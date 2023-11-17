@@ -15,7 +15,7 @@ use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationRe
 use crate::{
     client_events::ClientId,
     contract::ContractHandlerEvent,
-    message::{InnerMessage, Message, Transaction},
+    message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager, PeerKey},
     ring::{Location, PeerKeyLocation, RingError},
 };
@@ -524,7 +524,7 @@ fn build_op_result(
 ) -> Result<OperationResult, OpError> {
     let output_op = Some(PutOp { id, state, stats });
     Ok(OperationResult {
-        return_msg: msg.map(Message::from),
+        return_msg: msg.map(NetMessage::from),
         state: output_op.map(OpEnum::Put),
     })
 }
@@ -592,7 +592,7 @@ async fn try_to_broadcast(
                 };
                 op_storage
                     .notify_op_change(
-                        Message::from(return_msg.unwrap()),
+                        NetMessage::from(return_msg.unwrap()),
                         OpEnum::Put(op),
                         client_id,
                     )
@@ -710,7 +710,7 @@ pub(crate) async fn request_put(
             };
 
             op_storage
-                .notify_op_change(Message::from(msg), OpEnum::Put(op), client_id)
+                .notify_op_change(NetMessage::from(msg), OpEnum::Put(op), client_id)
                 .await?;
         }
         _ => return Err(OpError::invalid_transition(put_op.id)),
@@ -940,7 +940,7 @@ mod test {
     use freenet_stdlib::client_api::ContractRequest;
     use freenet_stdlib::prelude::*;
 
-    use crate::node::tests::{NodeSpecification, SimNetwork};
+    use crate::node::testing_impl::{NodeSpecification, SimNetwork};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn successful_put_op_between_nodes() -> Result<(), anyhow::Error> {
@@ -965,11 +965,11 @@ mod test {
         )
         .await;
         let mut locations = sim_nw.get_locations_by_node();
-        let node0_loc = locations.remove(&"node-0".into()).unwrap();
-        let node1_loc = locations.remove(&"node-1".into()).unwrap();
+        let node0_loc = locations.remove(&"node-1".into()).unwrap();
+        let node1_loc = locations.remove(&"node-2".into()).unwrap();
 
         // both own the contract, and one triggers an update
-        let node_0 = NodeSpecification {
+        let node_1 = NodeSpecification {
             owned_contracts: vec![(
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone())),
                 contract_val.clone(),
@@ -978,7 +978,7 @@ mod test {
             contract_subscribers: HashMap::from_iter([(key.clone(), vec![node1_loc])]),
         };
 
-        let node_1 = NodeSpecification {
+        let node_2 = NodeSpecification {
             owned_contracts: vec![(
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone())),
                 contract_val.clone(),
@@ -1005,8 +1005,8 @@ mod test {
 
         // establish network
         let put_specs = HashMap::from_iter([
-            ("node-0".into(), node_0),
             ("node-1".into(), node_1),
+            ("node-2".into(), node_2),
             ("gateway-0".into(), gw_0),
         ]);
 

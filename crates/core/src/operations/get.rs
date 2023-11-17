@@ -8,7 +8,7 @@ use futures::FutureExt;
 use crate::{
     client_events::ClientId,
     contract::{ContractError, ContractHandlerEvent, StoreResponse},
-    message::{InnerMessage, Message, Transaction},
+    message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager, PeerKey},
     operations::{OpInitialization, Operation},
     ring::{Location, PeerKeyLocation, RingError},
@@ -506,7 +506,7 @@ impl Operation for GetOp {
 
                             op_storage
                                 .notify_op_change(
-                                    Message::from(GetMsg::ReturnGet {
+                                    NetMessage::from(GetMsg::ReturnGet {
                                         id,
                                         key,
                                         value: StoreResponse {
@@ -609,7 +609,7 @@ fn build_op_result(
         stats,
     });
     Ok(OperationResult {
-        return_msg: msg.map(Message::from),
+        return_msg: msg.map(NetMessage::from),
         state: output_op.map(OpEnum::Get),
     })
 }
@@ -617,7 +617,7 @@ fn build_op_result(
 async fn continue_seeking<NB: NetworkBridge>(
     conn_manager: &mut NB,
     new_target: &PeerKeyLocation,
-    retry_msg: Message,
+    retry_msg: NetMessage,
 ) -> Result<(), OpError> {
     tracing::debug!(
         tx = %retry_msg.id(),
@@ -759,7 +759,7 @@ pub(crate) async fn request_get(
             };
 
             op_storage
-                .notify_op_change(Message::from(msg), OpEnum::Get(op), client_id)
+                .notify_op_change(NetMessage::from(msg), OpEnum::Get(op), client_id)
                 .await?;
         }
         _ => return Err(OpError::invalid_transition(get_op.id)),
@@ -859,7 +859,7 @@ mod test {
     use std::{collections::HashMap, time::Duration};
 
     use super::*;
-    use crate::node::tests::{NodeSpecification, SimNetwork};
+    use crate::node::testing_impl::{NodeSpecification, SimNetwork};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn successful_get_op_between_nodes() -> Result<(), anyhow::Error> {
@@ -876,7 +876,7 @@ mod test {
             fetch_contract: true,
         }
         .into();
-        let node_0 = NodeSpecification {
+        let node_1 = NodeSpecification {
             owned_contracts: vec![],
             events_to_generate: HashMap::from_iter([(1, get_event)]),
             contract_subscribers: HashMap::new(),
@@ -891,7 +891,7 @@ mod test {
             contract_subscribers: HashMap::new(),
         };
 
-        let get_specs = HashMap::from_iter([("node-0".into(), node_0), ("gateway-0".into(), gw_0)]);
+        let get_specs = HashMap::from_iter([("node-1".into(), node_1), ("gateway-0".into(), gw_0)]);
 
         // establish network
         let mut sim_nw = SimNetwork::new(
@@ -909,9 +909,9 @@ mod test {
 
         // trigger get @ node-0, which does not own the contract
         sim_nw
-            .trigger_event("node-0", 1, Some(Duration::from_secs(1)))
+            .trigger_event("node-1", 1, Some(Duration::from_secs(1)))
             .await?;
-        assert!(sim_nw.has_got_contract("node-0", &key));
+        assert!(sim_nw.has_got_contract("node-1", &key));
         Ok(())
     }
 
@@ -970,13 +970,13 @@ mod test {
         }
         .into();
 
-        let node_0 = NodeSpecification {
+        let node_1 = NodeSpecification {
             owned_contracts: vec![],
             events_to_generate: HashMap::from_iter([(1, get_event)]),
             contract_subscribers: HashMap::new(),
         };
 
-        let node_1 = NodeSpecification {
+        let node_2 = NodeSpecification {
             owned_contracts: vec![(
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
                 contract_val,
@@ -992,8 +992,8 @@ mod test {
         };
 
         let get_specs = HashMap::from_iter([
-            ("node-0".into(), node_0),
             ("node-1".into(), node_1),
+            ("node-2".into(), node_2),
             ("gateway-0".into(), gw_0),
         ]);
 
@@ -1011,9 +1011,9 @@ mod test {
         sim_nw.start_with_spec(get_specs).await;
         sim_nw.check_connectivity(Duration::from_secs(3))?;
         sim_nw
-            .trigger_event("node-0", 1, Some(Duration::from_secs(1)))
+            .trigger_event("node-1", 1, Some(Duration::from_secs(1)))
             .await?;
-        assert!(sim_nw.has_got_contract("node-0", &key));
+        assert!(sim_nw.has_got_contract("node-1", &key));
         Ok(())
     }
 }

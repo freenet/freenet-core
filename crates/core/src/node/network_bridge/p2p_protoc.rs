@@ -44,7 +44,7 @@ use crate::{
     client_events::ClientId,
     config::{self, GlobalExecutor},
     contract::{ClientResponsesSender, ExecutorToEventLoopChannel, NetworkEventListenerHalve},
-    message::{Message, NodeEvent, Transaction, TransactionType},
+    message::{NetMessage, NodeEvent, Transaction, TransactionType},
     node::{
         handle_cancelled_op, join_ring_request, network_event_log::NetEventLog, process_message,
         InitPeerNode, NetEventRegister, NodeBuilder, OpManager, PeerKey,
@@ -63,7 +63,7 @@ const CURRENT_PROTOC_VER_STR: &str = "/freenet/0.1.0";
 const CURRENT_IDENTIFY_PROTOC_VER: &str = "/id/1.0.0";
 
 fn config_behaviour(
-    local_key: &Keypair,
+    private_key: &Keypair,
     gateways: &[InitPeerNode],
     _private_addr: &Option<Multiaddr>,
     op_manager: Arc<OpManager>,
@@ -73,17 +73,19 @@ fn config_behaviour(
         .filter_map(|p| {
             p.addr
                 .as_ref()
-                .map(|addr| (p.identifier, HashSet::from_iter([addr.clone()])))
+                .map(|addr| (p.identifier.0, HashSet::from_iter([addr.clone()])))
         })
         .collect();
 
-    let ident_config =
-        identify::Config::new(CURRENT_IDENTIFY_PROTOC_VER.to_string(), local_key.public())
-            .with_agent_version(CURRENT_AGENT_VER.to_string());
+    let ident_config = identify::Config::new(
+        CURRENT_IDENTIFY_PROTOC_VER.to_string(),
+        private_key.public(),
+    )
+    .with_agent_version(CURRENT_AGENT_VER.to_string());
 
     let ping = ping::Behaviour::default();
 
-    let peer_id = local_key.public().to_peer_id();
+    let peer_id = private_key.public().to_peer_id();
     let auto_nat = {
         let config = autonat::Config {
             ..Default::default()
@@ -91,7 +93,7 @@ fn config_behaviour(
         let mut behaviour = autonat::Behaviour::new(peer_id, config);
 
         for (peer, addr) in gateways.iter().map(|p| (&p.identifier, &p.addr)) {
-            behaviour.add_server(*peer, addr.clone());
+            behaviour.add_server(peer.0, addr.clone());
         }
         behaviour
     };
@@ -120,7 +122,7 @@ fn multiaddr_from_connection(conn: (IpAddr, u16)) -> Multiaddr {
     addr
 }
 
-type P2pBridgeEvent = Either<(PeerKey, Box<Message>), NodeEvent>;
+type P2pBridgeEvent = Either<(PeerKey, Box<NetMessage>), NodeEvent>;
 
 pub(crate) struct P2pBridge {
     active_net_connections: Arc<DashMap<PeerKey, Multiaddr>>,
@@ -220,7 +222,7 @@ impl NetworkBridge for P2pBridge {
         Ok(())
     }
 
-    async fn send(&self, target: &PeerKey, msg: Message) -> super::ConnResult<()> {
+    async fn send(&self, target: &PeerKey, msg: NetMessage) -> super::ConnResult<()> {
         self.log_register
             .try_lock()
             .expect("single reference")
@@ -246,11 +248,12 @@ pub(in crate::node) struct P2pConnManager {
 }
 
 impl P2pConnManager {
-    pub fn build<const CLIENTS: usize>(
+    pub fn build(
         transport: transport::Boxed<(PeerId, muxing::StreamMuxerBox)>,
-        config: &NodeBuilder<CLIENTS>,
+        config: &NodeBuilder,
         op_manager: Arc<OpManager>,
         event_listener: impl NetEventRegister + Clone,
+        private_key: Keypair,
     ) -> Result<Self, anyhow::Error> {
         // We set a global executor which is virtually the Tokio multi-threaded executor
         // to reuse it's thread pool and scheduler in order to drive futures.
@@ -271,7 +274,7 @@ impl P2pConnManager {
         };
 
         let behaviour = config_behaviour(
-            &config.local_key,
+            &private_key,
             &config.remote_nodes,
             &private_addr,
             op_manager.clone(),
@@ -279,7 +282,7 @@ impl P2pConnManager {
         let mut swarm = Swarm::new(
             transport,
             behaviour,
-            PeerId::from(config.local_key.public()),
+            config.public_key.0,
             SwarmConfig::with_executor(global_executor)
                 .with_idle_connection_timeout(config::PEER_TIMEOUT),
         );
@@ -446,7 +449,7 @@ impl P2pConnManager {
                 Ok(Left((msg, client_id))) => {
                     let cb = self.bridge.clone();
                     match msg {
-                        Message::Aborted(tx) => {
+                        NetMessage::Aborted(tx) => {
                             let tx_type = tx.transaction_type();
                             let res = handle_cancelled_op(
                                 tx,
@@ -604,7 +607,7 @@ enum ConnMngrActions {
     /// Outbound message
     SendMessage {
         peer: PeerKey,
-        msg: Box<Message>,
+        msg: Box<NetMessage>,
     },
     /// Update self own public address, useful when communicating for first time
     UpdatePublicAddr(Multiaddr),
@@ -618,9 +621,9 @@ enum ConnMngrActions {
 /// Manages network connections with different peers and event routing within the swarm.
 pub(in crate::node) struct FreenetBehaviour {
     // FIFO queue for outbound messages
-    outbound: VecDeque<(PeerId, Either<Message, NodeEvent>)>,
+    outbound: VecDeque<(PeerId, Either<NetMessage, NodeEvent>)>,
     // FIFO queue for inbound messages
-    inbound: VecDeque<Either<Message, NodeEvent>>,
+    inbound: VecDeque<Either<NetMessage, NodeEvent>>,
     routing_table: HashMap<PeerId, HashSet<Multiaddr>>,
     connected: HashMap<PeerId, ConnectionId>,
     openning_connection: HashSet<PeerId>,
@@ -630,7 +633,7 @@ pub(in crate::node) struct FreenetBehaviour {
 impl NetworkBehaviour for FreenetBehaviour {
     type ConnectionHandler = Handler;
 
-    type ToSwarm = Message;
+    type ToSwarm = NetMessage;
 
     fn handle_established_inbound_connection(
         &mut self,
@@ -743,8 +746,8 @@ type UniqConnId = usize;
 
 #[derive(Debug)]
 pub(in crate::node) enum HandlerEvent {
-    Inbound(Either<Message, NodeEvent>),
-    Outbound(Either<Message, NodeEvent>),
+    Inbound(Either<NetMessage, NodeEvent>),
+    Outbound(Either<NetMessage, NodeEvent>),
 }
 
 /// Handles the connection with a given peer.
@@ -752,7 +755,7 @@ pub(in crate::node) struct Handler {
     substreams: Vec<SubstreamState>,
     uniq_conn_id: UniqConnId,
     protocol_status: ProtocolStatus,
-    pending: Vec<Message>,
+    pending: Vec<NetMessage>,
     op_manager: Arc<OpManager>,
 }
 
@@ -769,7 +772,7 @@ enum SubstreamState {
     /// We haven't started opening the outgoing substream yet.
     /// Contains the initial request we want to send.
     OutPendingOpen {
-        msg: Box<Message>,
+        msg: Box<NetMessage>,
         conn_id: UniqConnId,
     },
     /// Waiting for the first message after requesting an outbound open connection.
@@ -782,7 +785,7 @@ enum SubstreamState {
     PendingSend {
         conn_id: UniqConnId,
         substream: FreenetStream<NegotiatedSubstream>,
-        msg: Box<Either<Message, NodeEvent>>,
+        msg: Box<Either<NetMessage, NodeEvent>>,
     },
     /// Waiting to flush the substream so that the data arrives to the remote.
     PendingFlush {
@@ -811,7 +814,7 @@ impl Handler {
     }
 
     #[inline]
-    fn send_to_free_substream(&mut self, msg: Message) -> Option<Message> {
+    fn send_to_free_substream(&mut self, msg: NetMessage) -> Option<NetMessage> {
         let pos = self
             .substreams
             .iter()
@@ -1180,12 +1183,12 @@ pub(crate) type FreenetStream<S> = stream::AndThen<
     sink::With<
         stream::ErrInto<Framed<S, UviBytes<io::Cursor<Vec<u8>>>>, ConnectionError>,
         io::Cursor<Vec<u8>>,
-        Message,
+        NetMessage,
         future::Ready<Result<io::Cursor<Vec<u8>>, ConnectionError>>,
-        fn(Message) -> future::Ready<Result<io::Cursor<Vec<u8>>, ConnectionError>>,
+        fn(NetMessage) -> future::Ready<Result<io::Cursor<Vec<u8>>, ConnectionError>>,
     >,
-    future::Ready<Result<Message, ConnectionError>>,
-    fn(BytesMut) -> future::Ready<Result<Message, ConnectionError>>,
+    future::Ready<Result<NetMessage, ConnectionError>>,
+    fn(BytesMut) -> future::Ready<Result<NetMessage, ConnectionError>>,
 >;
 
 impl<S> InboundUpgrade<S> for FreenetProtocol
@@ -1231,12 +1234,12 @@ where
 }
 
 #[inline(always)]
-fn encode_msg(msg: Message) -> Result<Vec<u8>, ConnectionError> {
+fn encode_msg(msg: NetMessage) -> Result<Vec<u8>, ConnectionError> {
     bincode::serialize(&msg).map_err(|err| ConnectionError::Serialization(Some(err)))
 }
 
 #[inline(always)]
-fn decode_msg(buf: BytesMut) -> Result<Message, ConnectionError> {
+fn decode_msg(buf: BytesMut) -> Result<NetMessage, ConnectionError> {
     let cursor = std::io::Cursor::new(buf);
     bincode::deserialize_from(cursor).map_err(|err| ConnectionError::Serialization(Some(err)))
 }
@@ -1259,7 +1262,7 @@ pub(in crate::node) struct NetBehaviour {
 
 #[derive(Debug)]
 pub(in crate::node) enum NetEvent {
-    Freenet(Box<Message>),
+    Freenet(Box<NetMessage>),
     Identify(Box<identify::Event>),
     Ping(ping::Event),
     Autonat(autonat::Event),
@@ -1283,8 +1286,8 @@ impl From<ping::Event> for NetEvent {
     }
 }
 
-impl From<Message> for NetEvent {
-    fn from(event: Message) -> NetEvent {
+impl From<NetMessage> for NetEvent {
+    fn from(event: NetMessage) -> NetEvent {
         Self::Freenet(Box::new(event))
     }
 }

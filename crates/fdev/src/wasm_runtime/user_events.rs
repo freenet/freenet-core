@@ -309,14 +309,25 @@ impl ClientEventsProxy for StdInput {
                             ));
                         }
                         Ok(Command::GetParams) => {
-                            // FIXME: related to issue 272
-                            let _node = &*self.app_state.local_node.read().await;
-                            // let p = node
-                            //     .contract_state
-                            //     .get_params(self.contract.key())
-                            //     .await
-                            //     .unwrap();
-                            // self.app_state.printout_deser(&p);
+                            let node = &*self.app_state.local_node.read().await;
+                            let key = self.contract.key();
+                            let p = node
+                                .state_store
+                                .get_params(&key)
+                                .await
+                                .map_err(|e| {
+                                    ClientError::from(ErrorKind::Unhandled {
+                                        cause: format!("{e}"),
+                                    })
+                                })?
+                                .ok_or_else(|| {
+                                    ClientError::from(ErrorKind::Unhandled {
+                                        cause: format!("missing contract parameters: {key}",),
+                                    })
+                                })?;
+                            if let Err(e) = self.app_state.printout_deser(&p) {
+                                tracing::error!("error printing params: {e}");
+                            }
                         }
                         Ok(cmd) => {
                             return Ok(Either::Left(

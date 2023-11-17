@@ -74,7 +74,7 @@ freenet-stdlib = { features = ["net"], workspace = true }
 arbitrary = { features = ["derive"], version = "1" }
 chrono = { features = ["arbitrary"], workspace = true }
 freenet-stdlib = { features = ["net", "testing"], workspace = true }
-itertools = "0.11"
+itertools = "0.12"
 pav_regression = "0.4.0"
 pico-args = "0.5"
 statrs = "0.16.0"

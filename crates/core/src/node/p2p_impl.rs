@@ -17,7 +17,7 @@ use super::{
     NetEventRegister, PeerKey,
 };
 use crate::{
-    client_events::combinator::ClientEventsCombinator,
+    client_events::{combinator::ClientEventsCombinator, BoxedClient},
     config::{self, GlobalExecutor},
     contract::{
         self, ClientResponsesSender, ContractHandler, ExecutorToEventLoopChannel,
@@ -76,7 +76,9 @@ impl NodeP2P {
     }
 
     pub(crate) async fn build<CH, const CLIENTS: usize, ER>(
-        builder: NodeBuilder<CLIENTS>,
+        builder: NodeBuilder,
+        private_key: Keypair,
+        clients: [BoxedClient; CLIENTS],
         event_register: ER,
         ch_builder: CH::Builder,
     ) -> Result<NodeP2P, anyhow::Error>
@@ -84,7 +86,7 @@ impl NodeP2P {
         CH: ContractHandler + Send + 'static,
         ER: NetEventRegister + Clone,
     {
-        let peer_key = PeerKey::from(builder.local_key.public());
+        let peer_key = builder.public_key;
         let gateways = builder.get_gateways()?;
 
         let (notification_channel, notification_tx) = EventLoopNotifications::channel();
@@ -104,8 +106,14 @@ impl NodeP2P {
             .map_err(|e| anyhow::anyhow!(e))?;
 
         let conn_manager = {
-            let transport = Self::config_transport(&builder.local_key)?;
-            P2pConnManager::build(transport, &builder, op_storage.clone(), event_register)?
+            let transport = Self::config_transport(&private_key)?;
+            P2pConnManager::build(
+                transport,
+                &builder,
+                op_storage.clone(),
+                event_register,
+                private_key,
+            )?
         };
 
         let parent_span = tracing::Span::current();
@@ -113,7 +121,7 @@ impl NodeP2P {
             contract::contract_handling(contract_handler)
                 .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
         );
-        let clients = ClientEventsCombinator::new(builder.clients);
+        let clients = ClientEventsCombinator::new(clients);
         let (node_controller_tx, node_controller_rx) = tokio::sync::mpsc::channel(1);
         GlobalExecutor::spawn(
             client_event_handling(
@@ -169,7 +177,7 @@ mod test {
         client_events::test::MemoryEventsGen,
         config::GlobalExecutor,
         contract::MemoryContractHandler,
-        node::{network_event_log, tests::get_free_port, InitPeerNode},
+        node::{network_event_log, testing_impl::get_free_port, InitPeerNode},
         ring::Location,
     };
 
@@ -220,14 +228,16 @@ mod test {
         // Start up the initial node.
         GlobalExecutor::spawn(async move {
             let user_events = MemoryEventsGen::new(receiver1, PeerKey::from(peer1_id));
-            let mut config = NodeBuilder::new([Box::new(user_events)]);
+            let mut config = NodeBuilder::new();
             config
                 .with_ip(Ipv4Addr::LOCALHOST)
                 .with_port(peer1_port)
-                .with_key(peer1_key);
+                .with_key(peer1_key.public().into());
             let mut peer1 = Box::new(
                 NodeP2P::build::<MemoryContractHandler, 1, _>(
                     config,
+                    peer1_key,
+                    [Box::new(user_events)],
                     network_event_log::TestEventListener::new(),
                     "ping-listener".into(),
                 )
@@ -241,10 +251,14 @@ mod test {
         // Start up the dialing node
         let dialer = GlobalExecutor::spawn(async move {
             let user_events = MemoryEventsGen::new(receiver2, PeerKey::from(peer2_id));
-            let mut config = NodeBuilder::new([Box::new(user_events)]);
-            config.add_gateway(peer1_config.clone());
+            let mut config = NodeBuilder::new();
+            config
+                .add_gateway(peer1_config.clone())
+                .with_key(peer2_key.public().into());
             let mut peer2 = NodeP2P::build::<MemoryContractHandler, 1, _>(
                 config,
+                peer2_key,
+                [Box::new(user_events)],
                 network_event_log::TestEventListener::new(),
                 "ping-dialer".into(),
             )

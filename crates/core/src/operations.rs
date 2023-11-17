@@ -8,7 +8,7 @@ use tokio::sync::mpsc::error::SendError;
 use crate::{
     client_events::{ClientId, HostResult},
     contract::ContractError,
-    message::{InnerMessage, Message, Transaction, TransactionType},
+    message::{InnerMessage, NetMessage, Transaction, TransactionType},
     node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable, PeerKey},
     ring::{Location, PeerKeyLocation, RingError},
     DynError,
@@ -22,7 +22,7 @@ pub(crate) mod update;
 
 pub(crate) struct OperationResult {
     /// Inhabited if there is a message to return to the other peer.
-    pub return_msg: Option<Message>,
+    pub return_msg: Option<NetMessage>,
     /// None if the operation has been completed.
     pub state: Option<OpEnum>,
 }
@@ -63,7 +63,6 @@ async fn handle_op_result<CB>(
 where
     CB: NetworkBridge,
 {
-    // FIXME: register changes in the future op commit log
     match result {
         Err(OpError::StatePushed) => {
             // do nothing and continue, the operation will just continue later on
@@ -72,7 +71,7 @@ where
         Err(err) => {
             if let Some(sender) = sender {
                 network_bridge
-                    .send(&sender, Message::Aborted(tx_id))
+                    .send(&sender, NetMessage::Aborted(tx_id))
                     .await?;
             }
             return Err(err);

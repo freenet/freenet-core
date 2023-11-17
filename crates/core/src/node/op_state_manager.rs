@@ -9,7 +9,7 @@ use crate::{
     config::GlobalExecutor,
     contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent, SenderHalve},
     dev_tool::ClientId,
-    message::{Message, Transaction, TransactionType},
+    message::{NetMessage, Transaction, TransactionType},
     operations::{
         connect::ConnectOp, get::GetOp, put::PutOp, subscribe::SubscribeOp, update::UpdateOp,
         OpEnum, OpError,
@@ -59,14 +59,14 @@ pub(crate) struct OpManager {
 }
 
 impl OpManager {
-    pub(super) fn new<const CLIENTS: usize, ER: NetEventRegister>(
+    pub(super) fn new<ER: NetEventRegister>(
         notification_channel: EventLoopNotificationsSender,
         contract_handler: ContractHandlerChannel<SenderHalve>,
-        builder: &NodeBuilder<CLIENTS>,
+        builder: &NodeBuilder,
         gateways: &[PeerKeyLocation],
         event_register: ER,
     ) -> Result<Self, anyhow::Error> {
-        let ring = Ring::new::<CLIENTS, ER>(builder, gateways, notification_channel.clone())?;
+        let ring = Ring::new::<ER>(builder, gateways, notification_channel.clone())?;
         let ops = Arc::new(Ops::default());
 
         let (new_transactions, rx) = tokio::sync::mpsc::channel(100);
@@ -97,7 +97,7 @@ impl OpManager {
     /// with other nodes, like intermediate states before returning.
     pub async fn notify_op_change(
         &self,
-        msg: Message,
+        msg: NetMessage,
         op: OpEnum,
         client_id: Option<ClientId>,
     ) -> Result<(), OpError> {
@@ -208,7 +208,7 @@ impl OpManager {
     }
 
     /// Notify the operation manager that a transaction is being transacted over the network.
-    pub fn sending_transaction(&self, peer: &PeerKey, msg: &Message) {
+    pub fn sending_transaction(&self, peer: &PeerKey, msg: &NetMessage) {
         let transaction = msg.id();
         if let Some(loc) = msg.requested_location() {
             self.ring

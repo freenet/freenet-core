@@ -17,7 +17,7 @@ pub(super) struct SafeWriter<S> {
     file: BufWriter<File>,
     lock_file_path: PathBuf,
     compact: bool,
-    _marker: std::marker::PhantomData<fn(&S) -> ()>,
+    _marker: std::marker::PhantomData<fn(S) -> S>,
 }
 
 impl<S: StoreFsManagement> SafeWriter<S> {

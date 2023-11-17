@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use super::{ConnectionError, NetworkBridge, PeerKey};
 use crate::{
     config::GlobalExecutor,
-    message::Message,
+    message::NetMessage,
     node::{network_event_log::NetEventLog, NetEventRegister, OpManager},
 };
 
@@ -25,7 +25,7 @@ pub(in crate::node) struct MemoryConnManager {
     pub transport: InMemoryTransport,
     log_register: Arc<Mutex<Box<dyn NetEventRegister>>>,
     op_manager: Arc<OpManager>,
-    msg_queue: Arc<Mutex<Vec<Message>>>,
+    msg_queue: Arc<Mutex<Vec<NetMessage>>>,
     peer: PeerKey,
 }
 
@@ -47,7 +47,8 @@ impl MemoryConnManager {
                 let Some(msg) = transport_cp.msg_stack_queue.lock().await.pop() else {
                     continue;
                 };
-                let msg_data: Message = bincode::deserialize_from(Cursor::new(msg.data)).unwrap();
+                let msg_data: NetMessage =
+                    bincode::deserialize_from(Cursor::new(msg.data)).unwrap();
                 msg_queue_cp.lock().await.push(msg_data);
             }
         });
@@ -61,7 +62,7 @@ impl MemoryConnManager {
         }
     }
 
-    pub async fn recv(&self) -> Result<Message, ConnectionError> {
+    pub async fn recv(&self) -> Result<NetMessage, ConnectionError> {
         loop {
             let mut queue = self.msg_queue.lock().await;
             let Some(msg) = queue.pop() else {
@@ -94,7 +95,7 @@ impl Clone for MemoryConnManager {
 
 #[async_trait::async_trait]
 impl NetworkBridge for MemoryConnManager {
-    async fn send(&self, target: &PeerKey, msg: Message) -> super::ConnResult<()> {
+    async fn send(&self, target: &PeerKey, msg: NetMessage) -> super::ConnResult<()> {
         self.log_register
             .try_lock()
             .expect("unique lock")

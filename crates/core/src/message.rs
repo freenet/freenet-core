@@ -197,7 +197,7 @@ mod sealed_msg_type {
     macro_rules! transaction_type_enumeration {
         (decl struct { $( $var:tt -> $ty:tt),+ }) => {
             $(
-                impl From<$ty> for Message {
+                impl From<$ty> for NetMessage {
                     fn from(msg: $ty) -> Self {
                         Self::$var(msg)
                     }
@@ -222,7 +222,7 @@ mod sealed_msg_type {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) enum Message {
+pub(crate) enum NetMessage {
     Connect(ConnectMsg),
     Put(PutMsg),
     Get(GetMsg),
@@ -232,7 +232,7 @@ pub(crate) enum Message {
     Aborted(Transaction),
 }
 
-pub(crate) trait InnerMessage: Into<Message> {
+pub(crate) trait InnerMessage: Into<NetMessage> {
     fn id(&self) -> &Transaction;
 
     fn target(&self) -> Option<&PeerKeyLocation>;
@@ -283,9 +283,9 @@ impl Display for NodeEvent {
     }
 }
 
-impl Message {
+impl NetMessage {
     pub fn id(&self) -> &Transaction {
-        use Message::*;
+        use NetMessage::*;
         match self {
             Connect(op) => op.id(),
             Put(op) => op.id(),
@@ -297,7 +297,7 @@ impl Message {
     }
 
     pub fn target(&self) -> Option<&PeerKeyLocation> {
-        use Message::*;
+        use NetMessage::*;
         match self {
             Connect(op) => op.target(),
             Put(op) => op.target(),
@@ -310,7 +310,7 @@ impl Message {
 
     /// Is the last expected message for this chain of messages.
     pub fn terminal(&self) -> bool {
-        use Message::*;
+        use NetMessage::*;
         match self {
             Connect(op) => op.terminal(),
             Put(op) => op.terminal(),
@@ -322,7 +322,7 @@ impl Message {
     }
 
     pub fn requested_location(&self) -> Option<Location> {
-        use Message::*;
+        use NetMessage::*;
         match self {
             Connect(op) => op.requested_location(),
             Put(op) => op.requested_location(),
@@ -334,14 +334,14 @@ impl Message {
     }
 
     pub fn track_stats(&self) -> bool {
-        use Message::*;
+        use NetMessage::*;
         !matches!(self, Connect(_) | Subscribe(_) | Aborted(_))
     }
 }
 
-impl Display for Message {
+impl Display for NetMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use Message::*;
+        use NetMessage::*;
         write!(f, "Message {{")?;
         match self {
             Connect(msg) => msg.fmt(f)?,

@@ -85,7 +85,7 @@ mod messages {
             todo!()
         }
 
-        fn requested_location(&self) -> Option<crate::network_sim::Location> {
+        fn requested_location(&self) -> Option<crate::ring::Location> {
             todo!()
         }
     }

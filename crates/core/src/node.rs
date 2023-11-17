@@ -18,9 +18,9 @@ use std::{
 use either::Either;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ErrorKind};
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
+use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
-use self::in_memory_impl::NodeInMemory;
 use self::{network_event_log::NetEventLog, p2p_impl::NodeP2P};
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
@@ -30,7 +30,7 @@ use crate::{
         ClientResponses, ClientResponsesSender, ContractError, ExecutorToEventLoopChannel,
         NetworkContractHandler, NetworkEventListenerHalve, OperationMode,
     },
-    message::{Message, NodeEvent, Transaction, TransactionType},
+    message::{NetMessage, NodeEvent, Transaction, TransactionType},
     operations::{
         connect::{self, ConnectMsg, ConnectOp},
         get, put, subscribe, OpEnum, OpError, OpOutcome,
@@ -43,15 +43,16 @@ use crate::{
 
 use crate::operations::handle_op_request;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
+#[cfg(feature = "trace-ot")]
+pub(crate) use network_event_log::CombinedRegister;
 pub(crate) use network_event_log::{EventRegister, NetEventRegister};
 pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
-mod in_memory_impl;
 mod network_bridge;
 mod network_event_log;
 mod op_state_manager;
 mod p2p_impl;
-pub(crate) mod tests;
+pub(crate) mod testing_impl;
 
 #[derive(clap::Parser, Clone, Debug)]
 pub struct NodeConfig {
@@ -89,9 +90,10 @@ impl Node {
 ///
 /// If both are provided but also additional peers are added via the [`Self::add_gateway()`] method, this node will
 /// be listening but also try to connect to an existing peer.
-pub struct NodeBuilder<const CLIENTS: usize> {
-    /// local peer private key in
-    pub(crate) local_key: identity::Keypair,
+#[derive(Serialize, Deserialize)]
+pub struct NodeBuilder {
+    /// public key for the peer
+    pub(crate) public_key: PeerKey,
     // optional local info, in case this is an initial bootstrap node
     /// IP to bind to the listener
     pub(crate) local_ip: Option<IpAddr>,
@@ -110,14 +112,13 @@ pub struct NodeBuilder<const CLIENTS: usize> {
     pub(crate) rnd_if_htl_above: Option<usize>,
     pub(crate) max_number_conn: Option<usize>,
     pub(crate) min_number_conn: Option<usize>,
-    pub(crate) clients: [BoxedClient; CLIENTS],
 }
 
-impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
-    pub fn new(clients: [BoxedClient; CLIENTS]) -> NodeBuilder<CLIENTS> {
-        let local_key = Config::conf().local_peer_keypair.clone();
+impl NodeBuilder {
+    pub fn new() -> NodeBuilder {
+        let local_key = Config::conf().local_peer_keypair.public().into();
         NodeBuilder {
-            local_key,
+            public_key: local_key,
             remote_nodes: Vec::with_capacity(1),
             local_ip: None,
             local_port: None,
@@ -128,7 +129,6 @@ impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
             rnd_if_htl_above: None,
             max_number_conn: None,
             min_number_conn: None,
-            clients,
         }
     }
 
@@ -164,8 +164,8 @@ impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
 
     /// Optional identity key of this node.
     /// If not provided it will be either obtained from the configuration or freshly generated.
-    pub fn with_key(&mut self, key: identity::Keypair) -> &mut Self {
-        self.local_key = key;
+    pub fn with_key(&mut self, key: PeerKey) -> &mut Self {
+        self.public_key = key;
         self
     }
 
@@ -181,11 +181,16 @@ impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
     }
 
     /// Builds a node using the default backend connection manager.
-    pub async fn build(self, config: NodeConfig) -> Result<Node, anyhow::Error> {
+    pub async fn build<const CLIENTS: usize>(
+        self,
+        config: NodeConfig,
+        clients: [BoxedClient; CLIENTS],
+        private_key: identity::Keypair,
+    ) -> Result<Node, anyhow::Error> {
         let event_register = {
             #[cfg(feature = "trace-ot")]
             {
-                use super::node::network_event_log::{CombinedRegister, OTEventRegister};
+                use super::node::network_event_log::OTEventRegister;
                 CombinedRegister::new([
                     Box::new(EventRegister::new()),
                     Box::new(OTEventRegister::new()),
@@ -196,23 +201,28 @@ impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
                 EventRegister::new()
             }
         };
-        let node =
-            NodeP2P::build::<NetworkContractHandler, CLIENTS, _>(self, event_register, config)
-                .await?;
+        let node = NodeP2P::build::<NetworkContractHandler, CLIENTS, _>(
+            self,
+            private_key,
+            clients,
+            event_register,
+            config,
+        )
+        .await?;
         Ok(Node(node))
     }
 
     /// Returns all specified gateways for this peer. Returns an error if the peer is not a gateway
     /// and no gateways are specified.
     fn get_gateways(&self) -> Result<Vec<PeerKeyLocation>, anyhow::Error> {
-        let peer = PeerKey::from(self.local_key.public());
+        let peer = self.public_key;
         let gateways: Vec<_> = self
             .remote_nodes
             .iter()
             .filter_map(|node| {
                 if node.addr.is_some() {
                     Some(PeerKeyLocation {
-                        peer: PeerKey::from(node.identifier),
+                        peer: node.identifier,
                         location: Some(node.location),
                     })
                 } else {
@@ -231,11 +241,17 @@ impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
     }
 }
 
+impl Default for NodeBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Gateway node to bootstrap the network.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct InitPeerNode {
     addr: Option<Multiaddr>,
-    identifier: PeerId,
+    identifier: PeerKey,
     location: Location,
 }
 
@@ -243,7 +259,7 @@ impl InitPeerNode {
     pub fn new(identifier: PeerId, location: Location) -> Self {
         Self {
             addr: None,
-            identifier,
+            identifier: PeerKey(identifier),
             location,
         }
     }
@@ -587,7 +603,7 @@ macro_rules! handle_op_not_available {
 }
 
 async fn process_message<CB>(
-    msg: Message,
+    msg: NetMessage,
     op_storage: Arc<OpManager>,
     mut conn_manager: CB,
     mut event_listener: Box<dyn NetEventRegister>,
@@ -605,7 +621,7 @@ async fn process_message<CB>(
         .await;
     loop {
         match &msg {
-            Message::Connect(op) => {
+            NetMessage::Connect(op) => {
                 // log_handling_msg!("join", op.id(), op_storage);
                 let op_result = handle_op_request::<connect::ConnectOp, _>(
                     &op_storage,
@@ -625,7 +641,7 @@ async fn process_message<CB>(
                 )
                 .await;
             }
-            Message::Put(op) => {
+            NetMessage::Put(op) => {
                 // log_handling_msg!("put", *op.id(), op_storage);
                 let op_result = handle_op_request::<put::PutOp, _>(
                     &op_storage,
@@ -645,7 +661,7 @@ async fn process_message<CB>(
                 )
                 .await;
             }
-            Message::Get(op) => {
+            NetMessage::Get(op) => {
                 // log_handling_msg!("get", op.id(), op_storage);
                 let op_result = handle_op_request::<get::GetOp, _>(
                     &op_storage,
@@ -665,7 +681,7 @@ async fn process_message<CB>(
                 )
                 .await;
             }
-            Message::Subscribe(op) => {
+            NetMessage::Subscribe(op) => {
                 // log_handling_msg!("subscribe", op.id(), op_storage);
                 let op_result = handle_op_request::<subscribe::SubscribeOp, _>(
                     &op_storage,
@@ -738,7 +754,7 @@ impl<'a> arbitrary::Arbitrary<'a> for PeerKey {
 }
 
 impl PeerKey {
-    pub(crate) fn random() -> Self {
+    pub fn random() -> Self {
         use libp2p::identity::Keypair;
         PeerKey::from(Keypair::generate_ed25519().public())
     }

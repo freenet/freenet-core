@@ -1,10 +1,10 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use either::Either;
 use freenet_stdlib::prelude::*;
 use tracing::Instrument;
 
-use super::{
+use crate::node::{
     client_event_handling, handle_cancelled_op, join_ring_request,
     network_bridge::{in_memory::MemoryConnManager, EventLoopNotifications},
     network_event_log::NetEventLog,
@@ -18,37 +18,21 @@ use crate::{
         self, executor_channel, ClientResponsesSender, ContractHandler, ExecutorToEventLoopChannel,
         MemoryContractHandler, NetworkEventListenerHalve,
     },
-    message::{Message, NodeEvent, TransactionType},
-    node::NodeBuilder,
+    message::{NetMessage, NodeEvent, TransactionType},
     operations::OpError,
     ring::PeerKeyLocation,
     util::IterExt,
 };
 
-pub(super) struct NodeInMemory {
-    pub peer_key: PeerKey,
-    pub op_storage: Arc<OpManager>,
-    gateways: Vec<PeerKeyLocation>,
-    notification_channel: EventLoopNotifications,
-    conn_manager: MemoryConnManager,
-    event_register: Box<dyn NetEventRegister>,
-    is_gateway: bool,
-    _executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
-    /// Span to use for this node for tracing purposes
-    pub parent_span: tracing::Span,
-}
+use super::Builder;
 
-impl NodeInMemory {
-    /// Buils an in-memory node. Does nothing upon construction,
-    pub async fn build<ER: NetEventRegister + Clone>(
-        builder: NodeBuilder<0>,
-        event_register: ER,
-        ch_builder: String,
-        add_noise: bool,
-    ) -> Result<NodeInMemory, anyhow::Error> {
-        let peer_key = PeerKey::from(builder.local_key.public());
-        let gateways = builder.get_gateways()?;
-        let is_gateway = builder.local_ip.zip(builder.local_port).is_some();
+impl<ER: NetEventRegister + Clone> Builder<ER> {
+    pub async fn run_node<UsrEv>(self, user_events: UsrEv) -> Result<(), anyhow::Error>
+    where
+        UsrEv: ClientEventsProxy + Send + 'static,
+    {
+        let gateways = self.builder.get_gateways()?;
+        let is_gateway = self.builder.local_ip.zip(self.builder.local_port).is_some();
 
         let (notification_channel, notification_tx) = EventLoopNotifications::channel();
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
@@ -56,22 +40,21 @@ impl NodeInMemory {
         let op_storage = Arc::new(OpManager::new(
             notification_tx,
             ops_ch_channel,
-            &builder,
+            &self.builder,
             &gateways,
-            event_register.clone(),
+            self.event_register.clone(),
         )?);
         let (_executor_listener, executor_sender) = executor_channel(op_storage.clone());
         let contract_handler =
-            MemoryContractHandler::build(ch_channel, executor_sender, ch_builder)
+            MemoryContractHandler::build(ch_channel, executor_sender, self.ch_builder)
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
 
-        let event_register = Box::new(event_register);
         let conn_manager = MemoryConnManager::new(
-            peer_key,
-            event_register.trait_clone(),
+            self.peer_key,
+            self.event_register.trait_clone(),
             op_storage.clone(),
-            add_noise,
+            self.add_noise,
         );
 
         let parent_span = tracing::Span::current();
@@ -79,62 +62,53 @@ impl NodeInMemory {
             contract::contract_handling(contract_handler)
                 .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
         );
-
-        Ok(NodeInMemory {
-            peer_key,
-            conn_manager,
+        let mut running_node = InMemoryNode {
+            peer_key: self.peer_key,
             op_storage,
             gateways,
             notification_channel,
-            event_register,
+            conn_manager,
+            event_register: self.event_register.trait_clone(),
             is_gateway,
             _executor_listener,
             parent_span,
-        })
-    }
-
-    pub async fn run_node<UsrEv>(&mut self, user_events: UsrEv) -> Result<(), anyhow::Error>
-    where
-        UsrEv: ClientEventsProxy + Send + 'static,
-    {
-        if !self.is_gateway {
-            if let Some(gateway) = self.gateways.iter().shuffle().take(1).next() {
-                join_ring_request(
-                    None,
-                    self.peer_key,
-                    gateway,
-                    &self.op_storage,
-                    &mut self.conn_manager,
-                )
-                .await?;
-            } else {
-                anyhow::bail!("requires at least one gateway");
-            }
-        }
-        let (client_responses, cli_response_sender) = contract::ClientResponses::channel();
-        let parent_span = self.parent_span.clone();
-        let (node_controller_tx, node_controller_rx) = tokio::sync::mpsc::channel(1);
-        GlobalExecutor::spawn(
-            client_event_handling(
-                self.op_storage.clone(),
-                user_events,
-                client_responses,
-                node_controller_tx,
-            )
-            .instrument(tracing::info_span!(parent: parent_span, "client_event_handling")),
-        );
-        let parent_span: tracing::Span = self.parent_span.clone();
-        self.run_event_listener(cli_response_sender, node_controller_rx)
-            .instrument(parent_span)
-            .await
+        };
+        running_node
+            .append_contracts(self.contracts, self.contract_subscribers)
+            .await?;
+        running_node.run_node(user_events).await
     }
 
     #[cfg(test)]
-    pub async fn append_contracts<'a>(
-        &self,
+    pub fn append_contracts(
+        &mut self,
         contracts: Vec<(ContractContainer, WrappedState)>,
         contract_subscribers: std::collections::HashMap<ContractKey, Vec<PeerKeyLocation>>,
-    ) -> Result<(), crate::contract::ContractError> {
+    ) {
+        self.contracts.extend(contracts);
+        self.contract_subscribers.extend(contract_subscribers);
+    }
+}
+
+struct InMemoryNode {
+    peer_key: PeerKey,
+    op_storage: Arc<OpManager>,
+    gateways: Vec<PeerKeyLocation>,
+    notification_channel: EventLoopNotifications,
+    conn_manager: MemoryConnManager,
+    event_register: Box<dyn NetEventRegister>,
+    is_gateway: bool,
+    _executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
+    /// Span to use for this node for tracing purposes
+    parent_span: tracing::Span,
+}
+
+impl InMemoryNode {
+    async fn append_contracts(
+        &mut self,
+        contracts: Vec<(ContractContainer, WrappedState)>,
+        contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
+    ) -> Result<(), anyhow::Error> {
         use crate::contract::ContractHandlerEvent;
         for (contract, state) in contracts {
             let key: ContractKey = contract.key();
@@ -177,6 +151,42 @@ impl NodeInMemory {
         Ok(())
     }
 
+    pub async fn run_node<UsrEv>(mut self, user_events: UsrEv) -> Result<(), anyhow::Error>
+    where
+        UsrEv: ClientEventsProxy + Send + 'static,
+    {
+        if !self.is_gateway {
+            if let Some(gateway) = self.gateways.iter().shuffle().take(1).next() {
+                join_ring_request(
+                    None,
+                    self.peer_key,
+                    gateway,
+                    &self.op_storage,
+                    &mut self.conn_manager,
+                )
+                .await?;
+            } else {
+                anyhow::bail!("requires at least one gateway");
+            }
+        }
+        let (client_responses, cli_response_sender) = contract::ClientResponses::channel();
+        let parent_span = self.parent_span.clone();
+        let (node_controller_tx, node_controller_rx) = tokio::sync::mpsc::channel(1);
+        GlobalExecutor::spawn(
+            client_event_handling(
+                self.op_storage.clone(),
+                user_events,
+                client_responses,
+                node_controller_tx,
+            )
+            .instrument(tracing::info_span!(parent: parent_span, "client_event_handling")),
+        );
+        let parent_span: tracing::Span = self.parent_span.clone();
+        self.run_event_listener(cli_response_sender, node_controller_rx)
+            .instrument(parent_span)
+            .await
+    }
+
     /// Starts listening to incoming events. Will attempt to join the ring if any gateways have been provided.
     async fn run_event_listener(
         &mut self,
@@ -202,7 +212,7 @@ impl NodeInMemory {
                 }
             };
 
-            if let Ok(Either::Left(Message::Aborted(tx))) = msg {
+            if let Ok(Either::Left(NetMessage::Aborted(tx))) = msg {
                 let tx_type = tx.transaction_type();
                 let res = handle_cancelled_op(
                     tx,
@@ -259,7 +269,7 @@ impl NodeInMemory {
                     }
                 },
                 Err(err) => {
-                    super::report_result(
+                    super::super::report_result(
                         None,
                         Err(err.into()),
                         &self.op_storage,

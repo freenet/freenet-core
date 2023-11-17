@@ -260,7 +260,7 @@ pub struct Executor<R = Runtime> {
     ))]
     mode: OperationMode,
     runtime: R,
-    state_store: StateStore<Storage>,
+    pub state_store: StateStore<Storage>,
     update_notifications: HashMap<ContractKey, Vec<(ClientId, mpsc::UnboundedSender<HostResult>)>>,
     subscriber_summaries: HashMap<ContractKey, HashMap<ClientId, Option<StateSummary<'static>>>>,
     delegate_attested_ids: HashMap<DelegateKey, Vec<ContractInstanceId>>,

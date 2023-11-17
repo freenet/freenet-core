@@ -1,4 +1,7 @@
+use std::time::Duration;
+
 use anyhow::Error;
+use freenet::dev_tool::SimNetwork;
 
 /// Testing framework for running Freenet network simulations.
 #[derive(clap::Parser, Clone)]
@@ -46,6 +49,24 @@ pub struct TestConfig {
     pub command: TestMode,
 }
 
+impl TestConfig {
+    fn get_connection_check_params(&self) -> (Duration, f64) {
+        let conns_per_gw = (self.nodes / self.gateways) as f64;
+        let conn_percent = (conns_per_gw / self.nodes as f64).min(0.99);
+        let connectivity_timeout = Duration::from_millis(self.wait_duration.unwrap_or_else(|| {
+            // expect a peer to take max 200ms to connect, this should happen in parallel
+            // but err on the side of safety
+            (conns_per_gw * 200.0).ceil() as u64
+        }));
+        (connectivity_timeout, conn_percent)
+    }
+
+    fn seed(&self) -> u64 {
+        use rand::RngCore;
+        self.seed.unwrap_or_else(|| rand::rngs::OsRng.next_u64())
+    }
+}
+
 fn randomize_test_name() -> String {
     const ALPHABET: &str = "abcdefghijklmnopqrstuvwxyz";
     use rand::seq::IteratorRandom;
@@ -83,42 +104,66 @@ pub(crate) async fn test_framework(base_config: TestConfig) -> Result<(), Error>
     Ok(())
 }
 
+async fn config_sim_network(base_config: &TestConfig) -> Result<SimNetwork, Error> {
+    if base_config.gateways == 0 {
+        anyhow::bail!("Gateways should be higher than 0");
+    }
+    if base_config.nodes == 0 {
+        anyhow::bail!("Nodes should be higher than 0");
+    }
+    let name = &base_config
+        .name
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(randomize_test_name);
+    let sim = SimNetwork::new(
+        name,
+        base_config.gateways,
+        base_config.nodes,
+        base_config.ring_max_htl,
+        base_config.rnd_if_htl_above,
+        base_config.max_connections,
+        base_config.min_connections,
+    )
+    .await;
+    Ok(sim)
+}
+
+mod multiple_process {
+    use freenet::dev_tool::{MemoryEventsGen, PeerKey};
+
+    struct MultiProcessEventSender {}
+
+    struct MultiProcessEventReceiver {}
+
+    pub(super) async fn run(base_config: &super::TestConfig) -> Result<(), super::Error> {
+        let mut simulated_network = super::config_sim_network(base_config).await?;
+        let peers = simulated_network.build_peers();
+        let (user_ev_controller, receiver_ch) = tokio::sync::watch::channel((0, PeerKey::random()));
+        for (label, node) in peers {
+            let mut user_events = MemoryEventsGen::<fastrand::Rng>::new_with_seed(
+                receiver_ch.clone(),
+                node.peer_key(),
+                base_config.seed(),
+            );
+            // user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
+        }
+        todo!()
+    }
+}
+
 mod single_process {
     use std::time::Duration;
 
-    use freenet::network_sim::SimNetwork;
     use futures::StreamExt;
-    use rand::RngCore;
     use tokio::signal;
 
     pub(super) async fn run(base_config: &super::TestConfig) -> Result<(), super::Error> {
-        if base_config.gateways == 0 {
-            anyhow::bail!("Gateways should be higher than 0");
-        }
-        if base_config.nodes == 0 {
-            anyhow::bail!("Nodes should be higher than 0");
-        }
-        let name = &base_config
-            .name
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(super::randomize_test_name);
-        let mut simulated_network = SimNetwork::new(
-            name,
-            base_config.gateways,
-            base_config.nodes,
-            base_config.ring_max_htl,
-            base_config.rnd_if_htl_above,
-            base_config.max_connections,
-            base_config.min_connections,
-        )
-        .await;
+        let mut simulated_network = super::config_sim_network(base_config).await?;
 
         let join_handles = simulated_network
             .start_with_rand_gen::<fastrand::Rng>(
-                base_config
-                    .seed
-                    .unwrap_or_else(|| rand::rngs::OsRng.next_u64()),
+                base_config.seed(),
                 base_config
                     .max_contract_number
                     .unwrap_or(base_config.nodes * 10),
@@ -128,17 +173,8 @@ mod single_process {
 
         let events = base_config.events;
         let next_event_wait_time = base_config.event_wait_time.map(Duration::from_millis);
-        let (connectivity_timeout, network_connection_percent) = {
-            let conns_per_gw = (base_config.nodes / base_config.gateways) as f64;
-            let conn_percent = (conns_per_gw / base_config.nodes as f64).min(0.99);
-            let connectivity_timeout =
-                Duration::from_millis(base_config.wait_duration.unwrap_or_else(|| {
-                    // expect a peer to take max 200ms to connect, this should happen in parallel
-                    // but err on the side of safety
-                    (conns_per_gw * 200.0).ceil() as u64
-                }));
-            (connectivity_timeout, conn_percent)
-        };
+        let (connectivity_timeout, network_connection_percent) =
+            base_config.get_connection_check_params();
         let events_generated = tokio::task::spawn_blocking(move || {
             println!(
                 "Waiting for network to be sufficiently connected ({}ms timeout, {}%)",
@@ -147,12 +183,12 @@ mod single_process {
             );
             simulated_network
                 .check_partial_connectivity(connectivity_timeout, network_connection_percent)?;
-            for _ in simulated_network.event_chain(events) {
+            for _ in simulated_network.event_chain(events, None) {
                 if let Some(t) = next_event_wait_time {
                     std::thread::sleep(t);
                 }
             }
-            Ok::<_, super::Error>(simulated_network)
+            Ok::<_, super::Error>(())
         });
 
         let join_peer_tasks = async move {
@@ -169,7 +205,6 @@ mod single_process {
         tokio::pin!(join_peer_tasks);
         tokio::pin!(ctrl_c);
 
-        let mut network_sim = None;
         loop {
             tokio::select! {
                 _ = &mut ctrl_c  /* SIGINT handling */ => {
@@ -177,10 +212,9 @@ mod single_process {
                 }
                 res = &mut events_generated => {
                     match res? {
-                        Ok(return_nw) => {
+                        Ok(()) => {
                             println!("Test events generated successfully");
-                            network_sim = Some(return_nw);
-                            *events_generated = tokio::task::spawn(futures::future::pending::<Result<SimNetwork, super::Error>>());
+                            *events_generated = tokio::task::spawn(futures::future::pending::<Result<(), super::Error>>());
                             continue;
                         }
                         Err(err) => {
@@ -202,8 +236,6 @@ mod single_process {
                 }
             }
         }
-
-        _ = network_sim;
 
         Ok(())
     }

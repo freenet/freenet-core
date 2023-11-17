@@ -18,7 +18,7 @@ use super::PeerKey;
 use crate::{
     config::GlobalExecutor,
     contract::StoreResponse,
-    message::{Message, Transaction},
+    message::{NetMessage, Transaction},
     operations::{connect, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg},
     ring::{Location, PeerKeyLocation},
     router::RouteEvent,
@@ -130,11 +130,11 @@ impl<'a> NetEventLog<'a> {
     }
 
     pub fn from_outbound_msg(
-        msg: &'a Message,
+        msg: &'a NetMessage,
         op_storage: &'a OpManager,
     ) -> Either<Self, Vec<Self>> {
         let kind = match msg {
-            Message::Connect(connect::ConnectMsg::Response {
+            NetMessage::Connect(connect::ConnectMsg::Response {
                 msg:
                     connect::ConnectResponse::AcceptedBy {
                         peers,
@@ -156,7 +156,7 @@ impl<'a> NetEventLog<'a> {
                     EventKind::Ignored
                 }
             }
-            Message::Connect(connect::ConnectMsg::Response {
+            NetMessage::Connect(connect::ConnectMsg::Response {
                 msg:
                     connect::ConnectResponse::Proxy {
                         accepted_by,
@@ -187,11 +187,11 @@ impl<'a> NetEventLog<'a> {
     }
 
     pub fn from_inbound_msg(
-        msg: &'a Message,
+        msg: &'a NetMessage,
         op_storage: &'a OpManager,
     ) -> Either<Self, Vec<Self>> {
         let kind = match msg {
-            Message::Connect(connect::ConnectMsg::Response {
+            NetMessage::Connect(connect::ConnectMsg::Response {
                 msg:
                     connect::ConnectResponse::AcceptedBy {
                         peers,
@@ -230,7 +230,7 @@ impl<'a> NetEventLog<'a> {
                 }
                 return Either::Right(events);
             }
-            Message::Put(PutMsg::RequestPut {
+            NetMessage::Put(PutMsg::RequestPut {
                 contract, target, ..
             }) => {
                 let key = contract.key();
@@ -239,13 +239,13 @@ impl<'a> NetEventLog<'a> {
                     key,
                 })
             }
-            Message::Put(PutMsg::SuccessfulUpdate { new_value, .. }) => {
+            NetMessage::Put(PutMsg::SuccessfulUpdate { new_value, .. }) => {
                 EventKind::Put(PutEvent::PutSuccess {
                     requester: op_storage.ring.peer_key,
                     value: new_value.clone(),
                 })
             }
-            Message::Put(PutMsg::Broadcasting {
+            NetMessage::Put(PutMsg::Broadcasting {
                 new_value,
                 broadcast_to,
                 key,
@@ -255,7 +255,7 @@ impl<'a> NetEventLog<'a> {
                 key: key.clone(),
                 value: new_value.clone(),
             }),
-            Message::Put(PutMsg::BroadcastTo {
+            NetMessage::Put(PutMsg::BroadcastTo {
                 sender,
                 new_value,
                 key,
@@ -265,12 +265,12 @@ impl<'a> NetEventLog<'a> {
                 key: key.clone(),
                 value: new_value.clone(),
             }),
-            Message::Get(GetMsg::ReturnGet {
+            NetMessage::Get(GetMsg::ReturnGet {
                 key,
                 value: StoreResponse { state: Some(_), .. },
                 ..
             }) => EventKind::Get { key: key.clone() },
-            Message::Subscribe(SubscribeMsg::ReturnSub {
+            NetMessage::Subscribe(SubscribeMsg::ReturnSub {
                 subscribed: true,
                 key,
                 sender,
@@ -1003,7 +1003,7 @@ pub(super) mod test {
     use parking_lot::Mutex;
 
     use super::*;
-    use crate::{node::tests::NodeLabel, ring::Distance};
+    use crate::{node::testing_impl::NodeLabel, ring::Distance};
 
     static LOG_ID: AtomicUsize = AtomicUsize::new(0);
 

@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -37,12 +35,4 @@ impl Default for Mean {
 #[derive(Debug, Clone, Copy, Serialize)]
 pub(super) struct TransferSpeed {
     pub bytes_per_second: f64,
-}
-
-impl TransferSpeed {
-    pub fn new(bytes: usize, duration: Duration) -> Self {
-        TransferSpeed {
-            bytes_per_second: bytes as f64 / duration.as_secs_f64(),
-        }
-    }
 }

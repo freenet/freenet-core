@@ -164,11 +164,11 @@ pub(crate) mod test {
     use rand::{seq::SliceRandom, SeedableRng};
     use tokio::sync::watch::Receiver;
 
-    use crate::node::{tests::EventId, PeerKey};
+    use crate::node::{testing_impl::EventId, PeerKey};
 
     use super::*;
 
-    pub(crate) struct MemoryEventsGen<R = rand::rngs::SmallRng> {
+    pub struct MemoryEventsGen<R = rand::rngs::SmallRng> {
         id: PeerKey,
         signal: Receiver<(EventId, PeerKey)>,
         events_to_gen: HashMap<EventId, ClientRequest<'static>>,

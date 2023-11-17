@@ -7,7 +7,7 @@ use std::{collections::HashSet, time::Duration};
 use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::{
     client_events::ClientId,
-    message::{InnerMessage, Message, Transaction},
+    message::{InnerMessage, NetMessage, Transaction},
     node::{ConnectionError, NetworkBridge, OpManager, PeerKey},
     operations::OpEnum,
     ring::{Location, PeerKeyLocation, Ring},
@@ -460,7 +460,7 @@ impl Operation for ConnectOp {
                         };
                         op_storage
                             .notify_op_change(
-                                Message::Aborted(*id),
+                                NetMessage::Aborted(*id),
                                 OpEnum::Connect(op.into()),
                                 None,
                             )
@@ -682,7 +682,7 @@ fn build_op_result(
         backoff,
     });
     Ok(OperationResult {
-        return_msg: msg.map(Message::from),
+        return_msg: msg.map(NetMessage::from),
         state: output_op.map(|op| OpEnum::Connect(Box::new(op))),
     })
 }
@@ -858,7 +858,7 @@ where
 
     conn_bridge.add_connection(gateway.peer).await?;
     let assigned_location = op_storage.ring.own_location().location;
-    let join_req = Message::from(messages::ConnectMsg::Request {
+    let join_req = NetMessage::from(messages::ConnectMsg::Request {
         id: tx,
         msg: messages::ConnectRequest::StartReq {
             target: gateway,
@@ -931,16 +931,13 @@ where
             "Selecting close peer to forward request",
         );
         // FIXME: target the `desired_location`
-        ring.routing(
-            joiner.location.unwrap(),
-            Some(&req_peer.peer),
-            skip_list.as_slice(),
-        )
-        .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))
+        let desired_location = joiner.location.unwrap();
+        ring.routing(desired_location, Some(&req_peer.peer), skip_list.as_slice())
+            .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))
     };
 
     if let Some(forward_to) = forward_to {
-        let forwarded = Message::from(ConnectMsg::Request {
+        let forwarded = NetMessage::from(ConnectMsg::Request {
             id,
             msg: ConnectRequest::Proxy {
                 joiner,
@@ -1142,7 +1139,7 @@ mod messages {
 mod test {
     use std::time::Duration;
 
-    use crate::node::tests::SimNetwork;
+    use crate::node::testing_impl::SimNetwork;
 
     /// Given a network of one node and one gateway test that both are connected.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

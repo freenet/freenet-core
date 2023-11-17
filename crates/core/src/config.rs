@@ -1,4 +1,3 @@
-#![allow(unused)] // FIXME: remove unused
 use std::{
     convert::TryFrom,
     fs::{self, File},
@@ -58,6 +57,7 @@ pub struct Config {
     local_mode: AtomicBool,
 
     #[cfg(feature = "websocket")]
+    #[allow(unused)]
     pub(crate) ws: WebSocketApiConfig,
 }
 
@@ -102,7 +102,6 @@ pub struct ConfigPaths {
     delegates_dir: PathBuf,
     secrets_dir: PathBuf,
     db_dir: PathBuf,
-    app_data_dir: PathBuf,
     event_log: PathBuf,
 }
 
@@ -158,7 +157,6 @@ impl ConfigPaths {
             delegates_dir,
             secrets_dir,
             db_dir,
-            app_data_dir,
             event_log,
         })
     }
@@ -375,8 +373,7 @@ pub fn set_logger() {
 
 #[cfg(feature = "trace")]
 pub(super) mod tracer {
-    use tracing::Subscriber;
-    use tracing_subscriber::{fmt, layer::Layered, Layer, Registry};
+    use tracing_subscriber::{Layer, Registry};
 
     use crate::DynError;
 
@@ -396,7 +393,6 @@ pub(super) mod tracer {
 
         // use opentelemetry_sdk::propagation::TraceContextPropagator;
         use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::Registry;
 
         let disabled_logs = std::env::var("FREENET_DISABLE_LOGS").is_ok();
         let layers = {

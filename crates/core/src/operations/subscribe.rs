@@ -9,7 +9,7 @@ use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationRe
 use crate::{
     client_events::ClientId,
     contract::ContractError,
-    message::{InnerMessage, Message, Transaction},
+    message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager, PeerKey},
     ring::{Location, PeerKeyLocation, RingError},
 };
@@ -135,7 +135,7 @@ impl Operation for SubscribeOp {
                     let sender = op_storage.ring.own_location();
                     let return_err = || -> OperationResult {
                         OperationResult {
-                            return_msg: Some(Message::from(SubscribeMsg::ReturnSub {
+                            return_msg: Some(NetMessage::from(SubscribeMsg::ReturnSub {
                                 key: key.clone(),
                                 id: *id,
                                 subscribed: false,
@@ -307,7 +307,7 @@ fn build_op_result(
         state: Some(state),
     });
     Ok(OperationResult {
-        return_msg: msg.map(Message::from),
+        return_msg: msg.map(NetMessage::from),
         state: output_op.map(OpEnum::Subscribe),
     })
 }
@@ -373,7 +373,7 @@ pub(crate) async fn request_subscribe(
                 state: new_state,
             };
             op_storage
-                .notify_op_change(Message::from(msg), OpEnum::Subscribe(op), client_id)
+                .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op), client_id)
                 .await?;
         }
         _ => return Err(OpError::invalid_transition(sub_op.id)),
@@ -478,7 +478,7 @@ mod test {
     use freenet_stdlib::client_api::ContractRequest;
 
     use super::*;
-    use crate::node::tests::{NodeSpecification, SimNetwork};
+    use crate::node::testing_impl::{NodeSpecification, SimNetwork};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn successful_subscribe_op_between_nodes() -> Result<(), anyhow::Error> {
@@ -511,8 +511,8 @@ mod test {
         };
 
         let subscribe_specs = HashMap::from_iter([
-            ("node-0".into(), first_node),
-            ("node-1".into(), second_node),
+            ("node-1".into(), first_node),
+            ("node-2".into(), second_node),
         ]);
         let mut sim_nw = SimNetwork::new(
             "successful_subscribe_op_between_nodes",
@@ -527,11 +527,11 @@ mod test {
         sim_nw.start_with_spec(subscribe_specs).await;
         sim_nw.check_connectivity(Duration::from_secs(3))?;
         sim_nw
-            .trigger_event("node-1", 1, Some(Duration::from_secs(1)))
+            .trigger_event("node-2", 1, Some(Duration::from_secs(1)))
             .await?;
-        assert!(sim_nw.has_got_contract("node-1", &contract_key));
+        assert!(sim_nw.has_got_contract("node-2", &contract_key));
         tokio::time::sleep(Duration::from_secs(3)).await;
-        assert!(sim_nw.is_subscribed_to_contract("node-1", &contract_key));
+        assert!(sim_nw.is_subscribed_to_contract("node-2", &contract_key));
         Ok(())
     }
 }

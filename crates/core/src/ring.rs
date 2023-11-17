@@ -224,14 +224,14 @@ impl Ring {
     /// connection of a peer in the network).
     const MAX_HOPS_TO_LIVE: usize = 10;
 
-    pub fn new<const CLIENTS: usize, EL: NetEventRegister>(
-        config: &NodeBuilder<CLIENTS>,
+    pub fn new<EL: NetEventRegister>(
+        config: &NodeBuilder,
         gateways: &[PeerKeyLocation],
         event_loop_notifier: EventLoopNotificationsSender,
     ) -> Result<Arc<Self>, anyhow::Error> {
         let (live_tx_tracker, missing_candidate_rx) = LiveTransactionTracker::new();
 
-        let peer_key = PeerKey::from(config.local_key.public());
+        let peer_key = config.public_key;
 
         // for location here consider -1 == None
         let own_location = AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()));
@@ -306,13 +306,20 @@ impl Ring {
         Ok(ring)
     }
 
-    async fn refresh_router<EL: NetEventRegister>(router: Arc<RwLock<Router>>) {
+    async fn refresh_router<ER: NetEventRegister>(router: Arc<RwLock<Router>>) {
         let mut interval = tokio::time::interval(Duration::from_secs(60 * 5));
         interval.tick().await;
         loop {
             interval.tick().await;
-            // fixme
-            let history = if std::any::type_name::<EL>() == std::any::type_name::<EventRegister>() {
+            #[cfg(feature = "trace-ot")]
+            let should_route = std::any::type_name::<ER>()
+                == std::any::type_name::<EventRegister>()
+                || std::any::type_name::<ER>()
+                    == std::any::type_name::<crate::node::CombinedRegister<2>>();
+            #[cfg(not(feature = "trace-ot"))]
+            let should_route =
+                std::any::type_name::<ER>() == std::any::type_name::<EventRegister>();
+            let history = if should_route {
                 EventRegister::get_router_events(10_000)
                     .await
                     .map_err(|error| {
