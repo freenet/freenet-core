@@ -32,26 +32,34 @@ enum Error {
     CommandFailed(&'static str),
 }
 
-#[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
-    freenet::config::set_logger();
-    let cwd = std::env::current_dir()?;
+fn main() -> Result<(), anyhow::Error> {
+    let tokio_rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     let config = Config::parse();
     freenet::config::Config::set_op_mode(config.additional.mode);
-    let r = match config.sub_command {
-        SubCommand::WasmRuntime(local_node_config) => run_local_executor(local_node_config).await,
-        SubCommand::Build(build_tool_config) => build_package(build_tool_config, &cwd),
-        SubCommand::Inspect(inspect_config) => inspect(inspect_config),
-        SubCommand::New(new_pckg_config) => create_new_package(new_pckg_config),
-        SubCommand::Publish(publish_config) => put(publish_config, config.additional).await,
-        SubCommand::Execute(cmd_config) => match cmd_config.command {
-            config::NodeCommand::Put(put_config) => put(put_config, config.additional).await,
-            config::NodeCommand::Update(update_config) => {
-                update(update_config, config.additional).await
+    if !config.sub_command.is_child() {
+        freenet::config::set_logger();
+    }
+    tokio_rt.block_on(async move {
+        let cwd = std::env::current_dir()?;
+        let r = match config.sub_command {
+            SubCommand::WasmRuntime(local_node_config) => {
+                run_local_executor(local_node_config).await
             }
-        },
-        SubCommand::Test(test_config) => testing::test_framework(test_config).await,
-    };
-    // todo: make all commands return concrete `thiserror` compatible errors so we can use anyhow
-    r.map_err(|e| anyhow::format_err!(e))
+            SubCommand::Build(build_tool_config) => build_package(build_tool_config, &cwd),
+            SubCommand::Inspect(inspect_config) => inspect(inspect_config),
+            SubCommand::New(new_pckg_config) => create_new_package(new_pckg_config),
+            SubCommand::Publish(publish_config) => put(publish_config, config.additional).await,
+            SubCommand::Execute(cmd_config) => match cmd_config.command {
+                config::NodeCommand::Put(put_config) => put(put_config, config.additional).await,
+                config::NodeCommand::Update(update_config) => {
+                    update(update_config, config.additional).await
+                }
+            },
+            SubCommand::Test(test_config) => testing::test_framework(test_config).await,
+        };
+        // todo: make all commands return concrete `thiserror` compatible errors so we can use anyhow
+        r.map_err(|e| anyhow::format_err!(e))
+    })
 }

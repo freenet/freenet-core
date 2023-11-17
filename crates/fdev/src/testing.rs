@@ -3,6 +3,8 @@ use std::time::Duration;
 use anyhow::Error;
 use freenet::dev_tool::SimNetwork;
 
+pub(crate) use multiple_process::Process;
+
 /// Testing framework for running Freenet network simulations.
 #[derive(clap::Parser, Clone)]
 pub struct TestConfig {
@@ -84,7 +86,7 @@ pub enum TestMode {
     /// Runs multiple simulated nodes in a single process.
     SingleProcess,
     /// Runs multiple simulated nodes in multiple processes.
-    MultiProcess,
+    MultiProcess(multiple_process::MultiProcessConfig),
     /// Runs multiple simulated nodes in multiple processes and multiple machines.
     Network,
 }
@@ -94,8 +96,8 @@ pub(crate) async fn test_framework(base_config: TestConfig) -> Result<(), Error>
         TestMode::SingleProcess => {
             single_process::run(&base_config).await?;
         }
-        TestMode::MultiProcess => {
-            todo!()
+        TestMode::MultiProcess(config) => {
+            multiple_process::run(&base_config, config).await?;
         }
         TestMode::Network => {
             todo!()
@@ -130,25 +132,181 @@ async fn config_sim_network(base_config: &TestConfig) -> Result<SimNetwork, Erro
 }
 
 mod multiple_process {
-    use freenet::dev_tool::{MemoryEventsGen, PeerId};
+    use std::{
+        io::{Read, Write},
+        process::{Command, Stdio},
+    };
 
-    struct MultiProcessEventSender {}
+    use anyhow::anyhow;
+    use freenet::dev_tool::{MemoryEventsGen, NodeConfig, NodeLabel, PeerId, SimPeer};
 
-    struct MultiProcessEventReceiver {}
+    use super::Error;
 
-    pub(super) async fn run(base_config: &super::TestConfig) -> Result<(), super::Error> {
-        let mut simulated_network = super::config_sim_network(base_config).await?;
-        let peers = simulated_network.build_peers();
-        let (user_ev_controller, receiver_ch) = tokio::sync::watch::channel((0, PeerId::random()));
-        for (label, node) in peers {
-            let mut user_events = MemoryEventsGen::<fastrand::Rng>::new_with_seed(
-                receiver_ch.clone(),
-                node.peer_key(),
-                base_config.seed(),
-            );
-            // user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
+    impl super::TestConfig {
+        fn subprocess_command(&self, seed: u64) -> Vec<String> {
+            let mut args = Vec::new();
+
+            args.push("test".to_owned());
+
+            if let Some(name) = &self.name {
+                args.push("--name".to_owned());
+                args.push(name.to_string());
+            }
+
+            args.push("--seed".to_owned());
+            args.push(seed.to_string());
+
+            args.push("--gateways".to_owned());
+            args.push(self.gateways.to_string());
+            args.push("--nodes".to_owned());
+            args.push(self.nodes.to_string());
+            args.push("--ring_max_htl".to_owned());
+            args.push(self.ring_max_htl.to_string());
+            args.push("--rnd_if_htl_above".to_owned());
+            args.push(self.rnd_if_htl_above.to_string());
+            args.push("--max_connections".to_owned());
+            args.push(self.max_connections.to_string());
+            args.push("--min_connections".to_owned());
+            args.push(self.min_connections.to_string());
+
+            if let Some(max_contract_number) = self.max_contract_number {
+                args.push("--max_contract_number".to_owned());
+                args.push(max_contract_number.to_string());
+            }
+
+            args.push("--events".to_owned());
+            args.push(self.events.to_string());
+
+            if let Some(wait_duration) = self.wait_duration {
+                args.push("--wait_duration".to_owned());
+                args.push(wait_duration.to_string());
+            }
+
+            if let Some(event_wait_time) = self.event_wait_time {
+                args.push("--event_wait_time".to_owned());
+                args.push(event_wait_time.to_string());
+            }
+
+            args.push("multi-process".to_owned());
+            args.push("child".to_owned());
+
+            args
         }
-        todo!()
+    }
+
+    #[derive(clap::Parser, Clone)]
+    pub struct MultiProcessConfig {
+        #[arg(long)]
+        pub mode: Process,
+        #[arg(long)]
+        id: Option<usize>,
+    }
+
+    #[derive(Default, Clone, clap::ValueEnum)]
+    pub enum Process {
+        #[default]
+        Supervisor,
+        Child,
+    }
+
+    #[derive(Default)]
+    struct SubProcessManager {
+        processes: Vec<SubProcess>,
+    }
+
+    struct SubProcess {
+        label: NodeLabel,
+        child: std::process::Child,
+    }
+
+    impl SubProcess {
+        fn start(cmd_args: &[String], label: NodeLabel) -> Result<Self, Error> {
+            let cmd = Command::new("fdev")
+                .args(cmd_args)
+                .arg("--id")
+                .arg(label.number().to_string())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?;
+            Ok(Self { label, child: cmd })
+        }
+
+        fn config(&mut self, config: NodeConfig) -> Result<(), Error> {
+            let input = self.get_input().ok_or_else(|| anyhow!("closed"))?;
+            let serialize = bincode::serialize(&config)?;
+            input.write_all(&(serialize.len() as u64).to_le_bytes())?;
+            input.write_all(&serialize)?;
+            Ok(())
+        }
+
+        fn send_event(&mut self, event: usize) -> Result<(), std::io::Error> {
+            let input = self.get_input().ok_or(std::io::ErrorKind::BrokenPipe)?;
+            input.write_all(&event.to_le_bytes())?;
+            Ok(())
+        }
+
+        #[inline]
+        fn get_input(&mut self) -> Option<&mut std::process::ChildStdin> {
+            self.child.stdin.as_mut()
+        }
+
+        fn close(mut self) {
+            let _ = self.child.kill();
+        }
+    }
+
+    pub(super) async fn run(
+        config: &super::TestConfig,
+        cmd_config: &MultiProcessConfig,
+    ) -> Result<(), Error> {
+        match cmd_config.mode {
+            Process::Supervisor => supervisor(config).await,
+            Process::Child => {
+                child(config, cmd_config.id.expect("id should be set for child")).await
+            }
+        }
+    }
+
+    async fn supervisor(config: &super::TestConfig) -> Result<(), Error> {
+        let mut simulated_network = super::config_sim_network(config).await?;
+        let peers = simulated_network.build_peers();
+
+        let seed = config.seed();
+        let mut manager = SubProcessManager::default();
+        let cmd_args = config.subprocess_command(seed);
+        for (label, node) in peers {
+            let mut subprocess = SubProcess::start(&cmd_args, label)?;
+            subprocess.config(node)?;
+            manager.processes.push(subprocess);
+        }
+        Ok(())
+    }
+
+    async fn child(config: &super::TestConfig, id: usize) -> Result<(), Error> {
+        let mut input = std::io::stdin();
+        let mut output = std::io::stdout();
+        let mut buf = [0u8; 8];
+        input.read_exact(&mut buf)?;
+        let config_len = u64::from_le_bytes(buf);
+        let mut config_buf = vec![0u8; config_len as usize];
+        input.read_exact(&mut config_buf)?;
+        let node_config: NodeConfig = bincode::deserialize(&config_buf)?;
+
+        let (user_ev_controller, receiver_ch) = tokio::sync::watch::channel((0, PeerId::random()));
+        let mut event_generator = MemoryEventsGen::<fastrand::Rng>::new_with_seed(
+            receiver_ch.clone(),
+            node_config.peer_id,
+            config.seed.expect("seed should be set for child process"),
+        );
+        event_generator.rng_params(
+            id,
+            config.gateways + config.nodes,
+            config.max_contract_number.unwrap_or(config.nodes * 10),
+            config.events,
+        );
+        let config = SimPeer::from(node_config);
+        config.start_child(event_generator).await?;
+        Ok(())
     }
 }
 
@@ -158,23 +316,21 @@ mod single_process {
     use futures::StreamExt;
     use tokio::signal;
 
-    pub(super) async fn run(base_config: &super::TestConfig) -> Result<(), super::Error> {
-        let mut simulated_network = super::config_sim_network(base_config).await?;
+    pub(super) async fn run(config: &super::TestConfig) -> Result<(), super::Error> {
+        let mut simulated_network = super::config_sim_network(config).await?;
 
         let join_handles = simulated_network
             .start_with_rand_gen::<fastrand::Rng>(
-                base_config.seed(),
-                base_config
-                    .max_contract_number
-                    .unwrap_or(base_config.nodes * 10),
-                base_config.events,
+                config.seed(),
+                config.max_contract_number.unwrap_or(config.nodes * 10),
+                config.events,
             )
             .await;
 
-        let events = base_config.events;
-        let next_event_wait_time = base_config.event_wait_time.map(Duration::from_millis);
+        let events = config.events;
+        let next_event_wait_time = config.event_wait_time.map(Duration::from_millis);
         let (connectivity_timeout, network_connection_percent) =
-            base_config.get_connection_check_params();
+            config.get_connection_check_params();
         let events_generated = tokio::task::spawn_blocking(move || {
             println!(
                 "Waiting for network to be sufficiently connected ({}ms timeout, {}%)",

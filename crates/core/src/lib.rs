@@ -29,7 +29,10 @@ pub mod dev_tool {
     pub use crate::config::Config;
     pub use client_events::{test::MemoryEventsGen, ClientEventsProxy, ClientId, OpenRequest};
     pub use contract::{storages::Storage, Executor, OperationMode};
-    pub use node::{testing_impl::SimNetwork, InitPeerNode, NodeConfig, PeerCliConfig, PeerId};
+    pub use node::{
+        testing_impl::{NodeLabel, SimNetwork, SimPeer},
+        InitPeerNode, NodeConfig, PeerCliConfig, PeerId,
+    };
     pub use ring::Location;
     pub use runtime::{ContractStore, DelegateStore, Runtime, SecretsStore, StateStore};
 }

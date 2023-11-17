@@ -43,6 +43,17 @@ pub enum SubCommand {
     Test(crate::testing::TestConfig),
 }
 
+impl SubCommand {
+    pub fn is_child(&self) -> bool {
+        if let SubCommand::Test(config) = self {
+            if let crate::testing::TestMode::MultiProcess(config) = &config.command {
+                return matches!(config.mode, crate::testing::Process::Child);
+            }
+        }
+        false
+    }
+}
+
 /// Core CLI tool for interacting with the Freenet local node.
 ///
 /// This tool allows the execution of commands against the local node

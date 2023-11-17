@@ -29,7 +29,7 @@ use crate::{
 mod in_memory;
 mod inter_process;
 
-use self::inter_process::SimPeer;
+pub use self::inter_process::SimPeer;
 
 use super::{network_bridge::EventLoopNotifications, ConnectionError, NetworkBridge, PeerId};
 
@@ -487,17 +487,12 @@ impl SimNetwork {
     }
 
     /// Builds peer nodes and returns the controller to trigger events.
-    pub fn build_peers(&mut self) -> Vec<(NodeLabel, SimPeer)> {
+    pub fn build_peers(&mut self) -> Vec<(NodeLabel, NodeConfig)> {
         let gw = self.gateways.drain(..).map(|(n, c)| (n, c.label));
         let mut peers = vec![];
         for (builder, label) in gw.chain(self.nodes.drain(..)).collect::<Vec<_>>() {
             self.labels.push((label.clone(), builder.peer_key));
-            peers.push((
-                label,
-                SimPeer {
-                    config: builder.config,
-                },
-            ));
+            peers.push((label, builder.config));
         }
         self.labels.sort_by(|(a, _), (b, _)| a.cmp(b));
         peers.sort_by(|(a, _), (b, _)| a.cmp(b));

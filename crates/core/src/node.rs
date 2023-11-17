@@ -93,7 +93,7 @@ impl Node {
 #[derive(Serialize, Deserialize)]
 pub struct NodeConfig {
     /// public identifier for the peer
-    pub(crate) peer_id: PeerId,
+    pub peer_id: PeerId,
     // optional local info, in case this is an initial bootstrap node
     /// IP to bind to the listener
     pub(crate) local_ip: Option<IpAddr>,

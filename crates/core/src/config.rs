@@ -372,7 +372,7 @@ pub fn set_logger() {
 }
 
 #[cfg(feature = "trace")]
-pub(super) mod tracer {
+mod tracer {
     use tracing_subscriber::{Layer, Registry};
 
     use crate::DynError;
