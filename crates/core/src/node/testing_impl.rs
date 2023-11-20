@@ -52,7 +52,7 @@ pub fn get_dynamic_port() -> u16 {
     rand::thread_rng().gen_range(FIRST_DYNAMIC_PORT..LAST_DYNAMIC_PORT)
 }
 
-pub(crate) type EventId = usize;
+pub(crate) type EventId = u32;
 
 #[derive(PartialEq, Eq, Hash, Clone, PartialOrd, Ord, Debug)]
 pub struct NodeLabel(Arc<str>);
@@ -133,29 +133,53 @@ struct GatewayConfig {
 }
 
 pub struct EventChain {
-    network: SimNetwork,
-    total_events: usize,
-    count: usize,
+    labels: Vec<(NodeLabel, PeerId)>,
+    user_ev_controller: Sender<(EventId, PeerId)>,
+    total_events: u32,
+    count: u32,
     rng: rand::rngs::SmallRng,
+    clean_up_tmp_dirs: bool,
+}
+
+impl EventChain {
+    pub fn new(
+        labels: Vec<(NodeLabel, PeerId)>,
+        user_ev_controller: Sender<(EventId, PeerId)>,
+        total_events: u32,
+        clean_up_tmp_dirs: bool,
+    ) -> Self {
+        const SEED: u64 = 0xdeadbeef;
+        EventChain {
+            labels,
+            user_ev_controller,
+            total_events,
+            count: 0,
+            rng: rand::rngs::SmallRng::seed_from_u64(SEED),
+            clean_up_tmp_dirs,
+        }
+    }
 }
 
 impl Iterator for EventChain {
-    type Item = usize;
+    type Item = EventId;
 
     fn next(&mut self) -> Option<Self::Item> {
         (self.count < self.total_events).then(|| {
-            let (_, id) = self
-                .network
-                .labels
-                .choose(&mut self.rng)
-                .expect("not empty");
-            self.network
-                .user_ev_controller
+            let (_, id) = self.labels.choose(&mut self.rng).expect("not empty");
+            self.user_ev_controller
                 .send((self.count, *id))
                 .expect("peer controller should be alive");
             self.count += 1;
             self.count
         })
+    }
+}
+
+impl Drop for EventChain {
+    fn drop(&mut self) {
+        if self.clean_up_tmp_dirs {
+            clean_up_tmp_dirs(&self.labels)
+        }
     }
 }
 
@@ -168,7 +192,7 @@ type DefaultRegistry = TestEventListener;
 pub(super) struct Builder<ER> {
     pub(super) peer_key: PeerId,
     config: NodeConfig,
-    ch_builder: String,
+    contract_handler_name: String,
     add_noise: bool,
     event_register: ER,
     contracts: Vec<(ContractContainer, WrappedState)>,
@@ -180,14 +204,14 @@ impl<ER: NetEventRegister> Builder<ER> {
     pub fn build(
         builder: NodeConfig,
         event_register: ER,
-        ch_builder: String,
+        contract_handler_name: String,
         add_noise: bool,
     ) -> Builder<ER> {
         let peer_key = builder.peer_id;
         Builder {
             peer_key,
             config: builder,
-            ch_builder,
+            contract_handler_name,
             add_noise,
             event_register,
             contracts: Vec::new(),
@@ -199,10 +223,10 @@ impl<ER: NetEventRegister> Builder<ER> {
 /// A simulated in-memory network topology.
 pub struct SimNetwork {
     name: String,
-    debug: bool,
+    clean_up_tmp_dirs: bool,
     labels: Vec<(NodeLabel, PeerId)>,
     pub(crate) event_listener: TestEventListener,
-    user_ev_controller: Sender<(EventId, PeerId)>,
+    user_ev_controller: Option<Sender<(EventId, PeerId)>>,
     receiver_ch: Receiver<(EventId, PeerId)>,
     number_of_gateways: usize,
     gateways: Vec<(Builder<DefaultRegistry>, GatewayConfig)>,
@@ -214,24 +238,6 @@ pub struct SimNetwork {
     min_connections: usize,
     init_backoff: Duration,
     add_noise: bool,
-}
-
-#[cfg(any(debug_assertions, test))]
-impl std::fmt::Debug for SimNetwork {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SimNetwork")
-            .field("name", &self.name)
-            .field("labels", &self.labels)
-            .field("number_of_gateways", &self.number_of_gateways)
-            .field("number_of_nodes", &self.number_of_nodes)
-            .field("ring_max_htl", &self.ring_max_htl)
-            .field("rnd_if_htl_above", &self.rnd_if_htl_above)
-            .field("max_connections", &self.max_connections)
-            .field("min_connections", &self.min_connections)
-            .field("init_backoff", &self.init_backoff)
-            .field("add_noise", &self.add_noise)
-            .finish()
-    }
 }
 
 impl SimNetwork {
@@ -248,10 +254,10 @@ impl SimNetwork {
         let (user_ev_controller, receiver_ch) = channel((0, PeerId::random()));
         let mut net = Self {
             name: name.into(),
-            debug: false,
+            clean_up_tmp_dirs: true,
             event_listener: TestEventListener::new(),
             labels: Vec::with_capacity(nodes + gateways),
-            user_ev_controller,
+            user_ev_controller: Some(user_ev_controller),
             receiver_ch,
             number_of_gateways: gateways,
             gateways: Vec::with_capacity(gateways),
@@ -264,8 +270,8 @@ impl SimNetwork {
             init_backoff: Duration::from_millis(1),
             add_noise: false,
         };
-        net.build_gateways(gateways).await;
-        net.build_nodes(nodes).await;
+        net.config_gateways(gateways).await;
+        net.config_nodes(nodes).await;
         net
     }
 }
@@ -283,10 +289,10 @@ impl SimNetwork {
 
     #[allow(unused)]
     pub fn debug(&mut self) {
-        self.debug = true;
+        self.clean_up_tmp_dirs = false;
     }
 
-    async fn build_gateways(&mut self, num: usize) {
+    async fn config_gateways(&mut self, num: usize) {
         info!("Building {} gateways", num);
         let mut configs = Vec::with_capacity(num);
         for node_no in 0..num {
@@ -358,7 +364,7 @@ impl SimNetwork {
         }
     }
 
-    async fn build_nodes(&mut self, num: usize) {
+    async fn config_nodes(&mut self, num: usize) {
         info!("Building {} regular nodes", num);
         let gateways: Vec<_> = self
             .gateways
@@ -618,6 +624,8 @@ impl SimNetwork {
             .map_err(|_| anyhow::anyhow!("peer not found"))?;
         let (_, peer) = &self.labels[pos];
         self.user_ev_controller
+            .as_ref()
+            .expect("should be set")
             .send((event_id, *peer))
             .expect("node listeners disconnected");
         if let Some(sleep_time) = await_for {
@@ -632,19 +640,18 @@ impl SimNetwork {
     /// nodes built through the [`build_peers`](`Self::build_peers`) method.
     pub fn event_chain(
         mut self,
-        total_events: usize,
+        total_events: u32,
         controller: Option<Sender<(EventId, PeerId)>>,
     ) -> EventChain {
-        const SEED: u64 = 0xdeadbeef;
-        if let Some(controller) = controller {
-            self.user_ev_controller = controller;
-        }
-        EventChain {
-            network: self,
-            total_events,
-            count: 0,
-            rng: rand::rngs::SmallRng::seed_from_u64(SEED),
-        }
+        let user_ev_controller = controller.unwrap_or_else(|| {
+            self.user_ev_controller
+                .take()
+                .expect("controller should be ser")
+        });
+        let labels = std::mem::take(&mut self.labels);
+        let debug_val = self.clean_up_tmp_dirs;
+        self.clean_up_tmp_dirs = false; // set to false to avoid cleaning up the tmp dirs
+        EventChain::new(labels, user_ev_controller, total_events, debug_val)
     }
 
     /// Checks that all peers in the network have acquired at least one connection to any
@@ -768,15 +775,40 @@ impl SimNetwork {
     }
 }
 
+#[cfg(any(debug_assertions, test))]
+impl std::fmt::Debug for SimNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimNetwork")
+            .field("name", &self.name)
+            .field("labels", &self.labels)
+            .field("number_of_gateways", &self.number_of_gateways)
+            .field("number_of_nodes", &self.number_of_nodes)
+            .field("ring_max_htl", &self.ring_max_htl)
+            .field("rnd_if_htl_above", &self.rnd_if_htl_above)
+            .field("max_connections", &self.max_connections)
+            .field("min_connections", &self.min_connections)
+            .field("init_backoff", &self.init_backoff)
+            .field("add_noise", &self.add_noise)
+            .finish()
+    }
+}
+
 impl Drop for SimNetwork {
     fn drop(&mut self) {
-        if !self.debug {
-            for (label, _) in &self.labels {
-                let p = std::env::temp_dir()
-                    .join(format!("freenet-executor-{sim}-{label}", sim = self.name));
-                let _ = std::fs::remove_dir_all(p);
-            }
+        if self.clean_up_tmp_dirs {
+            clean_up_tmp_dirs(&self.labels);
         }
+    }
+}
+
+fn clean_up_tmp_dirs(labels: &[(NodeLabel, PeerId)]) {
+    for (label, _) in labels {
+        let p = std::env::temp_dir().join(format!(
+            "freenet-executor-{sim}-{label}",
+            sim = "sim",
+            label = label
+        ));
+        let _ = std::fs::remove_dir_all(p);
     }
 }
 
@@ -1027,7 +1059,6 @@ where
         };
 
         let op_storage = op_storage.clone();
-        let conn_manager = conn_manager.clone();
         let event_listener = event_register.trait_clone();
 
         let span = {
@@ -1053,7 +1084,7 @@ where
         let msg = super::process_message(
             msg,
             op_storage,
-            conn_manager,
+            conn_manager.clone(),
             event_listener,
             None,
             None,

@@ -30,8 +30,8 @@ pub mod dev_tool {
     pub use client_events::{test::MemoryEventsGen, ClientEventsProxy, ClientId, OpenRequest};
     pub use contract::{storages::Storage, Executor, OperationMode};
     pub use node::{
-        testing_impl::{NodeLabel, SimNetwork, SimPeer},
-        InitPeerNode, NodeConfig, PeerCliConfig, PeerId,
+        testing_impl::{EventChain, NodeLabel, SimNetwork, SimPeer},
+        InitPeerNode, InterProcessConnManager, NodeConfig, PeerCliConfig, PeerId,
     };
     pub use ring::Location;
     pub use runtime::{ContractStore, DelegateStore, Runtime, SecretsStore, StateStore};

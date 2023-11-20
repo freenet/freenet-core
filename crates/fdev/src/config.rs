@@ -27,6 +27,9 @@ pub struct BaseConfig {
     /// Overrides the default data directory where Freenet secret files are stored.
     #[arg(long)]
     pub(crate) secret_data_dir: Option<PathBuf>,
+    /// Overrides the default data directory where Freenet database files are stored.
+    #[arg(long)]
+    pub(crate) database_dir: Option<PathBuf>,
     /// Node operation mode.
     #[arg(value_enum, default_value_t=OperationMode::Local)]
     pub mode: OperationMode,

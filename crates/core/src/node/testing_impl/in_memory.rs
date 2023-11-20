@@ -42,7 +42,7 @@ impl<ER> Builder<ER> {
         )?);
         let (_executor_listener, executor_sender) = executor_channel(op_storage.clone());
         let contract_handler =
-            MemoryContractHandler::build(ch_channel, executor_sender, self.ch_builder)
+            MemoryContractHandler::build(ch_channel, executor_sender, self.contract_handler_name)
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
 

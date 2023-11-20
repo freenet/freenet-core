@@ -30,7 +30,10 @@ impl AppState {
             Self::DEFAULT_MAX_DELEGATE_SIZE,
         )?;
         let secrets_store = SecretsStore::new(Config::conf().secrets_dir())?;
-        let state_store = StateStore::new(Storage::new().await?, Self::MAX_MEM_CACHE)?;
+        let state_store = StateStore::new(
+            Storage::new(Some(&Config::conf().db_dir())).await?,
+            Self::MAX_MEM_CACHE,
+        )?;
         let rt = freenet::dev_tool::Runtime::build(
             contract_store,
             delegate_store,

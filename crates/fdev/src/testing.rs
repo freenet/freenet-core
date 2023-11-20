@@ -37,8 +37,8 @@ pub struct TestConfig {
     max_contract_number: Option<usize>,
     /// Number of events that will be executed in this simulation.
     /// Events are simulated get, puts and other operations.
-    #[arg(long, default_value_t = usize::MAX)]
-    events: usize,
+    #[arg(long, default_value_t = u32::MAX)]
+    events: u32,
     /// Time in milliseconds to wait for the network to be sufficiently connected to start requesting events.
     /// (20% of the expected connections to be processed per gateway)
     #[arg(long)]
@@ -91,7 +91,7 @@ pub enum TestMode {
     Network,
 }
 
-pub(crate) async fn test_framework(base_config: TestConfig) -> Result<(), Error> {
+pub(crate) async fn test_framework(base_config: TestConfig) -> anyhow::Result<(), Error> {
     match &base_config.command {
         TestMode::SingleProcess => {
             single_process::run(&base_config).await?;
@@ -106,7 +106,7 @@ pub(crate) async fn test_framework(base_config: TestConfig) -> Result<(), Error>
     Ok(())
 }
 
-async fn config_sim_network(base_config: &TestConfig) -> Result<SimNetwork, Error> {
+async fn config_sim_network(base_config: &TestConfig) -> anyhow::Result<SimNetwork, Error> {
     if base_config.gateways == 0 {
         anyhow::bail!("Gateways should be higher than 0");
     }
@@ -133,12 +133,21 @@ async fn config_sim_network(base_config: &TestConfig) -> Result<SimNetwork, Erro
 
 mod multiple_process {
     use std::{
-        io::{Read, Write},
-        process::{Command, Stdio},
+        collections::{HashMap, VecDeque},
+        process::Stdio,
+        time::Duration,
     };
 
     use anyhow::anyhow;
-    use freenet::dev_tool::{MemoryEventsGen, NodeConfig, NodeLabel, PeerId, SimPeer};
+    use freenet::dev_tool::{
+        EventChain, InterProcessConnManager, MemoryEventsGen, NodeConfig, NodeLabel, PeerId,
+        SimPeer,
+    };
+    use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        process::Command,
+    };
 
     use super::Error;
 
@@ -209,56 +218,10 @@ mod multiple_process {
         Child,
     }
 
-    #[derive(Default)]
-    struct SubProcessManager {
-        processes: Vec<SubProcess>,
-    }
-
-    struct SubProcess {
-        label: NodeLabel,
-        child: std::process::Child,
-    }
-
-    impl SubProcess {
-        fn start(cmd_args: &[String], label: NodeLabel) -> Result<Self, Error> {
-            let cmd = Command::new("fdev")
-                .args(cmd_args)
-                .arg("--id")
-                .arg(label.number().to_string())
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()?;
-            Ok(Self { label, child: cmd })
-        }
-
-        fn config(&mut self, config: NodeConfig) -> Result<(), Error> {
-            let input = self.get_input().ok_or_else(|| anyhow!("closed"))?;
-            let serialize = bincode::serialize(&config)?;
-            input.write_all(&(serialize.len() as u64).to_le_bytes())?;
-            input.write_all(&serialize)?;
-            Ok(())
-        }
-
-        fn send_event(&mut self, event: usize) -> Result<(), std::io::Error> {
-            let input = self.get_input().ok_or(std::io::ErrorKind::BrokenPipe)?;
-            input.write_all(&event.to_le_bytes())?;
-            Ok(())
-        }
-
-        #[inline]
-        fn get_input(&mut self) -> Option<&mut std::process::ChildStdin> {
-            self.child.stdin.as_mut()
-        }
-
-        fn close(mut self) {
-            let _ = self.child.kill();
-        }
-    }
-
     pub(super) async fn run(
         config: &super::TestConfig,
         cmd_config: &MultiProcessConfig,
-    ) -> Result<(), Error> {
+    ) -> anyhow::Result<(), Error> {
         match cmd_config.mode {
             Process::Supervisor => supervisor(config).await,
             Process::Child => {
@@ -267,32 +230,207 @@ mod multiple_process {
         }
     }
 
-    async fn supervisor(config: &super::TestConfig) -> Result<(), Error> {
+    async fn supervisor(config: &super::TestConfig) -> anyhow::Result<(), Error> {
         let mut simulated_network = super::config_sim_network(config).await?;
+        simulated_network.debug(); // set to avoid deleting temp dirs created
         let peers = simulated_network.build_peers();
 
+        let (user_ev_controller, event_rx) = tokio::sync::watch::channel((0, PeerId::random()));
+
         let seed = config.seed();
-        let mut manager = SubProcessManager::default();
+        let mut supervisor = Supervisor {
+            processes: HashMap::new(),
+            event_rx,
+            waiting_response: FuturesUnordered::new(),
+            queued: HashMap::new(),
+        };
         let cmd_args = config.subprocess_command(seed);
-        for (label, node) in peers {
-            let mut subprocess = SubProcess::start(&cmd_args, label)?;
-            subprocess.config(node)?;
-            manager.processes.push(subprocess);
+        for (label, node) in &peers {
+            let mut subprocess = SubProcess::start(&cmd_args, label, node.peer_id)?;
+            subprocess.config(node).await?;
+            supervisor.processes.insert(node.peer_id, subprocess);
         }
+
+        let peers = peers
+            .into_iter()
+            .map(|(label, config)| (label, config.peer_id))
+            .collect();
+        let supervisor_task = tokio::task::spawn(supervisor.start_simulation());
+
+        let events = EventChain::new(peers, user_ev_controller, config.events, true);
+        let next_event_wait_time = config.event_wait_time.map(Duration::from_millis);
+        for _event_id in events {
+            if let Some(t) = next_event_wait_time {
+                std::thread::sleep(t);
+            }
+        }
+        supervisor_task.await?;
+
         Ok(())
     }
 
-    async fn child(config: &super::TestConfig, id: usize) -> Result<(), Error> {
-        let mut input = std::io::stdin();
-        let mut output = std::io::stdout();
-        let mut buf = [0u8; 8];
-        input.read_exact(&mut buf)?;
-        let config_len = u64::from_le_bytes(buf);
-        let mut config_buf = vec![0u8; config_len as usize];
-        input.read_exact(&mut config_buf)?;
-        let node_config: NodeConfig = bincode::deserialize(&config_buf)?;
+    type ChildResponses = Vec<(PeerId, Vec<u8>)>;
 
+    /// Event driver for the supervisor process.
+    struct Supervisor {
+        processes: HashMap<PeerId, SubProcess>,
+        event_rx: tokio::sync::watch::Receiver<(u32, PeerId)>,
+        waiting_response:
+            FuturesUnordered<BoxFuture<'static, anyhow::Result<(SubProcess, ChildResponses)>>>,
+        queued: HashMap<PeerId, VecDeque<IPCMessage>>,
+    }
+
+    impl Supervisor {
+        async fn start_simulation(mut self) {
+            loop {
+                tokio::select! {
+                    biased;
+                    res = self.waiting_response.next() => {
+                        let (subprocess, responses) = res.unwrap().unwrap();
+                        if let Err(err) = self.process_responses(subprocess, responses).await {
+                            eprintln!("Error processing responses: {err}");
+                            break;
+                        }
+
+                    }
+                    msg = self.event_rx.changed() => {
+                        if msg.is_err() {
+                            break;
+                        }
+                        let (event, peer) = *self.event_rx.borrow();
+                        let Some(mut subprocess) = self.processes.remove(&peer) else {
+                            self.queued.entry(peer).or_default().push_back(IPCMessage::FiredEvent(event));
+                            continue;
+                        };
+                        let mut pending = self.queued.remove(&peer).unwrap_or_default();
+                        pending.push_back(IPCMessage::FiredEvent(event));
+                        let task = async move {
+                                for msg in pending {
+                                    msg.send(subprocess.child.stdin.as_mut().expect("not taken"))
+                                    .await?;
+                            }
+                            let mut returned = vec![];
+                            while let Ok((target, msg)) = InterProcessConnManager::pull_msg(
+                                subprocess.child.stdout.as_mut().expect("stdout not taken"),
+                            )
+                            .await
+                            {
+                                returned.push((target, msg));
+                            }
+                            Ok((subprocess, returned))
+                        }.boxed();
+                        self.waiting_response.push(task);
+                    }
+                }
+            }
+            for (_, subprocess) in self.processes.drain() {
+                subprocess.close().await;
+            }
+            println!("Simulation finished");
+        }
+
+        async fn process_responses(
+            &mut self,
+            mut subprocess: SubProcess,
+            responses: ChildResponses,
+        ) -> anyhow::Result<()> {
+            for (target, data) in responses {
+                if let Some(target) = self.processes.remove(&target) {
+                    let task = async move { target.send_msg(IPCMessage::Data(data)).await }.boxed();
+                    self.waiting_response.push(task);
+                } else {
+                    self.queued
+                        .entry(target)
+                        .or_default()
+                        .push_back(IPCMessage::Data(data));
+                }
+            }
+            if let Some(mut queued) = self.queued.remove(&subprocess.id) {
+                for msg in queued.drain(..) {
+                    msg.send(subprocess.child.stdin.as_mut().expect("not taken"))
+                        .await?;
+                    while let Ok((target, data)) = InterProcessConnManager::pull_msg(
+                        subprocess.child.stdout.as_mut().expect("stdout not taken"),
+                    )
+                    .await
+                    {
+                        self.queued
+                            .entry(target)
+                            .or_default()
+                            .push_back(IPCMessage::Data(data));
+                    }
+                }
+            }
+            self.processes.insert(subprocess.id, subprocess);
+            Ok(())
+        }
+    }
+
+    struct SubProcess {
+        child: tokio::process::Child,
+        id: PeerId,
+    }
+
+    impl SubProcess {
+        fn start(
+            cmd_args: &[String],
+            label: &NodeLabel,
+            id: PeerId,
+        ) -> anyhow::Result<Self, Error> {
+            let cmd = Command::new("fdev")
+                .args(cmd_args)
+                .arg("--id")
+                .arg(label.number().to_string())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?;
+            Ok(Self { child: cmd, id })
+        }
+
+        async fn config(&mut self, config: &NodeConfig) -> anyhow::Result<(), Error> {
+            let input = self.get_input().ok_or_else(|| anyhow!("closed"))?;
+            let serialize = bincode::serialize(&config)?;
+            input
+                .write_all(&(serialize.len() as u64).to_le_bytes())
+                .await?;
+            input.write_all(&serialize).await?;
+            Ok(())
+        }
+
+        async fn send_msg(mut self, msg: IPCMessage) -> anyhow::Result<(Self, ChildResponses)> {
+            msg.send(self.child.stdin.as_mut().expect("not taken"))
+                .await?;
+            let mut returned = vec![];
+            while let Ok((target, msg)) = InterProcessConnManager::pull_msg(
+                self.child.stdout.as_mut().expect("stdout not taken"),
+            )
+            .await
+            {
+                returned.push((target, msg));
+            }
+            Ok((self, returned))
+        }
+
+        async fn close(mut self) {
+            let _ = self.child.kill().await;
+        }
+
+        #[inline]
+        fn get_input(&mut self) -> Option<&mut tokio::process::ChildStdin> {
+            self.child.stdin.as_mut()
+        }
+    }
+
+    async fn child(config: &super::TestConfig, id: usize) -> anyhow::Result<()> {
         let (user_ev_controller, receiver_ch) = tokio::sync::watch::channel((0, PeerId::random()));
+        let mut input = tokio::io::stdin();
+        let node_config = Child::get_config(&mut input).await?;
+        let this_child = Child {
+            input,
+            user_ev_controller,
+            peer_id: node_config.peer_id,
+        };
+
         let mut event_generator = MemoryEventsGen::<fastrand::Rng>::new_with_seed(
             receiver_ch.clone(),
             node_config.peer_id,
@@ -302,11 +440,87 @@ mod multiple_process {
             id,
             config.gateways + config.nodes,
             config.max_contract_number.unwrap_or(config.nodes * 10),
-            config.events,
+            config.events as usize,
         );
         let config = SimPeer::from(node_config);
+        tokio::task::spawn(this_child.event_loop());
         config.start_child(event_generator).await?;
         Ok(())
+    }
+
+    /// Controller for a child process.
+    struct Child {
+        input: tokio::io::Stdin,
+        user_ev_controller: tokio::sync::watch::Sender<(u32, PeerId)>,
+        peer_id: PeerId,
+    }
+
+    impl Child {
+        async fn get_config(input: &mut tokio::io::Stdin) -> anyhow::Result<NodeConfig> {
+            let mut buf = [0u8; 4];
+            input.read_exact(&mut buf).await?;
+            let config_len = u32::from_le_bytes(buf);
+            let mut config_buf = vec![0u8; config_len as usize];
+            input.read_exact(&mut config_buf).await?;
+            let node_config: NodeConfig = bincode::deserialize(&config_buf)?;
+            Ok(node_config)
+        }
+
+        async fn event_loop(mut self) -> anyhow::Result<()> {
+            loop {
+                match IPCMessage::recv(&mut self.input).await? {
+                    IPCMessage::FiredEvent(id) => {
+                        self.user_ev_controller.send((id, self.peer_id))?;
+                    }
+                    IPCMessage::Data(data) => {
+                        InterProcessConnManager::push_msg(data);
+                    }
+                }
+            }
+        }
+    }
+
+    enum IPCMessage {
+        FiredEvent(u32),
+        Data(Vec<u8>),
+    }
+
+    impl IPCMessage {
+        async fn send(self, out: &mut tokio::process::ChildStdin) -> anyhow::Result<()> {
+            match self {
+                Self::FiredEvent(id) => {
+                    out.write_u8(0).await?;
+                    out.write_all(&id.to_le_bytes()).await?;
+                }
+                Self::Data(data) => {
+                    out.write_u8(1).await?;
+                    out.write_all(&(data.len() as u32).to_le_bytes()).await?;
+                    out.write_all(&data).await?;
+                }
+            }
+            Ok(())
+        }
+
+        async fn recv(input: &mut tokio::io::Stdin) -> anyhow::Result<Self> {
+            let marker = input.read_u8().await?;
+            match marker {
+                0 => {
+                    let mut buf = [0u8; 4];
+                    input.read_exact(&mut buf).await?;
+                    let event_id = u32::from_le_bytes(buf);
+                    Ok(Self::FiredEvent(event_id))
+                }
+                1 => {
+                    let mut buf = [0u8; 4];
+                    input.read_exact(&mut buf).await?;
+                    let data_len = u32::from_le_bytes(buf);
+                    let mut data = vec![0u8; data_len as usize];
+                    input.read_exact(&mut data).await?;
+                    Ok(Self::Data(data))
+                }
+                _ => unimplemented!(),
+            }
+        }
     }
 }
 
@@ -316,14 +530,14 @@ mod single_process {
     use futures::StreamExt;
     use tokio::signal;
 
-    pub(super) async fn run(config: &super::TestConfig) -> Result<(), super::Error> {
+    pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super::Error> {
         let mut simulated_network = super::config_sim_network(config).await?;
 
         let join_handles = simulated_network
             .start_with_rand_gen::<fastrand::Rng>(
                 config.seed(),
                 config.max_contract_number.unwrap_or(config.nodes * 10),
-                config.events,
+                config.events as usize,
             )
             .await;
 
@@ -370,7 +584,7 @@ mod single_process {
                     match res? {
                         Ok(()) => {
                             println!("Test events generated successfully");
-                            *events_generated = tokio::task::spawn(futures::future::pending::<Result<(), super::Error>>());
+                            *events_generated = tokio::task::spawn(futures::future::pending::<anyhow::Result<(), super::Error>>());
                             continue;
                         }
                         Err(err) => {

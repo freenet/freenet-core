@@ -391,7 +391,9 @@ impl<R> Executor<R> {
         const MAX_MEM_CACHE: u32 = 10_000_000;
         let static_conf = crate::config::Config::conf();
 
-        let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
+        let db_path = crate::config::Config::conf().db_dir().join("freenet.db");
+        let state_store =
+            StateStore::new(Storage::new(Some(&db_path)).await?, MAX_MEM_CACHE).unwrap();
 
         let contract_dir = config
             .node_data_dir
@@ -1204,8 +1206,10 @@ impl Executor<crate::contract::MockRuntime> {
         std::fs::create_dir_all(&contracts_data_dir).expect("directory created");
         let contract_store = ContractStore::new(contracts_data_dir, u16::MAX as i64)?;
 
-        // uses inmemory SQLite
-        let state_store = StateStore::new(Storage::new().await?, u16::MAX as u32).unwrap();
+        let db_path = tmp_path.join("freenet.db");
+        std::fs::create_dir_all(&db_path).expect("directory created");
+        let state_store =
+            StateStore::new(Storage::new(Some(&db_path)).await?, u16::MAX as u32).unwrap();
 
         let executor = Executor::new(
             state_store,
@@ -1338,7 +1342,7 @@ mod test {
         const MAX_MEM_CACHE: u32 = 10_000_000;
         let tmp_path = std::env::temp_dir().join("freenet-test");
         let contract_store = ContractStore::new(tmp_path.join("executor-test"), MAX_SIZE)?;
-        let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
+        let state_store = StateStore::new(Storage::new(None).await?, MAX_MEM_CACHE).unwrap();
         let mut counter = 0;
         Executor::new(
             state_store,

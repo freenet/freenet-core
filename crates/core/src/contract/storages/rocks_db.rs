@@ -1,22 +1,23 @@
+use std::path::Path;
+
 use freenet_stdlib::prelude::*;
 use rocksdb::{Options, DB};
 
+use crate::contract::ContractKey;
 use crate::runtime::StateStorage;
-use crate::{config::Config, contract::ContractKey};
 
 pub struct RocksDb(DB);
 
 impl RocksDb {
     #[cfg_attr(feature = "sqlite", allow(unused))]
-    pub async fn new() -> Result<Self, rocksdb::Error> {
-        let path = Config::conf().db_dir().join("freenet.db");
-        tracing::info!("loading contract store from {path:?}");
+    pub async fn new(db_path: &Path) -> Result<Self, rocksdb::Error> {
+        tracing::info!("loading contract store from {db_path:?}");
 
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.set_log_level(rocksdb::LogLevel::Debug);
 
-        let db = DB::open(&opts, path).unwrap();
+        let db = DB::open(&opts, db_path).unwrap();
 
         Ok(Self(db))
     }

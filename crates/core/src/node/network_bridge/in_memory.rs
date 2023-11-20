@@ -21,11 +21,8 @@ use crate::{
     },
 };
 
-static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
-    OnceCell::new();
-
 pub(in crate::node) struct MemoryConnManager {
-    pub transport: InMemoryTransport,
+    transport: InMemoryTransport,
     log_register: Arc<Mutex<Box<dyn NetEventRegister>>>,
     op_manager: Arc<OpManager>,
     msg_queue: Arc<Mutex<Vec<NetMessage>>>,
@@ -63,23 +60,6 @@ impl MemoryConnManager {
             msg_queue,
             peer,
         }
-    }
-}
-
-impl NetworkBridgeExt for MemoryConnManager {
-    fn recv(&mut self) -> BoxFuture<'_, Result<NetMessage, ConnectionError>> {
-        async {
-            loop {
-                let mut queue = self.msg_queue.lock().await;
-                let Some(msg) = queue.pop() else {
-                    std::mem::drop(queue);
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    continue;
-                };
-                return Ok(msg);
-            }
-        }
-        .boxed()
     }
 }
 
@@ -124,6 +104,23 @@ impl NetworkBridge for MemoryConnManager {
     }
 }
 
+impl NetworkBridgeExt for MemoryConnManager {
+    fn recv(&mut self) -> BoxFuture<'_, Result<NetMessage, ConnectionError>> {
+        async {
+            loop {
+                let mut queue = self.msg_queue.lock().await;
+                let Some(msg) = queue.pop() else {
+                    std::mem::drop(queue);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                };
+                return Ok(msg);
+            }
+        }
+        .boxed()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct MessageOnTransit {
     origin: PeerId,
@@ -131,8 +128,11 @@ struct MessageOnTransit {
     data: Vec<u8>,
 }
 
+static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
+    OnceCell::new();
+
 #[derive(Clone, Debug)]
-pub struct InMemoryTransport {
+struct InMemoryTransport {
     interface_peer: PeerId,
     /// received messages per each peer awaiting processing
     msg_stack_queue: Arc<Mutex<Vec<MessageOnTransit>>>,

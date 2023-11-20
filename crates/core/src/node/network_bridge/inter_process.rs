@@ -1,4 +1,13 @@
-use futures::future::BoxFuture;
+use std::sync::{Arc, OnceLock};
+
+use futures::{future::BoxFuture, FutureExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::{
+        watch::{Receiver, Sender},
+        Mutex,
+    },
+};
 
 use crate::{
     message::NetMessage,
@@ -7,25 +16,65 @@ use crate::{
 
 use super::{ConnectionError, NetworkBridge};
 
+type Data = Vec<u8>;
+
+static INCOMING_DATA: OnceLock<Sender<Data>> = OnceLock::new();
+
 #[derive(Clone)]
-pub(in crate::node) struct InterProcessConnManager {}
+pub struct InterProcessConnManager {
+    recv: Receiver<Data>,
+    output: Arc<Mutex<tokio::io::Stdout>>,
+}
 
 impl InterProcessConnManager {
-    pub fn new() -> Self {
-        Self {}
+    pub(in crate::node) fn new() -> Self {
+        let (sender, recv) = tokio::sync::watch::channel(vec![]);
+        INCOMING_DATA.set(sender).expect("shouldn't be set");
+        Self {
+            recv,
+            output: Arc::new(Mutex::new(tokio::io::stdout())),
+        }
+    }
+
+    pub fn push_msg(data: Vec<u8>) {
+        let _ = INCOMING_DATA.get().expect("should be set").send(data);
+    }
+
+    pub async fn pull_msg(
+        stdout: &mut tokio::process::ChildStdout,
+    ) -> std::io::Result<(PeerId, Data)> {
+        let mut msg_len = [0u8; 4];
+        stdout.read_exact(&mut msg_len).await?;
+        let msg_len = u32::from_le_bytes(msg_len) as usize;
+        let buf = &mut vec![0u8; msg_len];
+        stdout.read_exact(buf).await?;
+        bincode::deserialize(buf).map_err(|_| std::io::ErrorKind::Other.into())
     }
 }
 
 impl NetworkBridgeExt for InterProcessConnManager {
     fn recv(&mut self) -> BoxFuture<Result<NetMessage, ConnectionError>> {
-        todo!()
+        async {
+            self.recv
+                .changed()
+                .await
+                .map_err(|_| ConnectionError::Timeout)?;
+            let data = &*self.recv.borrow();
+            let deser = bincode::deserialize(data)?;
+            Ok(deser)
+        }
+        .boxed()
     }
 }
 
 #[async_trait::async_trait]
 impl NetworkBridge for InterProcessConnManager {
     async fn send(&self, target: &PeerId, msg: NetMessage) -> super::ConnResult<()> {
-        todo!()
+        let data = bincode::serialize(&(*target, msg)).expect("proper encoding");
+        let output = &mut *self.output.lock().await;
+        output.write_all(&(data.len() as u32).to_le_bytes()).await?;
+        output.write_all(&data).await?;
+        Ok(())
     }
 
     async fn add_connection(&mut self, _peer: PeerId) -> super::ConnResult<()> {
