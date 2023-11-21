@@ -8,8 +8,8 @@ use futures::FutureExt;
 use crate::{
     client_events::ClientId,
     contract::{ContractError, ContractHandlerEvent, StoreResponse},
-    message::{InnerMessage, Message, Transaction},
-    node::{NetworkBridge, OpManager, PeerKey},
+    message::{InnerMessage, NetMessage, Transaction},
+    node::{NetworkBridge, OpManager, PeerId},
     operations::{OpInitialization, Operation},
     ring::{Location, PeerKeyLocation, RingError},
     DynError,
@@ -142,7 +142,7 @@ impl Operation for GetOp {
         msg: &'a Self::Message,
     ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>> {
         async move {
-            let mut sender: Option<PeerKey> = None;
+            let mut sender: Option<PeerId> = None;
             if let Some(peer_key_loc) = msg.sender().cloned() {
                 sender = Some(peer_key_loc.peer);
             };
@@ -203,7 +203,7 @@ impl Operation for GetOp {
                         self.state,
                         Some(GetState::AwaitingResponse { .. })
                     ));
-                    tracing::debug!(tx = %id, "Seek contract {} @ {}", key, target.peer);
+                    tracing::info!(tx = %id, %key, target = %target.peer, "Seek contract");
                     new_state = self.state;
                     stats = Some(GetStats {
                         contract_location: Location::from(key),
@@ -243,17 +243,17 @@ impl Operation for GetOp {
                     if !is_cached_contract {
                         tracing::warn!(
                             tx = %id,
-                            "Contract `{}` not found while processing a get request at node @ {}",
-                            key,
-                            target.peer
+                            %key,
+                            this_peer = %target.peer,
+                            "Contract not found while processing a get request",
                         );
 
                         if htl == 0 {
                             tracing::warn!(
                                 tx = %id,
-                                "The maximum hops has been exceeded, sending the error \
-                                 back to the node @ {}",
-                                sender.peer
+                                sender = %sender.peer,
+                                "The maximum hops has been exceeded, sending error \
+                                 back to the node",
                             );
 
                             return build_op_result(
@@ -279,7 +279,12 @@ impl Operation for GetOp {
                             .ring
                             .closest_caching(&key, [&sender.peer].as_slice())
                         else {
-                            tracing::warn!(tx = %id, "No other peers found while trying getting contract {key} @ {}", target.peer);
+                            tracing::warn!(
+                                tx = %id,
+                                %key,
+                                target = %target.peer,
+                                "No other peers found while trying getting contract",
+                            );
                             return Err(OpError::RingError(RingError::NoCachingPeers(key)));
                         };
                         continue_seeking(
@@ -373,10 +378,10 @@ impl Operation for GetOp {
                     let this_peer = target;
                     tracing::warn!(
                         tx = %id,
+                        %key,
                         %this_peer,
-                        "Neither contract or contract value for contract `{}` found at peer {}, \
+                        "Neither contract or contract value for contract found at peer {}, \
                         retrying with other peers",
-                        key,
                         sender.peer
                     );
 
@@ -501,7 +506,7 @@ impl Operation for GetOp {
 
                             op_storage
                                 .notify_op_change(
-                                    Message::from(GetMsg::ReturnGet {
+                                    NetMessage::from(GetMsg::ReturnGet {
                                         id,
                                         key,
                                         value: StoreResponse {
@@ -556,7 +561,7 @@ impl Operation for GetOp {
                                     contract: contract.clone(),
                                 });
                             } else {
-                                tracing::debug!(tx = %id, "Get response received for contract {}", key);
+                                tracing::info!(tx = %id, %key, "Get response received for contract");
                                 new_state = None;
                                 return_msg = None;
                                 result = Some(GetResult {
@@ -566,7 +571,7 @@ impl Operation for GetOp {
                             }
                         }
                         Some(GetState::ReceivedRequest) => {
-                            tracing::debug!(tx = %id, "Returning contract {} to {}", key, sender.peer);
+                            tracing::info!(tx = %id, "Returning contract {} to {}", key, sender.peer);
                             new_state = None;
                             return_msg = Some(GetMsg::ReturnGet {
                                 id,
@@ -604,7 +609,7 @@ fn build_op_result(
         stats,
     });
     Ok(OperationResult {
-        return_msg: msg.map(Message::from),
+        return_msg: msg.map(NetMessage::from),
         state: output_op.map(OpEnum::Get),
     })
 }
@@ -612,7 +617,7 @@ fn build_op_result(
 async fn continue_seeking<NB: NetworkBridge>(
     conn_manager: &mut NB,
     new_target: &PeerKeyLocation,
-    retry_msg: Message,
+    retry_msg: NetMessage,
 ) -> Result<(), OpError> {
     tracing::debug!(
         tx = %retry_msg.id(),
@@ -688,7 +693,7 @@ enum GetState {
     },
     /// Awaiting response from petition.
     AwaitingResponse {
-        skip_list: Vec<PeerKey>,
+        skip_list: Vec<PeerId>,
         retries: usize,
         fetch_contract: bool,
     },
@@ -701,7 +706,7 @@ pub(crate) async fn request_get(
     client_id: Option<ClientId>,
 ) -> Result<(), OpError> {
     let (target, id) = if let Some(GetState::PrepareRequest { key, id, .. }) = &get_op.state {
-        const EMPTY: &[PeerKey] = &[];
+        const EMPTY: &[PeerId] = &[];
         // the initial request must provide:
         // - a location in the network where the contract resides
         // - and the key of the contract value to get
@@ -719,8 +724,8 @@ pub(crate) async fn request_get(
     };
     tracing::debug!(
         tx = %id,
-        "Preparing get contract request to {}",
-        target.peer,
+        target = %target.peer,
+        "Preparing get contract request",
     );
 
     match get_op.state {
@@ -754,7 +759,7 @@ pub(crate) async fn request_get(
             };
 
             op_storage
-                .notify_op_change(Message::from(msg), OpEnum::Get(op), client_id)
+                .notify_op_change(NetMessage::from(msg), OpEnum::Get(op), client_id)
                 .await?;
         }
         _ => return Err(OpError::invalid_transition(get_op.id)),
@@ -854,7 +859,7 @@ mod test {
     use std::{collections::HashMap, time::Duration};
 
     use super::*;
-    use crate::node::tests::{NodeSpecification, SimNetwork};
+    use crate::node::testing_impl::{NodeSpecification, SimNetwork};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn successful_get_op_between_nodes() -> Result<(), anyhow::Error> {
@@ -871,9 +876,8 @@ mod test {
             fetch_contract: true,
         }
         .into();
-        let node_0 = NodeSpecification {
+        let node_1 = NodeSpecification {
             owned_contracts: vec![],
-            non_owned_contracts: vec![key.clone()],
             events_to_generate: HashMap::from_iter([(1, get_event)]),
             contract_subscribers: HashMap::new(),
         };
@@ -883,12 +887,11 @@ mod test {
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
                 contract_val,
             )],
-            non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::new(),
         };
 
-        let get_specs = HashMap::from_iter([("node-0".into(), node_0), ("gateway-0".into(), gw_0)]);
+        let get_specs = HashMap::from_iter([("node-1".into(), node_1), ("gateway-0".into(), gw_0)]);
 
         // establish network
         let mut sim_nw = SimNetwork::new(
@@ -902,13 +905,13 @@ mod test {
         )
         .await;
         sim_nw.start_with_spec(get_specs).await;
-        sim_nw.check_connectivity(Duration::from_secs(3)).await?;
+        sim_nw.check_connectivity(Duration::from_secs(3))?;
 
         // trigger get @ node-0, which does not own the contract
         sim_nw
-            .trigger_event("node-0", 1, Some(Duration::from_secs(1)))
+            .trigger_event("node-1", 1, Some(Duration::from_secs(1)))
             .await?;
-        assert!(sim_nw.has_got_contract("node-0", &key));
+        assert!(sim_nw.has_got_contract("node-1", &key));
         Ok(())
     }
 
@@ -929,7 +932,6 @@ mod test {
         .into();
         let node_1 = NodeSpecification {
             owned_contracts: vec![],
-            non_owned_contracts: vec![key.clone()],
             events_to_generate: HashMap::from_iter([(1, get_event)]),
             contract_subscribers: HashMap::new(),
         };
@@ -940,7 +942,7 @@ mod test {
         let mut sim_nw =
             SimNetwork::new("get_contract_not_found", NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
         sim_nw.start_with_spec(get_specs).await;
-        sim_nw.check_connectivity(Duration::from_secs(3)).await?;
+        sim_nw.check_connectivity(Duration::from_secs(3))?;
 
         // trigger get @ node-1, which does not own the contract
         sim_nw
@@ -968,33 +970,30 @@ mod test {
         }
         .into();
 
-        let node_0 = NodeSpecification {
+        let node_1 = NodeSpecification {
             owned_contracts: vec![],
-            non_owned_contracts: vec![key.clone()],
             events_to_generate: HashMap::from_iter([(1, get_event)]),
             contract_subscribers: HashMap::new(),
         };
 
-        let node_1 = NodeSpecification {
+        let node_2 = NodeSpecification {
             owned_contracts: vec![(
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
                 contract_val,
             )],
-            non_owned_contracts: vec![key.clone()],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::new(),
         };
 
         let gw_0 = NodeSpecification {
             owned_contracts: vec![],
-            non_owned_contracts: vec![],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::new(),
         };
 
         let get_specs = HashMap::from_iter([
-            ("node-0".into(), node_0),
             ("node-1".into(), node_1),
+            ("node-2".into(), node_2),
             ("gateway-0".into(), gw_0),
         ]);
 
@@ -1010,11 +1009,11 @@ mod test {
         )
         .await;
         sim_nw.start_with_spec(get_specs).await;
-        sim_nw.check_connectivity(Duration::from_secs(3)).await?;
+        sim_nw.check_connectivity(Duration::from_secs(3))?;
         sim_nw
-            .trigger_event("node-0", 1, Some(Duration::from_secs(1)))
+            .trigger_event("node-1", 1, Some(Duration::from_secs(1)))
             .await?;
-        assert!(sim_nw.has_got_contract("node-0", &key));
+        assert!(sim_nw.has_got_contract("node-1", &key));
         Ok(())
     }
 }

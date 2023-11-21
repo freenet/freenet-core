@@ -7,8 +7,8 @@ use std::{collections::HashSet, time::Duration};
 use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::{
     client_events::ClientId,
-    message::{InnerMessage, Message, Transaction},
-    node::{ConnectionError, NetworkBridge, OpManager, PeerKey},
+    message::{InnerMessage, NetMessage, Transaction},
+    node::{ConnectionError, NetworkBridge, OpManager, PeerId},
     operations::OpEnum,
     ring::{Location, PeerKeyLocation, Ring},
     util::ExponentialBackoff,
@@ -460,7 +460,7 @@ impl Operation for ConnectOp {
                         };
                         op_storage
                             .notify_op_change(
-                                Message::Aborted(*id),
+                                NetMessage::Aborted(*id),
                                 OpEnum::Connect(op.into()),
                                 None,
                             )
@@ -682,7 +682,7 @@ fn build_op_result(
         backoff,
     });
     Ok(OperationResult {
-        return_msg: msg.map(Message::from),
+        return_msg: msg.map(NetMessage::from),
         state: output_op.map(|op| OpEnum::Connect(Box::new(op))),
     })
 }
@@ -692,7 +692,7 @@ fn try_returning_proxy_connection(
     sender: &PeerKeyLocation,
     own_loc: &PeerKeyLocation,
     accepted_by: HashSet<PeerKeyLocation>,
-    joiner: PeerKey,
+    joiner: PeerId,
 ) -> (Option<ConnectState>, Option<ConnectMsg>) {
     let new_state = if accepted_by.contains(own_loc) {
         tracing::debug!(
@@ -760,13 +760,13 @@ enum ConnectState {
         target: PeerKeyLocation,
         accepted_by: HashSet<PeerKeyLocation>,
         new_location: Location,
-        new_peer_id: PeerKey,
+        new_peer_id: PeerId,
     },
     AwaitingConnectionAcquisition {
         joiner: PeerKeyLocation,
     },
     AwaitingNewConnection {
-        query_target: PeerKey,
+        query_target: PeerId,
     },
     OCReceived,
     Connected,
@@ -775,7 +775,7 @@ enum ConnectState {
 #[derive(Debug, Clone)]
 struct ConnectionInfo {
     gateway: PeerKeyLocation,
-    this_peer: PeerKey,
+    this_peer: PeerId,
     max_hops_to_live: usize,
 }
 
@@ -802,7 +802,7 @@ impl ConnectState {
 }
 
 pub(crate) fn initial_request(
-    this_peer: PeerKey,
+    this_peer: PeerId,
     gateway: PeerKeyLocation,
     max_hops_to_live: usize,
     id: Transaction,
@@ -858,7 +858,7 @@ where
 
     conn_bridge.add_connection(gateway.peer).await?;
     let assigned_location = op_storage.ring.own_location().location;
-    let join_req = Message::from(messages::ConnectMsg::Request {
+    let join_req = NetMessage::from(messages::ConnectMsg::Request {
         id: tx,
         msg: messages::ConnectRequest::StartReq {
             target: gateway,
@@ -894,7 +894,7 @@ async fn forward_conn<NB>(
     (req_peer, joiner): (PeerKeyLocation, PeerKeyLocation),
     left_htl: usize,
     accepted_by: HashSet<PeerKeyLocation>,
-    skip_list: Vec<PeerKey>,
+    skip_list: Vec<PeerId>,
 ) -> Result<Option<ConnectState>, OpError>
 where
     NB: NetworkBridge,
@@ -931,16 +931,13 @@ where
             "Selecting close peer to forward request",
         );
         // FIXME: target the `desired_location`
-        ring.routing(
-            joiner.location.unwrap(),
-            Some(&req_peer.peer),
-            skip_list.as_slice(),
-        )
-        .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))
+        let desired_location = joiner.location.unwrap();
+        ring.routing(desired_location, Some(&req_peer.peer), skip_list.as_slice())
+            .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))
     };
 
     if let Some(forward_to) = forward_to {
-        let forwarded = Message::from(ConnectMsg::Request {
+        let forwarded = NetMessage::from(ConnectMsg::Request {
             id,
             msg: ConnectRequest::Proxy {
                 joiner,
@@ -1045,7 +1042,7 @@ mod messages {
     }
 
     impl ConnectMsg {
-        pub fn sender(&self) -> Option<&PeerKey> {
+        pub fn sender(&self) -> Option<&PeerId> {
             use ConnectMsg::*;
             match self {
                 Response { sender, .. } => Some(&sender.peer),
@@ -1096,7 +1093,7 @@ mod messages {
     pub(crate) enum ConnectRequest {
         StartReq {
             target: PeerKeyLocation,
-            joiner: PeerKey,
+            joiner: PeerId,
             assigned_location: Option<Location>,
             hops_to_live: usize,
             max_hops_to_live: usize,
@@ -1114,7 +1111,7 @@ mod messages {
             sender: PeerKeyLocation,
             joiner: PeerKeyLocation,
             hops_to_live: usize,
-            skip_list: Vec<PeerKey>,
+            skip_list: Vec<PeerId>,
             accepted_by: HashSet<PeerKeyLocation>,
         },
         ReceivedOC,
@@ -1125,7 +1122,7 @@ mod messages {
         AcceptedBy {
             peers: HashSet<PeerKeyLocation>,
             your_location: Location,
-            your_peer_id: PeerKey,
+            your_peer_id: PeerId,
         },
         ReceivedOC {
             by_peer: PeerKeyLocation,
@@ -1133,7 +1130,7 @@ mod messages {
         },
         Proxy {
             accepted_by: HashSet<PeerKeyLocation>,
-            joiner: PeerKey,
+            joiner: PeerId,
         },
     }
 }
@@ -1142,7 +1139,7 @@ mod messages {
 mod test {
     use std::time::Duration;
 
-    use crate::node::tests::SimNetwork;
+    use crate::node::testing_impl::SimNetwork;
 
     /// Given a network of one node and one gateway test that both are connected.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1170,7 +1167,7 @@ mod test {
         .await;
         // sim_nw.with_start_backoff(Duration::from_millis(100));
         sim_nw.start().await;
-        sim_nw.check_connectivity(Duration::from_secs(3)).await?;
+        sim_nw.check_connectivity(Duration::from_secs(3))?;
         let some_forwarded = sim_nw
             .node_connectivity()
             .into_iter()
@@ -1201,7 +1198,7 @@ mod test {
         .await;
         sim_nw.with_start_backoff(Duration::from_millis(100));
         sim_nw.start().await;
-        sim_nw.check_connectivity(Duration::from_secs(10)).await?;
+        sim_nw.check_connectivity(Duration::from_secs(10))?;
         // wait for a bit so peers can acquire more connections
         tokio::time::sleep(Duration::from_secs(3)).await;
         sim_nw.network_connectivity_quality()?;

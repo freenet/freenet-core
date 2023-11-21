@@ -9,8 +9,8 @@ use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationRe
 use crate::{
     client_events::ClientId,
     contract::ContractError,
-    message::{InnerMessage, Message, Transaction},
-    node::{NetworkBridge, OpManager, PeerKey},
+    message::{InnerMessage, NetMessage, Transaction},
+    node::{NetworkBridge, OpManager, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
 };
 
@@ -57,7 +57,7 @@ impl Operation for SubscribeOp {
         msg: &'a Self::Message,
     ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>> {
         async move {
-            let mut sender: Option<PeerKey> = None;
+            let mut sender: Option<PeerId> = None;
             if let Some(peer_key_loc) = msg.sender().cloned() {
                 sender = Some(peer_key_loc.peer);
             };
@@ -135,7 +135,7 @@ impl Operation for SubscribeOp {
                     let sender = op_storage.ring.own_location();
                     let return_err = || -> OperationResult {
                         OperationResult {
-                            return_msg: Some(Message::from(SubscribeMsg::ReturnSub {
+                            return_msg: Some(NetMessage::from(SubscribeMsg::ReturnSub {
                                 key: key.clone(),
                                 id: *id,
                                 subscribed: false,
@@ -188,10 +188,11 @@ impl Operation for SubscribeOp {
 
                     match self.state {
                         Some(SubscribeState::ReceivedRequest) => {
-                            tracing::debug!(
+                            tracing::info!(
                                 tx = %id,
-                                "Peer {} successfully subscribed to contract {key}",
-                                subscriber.peer,
+                                %key,
+                                subscriber = % subscriber.peer,
+                                "Peer successfully subscribed to contract",
                             );
                             new_state = None;
                             // TODO review behaviour, if the contract is not cached should return subscribed false?
@@ -215,8 +216,9 @@ impl Operation for SubscribeOp {
                 } => {
                     tracing::warn!(
                         tx = %id,
-                        "Contract `{key}` not found at potential subscription provider {}",
-                        sender.peer
+                        %key,
+                        potential_provider = %sender.peer,
+                        "Contract not found at potential subscription provider",
                     );
                     // will error out in case it has reached max number of retries
                     match self.state {
@@ -269,15 +271,15 @@ impl Operation for SubscribeOp {
                 } => {
                     match self.state {
                         Some(SubscribeState::AwaitingResponse { .. }) => {
-                            tracing::debug!(
+                            tracing::info!(
                                 tx = %id,
-                                target = ?target.peer,
-                                this = ?op_storage.ring.own_location().peer,
-                                "Subscribed to `{key}` at provider {}", sender.peer
+                                %key,
+                                this_peer = %target.peer,
+                                provider = %sender.peer,
+                                "Subscribed to contract"
                             );
                             op_storage.ring.add_subscription(key.clone());
-                            // todo: should inform back to the network event loop in case a client
-                            // is waiting for response
+                            // fixme: should inform back to the network event loop in case a client is waiting for response
                             let _ = client_id;
                             new_state = Some(SubscribeState::Completed);
                             return_msg = None;
@@ -305,7 +307,7 @@ fn build_op_result(
         state: Some(state),
     });
     Ok(OperationResult {
-        return_msg: msg.map(Message::from),
+        return_msg: msg.map(NetMessage::from),
         state: output_op.map(OpEnum::Subscribe),
     })
 }
@@ -327,7 +329,7 @@ enum SubscribeState {
     ReceivedRequest,
     /// Awaitinh response from petition.
     AwaitingResponse {
-        skip_list: Vec<PeerKey>,
+        skip_list: Vec<PeerId>,
         retries: usize,
     },
     Completed,
@@ -345,7 +347,7 @@ pub(crate) async fn request_subscribe(
                 key.clone(),
             )));
         }
-        const EMPTY: &[PeerKey] = &[];
+        const EMPTY: &[PeerId] = &[];
         (
             op_storage
                 .ring
@@ -371,7 +373,7 @@ pub(crate) async fn request_subscribe(
                 state: new_state,
             };
             op_storage
-                .notify_op_change(Message::from(msg), OpEnum::Subscribe(op), client_id)
+                .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op), client_id)
                 .await?;
         }
         _ => return Err(OpError::invalid_transition(sub_op.id)),
@@ -402,7 +404,7 @@ mod messages {
             key: ContractKey,
             target: PeerKeyLocation,
             subscriber: PeerKeyLocation,
-            skip_list: Vec<PeerKey>,
+            skip_list: Vec<PeerId>,
             htl: usize,
         },
         ReturnSub {
@@ -476,7 +478,7 @@ mod test {
     use freenet_stdlib::client_api::ContractRequest;
 
     use super::*;
-    use crate::node::tests::{NodeSpecification, SimNetwork};
+    use crate::node::testing_impl::{NodeSpecification, SimNetwork};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn successful_subscribe_op_between_nodes() -> Result<(), anyhow::Error> {
@@ -499,20 +501,18 @@ mod test {
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
                 contract_val,
             )],
-            non_owned_contracts: Vec::new(),
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::new(),
         };
         let second_node = NodeSpecification {
             owned_contracts: Vec::new(),
-            non_owned_contracts: vec![contract_key.clone()],
             events_to_generate: HashMap::from_iter([(1, event)]),
             contract_subscribers: HashMap::new(),
         };
 
         let subscribe_specs = HashMap::from_iter([
-            ("node-0".into(), first_node),
-            ("node-1".into(), second_node),
+            ("node-1".into(), first_node),
+            ("node-2".into(), second_node),
         ]);
         let mut sim_nw = SimNetwork::new(
             "successful_subscribe_op_between_nodes",
@@ -525,13 +525,13 @@ mod test {
         )
         .await;
         sim_nw.start_with_spec(subscribe_specs).await;
-        sim_nw.check_connectivity(Duration::from_secs(3)).await?;
+        sim_nw.check_connectivity(Duration::from_secs(3))?;
         sim_nw
-            .trigger_event("node-1", 1, Some(Duration::from_secs(1)))
+            .trigger_event("node-2", 1, Some(Duration::from_secs(1)))
             .await?;
-        assert!(sim_nw.has_got_contract("node-1", &contract_key));
+        assert!(sim_nw.has_got_contract("node-2", &contract_key));
         tokio::time::sleep(Duration::from_secs(3)).await;
-        assert!(sim_nw.is_subscribed_to_contract("node-1", &contract_key));
+        assert!(sim_nw.is_subscribed_to_contract("node-2", &contract_key));
         Ok(())
     }
 }

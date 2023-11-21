@@ -9,7 +9,7 @@ use crate::{
     config::GlobalExecutor,
     contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent, SenderHalve},
     dev_tool::ClientId,
-    message::{Message, Transaction, TransactionType},
+    message::{NetMessage, Transaction, TransactionType},
     operations::{
         connect::ConnectOp, get::GetOp, put::PutOp, subscribe::SubscribeOp, update::UpdateOp,
         OpEnum, OpError,
@@ -17,7 +17,7 @@ use crate::{
     ring::{LiveTransactionTracker, PeerKeyLocation, Ring},
 };
 
-use super::{network_bridge::EventLoopNotificationsSender, NetEventRegister, NodeBuilder, PeerKey};
+use super::{network_bridge::EventLoopNotificationsSender, NetEventRegister, NodeConfig, PeerId};
 
 #[cfg(debug_assertions)]
 macro_rules! check_id_op {
@@ -59,18 +59,23 @@ pub(crate) struct OpManager {
 }
 
 impl OpManager {
-    pub(super) fn new<const CLIENTS: usize, ER: NetEventRegister>(
+    pub(super) fn new<ER: NetEventRegister>(
         notification_channel: EventLoopNotificationsSender,
         contract_handler: ContractHandlerChannel<SenderHalve>,
-        builder: &NodeBuilder<CLIENTS>,
+        config: &NodeConfig,
         gateways: &[PeerKeyLocation],
         event_register: ER,
     ) -> Result<Self, anyhow::Error> {
-        let ring = Ring::new::<CLIENTS, ER>(builder, gateways, notification_channel.clone())?;
+        let ring = Ring::new::<ER>(config, gateways, notification_channel.clone())?;
         let ops = Arc::new(Ops::default());
 
         let (new_transactions, rx) = tokio::sync::mpsc::channel(100);
-        let parent_span = tracing::Span::current();
+        let current_span = tracing::Span::current();
+        let garbage_span = if current_span.is_none() {
+            tracing::info_span!("garbage_cleanup_task")
+        } else {
+            tracing::info_span!(parent: current_span, "garbage_cleanup_task")
+        };
         GlobalExecutor::spawn(
             garbage_cleanup_task(
                 rx,
@@ -78,7 +83,7 @@ impl OpManager {
                 ring.live_tx_tracker.clone(),
                 event_register,
             )
-            .instrument(tracing::info_span!(parent: parent_span, "garbage_cleanup_task")),
+            .instrument(garbage_span),
         );
 
         Ok(Self {
@@ -97,7 +102,7 @@ impl OpManager {
     /// with other nodes, like intermediate states before returning.
     pub async fn notify_op_change(
         &self,
-        msg: Message,
+        msg: NetMessage,
         op: OpEnum,
         client_id: Option<ClientId>,
     ) -> Result<(), OpError> {
@@ -208,7 +213,7 @@ impl OpManager {
     }
 
     /// Notify the operation manager that a transaction is being transacted over the network.
-    pub fn sending_transaction(&self, peer: &PeerKey, msg: &Message) {
+    pub fn sending_transaction(&self, peer: &PeerId, msg: &NetMessage) {
         let transaction = msg.id();
         if let Some(loc) = msg.requested_location() {
             self.ring

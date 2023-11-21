@@ -15,8 +15,8 @@ use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationRe
 use crate::{
     client_events::ClientId,
     contract::ContractHandlerEvent,
-    message::{InnerMessage, Message, Transaction},
-    node::{NetworkBridge, OpManager, PeerKey},
+    message::{InnerMessage, NetMessage, Transaction},
+    node::{NetworkBridge, OpManager, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
 };
 
@@ -128,7 +128,7 @@ impl Operation for PutOp {
         msg: &'a Self::Message,
     ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>> {
         async move {
-            let mut sender: Option<PeerKey> = None;
+            let mut sender: Option<PeerId> = None;
             if let Some(peer_key_loc) = msg.sender().cloned() {
                 sender = Some(peer_key_loc.peer);
             };
@@ -189,7 +189,7 @@ impl Operation for PutOp {
 
                     let key = contract.key();
                     tracing::debug!(
-                        "Rquesting put for contract {} from {} to {}",
+                        "Requesting put for contract {} from {} to {}",
                         key,
                         sender.peer,
                         target.peer
@@ -223,9 +223,9 @@ impl Operation for PutOp {
 
                     tracing::debug!(
                         tx = %id,
-                        "Puttting contract {} at target peer {}",
-                        key,
-                        target.peer,
+                        %key,
+                        target = %target.peer,
+                        "Puttting contract at target peer",
                     );
 
                     if !is_cached_contract
@@ -233,7 +233,7 @@ impl Operation for PutOp {
                             .ring
                             .within_caching_distance(&Location::from(&key))
                     {
-                        tracing::debug!(tx = %id, "Contract `{}` not cached @ peer {}", key, target.peer);
+                        tracing::debug!(tx = %id, %key, "Contract not cached @ peer {}", target.peer);
                         match try_to_cache_contract(op_storage, contract, &key, client_id).await {
                             Ok(_) => {}
                             Err(err) => return Err(err),
@@ -244,8 +244,8 @@ impl Operation for PutOp {
                         // to give back to requesting peer
                         tracing::warn!(
                             tx = %id,
-                            "Contract {} not found while processing info, forwarding",
-                            key
+                            %key,
+                            "Contract not found while processing info, forwarding",
                         );
                     }
 
@@ -344,7 +344,7 @@ impl Operation for PutOp {
                         .map(|i| {
                             // Avoid already broadcast nodes and sender from broadcasting
                             let mut subscribers: Vec<PeerKeyLocation> = i.value().to_vec();
-                            let mut avoid_list: HashSet<PeerKey> =
+                            let mut avoid_list: HashSet<PeerId> =
                                 sender_subscribers.iter().map(|pl| pl.peer).collect();
                             avoid_list.insert(sender.peer);
                             subscribers.retain(|s| !avoid_list.contains(&s.peer));
@@ -446,9 +446,9 @@ impl Operation for PutOp {
                         }
                         _ => return Err(OpError::invalid_transition(self.id)),
                     };
-                    tracing::debug!(
-                        "Peer {} completed contract value put",
-                        op_storage.ring.peer_key
+                    tracing::info!(
+                        this_peer = %op_storage.ring.peer_key,
+                        "Peer completed contract value put",
                     );
                 }
                 PutMsg::PutForward {
@@ -461,9 +461,9 @@ impl Operation for PutOp {
                     let peer_loc = op_storage.ring.own_location();
 
                     tracing::debug!(
-                        "Forwarding changes at {}, trying put the contract {}",
-                        peer_loc.peer,
-                        key
+                        %key,
+                        this_peer = % peer_loc.peer,
+                        "Forwarding changes, trying put the contract"
                     );
 
                     let cached_contract = op_storage.ring.is_contract_cached(&key);
@@ -524,7 +524,7 @@ fn build_op_result(
 ) -> Result<OperationResult, OpError> {
     let output_op = Some(PutOp { id, state, stats });
     Ok(OperationResult {
-        return_msg: msg.map(Message::from),
+        return_msg: msg.map(NetMessage::from),
         state: output_op.map(OpEnum::Put),
     })
 }
@@ -592,7 +592,7 @@ async fn try_to_broadcast(
                 };
                 op_storage
                     .notify_op_change(
-                        Message::from(return_msg.unwrap()),
+                        NetMessage::from(return_msg.unwrap()),
                         OpEnum::Put(op),
                         client_id,
                     )
@@ -710,7 +710,7 @@ pub(crate) async fn request_put(
             };
 
             op_storage
-                .notify_op_change(Message::from(msg), OpEnum::Put(op), client_id)
+                .notify_op_change(NetMessage::from(msg), OpEnum::Put(op), client_id)
                 .await?;
         }
         _ => return Err(OpError::invalid_transition(put_op.id)),
@@ -770,7 +770,7 @@ async fn forward_changes<CB>(
 {
     let key = contract.key();
     let contract_loc = Location::from(&key);
-    const EMPTY: &[PeerKey] = &[];
+    const EMPTY: &[PeerId] = &[];
     let forward_to = op_storage.ring.closest_caching(&key, EMPTY);
     let own_loc = op_storage.ring.own_location().location.expect("infallible");
     if let Some(peer) = forward_to {
@@ -940,7 +940,7 @@ mod test {
     use freenet_stdlib::client_api::ContractRequest;
     use freenet_stdlib::prelude::*;
 
-    use crate::node::tests::{NodeSpecification, SimNetwork};
+    use crate::node::testing_impl::{NodeSpecification, SimNetwork};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn successful_put_op_between_nodes() -> Result<(), anyhow::Error> {
@@ -965,26 +965,24 @@ mod test {
         )
         .await;
         let mut locations = sim_nw.get_locations_by_node();
-        let node0_loc = locations.remove(&"node-0".into()).unwrap();
-        let node1_loc = locations.remove(&"node-1".into()).unwrap();
+        let node0_loc = locations.remove(&"node-1".into()).unwrap();
+        let node1_loc = locations.remove(&"node-2".into()).unwrap();
 
         // both own the contract, and one triggers an update
-        let node_0 = NodeSpecification {
-            owned_contracts: vec![(
-                ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone())),
-                contract_val.clone(),
-            )],
-            non_owned_contracts: vec![],
-            events_to_generate: HashMap::new(),
-            contract_subscribers: HashMap::from_iter([(key.clone(), vec![node1_loc])]),
-        };
-
         let node_1 = NodeSpecification {
             owned_contracts: vec![(
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone())),
                 contract_val.clone(),
             )],
-            non_owned_contracts: vec![],
+            events_to_generate: HashMap::new(),
+            contract_subscribers: HashMap::from_iter([(key.clone(), vec![node1_loc])]),
+        };
+
+        let node_2 = NodeSpecification {
+            owned_contracts: vec![(
+                ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone())),
+                contract_val.clone(),
+            )],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::from_iter([(key.clone(), vec![node0_loc])]),
         };
@@ -1001,20 +999,19 @@ mod test {
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone())),
                 contract_val,
             )],
-            non_owned_contracts: vec![],
             events_to_generate: HashMap::from_iter([(1, put_event)]),
             contract_subscribers: HashMap::new(),
         };
 
         // establish network
         let put_specs = HashMap::from_iter([
-            ("node-0".into(), node_0),
             ("node-1".into(), node_1),
+            ("node-2".into(), node_2),
             ("gateway-0".into(), gw_0),
         ]);
 
         sim_nw.start_with_spec(put_specs).await;
-        sim_nw.check_connectivity(Duration::from_secs(3)).await?;
+        sim_nw.check_connectivity(Duration::from_secs(3))?;
 
         // trigger the put op @ gw-0
         sim_nw

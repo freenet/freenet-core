@@ -1,6 +1,6 @@
 use std::{fmt::Display, path::PathBuf};
 
-use crate::{commands::PutType, local_node::LocalNodeCliConfig};
+use crate::{commands::PutType, wasm_runtime::ExecutorConfig};
 use clap::ValueEnum;
 use freenet::dev_tool::OperationMode;
 use semver::Version;
@@ -27,6 +27,9 @@ pub struct BaseConfig {
     /// Overrides the default data directory where Freenet secret files are stored.
     #[arg(long)]
     pub(crate) secret_data_dir: Option<PathBuf>,
+    /// Overrides the default data directory where Freenet database files are stored.
+    #[arg(long)]
+    pub(crate) database_dir: Option<PathBuf>,
     /// Node operation mode.
     #[arg(value_enum, default_value_t=OperationMode::Local)]
     pub mode: OperationMode,
@@ -34,15 +37,27 @@ pub struct BaseConfig {
 
 #[derive(clap::Subcommand, Clone)]
 pub enum SubCommand {
-    RunLocal(LocalNodeCliConfig),
-    Build(BuildToolCliConfig),
-    New(NewPackageCliConfig),
+    New(NewPackageConfig),
+    Build(BuildToolConfig),
+    Inspect(crate::inspect::InspectConfig),
     Publish(PutConfig),
+    WasmRuntime(ExecutorConfig),
     Execute(RunCliConfig),
-    Inspect(crate::inspect::InspectCliConfig),
+    Test(crate::testing::TestConfig),
 }
 
-/// Node CLI
+impl SubCommand {
+    pub fn is_child(&self) -> bool {
+        if let SubCommand::Test(config) = self {
+            if let crate::testing::TestMode::MultiProcess(config) = &config.command {
+                return matches!(config.mode, crate::testing::Process::Child);
+            }
+        }
+        false
+    }
+}
+
+/// Core CLI tool for interacting with the Freenet local node.
 ///
 /// This tool allows the execution of commands against the local node
 /// and is intended to be used for development and automated workflows.
@@ -92,11 +107,11 @@ pub struct PutConfig {
     pub(crate) package_type: PutType,
 }
 
-/// Builds and packages a contract.
+/// Builds and packages a contract or delegate.
 ///
 /// This tool will build the WASM contract or delegate and publish it to the network.
 #[derive(clap::Parser, Clone, Debug)]
-pub struct BuildToolCliConfig {
+pub struct BuildToolConfig {
     /// Compile the contract or delegate with specific features.
     #[arg(long)]
     pub(crate) features: Option<String>,
@@ -139,7 +154,7 @@ impl Display for PackageType {
     }
 }
 
-impl Default for BuildToolCliConfig {
+impl Default for BuildToolConfig {
     fn default() -> Self {
         Self {
             features: None,
@@ -156,7 +171,7 @@ fn parse_version(src: &str) -> Result<Version, String> {
 
 /// Create a new Freenet contract and/or app.
 #[derive(clap::Parser, Clone)]
-pub struct NewPackageCliConfig {
+pub struct NewPackageConfig {
     #[arg(id = "type", value_enum)]
     pub(crate) kind: ContractKind,
 }

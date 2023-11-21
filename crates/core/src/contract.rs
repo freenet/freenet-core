@@ -4,7 +4,6 @@ use freenet_stdlib::prelude::*;
 
 mod executor;
 mod handler;
-#[cfg(test)]
 mod in_memory;
 pub mod storages;
 
@@ -16,7 +15,6 @@ pub(crate) use handler::{
     ContractHandlerChannel, ContractHandlerEvent, EventId, NetworkContractHandler, SenderHalve,
     StoreResponse,
 };
-#[cfg(test)]
 pub(crate) use in_memory::{MemoryContractHandler, MockRuntime};
 
 pub use executor::{Executor, ExecutorError, OperationMode};

@@ -14,11 +14,11 @@ use tokio::{
     },
 };
 
-use super::PeerKey;
+use super::PeerId;
 use crate::{
     config::GlobalExecutor,
     contract::StoreResponse,
-    message::{Message, Transaction},
+    message::{NetMessage, Transaction},
     operations::{connect, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg},
     ring::{Location, PeerKeyLocation},
     router::RouteEvent,
@@ -27,7 +27,6 @@ use crate::{
 
 #[cfg(feature = "trace-ot")]
 pub(super) use opentelemetry_tracer::OTEventRegister;
-#[cfg(test)]
 pub(super) use test::TestEventListener;
 
 use super::OpManager;
@@ -105,7 +104,7 @@ impl<const N: usize> Clone for CombinedRegister<N> {
 #[derive(Clone)]
 pub(crate) struct NetEventLog<'a> {
     tx: &'a Transaction,
-    peer_id: &'a PeerKey,
+    peer_id: &'a PeerId,
     kind: EventKind,
 }
 
@@ -122,7 +121,7 @@ impl<'a> NetEventLog<'a> {
         }
     }
 
-    pub fn disconnected(from: &'a PeerKey) -> Self {
+    pub fn disconnected(from: &'a PeerId) -> Self {
         NetEventLog {
             tx: Transaction::NULL,
             peer_id: from,
@@ -131,11 +130,11 @@ impl<'a> NetEventLog<'a> {
     }
 
     pub fn from_outbound_msg(
-        msg: &'a Message,
+        msg: &'a NetMessage,
         op_storage: &'a OpManager,
     ) -> Either<Self, Vec<Self>> {
         let kind = match msg {
-            Message::Connect(connect::ConnectMsg::Response {
+            NetMessage::Connect(connect::ConnectMsg::Response {
                 msg:
                     connect::ConnectResponse::AcceptedBy {
                         peers,
@@ -157,7 +156,7 @@ impl<'a> NetEventLog<'a> {
                     EventKind::Ignored
                 }
             }
-            Message::Connect(connect::ConnectMsg::Response {
+            NetMessage::Connect(connect::ConnectMsg::Response {
                 msg:
                     connect::ConnectResponse::Proxy {
                         accepted_by,
@@ -188,11 +187,11 @@ impl<'a> NetEventLog<'a> {
     }
 
     pub fn from_inbound_msg(
-        msg: &'a Message,
+        msg: &'a NetMessage,
         op_storage: &'a OpManager,
     ) -> Either<Self, Vec<Self>> {
         let kind = match msg {
-            Message::Connect(connect::ConnectMsg::Response {
+            NetMessage::Connect(connect::ConnectMsg::Response {
                 msg:
                     connect::ConnectResponse::AcceptedBy {
                         peers,
@@ -231,7 +230,7 @@ impl<'a> NetEventLog<'a> {
                 }
                 return Either::Right(events);
             }
-            Message::Put(PutMsg::RequestPut {
+            NetMessage::Put(PutMsg::RequestPut {
                 contract, target, ..
             }) => {
                 let key = contract.key();
@@ -240,13 +239,13 @@ impl<'a> NetEventLog<'a> {
                     key,
                 })
             }
-            Message::Put(PutMsg::SuccessfulUpdate { new_value, .. }) => {
+            NetMessage::Put(PutMsg::SuccessfulUpdate { new_value, .. }) => {
                 EventKind::Put(PutEvent::PutSuccess {
                     requester: op_storage.ring.peer_key,
                     value: new_value.clone(),
                 })
             }
-            Message::Put(PutMsg::Broadcasting {
+            NetMessage::Put(PutMsg::Broadcasting {
                 new_value,
                 broadcast_to,
                 key,
@@ -256,7 +255,7 @@ impl<'a> NetEventLog<'a> {
                 key: key.clone(),
                 value: new_value.clone(),
             }),
-            Message::Put(PutMsg::BroadcastTo {
+            NetMessage::Put(PutMsg::BroadcastTo {
                 sender,
                 new_value,
                 key,
@@ -266,12 +265,12 @@ impl<'a> NetEventLog<'a> {
                 key: key.clone(),
                 value: new_value.clone(),
             }),
-            Message::Get(GetMsg::ReturnGet {
+            NetMessage::Get(GetMsg::ReturnGet {
                 key,
                 value: StoreResponse { state: Some(_), .. },
                 ..
             }) => EventKind::Get { key: key.clone() },
-            Message::Subscribe(SubscribeMsg::ReturnSub {
+            NetMessage::Subscribe(SubscribeMsg::ReturnSub {
                 subscribed: true,
                 key,
                 sender,
@@ -295,7 +294,7 @@ impl<'a> NetEventLog<'a> {
 struct NetLogMessage {
     tx: Transaction,
     datetime: DateTime<Utc>,
-    peer_id: PeerKey,
+    peer_id: PeerId,
     kind: EventKind,
 }
 
@@ -491,8 +490,8 @@ impl EventRegister {
             Ok(())
         }
 
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await; // wait for the node to start
         let event_log_path = crate::config::Config::conf().event_log();
-        tracing::info!(?event_log_path);
         let mut event_log = match OpenOptions::new()
             .write(true)
             .read(true)
@@ -674,6 +673,7 @@ mod opentelemetry_tracer {
     use opentelemetry::{
         global,
         trace::{self, Span},
+        KeyValue,
     };
 
     use super::*;
@@ -705,6 +705,10 @@ mod opentelemetry_tracer {
                 start_time: Some(start_time),
                 span_id: Some(trace::SpanId::from_bytes(span_id)),
                 trace_id: Some(trace::TraceId::from_bytes(tx_bytes)),
+                attributes: Some(vec![
+                    KeyValue::new("transaction", transaction.to_string()),
+                    KeyValue::new("tx_type", transaction.transaction_type().description()),
+                ]),
                 ..Default::default()
             });
             OTSpan {
@@ -945,14 +949,14 @@ enum EventKind {
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 enum ConnectEvent {
     StartConnection {
-        from: PeerKey,
+        from: PeerId,
     },
     Connected {
         this: PeerKeyLocation,
         connected: PeerKeyLocation,
     },
     Finished {
-        initiator: PeerKey,
+        initiator: PeerId,
         location: Location,
     },
 }
@@ -961,11 +965,11 @@ enum ConnectEvent {
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 enum PutEvent {
     Request {
-        performer: PeerKey,
+        performer: PeerId,
         key: ContractKey,
     },
     PutSuccess {
-        requester: PeerKey,
+        requester: PeerId,
         value: WrappedState,
     },
     BroadcastEmitted {
@@ -978,7 +982,7 @@ enum PutEvent {
     },
     BroadcastReceived {
         /// peer who started the broadcast op
-        requester: PeerKey,
+        requester: PeerId,
         /// key of the contract which value was being updated
         key: ContractKey,
         /// value that was put
@@ -986,7 +990,6 @@ enum PutEvent {
     },
 }
 
-#[cfg(test)]
 pub(super) mod test {
     use std::{
         collections::HashMap,
@@ -994,19 +997,19 @@ pub(super) mod test {
             atomic::{AtomicUsize, Ordering::SeqCst},
             Arc,
         },
-        time::Duration,
     };
 
     use dashmap::DashMap;
     use parking_lot::Mutex;
 
     use super::*;
-    use crate::{node::tests::NodeLabel, ring::Distance};
+    use crate::{node::testing_impl::NodeLabel, ring::Distance};
 
     static LOG_ID: AtomicUsize = AtomicUsize::new(0);
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn event_register_read_write() -> Result<(), DynError> {
+        use std::time::Duration;
         let event_log_path = crate::config::Config::conf().event_log();
         // truncate the log if it exists
         std::fs::File::create(event_log_path).unwrap();
@@ -1022,7 +1025,7 @@ pub(super) mod test {
         for _ in 0..TEST_LOGS {
             let tx: Transaction = gen.arbitrary()?;
             transactions.push(tx);
-            let peer: PeerKey = gen.arbitrary()?;
+            let peer: PeerId = gen.arbitrary()?;
             peers.push(peer);
         }
         for _ in 0..TEST_LOGS {
@@ -1045,7 +1048,7 @@ pub(super) mod test {
 
     #[derive(Clone)]
     pub(crate) struct TestEventListener {
-        node_labels: Arc<DashMap<NodeLabel, PeerKey>>,
+        node_labels: Arc<DashMap<NodeLabel, PeerId>>,
         tx_log: Arc<DashMap<Transaction, Vec<ListenerLogId>>>,
         logs: Arc<Mutex<Vec<NetLogMessage>>>,
     }
@@ -1059,11 +1062,11 @@ pub(super) mod test {
             }
         }
 
-        pub fn add_node(&mut self, label: NodeLabel, peer: PeerKey) {
+        pub fn add_node(&mut self, label: NodeLabel, peer: PeerId) {
             self.node_labels.insert(label, peer);
         }
 
-        pub fn is_connected(&self, peer: &PeerKey) -> bool {
+        pub fn is_connected(&self, peer: &PeerId) -> bool {
             let logs = self.logs.lock();
             logs.iter().any(|log| {
                 &log.peer_id == peer
@@ -1073,7 +1076,7 @@ pub(super) mod test {
 
         pub fn has_put_contract(
             &self,
-            peer: &PeerKey,
+            peer: &PeerId,
             for_key: &ContractKey,
             expected_value: &WrappedState,
         ) -> bool {
@@ -1114,6 +1117,7 @@ pub(super) mod test {
         }
 
         /// The contract was broadcasted from one peer to an other successfully.
+        #[cfg(test)]
         pub fn contract_broadcasted(&self, for_key: &ContractKey) -> bool {
             let logs = self.logs.lock();
             let put_broadcast_ops = logs.iter().filter_map(|l| match &l.kind {
@@ -1147,7 +1151,7 @@ pub(super) mod test {
             false
         }
 
-        pub fn has_got_contract(&self, peer: &PeerKey, expected_key: &ContractKey) -> bool {
+        pub fn has_got_contract(&self, peer: &PeerId, expected_key: &ContractKey) -> bool {
             let logs = self.logs.lock();
             logs.iter().any(|log| {
                 &log.peer_id == peer
@@ -1155,11 +1159,7 @@ pub(super) mod test {
             })
         }
 
-        pub fn is_subscribed_to_contract(
-            &self,
-            peer: &PeerKey,
-            expected_key: &ContractKey,
-        ) -> bool {
+        pub fn is_subscribed_to_contract(&self, peer: &PeerId, expected_key: &ContractKey) -> bool {
             let logs = self.logs.lock();
             logs.iter().any(|log| {
                 &log.peer_id == peer
@@ -1168,7 +1168,7 @@ pub(super) mod test {
         }
 
         /// Unique connections for a given peer and their relative distance to other peers.
-        pub fn connections(&self, peer: PeerKey) -> impl Iterator<Item = (PeerKey, Distance)> {
+        pub fn connections(&self, peer: PeerId) -> impl Iterator<Item = (PeerId, Distance)> {
             let logs = self.logs.lock();
             let disconnects = logs
                 .iter()
@@ -1249,13 +1249,13 @@ pub(super) mod test {
     #[test]
     fn test_get_connections() -> Result<(), anyhow::Error> {
         use crate::ring::Location;
-        let peer_id = PeerKey::random();
+        let peer_id = PeerId::random();
         let loc = Location::try_from(0.5)?;
         let tx = Transaction::new::<connect::ConnectMsg>();
         let locations = [
-            (PeerKey::random(), Location::try_from(0.5)?),
-            (PeerKey::random(), Location::try_from(0.75)?),
-            (PeerKey::random(), Location::try_from(0.25)?),
+            (PeerId::random(), Location::try_from(0.5)?),
+            (PeerId::random(), Location::try_from(0.75)?),
+            (PeerId::random(), Location::try_from(0.25)?),
         ];
 
         let mut listener = TestEventListener::new();

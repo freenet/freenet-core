@@ -8,12 +8,12 @@ use std::{
 
 use crate::{
     build::*,
-    config::{ContractKind, NewPackageCliConfig},
+    config::{ContractKind, NewPackageConfig},
     util::pipe_std_streams,
     Error,
 };
 
-pub fn create_new_package(config: NewPackageCliConfig) -> Result<(), anyhow::Error> {
+pub fn create_new_package(config: NewPackageConfig) -> Result<(), anyhow::Error> {
     let cwd = env::current_dir()?;
     match config.kind {
         ContractKind::WebApp => create_view_package(&cwd)?,
@@ -25,7 +25,7 @@ pub fn create_new_package(config: NewPackageCliConfig) -> Result<(), anyhow::Err
 fn create_view_package(cwd: &Path) -> Result<(), anyhow::Error> {
     create_rust_crate(cwd, ContractKind::WebApp)?;
     create_web_init_files(cwd)?;
-    let freenet_file_config = BuildToolConfig {
+    let freenet_file_config = ContractBuildConfig {
         contract: Contract {
             c_type: Some(ContractType::WebApp),
             lang: Some(SupportedContractLangs::Rust),
@@ -52,7 +52,7 @@ fn create_view_package(cwd: &Path) -> Result<(), anyhow::Error> {
 
 fn create_regular_contract(cwd: &Path) -> Result<(), anyhow::Error> {
     create_rust_crate(cwd, ContractKind::Contract)?;
-    let freenet_file_config = BuildToolConfig {
+    let freenet_file_config = ContractBuildConfig {
         contract: Contract {
             c_type: Some(ContractType::Standard),
             lang: Some(SupportedContractLangs::Rust),

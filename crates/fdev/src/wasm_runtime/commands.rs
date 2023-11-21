@@ -3,10 +3,10 @@ use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractRespons
 
 use crate::CommandReceiver;
 
-use super::{state::AppState, LocalNodeCliConfig};
+use super::{state::AppState, ExecutorConfig};
 
 pub(super) async fn wasm_runtime(
-    _config: LocalNodeCliConfig,
+    _config: ExecutorConfig,
     mut command_receiver: CommandReceiver,
     mut app: AppState,
 ) -> Result<(), anyhow::Error> {

@@ -20,22 +20,19 @@ pub mod local_node {
     use super::*;
     pub use contract::Executor;
     pub use contract::OperationMode;
-    pub use node::NodeConfig;
-}
-
-/// Exports to build a running network simulation.
-pub mod network_sim {
-    use super::*;
-    pub use client_events::{ClientEventsProxy, ClientId, OpenRequest};
-    pub use node::{InitPeerNode, NodeBuilder, NodeConfig};
-    pub use ring::Location;
+    pub use node::PeerCliConfig;
 }
 
 /// Exports for the dev tool.
 pub mod dev_tool {
     use super::*;
     pub use crate::config::Config;
-    pub use client_events::{ClientEventsProxy, ClientId, OpenRequest};
+    pub use client_events::{test::MemoryEventsGen, ClientEventsProxy, ClientId, OpenRequest};
     pub use contract::{storages::Storage, Executor, OperationMode};
+    pub use node::{
+        testing_impl::{EventChain, NodeLabel, SimNetwork, SimPeer},
+        InitPeerNode, InterProcessConnManager, NodeConfig, PeerCliConfig, PeerId,
+    };
+    pub use ring::Location;
     pub use runtime::{ContractStore, DelegateStore, Runtime, SecretsStore, StateStore};
 }

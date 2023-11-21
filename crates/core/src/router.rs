@@ -1,4 +1,3 @@
-#![allow(dead_code)] // FIXME: remove this when this module is integrated with the rest of the codebase
 mod isotonic_estimator;
 mod util;
 

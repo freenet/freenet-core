@@ -5,7 +5,6 @@ use wasmer::TypedFunction;
 use super::{super::Runtime, TestSetup};
 
 #[test]
-#[ignore]
 fn now() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {
         contract_store,

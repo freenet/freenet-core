@@ -1,46 +1,25 @@
-use std::str::FromStr;
+use std::{path::Path, str::FromStr};
 
 use freenet_stdlib::prelude::*;
-use once_cell::sync::Lazy;
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteRow},
     ConnectOptions, Row, SqlitePool,
 };
 
 use crate::{
-    config::Config,
     contract::ContractKey,
     runtime::{ContractError, StateStorage, StateStoreError},
 };
 
-// Is fine to clone this as it wraps by an Arc.
-static POOL: Lazy<SqlitePool> = Lazy::new(|| {
-    let opts = if cfg!(test) {
-        SqliteConnectOptions::from_str("sqlite::memory:").unwrap()
-    } else {
-        let conn_str = Config::conf().db_dir().join("freenet.db");
-        tracing::info!("loading contract store from {conn_str:?}");
-        SqliteConnectOptions::new()
-            .create_if_missing(true)
-            .filename(conn_str)
-    };
-    let opts = opts.log_statements(tracing::log::LevelFilter::Debug);
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current()
-            .block_on(async move { SqlitePool::connect_with(opts).await })
-    })
-    .unwrap()
-});
-
-async fn create_contracts_table() -> Result<(), SqlDbError> {
+async fn create_contracts_table(pool: &SqlitePool) -> Result<(), SqlDbError> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS states (
-                    contract        BLOB PRIMARY KEY,
+            contract        BLOB PRIMARY KEY,
                     state           BLOB,
                     params          BLOB
                 )",
     )
-    .execute(&*POOL)
+    .execute(pool)
     .await?;
     Ok(())
 }
@@ -49,9 +28,24 @@ async fn create_contracts_table() -> Result<(), SqlDbError> {
 pub struct Pool(SqlitePool);
 
 impl Pool {
-    pub async fn new() -> Result<Self, SqlDbError> {
-        create_contracts_table().await?;
-        Ok(Self(POOL.clone()))
+    pub async fn new(db_dir: Option<&Path>) -> Result<Self, SqlDbError> {
+        let opts = if let Some(db_dir) = db_dir {
+            let file = db_dir.join("freenet.db");
+            tracing::info!("loading contract store from {file:?}");
+            SqliteConnectOptions::new()
+                .create_if_missing(true)
+                .filename(file)
+        } else {
+            SqliteConnectOptions::from_str("sqlite::memory:").unwrap()
+        };
+        let opts = opts.log_statements(tracing::log::LevelFilter::Debug);
+        let pool = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async move { SqlitePool::connect_with(opts).await })
+        })
+        .unwrap();
+        create_contracts_table(&pool).await?;
+        Ok(Self(pool.clone()))
     }
 }
 

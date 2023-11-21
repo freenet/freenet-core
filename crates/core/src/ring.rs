@@ -44,7 +44,7 @@ use crate::{
     config::GlobalExecutor,
     message::Transaction,
     node::{
-        self, EventLoopNotificationsSender, EventRegister, NetEventRegister, NodeBuilder, PeerKey,
+        self, EventLoopNotificationsSender, EventRegister, NetEventRegister, NodeConfig, PeerId,
     },
     operations::connect,
     router::Router,
@@ -54,8 +54,8 @@ use crate::{
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 /// The location of a peer in the ring. This location allows routing towards the peer.
-pub(crate) struct PeerKeyLocation {
-    pub peer: PeerKey,
+pub struct PeerKeyLocation {
+    pub peer: PeerId,
     /// An unspecified location means that the peer hasn't been asigned a location, yet.
     pub location: Option<Location>,
 }
@@ -64,14 +64,14 @@ impl PeerKeyLocation {
     #[cfg(test)]
     pub fn random() -> Self {
         PeerKeyLocation {
-            peer: PeerKey::random(),
+            peer: PeerId::random(),
             location: Some(Location::random()),
         }
     }
 }
 
-impl From<PeerKey> for PeerKeyLocation {
-    fn from(peer: PeerKey) -> Self {
+impl From<PeerId> for PeerKeyLocation {
+    fn from(peer: PeerId) -> Self {
         PeerKeyLocation {
             peer,
             location: None,
@@ -101,13 +101,13 @@ struct Connection {
 
 #[derive(Clone)]
 pub(crate) struct LiveTransactionTracker {
-    tx_per_peer: Arc<DashMap<PeerKey, Vec<Transaction>>>,
-    missing_candidate_sender: sync::mpsc::Sender<PeerKey>,
+    tx_per_peer: Arc<DashMap<PeerId, Vec<Transaction>>>,
+    missing_candidate_sender: sync::mpsc::Sender<PeerId>,
 }
 
 impl LiveTransactionTracker {
     /// The given peer does not have (good) candidates for acquiring new connections.
-    pub async fn missing_candidate_peers(&self, peer: PeerKey) {
+    pub async fn missing_candidate_peers(&self, peer: PeerId) {
         let _ = self
             .missing_candidate_sender
             .send(peer)
@@ -118,12 +118,12 @@ impl LiveTransactionTracker {
             });
     }
 
-    pub fn add_transaction(&self, peer: PeerKey, tx: Transaction) {
+    pub fn add_transaction(&self, peer: PeerId, tx: Transaction) {
         self.tx_per_peer.entry(peer).or_default().push(tx);
     }
 
     pub fn remove_finished_transaction(&self, tx: Transaction) {
-        let keys_to_remove: Vec<PeerKey> = self
+        let keys_to_remove: Vec<PeerId> = self
             .tx_per_peer
             .iter()
             .filter(|entry| entry.value().iter().any(|otx| otx == &tx))
@@ -138,11 +138,11 @@ impl LiveTransactionTracker {
         }
     }
 
-    fn prune_transactions_from_peer(&self, peer: &PeerKey) {
+    fn prune_transactions_from_peer(&self, peer: &PeerId) {
         self.tx_per_peer.remove(peer);
     }
 
-    fn new() -> (Self, sync::mpsc::Receiver<PeerKey>) {
+    fn new() -> (Self, sync::mpsc::Receiver<PeerId>) {
         let (missing_peer, rx) = sync::mpsc::channel(10);
         (
             Self {
@@ -153,7 +153,7 @@ impl LiveTransactionTracker {
         )
     }
 
-    fn has_live_connection(&self, peer: &PeerKey) -> bool {
+    fn has_live_connection(&self, peer: &PeerId) -> bool {
         self.tx_per_peer.contains_key(peer)
     }
 
@@ -171,7 +171,7 @@ impl LiveTransactionTracker {
 pub(crate) struct Ring {
     pub rnd_if_htl_above: usize,
     pub max_hops_to_live: usize,
-    pub peer_key: PeerKey,
+    pub peer_key: PeerId,
     max_connections: usize,
     min_connections: usize,
     router: Arc<RwLock<Router>>,
@@ -180,7 +180,7 @@ pub(crate) struct Ring {
     /// Slow is for when there are enough connections so we need to drop a connection in order to replace it.
     fast_acquisition: AtomicBool,
     connections_by_location: RwLock<BTreeMap<Location, Vec<Connection>>>,
-    location_for_peer: RwLock<BTreeMap<PeerKey, Location>>,
+    location_for_peer: RwLock<BTreeMap<PeerId, Location>>,
     /// contracts in the ring cached by this node
     cached_contracts: DashSet<ContractKey>,
     own_location: AtomicU64,
@@ -224,14 +224,14 @@ impl Ring {
     /// connection of a peer in the network).
     const MAX_HOPS_TO_LIVE: usize = 10;
 
-    pub fn new<const CLIENTS: usize, EL: NetEventRegister>(
-        config: &NodeBuilder<CLIENTS>,
+    pub fn new<EL: NetEventRegister>(
+        config: &NodeConfig,
         gateways: &[PeerKeyLocation],
         event_loop_notifier: EventLoopNotificationsSender,
     ) -> Result<Arc<Self>, anyhow::Error> {
         let (live_tx_tracker, missing_candidate_rx) = LiveTransactionTracker::new();
 
-        let peer_key = PeerKey::from(config.local_key.public());
+        let peer_key = config.peer_id;
 
         // for location here consider -1 == None
         let own_location = AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()));
@@ -297,22 +297,34 @@ impl Ring {
         }
 
         let ring = Arc::new(ring);
-        let parent_span = tracing::Span::current();
+        let current_span = tracing::Span::current();
+        let span = if current_span.is_none() {
+            tracing::info_span!("connection_maintenance")
+        } else {
+            tracing::info_span!(parent: current_span, "connection_maintenance")
+        };
         GlobalExecutor::spawn(
             ring.clone()
                 .connection_maintenance(event_loop_notifier, live_tx_tracker, missing_candidate_rx)
-                .instrument(tracing::info_span!(parent: parent_span, "connection_maintenance")),
+                .instrument(span),
         );
         Ok(ring)
     }
 
-    async fn refresh_router<EL: NetEventRegister>(router: Arc<RwLock<Router>>) {
+    async fn refresh_router<ER: NetEventRegister>(router: Arc<RwLock<Router>>) {
         let mut interval = tokio::time::interval(Duration::from_secs(60 * 5));
         interval.tick().await;
         loop {
             interval.tick().await;
-            // fixme
-            let history = if std::any::type_name::<EL>() == std::any::type_name::<EventRegister>() {
+            #[cfg(feature = "trace-ot")]
+            let should_route = std::any::type_name::<ER>()
+                == std::any::type_name::<EventRegister>()
+                || std::any::type_name::<ER>()
+                    == std::any::type_name::<crate::node::CombinedRegister<2>>();
+            #[cfg(not(feature = "trace-ot"))]
+            let should_route =
+                std::any::type_name::<ER>() == std::any::type_name::<EventRegister>();
+            let history = if should_route {
                 EventRegister::get_router_events(10_000)
                     .await
                     .map_err(|error| {
@@ -431,7 +443,7 @@ impl Ring {
             .record_request(requested_location, request_type);
     }
 
-    pub fn add_connection(&self, loc: Location, peer: PeerKey) {
+    pub fn add_connection(&self, loc: Location, peer: PeerId) {
         let mut cbl = self.connections_by_location.write();
         cbl.entry(loc).or_default().push(Connection {
             location: PeerKeyLocation {
@@ -457,7 +469,7 @@ impl Ring {
     pub fn closest_caching(
         &self,
         contract_key: &ContractKey,
-        skip_list: impl Contains<PeerKey>,
+        skip_list: impl Contains<PeerId>,
     ) -> Option<PeerKeyLocation> {
         self.routing(Location::from(contract_key), None, skip_list)
     }
@@ -466,8 +478,8 @@ impl Ring {
     pub fn routing(
         &self,
         target: Location,
-        requesting: Option<&PeerKey>,
-        skip_list: impl Contains<PeerKey>,
+        requesting: Option<&PeerId>,
+        skip_list: impl Contains<PeerId>,
     ) -> Option<PeerKeyLocation> {
         let connections = self.connections_by_location.read();
         let peers = connections.values().filter_map(|conns| {
@@ -490,7 +502,7 @@ impl Ring {
     /// Get a random peer from the known ring connections.
     pub fn random_peer<F>(&self, filter_fn: F) -> Option<PeerKeyLocation>
     where
-        F: Fn(&PeerKey) -> bool,
+        F: Fn(&PeerId) -> bool,
     {
         let peers = &*self.location_for_peer.read();
         let amount = peers.len();
@@ -557,7 +569,7 @@ impl Ring {
         self.connections_by_location.read().len()
     }
 
-    pub fn prune_connection(&self, peer: PeerKey) {
+    pub fn prune_connection(&self, peer: PeerId) {
         #[cfg(debug_assertions)]
         {
             tracing::info!(%peer, "Removing connection");
@@ -583,7 +595,7 @@ impl Ring {
     pub fn closest_to_location(
         &self,
         location: Location,
-        skip_list: &[PeerKey],
+        skip_list: &[PeerId],
     ) -> Option<PeerKeyLocation> {
         self.connections_by_location
             .read()
@@ -610,12 +622,10 @@ impl Ring {
         self: Arc<Self>,
         notifier: EventLoopNotificationsSender,
         live_tx_tracker: LiveTransactionTracker,
-        mut missing_candidates: sync::mpsc::Receiver<PeerKey>,
+        mut missing_candidates: sync::mpsc::Receiver<PeerId>,
     ) -> Result<(), DynError> {
         /// Peers whose connection should be acquired.
-        fn should_swap<'a>(
-            _connections: impl Iterator<Item = &'a PeerKeyLocation>,
-        ) -> Vec<PeerKey> {
+        fn should_swap<'a>(_connections: impl Iterator<Item = &'a PeerKeyLocation>) -> Vec<PeerId> {
             // todo: instead we should be using ConnectionEvaluator here
             vec![]
         }
@@ -628,7 +638,7 @@ impl Ring {
         const REMOVAL_TICK_DURATION: Duration = Duration::from_secs(60 * 5);
         #[cfg(test)]
         const REMOVAL_TICK_DURATION: Duration = Duration::from_secs(1);
-        const ACQUIRE_CONNS_TICK_DURATION: Duration = Duration::from_secs(1);
+        const ACQUIRE_CONNS_TICK_DURATION: Duration = Duration::from_secs(2);
         const REGENERATE_DENSITY_MAP_INTERVAL: Duration = Duration::from_secs(60);
 
         let mut check_interval = tokio::time::interval(REMOVAL_TICK_DURATION);
@@ -644,6 +654,10 @@ impl Ring {
         let retry_interval = REMOVAL_TICK_DURATION * 2;
         #[cfg(test)]
         let retry_interval = Duration::from_secs(5);
+
+        // if the peer is just starting wait a bit before
+        // we even attempt acquiring more connections
+        tokio::time::sleep(ACQUIRE_CONNS_TICK_DURATION).await;
 
         let mut live_tx = None;
         'outer: loop {
@@ -687,7 +701,7 @@ impl Ring {
                     match loc {
                         Ok(loc) => loc,
                         Err(_) => {
-                            tracing::debug!(peer = %self.own_location(), "Insufficient data gathered by the topology manager");
+                            tracing::trace!(peer = %self.own_location(), "Insufficient data gathered by the topology manager");
                             acquire_max_connections.tick().await;
                             continue;
                         }
@@ -775,7 +789,7 @@ impl Ring {
     async fn acquire_new(
         &self,
         ideal_location: Location,
-        skip_list: &[&PeerKey],
+        skip_list: &[&PeerId],
         notifier: &EventLoopNotificationsSender,
         missing_connections: usize,
     ) -> Result<Option<Transaction>, DynError> {

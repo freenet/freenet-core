@@ -1,6 +1,6 @@
 [package]
 name = "fdev"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2021"
 rust-version = "1.71.1"
 publish = true
@@ -25,7 +25,7 @@ serde_with = { workspace = true }
 semver = { workspace = true }
 tar = "0.4"
 thiserror = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signal", "parking_lot"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signal", "parking_lot", "process"] }
 toml = { version = "0.8", features = ["default", "preserve_order"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
@@ -34,3 +34,6 @@ xz2 = "0.1"
 # internal
 freenet = { path = "../core" }
 freenet-stdlib = { workspace = true }
+
+[features]
+trace-ot = ["freenet/trace-ot"]

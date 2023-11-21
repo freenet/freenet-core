@@ -3,10 +3,10 @@ use freenet_stdlib::prelude::{
     APIVersion, CodeHash, Delegate, DelegateCode, DelegateContainer, DelegateKey,
     DelegateWasmAPIVersion, Parameters,
 };
-use std::fs::OpenOptions;
-use std::io::BufWriter;
 use std::{fs::File, io::Write, path::PathBuf, sync::Arc};
 use stretto::Cache;
+
+use crate::runtime::store::SafeWriter;
 
 use super::store::StoreFsManagement;
 use super::RuntimeResult;
@@ -15,10 +15,9 @@ pub struct DelegateStore {
     delegates_dir: PathBuf,
     delegate_cache: Cache<CodeHash, DelegateCode<'static>>,
     key_to_code_part: Arc<DashMap<DelegateKey, (u64, CodeHash)>>,
-    index_file: BufWriter<File>,
+    index_file: SafeWriter<Self>,
+    key_file: PathBuf,
 }
-
-static KEY_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
 
 impl StoreFsManagement for DelegateStore {
     type MemContainer = Arc<DashMap<DelegateKey, (u64, CodeHash)>>;
@@ -40,13 +39,7 @@ impl DelegateStore {
     pub fn new(delegates_dir: PathBuf, max_size: i64) -> RuntimeResult<Self> {
         const ERR: &str = "failed to build mem cache";
         let mut key_to_code_part = Arc::new(DashMap::new());
-        let key_file = match KEY_FILE_PATH
-            .try_insert(delegates_dir.join("KEY_DATA"))
-            .map_err(|(e, _)| e)
-        {
-            Ok(f) => f,
-            Err(f) => f,
-        };
+        let key_file = delegates_dir.join("KEY_DATA");
         if !key_file.exists() {
             std::fs::create_dir_all(&delegates_dir).map_err(|err| {
                 tracing::error!("error creating delegate dir: {err}");
@@ -54,17 +47,17 @@ impl DelegateStore {
             })?;
             File::create(delegates_dir.join("KEY_DATA"))?;
         } else {
-            Self::load_from_file(key_file, &mut key_to_code_part)?;
+            Self::load_from_file(&key_file, &mut key_to_code_part)?;
         }
-        Self::watch_changes(key_to_code_part.clone(), key_file)?;
+        Self::watch_changes(key_to_code_part.clone(), &key_file)?;
 
-        let index_file =
-            std::io::BufWriter::new(OpenOptions::new().append(true).read(true).open(key_file)?);
+        let index_file = SafeWriter::new(&key_file, false)?;
         Ok(Self {
             delegate_cache: Cache::new(100, max_size).expect(ERR),
             delegates_dir,
             key_to_code_part,
             index_file,
+            key_file,
         })
     }
 
@@ -138,10 +131,7 @@ impl DelegateStore {
                 let current_version_offset = v.get().0;
                 let prev_val = &mut v.get_mut().1;
                 // first mark the old entry (if it exists) as removed
-                Self::remove(
-                    KEY_FILE_PATH.get().expect("should be set"),
-                    current_version_offset,
-                )?;
+                Self::remove(&self.key_file, current_version_offset)?;
                 let new_offset = Self::insert(&mut self.index_file, key.clone(), code_hash)?;
                 *prev_val = *code_hash;
                 v.get_mut().0 = new_offset;
@@ -159,7 +149,7 @@ impl DelegateStore {
         self.delegate_cache.remove(key.code_hash());
         let cmp_path: PathBuf = self.delegates_dir.join(key.encode()).with_extension("wasm");
         if let Some((_, (offset, _))) = self.key_to_code_part.remove(key) {
-            Self::remove(KEY_FILE_PATH.get().expect("infallible"), offset)?;
+            Self::remove(&self.key_file, offset)?;
         }
         match std::fs::remove_file(cmp_path) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),

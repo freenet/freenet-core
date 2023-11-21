@@ -8,21 +8,21 @@ use freenet_stdlib::prelude::*;
 use futures::TryFutureExt;
 use tokio::sync::RwLock;
 
-use crate::local_node::DeserializationFmt;
+use crate::wasm_runtime::DeserializationFmt;
 
-use super::LocalNodeCliConfig;
+use super::ExecutorConfig;
 
 #[derive(Clone)]
 pub(super) struct AppState {
     pub(crate) local_node: Arc<RwLock<Executor>>,
-    config: LocalNodeCliConfig,
+    config: ExecutorConfig,
 }
 
 impl AppState {
     const MAX_MEM_CACHE: u32 = 10_000_000;
     const DEFAULT_MAX_DELEGATE_SIZE: i64 = 10 * 1024 * 1024;
 
-    pub async fn new(config: &LocalNodeCliConfig) -> Result<Self, anyhow::Error> {
+    pub async fn new(config: &ExecutorConfig) -> Result<Self, anyhow::Error> {
         let contract_store =
             ContractStore::new(Config::conf().contracts_dir(), config.max_contract_size)?;
         let delegate_store = DelegateStore::new(
@@ -30,7 +30,10 @@ impl AppState {
             Self::DEFAULT_MAX_DELEGATE_SIZE,
         )?;
         let secrets_store = SecretsStore::new(Config::conf().secrets_dir())?;
-        let state_store = StateStore::new(Storage::new().await?, Self::MAX_MEM_CACHE)?;
+        let state_store = StateStore::new(
+            Storage::new(Some(&Config::conf().db_dir())).await?,
+            Self::MAX_MEM_CACHE,
+        )?;
         let rt = freenet::dev_tool::Runtime::build(
             contract_store,
             delegate_store,
@@ -56,7 +59,7 @@ impl AppState {
     }
 
     pub fn printout_deser<R: AsRef<[u8]> + ?Sized>(&self, data: &R) -> Result<(), std::io::Error> {
-        fn write_res(config: &LocalNodeCliConfig, pprinted: &str) -> Result<(), std::io::Error> {
+        fn write_res(config: &ExecutorConfig, pprinted: &str) -> Result<(), std::io::Error> {
             if let Some(p) = &config.output_file {
                 let mut f = File::create(p)?;
                 f.write_all(pprinted.as_bytes())?;

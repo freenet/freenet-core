@@ -30,7 +30,7 @@ use libp2p::{
         KeepAlive, NetworkBehaviour, NotifyHandler, Stream as NegotiatedSubstream,
         SubstreamProtocol, SwarmEvent, ToSwarm,
     },
-    InboundUpgrade, Multiaddr, OutboundUpgrade, PeerId, Swarm,
+    InboundUpgrade, Multiaddr, OutboundUpgrade, PeerId as Libp2pPeerId, Swarm,
 };
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
@@ -44,10 +44,10 @@ use crate::{
     client_events::ClientId,
     config::{self, GlobalExecutor},
     contract::{ClientResponsesSender, ExecutorToEventLoopChannel, NetworkEventListenerHalve},
-    message::{Message, NodeEvent, Transaction, TransactionType},
+    message::{NetMessage, NodeEvent, Transaction, TransactionType},
     node::{
         handle_cancelled_op, join_ring_request, network_event_log::NetEventLog, process_message,
-        InitPeerNode, NetEventRegister, NodeBuilder, OpManager, PeerKey,
+        InitPeerNode, NetEventRegister, NodeConfig, OpManager, PeerId as FreenetPeerId,
     },
     operations::OpError,
     ring::PeerKeyLocation,
@@ -63,7 +63,7 @@ const CURRENT_PROTOC_VER_STR: &str = "/freenet/0.1.0";
 const CURRENT_IDENTIFY_PROTOC_VER: &str = "/id/1.0.0";
 
 fn config_behaviour(
-    local_key: &Keypair,
+    private_key: &Keypair,
     gateways: &[InitPeerNode],
     _private_addr: &Option<Multiaddr>,
     op_manager: Arc<OpManager>,
@@ -73,17 +73,19 @@ fn config_behaviour(
         .filter_map(|p| {
             p.addr
                 .as_ref()
-                .map(|addr| (p.identifier, HashSet::from_iter([addr.clone()])))
+                .map(|addr| (p.identifier.0, HashSet::from_iter([addr.clone()])))
         })
         .collect();
 
-    let ident_config =
-        identify::Config::new(CURRENT_IDENTIFY_PROTOC_VER.to_string(), local_key.public())
-            .with_agent_version(CURRENT_AGENT_VER.to_string());
+    let ident_config = identify::Config::new(
+        CURRENT_IDENTIFY_PROTOC_VER.to_string(),
+        private_key.public(),
+    )
+    .with_agent_version(CURRENT_AGENT_VER.to_string());
 
     let ping = ping::Behaviour::default();
 
-    let peer_id = local_key.public().to_peer_id();
+    let peer_id = private_key.public().to_peer_id();
     let auto_nat = {
         let config = autonat::Config {
             ..Default::default()
@@ -91,7 +93,7 @@ fn config_behaviour(
         let mut behaviour = autonat::Behaviour::new(peer_id, config);
 
         for (peer, addr) in gateways.iter().map(|p| (&p.identifier, &p.addr)) {
-            behaviour.add_server(*peer, addr.clone());
+            behaviour.add_server(peer.0, addr.clone());
         }
         behaviour
     };
@@ -120,11 +122,11 @@ fn multiaddr_from_connection(conn: (IpAddr, u16)) -> Multiaddr {
     addr
 }
 
-type P2pBridgeEvent = Either<(PeerKey, Box<Message>), NodeEvent>;
+type P2pBridgeEvent = Either<(FreenetPeerId, Box<NetMessage>), NodeEvent>;
 
 pub(crate) struct P2pBridge {
-    active_net_connections: Arc<DashMap<PeerKey, Multiaddr>>,
-    accepted_peers: Arc<DashSet<PeerKey>>,
+    active_net_connections: Arc<DashMap<FreenetPeerId, Multiaddr>>,
+    accepted_peers: Arc<DashSet<FreenetPeerId>>,
     ev_listener_tx: Sender<P2pBridgeEvent>,
     op_manager: Arc<OpManager>,
     log_register: Arc<Mutex<Box<dyn NetEventRegister>>>,
@@ -195,7 +197,7 @@ impl Clone for P2pBridge {
 
 #[async_trait::async_trait]
 impl NetworkBridge for P2pBridge {
-    async fn add_connection(&mut self, peer: PeerKey) -> super::ConnResult<()> {
+    async fn add_connection(&mut self, peer: FreenetPeerId) -> super::ConnResult<()> {
         if self.active_net_connections.contains_key(&peer) {
             self.accepted_peers.insert(peer);
         }
@@ -206,7 +208,7 @@ impl NetworkBridge for P2pBridge {
         Ok(())
     }
 
-    async fn drop_connection(&mut self, peer: &PeerKey) -> super::ConnResult<()> {
+    async fn drop_connection(&mut self, peer: &FreenetPeerId) -> super::ConnResult<()> {
         self.accepted_peers.remove(peer);
         self.ev_listener_tx
             .send(Right(NodeEvent::DropConnection(*peer)))
@@ -220,7 +222,7 @@ impl NetworkBridge for P2pBridge {
         Ok(())
     }
 
-    async fn send(&self, target: &PeerKey, msg: Message) -> super::ConnResult<()> {
+    async fn send(&self, target: &FreenetPeerId, msg: NetMessage) -> super::ConnResult<()> {
         self.log_register
             .try_lock()
             .expect("single reference")
@@ -246,11 +248,12 @@ pub(in crate::node) struct P2pConnManager {
 }
 
 impl P2pConnManager {
-    pub fn build<const CLIENTS: usize>(
-        transport: transport::Boxed<(PeerId, muxing::StreamMuxerBox)>,
-        config: &NodeBuilder<CLIENTS>,
+    pub fn build(
+        transport: transport::Boxed<(Libp2pPeerId, muxing::StreamMuxerBox)>,
+        config: &NodeConfig,
         op_manager: Arc<OpManager>,
         event_listener: impl NetEventRegister + Clone,
+        private_key: Keypair,
     ) -> Result<Self, anyhow::Error> {
         // We set a global executor which is virtually the Tokio multi-threaded executor
         // to reuse it's thread pool and scheduler in order to drive futures.
@@ -271,7 +274,7 @@ impl P2pConnManager {
         };
 
         let behaviour = config_behaviour(
-            &config.local_key,
+            &private_key,
             &config.remote_nodes,
             &private_addr,
             op_manager.clone(),
@@ -279,7 +282,7 @@ impl P2pConnManager {
         let mut swarm = Swarm::new(
             transport,
             behaviour,
-            PeerId::from(config.local_key.public()),
+            config.peer_id.0,
             SwarmConfig::with_executor(global_executor)
                 .with_idle_connection_timeout(config::PEER_TIMEOUT),
         );
@@ -317,13 +320,14 @@ impl P2pConnManager {
         mut notification_channel: EventLoopNotifications,
         mut executor_channel: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         cli_response_sender: ClientResponsesSender,
+        mut node_controller: Receiver<NodeEvent>,
     ) -> Result<(), anyhow::Error> {
         use ConnMngrActions::*;
 
         let mut pending_from_executor = HashSet::new();
         let mut tx_to_client: HashMap<Transaction, ClientId> = HashMap::new();
 
-        let this_peer = super::PeerKey(
+        let this_peer = FreenetPeerId::from(
             crate::config::Config::conf()
                 .local_peer_keypair
                 .public()
@@ -338,7 +342,7 @@ impl P2pConnManager {
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
                     Ok(Right(ConnMngrActions::ConnectionClosed {
-                        peer: PeerKey::from(peer_id),
+                        peer: FreenetPeerId::from(peer_id),
                     }))
                 }
                 SwarmEvent::Dialing { peer_id, .. } => {
@@ -351,13 +355,13 @@ impl P2pConnManager {
                     if let identify::Event::Received { peer_id, info } = *id {
                         if Self::is_compatible_peer(&info) {
                             Ok(Right(ConnMngrActions::ConnectionEstablished {
-                                peer: PeerKey(peer_id),
+                                peer: FreenetPeerId::from(peer_id),
                                 address: info.observed_addr,
                             }))
                         } else {
                             tracing::warn!("Incompatible peer: {}, disconnecting", peer_id);
                             Ok(Right(ConnMngrActions::ConnectionClosed {
-                                peer: PeerKey::from(peer_id),
+                                peer: FreenetPeerId::from(peer_id),
                             }))
                         }
                     } else {
@@ -374,7 +378,7 @@ impl P2pConnManager {
                             "Successful autonat probe, established conn with {peer} @ {address}"
                         );
                         Ok(Right(ConnMngrActions::ConnectionEstablished {
-                            peer: PeerKey(peer),
+                            peer: FreenetPeerId::from(peer),
                             address,
                         }))
                     }
@@ -422,6 +426,13 @@ impl P2pConnManager {
                 msg = network_msg => { msg }
                 msg = notification_msg => { msg }
                 msg = bridge_msg => { msg }
+                msg = node_controller.recv() => {
+                    if let Some(msg) = msg {
+                        Ok(Right(NodeAction(msg)))
+                    } else {
+                        Ok(Right(ClosedChannel))
+                    }
+                }
                 event_id = op_manager.recv_from_handler() => {
                     if let Some((client_id, transaction)) = event_id.client_id().zip(event_id.transaction()) {
                         tx_to_client.insert(transaction, client_id);
@@ -438,7 +449,7 @@ impl P2pConnManager {
                 Ok(Left((msg, client_id))) => {
                     let cb = self.bridge.clone();
                     match msg {
-                        Message::Aborted(tx) => {
+                        NetMessage::Aborted(tx) => {
                             let tx_type = tx.transaction_type();
                             let res = handle_cancelled_op(
                                 tx,
@@ -524,6 +535,13 @@ impl P2pConnManager {
                     // todo: if we prefilter connections, should only accept ones informed this way
                     //       (except 'join ring' requests)
                 }
+                Ok(Right(NodeAction(NodeEvent::Disconnect { cause }))) => {
+                    match cause {
+                        Some(cause) => tracing::warn!("Shutting down node: {cause}"),
+                        None => tracing::warn!("Shutting down node"),
+                    }
+                    return Ok(());
+                }
                 Ok(Right(ConnectionEstablished {
                     address: addr,
                     peer,
@@ -579,22 +597,22 @@ impl P2pConnManager {
 enum ConnMngrActions {
     /// Received a new connection
     ConnectionEstablished {
-        peer: PeerKey,
+        peer: FreenetPeerId,
         address: Multiaddr,
     },
     /// Closed a connection with the peer
     ConnectionClosed {
-        peer: PeerKey,
+        peer: FreenetPeerId,
     },
     /// Outbound message
     SendMessage {
-        peer: PeerKey,
-        msg: Box<Message>,
+        peer: FreenetPeerId,
+        msg: Box<NetMessage>,
     },
     /// Update self own public address, useful when communicating for first time
     UpdatePublicAddr(Multiaddr),
     /// This is private, so when establishing connections hole-punching should be performed
-    IsPrivatePeer(PeerId),
+    IsPrivatePeer(Libp2pPeerId),
     NodeAction(NodeEvent),
     ClosedChannel,
     NoAction,
@@ -603,24 +621,24 @@ enum ConnMngrActions {
 /// Manages network connections with different peers and event routing within the swarm.
 pub(in crate::node) struct FreenetBehaviour {
     // FIFO queue for outbound messages
-    outbound: VecDeque<(PeerId, Either<Message, NodeEvent>)>,
+    outbound: VecDeque<(Libp2pPeerId, Either<NetMessage, NodeEvent>)>,
     // FIFO queue for inbound messages
-    inbound: VecDeque<Either<Message, NodeEvent>>,
-    routing_table: HashMap<PeerId, HashSet<Multiaddr>>,
-    connected: HashMap<PeerId, ConnectionId>,
-    openning_connection: HashSet<PeerId>,
+    inbound: VecDeque<Either<NetMessage, NodeEvent>>,
+    routing_table: HashMap<Libp2pPeerId, HashSet<Multiaddr>>,
+    connected: HashMap<Libp2pPeerId, ConnectionId>,
+    openning_connection: HashSet<Libp2pPeerId>,
     op_manager: Arc<OpManager>,
 }
 
 impl NetworkBehaviour for FreenetBehaviour {
     type ConnectionHandler = Handler;
 
-    type ToSwarm = Message;
+    type ToSwarm = NetMessage;
 
     fn handle_established_inbound_connection(
         &mut self,
         connection_id: ConnectionId,
-        peer_id: PeerId,
+        peer_id: Libp2pPeerId,
         _local_addr: &Multiaddr,
         remote_addr: &Multiaddr,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
@@ -637,7 +655,7 @@ impl NetworkBehaviour for FreenetBehaviour {
     fn handle_established_outbound_connection(
         &mut self,
         connection_id: ConnectionId,
-        peer_id: PeerId,
+        peer_id: Libp2pPeerId,
         addr: &Multiaddr,
         _role_override: libp2p::core::Endpoint,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
@@ -653,7 +671,7 @@ impl NetworkBehaviour for FreenetBehaviour {
 
     fn on_connection_handler_event(
         &mut self,
-        peer_id: PeerId,
+        peer_id: Libp2pPeerId,
         _connection: ConnectionId,
         event: <Self::ConnectionHandler as ConnectionHandler>::ToBehaviour,
     ) {
@@ -728,8 +746,8 @@ type UniqConnId = usize;
 
 #[derive(Debug)]
 pub(in crate::node) enum HandlerEvent {
-    Inbound(Either<Message, NodeEvent>),
-    Outbound(Either<Message, NodeEvent>),
+    Inbound(Either<NetMessage, NodeEvent>),
+    Outbound(Either<NetMessage, NodeEvent>),
 }
 
 /// Handles the connection with a given peer.
@@ -737,7 +755,7 @@ pub(in crate::node) struct Handler {
     substreams: Vec<SubstreamState>,
     uniq_conn_id: UniqConnId,
     protocol_status: ProtocolStatus,
-    pending: Vec<Message>,
+    pending: Vec<NetMessage>,
     op_manager: Arc<OpManager>,
 }
 
@@ -754,7 +772,7 @@ enum SubstreamState {
     /// We haven't started opening the outgoing substream yet.
     /// Contains the initial request we want to send.
     OutPendingOpen {
-        msg: Box<Message>,
+        msg: Box<NetMessage>,
         conn_id: UniqConnId,
     },
     /// Waiting for the first message after requesting an outbound open connection.
@@ -767,7 +785,7 @@ enum SubstreamState {
     PendingSend {
         conn_id: UniqConnId,
         substream: FreenetStream<NegotiatedSubstream>,
-        msg: Box<Either<Message, NodeEvent>>,
+        msg: Box<Either<NetMessage, NodeEvent>>,
     },
     /// Waiting to flush the substream so that the data arrives to the remote.
     PendingFlush {
@@ -796,7 +814,7 @@ impl Handler {
     }
 
     #[inline]
-    fn send_to_free_substream(&mut self, msg: Message) -> Option<Message> {
+    fn send_to_free_substream(&mut self, msg: NetMessage) -> Option<NetMessage> {
         let pos = self
             .substreams
             .iter()
@@ -1165,12 +1183,12 @@ pub(crate) type FreenetStream<S> = stream::AndThen<
     sink::With<
         stream::ErrInto<Framed<S, UviBytes<io::Cursor<Vec<u8>>>>, ConnectionError>,
         io::Cursor<Vec<u8>>,
-        Message,
+        NetMessage,
         future::Ready<Result<io::Cursor<Vec<u8>>, ConnectionError>>,
-        fn(Message) -> future::Ready<Result<io::Cursor<Vec<u8>>, ConnectionError>>,
+        fn(NetMessage) -> future::Ready<Result<io::Cursor<Vec<u8>>, ConnectionError>>,
     >,
-    future::Ready<Result<Message, ConnectionError>>,
-    fn(BytesMut) -> future::Ready<Result<Message, ConnectionError>>,
+    future::Ready<Result<NetMessage, ConnectionError>>,
+    fn(BytesMut) -> future::Ready<Result<NetMessage, ConnectionError>>,
 >;
 
 impl<S> InboundUpgrade<S> for FreenetProtocol
@@ -1216,12 +1234,12 @@ where
 }
 
 #[inline(always)]
-fn encode_msg(msg: Message) -> Result<Vec<u8>, ConnectionError> {
+fn encode_msg(msg: NetMessage) -> Result<Vec<u8>, ConnectionError> {
     bincode::serialize(&msg).map_err(|err| ConnectionError::Serialization(Some(err)))
 }
 
 #[inline(always)]
-fn decode_msg(buf: BytesMut) -> Result<Message, ConnectionError> {
+fn decode_msg(buf: BytesMut) -> Result<NetMessage, ConnectionError> {
     let cursor = std::io::Cursor::new(buf);
     bincode::deserialize_from(cursor).map_err(|err| ConnectionError::Serialization(Some(err)))
 }
@@ -1244,7 +1262,7 @@ pub(in crate::node) struct NetBehaviour {
 
 #[derive(Debug)]
 pub(in crate::node) enum NetEvent {
-    Freenet(Box<Message>),
+    Freenet(Box<NetMessage>),
     Identify(Box<identify::Event>),
     Ping(ping::Event),
     Autonat(autonat::Event),
@@ -1268,8 +1286,8 @@ impl From<ping::Event> for NetEvent {
     }
 }
 
-impl From<Message> for NetEvent {
-    fn from(event: Message) -> NetEvent {
+impl From<NetMessage> for NetEvent {
+    fn from(event: NetMessage) -> NetEvent {
         Self::Freenet(Box::new(event))
     }
 }

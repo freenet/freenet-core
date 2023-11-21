@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, File, OpenOptions},
-    io::{BufWriter, Write},
+    fs::{self, File},
+    io::Write,
     path::PathBuf,
     sync::Arc,
 };
@@ -12,7 +12,10 @@ use dashmap::DashMap;
 use freenet_stdlib::{client_api::DelegateRequest, prelude::*};
 use once_cell::sync::Lazy;
 
-use super::{store::StoreFsManagement, RuntimeResult};
+use super::{
+    store::{SafeWriter, StoreFsManagement},
+    RuntimeResult,
+};
 
 type SecretKey = [u8; 32];
 
@@ -38,10 +41,9 @@ pub struct SecretsStore {
     base_path: PathBuf,
     ciphers: HashMap<DelegateKey, Encryption>,
     key_to_secret_part: Arc<DashMap<DelegateKey, (u64, HashSet<SecretKey>)>>,
-    index_file: BufWriter<File>,
+    index_file: SafeWriter<Self>,
+    key_file: PathBuf,
 }
-
-static KEY_FILE_PATH: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
 
 pub(super) struct ConcatenatedSecretKeys(Vec<u8>);
 
@@ -108,13 +110,7 @@ static DEFAULT_ENCRYPTION: Lazy<Encryption> = Lazy::new(|| Encryption {
 impl SecretsStore {
     pub fn new(secrets_dir: PathBuf) -> RuntimeResult<Self> {
         let mut key_to_secret_part = Arc::new(DashMap::new());
-        let key_file = match KEY_FILE_PATH
-            .try_insert(secrets_dir.join("KEY_DATA"))
-            .map_err(|(e, _)| e)
-        {
-            Ok(f) => f,
-            Err(f) => f,
-        };
+        let key_file = secrets_dir.join("KEY_DATA");
         if !key_file.exists() {
             std::fs::create_dir_all(&secrets_dir).map_err(|err| {
                 tracing::error!("error creating delegate dir: {err}");
@@ -122,17 +118,17 @@ impl SecretsStore {
             })?;
             File::create(secrets_dir.join("KEY_DATA"))?;
         } else {
-            Self::load_from_file(key_file, &mut key_to_secret_part)?;
+            Self::load_from_file(&key_file, &mut key_to_secret_part)?;
         }
-        Self::watch_changes(key_to_secret_part.clone(), key_file)?;
+        Self::watch_changes(key_to_secret_part.clone(), &key_file)?;
 
-        let index_file =
-            std::io::BufWriter::new(OpenOptions::new().append(true).read(true).open(key_file)?);
+        let index_file = SafeWriter::new(&key_file, false)?;
         Ok(Self {
             base_path: secrets_dir,
             ciphers: HashMap::new(),
             key_to_secret_part,
             index_file,
+            key_file,
         })
     }
 
@@ -183,10 +179,7 @@ impl SecretsStore {
                     value.extend_from_slice(hash);
                 }
                 // first mark the old entry (if it exists) as removed
-                Self::remove(
-                    KEY_FILE_PATH.get().expect("should be set"),
-                    current_version_offset,
-                )?;
+                Self::remove(&self.key_file, current_version_offset)?;
                 let new_offset = Self::insert(
                     &mut self.index_file,
                     delegate.clone(),

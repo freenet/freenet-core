@@ -4,9 +4,9 @@ use freenet_stdlib::prelude::{ContractCode, DelegateCode};
 
 use crate::Error;
 
-/// Inspect a contract, delegate or freenet kernel compatible executable code properties.
+/// Inspect a contract, delegate or freenet core compatible executable code properties.
 #[derive(clap::Parser, Clone)]
-pub struct InspectCliConfig {
+pub struct InspectConfig {
     #[clap(subcommand)]
     r#type: FileType,
     file: PathBuf,
@@ -22,7 +22,7 @@ enum FileType {
 #[derive(clap::Parser, Clone)]
 struct CodeInspection {}
 
-pub fn inspect(config: InspectCliConfig) -> Result<(), anyhow::Error> {
+pub fn inspect(config: InspectConfig) -> Result<(), anyhow::Error> {
     if !config.file.exists() {
         return Err(Error::CommandFailed("couldn't find file").into());
     }

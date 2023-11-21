@@ -18,7 +18,7 @@ use super::{
 };
 use crate::client_events::HostResult;
 use crate::message::Transaction;
-use crate::{client_events::ClientId, node::NodeConfig, runtime::Runtime, DynError};
+use crate::{client_events::ClientId, node::PeerCliConfig, runtime::Runtime, DynError};
 
 pub(crate) struct ClientResponses(UnboundedReceiver<(ClientId, HostResult)>);
 
@@ -86,7 +86,7 @@ pub(crate) struct NetworkContractHandler<R = Runtime> {
 }
 
 impl ContractHandler for NetworkContractHandler<Runtime> {
-    type Builder = NodeConfig;
+    type Builder = PeerCliConfig;
     type ContractExecutor = Executor<Runtime>;
 
     fn build(
@@ -138,13 +138,13 @@ impl ContractHandler for NetworkContractHandler<super::MockRuntime> {
     fn build(
         channel: ContractHandlerChannel<ContractHandlerHalve>,
         _executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
-        data_dir: Self::Builder,
+        identifier: Self::Builder,
     ) -> BoxFuture<'static, Result<Self, DynError>>
     where
         Self: Sized + 'static,
     {
         async move {
-            let executor = Executor::new_mock(&data_dir).await?;
+            let executor = Executor::new_mock(&identifier).await?;
             Ok(Self { executor, channel })
         }
         .boxed()

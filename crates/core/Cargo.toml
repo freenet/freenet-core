@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2021"
 rust-version = "1.71.1"
 publish =  true
@@ -35,7 +35,6 @@ delegate = "0.10"
 directories = "5"
 either = { features = ["serde"], workspace = true }
 fastrand = { workspace = true }
-fs4 = "0.7"
 futures = "0.3.21"
 itertools = "0.11"
 libp2p = { default-features = false, features = ["autonat", "dns", "ed25519", "identify", "macros", "noise", "ping", "tcp", "tokio", "yamux"], version = "0.52.3" }
@@ -54,7 +53,7 @@ sqlx = { features = ["runtime-tokio-rustls", "sqlite"], optional = true, version
 stretto = { features = ["async", "sync"], version = "0.8" }
 tar = { version = "0.4.38" }
 thiserror = "1"
-tokio = { features = ["fs", "macros", "rt-multi-thread", "sync"], version = "1" }
+tokio = { features = ["fs", "macros", "rt-multi-thread", "sync", "process"], version = "1" }
 tower-http = { features = ["fs", "trace"], version = "0.4" }
 ulid = { features = ["serde"], version = "0.4" }
 unsigned-varint = "0.7"
@@ -75,7 +74,7 @@ freenet-stdlib = { features = ["net"], workspace = true }
 arbitrary = { features = ["derive"], version = "1" }
 chrono = { features = ["arbitrary"], workspace = true }
 freenet-stdlib = { features = ["net", "testing"], workspace = true }
-itertools = "0.11"
+itertools = "0.12"
 pav_regression = "0.4.0"
 pico-args = "0.5"
 statrs = "0.16.0"

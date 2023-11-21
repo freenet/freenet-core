@@ -146,7 +146,7 @@ impl TopologyManager {
                 location
             }
             Err(_) => {
-                tracing::warn!(
+                tracing::debug!(
                     "An error occurred while getting max density, falling back to random location"
                 );
                 self.random_location()
