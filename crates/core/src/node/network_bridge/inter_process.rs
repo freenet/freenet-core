@@ -48,7 +48,10 @@ impl InterProcessConnManager {
         let msg_len = u32::from_le_bytes(msg_len) as usize;
         let buf = &mut vec![0u8; msg_len];
         stdout.read_exact(buf).await?;
-        bincode::deserialize(buf).map_err(|_| std::io::ErrorKind::Other.into())
+        let (target, data) = bincode::deserialize(buf)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::Other))?;
+        tracing::debug!(%target, "network message received");
+        Ok((target, data))
     }
 }
 
@@ -59,7 +62,7 @@ impl NetworkBridgeExt for InterProcessConnManager {
                 .changed()
                 .await
                 .map_err(|_| ConnectionError::Timeout)?;
-            let data = &*self.recv.borrow();
+            let data = &*self.recv.borrow_and_update();
             let deser = bincode::deserialize(data)?;
             Ok(deser)
         }
@@ -70,7 +73,7 @@ impl NetworkBridgeExt for InterProcessConnManager {
 #[async_trait::async_trait]
 impl NetworkBridge for InterProcessConnManager {
     async fn send(&self, target: &PeerId, msg: NetMessage) -> super::ConnResult<()> {
-        let data = bincode::serialize(&(*target, msg)).expect("proper encoding");
+        let data = bincode::serialize(&(*target, msg))?;
         let output = &mut *self.output.lock().await;
         output.write_all(&(data.len() as u32).to_le_bytes()).await?;
         output.write_all(&data).await?;

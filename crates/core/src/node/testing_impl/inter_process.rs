@@ -24,10 +24,6 @@ impl SimPeer {
     where
         UsrEv: ClientEventsProxy + Send + 'static,
     {
-        // disable console logging but enable trace collector (if it's enabled)
-        std::env::set_var("FREENET_DISABLE_LOGS", "1");
-        crate::config::set_logger();
-
         let event_register = {
             #[cfg(feature = "trace-ot")]
             {

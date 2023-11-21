@@ -2,17 +2,18 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Write,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use either::Either;
 use freenet_stdlib::prelude::*;
-use futures::future::BoxFuture;
+use futures::{future::BoxFuture, Future};
 use itertools::Itertools;
 use libp2p::{identity, PeerId as Libp2pPeerId};
 use rand::{seq::SliceRandom, Rng};
-use tokio::sync::watch::{channel, Receiver, Sender};
+use tokio::sync::{mpsc, watch};
 use tracing::{info, Instrument};
 
 #[cfg(feature = "trace-ot")]
@@ -132,19 +133,21 @@ struct GatewayConfig {
     location: Location,
 }
 
-pub struct EventChain {
+pub struct EventChain<S = watch::Sender<(EventId, PeerId)>> {
     labels: Vec<(NodeLabel, PeerId)>,
-    user_ev_controller: Sender<(EventId, PeerId)>,
+    // user_ev_controller: Sender<(EventId, PeerId)>,
+    user_ev_controller: S,
     total_events: u32,
     count: u32,
     rng: rand::rngs::SmallRng,
     clean_up_tmp_dirs: bool,
+    choice: Option<PeerId>,
 }
 
-impl EventChain {
+impl<S> EventChain<S> {
     pub fn new(
         labels: Vec<(NodeLabel, PeerId)>,
-        user_ev_controller: Sender<(EventId, PeerId)>,
+        user_ev_controller: S,
         total_events: u32,
         clean_up_tmp_dirs: bool,
     ) -> Self {
@@ -156,26 +159,104 @@ impl EventChain {
             count: 0,
             rng: rand::rngs::SmallRng::seed_from_u64(SEED),
             clean_up_tmp_dirs,
+            choice: None,
+        }
+    }
+
+    fn increment_count(self: Pin<&mut Self>) {
+        unsafe {
+            // This is safe because we're not moving the EventChain, just modifying a field
+            let this = self.get_unchecked_mut();
+            this.count += 1;
+        }
+    }
+
+    fn choose_peer(self: Pin<&mut Self>) -> PeerId {
+        let this = unsafe {
+            // This is safe because we're not moving the EventChain, just copying one inner valur
+            self.get_unchecked_mut()
+        };
+        if let Some(id) = this.choice.take() {
+            return id;
+        }
+        let rng = &mut this.rng;
+        let labels = &mut this.labels;
+        let (_, id) = labels.choose(rng).expect("not empty");
+        *id
+    }
+
+    fn set_choice(self: Pin<&mut Self>, id: PeerId) {
+        let this = unsafe {
+            // This is safe because we're not moving the EventChain, just copying one inner valur
+            self.get_unchecked_mut()
+        };
+        this.choice = Some(id);
+    }
+}
+
+trait EventSender {
+    fn send(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        value: (EventId, PeerId),
+    ) -> std::task::Poll<Result<(), ()>>;
+}
+
+impl EventSender for mpsc::Sender<(EventId, PeerId)> {
+    fn send(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        value: (EventId, PeerId),
+    ) -> std::task::Poll<Result<(), ()>> {
+        let f = self.send(value);
+        futures::pin_mut!(f);
+        f.poll(cx).map(|r| r.map_err(|_| ()))
+    }
+}
+
+impl EventSender for watch::Sender<(EventId, PeerId)> {
+    fn send(
+        &self,
+        _cx: &mut std::task::Context<'_>,
+        value: (EventId, PeerId),
+    ) -> std::task::Poll<Result<(), ()>> {
+        match self.send(value) {
+            Ok(_) => std::task::Poll::Ready(Ok(())),
+            Err(_) => std::task::Poll::Ready(Err(())),
         }
     }
 }
 
-impl Iterator for EventChain {
+impl<S: EventSender> futures::stream::Stream for EventChain<S> {
     type Item = EventId;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        (self.count < self.total_events).then(|| {
-            let (_, id) = self.labels.choose(&mut self.rng).expect("not empty");
-            self.user_ev_controller
-                .send((self.count, *id))
-                .expect("peer controller should be alive");
-            self.count += 1;
-            self.count
-        })
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.count < self.total_events {
+            let id = self.as_mut().choose_peer();
+            match self
+                .user_ev_controller
+                .send(cx, (self.count, id))
+                .map_err(|_| {
+                    tracing::error!("peer controller should be alive, finishing event chain")
+                }) {
+                std::task::Poll::Ready(_) => {}
+                std::task::Poll::Pending => {
+                    self.as_mut().set_choice(id);
+                    return std::task::Poll::Pending;
+                }
+            }
+            self.as_mut().increment_count();
+            std::task::Poll::Ready(Some(self.count))
+        } else {
+            std::task::Poll::Ready(None)
+        }
     }
 }
 
-impl Drop for EventChain {
+impl<S> Drop for EventChain<S> {
     fn drop(&mut self) {
         if self.clean_up_tmp_dirs {
             clean_up_tmp_dirs(&self.labels)
@@ -226,8 +307,8 @@ pub struct SimNetwork {
     clean_up_tmp_dirs: bool,
     labels: Vec<(NodeLabel, PeerId)>,
     pub(crate) event_listener: TestEventListener,
-    user_ev_controller: Option<Sender<(EventId, PeerId)>>,
-    receiver_ch: Receiver<(EventId, PeerId)>,
+    user_ev_controller: Option<watch::Sender<(EventId, PeerId)>>,
+    receiver_ch: watch::Receiver<(EventId, PeerId)>,
     number_of_gateways: usize,
     gateways: Vec<(Builder<DefaultRegistry>, GatewayConfig)>,
     number_of_nodes: usize,
@@ -251,7 +332,8 @@ impl SimNetwork {
         min_connections: usize,
     ) -> Self {
         assert!(gateways > 0 && nodes > 0);
-        let (user_ev_controller, receiver_ch) = channel((0, PeerId::random()));
+        let (user_ev_controller, mut receiver_ch) = watch::channel((0, PeerId::random()));
+        receiver_ch.borrow_and_update();
         let mut net = Self {
             name: name.into(),
             clean_up_tmp_dirs: true,
@@ -641,7 +723,7 @@ impl SimNetwork {
     pub fn event_chain(
         mut self,
         total_events: u32,
-        controller: Option<Sender<(EventId, PeerId)>>,
+        controller: Option<watch::Sender<(EventId, PeerId)>>,
     ) -> EventChain {
         let user_ev_controller = controller.unwrap_or_else(|| {
             self.user_ev_controller

@@ -260,7 +260,7 @@ pub(crate) mod test {
             async {
                 loop {
                     if self.signal.changed().await.is_ok() {
-                        let (ev_id, pk) = *self.signal.borrow();
+                        let (ev_id, pk) = *self.signal.borrow_and_update();
                         if self.rng.is_some() && pk == self.id {
                             let res = OpenRequest {
                                 client_id: ClientId::FIRST,

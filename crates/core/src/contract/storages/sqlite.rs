@@ -28,12 +28,13 @@ async fn create_contracts_table(pool: &SqlitePool) -> Result<(), SqlDbError> {
 pub struct Pool(SqlitePool);
 
 impl Pool {
-    pub async fn new(db_path: Option<&Path>) -> Result<Self, SqlDbError> {
-        let opts = if let Some(db_path) = db_path {
-            tracing::info!("loading contract store from {db_path:?}");
+    pub async fn new(db_dir: Option<&Path>) -> Result<Self, SqlDbError> {
+        let opts = if let Some(db_dir) = db_dir {
+            let file = db_dir.join("freenet.db");
+            tracing::info!("loading contract store from {file:?}");
             SqliteConnectOptions::new()
                 .create_if_missing(true)
-                .filename(db_path)
+                .filename(file)
         } else {
             SqliteConnectOptions::from_str("sqlite::memory:").unwrap()
         };

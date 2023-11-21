@@ -14,6 +14,7 @@ use std::{
 use directories::ProjectDirs;
 use libp2p::{identity, PeerId};
 use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 
 use crate::local_node::OperationMode;
@@ -102,7 +103,7 @@ pub struct ConfigPaths {
     delegates_dir: PathBuf,
     secrets_dir: PathBuf,
     db_dir: PathBuf,
-    event_log: PathBuf,
+    event_log: Mutex<PathBuf>,
 }
 
 impl ConfigPaths {
@@ -157,7 +158,7 @@ impl ConfigPaths {
             delegates_dir,
             secrets_dir,
             db_dir,
-            event_log,
+            event_log: Mutex::new(event_log),
         })
     }
 }
@@ -170,6 +171,7 @@ impl Config {
             .store(local_mode, std::sync::atomic::Ordering::SeqCst);
     }
 
+    #[cfg(feature = "trace-ot")]
     fn node_mode() -> OperationMode {
         if Self::conf()
             .local_mode
@@ -215,12 +217,22 @@ impl Config {
 
     pub fn event_log(&self) -> PathBuf {
         if self.local_mode.load(std::sync::atomic::Ordering::SeqCst) {
-            let mut local_file = self.config_paths.event_log.clone();
+            let mut local_file = self.config_paths.event_log.lock().clone();
             local_file.set_file_name("_EVENT_LOG_LOCAL");
             local_file
         } else {
-            self.config_paths.event_log.to_owned()
+            self.config_paths.event_log.lock().to_owned()
         }
+    }
+
+    pub fn set_event_log(path: PathBuf) {
+        tracing::debug!("setting event log file to: {:?}", &path);
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&path)
+            .expect("couln't create event log file");
+        *Self::conf().config_paths.event_log.lock() = path;
     }
 
     pub fn conf() -> &'static Config {
@@ -377,16 +389,14 @@ mod tracer {
 
     use crate::DynError;
 
-    use super::*;
-
     pub fn init_tracer() -> Result<(), DynError> {
-        let filter = if cfg!(any(test, debug_assertions)) {
+        let default_filter = if cfg!(any(test, debug_assertions)) {
             tracing_subscriber::filter::LevelFilter::DEBUG
         } else {
             tracing_subscriber::filter::LevelFilter::INFO
         };
         let filter_layer = tracing_subscriber::EnvFilter::builder()
-            .with_default_directive(filter.into())
+            .with_default_directive(default_filter.into())
             .from_env_lossy()
             .add_directive("stretto=off".parse().expect("infallible"))
             .add_directive("sqlx=error".parse().expect("infallible"));
@@ -395,6 +405,7 @@ mod tracer {
         use tracing_subscriber::layer::SubscriberExt;
 
         let disabled_logs = std::env::var("FREENET_DISABLE_LOGS").is_ok();
+        let to_stderr = std::env::var("FREENET_LOG_TO_STDERR").is_ok();
         let layers = {
             let fmt_layer = tracing_subscriber::fmt::layer().with_level(true);
             let fmt_layer = if cfg!(any(test, debug_assertions)) {
@@ -402,9 +413,17 @@ mod tracer {
             } else {
                 fmt_layer
             };
+            let fmt_layer = if to_stderr {
+                fmt_layer.with_writer(std::io::stderr).boxed()
+            } else {
+                fmt_layer.boxed()
+            };
+
             #[cfg(feature = "trace-ot")]
             {
+                use super::*;
                 let disabled_ot_traces = std::env::var("FREENET_DISABLE_TRACES").is_ok();
+                // FIXME
                 let identifier = if matches!(Config::node_mode(), OperationMode::Local) {
                     "freenet-core".to_string()
                 } else {

@@ -391,7 +391,7 @@ impl<R> Executor<R> {
         const MAX_MEM_CACHE: u32 = 10_000_000;
         let static_conf = crate::config::Config::conf();
 
-        let db_path = crate::config::Config::conf().db_dir().join("freenet.db");
+        let db_path = crate::config::Config::conf().db_dir();
         let state_store =
             StateStore::new(Storage::new(Some(&db_path)).await?, MAX_MEM_CACHE).unwrap();
 
@@ -1199,15 +1199,18 @@ impl Executor<Runtime> {
 }
 
 impl Executor<crate::contract::MockRuntime> {
-    pub async fn new_mock(data_dir: &str) -> Result<Self, DynError> {
-        let tmp_path = std::env::temp_dir().join(format!("freenet-executor-{data_dir}"));
+    pub async fn new_mock(identifier: &str) -> Result<Self, DynError> {
+        let data_dir = std::env::temp_dir().join(format!("freenet-executor-{identifier}"));
 
-        let contracts_data_dir = tmp_path.join("contracts");
+        let contracts_data_dir = data_dir.join("contracts");
         std::fs::create_dir_all(&contracts_data_dir).expect("directory created");
         let contract_store = ContractStore::new(contracts_data_dir, u16::MAX as i64)?;
 
-        let db_path = tmp_path.join("freenet.db");
+        let db_path = data_dir.join("db");
         std::fs::create_dir_all(&db_path).expect("directory created");
+        let log_file = data_dir.join("_EVENT_LOG_LOCAL");
+        eprintln!("{log_file:?}");
+        crate::config::Config::set_event_log(log_file);
         let state_store =
             StateStore::new(Storage::new(Some(&db_path)).await?, u16::MAX as u32).unwrap();
 
@@ -1340,8 +1343,8 @@ mod test {
     async fn local_node_handle() -> Result<(), Box<dyn std::error::Error>> {
         const MAX_SIZE: i64 = 10 * 1024 * 1024;
         const MAX_MEM_CACHE: u32 = 10_000_000;
-        let tmp_path = std::env::temp_dir().join("freenet-test");
-        let contract_store = ContractStore::new(tmp_path.join("executor-test"), MAX_SIZE)?;
+        let tmp_dir = tempfile::tempdir()?;
+        let contract_store = ContractStore::new(tmp_dir.path().join("executor-test"), MAX_SIZE)?;
         let state_store = StateStore::new(Storage::new(None).await?, MAX_MEM_CACHE).unwrap();
         let mut counter = 0;
         Executor::new(

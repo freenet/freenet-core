@@ -490,6 +490,7 @@ impl EventRegister {
             Ok(())
         }
 
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await; // wait for the node to start
         let event_log_path = crate::config::Config::conf().event_log();
         tracing::info!(?event_log_path);
         let mut event_log = match OpenOptions::new()
