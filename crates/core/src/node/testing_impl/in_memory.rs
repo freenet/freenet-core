@@ -33,6 +33,7 @@ impl<ER> Builder<ER> {
         let (notification_channel, notification_tx) = EventLoopNotifications::channel();
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
 
+        let _guard = parent_span.enter();
         let op_storage = Arc::new(OpManager::new(
             notification_tx,
             ops_ch_channel,
@@ -40,6 +41,7 @@ impl<ER> Builder<ER> {
             &gateways,
             self.event_register.clone(),
         )?);
+        std::mem::drop(_guard);
         let (_executor_listener, executor_sender) = executor_channel(op_storage.clone());
         let contract_handler =
             MemoryContractHandler::build(ch_channel, executor_sender, self.contract_handler_name)

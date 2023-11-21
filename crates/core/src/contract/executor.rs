@@ -1209,7 +1209,6 @@ impl Executor<crate::contract::MockRuntime> {
         let db_path = data_dir.join("db");
         std::fs::create_dir_all(&db_path).expect("directory created");
         let log_file = data_dir.join("_EVENT_LOG_LOCAL");
-        eprintln!("{log_file:?}");
         crate::config::Config::set_event_log(log_file);
         let state_store =
             StateStore::new(Storage::new(Some(&db_path)).await?, u16::MAX as u32).unwrap();

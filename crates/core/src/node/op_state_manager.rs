@@ -70,7 +70,12 @@ impl OpManager {
         let ops = Arc::new(Ops::default());
 
         let (new_transactions, rx) = tokio::sync::mpsc::channel(100);
-        let parent_span = tracing::Span::current();
+        let current_span = tracing::Span::current();
+        let garbage_span = if current_span.is_none() {
+            tracing::info_span!("garbage_cleanup_task")
+        } else {
+            tracing::info_span!(parent: current_span, "garbage_cleanup_task")
+        };
         GlobalExecutor::spawn(
             garbage_cleanup_task(
                 rx,
@@ -78,7 +83,7 @@ impl OpManager {
                 ring.live_tx_tracker.clone(),
                 event_register,
             )
-            .instrument(tracing::info_span!(parent: parent_span, "garbage_cleanup_task")),
+            .instrument(garbage_span),
         );
 
         Ok(Self {

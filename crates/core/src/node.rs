@@ -406,7 +406,11 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
                     key: _key,
                     data: _delta,
                 } => {
-                    todo!()
+                    // FIXME: DO THIS
+                    tracing::debug!(
+                        this_peer = %op_storage.ring.peer_key,
+                        "Received update from user event",
+                    );
                 }
                 ContractRequest::Get {
                     key,
@@ -414,8 +418,8 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
                 } => {
                     // Initialize a get op.
                     tracing::debug!(
-                        "Received get from user event @ {}",
-                        &op_storage.ring.peer_key
+                        this_peer = %op_storage.ring.peer_key,
+                        "Received get from user event",
                     );
                     let op = get::start_op(key, contract);
                     if let Err(err) = get::request_get(&op_storage, op, Some(client_id)).await {
@@ -479,10 +483,9 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
             }
         }
     };
-    GlobalExecutor::spawn(fut.instrument(tracing::span!(
-        tracing::Level::INFO,
-        "process_client_request"
-    )));
+    GlobalExecutor::spawn(fut.instrument(
+        tracing::info_span!(parent: tracing::Span::current(), "process_client_request"),
+    ));
 }
 
 #[allow(unused)]
@@ -490,8 +493,8 @@ macro_rules! log_handling_msg {
     ($op:expr, $id:expr, $op_storage:ident) => {
         tracing::debug!(
             tx = %$id,
-            concat!("Handling ", $op, " request @ {}"),
-            $op_storage.ring.peer_key,
+            this_peer = %$op_storage.ring.peer_key,
+            concat!("Handling ", $op, " request"),
         );
     };
 }

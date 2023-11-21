@@ -297,11 +297,16 @@ impl Ring {
         }
 
         let ring = Arc::new(ring);
-        let parent_span = tracing::Span::current();
+        let current_span = tracing::Span::current();
+        let span = if current_span.is_none() {
+            tracing::info_span!("connection_maintenance")
+        } else {
+            tracing::info_span!(parent: current_span, "connection_maintenance")
+        };
         GlobalExecutor::spawn(
             ring.clone()
                 .connection_maintenance(event_loop_notifier, live_tx_tracker, missing_candidate_rx)
-                .instrument(tracing::info_span!(parent: parent_span, "connection_maintenance")),
+                .instrument(span),
         );
         Ok(ring)
     }
@@ -696,7 +701,7 @@ impl Ring {
                     match loc {
                         Ok(loc) => loc,
                         Err(_) => {
-                            tracing::debug!(peer = %self.own_location(), "Insufficient data gathered by the topology manager");
+                            tracing::trace!(peer = %self.own_location(), "Insufficient data gathered by the topology manager");
                             acquire_max_connections.tick().await;
                             continue;
                         }

@@ -2,7 +2,7 @@ use std::sync::{Arc, OnceLock};
 
 use futures::{future::BoxFuture, FutureExt};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, BufWriter, Stdout},
     sync::{
         watch::{Receiver, Sender},
         Mutex,
@@ -23,7 +23,7 @@ static INCOMING_DATA: OnceLock<Sender<Data>> = OnceLock::new();
 #[derive(Clone)]
 pub struct InterProcessConnManager {
     recv: Receiver<Data>,
-    output: Arc<Mutex<tokio::io::Stdout>>,
+    output: Arc<Mutex<BufWriter<Stdout>>>,
 }
 
 impl InterProcessConnManager {
@@ -32,7 +32,7 @@ impl InterProcessConnManager {
         INCOMING_DATA.set(sender).expect("shouldn't be set");
         Self {
             recv,
-            output: Arc::new(Mutex::new(tokio::io::stdout())),
+            output: Arc::new(Mutex::new(BufWriter::new(tokio::io::stdout()))),
         }
     }
 
@@ -42,16 +42,23 @@ impl InterProcessConnManager {
 
     pub async fn pull_msg(
         stdout: &mut tokio::process::ChildStdout,
-    ) -> std::io::Result<(PeerId, Data)> {
+    ) -> std::io::Result<Option<(PeerId, Data)>> {
         let mut msg_len = [0u8; 4];
-        stdout.read_exact(&mut msg_len).await?;
+        let Ok(read_res) = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            stdout.read_exact(&mut msg_len),
+        )
+        .await
+        else {
+            return Ok(None);
+        };
+        read_res?;
         let msg_len = u32::from_le_bytes(msg_len) as usize;
         let buf = &mut vec![0u8; msg_len];
         stdout.read_exact(buf).await?;
         let (target, data) = bincode::deserialize(buf)
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::Other))?;
-        tracing::debug!(%target, "network message received");
-        Ok((target, data))
+        Ok(Some((target, data)))
     }
 }
 
@@ -62,7 +69,7 @@ impl NetworkBridgeExt for InterProcessConnManager {
                 .changed()
                 .await
                 .map_err(|_| ConnectionError::Timeout)?;
-            let data = &*self.recv.borrow_and_update();
+            let data = &*self.recv.borrow();
             let deser = bincode::deserialize(data)?;
             Ok(deser)
         }
@@ -73,10 +80,13 @@ impl NetworkBridgeExt for InterProcessConnManager {
 #[async_trait::async_trait]
 impl NetworkBridge for InterProcessConnManager {
     async fn send(&self, target: &PeerId, msg: NetMessage) -> super::ConnResult<()> {
+        tracing::debug!(%target, ?msg, "sending network message out");
         let data = bincode::serialize(&(*target, msg))?;
         let output = &mut *self.output.lock().await;
         output.write_all(&(data.len() as u32).to_le_bytes()).await?;
         output.write_all(&data).await?;
+        output.flush().await?;
+        tracing::debug!(%target, bytes = data.len(), "sent network message out");
         Ok(())
     }
 

@@ -145,9 +145,10 @@ mod multiple_process {
         SimPeer,
     };
     use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
+    use rand::Rng;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt, BufReader, Stdin},
-        process::Command,
+        process::{ChildStdout, Command},
     };
 
     use super::Error;
@@ -239,9 +240,10 @@ mod multiple_process {
         let seed = config.seed();
         let mut supervisor = Supervisor {
             processes: HashMap::new(),
-            event_rx: Some(event_rx),
-            waiting_response: FuturesUnordered::new(),
             queued: HashMap::new(),
+            sending: FuturesUnordered::new(),
+            responses: FuturesUnordered::new(),
+            event_rx: Some(event_rx),
         };
         let cmd_args = config.subprocess_command(seed);
         for (label, node) in &peers {
@@ -324,10 +326,11 @@ mod multiple_process {
     /// Event driver for the supervisor process.
     struct Supervisor {
         processes: HashMap<PeerId, SubProcess>,
-        event_rx: Option<tokio::sync::mpsc::Receiver<(u32, PeerId)>>,
-        waiting_response:
-            FuturesUnordered<BoxFuture<'static, anyhow::Result<(SubProcess, ChildResponses)>>>,
         queued: HashMap<PeerId, VecDeque<IPCMessage>>,
+        sending: FuturesUnordered<BoxFuture<'static, anyhow::Result<SubProcess>>>,
+        responses:
+            FuturesUnordered<BoxFuture<'static, anyhow::Result<(ChildStdout, ChildResponses)>>>,
+        event_rx: Option<tokio::sync::mpsc::Receiver<(u32, PeerId)>>,
     }
 
     impl Supervisor {
@@ -338,13 +341,22 @@ mod multiple_process {
             let mut event_rx = self.event_rx.take().expect("should be set");
             let mut finished_events = false;
 
+            for child_stdout in self
+                .processes
+                .values_mut()
+                .map(|sp| sp.child.stdout.take().expect("should be set"))
+            {
+                self.responses
+                    .push(SubProcess::get_child_responses(child_stdout).boxed());
+            }
+
             loop {
                 tokio::select! {
                     _ = &mut ctrl_c  /* SIGINT handling */ => {
                         break;
                     }
-                    res = self.waiting_response.next() => {
-                        let (subprocess, responses) = match res {
+                    res = self.responses.next(), if !self.responses.is_empty() => {
+                        let (child_stdout, responses) = match res {
                             Some(Ok(res)) => res,
                             Some(Err(err)) => {
                                 tracing::error!("Error processing responses: {err}");
@@ -354,11 +366,36 @@ mod multiple_process {
                                 continue;
                             }
                         };
-                        if let Err(err) = self.process_responses(subprocess, responses).await {
-                            tracing::error!("Error processing responses: {err}");
-                            return Err(err);
+                        self.responses.push(SubProcess::get_child_responses(child_stdout).boxed());
+                        self.process_responses(responses);
+                    }
+                    completed_send = self.sending.next(), if !self.sending.is_empty() => {
+                        let mut subprocess = match completed_send {
+                            Some(Ok(res)) => res,
+                            Some(Err(err)) => {
+                                tracing::error!("Error sending message: {err}");
+                                return Err(err);
+                            }
+                            None => {
+                                continue;
+                            }
+                        };
+                        let peer_queue = &mut *self.queued.entry(subprocess.id).or_default();
+                        if !peer_queue.is_empty() {
+                            let n = rand::thread_rng().gen_range(0..=peer_queue.len());
+                            let messages = peer_queue.drain(..n).collect::<Vec<_>>();
+                            let task = async move {
+                                let stdin = subprocess.child.stdin.as_mut().expect("not taken");
+                                tracing::debug!(peer = %subprocess.id, "Draining {} messages from queue", n + 1);
+                                for pending in messages {
+                                        pending.send(stdin).await?;
+                                }
+                                Ok(subprocess)
+                            }.boxed();
+                            self.sending.push(task);
+                        } else {
+                            self.processes.insert(subprocess.id, subprocess);
                         }
-
                     }
                     event = event_rx.recv(), if !finished_events => {
                         let Some((event, peer)) = event else {
@@ -366,7 +403,6 @@ mod multiple_process {
                             finished_events = true;
                             continue;
                         };
-                        tracing::debug!("Event {event} fired for {peer}");
                         let Some(mut subprocess) = self.processes.remove(&peer) else {
                             self.queued.entry(peer).or_default().push_back(IPCMessage::FiredEvent(event));
                             continue;
@@ -378,17 +414,9 @@ mod multiple_process {
                                 msg.send(subprocess.child.stdin.as_mut().expect("not taken"))
                                 .await?;
                             }
-                            let mut returned = vec![];
-                            while let Ok((target, msg)) = InterProcessConnManager::pull_msg(
-                                subprocess.child.stdout.as_mut().expect("stdout not taken"),
-                            )
-                            .await
-                            {
-                                returned.push((target, msg));
-                            }
-                            Ok((subprocess, returned))
+                            Ok(subprocess)
                         }.boxed();
-                        self.waiting_response.push(task);
+                        self.sending.push(task);
                     }
                 }
             }
@@ -399,41 +427,24 @@ mod multiple_process {
             Ok(())
         }
 
-        async fn process_responses(
-            &mut self,
-            mut subprocess: SubProcess,
-            responses: ChildResponses,
-        ) -> anyhow::Result<()> {
+        fn process_responses(&mut self, responses: ChildResponses) {
             for (target, data) in responses {
-                if let Some(target) = self.processes.remove(&target) {
-                    tracing::debug!(to = %subprocess.id, "sending message");
-                    let task = async move { target.send_msg(IPCMessage::Data(data)).await }.boxed();
-                    self.waiting_response.push(task);
+                if let Some(mut target) = self.processes.remove(&target) {
+                    tracing::debug!(to = %target.id, "Sending message");
+                    let task = async move {
+                        target.send_msg(IPCMessage::Data(data)).await?;
+                        Ok(target)
+                    }
+                    .boxed();
+                    self.sending.push(task);
                 } else {
+                    tracing::debug!(%target, "Queuing message");
                     self.queued
                         .entry(target)
                         .or_default()
                         .push_back(IPCMessage::Data(data));
                 }
             }
-            if let Some(mut queued) = self.queued.remove(&subprocess.id) {
-                for msg in queued.drain(..) {
-                    msg.send(subprocess.child.stdin.as_mut().expect("not taken"))
-                        .await?;
-                    while let Ok((target, data)) = InterProcessConnManager::pull_msg(
-                        subprocess.child.stdout.as_mut().expect("stdout not taken"),
-                    )
-                    .await
-                    {
-                        self.queued
-                            .entry(target)
-                            .or_default()
-                            .push_back(IPCMessage::Data(data));
-                    }
-                }
-            }
-            self.processes.insert(subprocess.id, subprocess);
-            Ok(())
         }
     }
 
@@ -470,18 +481,33 @@ mod multiple_process {
             Ok(())
         }
 
-        async fn send_msg(mut self, msg: IPCMessage) -> anyhow::Result<(Self, ChildResponses)> {
+        #[inline]
+        async fn send_msg(&mut self, msg: IPCMessage) -> anyhow::Result<()> {
             msg.send(self.child.stdin.as_mut().expect("not taken"))
                 .await?;
+            Ok(())
+        }
+
+        async fn get_child_responses(
+            mut stdout: ChildStdout,
+        ) -> anyhow::Result<(ChildStdout, Vec<(PeerId, Vec<u8>)>)> {
             let mut returned = vec![];
-            while let Ok((target, msg)) = InterProcessConnManager::pull_msg(
-                self.child.stdout.as_mut().expect("stdout not taken"),
-            )
-            .await
-            {
-                returned.push((target, msg));
+            loop {
+                match InterProcessConnManager::pull_msg(&mut stdout).await {
+                    Ok(Some((target, data))) => {
+                        returned.push((target, data));
+                    }
+                    Ok(None) if !returned.is_empty() => {
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        return Err(err.into());
+                    }
+                }
             }
-            Ok((self, returned))
+            tracing::debug!(len = %returned.len(), "Returning messages");
+            Ok((stdout, returned))
         }
 
         async fn close(mut self) {
@@ -497,7 +523,6 @@ mod multiple_process {
     async fn child(config: &super::TestConfig, id: usize) -> anyhow::Result<()> {
         // write logs to stderr so stdout and stdin are free of unexpected data
         std::env::set_var("FREENET_LOG_TO_STDERR", "1");
-        freenet::config::set_logger();
 
         let (user_ev_controller, mut receiver_ch) =
             tokio::sync::watch::channel((0, PeerId::random()));
@@ -509,6 +534,8 @@ mod multiple_process {
             user_ev_controller,
             peer_id: node_config.peer_id,
         };
+        std::env::set_var("FREENET_PEER_ID", node_config.peer_id.to_string());
+        freenet::config::set_logger();
         let mut event_generator = MemoryEventsGen::<fastrand::Rng>::new_with_seed(
             receiver_ch.clone(),
             node_config.peer_id,
@@ -555,7 +582,6 @@ mod multiple_process {
                         break Err(err);
                     }
                     Ok(IPCMessage::FiredEvent(id)) => {
-                        tracing::debug!("Event {id} received");
                         self.user_ev_controller.send((id, self.peer_id))?;
                     }
                     Ok(IPCMessage::Data(data)) => {
@@ -579,11 +605,9 @@ mod multiple_process {
                     out.write_all(&id.to_le_bytes()).await?;
                 }
                 Self::Data(data) => {
-                    tracing::info!("Sending data");
                     out.write_u8(1).await?;
                     out.write_all(&(data.len() as u32).to_le_bytes()).await?;
                     out.write_all(&data).await?;
-                    tracing::info!("Sent data");
                 }
             }
             Ok(())

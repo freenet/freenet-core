@@ -189,7 +189,7 @@ impl Operation for PutOp {
 
                     let key = contract.key();
                     tracing::debug!(
-                        "Rquesting put for contract {} from {} to {}",
+                        "Requesting put for contract {} from {} to {}",
                         key,
                         sender.peer,
                         target.peer

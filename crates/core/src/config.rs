@@ -171,18 +171,6 @@ impl Config {
             .store(local_mode, std::sync::atomic::Ordering::SeqCst);
     }
 
-    #[cfg(feature = "trace-ot")]
-    fn node_mode() -> OperationMode {
-        if Self::conf()
-            .local_mode
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            OperationMode::Local
-        } else {
-            OperationMode::Network
-        }
-    }
-
     pub fn db_dir(&self) -> PathBuf {
         if self.local_mode.load(std::sync::atomic::Ordering::SeqCst) {
             self.config_paths.db_dir.join("local")
@@ -421,16 +409,11 @@ mod tracer {
 
             #[cfg(feature = "trace-ot")]
             {
-                use super::*;
                 let disabled_ot_traces = std::env::var("FREENET_DISABLE_TRACES").is_ok();
-                // FIXME
-                let identifier = if matches!(Config::node_mode(), OperationMode::Local) {
-                    "freenet-core".to_string()
+                let identifier = if let Ok(peer) = std::env::var("FREENET_PEER_ID") {
+                    format!("freenet-core-{peer}")
                 } else {
-                    format!(
-                        "freenet-core-{peer}",
-                        peer = Config::conf().local_peer_keypair.public().to_peer_id()
-                    )
+                    "freenet-core".to_string()
                 };
                 let tracing_ot_layer = {
                     // Connect the Jaeger OT tracer with the tracing middleware

@@ -76,7 +76,7 @@ impl SimPeer {
 
         GlobalExecutor::spawn(
             contract::contract_handling(contract_handler)
-                .instrument(tracing::info_span!("contract_handling")),
+                .instrument(tracing::info_span!("contract_handling", peer = %self.config.peer_id)),
         );
 
         let running_node = super::RunnerConfig {
