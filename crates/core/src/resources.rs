@@ -222,7 +222,7 @@ impl Limits {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BytesPerSecond(f64);
 impl BytesPerSecond {
-    pub fn new(bytes_per_second: f64) -> Self {
+    pub const fn new(bytes_per_second: f64) -> Self {
         BytesPerSecond(bytes_per_second)
     }
 }
@@ -236,7 +236,7 @@ impl From<BytesPerSecond> for f64 {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InstructionsPerSecond(f64);
 impl InstructionsPerSecond {
-    pub fn new(cpu_usage: f64) -> Self {
+    pub const fn new(cpu_usage: f64) -> Self {
         InstructionsPerSecond(cpu_usage)
     }
 }

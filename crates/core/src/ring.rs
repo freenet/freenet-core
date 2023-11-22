@@ -50,6 +50,7 @@ use crate::{
     router::Router,
     DynError,
 };
+use crate::resources::{BytesPerSecond, InstructionsPerSecond, Limits, ResourceManager};
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
@@ -176,8 +177,10 @@ pub(crate) struct Ring {
     min_connections: usize,
     router: Arc<RwLock<Router>>,
     topology_manager: RwLock<TopologyManager>,
+    resource_manager: RwLock<ResourceManager>,
     /// Fast is for when there are less than our target number of connections so we want to acquire new connections quickly.
     /// Slow is for when there are enough connections so we need to drop a connection in order to replace it.
+    /// TODO: (Ian) Probably remove this
     fast_acquisition: AtomicBool,
     connections_by_location: RwLock<BTreeMap<Location, Vec<Connection>>>,
     location_for_peer: RwLock<BTreeMap<PeerKey, Location>>,
@@ -224,6 +227,17 @@ impl Ring {
     /// connection of a peer in the network).
     const MAX_HOPS_TO_LIVE: usize = 10;
 
+
+    /// default limits for ResourceManager
+    /// TODO: This needs to be determined from the peer's hardware / user preferences
+    const DEFAULT_LIMITS : Limits = Limits {
+        max_upstream_bandwidth: BytesPerSecond::new(5.0*1024.0*1024.0), // 5 megabytes per second
+        max_downstream_bandwidth: BytesPerSecond::new(5.0*1024.0*1024.0), // 5 megabytes per second
+        max_cpu_usage: InstructionsPerSecond::new(1.0*1000.0*1000.0*1000.0), // 1 billion IPS
+        max_memory_usage: 1.0 * 1024.0 * 1024.0 * 1024.0, // 1 gigabyte
+        max_storage_usage: 10.0 * 1024.0 * 1024.0 * 1024.0, // 10 gigabytes
+    };
+
     pub fn new<const CLIENTS: usize, EL: NetEventRegister>(
         config: &NodeBuilder<CLIENTS>,
         gateways: &[PeerKeyLocation],
@@ -266,6 +280,8 @@ impl Ring {
         // Just initialize with a fake location, this will be later updated when the peer has an actual location assigned.
         let topology_manager = RwLock::new(TopologyManager::new(Location::new(0.0)));
 
+        let resource_manager = RwLock::new(ResourceManager::new(Self::DEFAULT_LIMITS));
+
         let ring = Ring {
             rnd_if_htl_above,
             max_hops_to_live,
@@ -273,6 +289,7 @@ impl Ring {
             min_connections,
             router,
             topology_manager,
+            resource_manager,
             fast_acquisition: AtomicBool::new(true),
             connections_by_location: RwLock::new(BTreeMap::new()),
             location_for_peer: RwLock::new(BTreeMap::new()),
@@ -489,8 +506,8 @@ impl Ring {
 
     /// Get a random peer from the known ring connections.
     pub fn random_peer<F>(&self, filter_fn: F) -> Option<PeerKeyLocation>
-    where
-        F: Fn(&PeerKey) -> bool,
+        where
+            F: Fn(&PeerKey) -> bool,
     {
         let peers = &*self.location_for_peer.read();
         let amount = peers.len();
@@ -606,6 +623,14 @@ impl Ring {
             })
     }
 
+    /*
+     Rewrite plan:
+
+     This needs to acquire connections rapidly when resource usage is <
+     FAST_ACQUISITION_RESOURCE_THRESHOLD (say 0.5 or 50%), acquire them
+     slowly between FAST_ACQUISITION_RESOURCE_THRESHOLD and SLOW_RESOURCE_ACQUISITION_THRESHOLD,
+     and remove connections if resource usage > 1.0 / 100%.
+     */
     async fn connection_maintenance(
         self: Arc<Self>,
         notifier: EventLoopNotificationsSender,
@@ -641,9 +666,9 @@ impl Ring {
         let mut missing = BTreeMap::new();
 
         #[cfg(not(test))]
-        let retry_interval = REMOVAL_TICK_DURATION * 2;
+            let retry_interval = REMOVAL_TICK_DURATION * 2;
         #[cfg(test)]
-        let retry_interval = Duration::from_secs(5);
+            let retry_interval = Duration::from_secs(5);
 
         let mut live_tx = None;
         'outer: loop {
@@ -894,7 +919,7 @@ impl PartialEq for Location {
 }
 
 /// Since we don't allow NaN values in the construction of Location
-/// we can safely assume that an equivalence relation holds.  
+/// we can safely assume that an equivalence relation holds.
 impl Eq for Location {}
 
 impl Ord for Location {
