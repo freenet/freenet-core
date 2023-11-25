@@ -8,6 +8,7 @@ mod commands;
 mod config;
 mod inspect;
 mod new_package;
+pub(crate) mod network_metrics_server;
 mod testing;
 mod util;
 mod wasm_runtime;

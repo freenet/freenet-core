@@ -675,7 +675,7 @@ pub(crate) async fn request_put(
     // - and the value to put
     let target = op_storage
         .ring
-        .closest_caching(&key, [&sender.peer].as_slice())
+        .closest_potentially_caching(&key, [&sender.peer].as_slice())
         .into_iter()
         .next()
         .ok_or(RingError::EmptyRing)?;
@@ -771,7 +771,7 @@ async fn forward_changes<CB>(
     let key = contract.key();
     let contract_loc = Location::from(&key);
     const EMPTY: &[PeerId] = &[];
-    let forward_to = op_storage.ring.closest_caching(&key, EMPTY);
+    let forward_to = op_storage.ring.closest_potentially_caching(&key, EMPTY);
     let own_loc = op_storage.ring.own_location().location.expect("infallible");
     if let Some(peer) = forward_to {
         let other_loc = peer.location.as_ref().expect("infallible");

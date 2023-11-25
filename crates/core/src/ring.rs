@@ -39,13 +39,12 @@ use tracing::Instrument;
 
 use crate::message::TransactionType;
 use crate::topology::{AcquisitionStrategy, TopologyManager};
+use crate::tracing::{EventRegister, NetEventRegister};
 use crate::util::Contains;
 use crate::{
     config::GlobalExecutor,
     message::Transaction,
-    node::{
-        self, EventLoopNotificationsSender, EventRegister, NetEventRegister, NodeConfig, PeerId,
-    },
+    node::{self, EventLoopNotificationsSender, NodeConfig, PeerId},
     operations::connect,
     router::Router,
     DynError,
@@ -320,7 +319,7 @@ impl Ring {
             let should_route = std::any::type_name::<ER>()
                 == std::any::type_name::<EventRegister>()
                 || std::any::type_name::<ER>()
-                    == std::any::type_name::<crate::node::CombinedRegister<2>>();
+                    == std::any::type_name::<crate::tracing::CombinedRegister<2>>();
             #[cfg(not(feature = "trace-ot"))]
             let should_route =
                 std::any::type_name::<ER>() == std::any::type_name::<EventRegister>();
@@ -466,7 +465,7 @@ impl Ring {
 
     /// Return the most optimal peer caching a given contract.
     #[inline]
-    pub fn closest_caching(
+    pub fn closest_potentially_caching(
         &self,
         contract_key: &ContractKey,
         skip_list: impl Contains<PeerId>,

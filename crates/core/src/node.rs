@@ -11,6 +11,7 @@ use std::{
     fmt::Display,
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
+    str::FromStr,
     sync::Arc,
     time::Duration,
 };
@@ -21,7 +22,7 @@ use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId as Libp2pPeerId};
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
-use self::{network_event_log::NetEventLog, p2p_impl::NodeP2P};
+use self::p2p_impl::NodeP2P;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
     config::Config,
@@ -37,6 +38,7 @@ use crate::{
     },
     ring::{Location, PeerKeyLocation},
     router::{RouteEvent, RouteOutcome},
+    tracing::{EventRegister, NetEventLog, NetEventRegister},
     util::ExponentialBackoff,
     DynError,
 };
@@ -44,13 +46,10 @@ use crate::{
 use crate::operations::handle_op_request;
 pub use network_bridge::inter_process::InterProcessConnManager;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
-#[cfg(feature = "trace-ot")]
-pub(crate) use network_event_log::CombinedRegister;
-pub(crate) use network_event_log::{EventRegister, NetEventRegister};
+
 pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
 mod network_bridge;
-mod network_event_log;
 mod op_state_manager;
 mod p2p_impl;
 pub(crate) mod testing_impl;
@@ -191,7 +190,7 @@ impl NodeConfig {
         let event_register = {
             #[cfg(feature = "trace-ot")]
             {
-                use super::node::network_event_log::OTEventRegister;
+                use super::tracing::{CombinedRegister, OTEventRegister};
                 CombinedRegister::new([
                     Box::new(EventRegister::new()),
                     Box::new(OTEventRegister::new()),
@@ -791,6 +790,14 @@ impl From<identity::PublicKey> for PeerId {
 impl From<Libp2pPeerId> for PeerId {
     fn from(val: Libp2pPeerId) -> Self {
         PeerId(val)
+    }
+}
+
+impl FromStr for PeerId {
+    type Err = libp2p_identity::ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Libp2pPeerId::from_str(s)?))
     }
 }
 

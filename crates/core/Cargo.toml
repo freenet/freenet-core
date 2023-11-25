@@ -28,13 +28,14 @@ chrono = { workspace = true }
 clap = { features = ["derive", "env"], workspace = true }
 config = { features = ["toml"], version = "0.13.0" }
 cookie = "0.17"
-crossbeam = "0.8.2"
+crossbeam = { workspace = true } 
 ctrlc = { features = ["termination"], workspace = true }
-dashmap = "^5.5"
+dashmap = { workspace = true }
 delegate = "0.10"
 directories = "5"
 either = { features = ["serde"], workspace = true }
 fastrand = { workspace = true }
+flatbuffers = "23.5.26"
 futures = "0.3.21"
 itertools = "0.11"
 libp2p = { default-features = false, features = ["autonat", "dns", "ed25519", "identify", "macros", "noise", "ping", "tcp", "tokio", "yamux"], version = "0.52.3" }

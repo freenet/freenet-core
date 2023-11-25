@@ -9,8 +9,9 @@ use crate::{
     dev_tool::{ClientEventsProxy, NodeConfig},
     node::{
         network_bridge::{inter_process::InterProcessConnManager, EventLoopNotifications},
-        EventRegister, NetEventRegister, OpManager,
+        OpManager,
     },
+    tracing::{EventRegister, NetEventRegister},
 };
 
 #[derive(Serialize, Deserialize)]
@@ -27,8 +28,8 @@ impl SimPeer {
         let event_register = {
             #[cfg(feature = "trace-ot")]
             {
-                use crate::node::network_event_log::OTEventRegister;
-                crate::node::CombinedRegister::new([
+                use crate::tracing::{CombinedRegister, OTEventRegister};
+                CombinedRegister::new([
                     Box::new(EventRegister::new()),
                     Box::new(OTEventRegister::new()),
                 ])

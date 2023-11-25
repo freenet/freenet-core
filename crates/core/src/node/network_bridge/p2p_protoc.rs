@@ -46,11 +46,12 @@ use crate::{
     contract::{ClientResponsesSender, ExecutorToEventLoopChannel, NetworkEventListenerHalve},
     message::{NetMessage, NodeEvent, Transaction, TransactionType},
     node::{
-        handle_cancelled_op, join_ring_request, network_event_log::NetEventLog, process_message,
-        InitPeerNode, NetEventRegister, NodeConfig, OpManager, PeerId as FreenetPeerId,
+        handle_cancelled_op, join_ring_request, process_message, InitPeerNode, NetEventRegister,
+        NodeConfig, OpManager, PeerId as FreenetPeerId,
     },
     operations::OpError,
     ring::PeerKeyLocation,
+    tracing::NetEventLog,
     util::IterExt,
 };
 

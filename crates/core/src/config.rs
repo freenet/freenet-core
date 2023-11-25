@@ -234,7 +234,7 @@ impl Config {
     }
 
     fn load_conf() -> std::io::Result<Config> {
-        let settings = config::Config::builder()
+        let settings: config::Config = config::Config::builder()
             .add_source(config::Environment::with_prefix("FREENET"))
             .build()
             .unwrap();
@@ -367,85 +367,6 @@ pub fn set_logger() {
             return;
         }
 
-        tracer::init_tracer().expect("failed tracing initialization")
-    }
-}
-
-#[cfg(feature = "trace")]
-mod tracer {
-    use tracing_subscriber::{Layer, Registry};
-
-    use crate::DynError;
-
-    pub fn init_tracer() -> Result<(), DynError> {
-        let default_filter = if cfg!(any(test, debug_assertions)) {
-            tracing_subscriber::filter::LevelFilter::DEBUG
-        } else {
-            tracing_subscriber::filter::LevelFilter::INFO
-        };
-        let filter_layer = tracing_subscriber::EnvFilter::builder()
-            .with_default_directive(default_filter.into())
-            .from_env_lossy()
-            .add_directive("stretto=off".parse().expect("infallible"))
-            .add_directive("sqlx=error".parse().expect("infallible"));
-
-        // use opentelemetry_sdk::propagation::TraceContextPropagator;
-        use tracing_subscriber::layer::SubscriberExt;
-
-        let disabled_logs = std::env::var("FREENET_DISABLE_LOGS").is_ok();
-        let to_stderr = std::env::var("FREENET_LOG_TO_STDERR").is_ok();
-        let layers = {
-            let fmt_layer = tracing_subscriber::fmt::layer().with_level(true);
-            let fmt_layer = if cfg!(any(test, debug_assertions)) {
-                fmt_layer.with_file(true).with_line_number(true)
-            } else {
-                fmt_layer
-            };
-            let fmt_layer = if to_stderr {
-                fmt_layer.with_writer(std::io::stderr).boxed()
-            } else {
-                fmt_layer.boxed()
-            };
-
-            #[cfg(feature = "trace-ot")]
-            {
-                let disabled_ot_traces = std::env::var("FREENET_DISABLE_TRACES").is_ok();
-                let identifier = if let Ok(peer) = std::env::var("FREENET_PEER_ID") {
-                    format!("freenet-core-{peer}")
-                } else {
-                    "freenet-core".to_string()
-                };
-                let tracing_ot_layer = {
-                    // Connect the Jaeger OT tracer with the tracing middleware
-                    let ot_jaeger_tracer =
-                        opentelemetry_jaeger::config::agent::AgentPipeline::default()
-                            .with_service_name(identifier)
-                            .install_simple()?;
-                    // Get a tracer which will route OT spans to a Jaeger agent
-                    tracing_opentelemetry::layer().with_tracer(ot_jaeger_tracer)
-                };
-                if !disabled_logs && !disabled_ot_traces {
-                    fmt_layer.and_then(tracing_ot_layer).boxed()
-                } else if !disabled_ot_traces {
-                    tracing_ot_layer.boxed()
-                } else {
-                    return Ok(());
-                }
-            }
-            #[cfg(not(feature = "trace-ot"))]
-            {
-                if disabled_logs {
-                    return Ok(());
-                }
-                fmt_layer.boxed()
-            }
-        };
-        let filtered = layers.with_filter(filter_layer);
-        // Create a subscriber which includes the tracing Jaeger OT layer and a fmt layer
-        let subscriber = Registry::default().with(filtered);
-
-        // Set the global subscriber
-        tracing::subscriber::set_global_default(subscriber).expect("Error setting subscriber");
-        Ok(())
+        crate::tracing::tracer::init_tracer().expect("failed tracing initialization")
     }
 }

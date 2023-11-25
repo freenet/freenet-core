@@ -234,13 +234,13 @@ async fn websocket_interface(
 ) -> Result<(), DynError> {
     let (mut response_rx, client_id) = new_client_connection(&request_sender).await?;
     let (mut tx, mut rx) = ws.split();
-    let listeners: Arc<Mutex<VecDeque<(_, mpsc::UnboundedReceiver<HostResult>)>>> =
+    let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::UnboundedReceiver<HostResult>)>>> =
         Arc::new(Mutex::new(VecDeque::new()));
     loop {
-        let active_listeners = listeners.clone();
+        let contract_updates_cp = contract_updates.clone();
         let listeners_task = async move {
             loop {
-                let mut lock = active_listeners.lock().await;
+                let mut lock = contract_updates_cp.lock().await;
                 let active_listeners = &mut *lock;
                 for _ in 0..active_listeners.len() {
                     if let Some((key, mut listener)) = active_listeners.pop_front() {
@@ -287,7 +287,7 @@ async fn websocket_interface(
 
         tokio::select! { biased;
             msg = async { process_host_response(response_rx.recv().await, client_id, encoding_protoc, &mut tx).await } => {
-                let active_listeners = listeners.clone();
+                let active_listeners = contract_updates.clone();
                 if let Some(NewSubscription { key, callback }) = msg? {
                     tracing::debug!(cli_id = %client_id, contract = %key, "added new notification listener");
                     let active_listeners = &mut *active_listeners.lock().await;
@@ -357,7 +357,7 @@ async fn process_client_request(
         Ok(Message::Binary(data)) => data,
         Ok(Message::Text(data)) => data.into_bytes(),
         Ok(Message::Close(_)) => return Err(None),
-        Ok(Message::Ping(_)) => return Ok(Some(Message::Pong(vec![0, 3, 2]))),
+        Ok(Message::Ping(ping)) => return Ok(Some(Message::Pong(ping))),
         Ok(m) => {
             tracing::debug!(msg = ?m, "received random message");
             return Ok(None);

@@ -17,14 +17,15 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, Instrument};
 
 #[cfg(feature = "trace-ot")]
-use crate::node::network_event_log::CombinedRegister;
+use crate::tracing::CombinedRegister;
 use crate::{
     client_events::test::{MemoryEventsGen, RandomEventGenerator},
     config::GlobalExecutor,
     contract,
     message::{NetMessage, NodeEvent},
-    node::{network_event_log::TestEventListener, InitPeerNode, NetEventRegister, NodeConfig},
+    node::{InitPeerNode, NetEventRegister, NodeConfig},
     ring::{Distance, Location, PeerKeyLocation},
+    tracing::TestEventListener,
 };
 
 mod in_memory;
@@ -425,7 +426,7 @@ impl SimNetwork {
             let event_listener = {
                 #[cfg(feature = "trace-ot")]
                 {
-                    use super::network_event_log::OTEventRegister;
+                    use crate::tracing::OTEventRegister;
                     CombinedRegister::new([
                         self.event_listener.trait_clone(),
                         Box::new(OTEventRegister::new()),
@@ -483,7 +484,7 @@ impl SimNetwork {
             let event_listener = {
                 #[cfg(feature = "trace-ot")]
                 {
-                    use super::network_event_log::OTEventRegister;
+                    use crate::tracing::OTEventRegister;
                     CombinedRegister::new([
                         self.event_listener.trait_clone(),
                         Box::new(OTEventRegister::new()),
@@ -1109,7 +1110,7 @@ where
                 NodeEvent::DropConnection(peer) => {
                     tracing::info!("Dropping connection to {peer}");
                     event_register.register_events(Either::Left(
-                        crate::node::network_event_log::NetEventLog::disconnected(&peer),
+                        crate::tracing::NetEventLog::disconnected(&peer),
                     ));
                     op_storage.ring.prune_connection(peer);
                     continue;

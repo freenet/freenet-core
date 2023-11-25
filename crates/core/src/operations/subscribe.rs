@@ -151,7 +151,7 @@ impl Operation for SubscribeOp {
 
                         let Some(new_target) = op_storage
                             .ring
-                            .closest_caching(key, [&sender.peer].as_slice())
+                            .closest_potentially_caching(key, [&sender.peer].as_slice())
                         else {
                             tracing::warn!(tx = %id, "No peer found while trying getting contract {key}");
                             return Err(OpError::RingError(RingError::NoCachingPeers(key.clone())));
@@ -231,7 +231,7 @@ impl Operation for SubscribeOp {
                                 skip_list.push(sender.peer);
                                 if let Some(target) = op_storage
                                     .ring
-                                    .closest_caching(key, skip_list.as_slice())
+                                    .closest_potentially_caching(key, skip_list.as_slice())
                                     .into_iter()
                                     .next()
                                 {
@@ -351,7 +351,7 @@ pub(crate) async fn request_subscribe(
         (
             op_storage
                 .ring
-                .closest_caching(key, EMPTY)
+                .closest_potentially_caching(key, EMPTY)
                 .into_iter()
                 .next()
                 .ok_or_else(|| RingError::NoCachingPeers(key.clone()))?,

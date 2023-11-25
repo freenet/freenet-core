@@ -1453,9 +1453,11 @@ name = "fdev"
 version = "0.0.7"
 dependencies = [
  "anyhow",
+ "axum",
  "bincode",
  "bs58",
  "clap",
+ "dashmap",
  "either",
  "fastrand 2.0.1",
  "freenet",
@@ -1564,6 +1566,7 @@ dependencies = [
  "directories",
  "either",
  "fastrand 2.0.1",
+ "flatbuffers",
  "freenet-stdlib",
  "futures",
  "itertools 0.11.0",

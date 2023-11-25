@@ -16,9 +16,8 @@ use super::{ConnectionError, NetworkBridge, PeerId};
 use crate::{
     config::GlobalExecutor,
     message::NetMessage,
-    node::{
-        network_event_log::NetEventLog, testing_impl::NetworkBridgeExt, NetEventRegister, OpManager,
-    },
+    node::{testing_impl::NetworkBridgeExt, NetEventRegister, OpManager},
+    tracing::NetEventLog,
 };
 
 pub(in crate::node) struct MemoryConnManager {

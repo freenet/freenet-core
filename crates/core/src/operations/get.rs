@@ -277,7 +277,7 @@ impl Operation for GetOp {
                         let new_htl = htl - 1;
                         let Some(new_target) = op_storage
                             .ring
-                            .closest_caching(&key, [&sender.peer].as_slice())
+                            .closest_potentially_caching(&key, [&sender.peer].as_slice())
                         else {
                             tracing::warn!(
                                 tx = %id,
@@ -398,7 +398,7 @@ impl Operation for GetOp {
                                 skip_list.push(target.peer);
                                 if let Some(target) = op_storage
                                     .ring
-                                    .closest_caching(key, skip_list.as_slice())
+                                    .closest_potentially_caching(key, skip_list.as_slice())
                                     .into_iter()
                                     .next()
                                 {
@@ -713,7 +713,7 @@ pub(crate) async fn request_get(
         (
             op_storage
                 .ring
-                .closest_caching(key, EMPTY)
+                .closest_potentially_caching(key, EMPTY)
                 .into_iter()
                 .next()
                 .ok_or(RingError::EmptyRing)?,

@@ -177,7 +177,7 @@ mod test {
         client_events::test::MemoryEventsGen,
         config::GlobalExecutor,
         contract::MemoryContractHandler,
-        node::{network_event_log, testing_impl::get_free_port, InitPeerNode},
+        node::{testing_impl::get_free_port, InitPeerNode},
         ring::Location,
     };
 
@@ -238,7 +238,7 @@ mod test {
                     config,
                     peer1_key,
                     [Box::new(user_events)],
-                    network_event_log::TestEventListener::new(),
+                    crate::tracing::TestEventListener::new(),
                     "ping-listener".into(),
                 )
                 .await?,
@@ -259,7 +259,7 @@ mod test {
                 config,
                 peer2_key,
                 [Box::new(user_events)],
-                network_event_log::TestEventListener::new(),
+                crate::tracing::TestEventListener::new(),
                 "ping-dialer".into(),
             )
             .await
