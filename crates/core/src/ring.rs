@@ -624,7 +624,10 @@ impl Ring {
     }
 
     /*
-     Rewrite plan:
+     ChatGPT summary: https://chat.openai.com/share/f8fc2322-a10b-470b-ad45-9560faef6800
+
+     Rewrite plan
+     ============
 
      This needs to acquire connections rapidly when resource usage is <
      FAST_ACQUISITION_RESOURCE_THRESHOLD (say 0.5 or 50%), acquire them
@@ -645,6 +648,7 @@ impl Ring {
             vec![]
         }
 
+        /// TODO: (ian) Replace with a configuration struct
         #[cfg(not(test))]
         const CONNECTION_AGE_THRESOLD: Duration = Duration::from_secs(60 * 5);
         #[cfg(test)]
