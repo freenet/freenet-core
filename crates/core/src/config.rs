@@ -359,7 +359,7 @@ pub fn set_logger() {
             .compare_exchange(
                 false,
                 true,
-                std::sync::atomic::Ordering::Acquire,
+                std::sync::atomic::Ordering::Release,
                 std::sync::atomic::Ordering::SeqCst,
             )
             .is_err()

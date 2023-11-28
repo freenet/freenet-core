@@ -9,6 +9,7 @@ use axum::{
         ws::{Message, WebSocket},
         Query, WebSocketUpgrade,
     },
+    http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
     Extension, Router,
@@ -18,6 +19,7 @@ use freenet_stdlib::{
     prelude::*,
 };
 use futures::{future::BoxFuture, stream::SplitSink, FutureExt, SinkExt, StreamExt};
+use headers::Header;
 use serde::Deserialize;
 use tokio::sync::{mpsc, Mutex};
 
@@ -116,13 +118,13 @@ impl WebSocketProxy {
 
 struct EncodingProtocolExt(EncodingProtocol);
 
-impl axum::headers::Header for EncodingProtocolExt {
+impl headers::Header for EncodingProtocolExt {
     fn name() -> &'static axum::http::HeaderName {
         static HEADER: OnceLock<axum::http::HeaderName> = OnceLock::new();
         HEADER.get_or_init(|| axum::http::HeaderName::from_static("encoding-protocol"))
     }
 
-    fn decode<'i, I>(values: &mut I) -> Result<Self, axum::headers::Error>
+    fn decode<'i, I>(values: &mut I) -> Result<Self, headers::Error>
     where
         Self: Sized,
         I: Iterator<Item = &'i axum::http::HeaderValue>,
@@ -134,7 +136,7 @@ impl axum::headers::Header for EncodingProtocolExt {
                 "flatbuffers" => Some(EncodingProtocolExt(EncodingProtocol::Flatbuffers)),
                 _ => None,
             })
-            .ok_or_else(axum::headers::Error::invalid)
+            .ok_or_else(headers::Error::invalid)
     }
 
     fn encode<E: Extend<axum::http::HeaderValue>>(&self, values: &mut E) {
@@ -153,22 +155,18 @@ struct ConnectionInfo {
     encoding_protocol: Option<EncodingProtocol>,
 }
 
-async fn connection_info<B>(
-    encoding_protoc: Result<
-        axum::TypedHeader<EncodingProtocolExt>,
-        axum::extract::rejection::TypedHeaderRejection,
-    >,
-    auth_token: Result<
-        axum::TypedHeader<axum::headers::Authorization<axum::headers::authorization::Bearer>>,
-        axum::extract::rejection::TypedHeaderRejection,
-    >,
+async fn connection_info(
     Query(ConnectionInfo {
         auth_token: auth_token_q,
         encoding_protocol,
     }): Query<ConnectionInfo>,
-    mut req: axum::http::Request<B>,
-    next: axum::middleware::Next<B>,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
 ) -> Response {
+    use headers::{
+        authorization::{Authorization, Bearer},
+        HeaderMapExt,
+    };
     // tracing::info!(
     //     "headers: {:?}",
     //     req.headers()
@@ -176,30 +174,35 @@ async fn connection_info<B>(
     //         .flat_map(|(k, v)| v.to_str().ok().map(|v| format!("{k}: {v}")))
     //         .collect::<Vec<_>>()
     // );
-    let encoding_protoc = match encoding_protoc {
-        Ok(protoc) => protoc.0 .0,
-        Err(err)
-            if matches!(
-                err.reason(),
-                axum::extract::rejection::TypedHeaderRejectionReason::Missing
-            ) =>
-        {
-            encoding_protocol.unwrap_or(EncodingProtocol::Flatbuffers)
+
+    let encoding_protoc = match req.headers().typed_try_get::<EncodingProtocolExt>() {
+        Ok(Some(protoc)) => protoc.0,
+        Ok(None) => encoding_protocol.unwrap_or(EncodingProtocol::Flatbuffers),
+        Err(_error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Incorrect `{header}` header specification",
+                    header = EncodingProtocolExt::name()
+                ),
+            )
+                .into_response()
         }
-        Err(other) => return other.into_response(),
     };
 
-    let auth_token = match auth_token {
-        Ok(auth_token) => Some(AuthToken::from(auth_token.token().to_owned())),
-        Err(err)
-            if matches!(
-                err.reason(),
-                axum::extract::rejection::TypedHeaderRejectionReason::Missing
-            ) =>
-        {
-            auth_token_q
+    let auth_token = match req.headers().typed_try_get::<Authorization<Bearer>>() {
+        Ok(Some(value)) => Some(AuthToken::from(value.token().to_owned())),
+        Ok(None) => auth_token_q,
+        Err(_error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Incorrect Bearer `{header}` header specification",
+                    header = Authorization::<Bearer>::name()
+                ),
+            )
+                .into_response()
         }
-        Err(other) => return other.into_response(),
     };
 
     tracing::debug!(

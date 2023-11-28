@@ -16,7 +16,7 @@ path = "src/bin/freenet.rs"
 anyhow = "1"
 asynchronous-codec = "0.6"
 async-trait = "0.1"
-axum = { default-features = false, features = ["headers", "http1", "matched-path", "query", "tower-log", "ws"], version = "0.6" }
+axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws"], workspace = true }
 bincode = "1"
 blake3 = { workspace = true }
 bs58 = "0.5"
@@ -37,6 +37,7 @@ either = { features = ["serde"], workspace = true }
 fastrand = { workspace = true }
 flatbuffers = "23.5.26"
 futures = "0.3.21"
+headers = "0.4"
 itertools = "0.11"
 libp2p = { default-features = false, features = ["autonat", "dns", "ed25519", "identify", "macros", "noise", "ping", "tcp", "tokio", "yamux"], version = "0.52.3" }
 libp2p-identity = { features = ["ed25519", "rand"], version = "0.2.7" }
@@ -56,8 +57,8 @@ tar = { version = "0.4.38" }
 thiserror = "1"
 tokio = { features = ["fs", "macros", "rt-multi-thread", "sync", "process"], version = "1" }
 tokio-tungstenite = "0.20"
-tower-http = { features = ["fs", "trace"], version = "0.4" }
-ulid = { features = ["serde"], version = "0.4" }
+tower-http = { features = ["fs", "trace"], version = "0.5" }
+ulid = { features = ["serde"], version = "1.1" }
 unsigned-varint = "0.7"
 wasmer = { features = ["sys"], workspace = true }
 xz2 = { version = "0.1" }

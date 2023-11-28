@@ -371,13 +371,13 @@ mod tests {
         let ts_1 = Ulid::new();
         assert!(
             tx.id.timestamp_ms() > ts_0.timestamp_ms(),
-            "{} <= {}",
+            "{:?} <= {:?}",
             tx.id.datetime(),
             ts_0.datetime()
         );
         assert!(
             tx.id.timestamp_ms() < ts_1.timestamp_ms(),
-            "{} >= {}",
+            "{:?} >= {:?}",
             tx.id.datetime(),
             ts_1.datetime()
         );
