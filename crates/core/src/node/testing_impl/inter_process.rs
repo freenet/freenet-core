@@ -57,14 +57,14 @@ impl SimPeer {
         let (notification_channel, notification_tx) = EventLoopNotifications::channel();
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
 
-        let op_storage = Arc::new(OpManager::new(
+        let op_manager = Arc::new(OpManager::new(
             notification_tx,
             ops_ch_channel,
             &self.config,
             &gateways,
             event_register.clone(),
         )?);
-        let (_executor_listener, executor_sender) = contract::executor_channel(op_storage.clone());
+        let (_executor_listener, executor_sender) = contract::executor_channel(op_manager.clone());
         let contract_handler = MemoryContractHandler::build(
             ch_channel,
             executor_sender,
@@ -73,7 +73,7 @@ impl SimPeer {
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
 
-        let conn_manager = InterProcessConnManager::new();
+        let conn_manager = InterProcessConnManager::new(event_register.clone(), op_manager.clone());
 
         GlobalExecutor::spawn(
             contract::contract_handling(contract_handler)
@@ -82,7 +82,7 @@ impl SimPeer {
 
         let running_node = super::RunnerConfig {
             peer_key: self.config.peer_id,
-            op_storage,
+            op_manager,
             gateways,
             notification_channel,
             conn_manager,

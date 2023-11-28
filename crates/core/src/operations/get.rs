@@ -138,7 +138,7 @@ impl Operation for GetOp {
     type Result = GetResult;
 
     fn load_or_init<'a>(
-        op_storage: &'a OpManager,
+        op_manager: &'a OpManager,
         msg: &'a Self::Message,
     ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>> {
         async move {
@@ -147,13 +147,13 @@ impl Operation for GetOp {
                 sender = Some(peer_key_loc.peer);
             };
             let tx = *msg.id();
-            match op_storage.pop(msg.id()) {
+            match op_manager.pop(msg.id()) {
                 Ok(Some(OpEnum::Get(get_op))) => {
                     Ok(OpInitialization { op: get_op, sender })
                     // was an existing operation, other peer messaged back
                 }
                 Ok(Some(op)) => {
-                    let _ = op_storage.push(tx, op).await;
+                    let _ = op_manager.push(tx, op).await;
                     Err(OpError::OpNotPresent(tx))
                 }
                 Ok(None) => {
@@ -181,7 +181,7 @@ impl Operation for GetOp {
     fn process_message<'a, NB: NetworkBridge>(
         self,
         conn_manager: &'a mut NB,
-        op_storage: &'a OpManager,
+        op_manager: &'a OpManager,
         input: &'a Self::Message,
         client_id: Option<ClientId>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
@@ -212,7 +212,7 @@ impl Operation for GetOp {
                         first_response_time: None,
                         step: Default::default(),
                     });
-                    let own_loc = op_storage.ring.own_location();
+                    let own_loc = op_manager.ring.own_location();
                     return_msg = Some(GetMsg::SeekNode {
                         key: key.clone(),
                         id: *id,
@@ -235,7 +235,7 @@ impl Operation for GetOp {
                     let key: ContractKey = key.clone();
                     let fetch_contract = *fetch_contract;
 
-                    let is_cached_contract = op_storage.ring.is_contract_cached(&key);
+                    let is_cached_contract = op_manager.ring.is_contract_cached(&key);
                     if let Some(s) = stats.as_mut() {
                         s.caching_peer = Some(*target);
                     }
@@ -266,7 +266,7 @@ impl Operation for GetOp {
                                         state: None,
                                         contract: None,
                                     },
-                                    sender: op_storage.ring.own_location(),
+                                    sender: op_manager.ring.own_location(),
                                     target: *sender, // return to requester
                                 }),
                                 None,
@@ -275,7 +275,7 @@ impl Operation for GetOp {
                         }
 
                         let new_htl = htl - 1;
-                        let Some(new_target) = op_storage
+                        let Some(new_target) = op_manager
                             .ring
                             .closest_potentially_caching(&key, [&sender.peer].as_slice())
                         else {
@@ -307,7 +307,7 @@ impl Operation for GetOp {
                     } else if let ContractHandlerEvent::GetResponse {
                         key: returned_key,
                         response: value,
-                    } = op_storage
+                    } = op_manager
                         .notify_contract_handler(
                             ContractHandlerEvent::GetQuery {
                                 key: key.clone(),
@@ -396,7 +396,7 @@ impl Operation for GetOp {
                             if retries < MAX_RETRIES {
                                 // no response received from this peer, so skip it in the next iteration
                                 skip_list.push(target.peer);
-                                if let Some(target) = op_storage
+                                if let Some(target) = op_manager
                                     .ring
                                     .closest_potentially_caching(key, skip_list.as_slice())
                                     .into_iter()
@@ -472,7 +472,7 @@ impl Operation for GetOp {
                     if require_contract {
                         if let Some(contract) = &contract {
                             // store contract first
-                            let res = op_storage
+                            let res = op_manager
                                 .notify_contract_handler(
                                     ContractHandlerEvent::Cache(contract.clone()),
                                     client_id,
@@ -480,7 +480,7 @@ impl Operation for GetOp {
                                 .await?;
                             match res {
                                 ContractHandlerEvent::CacheResult(Ok(_)) => {
-                                    op_storage.ring.contract_cached(&key);
+                                    op_manager.ring.contract_cached(&key);
                                 }
                                 ContractHandlerEvent::CacheResult(Err(err)) => {
                                     return Err(OpError::ContractError(err));
@@ -504,7 +504,7 @@ impl Operation for GetOp {
                                 stats,
                             };
 
-                            op_storage
+                            op_manager
                                 .notify_op_change(
                                     NetMessage::from(GetMsg::ReturnGet {
                                         id,
@@ -525,7 +525,7 @@ impl Operation for GetOp {
                     }
 
                     let parameters = contract.as_ref().map(|c| c.params());
-                    let res = op_storage
+                    let res = op_manager
                         .notify_contract_handler(
                             ContractHandlerEvent::PutQuery {
                                 key: key.clone(),
@@ -701,7 +701,7 @@ enum GetState {
 
 /// Request to get the current value from a contract.
 pub(crate) async fn request_get(
-    op_storage: &OpManager,
+    op_manager: &OpManager,
     get_op: GetOp,
     client_id: Option<ClientId>,
 ) -> Result<(), OpError> {
@@ -711,7 +711,7 @@ pub(crate) async fn request_get(
         // - a location in the network where the contract resides
         // - and the key of the contract value to get
         (
-            op_storage
+            op_manager
                 .ring
                 .closest_potentially_caching(key, EMPTY)
                 .into_iter()
@@ -758,7 +758,7 @@ pub(crate) async fn request_get(
                 }),
             };
 
-            op_storage
+            op_manager
                 .notify_op_change(NetMessage::from(msg), OpEnum::Get(op), client_id)
                 .await?;
         }
