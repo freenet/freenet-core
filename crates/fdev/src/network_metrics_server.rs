@@ -270,26 +270,35 @@ pub(crate) async fn record_saver(
     data_dir: PathBuf,
     mut incoming_rec: tokio::sync::broadcast::Receiver<Change>,
 ) -> anyhow::Result<()> {
-    use tokio::io::AsyncWriteExt;
+    use std::io::Write;
     if !data_dir.exists() {
         std::fs::create_dir_all(&data_dir)?;
     }
-    let mut fs = tokio::io::BufWriter::new(
-        tokio::fs::OpenOptions::new()
+    let mut fs = std::io::BufWriter::new(
+        std::fs::OpenOptions::new()
             .write(true)
             .truncate(true)
             .create(true)
-            .open(data_dir.join("network-metrics"))
-            .await?,
+            .open(data_dir.join("network-metrics"))?,
     );
+
+    #[derive(Serialize)]
+    struct WithTimestamp {
+        timestamp: chrono::DateTime<chrono::Utc>,
+        #[serde(flatten)]
+        change: Change,
+    }
 
     // FIXME: this ain't flushing correctly after test ends
     // let mut batch = Vec::with_capacity(1024);
-    while let Ok(record) = incoming_rec.recv().await {
-        let mut rec = serde_json::to_vec(&record).unwrap();
-        rec.push(b'\n');
-        fs.write_all(&rec).await?;
-        fs.flush().await?;
+    while let Ok(change) = incoming_rec.recv().await {
+        let change = WithTimestamp {
+            change,
+            timestamp: chrono::Utc::now(),
+        };
+        serde_json::to_writer(&mut fs, &change)?;
+        fs.write_all(b"\n")?;
+        fs.flush()?;
         // batch.push(record);
         // if batch.len() > 0 {
         //     let batch = std::mem::replace(&mut batch, Vec::with_capacity(1024));
