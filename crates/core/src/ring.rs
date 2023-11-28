@@ -39,7 +39,7 @@ use tracing::Instrument;
 
 use crate::message::TransactionType;
 use crate::topology::{AcquisitionStrategy, TopologyManager};
-use crate::tracing::{EventRegister, NetEventRegister};
+use crate::tracing::{EventRegister, NetEventLog, NetEventRegister};
 use crate::util::Contains;
 use crate::{
     config::GlobalExecutor,
@@ -197,6 +197,7 @@ pub(crate) struct Ring {
     // A peer which has been blacklisted to perform actions regarding a given contract.
     // todo: add blacklist
     // contract_blacklist: Arc<DashMap<ContractKey, Vec<Blacklisted>>>,
+    event_register: Box<dyn NetEventRegister>,
 }
 
 // /// A data type that represents the fact that a peer has been blacklisted
@@ -223,10 +224,11 @@ impl Ring {
     /// connection of a peer in the network).
     const MAX_HOPS_TO_LIVE: usize = 10;
 
-    pub fn new<EL: NetEventRegister>(
+    pub fn new<ER: NetEventRegister>(
         config: &NodeConfig,
         gateways: &[PeerKeyLocation],
         event_loop_notifier: EventLoopNotificationsSender,
+        event_register: ER,
     ) -> Result<Arc<Self>, anyhow::Error> {
         let (live_tx_tracker, missing_candidate_rx) = LiveTransactionTracker::new();
 
@@ -260,7 +262,7 @@ impl Ring {
         };
 
         let router = Arc::new(RwLock::new(Router::new(&[])));
-        GlobalExecutor::spawn(Self::refresh_router::<EL>(router.clone()));
+        GlobalExecutor::spawn(Self::refresh_router::<ER>(router.clone()));
 
         // Just initialize with a fake location, this will be later updated when the peer has an actual location assigned.
         let topology_manager = RwLock::new(TopologyManager::new(Location::new(0.0)));
@@ -282,6 +284,7 @@ impl Ring {
             subscriptions: RwLock::new(Vec::new()),
             open_connections: AtomicUsize::new(0),
             live_tx_tracker: live_tx_tracker.clone(),
+            event_register: Box::new(event_register),
         };
 
         if let Some(loc) = config.location {
@@ -290,6 +293,7 @@ impl Ring {
             }
             ring.update_location(Some(loc));
             for PeerKeyLocation { peer, location } in gateways {
+                // FIXME: this is problematic cause gateways will take all spots then!
                 // all gateways are aware of each other
                 ring.add_connection((*location).unwrap(), *peer);
             }
@@ -444,6 +448,8 @@ impl Ring {
 
     pub fn add_connection(&self, loc: Location, peer: PeerId) {
         let mut cbl = self.connections_by_location.write();
+        self.event_register
+            .register_events(Either::Left(NetEventLog::connected(self, peer, loc)));
         cbl.entry(loc).or_default().push(Connection {
             location: PeerKeyLocation {
                 peer,
@@ -587,6 +593,8 @@ impl Ring {
                 subs
             });
         }
+        self.event_register
+            .register_events(Either::Left(NetEventLog::disconnected(self, &peer)));
         self.open_connections
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
