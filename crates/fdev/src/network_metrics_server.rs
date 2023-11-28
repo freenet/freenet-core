@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 pub async fn run_server(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
     const DEFAULT_PORT: u16 = 55010;
 
-    let port = std::env::var("PORT")
+    let port = std::env::var("FDEV_NETWORK_METRICS_SERVER_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_PORT);
@@ -252,12 +252,14 @@ async fn record_saver(
     if !data_dir.exists() {
         std::fs::create_dir_all(&data_dir)?;
     }
-    let mut fs = tokio::fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .create(true)
-        .open(data_dir.join("network-metrics"))
-        .await?;
+    let mut fs = tokio::io::BufWriter::new(
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .create(true)
+            .open(data_dir.join("network-metrics"))
+            .await?,
+    );
 
     let mut batch = Vec::with_capacity(1024);
     while let Ok(record) = incoming_rec.recv().await {
@@ -277,6 +279,10 @@ async fn record_saver(
                 fs.write_all(&rec).await?;
             }
         }
+    }
+    for rec in batch {
+        let rec = serde_json::to_vec(&rec).unwrap();
+        fs.write_all(&rec).await?;
     }
     Ok(())
 }

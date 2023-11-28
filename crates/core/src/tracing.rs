@@ -7,12 +7,13 @@ use futures::{future::BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs::OpenOptions,
-    io::AsyncSeekExt,
+    net::TcpStream,
     sync::{
         mpsc::{self},
         Mutex,
     },
 };
+use tokio_tungstenite::MaybeTlsStream;
 
 use crate::{
     config::GlobalExecutor,
@@ -20,7 +21,7 @@ use crate::{
     message::{NetMessage, Transaction},
     node::PeerId,
     operations::{connect, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg},
-    ring::{Location, PeerKeyLocation},
+    ring::{Location, PeerKeyLocation, Ring},
     router::RouteEvent,
     DynError,
 };
@@ -37,17 +38,11 @@ struct ListenerLogId(usize);
 /// A type that reacts to incoming messages from the network and records information about them.
 pub(crate) trait NetEventRegister: std::any::Any + Send + Sync + 'static {
     fn register_events<'a>(
-        &'a mut self,
+        &'a self,
         events: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
     ) -> BoxFuture<'a, ()>;
-    fn trait_clone(&self) -> Box<dyn NetEventRegister>;
-    fn as_any(&self) -> &dyn std::any::Any
-    where
-        Self: Sized,
-    {
-        self as _
-    }
     fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<()>;
+    fn trait_clone(&self) -> Box<dyn NetEventRegister>;
 }
 
 #[cfg(feature = "trace-ot")]
@@ -63,11 +58,11 @@ impl<const N: usize> CombinedRegister<N> {
 #[cfg(feature = "trace-ot")]
 impl<const N: usize> NetEventRegister for CombinedRegister<N> {
     fn register_events<'a>(
-        &'a mut self,
+        &'a self,
         events: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
     ) -> BoxFuture<'a, ()> {
         async move {
-            for registry in &mut self.0 {
+            for registry in &self.0 {
                 registry.register_events(events.clone()).await;
             }
         }
@@ -111,28 +106,39 @@ pub(crate) struct NetEventLog<'a> {
 impl<'a> NetEventLog<'a> {
     pub fn route_event(
         tx: &'a Transaction,
-        op_storage: &'a OpManager,
+        op_manager: &'a OpManager,
         route_event: &RouteEvent,
     ) -> Self {
         NetEventLog {
             tx,
-            peer_id: &op_storage.ring.peer_key,
+            peer_id: &op_manager.ring.peer_key,
             kind: EventKind::Route(route_event.clone()),
         }
     }
 
-    pub fn disconnected(from: &'a PeerId) -> Self {
+    pub fn connected(ring: &'a Ring, peer: PeerId, location: Location) -> Self {
         NetEventLog {
             tx: Transaction::NULL,
-            peer_id: from,
-            kind: EventKind::Disconnected,
+            peer_id: &ring.peer_key,
+            kind: EventKind::Connect(ConnectEvent::Connected {
+                this: ring.own_location(),
+                connected: PeerKeyLocation {
+                    peer,
+                    location: Some(location),
+                },
+            }),
         }
     }
 
-    pub fn from_outbound_msg(
-        msg: &'a NetMessage,
-        op_storage: &'a OpManager,
-    ) -> Either<Self, Vec<Self>> {
+    pub fn disconnected(ring: &'a Ring, from: &'a PeerId) -> Self {
+        NetEventLog {
+            tx: Transaction::NULL,
+            peer_id: &ring.peer_key,
+            kind: EventKind::Disconnected { from: *from },
+        }
+    }
+
+    pub fn from_outbound_msg(msg: &'a NetMessage, ring: &'a Ring) -> Either<Self, Vec<Self>> {
         let kind = match msg {
             NetMessage::Connect(connect::ConnectMsg::Response {
                 msg:
@@ -143,7 +149,7 @@ impl<'a> NetEventLog<'a> {
                     },
                 ..
             }) => {
-                let this_peer = op_storage.ring.own_location();
+                let this_peer = ring.own_location();
                 if peers.contains(&this_peer) {
                     EventKind::Connect(ConnectEvent::Connected {
                         this: this_peer,
@@ -164,7 +170,7 @@ impl<'a> NetEventLog<'a> {
                     },
                 ..
             }) => {
-                let this_peer = op_storage.ring.own_location();
+                let this_peer = ring.own_location();
                 if accepted_by.contains(&this_peer) {
                     EventKind::Connect(ConnectEvent::Connected {
                         this: this_peer,
@@ -181,14 +187,14 @@ impl<'a> NetEventLog<'a> {
         };
         Either::Left(NetEventLog {
             tx: msg.id(),
-            peer_id: &op_storage.ring.peer_key,
+            peer_id: &ring.peer_key,
             kind,
         })
     }
 
     pub fn from_inbound_msg(
         msg: &'a NetMessage,
-        op_storage: &'a OpManager,
+        op_manager: &'a OpManager,
     ) -> Either<Self, Vec<Self>> {
         let kind = match msg {
             NetMessage::Connect(connect::ConnectMsg::Response {
@@ -200,7 +206,7 @@ impl<'a> NetEventLog<'a> {
                     },
                 ..
             }) => {
-                let this_peer = &op_storage.ring.peer_key;
+                let this_peer = &op_manager.ring.peer_key;
                 let mut events = peers
                     .iter()
                     .map(|peer| {
@@ -241,7 +247,7 @@ impl<'a> NetEventLog<'a> {
             }
             NetMessage::Put(PutMsg::SuccessfulUpdate { new_value, .. }) => {
                 EventKind::Put(PutEvent::PutSuccess {
-                    requester: op_storage.ring.peer_key,
+                    requester: op_manager.ring.peer_key,
                     value: new_value.clone(),
                 })
             }
@@ -283,7 +289,7 @@ impl<'a> NetEventLog<'a> {
         };
         Either::Left(NetEventLog {
             tx: msg.id(),
-            peer_id: &op_storage.ring.peer_key,
+            peer_id: &op_manager.ring.peer_key,
             kind,
         })
     }
@@ -377,11 +383,15 @@ pub(crate) struct EventRegister {
 static NEW_RECORDS_TS: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
 static FILE_LOCK: Mutex<()> = Mutex::const_new(());
 
+const EVENT_REGISTER_BATCH_SIZE: usize = 100;
+
 impl EventRegister {
     #[cfg(not(test))]
     const MAX_LOG_RECORDS: usize = 100_000;
     #[cfg(test)]
     const MAX_LOG_RECORDS: usize = 10_000;
+
+    const BATCH_SIZE: usize = EVENT_REGISTER_BATCH_SIZE;
 
     pub fn new() -> Self {
         let (log_sender, log_recv) = mpsc::channel(1000);
@@ -391,104 +401,14 @@ impl EventRegister {
     }
 
     async fn record_logs(mut log_recv: mpsc::Receiver<NetLogMessage>) {
-        const BATCH_SIZE: usize = 100;
+        use futures::StreamExt;
 
-        async fn num_lines(path: &Path) -> io::Result<usize> {
-            use tokio::fs::File;
-            use tokio::io::AsyncReadExt;
+        const DEFAULT_METRICS_SERVER_PORT: u16 = 55010;
 
-            let mut file = tokio::io::BufReader::new(File::open(path).await?);
-            let mut num_records = 0;
-            let mut buf = [0; 4]; // Read the u32 length prefix
-
-            loop {
-                let bytes_read = file.read_exact(&mut buf).await;
-                if bytes_read.is_err() {
-                    break;
-                }
-                num_records += 1;
-
-                // Seek to the next record without reading its contents
-                let length = u32::from_le_bytes(buf) as u64;
-                if (file.seek(io::SeekFrom::Current(length as i64)).await).is_err() {
-                    break;
-                }
-            }
-
-            Ok(num_records)
-        }
-
-        async fn truncate_records(
-            file: &mut tokio::fs::File,
-            remove_records: usize,
-        ) -> Result<(), Box<dyn std::error::Error>> {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-            let _guard = FILE_LOCK.lock().await;
-            file.rewind().await?;
-            // tracing::debug!(position = file.stream_position().await.unwrap());
-            let mut records_count = 0;
-            while records_count < remove_records {
-                let mut length_bytes = [0u8; 4];
-                if let Err(error) = file.read_exact(&mut length_bytes).await {
-                    if matches!(error.kind(), io::ErrorKind::UnexpectedEof) {
-                        break;
-                    }
-                    let pos = file.stream_position().await;
-                    tracing::error!(%error, ?pos, "error while trying to read file");
-                    return Err(error.into());
-                }
-                let length = u32::from_be_bytes(length_bytes);
-                if let Err(error) = file.seek(io::SeekFrom::Current(length as i64)).await {
-                    if matches!(error.kind(), io::ErrorKind::UnexpectedEof) {
-                        break;
-                    }
-                    let pos = file.stream_position().await;
-                    tracing::error!(%error, ?pos, "error while trying to read file");
-                    return Err(error.into());
-                }
-                records_count += 1;
-            }
-
-            // Copy the rest of the file to the buffer
-            let mut buffer = Vec::new();
-            if let Err(error) = file.read_to_end(&mut buffer).await {
-                if !matches!(error.kind(), io::ErrorKind::UnexpectedEof) {
-                    let pos = file.stream_position().await;
-                    tracing::error!(%error, ?pos, "error while trying to read file");
-                    return Err(error.into());
-                }
-            }
-
-            #[cfg(test)]
-            {
-                assert!(!buffer.is_empty());
-                let mut unique = std::collections::HashSet::new();
-                let mut read_buf = &*buffer;
-                let mut length_bytes: [u8; 4] = [0u8; 4];
-                let mut cursor = 0;
-                while read_buf.read_exact(&mut length_bytes).await.is_ok() {
-                    let length = u32::from_be_bytes(length_bytes) as usize;
-                    cursor += 4;
-                    let log: NetLogMessage =
-                        bincode::deserialize(&buffer[cursor..cursor + length]).unwrap();
-                    cursor += length;
-                    read_buf = &buffer[cursor..];
-                    unique.insert(log.peer_id);
-                    // tracing::debug!(?log, %cursor);
-                }
-                assert!(unique.len() > 1);
-            }
-
-            // Seek back to the beginning and write the remaining content
-            file.rewind().await?;
-            file.write_all(&buffer).await?;
-
-            // Truncate the file to the new size
-            file.set_len(buffer.len() as u64).await?;
-            file.seek(io::SeekFrom::End(0)).await?;
-            Ok(())
-        }
+        let port = std::env::var("FDEV_NETWORK_METRICS_SERVER_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_METRICS_SERVER_PORT);
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await; // wait for the node to start
         let event_log_path = crate::config::Config::conf().event_log();
@@ -505,80 +425,294 @@ impl EventRegister {
             }
         };
         let mut num_written = 0;
-        let mut batch_buf = vec![];
-        let mut log_batch = Vec::with_capacity(BATCH_SIZE);
+        let mut log_batch = Vec::with_capacity(Self::BATCH_SIZE);
 
-        let mut num_recs = num_lines(event_log_path.as_path())
+        let mut num_recs = Self::num_lines(event_log_path.as_path())
             .await
             .expect("non IO error");
 
-        while let Some(log) = log_recv.recv().await {
-            log_batch.push(log);
+        let mut ws = tokio_tungstenite::connect_async(format!("ws//127.0.0.1:{port}/push-stats/"))
+            .await
+            .map(|(ws_stream, _)| ws_stream)
+            .ok();
 
-            if log_batch.len() >= BATCH_SIZE {
-                let num_logs: usize = log_batch.len();
-                let moved_batch = std::mem::replace(&mut log_batch, Vec::with_capacity(BATCH_SIZE));
-                let serialization_task = tokio::task::spawn_blocking(move || {
-                    let mut batch_serialized_data = Vec::with_capacity(BATCH_SIZE * 1024);
-                    for log_item in &moved_batch {
-                        let mut serialized = match bincode::serialize(log_item) {
-                            Err(err) => {
-                                tracing::error!("Failed serializing log: {err}");
-                                return Err(err);
-                            }
-                            Ok(serialized) => serialized,
-                        };
-                        {
-                            use byteorder::{BigEndian, WriteBytesExt};
-                            batch_serialized_data
-                                .write_u32::<BigEndian>(serialized.len() as u32)
-                                .expect("enough memory");
-                        }
-                        batch_serialized_data.append(&mut serialized);
+        loop {
+            let ws_recv = if let Some(ws) = &mut ws {
+                ws.next().boxed()
+            } else {
+                futures::future::pending().boxed()
+            };
+            tokio::select! {
+                log = log_recv.recv() => {
+                    let Some(log) = log else { break; };
+                    if let Some(ws) = ws.as_mut() {
+                        Self::send_to_metrics_server(ws, &log).await;
                     }
-                    Ok(batch_serialized_data)
-                });
-
-                match serialization_task.await {
-                    Ok(Ok(serialized_data)) => {
-                        // tracing::debug!(bytes = %serialized_data.len(), %num_logs, "serialized logs");
-                        batch_buf = serialized_data;
-                        num_written += num_logs;
-                        log_batch.clear(); // Clear the batch for new data
-                    }
-                    _ => {
-                        panic!("Failed serializing log");
+                    Self::persist_log(&mut log_batch, &mut num_written, &mut num_recs, &mut event_log, log).await;
+                }
+                ws_msg = ws_recv => {
+                    if let Some((ws, ws_msg)) = ws.as_mut().zip(ws_msg) {
+                        Self::process_ws_msg(ws, ws_msg).await;
                     }
                 }
             }
+        }
 
-            if num_written >= BATCH_SIZE {
-                {
-                    use tokio::io::AsyncWriteExt;
-                    let _guard = FILE_LOCK.lock().await;
-                    if let Err(err) = event_log.write_all(&batch_buf).await {
-                        tracing::error!("Failed writting to event log: {err}");
-                        panic!("Failed writting event log");
-                    }
+        // store remaining logs
+        let mut batch_serialized_data = Vec::with_capacity(log_batch.len() * 1024);
+        for log_item in log_batch {
+            let mut serialized = match bincode::serialize(&log_item) {
+                Err(err) => {
+                    tracing::error!("Failed serializing log: {err}");
+                    break;
                 }
-                num_recs += num_written;
-                num_written = 0;
+                Ok(serialized) => serialized,
+            };
+            {
+                use byteorder::{BigEndian, WriteBytesExt};
+                batch_serialized_data
+                    .write_u32::<BigEndian>(serialized.len() as u32)
+                    .expect("enough memory");
             }
-
-            // Check the number of lines and truncate if needed
-            if num_recs > Self::MAX_LOG_RECORDS {
-                const REMOVE_RECS: usize = 1000 + BATCH_SIZE; // making space for 1000 new records
-                if let Err(err) = truncate_records(&mut event_log, REMOVE_RECS).await {
-                    tracing::error!("Failed truncating log file: {:?}", err);
-                    panic!("Failed truncating log file");
-                }
-                num_recs -= REMOVE_RECS;
+            batch_serialized_data.append(&mut serialized);
+        }
+        if !batch_serialized_data.is_empty() {
+            use tokio::io::AsyncWriteExt;
+            let _guard = FILE_LOCK.lock().await;
+            if let Err(err) = event_log.write_all(&batch_serialized_data).await {
+                tracing::error!("Failed writting to event log: {err}");
+                panic!("Failed writting event log");
             }
         }
     }
 
+    async fn persist_log(
+        log_batch: &mut Vec<NetLogMessage>,
+        num_written: &mut usize,
+        num_recs: &mut usize,
+        event_log: &mut tokio::fs::File,
+        log: NetLogMessage,
+    ) {
+        log_batch.push(log);
+        let mut batch_buf = vec![];
+
+        if log_batch.len() >= Self::BATCH_SIZE {
+            let num_logs: usize = log_batch.len();
+            let moved_batch = std::mem::replace(log_batch, Vec::with_capacity(Self::BATCH_SIZE));
+            let serialization_task = tokio::task::spawn_blocking(move || {
+                let mut batch_serialized_data = Vec::with_capacity(Self::BATCH_SIZE * 1024);
+                for log_item in &moved_batch {
+                    let mut serialized = match bincode::serialize(log_item) {
+                        Err(err) => {
+                            tracing::error!("Failed serializing log: {err}");
+                            return Err(err);
+                        }
+                        Ok(serialized) => serialized,
+                    };
+                    {
+                        use byteorder::{BigEndian, WriteBytesExt};
+                        batch_serialized_data
+                            .write_u32::<BigEndian>(serialized.len() as u32)
+                            .expect("enough memory");
+                    }
+                    batch_serialized_data.append(&mut serialized);
+                }
+                Ok(batch_serialized_data)
+            });
+
+            match serialization_task.await {
+                Ok(Ok(serialized_data)) => {
+                    // tracing::debug!(bytes = %serialized_data.len(), %num_logs, "serialized logs");
+                    batch_buf = serialized_data;
+                    *num_written += num_logs;
+                    log_batch.clear(); // Clear the batch for new data
+                }
+                _ => {
+                    panic!("Failed serializing log");
+                }
+            }
+        }
+
+        if *num_written >= Self::BATCH_SIZE {
+            {
+                use tokio::io::AsyncWriteExt;
+                let _guard = FILE_LOCK.lock().await;
+                if let Err(err) = event_log.write_all(&batch_buf).await {
+                    tracing::error!("Failed writting to event log: {err}");
+                    panic!("Failed writting event log");
+                }
+            }
+            *num_recs += *num_written;
+            *num_written = 0;
+        }
+
+        // Check the number of lines and truncate if needed
+        if *num_recs > Self::MAX_LOG_RECORDS {
+            const REMOVE_RECS: usize = 1000 + EVENT_REGISTER_BATCH_SIZE; // making space for 1000 new records
+            if let Err(err) = Self::truncate_records(event_log, REMOVE_RECS).await {
+                tracing::error!("Failed truncating log file: {:?}", err);
+                panic!("Failed truncating log file");
+            }
+            *num_recs -= REMOVE_RECS;
+        }
+    }
+
+    async fn send_to_metrics_server(
+        ws_stream: &mut tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>,
+        send_msg: &NetLogMessage,
+    ) {
+        use crate::generated::PeerChange;
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let res = match &send_msg.kind {
+            EventKind::Connect(ConnectEvent::Connected {
+                this:
+                    PeerKeyLocation {
+                        peer: from_peer,
+                        location: Some(from_loc),
+                    },
+                connected:
+                    PeerKeyLocation {
+                        peer: to_peer,
+                        location: Some(to_loc),
+                    },
+            }) => {
+                let msg = PeerChange::added_connection_msg(
+                    (*from_peer, from_loc.as_f64()),
+                    (*to_peer, to_loc.as_f64()),
+                );
+                ws_stream.send(Message::Binary(msg)).await
+            }
+            EventKind::Disconnected { from } => {
+                let msg = PeerChange::removed_connection_msg(*from, send_msg.peer_id);
+                ws_stream.send(Message::Binary(msg)).await
+            }
+            _ => Ok(()),
+        };
+        if let Err(error) = res {
+            tracing::warn!(%error, "Error while sending message to network metrics server");
+        }
+    }
+
+    async fn process_ws_msg(
+        ws_stream: &mut tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>,
+        msg: tokio_tungstenite::tungstenite::Result<tokio_tungstenite::tungstenite::Message>,
+    ) {
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        match msg {
+            Ok(Message::Ping(ping)) => {
+                let _ = ws_stream.send(Message::Pong(ping)).await;
+            }
+            Ok(Message::Close(_)) => {
+                if let Err(error) = ws_stream.send(Message::Close(None)).await {
+                    tracing::warn!(%error, "Error while closing websocket with network metrics server");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn num_lines(path: &Path) -> io::Result<usize> {
+        use tokio::fs::File;
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+        let mut file = tokio::io::BufReader::new(File::open(path).await?);
+        let mut num_records = 0;
+        let mut buf = [0; 4]; // Read the u32 length prefix
+
+        loop {
+            let bytes_read = file.read_exact(&mut buf).await;
+            if bytes_read.is_err() {
+                break;
+            }
+            num_records += 1;
+
+            // Seek to the next record without reading its contents
+            let length = u32::from_le_bytes(buf) as u64;
+            if (file.seek(io::SeekFrom::Current(length as i64)).await).is_err() {
+                break;
+            }
+        }
+
+        Ok(num_records)
+    }
+
+    async fn truncate_records(
+        file: &mut tokio::fs::File,
+        remove_records: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+        let _guard = FILE_LOCK.lock().await;
+        file.rewind().await?;
+        // tracing::debug!(position = file.stream_position().await.unwrap());
+        let mut records_count = 0;
+        while records_count < remove_records {
+            let mut length_bytes = [0u8; 4];
+            if let Err(error) = file.read_exact(&mut length_bytes).await {
+                if matches!(error.kind(), io::ErrorKind::UnexpectedEof) {
+                    break;
+                }
+                let pos = file.stream_position().await;
+                tracing::error!(%error, ?pos, "error while trying to read file");
+                return Err(error.into());
+            }
+            let length = u32::from_be_bytes(length_bytes);
+            if let Err(error) = file.seek(io::SeekFrom::Current(length as i64)).await {
+                if matches!(error.kind(), io::ErrorKind::UnexpectedEof) {
+                    break;
+                }
+                let pos = file.stream_position().await;
+                tracing::error!(%error, ?pos, "error while trying to read file");
+                return Err(error.into());
+            }
+            records_count += 1;
+        }
+
+        // Copy the rest of the file to the buffer
+        let mut buffer = Vec::new();
+        if let Err(error) = file.read_to_end(&mut buffer).await {
+            if !matches!(error.kind(), io::ErrorKind::UnexpectedEof) {
+                let pos = file.stream_position().await;
+                tracing::error!(%error, ?pos, "error while trying to read file");
+                return Err(error.into());
+            }
+        }
+
+        #[cfg(test)]
+        {
+            assert!(!buffer.is_empty());
+            let mut unique = std::collections::HashSet::new();
+            let mut read_buf = &*buffer;
+            let mut length_bytes: [u8; 4] = [0u8; 4];
+            let mut cursor = 0;
+            while read_buf.read_exact(&mut length_bytes).await.is_ok() {
+                let length = u32::from_be_bytes(length_bytes) as usize;
+                cursor += 4;
+                let log: NetLogMessage =
+                    bincode::deserialize(&buffer[cursor..cursor + length]).unwrap();
+                cursor += length;
+                read_buf = &buffer[cursor..];
+                unique.insert(log.peer_id);
+                // tracing::debug!(?log, %cursor);
+            }
+            assert!(unique.len() > 1);
+        }
+
+        // Seek back to the beginning and write the remaining content
+        file.rewind().await?;
+        file.write_all(&buffer).await?;
+
+        // Truncate the file to the new size
+        file.set_len(buffer.len() as u64).await?;
+        file.seek(io::SeekFrom::End(0)).await?;
+        Ok(())
+    }
+
     pub async fn get_router_events(max_event_number: usize) -> Result<Vec<RouteEvent>, DynError> {
-        use tokio::io::AsyncReadExt;
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
         const MAX_EVENT_HISTORY: usize = 10_000;
         let event_num = max_event_number.min(MAX_EVENT_HISTORY);
 
@@ -643,7 +777,7 @@ impl EventRegister {
 
 impl NetEventRegister for EventRegister {
     fn register_events<'a>(
-        &'a mut self,
+        &'a self,
         logs: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
     ) -> BoxFuture<'a, ()> {
         async {
@@ -899,7 +1033,7 @@ mod opentelemetry_tracer {
 
     impl NetEventRegister for OTEventRegister {
         fn register_events<'a>(
-            &'a mut self,
+            &'a self,
             logs: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
         ) -> BoxFuture<'a, ()> {
             async {
@@ -942,7 +1076,9 @@ enum EventKind {
         at: PeerKeyLocation,
     },
     Ignored,
-    Disconnected,
+    Disconnected {
+        from: PeerId,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1095,7 +1231,7 @@ pub(super) mod test {
 
         // force a truncation
         const TEST_LOGS: usize = EventRegister::MAX_LOG_RECORDS + 100;
-        let mut register = EventRegister::new();
+        let register = EventRegister::new();
         let bytes = crate::util::test::random_bytes_2mb();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let mut transactions = vec![];
@@ -1251,7 +1387,7 @@ pub(super) mod test {
             let logs = self.logs.lock();
             let disconnects = logs
                 .iter()
-                .filter(|l| matches!(l.kind, EventKind::Disconnected))
+                .filter(|l| matches!(l.kind, EventKind::Disconnected { .. }))
                 .fold(HashMap::<_, Vec<_>>::new(), |mut map, log| {
                     map.entry(log.peer_id).or_default().push(log.datetime);
                     map
@@ -1293,7 +1429,7 @@ pub(super) mod test {
 
     impl super::NetEventRegister for TestEventListener {
         fn register_events<'a>(
-            &'a mut self,
+            &'a self,
             logs: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
         ) -> BoxFuture<'a, ()> {
             match logs {
@@ -1337,7 +1473,7 @@ pub(super) mod test {
             (PeerId::random(), Location::try_from(0.25)?),
         ];
 
-        let mut listener = TestEventListener::new();
+        let listener = TestEventListener::new();
         locations.iter().for_each(|(other, location)| {
             listener.register_events(Either::Left(NetEventLog {
                 tx: &tx,
