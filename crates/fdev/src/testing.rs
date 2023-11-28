@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::Error;
 use freenet::dev_tool::SimNetwork;
@@ -8,6 +8,8 @@ mod network;
 mod single_process;
 
 pub(crate) use multiple_process::Process;
+
+use crate::network_metrics_server::{start_server, ServerConfig};
 
 /// Testing framework for running Freenet network simulations.
 #[derive(clap::Parser, Clone)]
@@ -103,24 +105,11 @@ pub enum TestMode {
 
 pub(crate) async fn test_framework(base_config: TestConfig) -> anyhow::Result<(), Error> {
     let (server, changes_recorder) = if !base_config.disable_metrics {
-        let (changes, rx) = tokio::sync::broadcast::channel(10000);
-        let changes_recorder = base_config.execution_data.clone().map(|data_dir| {
-            tokio::task::spawn(async move {
-                if let Err(err) = crate::network_metrics_server::record_saver(data_dir, rx).await {
-                    tracing::error!(error = %err, "Record saver failed");
-                }
-            })
-        });
-        let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        let barrier_cp = barrier.clone();
-        let server = tokio::task::spawn(async move {
-            if let Err(err) = crate::network_metrics_server::run_server(barrier_cp, changes).await {
-                tracing::error!(error = %err, "Network metrics server failed");
-            }
-        });
-        barrier.wait().await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        (Some(server), changes_recorder)
+        let (s, r) = start_server(&ServerConfig {
+            log_directory: base_config.execution_data.clone(),
+        })
+        .await;
+        (Some(s), r)
     } else {
         (None, None)
     };

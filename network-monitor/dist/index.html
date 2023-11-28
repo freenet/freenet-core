@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Freenet Network Monitor</title>
+    <!-- ... -->
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/bulma/0.9.3/css/bulma.min.css"
+    />
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css"
+    />
+  </head>
+  <body>
+    <section class="section">
+      <div class="container">
+        <h1 class="title">Freenet Network Monitor</h1>
+      </div>
+    </section>
+    <section class="section">
+      <div class="container" style="position: relative">
+        <div
+          class="box"
+          id="peer-connections"
+          style="display: none; position: absolute; z-index: 1"
+        >
+          <h2 id="peer-connections-t">Peer Connections</h2>
+          <table id="peer-connections-l" class="table is-striped">
+            <tbody id="peer-connections-b"></tbody>
+          </table>
+        </div>
+        <table id="peers-table" class="table is-striped">
+          <thead id="peers-table-h">
+            <tr>
+              <th>Peer Id <i class="fas fa-sort-amount-up"></i></th>
+              <th>Location <i class="fas fa-sort-amount-up"></i></th>
+              <th>
+                Connection Date
+                <i class="fas fa-sort-amount-up"></i>
+              </th>
+            </tr>
+          </thead>
+          <tbody id="peers-table-b"></tbody>
+        </table>
+      </div>
+    </section>
+    <script src="./bundle.js"></script>
+  </body>
+</html>

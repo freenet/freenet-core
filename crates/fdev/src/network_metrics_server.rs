@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, path::PathBuf, str::FromStr, sync::Arc};
+use std::{net::Ipv4Addr, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -19,7 +19,46 @@ use freenet::{
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 
-pub async fn run_server(
+/// Network metrics server. Records metrics and data from a test network that can be used for
+/// analysis and visualization.
+#[derive(clap::Parser, Clone)]
+pub struct ServerConfig {
+    /// If provided, the server will save the event logs in this directory.
+    #[arg(long)]
+    pub log_directory: Option<PathBuf>,
+}
+
+/// Starts the server and returns a handle to the server thread
+/// and a handle to the  changes recorder thread if changes record path was provided.
+pub async fn start_server(
+    config: &ServerConfig,
+) -> (
+    tokio::task::JoinHandle<()>,
+    Option<tokio::task::JoinHandle<()>>,
+) {
+    let changes_record_path = config.log_directory.clone();
+    let (changes, rx) = tokio::sync::broadcast::channel(10000);
+    let changes_recorder = changes_record_path.map(|data_dir| {
+        tokio::task::spawn(async move {
+            if let Err(err) = crate::network_metrics_server::record_saver(data_dir, rx).await {
+                tracing::error!(error = %err, "Record saver failed");
+            }
+        })
+    });
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let barrier_cp = barrier.clone();
+    let server = tokio::task::spawn(async move {
+        if let Err(err) = crate::network_metrics_server::run_server(barrier_cp, changes).await {
+            tracing::error!(error = %err, "Network metrics server failed");
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    barrier.wait().await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    (server, changes_recorder)
+}
+
+async fn run_server(
     barrier: Arc<tokio::sync::Barrier>,
     changes: tokio::sync::broadcast::Sender<Change>,
 ) -> anyhow::Result<()> {
@@ -41,9 +80,7 @@ pub async fn run_server(
 
     tracing::info!("Starting metrics server on port {port}");
     barrier.wait().await;
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     axum::serve(listener, router).await?;
     Ok(())
 }
@@ -266,7 +303,7 @@ impl ServerState {
     }
 }
 
-pub(crate) async fn record_saver(
+async fn record_saver(
     data_dir: PathBuf,
     mut incoming_rec: tokio::sync::broadcast::Receiver<Change>,
 ) -> anyhow::Result<()> {
@@ -274,12 +311,14 @@ pub(crate) async fn record_saver(
     if !data_dir.exists() {
         std::fs::create_dir_all(&data_dir)?;
     }
+    let log_file = data_dir.join("network-metrics");
+    tracing::info!("Recording logs to {log_file:?}");
     let mut fs = std::io::BufWriter::new(
         std::fs::OpenOptions::new()
             .write(true)
             .truncate(true)
             .create(true)
-            .open(data_dir.join("network-metrics"))?,
+            .open(log_file)?,
     );
 
     #[derive(Serialize)]

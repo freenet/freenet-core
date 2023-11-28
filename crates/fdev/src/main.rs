@@ -7,8 +7,8 @@ mod build;
 mod commands;
 mod config;
 mod inspect;
-mod new_package;
 pub(crate) mod network_metrics_server;
+mod new_package;
 mod testing;
 mod util;
 mod wasm_runtime;
@@ -59,6 +59,15 @@ fn main() -> Result<(), anyhow::Error> {
                 }
             },
             SubCommand::Test(test_config) => testing::test_framework(test_config).await,
+            SubCommand::NetworkMetricsServer(server_config) => {
+                let (server, _) =
+                    crate::network_metrics_server::start_server(&server_config).await;
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = server => {}
+                }
+                Ok(())
+            }
         };
         // todo: make all commands return concrete `thiserror` compatible errors so we can use anyhow
         r.map_err(|e| anyhow::format_err!(e))

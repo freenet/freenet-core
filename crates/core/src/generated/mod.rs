@@ -42,7 +42,7 @@ impl PeerChange<'_> {
         let msg = topology::PeerChange::create(
             &mut buf,
             &topology::PeerChangeArgs {
-                change_type: topology::PeerChangeType::AddedConnection,
+                change_type: topology::PeerChangeType::NONE,
                 change: None,
                 current_state: Some(connections),
             },
