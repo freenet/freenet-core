@@ -238,7 +238,7 @@ mod test {
                     config,
                     peer1_key,
                     [Box::new(user_events)],
-                    crate::tracing::TestEventListener::new(),
+                    crate::tracing::TestEventListener::new().await,
                     "ping-listener".into(),
                 )
                 .await?,
@@ -259,7 +259,7 @@ mod test {
                 config,
                 peer2_key,
                 [Box::new(user_events)],
-                crate::tracing::TestEventListener::new(),
+                crate::tracing::TestEventListener::new().await,
                 "ping-dialer".into(),
             )
             .await

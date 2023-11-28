@@ -97,7 +97,6 @@ async fn supervisor(config: &super::TestConfig) -> anyhow::Result<(), Error> {
     simulated_network.debug(); // set to avoid deleting temp dirs created
     let peers = simulated_network.build_peers();
 
-    // let (user_ev_controller, event_rx) = tokio::sync::watch::channel((0, PeerId::random()));
     let (user_ev_controller, event_rx) = tokio::sync::mpsc::channel(1);
 
     let seed = config.seed();

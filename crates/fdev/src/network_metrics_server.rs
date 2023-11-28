@@ -9,7 +9,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
-    Router, Server,
+    Router,
 };
 use dashmap::DashMap;
 use freenet::{
@@ -19,7 +19,10 @@ use freenet::{
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 
-pub async fn run_server(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
+pub async fn run_server(
+    barrier: Arc<tokio::sync::Barrier>,
+    changes: tokio::sync::broadcast::Sender<Change>,
+) -> anyhow::Result<()> {
     const DEFAULT_PORT: u16 = 55010;
 
     let port = std::env::var("FDEV_NETWORK_METRICS_SERVER_PORT")
@@ -27,7 +30,6 @@ pub async fn run_server(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_PORT);
 
-    let (changes, rx) = tokio::sync::broadcast::channel(100);
     let router = Router::new()
         .route("/", get(home))
         .route("/push-stats/", get(push_stats))
@@ -36,17 +38,13 @@ pub async fn run_server(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
             changes,
             peer_data: DashMap::new(),
         }));
-    if let Some(data_dir) = data_dir {
-        tokio::task::spawn(async move {
-            if let Err(err) = record_saver(data_dir, rx).await {
-                tracing::error!(error = %err, "Record saver failed");
-            }
-        });
-    }
 
-    Server::bind(&(Ipv4Addr::LOCALHOST, port).into())
-        .serve(router.into_make_service())
-        .await?;
+    tracing::info!("Starting metrics server on port {port}");
+    barrier.wait().await;
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    axum::serve(listener, router).await?;
     Ok(())
 }
 
@@ -110,7 +108,7 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                 }
             }
             Err(e) => {
-                tracing::debug!("websocket error: {}", e);
+                tracing::debug!("Websocket error: {}", e);
                 break;
             }
         }
@@ -144,11 +142,11 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
     while let Ok(msg) = changes.recv().await {
         match msg {
             Change::AddedConnection { from, to } => {
-                let msg = PeerChange::added_connection_msg(from, to);
+                let msg = PeerChange::added_connection_msg((from.0 .0, from.1), (to.0 .0, to.1));
                 tx.send(Message::Binary(msg)).await?;
             }
             Change::RemovedConnection { from, at } => {
-                let msg = PeerChange::removed_connection_msg(at, from);
+                let msg = PeerChange::removed_connection_msg(at.0, from.0);
                 tx.send(Message::Binary(msg)).await?;
             }
         }
@@ -167,15 +165,39 @@ struct PeerData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum Change {
+pub(crate) enum Change {
     AddedConnection {
-        from: (PeerId, f64),
-        to: (PeerId, f64),
+        from: (PeerIdHumanReadable, f64),
+        to: (PeerIdHumanReadable, f64),
     },
     RemovedConnection {
-        from: PeerId,
-        at: PeerId,
+        from: PeerIdHumanReadable,
+        at: PeerIdHumanReadable,
     },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PeerIdHumanReadable(PeerId);
+
+impl Serialize for PeerIdHumanReadable {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for PeerIdHumanReadable {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(PeerIdHumanReadable(
+            PeerId::from_str(&s).map_err(serde::de::Error::custom)?,
+        ))
+    }
+}
+
+impl From<PeerId> for PeerIdHumanReadable {
+    fn from(peer_id: PeerId) -> Self {
+        Self(peer_id)
+    }
 }
 
 impl ServerState {
@@ -213,8 +235,8 @@ impl ServerState {
                 }
 
                 let _ = self.changes.send(Change::AddedConnection {
-                    from: (from_peer_id, from_loc),
-                    to: (to_peer_id, to_loc),
+                    from: (from_peer_id.into(), from_loc),
+                    to: (to_peer_id.into(), to_loc),
                 });
             }
             PeerChange::RemovedConnection(removed) => {
@@ -234,8 +256,8 @@ impl ServerState {
                 }
 
                 let _ = self.changes.send(Change::RemovedConnection {
-                    from: from_peer_id,
-                    at: at_peer_id,
+                    from: from_peer_id.into(),
+                    at: at_peer_id.into(),
                 });
             }
             _ => unreachable!(),
@@ -244,7 +266,7 @@ impl ServerState {
     }
 }
 
-async fn record_saver(
+pub(crate) async fn record_saver(
     data_dir: PathBuf,
     mut incoming_rec: tokio::sync::broadcast::Receiver<Change>,
 ) -> anyhow::Result<()> {
@@ -261,28 +283,39 @@ async fn record_saver(
             .await?,
     );
 
-    let mut batch = Vec::with_capacity(1024);
+    // FIXME: this ain't flushing correctly after test ends
+    // let mut batch = Vec::with_capacity(1024);
     while let Ok(record) = incoming_rec.recv().await {
-        batch.push(record);
-        if batch.len() > 100 {
-            let batch = std::mem::replace(&mut batch, Vec::with_capacity(1024));
-            let result = tokio::task::spawn_blocking(move || {
-                let mut serialized = Vec::with_capacity(batch.len() * 128);
-                for rec in batch {
-                    let rec = serde_json::to_vec(&rec).unwrap();
-                    serialized.push(rec);
-                }
-                serialized
-            })
-            .await?;
-            for rec in result {
-                fs.write_all(&rec).await?;
-            }
-        }
-    }
-    for rec in batch {
-        let rec = serde_json::to_vec(&rec).unwrap();
+        let mut rec = serde_json::to_vec(&record).unwrap();
+        rec.push(b'\n');
         fs.write_all(&rec).await?;
+        fs.flush().await?;
+        // batch.push(record);
+        // if batch.len() > 0 {
+        //     let batch = std::mem::replace(&mut batch, Vec::with_capacity(1024));
+        // let result = tokio::task::spawn_blocking(move || {
+        //     let mut serialized = Vec::with_capacity(batch.len() * 128);
+        //     for rec in batch {
+        //         let mut rec = serde_json::to_vec(&rec).unwrap();
+        //         rec.push(b'\n');
+        //         serialized.push(rec);
+        //     }
+        //     serialized
+        // })
+        // .await?;
+        // for rec in result {
+        //     fs.write_all(&rec).await?;
+        //     fs.flush().await?;
+        // }
+        // }
     }
+    // tracing::warn!(?batch, "Saving records");
+    // for rec in batch {
+    //     let mut rec = serde_json::to_vec(&rec).unwrap();
+    //     rec.push(b'\n');
+    //     fs.write_all(&rec).await?;
+    // }
+    // fs.flush().await?;
+    tracing::warn!("Finished saving records");
     Ok(())
 }

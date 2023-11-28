@@ -338,7 +338,7 @@ impl SimNetwork {
         let mut net = Self {
             name: name.into(),
             clean_up_tmp_dirs: true,
-            event_listener: TestEventListener::new(),
+            event_listener: TestEventListener::new().await,
             labels: Vec::with_capacity(nodes + gateways),
             user_ev_controller: Some(user_ev_controller),
             receiver_ch,

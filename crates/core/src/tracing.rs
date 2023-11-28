@@ -13,7 +13,7 @@ use tokio::{
         Mutex,
     },
 };
-use tokio_tungstenite::MaybeTlsStream;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::{
     config::GlobalExecutor,
@@ -385,6 +385,8 @@ static FILE_LOCK: Mutex<()> = Mutex::const_new(());
 
 const EVENT_REGISTER_BATCH_SIZE: usize = 100;
 
+const DEFAULT_METRICS_SERVER_PORT: u16 = 55010;
+
 impl EventRegister {
     #[cfg(not(test))]
     const MAX_LOG_RECORDS: usize = 100_000;
@@ -402,13 +404,6 @@ impl EventRegister {
 
     async fn record_logs(mut log_recv: mpsc::Receiver<NetLogMessage>) {
         use futures::StreamExt;
-
-        const DEFAULT_METRICS_SERVER_PORT: u16 = 55010;
-
-        let port = std::env::var("FDEV_NETWORK_METRICS_SERVER_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_METRICS_SERVER_PORT);
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await; // wait for the node to start
         let event_log_path = crate::config::Config::conf().event_log();
@@ -431,10 +426,7 @@ impl EventRegister {
             .await
             .expect("non IO error");
 
-        let mut ws = tokio_tungstenite::connect_async(format!("ws//127.0.0.1:{port}/push-stats/"))
-            .await
-            .map(|(ws_stream, _)| ws_stream)
-            .ok();
+        let mut ws = connect_to_metrics_server().await;
 
         loop {
             let ws_recv = if let Some(ws) = &mut ws {
@@ -446,13 +438,13 @@ impl EventRegister {
                 log = log_recv.recv() => {
                     let Some(log) = log else { break; };
                     if let Some(ws) = ws.as_mut() {
-                        Self::send_to_metrics_server(ws, &log).await;
+                        send_to_metrics_server(ws, &log).await;
                     }
                     Self::persist_log(&mut log_batch, &mut num_written, &mut num_recs, &mut event_log, log).await;
                 }
                 ws_msg = ws_recv => {
                     if let Some((ws, ws_msg)) = ws.as_mut().zip(ws_msg) {
-                        Self::process_ws_msg(ws, ws_msg).await;
+                        received_from_metrics_server(ws, ws_msg).await;
                     }
                 }
             }
@@ -554,63 +546,6 @@ impl EventRegister {
                 panic!("Failed truncating log file");
             }
             *num_recs -= REMOVE_RECS;
-        }
-    }
-
-    async fn send_to_metrics_server(
-        ws_stream: &mut tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>,
-        send_msg: &NetLogMessage,
-    ) {
-        use crate::generated::PeerChange;
-        use futures::SinkExt;
-        use tokio_tungstenite::tungstenite::Message;
-
-        let res = match &send_msg.kind {
-            EventKind::Connect(ConnectEvent::Connected {
-                this:
-                    PeerKeyLocation {
-                        peer: from_peer,
-                        location: Some(from_loc),
-                    },
-                connected:
-                    PeerKeyLocation {
-                        peer: to_peer,
-                        location: Some(to_loc),
-                    },
-            }) => {
-                let msg = PeerChange::added_connection_msg(
-                    (*from_peer, from_loc.as_f64()),
-                    (*to_peer, to_loc.as_f64()),
-                );
-                ws_stream.send(Message::Binary(msg)).await
-            }
-            EventKind::Disconnected { from } => {
-                let msg = PeerChange::removed_connection_msg(*from, send_msg.peer_id);
-                ws_stream.send(Message::Binary(msg)).await
-            }
-            _ => Ok(()),
-        };
-        if let Err(error) = res {
-            tracing::warn!(%error, "Error while sending message to network metrics server");
-        }
-    }
-
-    async fn process_ws_msg(
-        ws_stream: &mut tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>,
-        msg: tokio_tungstenite::tungstenite::Result<tokio_tungstenite::tungstenite::Message>,
-    ) {
-        use futures::SinkExt;
-        use tokio_tungstenite::tungstenite::Message;
-        match msg {
-            Ok(Message::Ping(ping)) => {
-                let _ = ws_stream.send(Message::Pong(ping)).await;
-            }
-            Ok(Message::Close(_)) => {
-                if let Err(error) = ws_stream.send(Message::Close(None)).await {
-                    tracing::warn!(%error, "Error while closing websocket with network metrics server");
-                }
-            }
-            _ => {}
         }
     }
 
@@ -794,6 +729,78 @@ impl NetEventRegister for EventRegister {
 
     fn notify_of_time_out(&mut self, _: Transaction) -> BoxFuture<()> {
         async {}.boxed()
+    }
+}
+
+async fn connect_to_metrics_server() -> Option<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    let port = std::env::var("FDEV_NETWORK_METRICS_SERVER_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_METRICS_SERVER_PORT);
+
+    tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/push-stats/"))
+        .await
+        .map(|(ws_stream, _)| {
+            tracing::info!("Connected to network metrics server");
+            ws_stream
+        })
+        .ok()
+}
+
+async fn send_to_metrics_server(
+    ws_stream: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    send_msg: &NetLogMessage,
+) {
+    use crate::generated::PeerChange;
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let res = match &send_msg.kind {
+        EventKind::Connect(ConnectEvent::Connected {
+            this:
+                PeerKeyLocation {
+                    peer: from_peer,
+                    location: Some(from_loc),
+                },
+            connected:
+                PeerKeyLocation {
+                    peer: to_peer,
+                    location: Some(to_loc),
+                },
+        }) => {
+            let msg = PeerChange::added_connection_msg(
+                (*from_peer, from_loc.as_f64()),
+                (*to_peer, to_loc.as_f64()),
+            );
+            ws_stream.send(Message::Binary(msg)).await
+        }
+        EventKind::Disconnected { from } => {
+            let msg = PeerChange::removed_connection_msg(*from, send_msg.peer_id);
+            ws_stream.send(Message::Binary(msg)).await
+        }
+        _ => Ok(()),
+    };
+    if let Err(error) = res {
+        tracing::warn!(%error, "Error while sending message to network metrics server");
+    }
+}
+
+async fn received_from_metrics_server(
+    ws_stream: &mut tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>,
+    msg: tokio_tungstenite::tungstenite::Result<tokio_tungstenite::tungstenite::Message>,
+) {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    match msg {
+        Ok(Message::Ping(ping)) => {
+            let _ = ws_stream.send(Message::Pong(ping)).await;
+        }
+        Ok(Message::Close(_)) => {
+            if let Err(error) = ws_stream.send(Message::Close(None)).await {
+                tracing::warn!(%error, "Error while closing websocket with network metrics server");
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1215,7 +1222,7 @@ pub(super) mod test {
     };
 
     use dashmap::DashMap;
-    use parking_lot::Mutex;
+    use tokio_tungstenite::WebSocketStream;
 
     use super::*;
     use crate::{node::testing_impl::NodeLabel, ring::Distance};
@@ -1265,15 +1272,20 @@ pub(super) mod test {
     pub(crate) struct TestEventListener {
         node_labels: Arc<DashMap<NodeLabel, PeerId>>,
         tx_log: Arc<DashMap<Transaction, Vec<ListenerLogId>>>,
-        logs: Arc<Mutex<Vec<NetLogMessage>>>,
+        logs: Arc<tokio::sync::Mutex<Vec<NetLogMessage>>>,
+        network_metrics_server:
+            Arc<tokio::sync::Mutex<Option<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
     }
 
     impl TestEventListener {
-        pub fn new() -> Self {
+        pub async fn new() -> Self {
             TestEventListener {
                 node_labels: Arc::new(DashMap::new()),
                 tx_log: Arc::new(DashMap::new()),
-                logs: Arc::new(Mutex::new(Vec::new())),
+                logs: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                network_metrics_server: Arc::new(tokio::sync::Mutex::new(
+                    connect_to_metrics_server().await,
+                )),
             }
         }
 
@@ -1282,7 +1294,9 @@ pub(super) mod test {
         }
 
         pub fn is_connected(&self, peer: &PeerId) -> bool {
-            let logs = self.logs.lock();
+            let Ok(logs) = self.logs.try_lock() else {
+                return false;
+            };
             logs.iter().any(|log| {
                 &log.peer_id == peer
                     && matches!(log.kind, EventKind::Connect(ConnectEvent::Connected { .. }))
@@ -1295,7 +1309,9 @@ pub(super) mod test {
             for_key: &ContractKey,
             expected_value: &WrappedState,
         ) -> bool {
-            let logs = self.logs.lock();
+            let Ok(logs) = self.logs.try_lock() else {
+                return false;
+            };
             let put_ops = logs.iter().filter_map(|l| match &l.kind {
                 EventKind::Put(ev) => Some((&l.tx, ev)),
                 _ => None,
@@ -1334,7 +1350,9 @@ pub(super) mod test {
         /// The contract was broadcasted from one peer to an other successfully.
         #[cfg(test)]
         pub fn contract_broadcasted(&self, for_key: &ContractKey) -> bool {
-            let logs = self.logs.lock();
+            let Ok(logs) = self.logs.try_lock() else {
+                return false;
+            };
             let put_broadcast_ops = logs.iter().filter_map(|l| match &l.kind {
                 EventKind::Put(ev @ PutEvent::BroadcastEmitted { .. })
                 | EventKind::Put(ev @ PutEvent::BroadcastReceived { .. }) => Some((&l.tx, ev)),
@@ -1367,7 +1385,9 @@ pub(super) mod test {
         }
 
         pub fn has_got_contract(&self, peer: &PeerId, expected_key: &ContractKey) -> bool {
-            let logs = self.logs.lock();
+            let Ok(logs) = self.logs.try_lock() else {
+                return false;
+            };
             logs.iter().any(|log| {
                 &log.peer_id == peer
                     && matches!(log.kind, EventKind::Get { ref key } if key == expected_key  )
@@ -1375,7 +1395,9 @@ pub(super) mod test {
         }
 
         pub fn is_subscribed_to_contract(&self, peer: &PeerId, expected_key: &ContractKey) -> bool {
-            let logs = self.logs.lock();
+            let Ok(logs) = self.logs.try_lock() else {
+                return false;
+            };
             logs.iter().any(|log| {
                 &log.peer_id == peer
                     && matches!(log.kind, EventKind::Subscribed { ref key, .. } if key == expected_key  )
@@ -1383,8 +1405,10 @@ pub(super) mod test {
         }
 
         /// Unique connections for a given peer and their relative distance to other peers.
-        pub fn connections(&self, peer: PeerId) -> impl Iterator<Item = (PeerId, Distance)> {
-            let logs = self.logs.lock();
+        pub fn connections(&self, peer: PeerId) -> Box<dyn Iterator<Item = (PeerId, Distance)>> {
+            let Ok(logs) = self.logs.try_lock() else {
+                return Box::new([].into_iter());
+            };
             let disconnects = logs
                 .iter()
                 .filter(|l| matches!(l.kind, EventKind::Disconnected { .. }))
@@ -1393,7 +1417,8 @@ pub(super) mod test {
                     map
                 });
 
-            logs.iter()
+            let iter = logs
+                .iter()
                 .filter_map(|l| {
                     if let EventKind::Connect(ConnectEvent::Connected { this, connected }) = l.kind
                     {
@@ -1411,7 +1436,8 @@ pub(super) mod test {
                     None
                 })
                 .collect::<HashMap<_, _>>()
-                .into_iter()
+                .into_iter();
+            Box::new(iter)
         }
 
         fn create_log(log: NetEventLog) -> (NetLogMessage, ListenerLogId) {
@@ -1432,24 +1458,33 @@ pub(super) mod test {
             &'a self,
             logs: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
         ) -> BoxFuture<'a, ()> {
-            match logs {
-                Either::Left(log) => {
-                    let tx = log.tx;
-                    let (msg_log, log_id) = Self::create_log(log);
-                    self.logs.lock().push(msg_log);
-                    self.tx_log.entry(*tx).or_default().push(log_id);
-                }
-                Either::Right(logs) => {
-                    let logs_list = &mut *self.logs.lock();
-                    for log in logs {
+            async {
+                match logs {
+                    Either::Left(log) => {
                         let tx = log.tx;
                         let (msg_log, log_id) = Self::create_log(log);
-                        logs_list.push(msg_log);
+                        if let Some(conn) = &mut *self.network_metrics_server.lock().await {
+                            send_to_metrics_server(conn, &msg_log).await;
+                        }
+                        self.logs.lock().await.push(msg_log);
                         self.tx_log.entry(*tx).or_default().push(log_id);
+                    }
+                    Either::Right(logs) => {
+                        let logs_list = &mut *self.logs.lock().await;
+                        let mut lock = self.network_metrics_server.lock().await;
+                        for log in logs {
+                            let tx = log.tx;
+                            let (msg_log, log_id) = Self::create_log(log);
+                            if let Some(conn) = &mut *lock {
+                                send_to_metrics_server(conn, &msg_log).await;
+                            }
+                            logs_list.push(msg_log);
+                            self.tx_log.entry(*tx).or_default().push(log_id);
+                        }
                     }
                 }
             }
-            async {}.boxed()
+            .boxed()
         }
 
         fn trait_clone(&self) -> Box<dyn NetEventRegister> {
@@ -1461,8 +1496,8 @@ pub(super) mod test {
         }
     }
 
-    #[test]
-    fn test_get_connections() -> Result<(), anyhow::Error> {
+    #[tokio::test]
+    async fn test_get_connections() -> Result<(), anyhow::Error> {
         use crate::ring::Location;
         let peer_id = PeerId::random();
         let loc = Location::try_from(0.5)?;
@@ -1473,7 +1508,7 @@ pub(super) mod test {
             (PeerId::random(), Location::try_from(0.25)?),
         ];
 
-        let listener = TestEventListener::new();
+        let listener = TestEventListener::new().await;
         locations.iter().for_each(|(other, location)| {
             listener.register_events(Either::Left(NetEventLog {
                 tx: &tx,

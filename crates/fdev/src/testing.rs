@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Error;
 use freenet::dev_tool::SimNetwork;
@@ -53,6 +53,9 @@ pub struct TestConfig {
     /// If provided, the execution data will be saved in this directory.
     #[arg(long)]
     execution_data: Option<PathBuf>,
+    /// Don't start the metrics server for this test run.
+    #[arg(long)]
+    disable_metrics: bool,
     #[clap(subcommand)]
     /// Execution mode for the test.
     pub command: TestMode,
@@ -99,24 +102,45 @@ pub enum TestMode {
 }
 
 pub(crate) async fn test_framework(base_config: TestConfig) -> anyhow::Result<(), Error> {
-    let exec_data_path = base_config.execution_data.clone();
-    tokio::task::spawn(async move {
-        if let Err(err) = crate::network_metrics_server::run_server(exec_data_path).await {
-            tracing::error!(error = %err, "Network metrics server failed");
-        }
-    });
-    match &base_config.command {
-        TestMode::SingleProcess => {
-            single_process::run(&base_config).await?;
-        }
-        TestMode::MultiProcess(config) => {
-            multiple_process::run(&base_config, config).await?;
-        }
-        TestMode::Network => {
-            network::run(&base_config).await?;
+    let (server, changes_recorder) = if !base_config.disable_metrics {
+        let (changes, rx) = tokio::sync::broadcast::channel(10000);
+        let changes_recorder = base_config.execution_data.clone().map(|data_dir| {
+            tokio::task::spawn(async move {
+                if let Err(err) = crate::network_metrics_server::record_saver(data_dir, rx).await {
+                    tracing::error!(error = %err, "Record saver failed");
+                }
+            })
+        });
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let barrier_cp = barrier.clone();
+        let server = tokio::task::spawn(async move {
+            if let Err(err) = crate::network_metrics_server::run_server(barrier_cp, changes).await {
+                tracing::error!(error = %err, "Network metrics server failed");
+            }
+        });
+        barrier.wait().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        (Some(server), changes_recorder)
+    } else {
+        (None, None)
+    };
+    let res = match &base_config.command {
+        TestMode::SingleProcess => single_process::run(&base_config).await,
+        TestMode::MultiProcess(config) => multiple_process::run(&base_config, config).await,
+        TestMode::Network => network::run(&base_config).await,
+    };
+    if let Some(server) = server {
+        server.abort();
+    }
+    if let Some(changes) = changes_recorder {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            r = changes => {
+                r?;
+            }
         }
     }
-    Ok(())
+    res
 }
 
 async fn config_sim_network(base_config: &TestConfig) -> anyhow::Result<SimNetwork, Error> {
