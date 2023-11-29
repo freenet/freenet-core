@@ -69,6 +69,7 @@ mod meter;
 pub mod rate;
 mod running_average;
 
+use std::collections::HashMap;
 use self::meter::{AttributionSource, Meter, ResourceType};
 use crate::ring::PeerKeyLocation;
 use std::time::Instant;
@@ -99,6 +100,33 @@ impl ResourceManager {
         value: f64,
     ) {
         self.meter.report(attribution, resource, value);
+    }
+
+    /// Return the maximum resource usage rate of any usage type as a proportion
+    /// of the limit for that usage type
+    pub(crate) fn max_usage_rate(&self) -> UsageRates {
+        let mut max = 0.0;
+        let mut usage_rate_per_type = HashMap::new();
+        for resource_type in ResourceType::iter() {
+            let usage_rate = self.resource_usage_rate(resource_type);
+            usage_rate_per_type.insert(resource_type, usage_rate);
+            if usage_rate > max {
+                max = usage_rate;
+            }
+        }
+        UsageRates {
+            usage_rate_per_type,
+            max_usage_rate: max,
+        }
+    }
+
+    /// Returns the current resource usage rate for a specified usage type as
+    /// a fraction of the limit.
+    pub(crate) fn resource_usage_rate(&self, resource_type: ResourceType) -> f64 {
+        match self.meter.resource_usage_rate(resource_type) {
+            Some(rate) => rate.per_second() / self.limits.get(resource_type),
+            None => 0.0,
+        }
     }
 
     /// Determines which peers should be deleted to reduce resource usage below
@@ -217,6 +245,11 @@ impl Limits {
             // TODO: Support non-flow resources like memory and storage use
         }
     }
+}
+
+pub(crate) struct UsageRates {
+    pub usage_rate_per_type : HashMap<ResourceType, f64>,
+    pub max_usage_rate: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
