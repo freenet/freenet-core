@@ -10,6 +10,7 @@ import {
   handleAddedConnection,
   handleRemovedConnection,
   peers,
+  PeerId,
 } from "../src/topology";
 
 describe("Network Monitor App", () => {
@@ -27,23 +28,25 @@ describe("Network Monitor App", () => {
     );
     handleAddedConnection(mockAddedConnection);
 
+    const peer1 = new PeerId("peer1");
+    const peer2 = new PeerId("peer2");
     expect(peers).toEqual({
       peer1: {
-        id: "peer1",
+        id: peer1,
         locationHistory: [],
         currentLocation: 0.6254,
         connectionTimestamp: expect.any(Number),
-        connections: [{ id: "peer2", location: 0.2875, transaction: "tx1" }],
+        connections: [{ id: peer2, location: 0.2875, transaction: "tx1" }],
         history: [
           {
             type: "Added",
             from: {
-              id: "peer1",
+              id: peer1,
               location: 0.6254,
               transaction: "tx1",
             },
             to: {
-              id: "peer2",
+              id: peer2,
               location: 0.2875,
               transaction: "tx1",
             },
@@ -52,21 +55,21 @@ describe("Network Monitor App", () => {
         ],
       },
       peer2: {
-        id: "peer2",
+        id: peer2,
         locationHistory: [],
         currentLocation: 0.2875,
         connectionTimestamp: expect.any(Number),
-        connections: [{ id: "peer1", location: 0.6254, transaction: "tx1" }],
+        connections: [{ id: peer1, location: 0.6254, transaction: "tx1" }],
         history: [
           {
             type: "Added",
             from: {
-              id: "peer1",
+              id: peer1,
               location: 0.6254,
               transaction: "tx1",
             },
             to: {
-              id: "peer2",
+              id: peer2,
               location: 0.2875,
               transaction: "tx1",
             },

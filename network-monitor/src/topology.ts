@@ -7,7 +7,7 @@ interface PeerList {
 }
 
 interface Peer {
-  id: string;
+  id: PeerId;
   currentLocation: number;
   connectionTimestamp: number;
   connections: Connection[];
@@ -17,7 +17,7 @@ interface Peer {
 
 interface Connection {
   transaction: string | null;
-  id: string;
+  id: PeerId;
   location: number;
 }
 
@@ -26,6 +26,26 @@ interface ChangeInfo {
   from: Connection;
   to: Connection;
   timestamp: number;
+}
+
+export class PeerId {
+  private id: string;
+
+  constructor(id: string | Uint8Array) {
+    if (id instanceof Uint8Array) {
+      this.id = new TextDecoder().decode(id);
+    } else {
+      this.id = id;
+    }
+  }
+
+  get short() {
+    return this.id.slice(-8);
+  }
+
+  get full() {
+    return this.id;
+  }
 }
 
 export function handleChange(peerChange: fbTopology.PeerChange) {
@@ -69,8 +89,8 @@ export function handleAddedConnection(
     return;
   }
   const added = peerChange;
-  const fromAdded = added.from!.toString();
-  const toAdded = added.to!.toString();
+  const from = new PeerId(added.from!);
+  const to = new PeerId(added.to!);
 
   let transaction: string | null;
   if (typeof added.transaction === "string") {
@@ -82,31 +102,32 @@ export function handleAddedConnection(
   }
   const fromConnection: Connection = {
     transaction: transaction,
-    id: fromAdded,
+    id: from,
     location: added.fromLocation,
   };
 
   const toConnection: Connection = {
     transaction: transaction,
-    id: toAdded,
+    id: to,
     location: added.toLocation,
   };
 
-  if (peers[fromAdded]) {
-    if (peers[fromAdded].currentLocation !== added.fromLocation) {
-      peers[fromAdded].locationHistory.push({
-        location: peers[fromAdded].currentLocation,
+  const fromFullId = from.full;
+  if (peers[fromFullId]) {
+    if (peers[fromFullId].currentLocation !== added.fromLocation) {
+      peers[fromFullId].locationHistory.push({
+        location: peers[fromFullId].currentLocation,
         timestamp: Date.now(),
       });
-      peers[fromAdded].currentLocation = added.fromLocation;
+      peers[fromFullId].currentLocation = added.fromLocation;
     }
 
-    if (!peers[fromAdded].connections.some((conn) => conn.id === toAdded)) {
-      peers[fromAdded].connections.push(toConnection);
+    if (!peers[fromFullId].connections.some((conn) => conn.id === to)) {
+      peers[fromFullId].connections.push(toConnection);
     }
   } else {
-    peers[fromAdded] = {
-      id: fromAdded,
+    peers[fromFullId] = {
+      id: from,
       currentLocation: added.fromLocation,
       connectionTimestamp: Date.now(),
       connections: [toConnection],
@@ -115,21 +136,22 @@ export function handleAddedConnection(
     };
   }
 
-  if (peers[toAdded]) {
-    if (peers[toAdded].currentLocation !== added.toLocation) {
-      peers[toAdded].locationHistory.push({
-        location: peers[toAdded].currentLocation,
+  const toFullId = to.full;
+  if (peers[toFullId]) {
+    if (peers[toFullId].currentLocation !== added.toLocation) {
+      peers[toFullId].locationHistory.push({
+        location: peers[toFullId].currentLocation,
         timestamp: Date.now(),
       });
-      peers[toAdded].currentLocation = added.toLocation;
+      peers[toFullId].currentLocation = added.toLocation;
     }
 
-    if (!peers[toAdded].connections.some((conn) => conn.id === fromAdded)) {
-      peers[toAdded].connections.push(toConnection);
+    if (!peers[toFullId].connections.some((conn) => conn.id === from)) {
+      peers[toFullId].connections.push(toConnection);
     }
   } else {
-    peers[toAdded] = {
-      id: toAdded,
+    peers[toFullId] = {
+      id: to,
       currentLocation: added.toLocation,
       connectionTimestamp: Date.now(),
       connections: [fromConnection],
@@ -146,62 +168,62 @@ export function handleAddedConnection(
   };
 
   // Check if the (to, from) pair or its reverse is already present in the history
-  const isPresent = peers[fromAdded].history.some(
+  const isPresent = peers[fromFullId].history.some(
     (item) =>
-      (item.from.id === changeInfo.from.id &&
-        item.to.id === changeInfo.to.id &&
+      (item.from.id.full === changeInfo.from.id.full &&
+        item.to.id.full === changeInfo.to.id.full &&
         item.from.transaction === changeInfo.from.transaction) ||
-      (item.from.id === changeInfo.to.id &&
-        item.to.id === changeInfo.from.id &&
+      (item.from.id.full === changeInfo.to.id.full &&
+        item.to.id.full === changeInfo.from.id.full &&
         item.from.transaction === changeInfo.from.transaction)
   );
 
   // Only push changeInfo if the pair is not already present
   if (!isPresent) {
-    peers[fromAdded].history.push(changeInfo);
-    peers[toAdded].history.push(changeInfo);
+    peers[fromFullId].history.push(changeInfo);
+    peers[toFullId].history.push(changeInfo);
   }
 }
 
 export function handleRemovedConnection(
   peerChange: fbTopology.RemovedConnectionT
 ) {
-  const removed = peerChange;
-  const fromRemoved = removed.from!.toString();
-  const atRemoved = removed.at!.toString();
-  const index = peers[fromRemoved].connections.findIndex(
-    (connection) => connection.id === atRemoved
+  const from = new PeerId(peerChange.from!);
+  const at = new PeerId(peerChange.at!);
+
+  const index = peers[from.full].connections.findIndex(
+    (connection) => connection.id.full === at.full
   );
 
   if (index > -1) {
-    peers[fromRemoved].connections.splice(index, 1);
+    peers[from.full].connections.splice(index, 1);
   }
 
-  const reverseIndex = peers[atRemoved].connections.findIndex(
-    (connection: Connection) => connection.id === fromRemoved
+  const reverseIndex = peers[at.full].connections.findIndex(
+    (connection: Connection) => connection.id.full === from.full
   );
 
   if (reverseIndex > -1) {
-    peers[atRemoved].connections.splice(reverseIndex, 1);
+    peers[at.full].connections.splice(reverseIndex, 1);
   }
 
   const changeInfo: ChangeInfo = {
     type: "Removed",
     from: {
       transaction: null,
-      id: fromRemoved,
-      location: peers[fromRemoved].currentLocation,
+      id: from,
+      location: peers[from.full].currentLocation,
     },
     to: {
       transaction: null,
-      id: atRemoved,
-      location: peers[atRemoved].currentLocation,
+      id: at,
+      location: peers[at.full].currentLocation,
     },
     timestamp: Date.now(),
   };
 
-  peers[fromRemoved].history.push(changeInfo);
-  peers[atRemoved].history.push(changeInfo);
+  peers[from.full].history.push(changeInfo);
+  peers[at.full].history.push(changeInfo);
 }
 
 function updateTable() {
@@ -245,9 +267,57 @@ function updateTable() {
       "mouseout",
       () => (peerConnectionsDiv.style.display = "none")
     );
+    row.addEventListener("click", () => {
+      const modal = document.createElement("div");
+      modal.classList.add("modal", "is-active");
+      const modalBackground = document.createElement("div");
+      modalBackground.classList.add("modal-background");
+      modal.appendChild(modalBackground);
+
+      const modalContent = document.createElement("div");
+      modalContent.classList.add("modal-content");
+      // Set the width of the modal content based on the viewport width
+      if (window.innerWidth >= 1200) {
+        modalContent.style.width = "80%";
+      } else if (window.innerWidth >= 769) {
+        modalContent.style.width = "640px";
+      } else {
+        modalContent.style.width = "100%";
+      }
+
+      const modalBox = document.createElement("div");
+      modalBox.classList.add("box");
+      modalBox.style.overflowWrap = "break-word";
+      modalBox.style.whiteSpace = "normal";
+
+      const peerData = document.getElementById("peer-connections")!.innerHTML;
+      modalBox.innerHTML = peerData;
+
+      // Make the table width 100% to ensure it fits within the modal box
+      modalBox.querySelectorAll("table").forEach((table) => {
+        if (table) {
+          table.style.width = "100%";
+          table.style.tableLayout = "fixed";
+        }
+      });
+
+      modalContent.appendChild(modalBox);
+      modal.appendChild(modalContent);
+
+      const closeModal = document.createElement("button");
+      closeModal.classList.add("modal-close", "is-large");
+      modal.appendChild(closeModal);
+
+      const containerDiv = document.querySelector(".container.main")!;
+      containerDiv.appendChild(modal);
+      modal.addEventListener("click", () => {
+        modal.style.display = "none";
+        modal.remove();
+      });
+    });
 
     const id = document.createElement("td");
-    id.textContent = peerData.id;
+    id.textContent = "..." + peerData.id.short;
     const location = document.createElement("td");
     location.textContent = peerData.currentLocation.toString();
     const connectionTimestamp = document.createElement("td");
@@ -370,7 +440,7 @@ export function showPeerData(peer: Peer) {
   connections.forEach((connection) => {
     const row = document.createElement("tr");
     const idCell = document.createElement("td");
-    idCell.textContent = connection.id.toString() ?? "";
+    idCell.textContent = connection.id.short;
     const locationCell = document.createElement("td");
     locationCell.textContent = connection.location.toString() ?? "";
     row.appendChild(idCell);
@@ -424,9 +494,9 @@ function displayHistory(peer: Peer) {
     const typeCell = document.createElement("td");
     typeCell.textContent = change.type;
     const fromCell = document.createElement("td");
-    fromCell.textContent = change.from.id.slice(-8); // Show last 8 characters
+    fromCell.textContent = "..." + change.from.id.short; // Show last 8 characters
     const toCell = document.createElement("td");
-    toCell.textContent = change.to.id.slice(-8); // Show last 8 characters
+    toCell.textContent = "..." + change.to.id.short; // Show last 8 characters
     const dateColumn = document.createElement("td");
     const date = new Date(change.timestamp);
     dateColumn.textContent = `${date.toUTCString()} (${date.getMilliseconds()}ms)`;
