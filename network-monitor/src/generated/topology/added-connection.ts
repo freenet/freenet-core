@@ -34,69 +34,89 @@ export class AddedConnection
     );
   }
 
-  from(): string | null;
-  from(optionalEncoding: flatbuffers.Encoding): string | Uint8Array | null;
-  from(optionalEncoding?: any): string | Uint8Array | null {
+  transaction(): string | null;
+  transaction(
+    optionalEncoding: flatbuffers.Encoding
+  ): string | Uint8Array | null;
+  transaction(optionalEncoding?: any): string | Uint8Array | null {
     const offset = this.bb!.__offset(this.bb_pos, 4);
     return offset
       ? this.bb!.__string(this.bb_pos + offset, optionalEncoding)
       : null;
   }
 
-  fromLocation(): number {
+  from(): string | null;
+  from(optionalEncoding: flatbuffers.Encoding): string | Uint8Array | null;
+  from(optionalEncoding?: any): string | Uint8Array | null {
     const offset = this.bb!.__offset(this.bb_pos, 6);
+    return offset
+      ? this.bb!.__string(this.bb_pos + offset, optionalEncoding)
+      : null;
+  }
+
+  fromLocation(): number {
+    const offset = this.bb!.__offset(this.bb_pos, 8);
     return offset ? this.bb!.readFloat64(this.bb_pos + offset) : 0.0;
   }
 
   to(): string | null;
   to(optionalEncoding: flatbuffers.Encoding): string | Uint8Array | null;
   to(optionalEncoding?: any): string | Uint8Array | null {
-    const offset = this.bb!.__offset(this.bb_pos, 8);
+    const offset = this.bb!.__offset(this.bb_pos, 10);
     return offset
       ? this.bb!.__string(this.bb_pos + offset, optionalEncoding)
       : null;
   }
 
   toLocation(): number {
-    const offset = this.bb!.__offset(this.bb_pos, 10);
+    const offset = this.bb!.__offset(this.bb_pos, 12);
     return offset ? this.bb!.readFloat64(this.bb_pos + offset) : 0.0;
   }
 
   static startAddedConnection(builder: flatbuffers.Builder) {
-    builder.startObject(4);
+    builder.startObject(5);
+  }
+
+  static addTransaction(
+    builder: flatbuffers.Builder,
+    transactionOffset: flatbuffers.Offset
+  ) {
+    builder.addFieldOffset(0, transactionOffset, 0);
   }
 
   static addFrom(builder: flatbuffers.Builder, fromOffset: flatbuffers.Offset) {
-    builder.addFieldOffset(0, fromOffset, 0);
+    builder.addFieldOffset(1, fromOffset, 0);
   }
 
   static addFromLocation(builder: flatbuffers.Builder, fromLocation: number) {
-    builder.addFieldFloat64(1, fromLocation, 0.0);
+    builder.addFieldFloat64(2, fromLocation, 0.0);
   }
 
   static addTo(builder: flatbuffers.Builder, toOffset: flatbuffers.Offset) {
-    builder.addFieldOffset(2, toOffset, 0);
+    builder.addFieldOffset(3, toOffset, 0);
   }
 
   static addToLocation(builder: flatbuffers.Builder, toLocation: number) {
-    builder.addFieldFloat64(3, toLocation, 0.0);
+    builder.addFieldFloat64(4, toLocation, 0.0);
   }
 
   static endAddedConnection(builder: flatbuffers.Builder): flatbuffers.Offset {
     const offset = builder.endObject();
-    builder.requiredField(offset, 4); // from
-    builder.requiredField(offset, 8); // to
+    builder.requiredField(offset, 6); // from
+    builder.requiredField(offset, 10); // to
     return offset;
   }
 
   static createAddedConnection(
     builder: flatbuffers.Builder,
+    transactionOffset: flatbuffers.Offset,
     fromOffset: flatbuffers.Offset,
     fromLocation: number,
     toOffset: flatbuffers.Offset,
     toLocation: number
   ): flatbuffers.Offset {
     AddedConnection.startAddedConnection(builder);
+    AddedConnection.addTransaction(builder, transactionOffset);
     AddedConnection.addFrom(builder, fromOffset);
     AddedConnection.addFromLocation(builder, fromLocation);
     AddedConnection.addTo(builder, toOffset);
@@ -106,6 +126,7 @@ export class AddedConnection
 
   unpack(): AddedConnectionT {
     return new AddedConnectionT(
+      this.transaction(),
       this.from(),
       this.fromLocation(),
       this.to(),
@@ -114,6 +135,7 @@ export class AddedConnection
   }
 
   unpackTo(_o: AddedConnectionT): void {
+    _o.transaction = this.transaction();
     _o.from = this.from();
     _o.fromLocation = this.fromLocation();
     _o.to = this.to();
@@ -123,6 +145,7 @@ export class AddedConnection
 
 export class AddedConnectionT implements flatbuffers.IGeneratedObject {
   constructor(
+    public transaction: string | Uint8Array | null = null,
     public from: string | Uint8Array | null = null,
     public fromLocation: number = 0.0,
     public to: string | Uint8Array | null = null,
@@ -130,11 +153,14 @@ export class AddedConnectionT implements flatbuffers.IGeneratedObject {
   ) {}
 
   pack(builder: flatbuffers.Builder): flatbuffers.Offset {
+    const transaction =
+      this.transaction !== null ? builder.createString(this.transaction!) : 0;
     const from = this.from !== null ? builder.createString(this.from!) : 0;
     const to = this.to !== null ? builder.createString(this.to!) : 0;
 
     return AddedConnection.createAddedConnection(
       builder,
+      transaction,
       from,
       this.fromLocation,
       to,

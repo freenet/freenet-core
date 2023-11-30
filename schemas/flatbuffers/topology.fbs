@@ -1,6 +1,7 @@
 namespace topology;
 
 table AddedConnection {
+  transaction: string;
   from: string(required); // encoded PeerId
   from_location: float64;
   to: string(required);   // encoded PeerId

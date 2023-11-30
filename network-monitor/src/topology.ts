@@ -16,6 +16,7 @@ interface Peer {
 }
 
 interface Connection {
+  transaction: string | null;
   id: string;
   location: number;
 }
@@ -49,7 +50,7 @@ export function handleChange(peerChange: fbTopology.PeerChange) {
         break;
     }
     unpacked.currentState.forEach((connection) => {
-      handleAddedConnection(connection);
+      handleAddedConnection(connection, false);
     });
   } catch (e) {
     console.error(e);
@@ -58,17 +59,35 @@ export function handleChange(peerChange: fbTopology.PeerChange) {
   }
 }
 
-export function handleAddedConnection(peerChange: fbTopology.AddedConnectionT) {
+export function handleAddedConnection(
+  peerChange: fbTopology.AddedConnectionT,
+  skipNonTransaction = true
+) {
+  if (!peerChange.transaction && skipNonTransaction) {
+    // only add connections if they have been reported as part of a transaction
+    // otherwise we end up with duplicates here
+    return;
+  }
   const added = peerChange;
   const fromAdded = added.from!.toString();
   const toAdded = added.to!.toString();
 
+  let transaction: string | null;
+  if (typeof added.transaction === "string") {
+    transaction = added.transaction;
+  } else if (added.transaction instanceof Uint8Array) {
+    transaction = new TextDecoder().decode(added.transaction);
+  } else {
+    transaction = null;
+  }
   const fromConnection: Connection = {
+    transaction: transaction,
     id: fromAdded,
     location: added.fromLocation,
   };
 
   const toConnection: Connection = {
+    transaction: transaction,
     id: toAdded,
     location: added.toLocation,
   };
@@ -126,8 +145,22 @@ export function handleAddedConnection(peerChange: fbTopology.AddedConnectionT) {
     timestamp: Date.now(),
   };
 
-  peers[fromAdded].history.push(changeInfo);
-  peers[toAdded].history.push(changeInfo);
+  // Check if the (to, from) pair or its reverse is already present in the history
+  const isPresent = peers[fromAdded].history.some(
+    (item) =>
+      (item.from.id === changeInfo.from.id &&
+        item.to.id === changeInfo.to.id &&
+        item.from.transaction === changeInfo.from.transaction) ||
+      (item.from.id === changeInfo.to.id &&
+        item.to.id === changeInfo.from.id &&
+        item.from.transaction === changeInfo.from.transaction)
+  );
+
+  // Only push changeInfo if the pair is not already present
+  if (!isPresent) {
+    peers[fromAdded].history.push(changeInfo);
+    peers[toAdded].history.push(changeInfo);
+  }
 }
 
 export function handleRemovedConnection(
@@ -155,10 +188,12 @@ export function handleRemovedConnection(
   const changeInfo: ChangeInfo = {
     type: "Removed",
     from: {
+      transaction: null,
       id: fromRemoved,
       location: peers[fromRemoved].currentLocation,
     },
     to: {
+      transaction: null,
       id: atRemoved,
       location: peers[atRemoved].currentLocation,
     },
@@ -201,7 +236,7 @@ function updateTable() {
     const row = document.createElement("tr");
     row.addEventListener("mouseover", (event) => {
       setDivPosition(event);
-      showConnections(peers[peer]);
+      showPeerData(peers[peer]);
     });
     row.addEventListener("mousemove", (event) => {
       setDivPosition(event);
@@ -227,7 +262,7 @@ function updateTable() {
     for (let i = 0; i < tds.length; i++) {
       tds[i].addEventListener("mouseover", (event) => {
         setDivPosition(event);
-        showConnections(peers[peer]);
+        showPeerData(peers[peer]);
       });
       row.addEventListener("mousemove", (event) => {
         setDivPosition(event);
@@ -254,13 +289,15 @@ function updateTable() {
 
 const sortDirections: number[] = [];
 
-document
-  .querySelector("#peers-table-h")!
-  .querySelectorAll("th")!
-  .forEach((header, index) => {
-    sortDirections.push(1);
-    tableSorting(header, index);
-  });
+document.addEventListener("DOMContentLoaded", () => {
+  document
+    .querySelector("#peers-table-h")!
+    .querySelectorAll("th")!
+    .forEach((header, index) => {
+      sortDirections.push(1);
+      tableSorting(header, index);
+    });
+});
 
 function tableSorting(header: HTMLTableCellElement, index: number) {
   header.addEventListener("click", () => {
@@ -295,9 +332,18 @@ function tableSorting(header: HTMLTableCellElement, index: number) {
   });
 }
 
-export function showConnections(peer: Peer) {
+export function showPeerData(peer: Peer) {
   const id = peer.id;
   const connections: Connection[] = peer.connections ?? [];
+
+  // Set title
+  const peerDataHeader = document.getElementById("peer-connections-h")!;
+  peerDataHeader.innerHTML = `
+  <div class="block">
+    <b>Peer Id</b>: ${id}</br>
+    <b>Location</b>: ${peer.currentLocation ?? ""}
+  </div>
+  `;
 
   // Sort connections by location
   connections.sort((a, b) => a.location - b.location);
@@ -332,25 +378,74 @@ export function showConnections(peer: Peer) {
     tableBody.appendChild(row);
   });
 
-  // Set title
-  const idLocation = document.getElementById("peer-connections-t")!;
-  idLocation.innerHTML = `<b>Peer Id</b>: ${id}, <b>Location</b>: ${
-    peer.currentLocation ?? ""
-  }`;
+  displayHistory(peer);
 }
 
-function displayHistory(peer: Peer): string {
-  let historyHTML = '<table class="table is-fullwidth is-striped">';
-  historyHTML +=
-    "<thead><tr><th>Timestamp</th><th>Type</th><th>From</th><th>To</th></tr></thead><tbody>";
+function displayHistory(peer: Peer) {
+  const peerConnections = document.getElementById("peer-connections")!;
 
-  historyHTML += peer.history
-    .map((change) => {
-      return `<tr><td>${change.timestamp}</td><td>${change.type}</td><td>${change.from.id}</td><td>${change.to.id}</td></tr>`;
-    })
-    .join("");
+  // Remove the existing table if it exists
+  const existingTable = peerConnections.querySelector("#connection-history");
+  if (existingTable) {
+    existingTable.remove();
+  }
 
-  historyHTML += "</tbody></table>";
+  // Create a new table
+  const table = document.createElement("table");
+  table.id = "connection-history";
+  table.classList.add("table", "is-striped", "block", "is-bordered");
+  table.style.overflowWrap = "break-word";
 
-  return historyHTML;
+  // Create the table header row
+  const thead = document.createElement("thead");
+  const headerRow = document.createElement("tr");
+  const typeHeader = document.createElement("th");
+  typeHeader.textContent = "Type";
+  const fromHeader = document.createElement("th");
+  fromHeader.textContent = "From";
+  const toHeader = document.createElement("th");
+  toHeader.textContent = "To";
+  const dateHeader = document.createElement("th");
+  dateHeader.textContent = "Date";
+  const transaction = document.createElement("th");
+  transaction.textContent = "Transaction";
+  headerRow.appendChild(typeHeader);
+  headerRow.appendChild(fromHeader);
+  headerRow.appendChild(toHeader);
+  headerRow.appendChild(dateHeader);
+  headerRow.appendChild(transaction);
+  thead.appendChild(headerRow);
+  table.appendChild(thead);
+
+  // Create the table body
+  const tbody = document.createElement("tbody");
+  const historyRows = peer.history.map((change) => {
+    const row = document.createElement("tr");
+    const typeCell = document.createElement("td");
+    typeCell.textContent = change.type;
+    const fromCell = document.createElement("td");
+    fromCell.textContent = change.from.id.slice(-8); // Show last 8 characters
+    const toCell = document.createElement("td");
+    toCell.textContent = change.to.id.slice(-8); // Show last 8 characters
+    const dateColumn = document.createElement("td");
+    const date = new Date(change.timestamp);
+    dateColumn.textContent = `${date.toUTCString()} (${date.getMilliseconds()}ms)`;
+    const transactionCell = document.createElement("td");
+    transactionCell.textContent = change.from.transaction
+      ? change.from.transaction
+      : "";
+    row.appendChild(typeCell);
+    row.appendChild(fromCell);
+    row.appendChild(toCell);
+    row.appendChild(dateColumn);
+    row.appendChild(transactionCell);
+    return row;
+  });
+  historyRows.forEach((row) => {
+    tbody.appendChild(row);
+  });
+  table.appendChild(tbody);
+
+  // Append the new table to the peerConnections element
+  peerConnections.appendChild(table);
 }

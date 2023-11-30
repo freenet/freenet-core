@@ -25,24 +25,35 @@
           id="peer-connections"
           style="display: none; position: absolute; z-index: 1"
         >
-          <h2 id="peer-connections-t">Peer Connections</h2>
-          <table id="peer-connections-l" class="table is-striped">
+          <div id="peer-connections-h" class="block"></div>
+          <h2 class="title is-3">Neighbours</h2>
+          <table
+            id="peer-connections-t"
+            class="table is-striped block is-bordered"
+          >
             <tbody id="peer-connections-b"></tbody>
           </table>
+          <h2 class="title is-3">Connections history</h2>
+          <table
+            id="connection-history"
+            class="table is-striped block is-bordered"
+          ></table>
         </div>
-        <table id="peers-table" class="table is-striped">
-          <thead id="peers-table-h">
-            <tr>
-              <th>Peer Id <i class="fas fa-sort-amount-up"></i></th>
-              <th>Location <i class="fas fa-sort-amount-up"></i></th>
-              <th>
-                Connection Date
-                <i class="fas fa-sort-amount-up"></i>
-              </th>
-            </tr>
-          </thead>
-          <tbody id="peers-table-b"></tbody>
-        </table>
+        <div class="box">
+          <table id="peers-table" class="table is-striped">
+            <thead id="peers-table-h">
+              <tr>
+                <th>Peer Id <i class="fas fa-sort-amount-up"></i></th>
+                <th>Location <i class="fas fa-sort-amount-up"></i></th>
+                <th>
+                  Connection Date
+                  <i class="fas fa-sort-amount-up"></i>
+                </th>
+              </tr>
+            </thead>
+            <tbody id="peers-table-b"></tbody>
+          </table>
+        </div>
       </div>
     </section>
     <script src="./bundle.js"></script>

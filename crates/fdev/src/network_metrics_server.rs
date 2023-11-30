@@ -178,8 +178,16 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
     let mut changes = state.changes.subscribe();
     while let Ok(msg) = changes.recv().await {
         match msg {
-            Change::AddedConnection { from, to } => {
-                let msg = PeerChange::added_connection_msg((from.0 .0, from.1), (to.0 .0, to.1));
+            Change::AddedConnection {
+                transaction,
+                from,
+                to,
+            } => {
+                let msg = PeerChange::added_connection_msg(
+                    transaction.as_ref(),
+                    (from.0 .0, from.1),
+                    (to.0 .0, to.1),
+                );
                 tx.send(Message::Binary(msg)).await?;
             }
             Change::RemovedConnection { from, at } => {
@@ -204,6 +212,9 @@ struct PeerData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum Change {
     AddedConnection {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        transaction: Option<String>,
         from: (PeerIdHumanReadable, f64),
         to: (PeerIdHumanReadable, f64),
     },
@@ -249,7 +260,10 @@ impl ServerState {
 
                 match self.peer_data.entry(from_peer_id) {
                     dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-                        occ.get_mut().connections.push((to_peer_id, to_loc));
+                        let connections = &mut occ.get_mut().connections;
+                        connections.push((to_peer_id, to_loc));
+                        connections.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                        connections.dedup();
                     }
                     dashmap::mapref::entry::Entry::Vacant(vac) => {
                         vac.insert(PeerData {
@@ -261,7 +275,10 @@ impl ServerState {
 
                 match self.peer_data.entry(to_peer_id) {
                     dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-                        occ.get_mut().connections.push((from_peer_id, from_loc));
+                        let connections = &mut occ.get_mut().connections;
+                        connections.push((from_peer_id, from_loc));
+                        connections.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                        connections.dedup();
                     }
                     dashmap::mapref::entry::Entry::Vacant(vac) => {
                         vac.insert(PeerData {
@@ -272,6 +289,7 @@ impl ServerState {
                 }
 
                 let _ = self.changes.send(Change::AddedConnection {
+                    transaction: added.transaction().map(|s| s.to_owned()),
                     from: (from_peer_id.into(), from_loc),
                     to: (to_peer_id.into(), to_loc),
                 });

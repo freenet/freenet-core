@@ -292,12 +292,6 @@ impl Ring {
                 return Err(anyhow::anyhow!("IP and port are required for gateways"));
             }
 
-            /*
-            min 20 max 100
-            GW A, number: 100
-            GW B, number: 50
-            */
-
             ring.update_location(Some(loc));
             for PeerKeyLocation { peer, location } in gateways {
                 // FIXME: this is problematic cause gateways will take all spots then!

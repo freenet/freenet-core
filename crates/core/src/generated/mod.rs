@@ -4,7 +4,7 @@
 pub(crate) mod topology_generated;
 pub use topology_generated::*;
 
-use crate::node::PeerId;
+use crate::{message::Transaction, node::PeerId};
 
 pub trait TryFromFbs<'a>: Sized + 'a {
     fn try_decode_fbs(buf: &'a [u8]) -> Result<Self, flatbuffers::InvalidFlatbuffer>;
@@ -30,6 +30,7 @@ impl PeerChange<'_> {
                 topology::AddedConnection::create(
                     &mut buf,
                     &topology::AddedConnectionArgs {
+                        transaction: None,
                         from,
                         from_location: *from_location,
                         to: Some(to),
@@ -52,15 +53,18 @@ impl PeerChange<'_> {
     }
 
     pub fn added_connection_msg(
+        transaction: Option<impl AsRef<str>>,
         (from, from_location): (PeerId, f64),
         (to, to_location): (PeerId, f64),
     ) -> Vec<u8> {
         let mut buf = flatbuffers::FlatBufferBuilder::new();
         let from = Some(buf.create_string(from.to_string().as_str()));
         let to = Some(buf.create_string(to.to_string().as_str()));
+        let transaction = transaction.map(|t| buf.create_string(t.as_ref()));
         let add_conn = topology::AddedConnection::create(
             &mut buf,
             &topology::AddedConnectionArgs {
+                transaction,
                 from,
                 from_location,
                 to,

@@ -10,7 +10,6 @@ import {
   handleAddedConnection,
   handleRemovedConnection,
   peers,
-  showConnections,
 } from "../src/topology";
 
 describe("Network Monitor App", () => {
@@ -20,6 +19,7 @@ describe("Network Monitor App", () => {
 
   test("should update peers table when receiving added connection", () => {
     const mockAddedConnection = new AddedConnectionT(
+      "tx1",
       "peer1",
       0.6254,
       "peer2",
@@ -32,17 +32,20 @@ describe("Network Monitor App", () => {
         id: "peer1",
         locationHistory: [],
         currentLocation: 0.6254,
-        connections: [{ id: "peer2", location: 0.2875 }],
+        connectionTimestamp: expect.any(Number),
+        connections: [{ id: "peer2", location: 0.2875, transaction: "tx1" }],
         history: [
           {
             type: "Added",
             from: {
               id: "peer1",
               location: 0.6254,
+              transaction: "tx1",
             },
             to: {
               id: "peer2",
               location: 0.2875,
+              transaction: "tx1",
             },
             timestamp: expect.any(Number),
           },
@@ -52,17 +55,20 @@ describe("Network Monitor App", () => {
         id: "peer2",
         locationHistory: [],
         currentLocation: 0.2875,
-        connections: [{ id: "peer1", location: 0.6254 }],
+        connectionTimestamp: expect.any(Number),
+        connections: [{ id: "peer1", location: 0.6254, transaction: "tx1" }],
         history: [
           {
             type: "Added",
             from: {
               id: "peer1",
               location: 0.6254,
+              transaction: "tx1",
             },
             to: {
               id: "peer2",
               location: 0.2875,
+              transaction: "tx1",
             },
             timestamp: expect.any(Number),
           },

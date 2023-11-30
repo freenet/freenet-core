@@ -769,6 +769,7 @@ async fn send_to_metrics_server(
                 },
         }) => {
             let msg = PeerChange::added_connection_msg(
+                (&send_msg.tx != Transaction::NULL).then(|| send_msg.tx.to_string()),
                 (*from_peer, from_loc.as_f64()),
                 (*to_peer, to_loc.as_f64()),
             );

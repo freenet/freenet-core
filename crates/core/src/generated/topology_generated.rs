@@ -233,10 +233,11 @@ pub mod topology {
     }
 
     impl<'a> AddedConnection<'a> {
-        pub const VT_FROM: flatbuffers::VOffsetT = 4;
-        pub const VT_FROM_LOCATION: flatbuffers::VOffsetT = 6;
-        pub const VT_TO: flatbuffers::VOffsetT = 8;
-        pub const VT_TO_LOCATION: flatbuffers::VOffsetT = 10;
+        pub const VT_TRANSACTION: flatbuffers::VOffsetT = 4;
+        pub const VT_FROM: flatbuffers::VOffsetT = 6;
+        pub const VT_FROM_LOCATION: flatbuffers::VOffsetT = 8;
+        pub const VT_TO: flatbuffers::VOffsetT = 10;
+        pub const VT_TO_LOCATION: flatbuffers::VOffsetT = 12;
 
         #[inline]
         pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -256,9 +257,24 @@ pub mod topology {
             if let Some(x) = args.from {
                 builder.add_from(x);
             }
+            if let Some(x) = args.transaction {
+                builder.add_transaction(x);
+            }
             builder.finish()
         }
 
+        #[inline]
+        pub fn transaction(&self) -> Option<&'a str> {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(
+                    AddedConnection::VT_TRANSACTION,
+                    None,
+                )
+            }
+        }
         #[inline]
         pub fn from(&self) -> &'a str {
             // Safety:
@@ -313,6 +329,11 @@ pub mod topology {
         ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
             use self::flatbuffers::Verifiable;
             v.visit_table(pos)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "transaction",
+                    Self::VT_TRANSACTION,
+                    false,
+                )?
                 .visit_field::<flatbuffers::ForwardsUOffset<&str>>("from", Self::VT_FROM, true)?
                 .visit_field::<f64>("from_location", Self::VT_FROM_LOCATION, false)?
                 .visit_field::<flatbuffers::ForwardsUOffset<&str>>("to", Self::VT_TO, true)?
@@ -322,6 +343,7 @@ pub mod topology {
         }
     }
     pub struct AddedConnectionArgs<'a> {
+        pub transaction: Option<flatbuffers::WIPOffset<&'a str>>,
         pub from: Option<flatbuffers::WIPOffset<&'a str>>,
         pub from_location: f64,
         pub to: Option<flatbuffers::WIPOffset<&'a str>>,
@@ -331,6 +353,7 @@ pub mod topology {
         #[inline]
         fn default() -> Self {
             AddedConnectionArgs {
+                transaction: None,
                 from: None, // required field
                 from_location: 0.0,
                 to: None, // required field
@@ -344,6 +367,13 @@ pub mod topology {
         start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
     }
     impl<'a: 'b, 'b> AddedConnectionBuilder<'a, 'b> {
+        #[inline]
+        pub fn add_transaction(&mut self, transaction: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                AddedConnection::VT_TRANSACTION,
+                transaction,
+            );
+        }
         #[inline]
         pub fn add_from(&mut self, from: flatbuffers::WIPOffset<&'b str>) {
             self.fbb_
@@ -386,6 +416,7 @@ pub mod topology {
     impl core::fmt::Debug for AddedConnection<'_> {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             let mut ds = f.debug_struct("AddedConnection");
+            ds.field("transaction", &self.transaction());
             ds.field("from", &self.from());
             ds.field("from_location", &self.from_location());
             ds.field("to", &self.to());
