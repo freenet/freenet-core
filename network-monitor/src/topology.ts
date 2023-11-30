@@ -1,4 +1,5 @@
 import * as fbTopology from "./generated/topology";
+import * as d3 from "d3";
 
 export let peers: PeerList = {};
 
@@ -122,7 +123,9 @@ export function handleAddedConnection(
       peers[fromFullId].currentLocation = added.fromLocation;
     }
 
-    if (!peers[fromFullId].connections.some((conn) => conn.id === to)) {
+    if (
+      !peers[fromFullId].connections.some((conn) => conn.id.full === to.full)
+    ) {
       peers[fromFullId].connections.push(toConnection);
     }
   } else {
@@ -146,8 +149,10 @@ export function handleAddedConnection(
       peers[toFullId].currentLocation = added.toLocation;
     }
 
-    if (!peers[toFullId].connections.some((conn) => conn.id === from)) {
-      peers[toFullId].connections.push(toConnection);
+    if (
+      !peers[toFullId].connections.some((conn) => conn.id.full === from.full)
+    ) {
+      peers[toFullId].connections.push(fromConnection);
     }
   } else {
     peers[toFullId] = {
@@ -227,7 +232,7 @@ export function handleRemovedConnection(
 }
 
 function updateTable() {
-  const peerConnectionsDiv = document.getElementById("peer-connections")!;
+  const peerConnectionsDiv = document.getElementById("peer-details")!;
 
   const table = document.getElementById("peers-table")!;
 
@@ -286,13 +291,12 @@ function updateTable() {
       }
 
       const modalBox = document.createElement("div");
-      modalBox.classList.add("box");
+      modalBox.classList.add("box", "column");
       modalBox.style.overflowWrap = "break-word";
       modalBox.style.whiteSpace = "normal";
 
-      const peerData = document.getElementById("peer-connections")!.innerHTML;
-      modalBox.innerHTML = peerData;
-
+      const currentDetails = document.getElementById("peer-details")!.innerHTML;
+      modalBox.innerHTML = currentDetails;
       // Make the table width 100% to ensure it fits within the modal box
       modalBox.querySelectorAll("table").forEach((table) => {
         if (table) {
@@ -312,8 +316,36 @@ function updateTable() {
       containerDiv.appendChild(modal);
       modal.addEventListener("click", () => {
         modal.style.display = "none";
+        const graphContainer = d3.select("#peer-conns-graph");
+        graphContainer.selectAll("*").remove();
         modal.remove();
       });
+
+      // Build the neightbours information section
+      const neightboursDiv = document.createElement("div");
+      neightboursDiv.classList.add("columns");
+
+      const graphDiv = document.createElement("div");
+      graphDiv.id = "peer-conns-graph";
+      graphDiv.classList.add("column");
+      graphDiv.style.display = "flex";
+      graphDiv.style.justifyContent = "center";
+      graphDiv.style.alignItems = "center";
+      const scaleFactor = 1.25; // Replace this with your actual scale factor
+      graphDiv.style.padding = `${10 * scaleFactor}px`; // Replace 10 with your actual padding
+      neightboursDiv.appendChild(graphDiv);
+
+      const peerConnectionsT = modalBox.querySelector("#peer-connections-t")!;
+      peerConnectionsT.classList.add("column");
+      neightboursDiv.appendChild(peerConnectionsT);
+
+      const graphContainer = d3.select(graphDiv);
+      ringVisualization(peerData, graphContainer, scaleFactor);
+
+      // Insert the new div before peer-connections-t in modalBox
+      modalBox
+        .querySelector("#neighbours-t")!
+        .insertAdjacentElement("afterend", neightboursDiv);
     });
 
     const id = document.createElement("td");
@@ -404,20 +436,177 @@ function tableSorting(header: HTMLTableCellElement, index: number) {
 
 export function showPeerData(peer: Peer) {
   const id = peer.id;
-  const connections: Connection[] = peer.connections ?? [];
+  peer.connections.sort((a, b) => a.location - b.location);
 
   // Set title
-  const peerDataHeader = document.getElementById("peer-connections-h")!;
+  const peerDataHeader = document.getElementById("peer-details-h")!;
   peerDataHeader.innerHTML = `
   <div class="block">
-    <b>Peer Id</b>: ${id}</br>
+    <b>Peer Id</b>: ${id.full}</br>
     <b>Location</b>: ${peer.currentLocation ?? ""}
   </div>
   `;
 
-  // Sort connections by location
-  connections.sort((a, b) => a.location - b.location);
+  listPeerConnections(peer.connections);
+  displayHistory(peer);
+}
 
+function ringVisualization(
+  peer: Peer,
+  graphContainer: d3.Selection<any, any, any, any>,
+  scaleFactor: number
+) {
+  const width = 200;
+  const height = 200;
+
+  const svg = graphContainer
+    .append("svg")
+    .attr("width", width)
+    .attr("height", height)
+    .attr("style", "max-width: 100%")
+    .attr("transform", `scale(${scaleFactor})`);
+
+  // Set up the ring
+  const radius = 75;
+  const centerX = width / 2;
+  const centerY = height / 2;
+
+  const referencePoint = { value: peer.currentLocation, legend: peer.id.short };
+  const dataPoints = peer.connections.map((conn) => {
+    return { value: conn.location, legend: conn.id.short };
+  });
+
+  svg
+    .append("circle")
+    .attr("cx", centerX)
+    .attr("cy", centerY)
+    .attr("r", radius)
+    .attr("stroke", "black")
+    .attr("stroke-width", 2)
+    .attr("fill", "none");
+
+  const tooltip = graphContainer
+    .append("div")
+    .attr("class", "tooltip")
+    .style("position", "absolute")
+    .style("visibility", "hidden")
+    .style("background-color", "white")
+    .style("border", "solid")
+    .style("border-width", "2px")
+    .style("border-radius", "5px")
+    .style("padding", "5px");
+
+  // Create points along the ring with legends
+  svg
+    .append("circle")
+    .attr("class", "fixed-point")
+    .attr("cx", centerX + radius * Math.cos(referencePoint.value * 2 * Math.PI))
+    .attr("cy", centerY + radius * Math.sin(referencePoint.value * 2 * Math.PI))
+    .attr("r", 5)
+    .attr("fill", "red");
+
+  function showLegend(
+    this: SVGCircleElement,
+    e: MouseEvent,
+    d: { value: number; legend: string }
+  ) {
+    const circleRect = this.getBoundingClientRect();
+    const mouseX = e.clientX - circleRect.left; // Get the mouse's x position within the circle
+    const mouseY = e.clientY - circleRect.top; // Get the mouse's y position within the circle
+    tooltip
+      .style("visibility", "visible")
+      .style("position", "absolute")
+      .style("stroke", "black")
+      .style("z-index", "2")
+      .html(`<b>${d.legend}</b>: ${d.value}`);
+    const tooltipRect = tooltip.node()!.getBoundingClientRect();
+    tooltip
+      .style("left", circleRect.left + mouseX - tooltipRect.width / 1.5 + "px")
+      .style("top", circleRect.top + mouseY - tooltipRect.height / 1.5 + "px");
+    d3.select(this).style("stroke", "black");
+  }
+
+  function hideLegend(this: SVGCircleElement) {
+    tooltip.style("visibility", "hidden");
+    d3.select(this).style("stroke", "none");
+  }
+
+  function circleId(d: { value: number; legend: string }, i: number) {
+    return `circle-${i}-${d.legend}`;
+  }
+
+  svg
+    .selectAll(".point")
+    .data(dataPoints)
+    .enter()
+    .append("circle")
+    .attr("class", "point")
+    .attr("id", (d, i) => circleId(d, i))
+    .attr("cx", (d) => centerX + radius * Math.cos(d.value * 2 * Math.PI))
+    .attr("cy", (d) => centerY + radius * Math.sin(d.value * 2 * Math.PI))
+    .attr("r", 5)
+    .attr("fill", "steelblue")
+    .on("mouseover", showLegend)
+    .on("mousemove", showLegend)
+    .on("mouseout", hideLegend);
+
+  // Connect all points to the fixed point (0.3) with distances as tooltips
+
+  function showDistance(
+    this: SVGLineElement,
+    e: MouseEvent,
+    d: { value: number; legend: string }
+  ) {
+    const distance = getDistance(referencePoint.value, d.value).toFixed(5);
+    const lineRect = this.getBoundingClientRect();
+    const mouseX = e.clientX - lineRect.left; // Get the mouse's x position within the line
+    const mouseY = e.clientY - lineRect.top; // Get the mouse's y position within the line
+    tooltip
+      .style("visibility", "visible")
+      .style("position", "absolute")
+      .style("z-index", "2")
+      .html(`<b>Distance</b>: ${distance}`);
+    const tooltipRect = tooltip.node()!.getBoundingClientRect();
+    tooltip
+      .style(
+        "left",
+        lineRect.left + window.scrollX + mouseX - tooltipRect.width + "px"
+      )
+      .style(
+        "top",
+        lineRect.top + window.scrollY + mouseY - tooltipRect.height / 1.5 + "px"
+      );
+    d3.select(this).style("stroke", "black");
+  }
+
+  function hideDistance(this: SVGLineElement) {
+    tooltip.style("visibility", "hidden");
+    d3.select(this).style("stroke", "gray");
+  }
+
+  function getDistance(point1: number, point2: number) {
+    const diff = Math.abs(point1 - point2);
+    return Math.min(diff, 1 - diff);
+  }
+
+  svg
+    .selectAll(".edge")
+    .data(dataPoints)
+    .enter()
+    .append("line")
+    .attr("class", "edge")
+    .attr("x1", centerX + radius * Math.cos(referencePoint.value * 2 * Math.PI))
+    .attr("y1", centerY + radius * Math.sin(referencePoint.value * 2 * Math.PI))
+    .attr("x2", (d) => centerX + radius * Math.cos(d.value * 2 * Math.PI))
+    .attr("y2", (d) => centerY + radius * Math.sin(d.value * 2 * Math.PI))
+    .attr("stroke", "gray")
+    .attr("stroke-width", 1.5)
+    .on("mouseover", showDistance)
+    .on("mousemove", showDistance)
+    .on("mouseout", hideDistance);
+}
+
+function listPeerConnections(connections: Connection[]) {
   // Find the existing peer connections table
   const tableBody = document.getElementById("peer-connections-b")!;
 
@@ -440,22 +629,20 @@ export function showPeerData(peer: Peer) {
   connections.forEach((connection) => {
     const row = document.createElement("tr");
     const idCell = document.createElement("td");
-    idCell.textContent = connection.id.short;
+    idCell.textContent = "..." + connection.id.short;
     const locationCell = document.createElement("td");
     locationCell.textContent = connection.location.toString() ?? "";
     row.appendChild(idCell);
     row.appendChild(locationCell);
     tableBody.appendChild(row);
   });
-
-  displayHistory(peer);
 }
 
 function displayHistory(peer: Peer) {
-  const peerConnections = document.getElementById("peer-connections")!;
+  const peerDetails = document.getElementById("peer-details")!;
 
   // Remove the existing table if it exists
-  const existingTable = peerConnections.querySelector("#connection-history");
+  const existingTable = peerDetails.querySelector("#connection-history");
   if (existingTable) {
     existingTable.remove();
   }
@@ -517,5 +704,5 @@ function displayHistory(peer: Peer) {
   table.appendChild(tbody);
 
   // Append the new table to the peerConnections element
-  peerConnections.appendChild(table);
+  peerDetails.appendChild(table);
 }
