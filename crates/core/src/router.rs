@@ -16,7 +16,7 @@ pub(crate) struct Router {
     transfer_rate_estimator: IsotonicEstimator,
     failure_estimator: IsotonicEstimator,
     mean_transfer_size: Mean,
-    closest_peers_capacity: usize
+    closest_peers_capacity: usize,
 }
 
 impl Router {
@@ -107,7 +107,7 @@ impl Router {
                 EstimatorType::Negative,
             ),
             mean_transfer_size,
-            closest_peers_capacity: 20
+            closest_peers_capacity: 20,
         }
     }
 
@@ -152,8 +152,11 @@ impl Router {
         }
     }
 
-    fn select_closest_peers<'a>(&self, peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
-        target_location: &Location) -> Vec<&'a PeerKeyLocation>  {
+    fn select_closest_peers<'a>(
+        &self, 
+        peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
+        target_location: &Location
+    ) -> Vec<&'a PeerKeyLocation>  {
         let mut heap = std::collections::BinaryHeap::with_capacity(self.closest_peers_capacity + 1);
 
         for peer_location in peers {
@@ -169,7 +172,10 @@ impl Router {
         }
 
         // Convert the heap to a sorted vector
-        heap.into_sorted_vec().into_iter().map(|(_, peer_location)| peer_location).collect()
+        heap.into_sorted_vec()
+            .into_iter()
+            .map(|(_, peer_location)| peer_location)
+            .collect()
     }
 
     pub fn select_peer<'a>(
@@ -423,17 +429,22 @@ mod tests {
     }
 
     #[test]
-    fn test_select_closest_peers_size(){
+    fn test_select_closest_peers_size() {
         const NUM_PEERS: u32 = 45;
         const CAP: u32 = 30;
 
-        assert_eq!(CAP as usize, Router::new(&[]).with_closest_peers_capacity(CAP).select_closest_peers(&create_peers(NUM_PEERS), &Location::random()).len());
+        assert_eq!(
+            CAP as usize, 
+            Router::new(&[])
+                .with_closest_peers_capacity(CAP)
+                .select_closest_peers(&create_peers(NUM_PEERS), &Location::random())
+                .len()
+        );
     }
 
-
     #[test]
-    fn test_select_closest_peers_equality(){
-        // Create 10 random peers and put them in an array
+    fn test_select_closest_peers_equality() {
+       // Create 10 random peers and put them in an array
         const NUM_PEERS: u32 = 100;
         const CLOSEST_CAP: u32 = 10;
         let peers: Vec<PeerKeyLocation> = create_peers(NUM_PEERS);
@@ -443,12 +454,15 @@ mod tests {
 
         // Create a router with no historical data
         let router = Router::new(&[]).with_closest_peers_capacity(CLOSEST_CAP);
-        let asserted_closest: Vec<&PeerKeyLocation> = router.select_closest_peers(&peers, &contract_location);
+        let asserted_closest: Vec<&PeerKeyLocation> = 
+            router.select_closest_peers(&peers, &contract_location);
 
         let mut expected_iter = expected_closest.iter();
         let mut asserted_iter = asserted_closest.iter();
 
-        while let (Some(expected_location), Some(asserted_location)) = (expected_iter.next(), asserted_iter.next()) {
+        while let (Some(expected_location), Some(asserted_location)) =
+            (expected_iter.next(), asserted_iter.next()) 
+        {
             assert_eq!(**expected_location, **asserted_location);
         }
 
@@ -476,7 +490,11 @@ mod tests {
         }
     }
 
-    fn select_closest_peers_vec<'a>(closest_peers_capacity: u32, peers: impl IntoIterator<Item = &'a PeerKeyLocation>, target_location: &Location) -> Vec<&'a PeerKeyLocation>  
+    fn select_closest_peers_vec<'a>(
+        closest_peers_capacity: u32, 
+        peers: impl IntoIterator<Item = &'a PeerKeyLocation>, 
+        target_location: &Location
+    ) -> Vec<&'a PeerKeyLocation>  
     where 
         PeerKeyLocation: Clone,
     {
@@ -484,12 +502,10 @@ mod tests {
         closest.sort_by_key(|&peer| {
             if let Some(location) = peer.location {
                 target_location.distance(location)
-            }
-            else{
+            } else{
                 Distance::new(f64::MAX)
             }
-        }
-        );
+        });
 
         closest[..closest_peers_capacity as usize].to_vec()
     }
@@ -504,5 +520,4 @@ mod tests {
 
         peers
     }
-
 }
