@@ -60,8 +60,7 @@ fn main() -> Result<(), anyhow::Error> {
             },
             SubCommand::Test(test_config) => testing::test_framework(test_config).await,
             SubCommand::NetworkMetricsServer(server_config) => {
-                let (server, _) =
-                    crate::network_metrics_server::start_server(&server_config).await;
+                let (server, _) = crate::network_metrics_server::start_server(&server_config).await;
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {}
                     _ = server => {}

@@ -1,5 +1,6 @@
 import * as fbTopology from "./generated/topology";
 import * as d3 from "d3";
+import { BaseType } from "d3-selection";
 
 export let peers: PeerList = {};
 
@@ -73,6 +74,7 @@ export function handleChange(peerChange: fbTopology.PeerChange) {
     unpacked.currentState.forEach((connection) => {
       handleAddedConnection(connection, false);
     });
+    ringHistogram(Object.values(peers));
   } catch (e) {
     console.error(e);
   } finally {
@@ -312,8 +314,8 @@ function updateTable() {
       closeModal.classList.add("modal-close", "is-large");
       modal.appendChild(closeModal);
 
-      const containerDiv = document.querySelector(".container.main")!;
-      containerDiv.appendChild(modal);
+      const mainDiv = document.querySelector(".main")!;
+      mainDiv.appendChild(modal);
       modal.addEventListener("click", () => {
         modal.style.display = "none";
         const graphContainer = d3.select("#peer-conns-graph");
@@ -392,6 +394,7 @@ function updateTable() {
 const sortDirections: number[] = [];
 
 document.addEventListener("DOMContentLoaded", () => {
+  ringHistogram(Object.values(peers));
   document
     .querySelector("#peers-table-h")!
     .querySelectorAll("th")!
@@ -510,19 +513,15 @@ function ringVisualization(
     e: MouseEvent,
     d: { value: number; legend: string }
   ) {
-    const circleRect = this.getBoundingClientRect();
-    const mouseX = e.clientX - circleRect.left; // Get the mouse's x position within the circle
-    const mouseY = e.clientY - circleRect.top; // Get the mouse's y position within the circle
     tooltip
       .style("visibility", "visible")
       .style("position", "absolute")
       .style("stroke", "black")
-      .style("z-index", "2")
       .html(`<b>${d.legend}</b>: ${d.value}`);
     const tooltipRect = tooltip.node()!.getBoundingClientRect();
     tooltip
-      .style("left", circleRect.left + mouseX - tooltipRect.width / 1.5 + "px")
-      .style("top", circleRect.top + mouseY - tooltipRect.height / 1.5 + "px");
+      .style("left", e.clientX - tooltipRect.width / 2 + "px")
+      .style("top", e.clientY - tooltipRect.height / 2 + "px");
     d3.select(this).style("stroke", "black");
   }
 
@@ -558,9 +557,6 @@ function ringVisualization(
     d: { value: number; legend: string }
   ) {
     const distance = getDistance(referencePoint.value, d.value).toFixed(5);
-    const lineRect = this.getBoundingClientRect();
-    const mouseX = e.clientX - lineRect.left; // Get the mouse's x position within the line
-    const mouseY = e.clientY - lineRect.top; // Get the mouse's y position within the line
     tooltip
       .style("visibility", "visible")
       .style("position", "absolute")
@@ -568,14 +564,8 @@ function ringVisualization(
       .html(`<b>Distance</b>: ${distance}`);
     const tooltipRect = tooltip.node()!.getBoundingClientRect();
     tooltip
-      .style(
-        "left",
-        lineRect.left + window.scrollX + mouseX - tooltipRect.width + "px"
-      )
-      .style(
-        "top",
-        lineRect.top + window.scrollY + mouseY - tooltipRect.height / 1.5 + "px"
-      );
+      .style("left", e.clientX - tooltipRect.width / 2 + "px")
+      .style("top", e.clientY - tooltipRect.height / 2 + "px");
     d3.select(this).style("stroke", "black");
   }
 
@@ -705,4 +695,125 @@ function displayHistory(peer: Peer) {
 
   // Append the new table to the peerConnections element
   peerDetails.appendChild(table);
+}
+
+function ringHistogram(peerLocations: Peer[]) {
+  const width = 500;
+  const height = 300;
+  const margin = { top: 10, right: 30, bottom: 50, left: 60 };
+  const innerWidth = width - margin.left - margin.right;
+
+  const container = d3.select("#peers-histogram");
+  container.selectAll("*").remove();
+
+  const svg = container
+    .append("svg")
+    .attr("width", width)
+    .attr("height", height)
+    .append("g")
+    .attr("transform", `translate(${margin.left}, ${margin.top})`);
+
+  const bucketSize = 0.05;
+
+  const binsData: number[] = Array(Math.ceil(1 / bucketSize)).fill(0);
+  peerLocations.forEach((peer) => {
+    const binIndex = Math.floor(peer.currentLocation / bucketSize);
+    binsData[binIndex]++;
+  });
+
+  const histogram = binsData.map((count, i) => ({
+    x0: i * bucketSize,
+    x1: (i + 1) * bucketSize,
+    count,
+  }));
+
+  const xScale = d3.scaleLinear().domain([0, 1]).range([0, innerWidth]);
+  const legendSpace = 50;
+  const adjustedHeight = height - legendSpace;
+  const padding = 10;
+  const yScale = d3
+    .scaleLinear()
+    .domain([0, d3.max(histogram, (d) => d.count)! + padding])
+    .range([adjustedHeight, 0]);
+
+  const colorScale = d3
+    .scaleQuantile<string>()
+    .domain(binsData)
+    .range(d3.schemeYlGn[9]);
+
+  const bins = svg
+    .selectAll("rect")
+    .data(histogram)
+    .enter()
+    .append("rect")
+    .attr("x", (d) => xScale(d.x0!))
+    .attr("y", (d) => yScale(d.count))
+    .attr("width", innerWidth / histogram.length)
+    .attr("height", (d) => adjustedHeight - yScale(d.count))
+    .attr("fill", (d) => colorScale(d.count))
+    .attr("stroke", "black")
+    .attr("stroke-width", 1);
+
+  const tooltip = container
+    .append("div")
+    .attr("class", "bin-tooltip")
+    .style("background-color", "white")
+    .style("border", "solid")
+    .style("border-width", "2px")
+    .style("border-radius", "5px")
+    .style("padding", "5px")
+    .style("opacity", 0)
+    .style("position", "absolute");
+
+  bins
+    .on("mouseover", (event: MouseEvent, d) => {
+      tooltip.transition().duration(200).style("opacity", 0.9);
+      tooltip
+        .html(
+          `Number of peers: ${d.count}, Subrange: [${d.x0.toFixed(
+            2
+          )}, ${d.x1.toFixed(2)})`
+        )
+        .style("left", event.clientX + window.scrollX + "px")
+        .style("top", event.clientY + window.scrollY - 150 + "px");
+    })
+    .on("mousemove", (event, _) => {
+      tooltip
+        .style("left", event.clientX + window.scrollX + "px")
+        .style("top", event.clientY + window.scrollY - 150 + "px");
+    })
+    .on("mouseout", (_) => {
+      tooltip.transition().duration(500).style("opacity", 0);
+    });
+
+  const xAxisTicks = Math.floor(innerWidth / 50); // 50 is the desired space between ticks
+  const xAxis = d3.axisBottom(xScale).ticks(xAxisTicks);
+  svg
+    .append("g")
+    .attr("transform", `translate(0, ${adjustedHeight})`)
+    .call(xAxis);
+
+  const yAxisTicks = Math.floor(adjustedHeight / 50); // 50 is the desired space between ticks
+  const yAxis = d3.axisLeft(yScale).ticks(yAxisTicks);
+  svg.append("g").call(yAxis);
+
+  // Position the legend within the SVG area
+  svg
+    .append("text")
+    .attr("fill", "#000")
+    .attr("x", innerWidth / 2)
+    .attr("y", height - margin.bottom / 4)
+    .attr("text-anchor", "middle")
+    .attr("font-size", "14px")
+    .text("Peer Locations");
+
+  svg
+    .append("text")
+    .attr("fill", "#000")
+    .attr("y", margin.left - 100)
+    .attr("x", -adjustedHeight / 2)
+    .attr("transform", "rotate(-90)")
+    .attr("text-anchor", "middle")
+    .attr("font-size", "14px")
+    .text("Amount of Peers");
 }
