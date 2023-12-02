@@ -153,10 +153,10 @@ impl Router {
     }
 
     fn select_closest_peers<'a>(
-        &self, 
+        &self,
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
         target_location: &Location
-    ) -> Vec<&'a PeerKeyLocation>  {
+    ) -> Vec<&'a PeerKeyLocation> {
         let mut heap = std::collections::BinaryHeap::with_capacity(self.closest_peers_capacity + 1);
 
         for peer_location in peers {
@@ -434,7 +434,7 @@ mod tests {
         const CAP: u32 = 30;
 
         assert_eq!(
-            CAP as usize, 
+            CAP as usize,
             Router::new(&[])
                 .with_closest_peers_capacity(CAP)
                 .select_closest_peers(&create_peers(NUM_PEERS), &Location::random())
@@ -444,7 +444,6 @@ mod tests {
 
     #[test]
     fn test_select_closest_peers_equality() {
-       // Create 10 random peers and put them in an array
         const NUM_PEERS: u32 = 100;
         const CLOSEST_CAP: u32 = 10;
         let peers: Vec<PeerKeyLocation> = create_peers(NUM_PEERS);
@@ -454,14 +453,14 @@ mod tests {
 
         // Create a router with no historical data
         let router = Router::new(&[]).with_closest_peers_capacity(CLOSEST_CAP);
-        let asserted_closest: Vec<&PeerKeyLocation> = 
+        let asserted_closest: Vec<&PeerKeyLocation> =
             router.select_closest_peers(&peers, &contract_location);
 
         let mut expected_iter = expected_closest.iter();
         let mut asserted_iter = asserted_closest.iter();
 
         while let (Some(expected_location), Some(asserted_location)) =
-            (expected_iter.next(), asserted_iter.next()) 
+            (expected_iter.next(), asserted_iter.next())
         {
             assert_eq!(**expected_location, **asserted_location);
         }
@@ -491,18 +490,18 @@ mod tests {
     }
 
     fn select_closest_peers_vec<'a>(
-        closest_peers_capacity: u32, 
-        peers: impl IntoIterator<Item = &'a PeerKeyLocation>, 
+        closest_peers_capacity: u32,
+        peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
         target_location: &Location
-    ) -> Vec<&'a PeerKeyLocation>  
-    where 
+    ) -> Vec<&'a PeerKeyLocation>
+    where
         PeerKeyLocation: Clone,
     {
         let mut closest: Vec<&'a PeerKeyLocation> = peers.into_iter().collect();
         closest.sort_by_key(|&peer| {
             if let Some(location) = peer.location {
                 target_location.distance(location)
-            } else{
+            } else {
                 Distance::new(f64::MAX)
             }
         });
