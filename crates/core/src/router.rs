@@ -1,7 +1,7 @@
 mod isotonic_estimator;
 mod util;
 
-use crate::ring::{Location, PeerKeyLocation};
+use crate::ring::{Location, PeerKeyLocation, Distance};
 use isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -16,6 +16,7 @@ pub(crate) struct Router {
     transfer_rate_estimator: IsotonicEstimator,
     failure_estimator: IsotonicEstimator,
     mean_transfer_size: Mean,
+    closest_peers_capacity: usize
 }
 
 impl Router {
@@ -106,7 +107,13 @@ impl Router {
                 EstimatorType::Negative,
             ),
             mean_transfer_size,
+            closest_peers_capacity: 20
         }
+    }
+
+    pub fn with_closest_peers_capacity(mut self, n: u32) -> Self {
+        self.closest_peers_capacity = n as usize;
+        self
     }
 
     pub fn add_event(&mut self, event: RouteEvent) {
@@ -145,6 +152,44 @@ impl Router {
         }
     }
 
+    fn select_closest_peers<'a>(&self, peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
+        target_location: &Location) -> Vec<&'a PeerKeyLocation>  {
+        let mut heap = std::collections::BinaryHeap::with_capacity(self.closest_peers_capacity + 1);
+
+        for peer_location in peers {
+            if let Some(location) = peer_location.location.as_ref() {
+                let distance = target_location.distance(location);
+                heap.push((distance, peer_location));
+
+                // Ensure we keep the heap size to specified capacity
+                if heap.len() > self.closest_peers_capacity {
+                    heap.pop();
+                }
+            }
+        }
+
+        // Convert the heap to a sorted vector
+        heap.into_sorted_vec().into_iter().map(|(_, peer_location)| peer_location).collect()
+    }
+
+    pub fn select_closest_peers_vec<'a>(&self, peers: impl IntoIterator<Item = &'a PeerKeyLocation>, target_location: &Location) -> Vec<&'a PeerKeyLocation>  
+    where 
+        PeerKeyLocation: Clone,
+    {
+        let mut closest: Vec<&'a PeerKeyLocation> = peers.into_iter().collect();
+        closest.sort_by_key(|&peer| {
+            if let Some(location) = peer.location {
+                target_location.distance(location)
+            }
+            else{
+                Distance::new(f64::MAX)
+            }
+        }
+        );
+
+        closest[..self.closest_peers_capacity].to_vec()
+    }
+
     pub fn select_peer<'a>(
         &self,
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
@@ -163,7 +208,7 @@ impl Router {
                 .map(|(peer, _)| peer)
         } else {
             // Find the peer with the minimum predicted routing outcome time
-            peers
+            self.select_closest_peers(peers, &target_location)
                 .into_iter()
                 .map(|peer: &PeerKeyLocation| {
                     let t = self.predict_routing_outcome(peer, target_location).expect(
@@ -279,6 +324,8 @@ pub enum RouteOutcome {
 mod tests {
     use rand::Rng;
 
+    use crate::ring;
+
     use super::*;
 
     #[test]
@@ -391,6 +438,56 @@ mod tests {
                 transfer_speed_error
             );
         }
+    }
+
+    #[test]
+    fn test_select_closest_peers(){
+        use std::time::Instant;
+        // Create 10 random peers and put them in an array
+        const NUM_PEERS: u32 = 100;
+        const CLOSEST_CAP: u32 = 10;
+        let mut peers = vec![];
+        let contract_location = Location::random();
+        for _ in 0..NUM_PEERS {
+            let peer = PeerKeyLocation::random();
+            peers.push(peer);
+        }
+
+        let expected_router = Router::new(&[]).with_closest_peers_capacity(CLOSEST_CAP);
+        let expected_start = Instant::now();
+        let expected_closest = expected_router.select_closest_peers_vec(&peers, &contract_location);
+        let expected_duration = expected_start.elapsed();
+
+        println!("Contract location: {}", contract_location);
+
+        println!("Expected:");
+        for location in &expected_closest {
+            println!("{}", location);
+        }
+        println!();
+
+        // Create a router with no historical data
+        let router = Router::new(&[]).with_closest_peers_capacity(CLOSEST_CAP);
+        let asserted_start = Instant::now();
+        let asserted_closest: Vec<&PeerKeyLocation> = router.select_closest_peers(&peers, &contract_location);
+        let asserted_duration = asserted_start.elapsed();
+
+        println!("Asserted:");
+        for location in &asserted_closest {
+            println!("{}", location);
+        }
+
+        println!("Expected duration: {:?}\nAsserted duration{:?}", expected_duration, asserted_duration);
+
+        let mut expected_iter = expected_closest.iter();
+        let mut asserted_iter = asserted_closest.iter();
+
+        while let (Some(expected_location), Some(asserted_location)) = (expected_iter.next(), asserted_iter.next()) {
+            println!("expected: {}, asserted: {}", expected_location, asserted_location);
+            assert_eq!(**expected_location, **asserted_location);
+        }
+
+        // assert_eq!(expected_iter.next(), asserted_iter.next());
     }
 
     fn simulate_prediction(
