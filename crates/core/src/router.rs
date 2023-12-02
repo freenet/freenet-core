@@ -155,7 +155,7 @@ impl Router {
     fn select_closest_peers<'a>(
         &self,
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
-        target_location: &Location
+        target_location: &Location,
     ) -> Vec<&'a PeerKeyLocation> {
         let mut heap = std::collections::BinaryHeap::with_capacity(self.closest_peers_capacity + 1);
 
@@ -492,7 +492,7 @@ mod tests {
     fn select_closest_peers_vec<'a>(
         closest_peers_capacity: u32,
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
-        target_location: &Location
+        target_location: &Location,
     ) -> Vec<&'a PeerKeyLocation>
     where
         PeerKeyLocation: Clone,
