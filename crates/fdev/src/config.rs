@@ -44,6 +44,7 @@ pub enum SubCommand {
     WasmRuntime(ExecutorConfig),
     Execute(RunCliConfig),
     Test(crate::testing::TestConfig),
+    NetworkMetricsServer(crate::network_metrics_server::ServerConfig),
 }
 
 impl SubCommand {

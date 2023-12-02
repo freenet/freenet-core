@@ -93,14 +93,14 @@ impl NodeP2P {
         let (ch_outbound, ch_inbound) = contract::contract_handler_channel();
         let (client_responses, cli_response_sender) = contract::ClientResponses::channel();
 
-        let op_storage = Arc::new(OpManager::new(
+        let op_manager = Arc::new(OpManager::new(
             notification_tx,
             ch_outbound,
             &builder,
             &gateways,
             event_register.clone(),
         )?);
-        let (executor_listener, executor_sender) = contract::executor_channel(op_storage.clone());
+        let (executor_listener, executor_sender) = contract::executor_channel(op_manager.clone());
         let contract_handler = CH::build(ch_inbound, executor_sender, ch_builder)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -110,7 +110,7 @@ impl NodeP2P {
             P2pConnManager::build(
                 transport,
                 &builder,
-                op_storage.clone(),
+                op_manager.clone(),
                 event_register,
                 private_key,
             )?
@@ -125,7 +125,7 @@ impl NodeP2P {
         let (node_controller_tx, node_controller_rx) = tokio::sync::mpsc::channel(1);
         GlobalExecutor::spawn(
             client_event_handling(
-                op_storage.clone(),
+                op_manager.clone(),
                 clients,
                 client_responses,
                 node_controller_tx,
@@ -137,7 +137,7 @@ impl NodeP2P {
             peer_key,
             conn_manager,
             notification_channel,
-            op_manager: op_storage,
+            op_manager,
             is_gateway: builder.location.is_some(),
             executor_listener,
             cli_response_sender,
@@ -177,7 +177,7 @@ mod test {
         client_events::test::MemoryEventsGen,
         config::GlobalExecutor,
         contract::MemoryContractHandler,
-        node::{network_event_log, testing_impl::get_free_port, InitPeerNode},
+        node::{testing_impl::get_free_port, InitPeerNode},
         ring::Location,
     };
 
@@ -238,7 +238,7 @@ mod test {
                     config,
                     peer1_key,
                     [Box::new(user_events)],
-                    network_event_log::TestEventListener::new(),
+                    crate::tracing::TestEventListener::new().await,
                     "ping-listener".into(),
                 )
                 .await?,
@@ -259,7 +259,7 @@ mod test {
                 config,
                 peer2_key,
                 [Box::new(user_events)],
-                network_event_log::TestEventListener::new(),
+                crate::tracing::TestEventListener::new().await,
                 "ping-dialer".into(),
             )
             .await

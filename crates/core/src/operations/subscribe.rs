@@ -53,7 +53,7 @@ impl Operation for SubscribeOp {
     type Result = SubscribeResult;
 
     fn load_or_init<'a>(
-        op_storage: &'a OpManager,
+        op_manager: &'a OpManager,
         msg: &'a Self::Message,
     ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>> {
         async move {
@@ -63,7 +63,7 @@ impl Operation for SubscribeOp {
             };
             let id = *msg.id();
 
-            match op_storage.pop(msg.id()) {
+            match op_manager.pop(msg.id()) {
                 Ok(Some(OpEnum::Subscribe(subscribe_op))) => {
                     // was an existing operation, the other peer messaged back
                     Ok(OpInitialization {
@@ -72,7 +72,7 @@ impl Operation for SubscribeOp {
                     })
                 }
                 Ok(Some(op)) => {
-                    let _ = op_storage.push(id, op).await;
+                    let _ = op_manager.push(id, op).await;
                     Err(OpError::OpNotPresent(id))
                 }
                 Ok(None) => {
@@ -98,7 +98,7 @@ impl Operation for SubscribeOp {
     fn process_message<'a, NB: NetworkBridge>(
         self,
         conn_manager: &'a mut NB,
-        op_storage: &'a OpManager,
+        op_manager: &'a OpManager,
         input: &'a Self::Message,
         client_id: Option<ClientId>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
@@ -113,7 +113,7 @@ impl Operation for SubscribeOp {
                         self.state,
                         Some(SubscribeState::AwaitingResponse { .. })
                     ));
-                    let sender = op_storage.ring.own_location();
+                    let sender = op_manager.ring.own_location();
                     new_state = self.state;
                     return_msg = Some(SubscribeMsg::SeekNode {
                         id: *id,
@@ -132,7 +132,7 @@ impl Operation for SubscribeOp {
                     skip_list,
                     htl,
                 } => {
-                    let sender = op_storage.ring.own_location();
+                    let sender = op_manager.ring.own_location();
                     let return_err = || -> OperationResult {
                         OperationResult {
                             return_msg: Some(NetMessage::from(SubscribeMsg::ReturnSub {
@@ -146,12 +146,12 @@ impl Operation for SubscribeOp {
                         }
                     };
 
-                    if !op_storage.ring.is_contract_cached(key) {
+                    if !op_manager.ring.is_contract_cached(key) {
                         tracing::debug!(tx = %id, "Contract {} not found at {}, trying other peer", key, target.peer);
 
-                        let Some(new_target) = op_storage
+                        let Some(new_target) = op_manager
                             .ring
-                            .closest_caching(key, [&sender.peer].as_slice())
+                            .closest_potentially_caching(key, [&sender.peer].as_slice())
                         else {
                             tracing::warn!(tx = %id, "No peer found while trying getting contract {key}");
                             return Err(OpError::RingError(RingError::NoCachingPeers(key.clone())));
@@ -181,7 +181,7 @@ impl Operation for SubscribeOp {
                                 .into(),
                             )
                             .await?;
-                    } else if op_storage.ring.add_subscriber(key, *subscriber).is_err() {
+                    } else if op_manager.ring.add_subscriber(key, *subscriber).is_err() {
                         // max number of subscribers for this contract reached
                         return Ok(return_err());
                     }
@@ -229,13 +229,13 @@ impl Operation for SubscribeOp {
                         }) => {
                             if retries < MAX_RETRIES {
                                 skip_list.push(sender.peer);
-                                if let Some(target) = op_storage
+                                if let Some(target) = op_manager
                                     .ring
-                                    .closest_caching(key, skip_list.as_slice())
+                                    .closest_potentially_caching(key, skip_list.as_slice())
                                     .into_iter()
                                     .next()
                                 {
-                                    let subscriber = op_storage.ring.own_location();
+                                    let subscriber = op_manager.ring.own_location();
                                     return_msg = Some(SubscribeMsg::SeekNode {
                                         id: *id,
                                         key: key.clone(),
@@ -278,7 +278,7 @@ impl Operation for SubscribeOp {
                                 provider = %sender.peer,
                                 "Subscribed to contract"
                             );
-                            op_storage.ring.add_subscription(key.clone());
+                            op_manager.ring.add_subscription(key.clone());
                             // fixme: should inform back to the network event loop in case a client is waiting for response
                             let _ = client_id;
                             new_state = Some(SubscribeState::Completed);
@@ -337,21 +337,21 @@ enum SubscribeState {
 
 /// Request to subscribe to value changes from a contract.
 pub(crate) async fn request_subscribe(
-    op_storage: &OpManager,
+    op_manager: &OpManager,
     sub_op: SubscribeOp,
     client_id: Option<ClientId>,
 ) -> Result<(), OpError> {
     let (target, _id) = if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        if !op_storage.ring.is_contract_cached(key) {
+        if !op_manager.ring.is_contract_cached(key) {
             return Err(OpError::ContractError(ContractError::ContractNotFound(
                 key.clone(),
             )));
         }
         const EMPTY: &[PeerId] = &[];
         (
-            op_storage
+            op_manager
                 .ring
-                .closest_caching(key, EMPTY)
+                .closest_potentially_caching(key, EMPTY)
                 .into_iter()
                 .next()
                 .ok_or_else(|| RingError::NoCachingPeers(key.clone()))?,
@@ -372,7 +372,7 @@ pub(crate) async fn request_subscribe(
                 id,
                 state: new_state,
             };
-            op_storage
+            op_manager
                 .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op), client_id)
                 .await?;
         }

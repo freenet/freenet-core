@@ -39,13 +39,12 @@ use tracing::Instrument;
 
 use crate::message::TransactionType;
 use crate::topology::{AcquisitionStrategy, TopologyManager};
+use crate::tracing::{EventRegister, NetEventLog, NetEventRegister};
 use crate::util::Contains;
 use crate::{
     config::GlobalExecutor,
     message::Transaction,
-    node::{
-        self, EventLoopNotificationsSender, EventRegister, NetEventRegister, NodeConfig, PeerId,
-    },
+    node::{self, EventLoopNotificationsSender, NodeConfig, PeerId},
     operations::connect,
     router::Router,
     DynError,
@@ -198,6 +197,7 @@ pub(crate) struct Ring {
     // A peer which has been blacklisted to perform actions regarding a given contract.
     // todo: add blacklist
     // contract_blacklist: Arc<DashMap<ContractKey, Vec<Blacklisted>>>,
+    event_register: Box<dyn NetEventRegister>,
 }
 
 // /// A data type that represents the fact that a peer has been blacklisted
@@ -224,10 +224,11 @@ impl Ring {
     /// connection of a peer in the network).
     const MAX_HOPS_TO_LIVE: usize = 10;
 
-    pub fn new<EL: NetEventRegister>(
+    pub fn new<ER: NetEventRegister>(
         config: &NodeConfig,
         gateways: &[PeerKeyLocation],
         event_loop_notifier: EventLoopNotificationsSender,
+        event_register: ER,
     ) -> Result<Arc<Self>, anyhow::Error> {
         let (live_tx_tracker, missing_candidate_rx) = LiveTransactionTracker::new();
 
@@ -261,7 +262,7 @@ impl Ring {
         };
 
         let router = Arc::new(RwLock::new(Router::new(&[])));
-        GlobalExecutor::spawn(Self::refresh_router::<EL>(router.clone()));
+        GlobalExecutor::spawn(Self::refresh_router::<ER>(router.clone()));
 
         // Just initialize with a fake location, this will be later updated when the peer has an actual location assigned.
         let topology_manager = RwLock::new(TopologyManager::new(Location::new(0.0)));
@@ -283,14 +284,17 @@ impl Ring {
             subscriptions: RwLock::new(Vec::new()),
             open_connections: AtomicUsize::new(0),
             live_tx_tracker: live_tx_tracker.clone(),
+            event_register: Box::new(event_register),
         };
 
         if let Some(loc) = config.location {
             if config.local_ip.is_none() || config.local_port.is_none() {
                 return Err(anyhow::anyhow!("IP and port are required for gateways"));
             }
+
             ring.update_location(Some(loc));
             for PeerKeyLocation { peer, location } in gateways {
+                // FIXME: this is problematic cause gateways will take all spots then!
                 // all gateways are aware of each other
                 ring.add_connection((*location).unwrap(), *peer);
             }
@@ -320,7 +324,7 @@ impl Ring {
             let should_route = std::any::type_name::<ER>()
                 == std::any::type_name::<EventRegister>()
                 || std::any::type_name::<ER>()
-                    == std::any::type_name::<crate::node::CombinedRegister<2>>();
+                    == std::any::type_name::<crate::tracing::CombinedRegister<2>>();
             #[cfg(not(feature = "trace-ot"))]
             let should_route =
                 std::any::type_name::<ER>() == std::any::type_name::<EventRegister>();
@@ -445,6 +449,8 @@ impl Ring {
 
     pub fn add_connection(&self, loc: Location, peer: PeerId) {
         let mut cbl = self.connections_by_location.write();
+        self.event_register
+            .register_events(Either::Left(NetEventLog::connected(self, peer, loc)));
         cbl.entry(loc).or_default().push(Connection {
             location: PeerKeyLocation {
                 peer,
@@ -466,7 +472,7 @@ impl Ring {
 
     /// Return the most optimal peer caching a given contract.
     #[inline]
-    pub fn closest_caching(
+    pub fn closest_potentially_caching(
         &self,
         contract_key: &ContractKey,
         skip_list: impl Contains<PeerId>,
@@ -588,6 +594,8 @@ impl Ring {
                 subs
             });
         }
+        self.event_register
+            .register_events(Either::Left(NetEventLog::disconnected(self, &peer)));
         self.open_connections
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }

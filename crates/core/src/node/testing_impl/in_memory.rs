@@ -34,7 +34,7 @@ impl<ER> Builder<ER> {
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
 
         let _guard = parent_span.enter();
-        let op_storage = Arc::new(OpManager::new(
+        let op_manager = Arc::new(OpManager::new(
             notification_tx,
             ops_ch_channel,
             &self.config,
@@ -42,7 +42,7 @@ impl<ER> Builder<ER> {
             self.event_register.clone(),
         )?);
         std::mem::drop(_guard);
-        let (_executor_listener, executor_sender) = executor_channel(op_storage.clone());
+        let (_executor_listener, executor_sender) = executor_channel(op_manager.clone());
         let contract_handler =
             MemoryContractHandler::build(ch_channel, executor_sender, self.contract_handler_name)
                 .await
@@ -50,8 +50,8 @@ impl<ER> Builder<ER> {
 
         let conn_manager = MemoryConnManager::new(
             self.peer_key,
-            self.event_register.trait_clone(),
-            op_storage.clone(),
+            self.event_register.clone(),
+            op_manager.clone(),
             self.add_noise,
         );
 
@@ -64,7 +64,7 @@ impl<ER> Builder<ER> {
             is_gateway,
             gateways,
             parent_span: Some(parent_span),
-            op_storage,
+            op_manager,
             conn_manager,
             user_events: Some(user_events),
             notification_channel,
@@ -101,10 +101,10 @@ where
         for (contract, state) in contracts {
             let key: ContractKey = contract.key();
             let parameters = contract.params();
-            self.op_storage
+            self.op_manager
                 .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()), None)
                 .await?;
-            self.op_storage
+            self.op_manager
                 .notify_contract_handler(
                     ContractHandlerEvent::PutQuery {
                         key: key.clone(),
@@ -118,14 +118,14 @@ where
             tracing::debug!(
                 "Appended contract {} to peer {}",
                 key,
-                self.op_storage.ring.peer_key
+                self.op_manager.ring.peer_key
             );
-            self.op_storage.ring.contract_cached(&key);
+            self.op_manager.ring.contract_cached(&key);
             if let Some(subscribers) = contract_subscribers.get(&key) {
                 // add contract subscribers
                 for subscriber in subscribers {
                     if self
-                        .op_storage
+                        .op_manager
                         .ring
                         .add_subscriber(&key, *subscriber)
                         .is_err()

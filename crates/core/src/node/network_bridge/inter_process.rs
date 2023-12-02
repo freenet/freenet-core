@@ -11,7 +11,8 @@ use tokio::{
 
 use crate::{
     message::NetMessage,
-    node::{testing_impl::NetworkBridgeExt, PeerId},
+    node::{testing_impl::NetworkBridgeExt, OpManager, PeerId},
+    tracing::{NetEventLog, NetEventRegister},
 };
 
 use super::{ConnectionError, NetworkBridge};
@@ -23,15 +24,22 @@ static INCOMING_DATA: OnceLock<Sender<Data>> = OnceLock::new();
 #[derive(Clone)]
 pub struct InterProcessConnManager {
     recv: Receiver<Data>,
+    log_register: Arc<dyn NetEventRegister>,
+    op_manager: Arc<OpManager>,
     output: Arc<Mutex<BufWriter<Stdout>>>,
 }
 
 impl InterProcessConnManager {
-    pub(in crate::node) fn new() -> Self {
+    pub(in crate::node) fn new(
+        log_register: impl NetEventRegister,
+        op_manager: Arc<OpManager>,
+    ) -> Self {
         let (sender, recv) = tokio::sync::watch::channel(vec![]);
         INCOMING_DATA.set(sender).expect("shouldn't be set");
         Self {
             recv,
+            log_register: Arc::new(log_register),
+            op_manager,
             output: Arc::new(Mutex::new(BufWriter::new(tokio::io::stdout()))),
         }
     }
@@ -81,6 +89,9 @@ impl NetworkBridgeExt for InterProcessConnManager {
 impl NetworkBridge for InterProcessConnManager {
     async fn send(&self, target: &PeerId, msg: NetMessage) -> super::ConnResult<()> {
         tracing::debug!(%target, ?msg, "sending network message out");
+        self.log_register
+            .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager.ring))
+            .await;
         let data = bincode::serialize(&(*target, msg))?;
         let output = &mut *self.output.lock().await;
         output.write_all(&(data.len() as u32).to_le_bytes()).await?;

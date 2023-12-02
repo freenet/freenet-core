@@ -86,7 +86,7 @@ async fn web_home(
     Extension(rs): Extension<HttpGatewayRequest>,
     axum::extract::State(config): axum::extract::State<Config>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
-    use axum::headers::{Header, HeaderMapExt};
+    use headers::{Header, HeaderMapExt};
 
     let domain = config
         .localhost
@@ -94,8 +94,7 @@ async fn web_home(
         .expect("non-local connections not supported yet");
     let token = AuthToken::generate();
 
-    let auth_header =
-        axum::headers::Authorization::<axum::headers::authorization::Bearer>::name().to_string();
+    let auth_header = headers::Authorization::<headers::authorization::Bearer>::name().to_string();
     let cookie = cookie::Cookie::build(auth_header, format!("Bearer {}", token.as_str()))
         .domain(domain)
         .path(format!("/contract/web/{key}"))
@@ -105,13 +104,13 @@ async fn web_home(
         .http_only(false)
         .finish();
 
-    let token_header = axum::headers::Authorization::bearer(token.as_str()).unwrap();
+    let token_header = headers::Authorization::bearer(token.as_str()).unwrap();
     let contract_idx = path_handlers::contract_home(key, rs, token).await?;
     let mut response = contract_idx.into_response();
     response.headers_mut().typed_insert(token_header);
     response.headers_mut().insert(
-        axum::headers::SetCookie::name(),
-        axum::headers::HeaderValue::from_str(&cookie.to_string()).unwrap(),
+        headers::SetCookie::name(),
+        headers::HeaderValue::from_str(&cookie.to_string()).unwrap(),
     );
 
     Ok(response)
