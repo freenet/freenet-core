@@ -5,7 +5,6 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::Poll,
-    time::Duration,
 };
 
 use asynchronous_codec::{BytesMut, Framed};
@@ -32,10 +31,7 @@ use libp2p::{
     },
     InboundUpgrade, Multiaddr, OutboundUpgrade, PeerId as Libp2pPeerId, Swarm,
 };
-use tokio::sync::{
-    mpsc::{self, Receiver, Sender},
-    Mutex,
-};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::Instrument;
 use unsigned_varint::codec::UviBytes;
 
@@ -46,11 +42,12 @@ use crate::{
     contract::{ClientResponsesSender, ExecutorToEventLoopChannel, NetworkEventListenerHalve},
     message::{NetMessage, NodeEvent, Transaction, TransactionType},
     node::{
-        handle_cancelled_op, join_ring_request, network_event_log::NetEventLog, process_message,
-        InitPeerNode, NetEventRegister, NodeConfig, OpManager, PeerId as FreenetPeerId,
+        handle_cancelled_op, join_ring_request, process_message, InitPeerNode, NetEventRegister,
+        NodeConfig, OpManager, PeerId as FreenetPeerId,
     },
     operations::OpError,
     ring::PeerKeyLocation,
+    tracing::NetEventLog,
     util::IterExt,
 };
 
@@ -124,12 +121,13 @@ fn multiaddr_from_connection(conn: (IpAddr, u16)) -> Multiaddr {
 
 type P2pBridgeEvent = Either<(FreenetPeerId, Box<NetMessage>), NodeEvent>;
 
+#[derive(Clone)]
 pub(crate) struct P2pBridge {
     active_net_connections: Arc<DashMap<FreenetPeerId, Multiaddr>>,
     accepted_peers: Arc<DashSet<FreenetPeerId>>,
     ev_listener_tx: Sender<P2pBridgeEvent>,
     op_manager: Arc<OpManager>,
-    log_register: Arc<Mutex<Box<dyn NetEventRegister>>>,
+    log_register: Arc<dyn NetEventRegister>,
 }
 
 impl P2pBridge {
@@ -146,51 +144,7 @@ impl P2pBridge {
             accepted_peers: Arc::new(DashSet::new()),
             ev_listener_tx: sender,
             op_manager,
-            log_register: Arc::new(Mutex::new(Box::new(event_register))),
-        }
-    }
-}
-
-#[cfg(any(debug_assertions, test))]
-static CONTESTED_BRIDGE_CLONES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(any(debug_assertions, test))]
-static TOTAL_BRIDGE_CLONES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-impl Clone for P2pBridge {
-    fn clone(&self) -> Self {
-        let log_register = loop {
-            if let Ok(lr) = self.log_register.try_lock() {
-                #[cfg(any(debug_assertions, test))]
-                {
-                    TOTAL_BRIDGE_CLONES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                }
-                break lr.trait_clone();
-            }
-            #[cfg(any(debug_assertions, test))]
-            {
-                let contested =
-                    CONTESTED_BRIDGE_CLONES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-
-                if contested % 100 == 0 {
-                    let total = TOTAL_BRIDGE_CLONES.load(std::sync::atomic::Ordering::Acquire);
-                    if total > 0 {
-                        let threshold = (total as f64 * 0.01) as usize;
-                        if contested / total > threshold {
-                            tracing::debug!("p2p bridge clone contested more than 1% of the time");
-                        }
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_nanos(50));
-        };
-        Self {
-            active_net_connections: self.active_net_connections.clone(),
-            accepted_peers: self.accepted_peers.clone(),
-            ev_listener_tx: self.ev_listener_tx.clone(),
-            op_manager: self.op_manager.clone(),
-            log_register: Arc::new(Mutex::new(log_register)),
+            log_register: Arc::new(event_register),
         }
     }
 }
@@ -215,18 +169,17 @@ impl NetworkBridge for P2pBridge {
             .await
             .map_err(|_| ConnectionError::SendNotCompleted)?;
         self.log_register
-            .try_lock()
-            .expect("single reference")
-            .register_events(Either::Left(NetEventLog::disconnected(peer)))
+            .register_events(Either::Left(NetEventLog::disconnected(
+                &self.op_manager.ring,
+                peer,
+            )))
             .await;
         Ok(())
     }
 
     async fn send(&self, target: &FreenetPeerId, msg: NetMessage) -> super::ConnResult<()> {
         self.log_register
-            .try_lock()
-            .expect("single reference")
-            .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager));
+            .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager.ring));
         self.op_manager.sending_transaction(target, &msg);
         self.ev_listener_tx
             .send(Left((*target, Box::new(msg))))

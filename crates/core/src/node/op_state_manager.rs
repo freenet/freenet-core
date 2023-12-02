@@ -59,14 +59,19 @@ pub(crate) struct OpManager {
 }
 
 impl OpManager {
-    pub(super) fn new<ER: NetEventRegister>(
+    pub(super) fn new<ER: NetEventRegister + Clone>(
         notification_channel: EventLoopNotificationsSender,
         contract_handler: ContractHandlerChannel<SenderHalve>,
         config: &NodeConfig,
         gateways: &[PeerKeyLocation],
         event_register: ER,
     ) -> Result<Self, anyhow::Error> {
-        let ring = Ring::new::<ER>(config, gateways, notification_channel.clone())?;
+        let ring = Ring::new(
+            config,
+            gateways,
+            notification_channel.clone(),
+            event_register.clone(),
+        )?;
         let ops = Arc::new(Ops::default());
 
         let (new_transactions, rx) = tokio::sync::mpsc::channel(100);

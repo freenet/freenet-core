@@ -16,23 +16,22 @@ use super::{ConnectionError, NetworkBridge, PeerId};
 use crate::{
     config::GlobalExecutor,
     message::NetMessage,
-    node::{
-        network_event_log::NetEventLog, testing_impl::NetworkBridgeExt, NetEventRegister, OpManager,
-    },
+    node::{testing_impl::NetworkBridgeExt, NetEventRegister, OpManager},
+    tracing::NetEventLog,
 };
 
+#[derive(Clone)]
 pub(in crate::node) struct MemoryConnManager {
     transport: InMemoryTransport,
-    log_register: Arc<Mutex<Box<dyn NetEventRegister>>>,
+    log_register: Arc<dyn NetEventRegister>,
     op_manager: Arc<OpManager>,
     msg_queue: Arc<Mutex<Vec<NetMessage>>>,
-    peer: PeerId,
 }
 
 impl MemoryConnManager {
     pub fn new(
         peer: PeerId,
-        log_register: Box<dyn NetEventRegister>,
+        log_register: impl NetEventRegister,
         op_manager: Arc<OpManager>,
         add_noise: bool,
     ) -> Self {
@@ -55,28 +54,9 @@ impl MemoryConnManager {
 
         Self {
             transport,
-            log_register: Arc::new(Mutex::new(log_register)),
+            log_register: Arc::new(log_register),
             op_manager,
             msg_queue,
-            peer,
-        }
-    }
-}
-
-impl Clone for MemoryConnManager {
-    fn clone(&self) -> Self {
-        let log_register = loop {
-            if let Ok(lr) = self.log_register.try_lock() {
-                break lr.trait_clone();
-            }
-            std::thread::sleep(Duration::from_nanos(50));
-        };
-        Self {
-            transport: self.transport.clone(),
-            log_register: Arc::new(Mutex::new(log_register)),
-            op_manager: self.op_manager.clone(),
-            msg_queue: self.msg_queue.clone(),
-            peer: self.peer,
         }
     }
 }
@@ -85,9 +65,7 @@ impl Clone for MemoryConnManager {
 impl NetworkBridge for MemoryConnManager {
     async fn send(&self, target: &PeerId, msg: NetMessage) -> super::ConnResult<()> {
         self.log_register
-            .try_lock()
-            .expect("unique lock")
-            .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager))
+            .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager.ring))
             .await;
         self.op_manager.sending_transaction(target, &msg);
         let msg = bincode::serialize(&msg)?;

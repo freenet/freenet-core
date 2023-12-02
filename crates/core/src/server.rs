@@ -47,7 +47,6 @@ pub mod local_node {
 
     use axum::Router;
     use freenet_stdlib::client_api::{ClientRequest, ErrorKind};
-    use futures::TryFutureExt;
     use tower_http::trace::TraceLayer;
 
     use crate::{
@@ -59,14 +58,13 @@ pub mod local_node {
     use super::http_gateway::HttpGateway;
 
     fn serve(socket: SocketAddr, router: Router) {
-        tracing::info!("listening on {}", socket);
-        tokio::spawn(
-            axum::Server::bind(&socket)
-                .serve(router.into_make_service())
-                .map_err(|e| {
-                    tracing::error!("Error while running HTTP gateway server: {e}");
-                }),
-        );
+        tokio::spawn(async move {
+            tracing::info!("listening on {}", socket);
+            let listener = tokio::net::TcpListener::bind(socket).await.unwrap();
+            axum::serve(listener, router).await.map_err(|e| {
+                tracing::error!("Error while running HTTP gateway server: {e}");
+            })
+        });
     }
 
     pub async fn run_local_node(

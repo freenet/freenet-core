@@ -1,6 +1,7 @@
 pub(crate) mod client_events;
 pub mod config;
 mod contract;
+pub mod generated;
 mod message;
 mod node;
 mod operations;
@@ -11,6 +12,7 @@ mod runtime;
 #[cfg(feature = "websocket")]
 pub mod server;
 mod topology;
+mod tracing;
 pub mod util;
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -29,6 +31,7 @@ pub mod dev_tool {
     pub use crate::config::Config;
     pub use client_events::{test::MemoryEventsGen, ClientEventsProxy, ClientId, OpenRequest};
     pub use contract::{storages::Storage, Executor, OperationMode};
+    pub use flatbuffers;
     pub use node::{
         testing_impl::{EventChain, NodeLabel, SimNetwork, SimPeer},
         InitPeerNode, InterProcessConnManager, NodeConfig, PeerCliConfig, PeerId,

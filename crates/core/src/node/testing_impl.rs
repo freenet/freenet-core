@@ -17,14 +17,15 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, Instrument};
 
 #[cfg(feature = "trace-ot")]
-use crate::node::network_event_log::CombinedRegister;
+use crate::tracing::CombinedRegister;
 use crate::{
     client_events::test::{MemoryEventsGen, RandomEventGenerator},
     config::GlobalExecutor,
     contract,
     message::{NetMessage, NodeEvent},
-    node::{network_event_log::TestEventListener, InitPeerNode, NetEventRegister, NodeConfig},
+    node::{InitPeerNode, NetEventRegister, NodeConfig},
     ring::{Distance, Location, PeerKeyLocation},
+    tracing::TestEventListener,
 };
 
 mod in_memory;
@@ -337,7 +338,7 @@ impl SimNetwork {
         let mut net = Self {
             name: name.into(),
             clean_up_tmp_dirs: true,
-            event_listener: TestEventListener::new(),
+            event_listener: TestEventListener::new().await,
             labels: Vec::with_capacity(nodes + gateways),
             user_ev_controller: Some(user_ev_controller),
             receiver_ch,
@@ -425,7 +426,7 @@ impl SimNetwork {
             let event_listener = {
                 #[cfg(feature = "trace-ot")]
                 {
-                    use super::network_event_log::OTEventRegister;
+                    use crate::tracing::OTEventRegister;
                     CombinedRegister::new([
                         self.event_listener.trait_clone(),
                         Box::new(OTEventRegister::new()),
@@ -483,7 +484,7 @@ impl SimNetwork {
             let event_listener = {
                 #[cfg(feature = "trace-ot")]
                 {
-                    use super::network_event_log::OTEventRegister;
+                    use crate::tracing::OTEventRegister;
                     CombinedRegister::new([
                         self.event_listener.trait_clone(),
                         Box::new(OTEventRegister::new()),
@@ -971,7 +972,7 @@ where
     is_gateway: bool,
     gateways: Vec<PeerKeyLocation>,
     parent_span: Option<tracing::Span>,
-    op_storage: Arc<OpManager>,
+    op_manager: Arc<OpManager>,
     conn_manager: NB,
     /// Set on creation, taken on run
     user_events: Option<UsrEv>,
@@ -991,7 +992,7 @@ where
                 None,
                 config.peer_key,
                 gateway,
-                &config.op_storage,
+                &config.op_manager,
                 &mut config.conn_manager,
             )
             .await?;
@@ -1018,7 +1019,7 @@ where
     let (node_controller_tx, node_controller_rx) = tokio::sync::mpsc::channel(1);
     GlobalExecutor::spawn(
         super::client_event_handling(
-            config.op_storage.clone(),
+            config.op_manager.clone(),
             config.user_events.take().expect("should be set"),
             client_responses,
             node_controller_tx,
@@ -1043,7 +1044,7 @@ async fn run_event_listener<NB, UsrEv>(
         is_gateway,
         gateways,
         parent_span,
-        op_storage,
+        op_manager,
         mut conn_manager,
         mut notification_channel,
         mut event_register,
@@ -1077,7 +1078,7 @@ where
         if let Ok(Either::Left(NetMessage::Aborted(tx))) = msg {
             let tx_type = tx.transaction_type();
             let res =
-                super::handle_cancelled_op(tx, peer_key, &op_storage, &mut conn_manager).await;
+                super::handle_cancelled_op(tx, peer_key, &op_manager, &mut conn_manager).await;
             match res {
                 Err(crate::operations::OpError::MaxRetriesExceeded(_, _))
                     if tx_type == crate::message::TransactionType::Connect && !is_gateway =>
@@ -1088,7 +1089,7 @@ where
                             None,
                             peer_key,
                             gateway,
-                            &op_storage,
+                            &op_manager,
                             &mut conn_manager,
                         )
                         .await?
@@ -1109,9 +1110,9 @@ where
                 NodeEvent::DropConnection(peer) => {
                     tracing::info!("Dropping connection to {peer}");
                     event_register.register_events(Either::Left(
-                        crate::node::network_event_log::NetEventLog::disconnected(&peer),
+                        crate::tracing::NetEventLog::disconnected(&op_manager.ring, &peer),
                     ));
-                    op_storage.ring.prune_connection(peer);
+                    op_manager.ring.prune_connection(peer);
                     continue;
                 }
                 NodeEvent::Disconnect { cause: Some(cause) } => {
@@ -1130,7 +1131,7 @@ where
                 super::report_result(
                     None,
                     Err(err.into()),
-                    &op_storage,
+                    &op_manager,
                     None,
                     None,
                     &mut *event_register as &mut _,
@@ -1140,7 +1141,7 @@ where
             }
         };
 
-        let op_storage = op_storage.clone();
+        let op_manager = op_manager.clone();
         let event_listener = event_register.trait_clone();
 
         let span = {
@@ -1165,7 +1166,7 @@ where
 
         let msg = super::process_message(
             msg,
-            op_storage,
+            op_manager,
             conn_manager.clone(),
             event_listener,
             None,

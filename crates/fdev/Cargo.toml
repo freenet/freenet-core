@@ -10,9 +10,12 @@ repository = "https://github.com/freenet/freenet"
 
 [dependencies]
 anyhow = "1"
+axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws"], workspace = true }
 bincode = "1"
 bs58 = { workspace = true }
+chrono = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
+dashmap = { workspace = true }
 either = { workspace = true }
 fastrand = { workspace = true }
 futures = { workspace = true }
