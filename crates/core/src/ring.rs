@@ -25,6 +25,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use std::sync::atomic::Ordering::SeqCst;
 
 use anyhow::bail;
 use dashmap::{mapref::one::Ref as DmRef, DashMap, DashSet};
@@ -640,7 +641,9 @@ impl Ring {
         live_tx_tracker: LiveTransactionTracker,
     ) -> Result<(), DynError> {
         'outer: loop {
-            self.resource_manager.read().
+            let open_connections = self.open_connections.load(SeqCst);
+
+            todo!()
         }
     }
 
