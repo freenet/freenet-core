@@ -45,13 +45,16 @@ pub struct TestConfig {
     /// Events are simulated get, puts and other operations.
     #[arg(long, default_value_t = u32::MAX)]
     events: u32,
+    /// Time in milliseconds to wait for the next event to be executed.
+    #[arg(long)]
+    event_wait_ms: Option<u64>,
     /// Time in milliseconds to wait for the network to be sufficiently connected to start sending events.
     /// (20% of the expected connections to be processed per gateway)
     #[arg(long)]
-    wait_duration: Option<u64>,
-    /// Time in milliseconds to wait for the next event to be executed.
+    connection_wait_ms: Option<u64>,
+    /// Time in milliseconds to wait for the next peer in the simulation to be started.
     #[arg(long)]
-    event_wait_time: Option<u64>,
+    peer_start_backoff_ms: Option<u64>,
     /// If provided, the execution data will be saved in this directory.
     #[arg(long)]
     execution_data: Option<PathBuf>,
@@ -67,11 +70,12 @@ impl TestConfig {
     fn get_connection_check_params(&self) -> (Duration, f64) {
         let conns_per_gw = (self.nodes / self.gateways) as f64;
         let conn_percent = (conns_per_gw / self.nodes as f64).min(0.99);
-        let connectivity_timeout = Duration::from_millis(self.wait_duration.unwrap_or_else(|| {
-            // expect a peer to take max 200ms to connect, this should happen in parallel
-            // but err on the side of safety
-            (conns_per_gw * 200.0).ceil() as u64
-        }));
+        let connectivity_timeout =
+            Duration::from_millis(self.connection_wait_ms.unwrap_or_else(|| {
+                // expect a peer to take max 200ms to connect, this should happen in parallel
+                // but err on the side of safety
+                (conns_per_gw * 200.0).ceil() as u64
+            }));
         (connectivity_timeout, conn_percent)
     }
 
@@ -144,7 +148,7 @@ async fn config_sim_network(base_config: &TestConfig) -> anyhow::Result<SimNetwo
         .as_ref()
         .cloned()
         .unwrap_or_else(randomize_test_name);
-    let sim = SimNetwork::new(
+    let mut sim = SimNetwork::new(
         name,
         base_config.gateways,
         base_config.nodes,
@@ -154,5 +158,8 @@ async fn config_sim_network(base_config: &TestConfig) -> anyhow::Result<SimNetwo
         base_config.min_connections,
     )
     .await;
+    if let Some(backoff) = base_config.peer_start_backoff_ms {
+        sim.with_start_backoff(Duration::from_millis(backoff));
+    }
     Ok(sim)
 }

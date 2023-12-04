@@ -233,7 +233,7 @@ impl Operation for ConnectOp {
 
                     // todo: location should be based on your public IP
                     let new_location = assigned_location.unwrap_or_else(Location::random);
-                    let accepted_by = if op_manager.ring.should_accept(new_location) {
+                    let accepted_by = if op_manager.ring.should_accept(new_location, joiner) {
                         tracing::debug!(tx = %id, %joiner, "Accepting connection from");
                         HashSet::from_iter([*this_peer])
                     } else {
@@ -313,10 +313,10 @@ impl Operation for ConnectOp {
                         %hops_to_live,
                         "Proxy connect request received to connect with peer",
                     );
-                    if op_manager
-                        .ring
-                        .should_accept(joiner.location.ok_or(ConnectionError::LocationUnknown)?)
-                    {
+                    if op_manager.ring.should_accept(
+                        joiner.location.ok_or(ConnectionError::LocationUnknown)?,
+                        &joiner.peer,
+                    ) {
                         tracing::debug!(tx = %id, "Accepting proxy connection from {}", joiner.peer);
                         accepted_by.insert(own_loc);
                     } else {
@@ -428,7 +428,7 @@ impl Operation for ConnectOp {
                         op_manager.ring.update_location(Some(*your_location));
 
                         for other_peer in accepted_by.iter().filter(|pl| pl.peer != target.peer) {
-                            let _ = propagate_oc_to_accepted_peers(
+                            let _ = propagate_oc_to_responding_peers(
                                 network_bridge,
                                 op_manager,
                                 gateway,
@@ -559,7 +559,7 @@ impl Operation for ConnectOp {
                                 new_state = None;
                             } else {
                                 for peer in accepted_by {
-                                    propagate_oc_to_accepted_peers(
+                                    propagate_oc_to_responding_peers(
                                         network_bridge,
                                         op_manager,
                                         *sender,
@@ -718,7 +718,7 @@ fn try_returning_proxy_connection(
     (new_state, return_msg)
 }
 
-async fn propagate_oc_to_accepted_peers<NB: NetworkBridge>(
+async fn propagate_oc_to_responding_peers<NB: NetworkBridge>(
     network_bridge: &mut NB,
     op_manager: &OpManager,
     sender: PeerKeyLocation,
@@ -730,6 +730,7 @@ async fn propagate_oc_to_accepted_peers<NB: NetworkBridge>(
         other_peer
             .location
             .ok_or(ConnectionError::LocationUnknown)?,
+        &other_peer.peer,
     ) {
         tracing::info!(tx = %id, from = %sender.peer, to = %other_peer.peer, "Established connection");
         network_bridge.add_connection(other_peer.peer).await?;
@@ -818,11 +819,25 @@ where
     CM: NetworkBridge + Send,
 {
     use crate::util::IterExt;
+    let number_of_parallel_connections = {
+        let max_potential_conns_per_gw = op_manager.ring.max_hops_to_live;
+        // e.g. 10 gateways and htl 5 -> only need 2 connections in parallel
+        let needed_to_cover_max = gateways
+            .iter()
+            .filter(|conn| conn.peer != this_peer)
+            .count()
+            / max_potential_conns_per_gw;
+        needed_to_cover_max.max(1)
+    };
+    tracing::info!(
+        "Attempting to connect to {} gateways in parallel",
+        number_of_parallel_connections
+    );
     for gateway in gateways
         .iter()
         .shuffle()
-        .take(op_manager.ring.min_connections)
         .filter(|conn| conn.peer != this_peer)
+        .take(number_of_parallel_connections)
     {
         join_ring_request(None, this_peer, gateway, op_manager, conn_manager).await?;
     }

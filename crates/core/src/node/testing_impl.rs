@@ -319,7 +319,7 @@ pub struct SimNetwork {
     rnd_if_htl_above: usize,
     max_connections: usize,
     min_connections: usize,
-    init_backoff: Duration,
+    start_backoff: Duration,
     add_noise: bool,
 }
 
@@ -351,7 +351,7 @@ impl SimNetwork {
             rnd_if_htl_above,
             max_connections,
             min_connections,
-            init_backoff: Duration::from_millis(1),
+            start_backoff: Duration::from_millis(1),
             add_noise: false,
         };
         net.config_gateways(gateways).await;
@@ -362,7 +362,7 @@ impl SimNetwork {
 
 impl SimNetwork {
     pub fn with_start_backoff(&mut self, value: Duration) {
-        self.init_backoff = value;
+        self.start_backoff = value;
     }
 
     /// Simulates network random behaviour, like messages arriving delayed or out of order, throttling etc.
@@ -537,7 +537,7 @@ impl SimNetwork {
             let node_task = async move { node.run_node(user_events, span).await };
             GlobalExecutor::spawn(node_task);
 
-            tokio::time::sleep(self.init_backoff).await;
+            tokio::time::sleep(self.start_backoff).await;
         }
         self.labels.sort_by(|(a, _), (b, _)| a.cmp(b));
     }
@@ -570,7 +570,7 @@ impl SimNetwork {
             let handle = GlobalExecutor::spawn(node_task);
             peers.push(handle);
 
-            tokio::time::sleep(self.init_backoff).await;
+            tokio::time::sleep(self.start_backoff).await;
         }
         self.labels.sort_by(|(a, _), (b, _)| a.cmp(b));
         peers
@@ -871,7 +871,7 @@ impl std::fmt::Debug for SimNetwork {
             .field("rnd_if_htl_above", &self.rnd_if_htl_above)
             .field("max_connections", &self.max_connections)
             .field("min_connections", &self.min_connections)
-            .field("init_backoff", &self.init_backoff)
+            .field("init_backoff", &self.start_backoff)
             .field("add_noise", &self.add_noise)
             .finish()
     }

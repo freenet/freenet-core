@@ -405,10 +405,16 @@ impl Ring {
     ///
     /// # Panic
     /// Will panic if the node checking for this condition has no location assigned.
-    pub fn should_accept(&self, location: Location) -> bool {
+    pub fn should_accept(&self, location: Location, peer: &PeerId) -> bool {
         let open_conn = self
             .open_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.location_for_peer.read().get(peer).is_some() {
+            // avoid connecting mroe than once to the same peer
+            self.open_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return false;
+        }
         let my_location = self
             .own_location()
             .location
@@ -633,9 +639,14 @@ impl Ring {
         live_tx_tracker: LiveTransactionTracker,
         mut missing_candidates: sync::mpsc::Receiver<PeerId>,
     ) -> Result<(), DynError> {
-        /// Peers whose connection should be acquired.
-        fn should_swap<'a>(_connections: impl Iterator<Item = &'a PeerKeyLocation>) -> Vec<PeerId> {
+        /// Peers whose connection should be dropped.
+        fn should_swap<'a>(
+            _connections: impl Iterator<Item = &'a PeerKeyLocation>,
+            is_gateway: bool,
+        ) -> Vec<PeerId> {
             // todo: instead we should be using ConnectionEvaluator here
+            // todo: if the peer is a gateway behaviour on how quickly we drop connections may be different
+            let _ = is_gateway;
             vec![]
         }
 
@@ -744,6 +755,7 @@ impl Ring {
                                 && !live_tx_tracker.has_live_connection(&conn.location.peer)
                         })
                         .map(|conn| &conn.location),
+                    self.is_gateway,
                 )
             };
             if !should_swap.is_empty() {
