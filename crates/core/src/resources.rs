@@ -66,6 +66,7 @@
 #![allow(dead_code, unused)] // FIXME: remove after integration
 
 mod meter;
+mod predictive_meter;
 pub mod rate;
 mod running_average;
 
