@@ -14,17 +14,22 @@ pub(super) struct PredictiveMeter {
     meter : RwLock<Meter>,
     samples : DashMap<ResourceType, DashMap<AttributionSource, UsageSamples>>,
     attribution_source_creation_time : DashMap<AttributionSource, Instant>,
+    regression_curve_cache: RwLock<Option<(Instant, IsotonicRegression)>>,
 }
 
 impl PredictiveMeter {
     pub(super) fn new(meter : RwLock<Meter>) -> Self {
        todo!()
     }
+
+    pub fn get_iso_regression(&mut self) {
+
+    }
 }
 
 pub(super) struct UsageSamples {
     samples : VecDeque<Sample>,
-    curve_cache : RwLock<Option<(Instant, IsotonicRegression)>>,
+    regression_curve_cache: RwLock<Option<(Instant, IsotonicRegression)>>,
 }
 
 pub struct Sample {
@@ -42,12 +47,12 @@ impl UsageSamples {
     }
 
     fn get_iso_regression(&self, attribution_source_creation_time: Instant, current_time: Instant) -> IsotonicRegression {
-        let max_cache_age = Duration::from_secs(10 * 60);
+        const MAX_CACHE_AGE: Duration = Duration::from_secs(10 * 60); // 10 minutes
         let old_curve_weight = 100.0;
 
-        let mut cache = self.curve_cache.write().unwrap();
+        let mut cache = self.regression_curve_cache.write().unwrap();
         // If there is no cache or cache is too old, create a new one
-        if cache.is_none() || cache.as_ref().unwrap().0.elapsed() > max_cache_age {
+        if cache.is_none() || cache.as_ref().unwrap().0.elapsed() > MAX_CACHE_AGE {
             let mut points: Vec<Point> =
                 self.samples.iter()
                     .map(|sample| {
