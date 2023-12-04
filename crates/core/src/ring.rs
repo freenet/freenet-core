@@ -164,15 +164,15 @@ impl LiveTransactionTracker {
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
 ///
-/// Note: For now internally we wrap some of the types internally with locks and/or use
-/// multithreaded maps. In the future if performance requires it some of this can be moved
-/// towards a more lock-free multithreading model if necessary.
+// Note: For now internally we wrap some of the types internally with locks and/or use
+// multithreaded maps. In the future if performance requires it some of this can be moved
+// towards a more lock-free multithreading model if necessary.
 pub(crate) struct Ring {
     pub rnd_if_htl_above: usize,
     pub max_hops_to_live: usize,
     pub peer_key: PeerId,
-    max_connections: usize,
-    min_connections: usize,
+    pub max_connections: usize,
+    pub min_connections: usize,
     router: Arc<RwLock<Router>>,
     topology_manager: RwLock<TopologyManager>,
     /// Fast is for when there are less than our target number of connections so we want to acquire new connections quickly.
@@ -198,6 +198,9 @@ pub(crate) struct Ring {
     // todo: add blacklist
     // contract_blacklist: Arc<DashMap<ContractKey, Vec<Blacklisted>>>,
     event_register: Box<dyn NetEventRegister>,
+    /// Whether this peer is a gateway or not. This will affect behavior of the node when acquiring
+    /// and dropping connections.
+    is_gateway: bool,
 }
 
 // /// A data type that represents the fact that a peer has been blacklisted
@@ -209,26 +212,24 @@ pub(crate) struct Ring {
 // }
 
 impl Ring {
-    const MIN_CONNECTIONS: usize = 10;
+    const DEFAULT_MIN_CONNECTIONS: usize = 10;
 
-    const MAX_CONNECTIONS: usize = 20;
+    const DEFAULT_MAX_CONNECTIONS: usize = 20;
 
     /// Max number of subscribers for a contract.
     const MAX_SUBSCRIBERS: usize = 10;
 
-    /// Above this number of remaining hops,
-    /// randomize which of node a message which be forwarded to.
-    const RAND_WALK_ABOVE_HTL: usize = 7;
+    /// Above this number of remaining hops, randomize which node a message which be forwarded to.
+    const DEFAULT_RAND_WALK_ABOVE_HTL: usize = 7;
 
-    /// Max hops to be performed for certain operations (e.g. propagating
-    /// connection of a peer in the network).
-    const MAX_HOPS_TO_LIVE: usize = 10;
+    /// Max hops to be performed for certain operations (e.g. propagating connection of a peer in the network).
+    const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
 
     pub fn new<ER: NetEventRegister>(
         config: &NodeConfig,
-        gateways: &[PeerKeyLocation],
         event_loop_notifier: EventLoopNotificationsSender,
         event_register: ER,
+        is_gateway: bool,
     ) -> Result<Arc<Self>, anyhow::Error> {
         let (live_tx_tracker, missing_candidate_rx) = LiveTransactionTracker::new();
 
@@ -240,25 +241,25 @@ impl Ring {
         let max_hops_to_live = if let Some(v) = config.max_hops_to_live {
             v
         } else {
-            Self::MAX_HOPS_TO_LIVE
+            Self::DEFAULT_MAX_HOPS_TO_LIVE
         };
 
         let rnd_if_htl_above = if let Some(v) = config.rnd_if_htl_above {
             v
         } else {
-            Self::RAND_WALK_ABOVE_HTL
+            Self::DEFAULT_RAND_WALK_ABOVE_HTL
         };
 
         let min_connections = if let Some(v) = config.min_number_conn {
             v
         } else {
-            Self::MIN_CONNECTIONS
+            Self::DEFAULT_MIN_CONNECTIONS
         };
 
         let max_connections = if let Some(v) = config.max_number_conn {
             v
         } else {
-            Self::MAX_CONNECTIONS
+            Self::DEFAULT_MAX_CONNECTIONS
         };
 
         let router = Arc::new(RwLock::new(Router::new(&[])));
@@ -285,19 +286,14 @@ impl Ring {
             open_connections: AtomicUsize::new(0),
             live_tx_tracker: live_tx_tracker.clone(),
             event_register: Box::new(event_register),
+            is_gateway,
         };
 
         if let Some(loc) = config.location {
             if config.local_ip.is_none() || config.local_port.is_none() {
                 return Err(anyhow::anyhow!("IP and port are required for gateways"));
             }
-
             ring.update_location(Some(loc));
-            for PeerKeyLocation { peer, location } in gateways {
-                // FIXME: this is problematic cause gateways will take all spots then!
-                // all gateways are aware of each other
-                ring.add_connection((*location).unwrap(), *peer);
-            }
         }
 
         let ring = Arc::new(ring);
@@ -313,6 +309,11 @@ impl Ring {
                 .instrument(span),
         );
         Ok(ring)
+    }
+
+    pub fn open_connections(&self) -> usize {
+        self.open_connections
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     async fn refresh_router<ER: NetEventRegister>(router: Arc<RwLock<Router>>) {

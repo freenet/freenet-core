@@ -40,15 +40,13 @@ use crate::{
     client_events::ClientId,
     config::{self, GlobalExecutor},
     contract::{ClientResponsesSender, ExecutorToEventLoopChannel, NetworkEventListenerHalve},
-    message::{NetMessage, NodeEvent, Transaction, TransactionType},
+    message::{NetMessage, NodeEvent, Transaction},
     node::{
-        handle_cancelled_op, join_ring_request, process_message, InitPeerNode, NetEventRegister,
-        NodeConfig, OpManager, PeerId as FreenetPeerId,
+        handle_aborted_op, process_message, InitPeerNode, NetEventRegister, NodeConfig, OpManager,
+        PeerId as FreenetPeerId,
     },
-    operations::OpError,
     ring::PeerKeyLocation,
     tracing::NetEventLog,
-    util::IterExt,
 };
 
 /// The default maximum size for a varint length-delimited packet.
@@ -403,33 +401,14 @@ impl P2pConnManager {
                     let cb = self.bridge.clone();
                     match msg {
                         NetMessage::Aborted(tx) => {
-                            let tx_type = tx.transaction_type();
-                            let res = handle_cancelled_op(
+                            handle_aborted_op(
                                 tx,
                                 op_manager.ring.peer_key,
                                 &op_manager,
                                 &mut self.bridge,
+                                &self.gateways,
                             )
-                            .await;
-                            match res {
-                                Err(OpError::MaxRetriesExceeded(_, _))
-                                    if tx_type == TransactionType::Connect
-                                        && self.public_addr.is_none() /* FIXME: this should be not a gateway instead */ =>
-                                {
-                                    tracing::warn!("Retrying joining the ring with an other peer");
-                                    let gateway = self.gateways.iter().shuffle().next().unwrap();
-                                    join_ring_request(
-                                        None,
-                                        op_manager.ring.peer_key,
-                                        gateway,
-                                        &op_manager,
-                                        &mut self.bridge,
-                                    )
-                                    .await?
-                                }
-                                Err(err) => return Err(anyhow::anyhow!(err)),
-                                Ok(_) => {}
-                            }
+                            .await?;
                             continue;
                         }
                         msg => {

@@ -14,7 +14,7 @@ use crate::{
         connect::ConnectOp, get::GetOp, put::PutOp, subscribe::SubscribeOp, update::UpdateOp,
         OpEnum, OpError,
     },
-    ring::{LiveTransactionTracker, PeerKeyLocation, Ring},
+    ring::{LiveTransactionTracker, Ring},
 };
 
 use super::{network_bridge::EventLoopNotificationsSender, NetEventRegister, NodeConfig, PeerId};
@@ -63,14 +63,13 @@ impl OpManager {
         notification_channel: EventLoopNotificationsSender,
         contract_handler: ContractHandlerChannel<SenderHalve>,
         config: &NodeConfig,
-        gateways: &[PeerKeyLocation],
         event_register: ER,
     ) -> Result<Self, anyhow::Error> {
         let ring = Ring::new(
             config,
-            gateways,
             notification_channel.clone(),
             event_register.clone(),
+            config.is_gateway(),
         )?;
         let ops = Arc::new(Ops::default());
 

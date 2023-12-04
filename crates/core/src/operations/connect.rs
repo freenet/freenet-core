@@ -801,7 +801,69 @@ impl ConnectState {
     }
 }
 
-pub(crate) fn initial_request(
+/// # Arguments
+///
+/// - gateways: Inmutable list of known gateways. Passed when starting up the node.
+/// After the initial connections through the gateways are established all other connections
+/// (to gateways or regular peers) will be treated as regular connections.
+///
+/// - is_gateway: Whether this peer is a gateway or not.
+pub(crate) async fn initial_join_procedure<CM>(
+    op_manager: &OpManager,
+    conn_manager: &mut CM,
+    this_peer: PeerId,
+    gateways: &[PeerKeyLocation],
+) -> Result<(), OpError>
+where
+    CM: NetworkBridge + Send,
+{
+    use crate::util::IterExt;
+    for gateway in gateways
+        .iter()
+        .shuffle()
+        .take(op_manager.ring.min_connections)
+        .filter(|conn| conn.peer != this_peer)
+    {
+        join_ring_request(None, this_peer, gateway, op_manager, conn_manager).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn join_ring_request<CM>(
+    backoff: Option<ExponentialBackoff>,
+    peer_key: PeerId,
+    gateway: &PeerKeyLocation,
+    op_manager: &OpManager,
+    conn_manager: &mut CM,
+) -> Result<(), OpError>
+where
+    CM: NetworkBridge + Send,
+{
+    let tx_id = Transaction::new::<ConnectMsg>();
+    let mut op = initial_request(peer_key, *gateway, op_manager.ring.max_hops_to_live, tx_id);
+    if let Some(mut backoff) = backoff {
+        // backoff to retry later in case it failed
+        tracing::warn!("Performing a new join, attempt {}", backoff.retries() + 1);
+        if backoff.sleep().await.is_none() {
+            tracing::error!("Max number of retries reached");
+            if op_manager.ring.open_connections() == 0 {
+                // only consider this a complete failure if no connections were established at all
+                // if connections where established the peer should incrementally acquire more over time
+                return Err(OpError::MaxRetriesExceeded(tx_id, tx_id.transaction_type()));
+            } else {
+                return Ok(());
+            }
+        }
+        // on first run the backoff will be initialized at the `initial_request` function
+        // if the op was to fail and retried this function will be called with the previous backoff
+        // passed as an argument and advanced
+        op.backoff = Some(backoff);
+    }
+    connect_request(tx_id, op_manager, conn_manager, op).await?;
+    Ok(())
+}
+
+fn initial_request(
     this_peer: PeerId,
     gateway: PeerKeyLocation,
     max_hops_to_live: usize,
@@ -831,7 +893,7 @@ pub(crate) fn initial_request(
 }
 
 /// Join ring routine, called upon performing a join operation for this node.
-pub(crate) async fn connect_request<NB>(
+async fn connect_request<NB>(
     tx: Transaction,
     op_manager: &OpManager,
     conn_bridge: &mut NB,

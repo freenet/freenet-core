@@ -52,7 +52,6 @@ impl SimPeer {
         ER: NetEventRegister + Send + Clone + 'static,
     {
         let gateways = self.config.get_gateways()?;
-        let is_gateway = self.config.local_ip.zip(self.config.local_port).is_some();
 
         let (notification_channel, notification_tx) = EventLoopNotifications::channel();
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
@@ -61,7 +60,6 @@ impl SimPeer {
             notification_tx,
             ops_ch_channel,
             &self.config,
-            &gateways,
             event_register.clone(),
         )?);
         let (_executor_listener, executor_sender) = contract::executor_channel(op_manager.clone());
@@ -83,13 +81,12 @@ impl SimPeer {
         let running_node = super::RunnerConfig {
             peer_key: self.config.peer_id,
             op_manager,
-            gateways,
             notification_channel,
             conn_manager,
             event_register: Box::new(event_register),
-            is_gateway,
             user_events: Some(event_generator),
             parent_span: None,
+            gateways,
         };
         super::run_node(running_node).await
     }

@@ -28,7 +28,6 @@ impl<ER> Builder<ER> {
         ER: NetEventRegister + Clone,
     {
         let gateways = self.config.get_gateways()?;
-        let is_gateway = self.config.local_ip.zip(self.config.local_port).is_some();
 
         let (notification_channel, notification_tx) = EventLoopNotifications::channel();
         let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
@@ -38,7 +37,6 @@ impl<ER> Builder<ER> {
             notification_tx,
             ops_ch_channel,
             &self.config,
-            &gateways,
             self.event_register.clone(),
         )?);
         std::mem::drop(_guard);
@@ -61,7 +59,6 @@ impl<ER> Builder<ER> {
         );
         let mut config = super::RunnerConfig {
             peer_key: self.peer_key,
-            is_gateway,
             gateways,
             parent_span: Some(parent_span),
             op_manager,

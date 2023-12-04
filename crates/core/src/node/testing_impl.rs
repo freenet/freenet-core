@@ -24,6 +24,7 @@ use crate::{
     contract,
     message::{NetMessage, NodeEvent},
     node::{InitPeerNode, NetEventRegister, NodeConfig},
+    operations::connect,
     ring::{Distance, Location, PeerKeyLocation},
     tracing::TestEventListener,
 };
@@ -969,8 +970,6 @@ where
     UsrEv: ClientEventsProxy + Send + 'static,
 {
     peer_key: PeerId,
-    is_gateway: bool,
-    gateways: Vec<PeerKeyLocation>,
     parent_span: Option<tracing::Span>,
     op_manager: Arc<OpManager>,
     conn_manager: NB,
@@ -978,6 +977,7 @@ where
     user_events: Option<UsrEv>,
     notification_channel: EventLoopNotifications,
     event_register: Box<dyn NetEventRegister>,
+    gateways: Vec<PeerKeyLocation>,
 }
 
 async fn run_node<NB, UsrEv>(mut config: RunnerConfig<NB, UsrEv>) -> Result<(), anyhow::Error>
@@ -985,21 +985,13 @@ where
     NB: NetworkBridge + NetworkBridgeExt,
     UsrEv: ClientEventsProxy + Send + 'static,
 {
-    use crate::util::IterExt;
-    if !config.is_gateway {
-        if let Some(gateway) = config.gateways.iter().shuffle().take(1).next() {
-            super::join_ring_request(
-                None,
-                config.peer_key,
-                gateway,
-                &config.op_manager,
-                &mut config.conn_manager,
-            )
-            .await?;
-        } else {
-            anyhow::bail!("requires at least one gateway");
-        }
-    }
+    connect::initial_join_procedure(
+        &config.op_manager,
+        &mut config.conn_manager,
+        config.peer_key,
+        &config.gateways,
+    )
+    .await?;
     let (client_responses, cli_response_sender) = contract::ClientResponses::channel();
     let span = {
         config
@@ -1041,7 +1033,6 @@ async fn run_event_listener<NB, UsrEv>(
     mut node_controller_rx: tokio::sync::mpsc::Receiver<NodeEvent>,
     RunnerConfig {
         peer_key,
-        is_gateway,
         gateways,
         parent_span,
         op_manager,
@@ -1055,7 +1046,6 @@ where
     NB: NetworkBridge + NetworkBridgeExt,
     UsrEv: ClientEventsProxy + Send + 'static,
 {
-    use crate::util::IterExt;
     loop {
         let msg = tokio::select! {
             msg = conn_manager.recv() => { msg.map(Either::Left) }
@@ -1076,31 +1066,8 @@ where
         };
 
         if let Ok(Either::Left(NetMessage::Aborted(tx))) = msg {
-            let tx_type = tx.transaction_type();
-            let res =
-                super::handle_cancelled_op(tx, peer_key, &op_manager, &mut conn_manager).await;
-            match res {
-                Err(crate::operations::OpError::MaxRetriesExceeded(_, _))
-                    if tx_type == crate::message::TransactionType::Connect && !is_gateway =>
-                {
-                    tracing::warn!("Retrying joining the ring with an other peer");
-                    if let Some(gateway) = gateways.iter().shuffle().next() {
-                        super::join_ring_request(
-                            None,
-                            peer_key,
-                            gateway,
-                            &op_manager,
-                            &mut conn_manager,
-                        )
-                        .await?
-                    } else {
-                        anyhow::bail!("requires at least one gateway");
-                    }
-                }
-                Err(err) => return Err(anyhow::anyhow!(err)),
-                Ok(_) => {}
-            }
-            continue;
+            super::handle_aborted_op(tx, peer_key, &op_manager, &mut conn_manager, &gateways)
+                .await?;
         }
 
         let msg = match msg {

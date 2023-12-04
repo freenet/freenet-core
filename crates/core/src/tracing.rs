@@ -104,14 +104,10 @@ pub(crate) struct NetEventLog<'a> {
 }
 
 impl<'a> NetEventLog<'a> {
-    pub fn route_event(
-        tx: &'a Transaction,
-        op_manager: &'a OpManager,
-        route_event: &RouteEvent,
-    ) -> Self {
+    pub fn route_event(tx: &'a Transaction, ring: &'a Ring, route_event: &RouteEvent) -> Self {
         NetEventLog {
             tx,
-            peer_id: &op_manager.ring.peer_key,
+            peer_id: &ring.peer_key,
             kind: EventKind::Route(route_event.clone()),
         }
     }
@@ -241,7 +237,7 @@ impl<'a> NetEventLog<'a> {
             }) => {
                 let key = contract.key();
                 EventKind::Put(PutEvent::Request {
-                    performer: target.peer,
+                    requester: target.peer,
                     key,
                 })
             }
@@ -779,6 +775,7 @@ async fn send_to_metrics_server(
             let msg = PeerChange::removed_connection_msg(*from, send_msg.peer_id);
             ws_stream.send(Message::Binary(msg)).await
         }
+        // todo: send op events too 8put, get, update, etc) so we can keep track of transactions
         _ => Ok(()),
     };
     if let Err(error) = res {
@@ -1109,7 +1106,7 @@ enum ConnectEvent {
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 enum PutEvent {
     Request {
-        performer: PeerId,
+        requester: PeerId,
         key: ContractKey,
     },
     PutSuccess {
