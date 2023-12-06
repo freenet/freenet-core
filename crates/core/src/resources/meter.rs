@@ -1,5 +1,5 @@
 use std::hash::Hash;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::resources::rate::Rate;
 use crate::resources::{BytesPerSecond, InstructionsPerSecond};
@@ -9,6 +9,13 @@ use freenet_stdlib::prelude::*;
 use crate::ring::PeerKeyLocation;
 
 use super::running_average::RunningAverage;
+
+// Sources younger than this will return default usage rather than actual usage as it
+// may be ramping up and not yet fully representative of its long-term usage.
+const SOURCE_RAMP_UP_TIME: Duration = Duration::from_secs(10*60); // 10 minutes
+
+// Default usage is assumed to be the 75th percentile of usage for the resource.
+const DEFAULT_USAGE_PERCENTILE: f64 = 0.75;
 
 /// A structure that keeps track of the usage of dynamic resources which are consumed over time.
 /// It provides methods to report and query resource usage, both total and attributed to specific
@@ -40,10 +47,11 @@ impl Meter {
         }
     }
 
+    /// The measured usage rate for a resource attributed to a specific source.
     pub(crate) fn attributed_usage_rate(
         &self,
         attribution: &AttributionSource,
-        resource: ResourceType,
+        resource: &ResourceType,
     ) -> Option<Rate> {
         // Try to get a mutable reference to the AttributionMeters for the given attribution
         match self.attribution_meters.get_mut(attribution) {
@@ -58,6 +66,45 @@ impl Meter {
                 }
             }
             None => None, // No AttributionMeters found for the given attribution
+        }
+    }
+
+    /// The measured usage rate for a resource attributed to a specific source, adjusted for
+    /// new attribution sources that may still be "ramping up" their usage.
+    pub(crate) fn adjusted_usage_rate(
+        &self,
+        attribution: &AttributionSource,
+        source_created_at : Instant,
+        resource: &ResourceType,
+    ) -> Option<Rate> {
+        let source_ramping_up =source_created_at.elapsed() < SOURCE_RAMP_UP_TIME;
+        let original_usage_rate = self.attributed_usage_rate(attribution, resource);
+        if source_ramping_up {
+            match original_usage_rate {
+                Some(original_usage_rate) => {
+                    // Iterate through sources of this type, record usages, sort them, and
+                    // return the DEFAULT_USAGE_PERCENTILE-th percentile usage.
+                    let mut usage_rates = Vec::new();
+                    for attr in self.attribution_meters.iter() {
+                        let resource_totals = attr.value();
+                        match resource_totals.map.get(resource) {
+                            Some(meter) => {
+                                if let Some(usage_rate) = meter.get_rate() {
+                                    usage_rates.push(usage_rate);
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                    usage_rates.sort_by(|a, b| a.partial_cmp(&b).unwrap());
+                    let adjusted_usage_rate = usage_rates[(DEFAULT_USAGE_PERCENTILE * usage_rates.len() as f64) as usize].clone();
+
+                    Some(adjusted_usage_rate)
+                }
+                None => None,
+            }
+        } else {
+            original_usage_rate
         }
     }
 
@@ -187,20 +234,20 @@ mod tests {
         // Test that the attributed usage is 0.0 for all resources
         let attribution = AttributionSource::Peer(PeerKeyLocation::random());
         assert!(meter
-            .attributed_usage_rate(&attribution, ResourceType::InboundBandwidthBytes)
+            .attributed_usage_rate(&attribution, &ResourceType::InboundBandwidthBytes)
             .is_none());
         assert!(meter
-            .attributed_usage_rate(&attribution, ResourceType::OutboundBandwidthBytes)
+            .attributed_usage_rate(&attribution, &ResourceType::OutboundBandwidthBytes)
             .is_none());
         assert!(meter
-            .attributed_usage_rate(&attribution, ResourceType::CpuInstructions)
+            .attributed_usage_rate(&attribution, &ResourceType::CpuInstructions)
             .is_none());
 
         // Report some usage and test that the attributed usage is updated
         meter.report(&attribution, ResourceType::InboundBandwidthBytes, 100.0);
         assert_eq!(
             meter
-                .attributed_usage_rate(&attribution, ResourceType::InboundBandwidthBytes)
+                .attributed_usage_rate(&attribution, &ResourceType::InboundBandwidthBytes)
                 .unwrap()
                 .per_second(),
             100.0
@@ -223,7 +270,7 @@ mod tests {
         );
         assert_eq!(
             meter
-                .attributed_usage_rate(&attribution, ResourceType::InboundBandwidthBytes)
+                .attributed_usage_rate(&attribution, &ResourceType::InboundBandwidthBytes)
                 .unwrap()
                 .per_second(),
             100.0
@@ -240,7 +287,7 @@ mod tests {
         );
         assert_eq!(
             meter
-                .attributed_usage_rate(&attribution, ResourceType::InboundBandwidthBytes)
+                .attributed_usage_rate(&attribution, &ResourceType::InboundBandwidthBytes)
                 .unwrap()
                 .per_second(),
             300.0
@@ -256,7 +303,7 @@ mod tests {
         );
         assert_eq!(
             meter
-                .attributed_usage_rate(&attribution, ResourceType::CpuInstructions)
+                .attributed_usage_rate(&attribution, &ResourceType::CpuInstructions)
                 .unwrap()
                 .per_second(),
             50.0
@@ -278,7 +325,7 @@ mod tests {
         );
         assert_eq!(
             meter
-                .attributed_usage_rate(&other_attribution, ResourceType::InboundBandwidthBytes)
+                .attributed_usage_rate(&other_attribution, &ResourceType::InboundBandwidthBytes)
                 .unwrap()
                 .per_second(),
             150.0

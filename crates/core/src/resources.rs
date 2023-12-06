@@ -66,7 +66,6 @@
 #![allow(dead_code, unused)] // FIXME: remove after integration
 
 mod meter;
-mod predictive_meter;
 pub mod rate;
 mod running_average;
 
@@ -179,7 +178,7 @@ impl ResourceManager {
             for PeerValue { peer, value } in candidates {
                 if let Some(cost) = self
                     .meter
-                    .attributed_usage_rate(&AttributionSource::Peer(peer), resource_type)
+                    .attributed_usage_rate(&AttributionSource::Peer(peer), &resource_type)
                 {
                     const MIN_VALUE: f64 = 0.0001;
                     let cost_per_second = cost.per_second();
@@ -334,7 +333,7 @@ mod tests {
         assert_eq!(
             resource_manager
                 .meter
-                .attributed_usage_rate(&attribution, ResourceType::InboundBandwidthBytes)
+                .attributed_usage_rate(&attribution, &ResourceType::InboundBandwidthBytes)
                 .unwrap()
                 .per_second(),
             100.0
