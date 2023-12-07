@@ -162,7 +162,7 @@ pub mod local_node {
                 Err(err) => {
                     tracing::error!("{err}");
                     let err = Err(ErrorKind::Unhandled {
-                        cause: format!("{err}"),
+                        cause: format!("{err}").into(),
                     }
                     .into());
                     match receiver {

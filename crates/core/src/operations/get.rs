@@ -483,7 +483,7 @@ impl Operation for GetOp {
                                     op_manager.ring.contract_cached(&key);
                                 }
                                 ContractHandlerEvent::CacheResult(Err(err)) => {
-                                    return Err(OpError::ContractError(err));
+                                    return Err(OpError::ExecutorError(err.into()));
                                 }
                                 _ => unreachable!(),
                             }

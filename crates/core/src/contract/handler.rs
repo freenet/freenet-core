@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use super::executor::{ExecutorHalve, ExecutorToEventLoopChannel};
+use super::ExecutorError;
 use super::{
     executor::{ContractExecutor, Executor},
     ContractError,
@@ -348,6 +349,7 @@ pub(crate) enum ContractHandlerEvent {
         state: WrappedState,
         related_contracts: RelatedContracts<'static>,
         parameters: Option<Parameters<'static>>,
+        // todo: optionally pass in contract code so it can be verified...
     },
     /// The response to a push query.
     PutResponse {
@@ -366,7 +368,7 @@ pub(crate) enum ContractHandlerEvent {
     /// Store a contract in the local store.
     Cache(ContractContainer),
     /// Result of a caching operation.
-    CacheResult(Result<(), ContractError>),
+    CacheResult(Result<(), ExecutorError>),
 }
 
 impl std::fmt::Display for ContractHandlerEvent {

@@ -1,6 +1,7 @@
 //! Network messaging between peers.
 
 use std::{
+    borrow::Cow,
     fmt::Display,
     time::{Duration, SystemTime},
 };
@@ -257,7 +258,7 @@ pub(crate) enum NodeEvent {
     #[serde(skip)]
     Error(ConnectionError),
     Disconnect {
-        cause: Option<String>,
+        cause: Option<Cow<'static, str>>,
     },
 }
 
