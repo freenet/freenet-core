@@ -16,7 +16,7 @@ pub(crate) struct Router {
     transfer_rate_estimator: IsotonicEstimator,
     failure_estimator: IsotonicEstimator,
     mean_transfer_size: Mean,
-    closest_peers_capacity: usize,
+    consider_n_closest_peers: usize,
 }
 
 impl Router {
@@ -107,12 +107,12 @@ impl Router {
                 EstimatorType::Negative,
             ),
             mean_transfer_size,
-            closest_peers_capacity: 20,
+            consider_n_closest_peers: 20,
         }
     }
 
-    pub fn with_closest_peers_capacity(mut self, n: u32) -> Self {
-        self.closest_peers_capacity = n as usize;
+    pub fn considering_n_closest_peers(mut self, n: u32) -> Self {
+        self.consider_n_closest_peers = n as usize;
         self
     }
 
@@ -157,7 +157,7 @@ impl Router {
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
         target_location: &Location,
     ) -> Vec<&'a PeerKeyLocation> {
-        let mut heap = std::collections::BinaryHeap::with_capacity(self.closest_peers_capacity + 1);
+        let mut heap = std::collections::BinaryHeap::with_capacity(self.consider_n_closest_peers + 1);
 
         for peer_location in peers {
             if let Some(location) = peer_location.location.as_ref() {
@@ -165,7 +165,7 @@ impl Router {
                 heap.push((distance, peer_location));
 
                 // Ensure we keep the heap size to specified capacity
-                if heap.len() > self.closest_peers_capacity {
+                if heap.len() > self.consider_n_closest_peers {
                     heap.pop();
                 }
             }
@@ -436,7 +436,7 @@ mod tests {
         assert_eq!(
             CAP as usize,
             Router::new(&[])
-                .with_closest_peers_capacity(CAP)
+                .considering_n_closest_peers(CAP)
                 .select_closest_peers(&create_peers(NUM_PEERS), &Location::random())
                 .len()
         );
@@ -452,7 +452,7 @@ mod tests {
         let expected_closest = select_closest_peers_vec(CLOSEST_CAP, &peers, &contract_location);
 
         // Create a router with no historical data
-        let router = Router::new(&[]).with_closest_peers_capacity(CLOSEST_CAP);
+        let router = Router::new(&[]).considering_n_closest_peers(CLOSEST_CAP);
         let asserted_closest: Vec<&PeerKeyLocation> =
             router.select_closest_peers(&peers, &contract_location);
 
