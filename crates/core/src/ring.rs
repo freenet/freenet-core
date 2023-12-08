@@ -53,6 +53,46 @@ use crate::{
 };
 use crate::resources::{BytesPerSecond, InstructionsPerSecond, Limits, ResourceManager};
 
+/// Thread safe and friendly data structure to keep track of the local knowledge
+/// of the state of the ring.
+///
+/// Note: For now internally we wrap some of the types internally with locks and/or use
+/// multithreaded maps. In the future if performance requires it some of this can be moved
+/// towards a more lock-free multithreading model if necessary.
+pub(crate) struct Ring {
+    pub rnd_if_htl_above: usize,
+    pub max_hops_to_live: usize,
+    pub peer_key: PeerKey,
+    max_connections: usize,
+    min_connections: usize,
+    router: Arc<RwLock<Router>>,
+    topology_manager: RwLock<TopologyManager>,
+    resource_manager: RwLock<ResourceManager>,
+    /// Fast is for when there are less than our target number of connections so we want to acquire new connections quickly.
+    /// Slow is for when there are enough connections so we need to drop a connection in order to replace it.
+    /// TODO: (Ian) Probably remove this
+    fast_acquisition: AtomicBool,
+    connections_by_location: RwLock<BTreeMap<Location, Vec<Connection>>>,
+    location_for_peer: RwLock<BTreeMap<PeerKey, Location>>,
+    /// contracts in the ring cached by this node
+    cached_contracts: DashSet<ContractKey>,
+    own_location: AtomicU64,
+    /// The container for subscriber is a vec instead of something like a hashset
+    /// that would allow for blind inserts of duplicate peers subscribing because
+    /// of data locality, since we are likely to end up iterating over the whole sequence
+    /// of subscribers more often than inserting, and anyways is a relatively short sequence
+    /// then is more optimal to just use a vector for it's compact memory layout.
+    subscribers: DashMap<ContractKey, Vec<PeerKeyLocation>>,
+    subscriptions: RwLock<Vec<ContractKey>>,
+    /// Interim connections ongoing handshake or successfully open connections
+    /// Is important to keep track of this so no more connections are accepted prematurely.
+    open_connections: AtomicUsize,
+    pub live_tx_tracker: LiveTransactionTracker,
+    // A peer which has been blacklisted to perform actions regarding a given contract.
+    // todo: add blacklist
+    // contract_blacklist: Arc<DashMap<ContractKey, Vec<Blacklisted>>>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 /// The location of a peer in the ring. This location allows routing towards the peer.
@@ -162,46 +202,6 @@ impl LiveTransactionTracker {
     fn still_alive(&self, tx: &Transaction) -> bool {
         self.tx_per_peer.iter().any(|e| e.value().contains(tx))
     }
-}
-
-/// Thread safe and friendly data structure to keep track of the local knowledge
-/// of the state of the ring.
-///
-/// Note: For now internally we wrap some of the types internally with locks and/or use
-/// multithreaded maps. In the future if performance requires it some of this can be moved
-/// towards a more lock-free multithreading model if necessary.
-pub(crate) struct Ring {
-    pub rnd_if_htl_above: usize,
-    pub max_hops_to_live: usize,
-    pub peer_key: PeerKey,
-    max_connections: usize,
-    min_connections: usize,
-    router: Arc<RwLock<Router>>,
-    topology_manager: RwLock<TopologyManager>,
-    resource_manager: RwLock<ResourceManager>,
-    /// Fast is for when there are less than our target number of connections so we want to acquire new connections quickly.
-    /// Slow is for when there are enough connections so we need to drop a connection in order to replace it.
-    /// TODO: (Ian) Probably remove this
-    fast_acquisition: AtomicBool,
-    connections_by_location: RwLock<BTreeMap<Location, Vec<Connection>>>,
-    location_for_peer: RwLock<BTreeMap<PeerKey, Location>>,
-    /// contracts in the ring cached by this node
-    cached_contracts: DashSet<ContractKey>,
-    own_location: AtomicU64,
-    /// The container for subscriber is a vec instead of something like a hashset
-    /// that would allow for blind inserts of duplicate peers subscribing because
-    /// of data locality, since we are likely to end up iterating over the whole sequence
-    /// of subscribers more often than inserting, and anyways is a relatively short sequence
-    /// then is more optimal to just use a vector for it's compact memory layout.
-    subscribers: DashMap<ContractKey, Vec<PeerKeyLocation>>,
-    subscriptions: RwLock<Vec<ContractKey>>,
-    /// Interim connections ongoing handshake or successfully open connections
-    /// Is important to keep track of this so no more connections are accepted prematurely.
-    open_connections: AtomicUsize,
-    pub live_tx_tracker: LiveTransactionTracker,
-    // A peer which has been blacklisted to perform actions regarding a given contract.
-    // todo: add blacklist
-    // contract_blacklist: Arc<DashMap<ContractKey, Vec<Blacklisted>>>,
 }
 
 // /// A data type that represents the fact that a peer has been blacklisted
