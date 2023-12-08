@@ -40,6 +40,8 @@ impl Meter {
         }
     }
 
+    // TODO: This needs to move out of Meter and into Ring because it needs source.created_at time
+
     /// Get the sum of attributed usage rates for all resources of type `resource`, using attributed_usage_rate
     /// or extrapolated_usage_rate depending on the value of extrapolated
     pub fn resource_usage_rate(&mut self, resource: ResourceType, extrapolated : bool) -> Option<Rate> {
@@ -213,10 +215,10 @@ mod tests {
 
     #[test]
     fn test_meter() {
-        let meter = Meter::new_with_window_size(100);
+        let mut meter = Meter::new_with_window_size(100);
 
         // Test that the new Meter has empty totals_by_resource and attribution_meters
-        assert!(meter.totals_by_resource.map.is_empty());
+        assert!(meter.resource_usage_rate(ResourceType::InboundBandwidthBytes, false).is_none());
         assert!(meter.attribution_meters.is_empty());
     }
 
@@ -226,13 +228,13 @@ mod tests {
 
         // Test that the total usage is 0.0 for all resources
         assert!(meter
-            .resource_usage_rate(ResourceType::InboundBandwidthBytes)
+            .resource_usage_rate(ResourceType::InboundBandwidthBytes, false)
             .is_none());
         assert!(meter
-            .resource_usage_rate(ResourceType::OutboundBandwidthBytes)
+            .resource_usage_rate(ResourceType::OutboundBandwidthBytes, false)
             .is_none());
         assert!(meter
-            .resource_usage_rate(ResourceType::CpuInstructions)
+            .resource_usage_rate(ResourceType::CpuInstructions, false)
             .is_none());
 
         // Report some usage and test that the total usage is updated
@@ -240,7 +242,7 @@ mod tests {
         meter.report(&attribution, ResourceType::InboundBandwidthBytes, 100.0);
         assert_eq!(
             meter
-                .resource_usage_rate(ResourceType::InboundBandwidthBytes)
+                .resource_usage_rate(ResourceType::InboundBandwidthBytes, false)
                 .unwrap()
                 .per_second(),
             100.0
@@ -283,7 +285,7 @@ mod tests {
         meter.report(&attribution, ResourceType::InboundBandwidthBytes, 100.0);
         assert_eq!(
             meter
-                .resource_usage_rate(ResourceType::InboundBandwidthBytes)
+                .resource_usage_rate(ResourceType::InboundBandwidthBytes, false)
                 .unwrap()
                 .per_second(),
             100.0
@@ -300,7 +302,7 @@ mod tests {
         meter.report(&attribution, ResourceType::InboundBandwidthBytes, 200.0);
         assert_eq!(
             meter
-                .resource_usage_rate(ResourceType::InboundBandwidthBytes)
+                .resource_usage_rate(ResourceType::InboundBandwidthBytes, false)
                 .unwrap()
                 .per_second(),
             300.0
@@ -316,7 +318,7 @@ mod tests {
         meter.report(&attribution, ResourceType::CpuInstructions, 50.0);
         assert_eq!(
             meter
-                .resource_usage_rate(ResourceType::CpuInstructions)
+                .resource_usage_rate(ResourceType::CpuInstructions, false)
                 .unwrap()
                 .per_second(),
             50.0
@@ -338,7 +340,7 @@ mod tests {
         );
         assert_eq!(
             meter
-                .resource_usage_rate(ResourceType::InboundBandwidthBytes)
+                .resource_usage_rate(ResourceType::InboundBandwidthBytes, false)
                 .unwrap()
                 .per_second(),
             450.0
