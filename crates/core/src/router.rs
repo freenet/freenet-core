@@ -157,7 +157,8 @@ impl Router {
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
         target_location: &Location,
     ) -> Vec<&'a PeerKeyLocation> {
-        let mut heap = std::collections::BinaryHeap::with_capacity(self.consider_n_closest_peers + 1);
+        let mut heap = 
+            std::collections::BinaryHeap::with_capacity(self.consider_n_closest_peers + 1);
 
         for peer_location in peers {
             if let Some(location) = peer_location.location.as_ref() {
