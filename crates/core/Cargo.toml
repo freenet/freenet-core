@@ -71,6 +71,7 @@ tracing-subscriber = { optional = true, version = "0.3.16" }
 # internal deps
 freenet-stdlib = { features = ["net"], workspace = true }
 concurrent-list = "0.0.2"
+time = "0.3.30"
 
 [dev-dependencies]
 arbitrary = { features = ["derive"], version = "1" }

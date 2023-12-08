@@ -14,8 +14,11 @@ use super::running_average::RunningAverage;
 // may be ramping up and not yet fully representative of its long-term usage.
 const SOURCE_RAMP_UP_TIME: Duration = Duration::from_secs(10*60); // 10 minutes
 
-// Default usage is assumed to be the 75th percentile of usage for the resource.
-const DEFAULT_USAGE_PERCENTILE: f64 = 0.75;
+// Default usage is assumed to be the 50th percentile of usage for the resource.
+const DEFAULT_USAGE_PERCENTILE: f64 = 0.5;
+
+// Recache the estimated usage rate this often
+const ESTIMATED_USAGE_RATE_CACHE_TIME: Duration = Duration::from_secs(60);
 
 /// A structure that keeps track of the usage of dynamic resources which are consumed over time.
 /// It provides methods to report and query resource usage, both total and attributed to specific
@@ -24,6 +27,7 @@ pub(super) struct Meter {
     totals_by_resource: ResourceTotals,
     attribution_meters: AttributionMeters,
     running_average_window_size: usize,
+    cached_estimated_usage_rate: DashMap<ResourceType, (Rate, Instant)>,
 }
 
 impl Meter {
@@ -33,6 +37,7 @@ impl Meter {
             totals_by_resource: ResourceTotals::new(),
             attribution_meters: AttributionMeters::new(),
             running_average_window_size,
+            cached_estimated_usage_rate: DashMap::new(),
         }
     }
 
@@ -69,42 +74,52 @@ impl Meter {
         }
     }
 
-    /// The measured usage rate for a resource attributed to a specific source, adjusted for
-    /// new attribution sources that may still be "ramping up" their usage.
-    pub(crate) fn adjusted_usage_rate(
-        &self,
+    /// The estimated usage rate for a resource, but adjusted for sources that are ramping up
+    /// to use a global estimate of the usage rate. Current time is supplied as a parameter
+    /// 'now' to facilitate testing.
+    pub(crate) fn extrapolated_usage_rate(
+        &mut self,
         attribution: &AttributionSource,
-        source_created_at : Instant,
+        source_created_at: Instant,
         resource: &ResourceType,
+        now: &Instant,
     ) -> Option<Rate> {
-        let source_ramping_up =source_created_at.elapsed() < SOURCE_RAMP_UP_TIME;
+        let source_ramping_up = now.duration_since(source_created_at) < SOURCE_RAMP_UP_TIME;
         let original_usage_rate = self.attributed_usage_rate(attribution, resource);
-        if source_ramping_up {
-            match original_usage_rate {
-                Some(original_usage_rate) => {
-                    // Iterate through sources of this type, record usages, sort them, and
-                    // return the DEFAULT_USAGE_PERCENTILE-th percentile usage.
-                    let mut usage_rates = Vec::new();
-                    for attr in self.attribution_meters.iter() {
-                        let resource_totals = attr.value();
-                        match resource_totals.map.get(resource) {
-                            Some(meter) => {
-                                if let Some(usage_rate) = meter.get_rate() {
-                                    usage_rates.push(usage_rate);
-                                }
-                            }
-                            None => {}
-                        }
-                    }
-                    usage_rates.sort_by(|a, b| a.partial_cmp(&b).unwrap());
-                    let adjusted_usage_rate = usage_rates[(DEFAULT_USAGE_PERCENTILE * usage_rates.len() as f64) as usize].clone();
 
-                    Some(adjusted_usage_rate)
+        if source_ramping_up {
+            let should_update_cache = match self.cached_estimated_usage_rate.get(resource) {
+                Some(eur) if eur.value().1 > ESTIMATED_USAGE_RATE_CACHE_TIME => true,
+                None => true,
+                _ => false,
+            };
+
+            if should_update_cache {
+                let new_rate = self.update_cached_estimated_usage_rate(resource);
+                if let Some(rate) = new_rate {
+                    self.cached_estimated_usage_rate.insert(*resource, (rate.clone(), *now));
+                    return Some(rate);
                 }
-                None => None,
             }
+
+            self.cached_estimated_usage_rate.get(resource).map(|eur| eur.value().0)
         } else {
             original_usage_rate
+        }
+    }
+
+    fn update_cached_estimated_usage_rate(&self, resource: &ResourceType) -> Option<Rate> {
+        let usage_rates: Vec<_> = self.attribution_meters.iter()
+            .filter_map(|attr| attr.value().map.get(resource))
+            .filter_map(|meter| meter.get_rate())
+            .collect();
+
+        if !usage_rates.is_empty() {
+            let estimated_index = (DEFAULT_USAGE_PERCENTILE * usage_rates.len() as f64) as usize;
+            let estimated_index = estimated_index.min(usage_rates.len() - 1);
+            Some(usage_rates[estimated_index].clone())
+        } else {
+            None
         }
     }
 
@@ -154,6 +169,8 @@ impl Meter {
         resource_value.insert(value);
     }
 }
+
+
 
 #[derive(Eq, Hash, PartialEq, Clone, Debug)]
 pub(crate) enum AttributionSource {
