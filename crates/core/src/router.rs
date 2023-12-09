@@ -111,6 +111,7 @@ impl Router {
         }
     }
 
+    #[allow(dead_code)]
     pub fn considering_n_closest_peers(mut self, n: u32) -> Self {
         self.consider_n_closest_peers = n as usize;
         self
@@ -157,7 +158,7 @@ impl Router {
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
         target_location: &Location,
     ) -> Vec<&'a PeerKeyLocation> {
-        let mut heap = 
+        let mut heap =
             std::collections::BinaryHeap::with_capacity(self.consider_n_closest_peers + 1);
 
         for peer_location in peers {
