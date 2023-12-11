@@ -2,8 +2,8 @@ use std::hash::Hash;
 use std::time::{Duration, Instant};
 
 use crate::resources::rate::Rate;
-use crate::resources::{BytesPerSecond, InstructionsPerSecond};
 use dashmap::DashMap;
+use itertools::Itertools;
 use freenet_stdlib::prelude::*;
 
 use crate::ring::PeerKeyLocation;
@@ -24,7 +24,6 @@ const ESTIMATED_USAGE_RATE_CACHE_TIME: Duration = Duration::from_secs(60);
 /// It provides methods to report and query resource usage, both total and attributed to specific
 /// sources.
 pub(super) struct Meter {
-    totals_by_resource: ResourceTotals,
     attribution_meters: AttributionMeters,
     running_average_window_size: usize,
     cached_estimated_usage_rate: DashMap<ResourceType, (Rate, Instant)>,
@@ -34,13 +33,35 @@ impl Meter {
     /// Creates a new `Meter`.
     pub fn new_with_window_size(running_average_window_size: usize) -> Self {
         Meter {
-            totals_by_resource: ResourceTotals::new(),
             attribution_meters: AttributionMeters::new(),
             running_average_window_size,
             cached_estimated_usage_rate: DashMap::new(),
         }
     }
 
+<<<<<<< HEAD
+=======
+    // TODO: This needs to move out of Meter and into Ring because it needs source.created_at time
+
+    /// Get the sum of attributed usage rates for all resources of type `resource`, using attributed_usage_rate
+    /// or extrapolated_usage_rate depending on the value of extrapolated
+    pub fn resource_usage_rate(&mut self, resource: ResourceType, extrapolated : bool) -> Option<Rate> {
+        let mut total = Rate::new(0.0, Duration::from_secs(1));
+        for (source, totals) in *self.attribution_meters.get(&resource)? {
+            let usage_rate = if extrapolated {
+                self.extrapolated_usage_rate(&source, source.created_at(), &resource, &Instant::now())
+            } else {
+                self.attributed_usage_rate(&source, &resource)
+            };
+            if let Some(usage_rate) = usage_rate {
+                total += usage_rate;
+            }
+
+        }
+        Some(total)
+    }
+
+>>>>>>> c2215e60a7b73bc09af93c7c19a6d8bb9bc5f796
     /// The measured usage rate for a resource attributed to a specific source.
     pub(crate) fn attributed_usage_rate(
         &self,
@@ -48,7 +69,7 @@ impl Meter {
         resource: &ResourceType,
     ) -> Option<Rate> {
         // Try to get a mutable reference to the AttributionMeters for the given attribution
-        match self.attribution_meters.get_mut(attribution) {
+        match self.attribution_meters.get_mut(&resource).get_mut(attribution) {
             Some(attribution_meters) => {
                 // Try to get a mutable reference to the Meter for the given resource
                 match attribution_meters.map.get_mut(&resource) {
@@ -93,17 +114,19 @@ impl Meter {
     }
 
     fn update_cached_estimated_usage_rate(&self, resource: &ResourceType) -> Option<Rate> {
-        let usage_rates: Vec<_> = self
-            .attribution_meters
+
+        let mut totals_for_type : Vec<Rate> = self.attribution_meters
+            .get(&resource)?
             .iter()
-            .filter_map(|attr| attr.value().map.get(resource))
-            .filter_map(|meter| meter.get_rate())
+            .map(|t| t.value().filter_map(|m| m.value().get_rate()))
+            .sorted()
             .collect();
 
-        if !usage_rates.is_empty() {
-            let estimated_index = (DEFAULT_USAGE_PERCENTILE * usage_rates.len() as f64) as usize;
-            let estimated_index = estimated_index.min(usage_rates.len() - 1);
-            Some(usage_rates[estimated_index].clone())
+        // Calculate the estimated usage rate as the 50th percentile of usage for the resource
+        if !totals_for_type.is_empty() {
+            let estimated_index = (DEFAULT_USAGE_PERCENTILE * totals_for_type.len() as f64) as usize;
+            let estimated_index = estimated_index.min(totals_for_type.len() - 1);
+            Some(totals_for_type[estimated_index].clone())
         } else {
             None
         }
@@ -135,17 +158,11 @@ impl Meter {
         resource: ResourceType,
         value: f64,
     ) {
-        // Report the total usage for the resource
-        let mut total_value = self
-            .totals_by_resource
-            .map
-            .entry(resource)
-            .or_insert_with(|| RunningAverage::new(self.running_average_window_size));
-        total_value.insert(value);
 
         // Report the usage for a specific attribution
         let resource_map = self
             .attribution_meters
+            .get(&resource)
             .entry(attribution.clone())
             .or_insert_with(ResourceTotals::new);
         let mut resource_value = resource_map
@@ -200,10 +217,10 @@ mod tests {
 
     #[test]
     fn test_meter() {
-        let meter = Meter::new_with_window_size(100);
+        let mut meter = Meter::new_with_window_size(100);
 
         // Test that the new Meter has empty totals_by_resource and attribution_meters
-        assert!(meter.totals_by_resource.map.is_empty());
+        assert!(meter.resource_usage_rate(ResourceType::InboundBandwidthBytes, false).is_none());
         assert!(meter.attribution_meters.is_empty());
     }
 
@@ -213,13 +230,13 @@ mod tests {
 
         // Test that the total usage is 0.0 for all resources
         assert!(meter
-            .resource_usage_rate(ResourceType::InboundBandwidthBytes)
+            .resource_usage_rate(ResourceType::InboundBandwidthBytes, false)
             .is_none());
         assert!(meter
-            .resource_usage_rate(ResourceType::OutboundBandwidthBytes)
+            .resource_usage_rate(ResourceType::OutboundBandwidthBytes, false)
             .is_none());
         assert!(meter
-            .resource_usage_rate(ResourceType::CpuInstructions)
+            .resource_usage_rate(ResourceType::CpuInstructions, false)
             .is_none());
 
         // Report some usage and test that the total usage is updated
@@ -227,7 +244,7 @@ mod tests {
         meter.report(&attribution, ResourceType::InboundBandwidthBytes, 100.0);
         assert_eq!(
             meter
-                .resource_usage_rate(ResourceType::InboundBandwidthBytes)
+                .resource_usage_rate(ResourceType::InboundBandwidthBytes, false)
                 .unwrap()
                 .per_second(),
             100.0
@@ -270,7 +287,7 @@ mod tests {
         meter.report(&attribution, ResourceType::InboundBandwidthBytes, 100.0);
         assert_eq!(
             meter
-                .resource_usage_rate(ResourceType::InboundBandwidthBytes)
+                .resource_usage_rate(ResourceType::InboundBandwidthBytes, false)
                 .unwrap()
                 .per_second(),
             100.0
@@ -287,7 +304,7 @@ mod tests {
         meter.report(&attribution, ResourceType::InboundBandwidthBytes, 200.0);
         assert_eq!(
             meter
-                .resource_usage_rate(ResourceType::InboundBandwidthBytes)
+                .resource_usage_rate(ResourceType::InboundBandwidthBytes, false)
                 .unwrap()
                 .per_second(),
             300.0
@@ -303,7 +320,7 @@ mod tests {
         meter.report(&attribution, ResourceType::CpuInstructions, 50.0);
         assert_eq!(
             meter
-                .resource_usage_rate(ResourceType::CpuInstructions)
+                .resource_usage_rate(ResourceType::CpuInstructions, false)
                 .unwrap()
                 .per_second(),
             50.0
@@ -325,7 +342,7 @@ mod tests {
         );
         assert_eq!(
             meter
-                .resource_usage_rate(ResourceType::InboundBandwidthBytes)
+                .resource_usage_rate(ResourceType::InboundBandwidthBytes, false)
                 .unwrap()
                 .per_second(),
             450.0

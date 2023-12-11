@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::time::Duration;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -84,6 +85,20 @@ impl RateProportion {
             "Proportion must be between 0 and 1"
         );
         RateProportion { value }
+    }
+}
+
+impl Eq for Rate {}
+
+impl PartialOrd for Rate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.value.partial_cmp(&other.value)
+    }
+}
+
+impl Ord for Rate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap_or(Ordering::Equal)
     }
 }
 
