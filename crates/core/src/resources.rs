@@ -94,11 +94,11 @@ pub(crate) struct ResourceManager {
     meter: Meter,
     source_creation_times: DashMap<AttributionSource, Instant>,
     pub(crate) request_density_tracker: RwLock<RequestDensityTracker>,
-    pub(crate) topology_manager: RwLock<TopologyManager>,
+    pub(crate) topology_manager: TopologyManager,
 }
 
 impl ResourceManager {
-    pub fn new(limits: Limits, this_peer_location: Option<Location>) -> Self {
+    pub fn new(limits: Limits) -> Self {
         ResourceManager {
             meter: Meter::new_with_window_size(100),
             limits,
@@ -106,7 +106,7 @@ impl ResourceManager {
             request_density_tracker: RwLock::new(RequestDensityTracker::new(
                 REQUEST_DENSITY_TRACKER_SAMPLE_SIZE,
             )),
-            topology_manager: RwLock::new(TopologyManager::new(this_peer_location)),
+            topology_manager: TopologyManager::new(),
         }
     }
 
@@ -213,7 +213,6 @@ struct CandidateCost {
 pub struct Limits {
     pub max_upstream_bandwidth: Rate,
     pub max_downstream_bandwidth: Rate,
-    pub max_cpu_usage: Rate,
 }
 
 impl Limits {
@@ -221,7 +220,6 @@ impl Limits {
         match resource_type {
             ResourceType::OutboundBandwidthBytes => self.max_upstream_bandwidth.clone(),
             ResourceType::InboundBandwidthBytes => self.max_downstream_bandwidth.clone(),
-            ResourceType::CpuInstructions => self.max_cpu_usage.clone(),
         }
     }
 }
@@ -231,37 +229,9 @@ pub(crate) struct UsageRates {
     pub max_usage_rate: RateProportion,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct InstructionsPerSecond(f64);
-impl InstructionsPerSecond {
-    pub const fn new(cpu_usage: f64) -> Self {
-        InstructionsPerSecond(cpu_usage)
-    }
-}
-
-impl From<InstructionsPerSecond> for f64 {
-    fn from(val: InstructionsPerSecond) -> Self {
-        val.0
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ByteCount(u64);
-impl ByteCount {
-    pub fn new(bytes: u64) -> Self {
-        ByteCount(bytes)
-    }
-}
-
-impl From<ByteCount> for f64 {
-    fn from(val: ByteCount) -> Self {
-        val.0 as f64
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::resources::{BytesPerSecond, InstructionsPerSecond, Limits, ResourceManager};
+    use crate::resources::{Limits, ResourceManager};
 
     use super::*;
     use std::time::Instant;
@@ -270,12 +240,10 @@ mod tests {
     fn test_resource_manager_report() {
         // Create a ResourceManager with arbitrary limits
         let limits = Limits {
-            max_upstream_bandwidth: BytesPerSecond::new(1000.0),
-            max_downstream_bandwidth: BytesPerSecond::new(1000.0),
-            max_cpu_usage: InstructionsPerSecond::new(1000.0),
-            max_memory_usage: 1000.0,
-            max_storage_usage: 1000.0,
+            max_upstream_bandwidth: Rate::new_per_second(1000.0),
+            max_downstream_bandwidth: Rate::new_per_second(1000.0),
         };
+        let my_location = Some(Location::random());
         let mut resource_manager = ResourceManager::new(limits);
 
         // Report some usage and test that the total and attributed usage are updated
@@ -309,11 +277,8 @@ mod tests {
     fn test_resource_manager_should_delete_peers() {
         // Create a ResourceManager with arbitrary limits
         let limits = Limits {
-            max_upstream_bandwidth: BytesPerSecond::new(1000.0),
-            max_downstream_bandwidth: BytesPerSecond::new(1000.0),
-            max_cpu_usage: InstructionsPerSecond::new(1000.0),
-            max_memory_usage: 1000.0,
-            max_storage_usage: 1000.0,
+            max_upstream_bandwidth: Rate::new_per_second(1000.0),
+            max_downstream_bandwidth: Rate::new_per_second(1000.0),
         };
         let mut resource_manager = ResourceManager::new(limits);
 
@@ -372,36 +337,24 @@ mod tests {
     #[test]
     fn test_update_limits() {
         let limits = Limits {
-            max_upstream_bandwidth: BytesPerSecond::new(1000.0),
-            max_downstream_bandwidth: BytesPerSecond::new(1000.0),
-            max_cpu_usage: InstructionsPerSecond::new(1000.0),
-            max_memory_usage: 1000.0,
-            max_storage_usage: 1000.0,
+            max_upstream_bandwidth: Rate::new_per_second(1000.0),
+            max_downstream_bandwidth: Rate::new_per_second(1000.0),
         };
         let mut resource_manager = ResourceManager::new(limits);
 
         let new_limits = Limits {
-            max_upstream_bandwidth: BytesPerSecond::new(2000.0),
-            max_downstream_bandwidth: BytesPerSecond::new(2000.0),
-            max_cpu_usage: InstructionsPerSecond::new(2000.0),
-            max_memory_usage: 2000.0,
-            max_storage_usage: 2000.0,
+            max_upstream_bandwidth: Rate::new_per_second(2000.0),
+            max_downstream_bandwidth: Rate::new_per_second(2000.0),
         };
         resource_manager.update_limits(new_limits);
 
         assert_eq!(
             resource_manager.limits.max_upstream_bandwidth,
-            BytesPerSecond::new(2000.0)
+            Rate::new_per_second(2000.0)
         );
         assert_eq!(
             resource_manager.limits.max_downstream_bandwidth,
-            BytesPerSecond::new(2000.0)
+            Rate::new_per_second(2000.0)
         );
-        assert_eq!(
-            resource_manager.limits.max_cpu_usage,
-            InstructionsPerSecond::new(2000.0)
-        );
-        assert_eq!(resource_manager.limits.max_memory_usage, 2000.0);
-        assert_eq!(resource_manager.limits.max_storage_usage, 2000.0);
     }
 }

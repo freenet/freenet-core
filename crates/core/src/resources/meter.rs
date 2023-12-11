@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::resources::rate::Rate;
 use dashmap::DashMap;
-use itertools::Itertools;
+use itertools::{Itertools, sorted};
 use freenet_stdlib::prelude::*;
 
 use crate::ring::PeerKeyLocation;
@@ -39,29 +39,6 @@ impl Meter {
         }
     }
 
-<<<<<<< HEAD
-=======
-    // TODO: This needs to move out of Meter and into Ring because it needs source.created_at time
-
-    /// Get the sum of attributed usage rates for all resources of type `resource`, using attributed_usage_rate
-    /// or extrapolated_usage_rate depending on the value of extrapolated
-    pub fn resource_usage_rate(&mut self, resource: ResourceType, extrapolated : bool) -> Option<Rate> {
-        let mut total = Rate::new(0.0, Duration::from_secs(1));
-        for (source, totals) in *self.attribution_meters.get(&resource)? {
-            let usage_rate = if extrapolated {
-                self.extrapolated_usage_rate(&source, source.created_at(), &resource, &Instant::now())
-            } else {
-                self.attributed_usage_rate(&source, &resource)
-            };
-            if let Some(usage_rate) = usage_rate {
-                total += usage_rate;
-            }
-
-        }
-        Some(total)
-    }
-
->>>>>>> c2215e60a7b73bc09af93c7c19a6d8bb9bc5f796
     /// The measured usage rate for a resource attributed to a specific source.
     pub(crate) fn attributed_usage_rate(
         &self,
@@ -69,7 +46,7 @@ impl Meter {
         resource: &ResourceType,
     ) -> Option<Rate> {
         // Try to get a mutable reference to the AttributionMeters for the given attribution
-        match self.attribution_meters.get_mut(&resource).get_mut(attribution) {
+        match self.attribution_meters.get_mut(attribution) {
             Some(attribution_meters) => {
                 // Try to get a mutable reference to the Meter for the given resource
                 match attribution_meters.map.get_mut(&resource) {
@@ -84,45 +61,17 @@ impl Meter {
         }
     }
 
-    /// Get the expected usage rate for a resource based on the usage rates of all attribution
-    /// sources.
-    pub(crate) fn estimated_type_usage_rate(
-        &mut self,
-        resource: &ResourceType,
-        now: &Instant,
-    ) -> Option<Rate> {
-        let should_update_cache = match self.cached_estimated_usage_rate.get(resource) {
-            Some(eur) if now.duration_since(eur.value().1) > ESTIMATED_USAGE_RATE_CACHE_TIME => {
-                true
-            }
-            None => true,
-            _ => false,
-        };
-
-        if should_update_cache {
-            let new_rate = self.update_cached_estimated_usage_rate(resource);
-            if let Some(rate) = new_rate {
-                self.cached_estimated_usage_rate
-                    .insert(*resource, (rate.clone(), *now));
-                return Some(rate);
-            }
-        }
-
-        self.cached_estimated_usage_rate
-            .get(resource)
-            .map(|eur| eur.value().0)
-    }
-
     fn update_cached_estimated_usage_rate(&self, resource: &ResourceType) -> Option<Rate> {
 
         let mut totals_for_type : Vec<Rate> = self.attribution_meters
-            .get(&resource)?
             .iter()
-            .map(|t| t.value().filter_map(|m| m.value().get_rate()))
+            // Note that resources with no Rate will be disregarded
+            .filter_map(|t| t.map.get(resource))
+            .filter_map(|m| m.get_rate())
             .sorted()
             .collect();
 
-        // Calculate the estimated usage rate as the 50th percentile of usage for the resource
+        // Calculate the estimated usage rate as the 50th percentile of usage for the resource.
         if !totals_for_type.is_empty() {
             let estimated_index = (DEFAULT_USAGE_PERCENTILE * totals_for_type.len() as f64) as usize;
             let estimated_index = estimated_index.min(totals_for_type.len() - 1);
@@ -162,7 +111,6 @@ impl Meter {
         // Report the usage for a specific attribution
         let resource_map = self
             .attribution_meters
-            .get(&resource)
             .entry(attribution.clone())
             .or_insert_with(ResourceTotals::new);
         let mut resource_value = resource_map
@@ -183,13 +131,11 @@ pub(crate) enum AttributionSource {
 pub enum ResourceType {
     InboundBandwidthBytes,
     OutboundBandwidthBytes,
-    CpuInstructions,
 }
 
-pub const ALL_RESOURCE_TYPES: [ResourceType; 3] = [
+pub const ALL_RESOURCE_TYPES: [ResourceType; 2] = [
     ResourceType::InboundBandwidthBytes,
     ResourceType::OutboundBandwidthBytes,
-    ResourceType::CpuInstructions,
 ];
 
 type AttributionMeters = DashMap<AttributionSource, ResourceTotals>;
@@ -235,9 +181,6 @@ mod tests {
         assert!(meter
             .resource_usage_rate(ResourceType::OutboundBandwidthBytes, false)
             .is_none());
-        assert!(meter
-            .resource_usage_rate(ResourceType::CpuInstructions, false)
-            .is_none());
 
         // Report some usage and test that the total usage is updated
         let attribution = AttributionSource::Peer(PeerKeyLocation::random());
@@ -262,9 +205,6 @@ mod tests {
             .is_none());
         assert!(meter
             .attributed_usage_rate(&attribution, &ResourceType::OutboundBandwidthBytes)
-            .is_none());
-        assert!(meter
-            .attributed_usage_rate(&attribution, &ResourceType::CpuInstructions)
             .is_none());
 
         // Report some usage and test that the attributed usage is updated
@@ -315,22 +255,6 @@ mod tests {
                 .unwrap()
                 .per_second(),
             300.0
-        );
-        // Report usage for a different resource and test that the total and attributed usage are updated
-        meter.report(&attribution, ResourceType::CpuInstructions, 50.0);
-        assert_eq!(
-            meter
-                .resource_usage_rate(ResourceType::CpuInstructions, false)
-                .unwrap()
-                .per_second(),
-            50.0
-        );
-        assert_eq!(
-            meter
-                .attributed_usage_rate(&attribution, &ResourceType::CpuInstructions)
-                .unwrap()
-                .per_second(),
-            50.0
         );
 
         // Report usage for a different attribution and test that the total and attributed usage are updated

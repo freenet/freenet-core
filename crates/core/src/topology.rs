@@ -44,12 +44,11 @@ pub(crate) struct TopologyManager {
     request_density_tracker: request_density_tracker::RequestDensityTracker,
     /// Must be updated when new neightbors are discovered.
     cached_density_map: CachedDensityMap,
-    pub this_peer_location: Option<Location>,
 }
 
 impl TopologyManager {
     /// Create a new TopologyManager specifying the peer's own Location
-    pub(crate) fn new(this_peer_location: Option<Location>) -> Self {
+    pub(crate) fn new() -> Self {
         TopologyManager {
             slow_connection_evaluator: connection_evaluator::ConnectionEvaluator::new(
                 SLOW_CONNECTION_EVALUATOR_WINDOW_DURATION,
@@ -61,7 +60,6 @@ impl TopologyManager {
                 REQUEST_DENSITY_TRACKER_WINDOW_SIZE,
             ),
             cached_density_map: CachedDensityMap::new(),
-            this_peer_location,
         }
     }
 
@@ -134,7 +132,7 @@ impl TopologyManager {
     }
 
     /// Get the ideal location for a new connection based on current neighbors and request density
-    pub(crate) fn get_best_candidate_location(&self) -> Result<Location, DensityMapError> {
+    pub(crate) fn get_best_candidate_location(&self, this_peer_location : &Location) -> Result<Location, DensityMapError> {
         let density_map = self
             .cached_density_map
             .get()
@@ -149,7 +147,7 @@ impl TopologyManager {
                 tracing::warn!(
                     "An error occurred while getting max density, falling back to random location"
                 );
-                self.random_location()
+                self.random_location(this_peer_location)
             }
         };
         Ok(best_location)
@@ -157,13 +155,13 @@ impl TopologyManager {
 
     /// Generates a random location that is close to the current peer location with a small
     /// world distribution.
-    fn random_location(&self) -> Location {
+    fn random_location(&self, this_peer_location : &Location) -> Location {
         tracing::debug!("Generating random location");
         let distance = random_link_distance(Distance::new(RANDOM_CLOSEST_DISTANCE));
         let location_f64 = if rand::random() {
-            self.this_peer_location.as_f64() - distance.as_f64()
+            this_peer_location.as_f64() - distance.as_f64()
         } else {
-            self.this_peer_location.as_f64() + distance.as_f64()
+            this_peer_location.as_f64() + distance.as_f64()
         };
         let location_f64 = location_f64.rem_euclid(1.0); // Ensure result is in [0.0, 1.0)
         Location::new(location_f64)
@@ -186,7 +184,7 @@ mod tests {
     #[test]
     fn test_topology_manager() {
         const NUM_REQUESTS: usize = 1_000;
-        let mut topology_manager = TopologyManager::new(Location::new(0.39));
+        let mut topology_manager = TopologyManager::new();
         let mut current_neighbors = std::collections::BTreeMap::new();
 
         // Insert neighbors from 0.0 to 0.9
@@ -194,9 +192,11 @@ mod tests {
             current_neighbors.insert(Location::new(i as f64 / 10.0), 0);
         }
 
+        let this_peer_location = Location::new(0.39);
+
         // Simulate a bunch of random requests clustered around 0.35
         for _ in 0..NUM_REQUESTS {
-            let requested_location = topology_manager.random_location();
+            let requested_location = topology_manager.random_location(&this_peer_location);
             topology_manager.record_request(requested_location, TransactionType::Get);
         }
 
@@ -208,7 +208,7 @@ mod tests {
             )
             .unwrap();
 
-        let best_candidate_location = topology_manager.get_best_candidate_location().unwrap();
+        let best_candidate_location = topology_manager.get_best_candidate_location(&this_peer_location).unwrap();
         // Should be half way between 0.3 and 0.4 as that is where the most requests were.
         assert_eq!(best_candidate_location, Location::new(0.35));
 

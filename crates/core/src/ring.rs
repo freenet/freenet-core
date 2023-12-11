@@ -232,7 +232,6 @@ impl Ring {
     const DEFAULT_LIMITS: Limits = Limits {
         max_upstream_bandwidth: Rate::new_per_second(5.0 * 1024.0 * 1024.0), // 5 megabytes per second
         max_downstream_bandwidth: Rate::new_per_second(5.0 * 1024.0 * 1024.0), // 5 megabytes per second
-        max_cpu_usage: Rate::new_per_second(1.0 * 1000.0 * 1000.0 * 1000.0), // 1 billion IPS               // 10 gigabytes
     };
 
     pub fn new<const CLIENTS: usize, EL: NetEventRegister>(
@@ -278,7 +277,6 @@ impl Ring {
 
         let resource_manager = RwLock::new(ResourceManager::new(
             Self::DEFAULT_LIMITS,
-            Location::new(0.0),
         ));
 
         let ring = Ring {
@@ -371,10 +369,6 @@ impl Ring {
                 u64::from_le_bytes(loc.0.to_le_bytes()),
                 std::sync::atomic::Ordering::Release,
             );
-            self.resource_manager
-                .topology_manager
-                .write()
-                .this_peer_location = loc;
         } else {
             self.own_location.store(
                 u64::from_le_bytes((-1f64).to_le_bytes()),
@@ -431,8 +425,9 @@ impl Ring {
             } else {
                 AcquisitionStrategy::Slow
             };
-            self.topology_manager
+            self.resource_manager
                 .write()
+                .topology_manager
                 .evaluate_new_connection(location, strategy)
                 .unwrap_or(false)
         };
@@ -444,8 +439,10 @@ impl Ring {
     }
 
     pub fn record_request(&self, requested_location: Location, request_type: TransactionType) {
-        self.topology_manager
+        self
+            .resource_manager
             .write()
+            .topology_manager
             .record_request(requested_location, request_type);
     }
 
@@ -459,14 +456,14 @@ impl Ring {
             open_at: Instant::now(),
         });
         self.location_for_peer.write().insert(peer, loc);
-        std::mem::drop(cbl);
+        drop(cbl);
         self.refresh_density_request_cache()
     }
 
     fn refresh_density_request_cache(&self) {
         let cbl = self.connections_by_location.read();
         let current_neighbors = &Self::current_neighbors(&cbl);
-        let topology_manager = &mut *self.topology_manager.write();
+        let topology_manager = &mut *self.resource_manager.write().topology_manager;
         let _ = topology_manager.refresh_cache(current_neighbors);
     }
 
