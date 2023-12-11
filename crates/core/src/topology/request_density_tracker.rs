@@ -5,7 +5,7 @@ use thiserror::Error;
 /// Tracks requests sent by a node to its neighbors and creates a density map, which
 /// is useful for determining which new neighbors to connect to based on their
 /// location.
-pub(super) struct RequestDensityTracker {
+pub(crate) struct RequestDensityTracker {
     /// Amount of requests done to an specific location.
     request_locations: BTreeMap<Location, usize>,
     /// Request locations sorted by order of execution.
@@ -15,7 +15,7 @@ pub(super) struct RequestDensityTracker {
 }
 
 impl RequestDensityTracker {
-    pub fn new(window_size: usize) -> Self {
+    pub(crate) fn new(window_size: usize) -> Self {
         Self {
             request_locations: BTreeMap::new(),
             request_list: VecDeque::with_capacity(window_size),
@@ -24,7 +24,7 @@ impl RequestDensityTracker {
         }
     }
 
-    pub fn sample(&mut self, value: Location) {
+    pub(crate) fn sample(&mut self, value: Location) {
         self.samples += 1;
 
         self.request_list.push_back(value);
@@ -42,7 +42,7 @@ impl RequestDensityTracker {
         }
     }
 
-    pub fn create_density_map(
+    pub(crate) fn create_density_map(
         &self,
         neighbors: &BTreeMap<Location, usize>,
     ) -> Result<DensityMap, DensityMapError> {

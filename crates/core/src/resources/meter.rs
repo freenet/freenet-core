@@ -12,7 +12,7 @@ use super::running_average::RunningAverage;
 
 // Sources younger than this will return default usage rather than actual usage as it
 // may be ramping up and not yet fully representative of its long-term usage.
-const SOURCE_RAMP_UP_TIME: Duration = Duration::from_secs(10*60); // 10 minutes
+const SOURCE_RAMP_UP_TIME: Duration = Duration::from_secs(10 * 60); // 10 minutes
 
 // Default usage is assumed to be the 50th percentile of usage for the resource.
 const DEFAULT_USAGE_PERCENTILE: f64 = 0.5;
@@ -41,17 +41,6 @@ impl Meter {
         }
     }
 
-    pub fn resource_usage_rate(&self, resource: ResourceType) -> Option<Rate> {
-        // Try to get a mutable reference to the Meter for the given resource
-        match self.totals_by_resource.map.get_mut(&resource) {
-            Some(meter) => {
-                // Get the current measurement value
-                meter.get_rate()
-            }
-            None => None, // No meter found for the given resource
-        }
-    }
-
     /// The measured usage rate for a resource attributed to a specific source.
     pub(crate) fn attributed_usage_rate(
         &self,
@@ -74,42 +63,39 @@ impl Meter {
         }
     }
 
-    /// The estimated usage rate for a resource, but adjusted for sources that are ramping up
-    /// to use a global estimate of the usage rate. Current time is supplied as a parameter
-    /// 'now' to facilitate testing.
-    pub(crate) fn extrapolated_usage_rate(
+    /// Get the expected usage rate for a resource based on the usage rates of all attribution
+    /// sources.
+    pub(crate) fn estimated_type_usage_rate(
         &mut self,
-        attribution: &AttributionSource,
-        source_created_at: Instant,
         resource: &ResourceType,
         now: &Instant,
     ) -> Option<Rate> {
-        let source_ramping_up = now.duration_since(source_created_at) < SOURCE_RAMP_UP_TIME;
-        let original_usage_rate = self.attributed_usage_rate(attribution, resource);
-
-        if source_ramping_up {
-            let should_update_cache = match self.cached_estimated_usage_rate.get(resource) {
-                Some(eur) if eur.value().1 > ESTIMATED_USAGE_RATE_CACHE_TIME => true,
-                None => true,
-                _ => false,
-            };
-
-            if should_update_cache {
-                let new_rate = self.update_cached_estimated_usage_rate(resource);
-                if let Some(rate) = new_rate {
-                    self.cached_estimated_usage_rate.insert(*resource, (rate.clone(), *now));
-                    return Some(rate);
-                }
+        let should_update_cache = match self.cached_estimated_usage_rate.get(resource) {
+            Some(eur) if now.duration_since(eur.value().1) > ESTIMATED_USAGE_RATE_CACHE_TIME => {
+                true
             }
+            None => true,
+            _ => false,
+        };
 
-            self.cached_estimated_usage_rate.get(resource).map(|eur| eur.value().0)
-        } else {
-            original_usage_rate
+        if should_update_cache {
+            let new_rate = self.update_cached_estimated_usage_rate(resource);
+            if let Some(rate) = new_rate {
+                self.cached_estimated_usage_rate
+                    .insert(*resource, (rate.clone(), *now));
+                return Some(rate);
+            }
         }
+
+        self.cached_estimated_usage_rate
+            .get(resource)
+            .map(|eur| eur.value().0)
     }
 
     fn update_cached_estimated_usage_rate(&self, resource: &ResourceType) -> Option<Rate> {
-        let usage_rates: Vec<_> = self.attribution_meters.iter()
+        let usage_rates: Vec<_> = self
+            .attribution_meters
+            .iter()
             .filter_map(|attr| attr.value().map.get(resource))
             .filter_map(|meter| meter.get_rate())
             .collect();
@@ -170,8 +156,6 @@ impl Meter {
     }
 }
 
-
-
 #[derive(Eq, Hash, PartialEq, Clone, Debug)]
 pub(crate) enum AttributionSource {
     Peer(PeerKeyLocation),
@@ -184,6 +168,12 @@ pub enum ResourceType {
     OutboundBandwidthBytes,
     CpuInstructions,
 }
+
+pub const ALL_RESOURCE_TYPES: [ResourceType; 3] = [
+    ResourceType::InboundBandwidthBytes,
+    ResourceType::OutboundBandwidthBytes,
+    ResourceType::CpuInstructions,
+];
 
 type AttributionMeters = DashMap<AttributionSource, ResourceTotals>;
 

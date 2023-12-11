@@ -69,21 +69,44 @@ mod meter;
 pub mod rate;
 mod running_average;
 
-use std::collections::HashMap;
 use self::meter::{AttributionSource, Meter, ResourceType};
-use crate::ring::PeerKeyLocation;
+use crate::resources::meter::ALL_RESOURCE_TYPES;
+use crate::resources::rate::{Rate, RateProportion};
+use crate::ring::{Location, PeerKeyLocation};
+use crate::topology::request_density_tracker::RequestDensityTracker;
+use crate::topology::TopologyManager;
+use dashmap::DashMap;
+use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::time::Duration;
 use std::time::Instant;
+
+// TODO: Reevaluate this value once we have realistic data
+const SOURCE_RAMP_UP_TIME: Duration = Duration::from_secs(5 * 60);
+
+const INCREASE_USAGE_IF_BELOW_PROP: RateProportion = RateProportion::new(0.5);
+const DECREASE_USAGE_IF_ABOVE_PROP: RateProportion = RateProportion::new(0.9);
+
+const REQUEST_DENSITY_TRACKER_SAMPLE_SIZE: usize = 5000;
 
 pub(crate) struct ResourceManager {
     limits: Limits,
     meter: Meter,
+    source_creation_times: DashMap<AttributionSource, Instant>,
+    pub(crate) request_density_tracker: RwLock<RequestDensityTracker>,
+    pub(crate) topology_manager: RwLock<TopologyManager>,
 }
 
 impl ResourceManager {
-    pub fn new(limits: Limits) -> Self {
+    pub fn new(limits: Limits, this_peer_location: Option<Location>) -> Self {
         ResourceManager {
             meter: Meter::new_with_window_size(100),
             limits,
+            source_creation_times: DashMap::new(),
+            request_density_tracker: RwLock::new(RequestDensityTracker::new(
+                REQUEST_DENSITY_TRACKER_SAMPLE_SIZE,
+            )),
+            topology_manager: RwLock::new(TopologyManager::new(this_peer_location)),
         }
     }
 
@@ -99,120 +122,79 @@ impl ResourceManager {
         resource: ResourceType,
         value: f64,
     ) {
+        if !self.source_creation_times.contains_key(attribution) {
+            self.source_creation_times
+                .insert(attribution.clone(), Instant::now());
+        }
+
         self.meter.report(attribution, resource, value);
     }
 
-    /// Return the maximum resource usage rate of any usage type as a proportion
-    /// of the limit for that usage type
-    pub(crate) fn max_usage_rate(&self) -> UsageRates {
-        let mut max = 0.0;
-        let mut usage_rate_per_type = HashMap::new();
-        for resource_type in ResourceType::iter() {
-            let usage_rate = self.resource_usage_rate(resource_type);
-            usage_rate_per_type.insert(resource_type, usage_rate);
-            if usage_rate > max {
-                max = usage_rate;
-            }
+    fn extrapolated_usage(&mut self, resource_type: ResourceType, now: &Instant) -> Usage {
+        let mut total_usage: Rate = Rate::new_per_second(0.0);
+        let mut usage_per_source: HashMap<AttributionSource, Rate> = HashMap::new();
+        for source_entry in self.source_creation_times.iter() {
+            let source = source_entry.key();
+            let creation_time = source_entry.value();
+            let ramping_up = now.duration_since(*creation_time) <= SOURCE_RAMP_UP_TIME;
+            let usage_rate: Option<Rate> = if ramping_up {
+                self.meter.estimated_type_usage_rate(&resource_type, now)
+            } else {
+                self.meter.attributed_usage_rate(source, &resource_type)
+            };
+            total_usage += usage_rate.unwrap_or(Rate::new_per_second(0.0));
+            usage_per_source.insert(
+                source.clone(),
+                usage_rate.unwrap_or(Rate::new_per_second(0.0)),
+            );
         }
-        UsageRates {
-            usage_rate_per_type,
-            max_usage_rate: max,
-        }
-    }
 
-    /// Returns the current resource usage rate for a specified usage type as
-    /// a fraction of the limit.
-    pub(crate) fn resource_usage_rate(&self, resource_type: ResourceType) -> f64 {
-        match self.meter.resource_usage_rate(resource_type) {
-            Some(rate) => rate.per_second() / self.limits.get(resource_type),
-            None => 0.0,
+        Usage {
+            total: total_usage,
+            per_source: usage_per_source,
         }
     }
 
-    /// Determines which peers should be deleted to reduce resource usage below
-    /// the specified limit.
-    ///
-    /// Given a resource type and a list of candidate peers, this function
-    /// calculates which peers should be deleted in order to bring the total
-    /// resource usage below the specified limit. Each candidate peer is
-    /// accompanied by an `f64` value representing its usefulness, typically
-    /// measured as the number of requests sent to the peer over a certain
-    /// period of time.
-    ///
-    /// Peers are prioritized for deletion based on their usefulness relative to
-    /// their current resource usage. The function returns a list of
-    /// `PeerKeyLocation` objects representing the peers that should be deleted.
-    /// If the total resource usage is already below the limit, an empty list is
-    /// returned.
-    ///
-    /// The usefulness value for each peer must be greater than zero. To prevent
-    /// division by zero, any usefulness value less than or equal to 0.0001 is
-    /// treated as 0.0001.
-    ///
-    /// # Parameters
-    /// - `resource_type`: The type of resource for which usage is being
-    ///   measured.
-    /// - `candidates`: An iterator over `PeerValue` objects, where each
-    ///   `PeerValue` consists of a peer and its associated usefulness value.
-    ///
-    /// # Returns
-    /// A `Vec<PeerKeyLocation>` containing the peers that should be deleted to
-    /// bring resource usage below the limit. If no peers need to be deleted, an
-    /// empty vector is returned.
-    pub(crate) fn should_delete_peers<P>(
-        &self,
-        resource_type: ResourceType,
-        candidates: P,
-    ) -> Vec<PeerKeyLocation>
-    where
-        P: IntoIterator<Item = PeerValue>,
-    {
-        let total_usage = match self.meter.resource_usage_rate(resource_type) {
-            Some(rate) => rate.per_second(),
-            None => return vec![], // Or handle the error as appropriate
-        };
-
-        let total_limit: f64 = self.limits.get(resource_type);
-        if total_usage > total_limit {
-            let mut candidate_costs = vec![];
-            for PeerValue { peer, value } in candidates {
-                if let Some(cost) = self
-                    .meter
-                    .attributed_usage_rate(&AttributionSource::Peer(peer), &resource_type)
-                {
-                    const MIN_VALUE: f64 = 0.0001;
-                    let cost_per_second = cost.per_second();
-                    let cost_per_value = cost_per_second / value.max(MIN_VALUE);
-                    candidate_costs.push(CandidateCost {
-                        peer,
-                        total_cost: cost_per_second,
-                        cost_per_value,
-                    });
-                } // Else, you might want to handle the case where cost is None
-            }
-
-            // Sort candidate_costs by cost_per_value descending
-            candidate_costs.sort_by(|a, b| {
-                b.cost_per_value
-                    .partial_cmp(&a.cost_per_value)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-            let mut to_delete = vec![];
-            let excess_usage = total_usage - total_limit;
-            let mut total_deleted_cost = 0.0;
-            for candidate in candidate_costs {
-                if total_deleted_cost >= excess_usage {
-                    break;
-                }
-                total_deleted_cost += candidate.total_cost;
-                to_delete.push(candidate.peer);
-            }
-            to_delete
+    // A function that will determine if any peers should be added or removed based on
+    // the current resource usage, and either add or remove them
+    fn adjust_topology(&mut self, resource_type: ResourceType, now: &Instant) {
+        let usage = self.extrapolated_usage(resource_type, now);
+        let total_limit: Rate = self.limits.get(resource_type);
+        let usage_proportion = total_limit.proportion_of(&self.limits.get(resource_type));
+        if usage_proportion < INCREASE_USAGE_IF_BELOW_PROP {
+            tracing::debug!(
+                "{:?} resource usage is too low, adding connections: {:?}",
+                resource_type,
+                usage_proportion
+            );
+            self.add_connections(&usage);
+        } else if usage_proportion > DECREASE_USAGE_IF_ABOVE_PROP {
+            tracing::debug!(
+                "{:?} resource usage is too high, removing connections: {:?}",
+                resource_type,
+                usage_proportion
+            );
+            self.remove_connections(&usage);
         } else {
-            vec![]
+            tracing::debug!(
+                "{:?} resource usage is within acceptable bounds: {:?}",
+                resource_type,
+                usage_proportion
+            );
         }
     }
+
+    /// Adds a single connection (one at a time to avoid overshooting)
+    fn add_connections(&mut self, usage: &Usage) {}
+
+    /// Calculates which peers should be deleted in order to bring the total
+    /// resource usage below the specified limit.
+    fn remove_connections(&mut self, usage: &Usage) {}
+}
+
+pub struct Usage {
+    pub total: Rate,
+    pub per_source: HashMap<AttributionSource, Rate>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -229,41 +211,24 @@ struct CandidateCost {
 }
 
 pub struct Limits {
-    pub max_upstream_bandwidth: BytesPerSecond,
-    pub max_downstream_bandwidth: BytesPerSecond,
-    pub max_cpu_usage: InstructionsPerSecond,
-    pub max_memory_usage: f64,
-    pub max_storage_usage: f64,
+    pub max_upstream_bandwidth: Rate,
+    pub max_downstream_bandwidth: Rate,
+    pub max_cpu_usage: Rate,
 }
 
 impl Limits {
-    pub fn get(&self, resource_type: ResourceType) -> f64 {
+    pub fn get(&self, resource_type: ResourceType) -> Rate {
         match resource_type {
-            ResourceType::OutboundBandwidthBytes => self.max_upstream_bandwidth.into(),
-            ResourceType::InboundBandwidthBytes => self.max_downstream_bandwidth.into(),
-            ResourceType::CpuInstructions => self.max_cpu_usage.into(),
-            // TODO: Support non-flow resources like memory and storage use
+            ResourceType::OutboundBandwidthBytes => self.max_upstream_bandwidth.clone(),
+            ResourceType::InboundBandwidthBytes => self.max_downstream_bandwidth.clone(),
+            ResourceType::CpuInstructions => self.max_cpu_usage.clone(),
         }
     }
 }
 
 pub(crate) struct UsageRates {
-    pub usage_rate_per_type : HashMap<ResourceType, f64>,
-    pub max_usage_rate: f64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct BytesPerSecond(f64);
-impl BytesPerSecond {
-    pub const fn new(bytes_per_second: f64) -> Self {
-        BytesPerSecond(bytes_per_second)
-    }
-}
-
-impl From<BytesPerSecond> for f64 {
-    fn from(val: BytesPerSecond) -> Self {
-        val.0
-    }
+    pub usage_rate_per_type: HashMap<ResourceType, RateProportion>,
+    pub max_usage_rate: RateProportion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

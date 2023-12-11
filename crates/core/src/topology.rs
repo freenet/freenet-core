@@ -8,8 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod connection_evaluator;
-mod request_density_tracker;
+pub mod connection_evaluator;
+pub mod request_density_tracker;
 mod small_world_rand;
 
 use request_density_tracker::DensityMapError;
@@ -44,12 +44,12 @@ pub(crate) struct TopologyManager {
     request_density_tracker: request_density_tracker::RequestDensityTracker,
     /// Must be updated when new neightbors are discovered.
     cached_density_map: CachedDensityMap,
-    pub this_peer_location: Location,
+    pub this_peer_location: Option<Location>,
 }
 
 impl TopologyManager {
     /// Create a new TopologyManager specifying the peer's own Location
-    pub(crate) fn new(this_peer_location: Location) -> Self {
+    pub(crate) fn new(this_peer_location: Option<Location>) -> Self {
         TopologyManager {
             slow_connection_evaluator: connection_evaluator::ConnectionEvaluator::new(
                 SLOW_CONNECTION_EVALUATOR_WINDOW_DURATION,

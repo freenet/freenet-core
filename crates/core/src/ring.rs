@@ -12,6 +12,7 @@
 
 use std::hash::Hash;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::SeqCst;
 use std::{
     cmp::Reverse,
     collections::BTreeMap,
@@ -25,11 +26,9 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use std::sync::atomic::Ordering::SeqCst;
 
 use anyhow::bail;
 use dashmap::{mapref::one::Ref as DmRef, DashMap, DashSet};
-use either::Either;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
 use rand::seq::SliceRandom;
@@ -39,6 +38,8 @@ use tokio::sync;
 use tracing::Instrument;
 
 use crate::message::TransactionType;
+use crate::resources::rate::Rate;
+use crate::resources::{Limits, ResourceManager};
 use crate::topology::{AcquisitionStrategy, TopologyManager};
 use crate::util::Contains;
 use crate::{
@@ -51,7 +52,6 @@ use crate::{
     router::Router,
     DynError,
 };
-use crate::resources::{BytesPerSecond, InstructionsPerSecond, Limits, ResourceManager};
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
@@ -66,7 +66,6 @@ pub(crate) struct Ring {
     max_connections: usize,
     min_connections: usize,
     router: Arc<RwLock<Router>>,
-    topology_manager: RwLock<TopologyManager>,
     resource_manager: RwLock<ResourceManager>,
     /// Fast is for when there are less than our target number of connections so we want to acquire new connections quickly.
     /// Slow is for when there are enough connections so we need to drop a connection in order to replace it.
@@ -228,15 +227,12 @@ impl Ring {
     /// connection of a peer in the network).
     const MAX_HOPS_TO_LIVE: usize = 10;
 
-
     /// default limits for ResourceManager
     /// TODO: This needs to be determined from the peer's hardware / user preferences
-    const DEFAULT_LIMITS : Limits = Limits {
-        max_upstream_bandwidth: BytesPerSecond::new(5.0*1024.0*1024.0), // 5 megabytes per second
-        max_downstream_bandwidth: BytesPerSecond::new(5.0*1024.0*1024.0), // 5 megabytes per second
-        max_cpu_usage: InstructionsPerSecond::new(1.0*1000.0*1000.0*1000.0), // 1 billion IPS
-        max_memory_usage: 1.0 * 1024.0 * 1024.0 * 1024.0, // 1 gigabyte
-        max_storage_usage: 10.0 * 1024.0 * 1024.0 * 1024.0, // 10 gigabytes
+    const DEFAULT_LIMITS: Limits = Limits {
+        max_upstream_bandwidth: Rate::new_per_second(5.0 * 1024.0 * 1024.0), // 5 megabytes per second
+        max_downstream_bandwidth: Rate::new_per_second(5.0 * 1024.0 * 1024.0), // 5 megabytes per second
+        max_cpu_usage: Rate::new_per_second(1.0 * 1000.0 * 1000.0 * 1000.0), // 1 billion IPS               // 10 gigabytes
     };
 
     pub fn new<const CLIENTS: usize, EL: NetEventRegister>(
@@ -279,9 +275,11 @@ impl Ring {
         GlobalExecutor::spawn(Self::refresh_router::<EL>(router.clone()));
 
         // Just initialize with a fake location, this will be later updated when the peer has an actual location assigned.
-        let topology_manager = RwLock::new(TopologyManager::new(Location::new(0.0)));
 
-        let resource_manager = RwLock::new(ResourceManager::new(Self::DEFAULT_LIMITS));
+        let resource_manager = RwLock::new(ResourceManager::new(
+            Self::DEFAULT_LIMITS,
+            Location::new(0.0),
+        ));
 
         let ring = Ring {
             rnd_if_htl_above,
@@ -289,7 +287,6 @@ impl Ring {
             max_connections,
             min_connections,
             router,
-            topology_manager,
             resource_manager,
             fast_acquisition: AtomicBool::new(true),
             connections_by_location: RwLock::new(BTreeMap::new()),
@@ -374,7 +371,10 @@ impl Ring {
                 u64::from_le_bytes(loc.0.to_le_bytes()),
                 std::sync::atomic::Ordering::Release,
             );
-            self.topology_manager.write().this_peer_location = loc;
+            self.resource_manager
+                .topology_manager
+                .write()
+                .this_peer_location = loc;
         } else {
             self.own_location.store(
                 u64::from_le_bytes((-1f64).to_le_bytes()),
@@ -507,8 +507,8 @@ impl Ring {
 
     /// Get a random peer from the known ring connections.
     pub fn random_peer<F>(&self, filter_fn: F) -> Option<PeerKeyLocation>
-        where
-            F: Fn(&PeerKey) -> bool,
+    where
+        F: Fn(&PeerKey) -> bool,
     {
         let peers = &*self.location_for_peer.read();
         let amount = peers.len();
@@ -625,16 +625,16 @@ impl Ring {
     }
 
     /*
-     ChatGPT summary: https://chat.openai.com/share/f8fc2322-a10b-470b-ad45-9560faef6800
+    ChatGPT summary: https://chat.openai.com/share/f8fc2322-a10b-470b-ad45-9560faef6800
 
-     Rewrite plan
-     ============
+    Rewrite plan
+    ============
 
-     This needs to acquire connections rapidly when resource usage is <
-     FAST_ACQUISITION_RESOURCE_THRESHOLD (say 0.5 or 50%), acquire them
-     slowly between FAST_ACQUISITION_RESOURCE_THRESHOLD and SLOW_RESOURCE_ACQUISITION_THRESHOLD,
-     and remove connections if resource usage > 1.0 / 100%.
-     */
+    This needs to acquire connections rapidly when resource usage is <
+    FAST_ACQUISITION_RESOURCE_THRESHOLD (say 0.5 or 50%), acquire them
+    slowly between FAST_ACQUISITION_RESOURCE_THRESHOLD and SLOW_RESOURCE_ACQUISITION_THRESHOLD,
+    and remove connections if resource usage > 1.0 / 100%.
+    */
     async fn connection_maintenance(
         self: Arc<Self>,
         notifier: EventLoopNotificationsSender,
@@ -646,7 +646,6 @@ impl Ring {
             todo!()
         }
     }
-
 }
 
 /// An abstract location on the 1D ring, represented by a real number on the interal [0, 1]
