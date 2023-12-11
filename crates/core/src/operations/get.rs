@@ -524,14 +524,13 @@ impl Operation for GetOp {
                         }
                     }
 
-                    let parameters = contract.as_ref().map(|c| c.params());
                     let res = op_manager
                         .notify_contract_handler(
                             ContractHandlerEvent::PutQuery {
                                 key: key.clone(),
                                 state: value.clone(),
                                 related_contracts: RelatedContracts::default(),
-                                parameters,
+                                contract: contract.clone(),
                             },
                             client_id,
                         )

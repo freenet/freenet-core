@@ -348,8 +348,7 @@ pub(crate) enum ContractHandlerEvent {
         key: ContractKey,
         state: WrappedState,
         related_contracts: RelatedContracts<'static>,
-        parameters: Option<Parameters<'static>>,
-        // todo: optionally pass in contract code so it can be verified...
+        contract: Option<ContractContainer>,
     },
     /// The response to a push query.
     PutResponse {
@@ -374,11 +373,9 @@ pub(crate) enum ContractHandlerEvent {
 impl std::fmt::Display for ContractHandlerEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ContractHandlerEvent::PutQuery {
-                key, parameters, ..
-            } => {
-                if let Some(params) = parameters {
-                    write!(f, "put query {{ {key}, params: {:?} }}", params.as_ref())
+            ContractHandlerEvent::PutQuery { key, contract, .. } => {
+                if let Some(contract) = contract {
+                    write!(f, "put query {{ {key}, params: {:?} }}", contract.params())
                 } else {
                     write!(f, "put query {{ {key} }}")
                 }

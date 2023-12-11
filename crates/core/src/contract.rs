@@ -82,7 +82,7 @@ where
                 key,
                 state,
                 related_contracts,
-                parameters,
+                contract,
             } => {
                 let put_result = contract_handler
                     .executor()
@@ -90,17 +90,16 @@ where
                         key.clone(),
                         Either::Left(state),
                         related_contracts,
-                        parameters,
+                        contract,
                     )
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
-                    .await
-                    .map_err(Into::into);
+                    .await;
                 contract_handler
                     .channel()
                     .send_to_sender(
                         id,
                         ContractHandlerEvent::PutResponse {
-                            new_value: put_result,
+                            new_value: put_result.map_err(Into::into),
                         },
                     )
                     .await

@@ -97,7 +97,6 @@ where
         use crate::contract::ContractHandlerEvent;
         for (contract, state) in contracts {
             let key: ContractKey = contract.key();
-            let parameters = contract.params();
             self.op_manager
                 .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()), None)
                 .await?;
@@ -107,7 +106,7 @@ where
                         key: key.clone(),
                         state,
                         related_contracts: RelatedContracts::default(),
-                        parameters: Some(parameters),
+                        contract: Some(contract),
                     },
                     None,
                 )

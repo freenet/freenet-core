@@ -251,13 +251,12 @@ impl Operation for PutOp {
 
                     // after the contract has been cached, push the update query
                     tracing::debug!(tx = %id, "Attempting contract value update");
-                    let parameters = contract.params();
                     let new_value = put_contract(
                         op_manager,
                         key.clone(),
                         value.clone(),
                         related_contracts.clone(),
-                        parameters,
+                        contract,
                         client_id,
                     )
                     .await?;
@@ -305,7 +304,7 @@ impl Operation for PutOp {
                         self.state,
                         broadcast_to,
                         key.clone(),
-                        (contract.params(), new_value),
+                        (contract.clone(), new_value),
                     )
                     .await
                     {
@@ -320,7 +319,7 @@ impl Operation for PutOp {
                     id,
                     key,
                     new_value,
-                    parameters,
+                    contract,
                     sender,
                     sender_subscribers,
                 } => {
@@ -332,7 +331,7 @@ impl Operation for PutOp {
                         key.clone(),
                         new_value.clone(),
                         RelatedContracts::default(),
-                        parameters.clone(),
+                        contract,
                         client_id,
                     )
                     .await?;
@@ -363,7 +362,7 @@ impl Operation for PutOp {
                         self.state,
                         broadcast_to,
                         key.clone(),
-                        (parameters.clone(), new_value),
+                        (contract.clone(), new_value),
                     )
                     .await
                     {
@@ -380,7 +379,7 @@ impl Operation for PutOp {
                     broadcasted_to,
                     key,
                     new_value,
-                    parameters,
+                    contract,
                 } => {
                     let sender = op_manager.ring.own_location();
                     let mut broadcasted_to = *broadcasted_to;
@@ -397,7 +396,7 @@ impl Operation for PutOp {
                             new_value: new_value.clone(),
                             sender,
                             sender_subscribers: broadcast_to.clone(),
-                            parameters: parameters.clone(),
+                            contract: contract.clone(),
                         };
                         let f = conn_manager.send(&peer.peer, msg.into());
                         broadcasting.push(f);
@@ -488,7 +487,7 @@ impl Operation for PutOp {
                         key,
                         new_value.clone(),
                         RelatedContracts::default(),
-                        contract.params(),
+                        contract,
                         client_id,
                     )
                     .await?;
@@ -557,7 +556,7 @@ async fn try_to_broadcast(
     state: Option<PutState>,
     broadcast_to: Vec<PeerKeyLocation>,
     key: ContractKey,
-    (parameters, new_value): (Parameters<'static>, WrappedState),
+    (contract, new_value): (ContractContainer, WrappedState),
 ) -> Result<(Option<PutState>, Option<PutMsg>), OpError> {
     let new_state;
     let return_msg;
@@ -579,10 +578,10 @@ async fn try_to_broadcast(
                 return_msg = Some(PutMsg::Broadcasting {
                     id,
                     new_value,
-                    parameters,
                     broadcasted_to: 0,
                     broadcast_to,
                     key,
+                    contract,
                 });
 
                 let op = PutOp {
@@ -724,7 +723,7 @@ async fn put_contract(
     key: ContractKey,
     state: WrappedState,
     related_contracts: RelatedContracts<'static>,
-    parameters: Parameters<'static>,
+    contract: &ContractContainer,
     client_id: Option<ClientId>,
 ) -> Result<WrappedState, OpError> {
     // after the contract has been cached, push the update query
@@ -734,7 +733,7 @@ async fn put_contract(
                 key,
                 state,
                 related_contracts,
-                parameters: Some(parameters),
+                contract: Some(contract.clone()),
             },
             client_id,
         )
@@ -851,8 +850,7 @@ mod messages {
             broadcast_to: Vec<PeerKeyLocation>,
             key: ContractKey,
             new_value: WrappedState,
-            #[serde(deserialize_with = "Parameters::deser_params")]
-            parameters: Parameters<'static>,
+            contract: ContractContainer,
         },
         /// Broadcasting a change to a peer, which then will relay the changes to other peers.
         BroadcastTo {
@@ -860,9 +858,8 @@ mod messages {
             sender: PeerKeyLocation,
             key: ContractKey,
             new_value: WrappedState,
-            #[serde(deserialize_with = "Parameters::deser_params")]
-            parameters: Parameters<'static>,
             sender_subscribers: Vec<PeerKeyLocation>,
+            contract: ContractContainer,
         },
     }
 

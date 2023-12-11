@@ -1,10 +1,10 @@
 use std::fmt::Display;
 
-use freenet_stdlib::prelude::{ContractKey, DelegateKey, SecretsId};
+use freenet_stdlib::prelude::{ContractKey, DelegateKey};
 
 use crate::DynError;
 
-use super::{delegate, secrets_store, wasm_runtime, DelegateExecError};
+use super::{delegate, secrets_store, wasm_runtime};
 
 pub type RuntimeResult<T> = std::result::Result<T, ContractError>;
 
@@ -12,50 +12,8 @@ pub type RuntimeResult<T> = std::result::Result<T, ContractError>;
 pub struct ContractError(Box<RuntimeInnerError>);
 
 impl ContractError {
-    pub fn is_contract_exec_error(&self) -> bool {
-        matches!(&*self.0, RuntimeInnerError::ContractExecError(_))
-    }
-
-    pub fn is_delegate_exec_error(&self) -> bool {
-        matches!(&*self.0, RuntimeInnerError::DelegateExecError(_))
-    }
-
-    pub fn delegate_auth_access(&self) -> Option<&SecretsId> {
-        match &*self.0 {
-            RuntimeInnerError::DelegateExecError(DelegateExecError::UnauthorizedSecretAccess {
-                secret,
-                ..
-            }) => Some(secret),
-            _ => None,
-        }
-    }
-
-    pub fn is_execution_error(&self) -> bool {
-        use RuntimeInnerError::*;
-        matches!(
-            &*self.0,
-            WasmInstantiationError(_) | WasmExportError(_) | WasmCompileError(_)
-        )
-    }
-
-    pub fn delegate_is_missing(&self) -> bool {
-        matches!(&*self.0, RuntimeInnerError::DelegateNotFound(_))
-    }
-
-    pub fn secret_is_missing(&self) -> bool {
-        matches!(
-            &*self.0,
-            RuntimeInnerError::SecretStoreError(secrets_store::SecretStoreError::MissingSecret(_))
-        )
-    }
-
-    pub fn get_secret_id(&self) -> SecretsId {
-        match &*self.0 {
-            RuntimeInnerError::SecretStoreError(
-                secrets_store::SecretStoreError::MissingSecret(id),
-            ) => id.clone(),
-            _ => panic!(),
-        }
+    pub(crate) fn deref(&self) -> &RuntimeInnerError {
+        &self.0
     }
 }
 
