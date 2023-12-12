@@ -463,8 +463,7 @@ impl Ring {
     fn refresh_density_request_cache(&self) {
         let cbl = self.connections_by_location.read();
         let current_neighbors = &Self::current_neighbors(&cbl);
-        let topology_manager = &mut *self.resource_manager.write().topology_manager;
-        let _ = topology_manager.refresh_cache(current_neighbors);
+        let _ = self.resource_manager.write().topology_manager.refresh_cache(current_neighbors);
     }
 
     /// Return the most optimal peer caching a given contract.

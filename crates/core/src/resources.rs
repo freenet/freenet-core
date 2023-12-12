@@ -84,9 +84,6 @@ use std::time::Instant;
 // TODO: Reevaluate this value once we have realistic data
 const SOURCE_RAMP_UP_TIME: Duration = Duration::from_secs(5 * 60);
 
-const INCREASE_USAGE_IF_BELOW_PROP: RateProportion = RateProportion::new(0.5);
-const DECREASE_USAGE_IF_ABOVE_PROP: RateProportion = RateProportion::new(0.9);
-
 const REQUEST_DENSITY_TRACKER_SAMPLE_SIZE: usize = 5000;
 
 pub(crate) struct ResourceManager {
@@ -117,20 +114,20 @@ impl ResourceManager {
     /// Report the use of a resource.
     pub(crate) fn report(
         &mut self,
-        _time: Instant,
         attribution: &AttributionSource,
         resource: ResourceType,
         value: f64,
+        now: Instant,
     ) {
         if !self.source_creation_times.contains_key(attribution) {
             self.source_creation_times
-                .insert(attribution.clone(), Instant::now());
+                .insert(attribution.clone(), now);
         }
 
         self.meter.report(attribution, resource, value);
     }
 
-    fn extrapolated_usage(&mut self, resource_type: ResourceType, now: &Instant) -> Usage {
+    fn extrapolated_usage(&mut self, resource_type: ResourceType, now: Instant) -> Usage {
         let mut total_usage: Rate = Rate::new_per_second(0.0);
         let mut usage_per_source: HashMap<AttributionSource, Rate> = HashMap::new();
         for source_entry in self.source_creation_times.iter() {
@@ -138,7 +135,7 @@ impl ResourceManager {
             let creation_time = source_entry.value();
             let ramping_up = now.duration_since(*creation_time) <= SOURCE_RAMP_UP_TIME;
             let usage_rate: Option<Rate> = if ramping_up {
-                self.meter.estimated_type_usage_rate(&resource_type, now)
+                self.meter.get_estimated_usage_rate(&resource_type, now)
             } else {
                 self.meter.attributed_usage_rate(source, &resource_type)
             };
@@ -157,18 +154,21 @@ impl ResourceManager {
 
     // A function that will determine if any peers should be added or removed based on
     // the current resource usage, and either add or remove them
-    fn adjust_topology(&mut self, resource_type: ResourceType, now: &Instant) {
+    fn adjust_topology(&mut self, resource_type: ResourceType, now: Instant) {
+        let increase_usage_if_below_prop: RateProportion = RateProportion::new(0.5);
+        let decrease_usage_if_above_prop: RateProportion = RateProportion::new(0.9);
+
         let usage = self.extrapolated_usage(resource_type, now);
         let total_limit: Rate = self.limits.get(resource_type);
         let usage_proportion = total_limit.proportion_of(&self.limits.get(resource_type));
-        if usage_proportion < INCREASE_USAGE_IF_BELOW_PROP {
+        if usage_proportion < increase_usage_if_below_prop {
             tracing::debug!(
                 "{:?} resource usage is too low, adding connections: {:?}",
                 resource_type,
                 usage_proportion
             );
             self.add_connections(&usage);
-        } else if usage_proportion > DECREASE_USAGE_IF_ABOVE_PROP {
+        } else if usage_proportion > decrease_usage_if_above_prop {
             tracing::debug!(
                 "{:?} resource usage is too high, removing connections: {:?}",
                 resource_type,
@@ -192,9 +192,9 @@ impl ResourceManager {
     fn remove_connections(&mut self, usage: &Usage) {}
 }
 
-pub struct Usage {
-    pub total: Rate,
-    pub per_source: HashMap<AttributionSource, Rate>,
+pub(crate) struct Usage {
+    pub(crate) total: Rate,
+    pub(crate) per_source: HashMap<AttributionSource, Rate>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -248,20 +248,12 @@ mod tests {
 
         // Report some usage and test that the total and attributed usage are updated
         let attribution = AttributionSource::Peer(PeerKeyLocation::random());
-        let time = Instant::now();
+        let now = Instant::now();
         resource_manager.report(
-            time,
             &attribution,
             ResourceType::InboundBandwidthBytes,
             100.0,
-        );
-        assert_eq!(
-            resource_manager
-                .meter
-                .resource_usage_rate(ResourceType::InboundBandwidthBytes)
-                .unwrap()
-                .per_second(),
-            100.0
+            now,
         );
         assert_eq!(
             resource_manager
@@ -287,18 +279,18 @@ mod tests {
         let attribution1 = AttributionSource::Peer(peer1);
         let peer2 = PeerKeyLocation::random();
         let attribution2 = AttributionSource::Peer(peer2);
-        let time = Instant::now();
+        let now = Instant::now();
         resource_manager.report(
-            time,
             &attribution1,
             ResourceType::InboundBandwidthBytes,
             400.0,
+            now,
         );
         resource_manager.report(
-            time,
             &attribution2,
             ResourceType::InboundBandwidthBytes,
             500.0,
+            now,
         );
 
         // Test that no peers should be deleted when the total usage is below the limit
@@ -312,26 +304,8 @@ mod tests {
                 value: 1.0,
             },
         ];
-        let to_delete = resource_manager
-            .should_delete_peers(ResourceType::InboundBandwidthBytes, candidates.clone());
 
-        // Test that no peers should be deleted when the total usage is below the limit
-        assert_eq!(to_delete.len(), 0);
-
-        // Report more usage to exceed the limit
-        resource_manager.report(
-            time,
-            &attribution1,
-            ResourceType::InboundBandwidthBytes,
-            200.0,
-        );
-
-        let to_delete =
-            resource_manager.should_delete_peers(ResourceType::InboundBandwidthBytes, candidates);
-        assert_eq!(to_delete.len(), 1);
-
-        // Test that the peer with the highest usage is deleted
-        assert_eq!(to_delete[0], peer1);
+        todo!("Verify deletion of peers")
     }
 
     #[test]

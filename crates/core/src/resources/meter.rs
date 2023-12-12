@@ -61,24 +61,82 @@ impl Meter {
         }
     }
 
-    fn update_cached_estimated_usage_rate(&self, resource: &ResourceType) -> Option<Rate> {
+    /// Returns the estimated usage rate for a resource of a given type.
+    ///
+    /// This function uses a percentile defined by `DEFAULT_USAGE_PERCENTILE` to estimate the usage rate
+    /// for resources with unknown usage. It caches the estimated rates and refreshes them every
+    /// `ESTIMATED_USAGE_RATE_CACHE_TIME` duration to avoid frequent recalculations.
+    ///
+    /// # Arguments
+    ///
+    /// * `resource` - A reference to the type of resource for which the usage rate is estimated.
+    /// * `now` - The current `Instant` used to determine if the cached value is still valid.
+    ///
+    /// # Returns
+    ///
+    /// An `Option<Rate>` which is `Some(rate)` if an estimated rate is available, or `None` if it can't be determined.
+    pub(crate) fn get_estimated_usage_rate(
+        &mut self,
+        resource: &ResourceType,
+        now: Instant,
+    ) -> Option<Rate> {
+        if let Some(cached) = self.cached_estimated_usage_rate.get(resource) {
+            let (cached_rate, cached_time) = cached.value();
+            if now - *cached_time <= ESTIMATED_USAGE_RATE_CACHE_TIME {
+                return Some(cached_rate.clone());
+            }
+        }
 
-        let mut totals_for_type : Vec<Rate> = self.attribution_meters
+        match self.calculate_estimated_usage_rate(resource) {
+            Some(estimated_usage_rate) => {
+                self.cached_estimated_usage_rate
+                    .insert(resource.clone(), (estimated_usage_rate.clone(), now));
+                Some(estimated_usage_rate)
+            }
+            None => None,
+        }
+    }
+
+    /// Estimates the usage rate for a given resource type based on existing data.
+    ///
+    /// This function calculates the estimated usage rate by taking the 50th percentile value (or another
+    /// specified percentile defined by [DEFAULT_USAGE_PERCENTILE]) from the set of known rates for the
+    /// specified resource type. It disregards resources with no known rate (which may leader to
+    /// higher estimates).
+    ///
+    /// # Arguments
+    ///
+    /// * `resource` - A reference to the resource type for which the usage rate is to be estimated.
+    ///
+    /// # Returns
+    ///
+    /// An `Option<Rate>` which is `Some(rate)` if an estimated rate can be determined from available data,
+    /// or `None` if no data is available for the given resource type.
+    ///
+    /// # Panics
+    ///
+    /// This function may panic if `DEFAULT_USAGE_PERCENTILE` is set to an invalid value that is not within
+    /// the range [0.0, 1.0].
+    fn calculate_estimated_usage_rate(&mut self, resource: &ResourceType) -> Option<Rate> {
+        let rates: Vec<Rate> = self.attribution_meters
             .iter()
-            // Note that resources with no Rate will be disregarded
-            .filter_map(|t| t.map.get(resource))
-            .filter_map(|m| m.get_rate())
-            .sorted()
+            // Filter out resources with no Rate and collect their rates
+            .filter_map(|t| t.map.get(resource).and_then(|m| m.get_rate()))
             .collect();
 
-        // Calculate the estimated usage rate as the 50th percentile of usage for the resource.
-        if !totals_for_type.is_empty() {
-            let estimated_index = (DEFAULT_USAGE_PERCENTILE * totals_for_type.len() as f64) as usize;
-            let estimated_index = estimated_index.min(totals_for_type.len() - 1);
-            Some(totals_for_type[estimated_index].clone())
-        } else {
-            None
+        if rates.is_empty() {
+            return None;
         }
+
+        // Sort the collected rates
+        let mut sorted_rates = rates;
+        sorted_rates.sort_unstable(); // Using sort_unstable for potentially better performance
+
+        // Calculate the index for the estimated usage rate
+        let percentile_index = (DEFAULT_USAGE_PERCENTILE * sorted_rates.len() as f64).round() as usize;
+        let estimated_index = percentile_index.min(sorted_rates.len().saturating_sub(1));
+
+        sorted_rates.get(estimated_index).cloned()
     }
 
     /// Report the use of a resource with multiple attribution sources, splitting the usage
@@ -162,36 +220,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_meter() {
+    fn test_empty_meter() {
         let mut meter = Meter::new_with_window_size(100);
 
-        // Test that the new Meter has empty totals_by_resource and attribution_meters
-        assert!(meter.resource_usage_rate(ResourceType::InboundBandwidthBytes, false).is_none());
+        assert!(meter.attributed_usage_rate(
+            &AttributionSource::Peer(PeerKeyLocation::random()),
+            &ResourceType::InboundBandwidthBytes
+        ).is_none());
         assert!(meter.attribution_meters.is_empty());
-    }
-
-    #[test]
-    fn test_meter_total_usage() {
-        let mut meter = Meter::new_with_window_size(100);
-
-        // Test that the total usage is 0.0 for all resources
-        assert!(meter
-            .resource_usage_rate(ResourceType::InboundBandwidthBytes, false)
-            .is_none());
-        assert!(meter
-            .resource_usage_rate(ResourceType::OutboundBandwidthBytes, false)
-            .is_none());
-
-        // Report some usage and test that the total usage is updated
-        let attribution = AttributionSource::Peer(PeerKeyLocation::random());
-        meter.report(&attribution, ResourceType::InboundBandwidthBytes, 100.0);
-        assert_eq!(
-            meter
-                .resource_usage_rate(ResourceType::InboundBandwidthBytes, false)
-                .unwrap()
-                .per_second(),
-            100.0
-        );
     }
 
     #[test]
@@ -227,13 +263,6 @@ mod tests {
         meter.report(&attribution, ResourceType::InboundBandwidthBytes, 100.0);
         assert_eq!(
             meter
-                .resource_usage_rate(ResourceType::InboundBandwidthBytes, false)
-                .unwrap()
-                .per_second(),
-            100.0
-        );
-        assert_eq!(
-            meter
                 .attributed_usage_rate(&attribution, &ResourceType::InboundBandwidthBytes)
                 .unwrap()
                 .per_second(),
@@ -242,13 +271,6 @@ mod tests {
 
         // Report more usage and test that the total and attributed usage are updated
         meter.report(&attribution, ResourceType::InboundBandwidthBytes, 200.0);
-        assert_eq!(
-            meter
-                .resource_usage_rate(ResourceType::InboundBandwidthBytes, false)
-                .unwrap()
-                .per_second(),
-            300.0
-        );
         assert_eq!(
             meter
                 .attributed_usage_rate(&attribution, &ResourceType::InboundBandwidthBytes)
@@ -263,13 +285,6 @@ mod tests {
             &other_attribution,
             ResourceType::InboundBandwidthBytes,
             150.0,
-        );
-        assert_eq!(
-            meter
-                .resource_usage_rate(ResourceType::InboundBandwidthBytes, false)
-                .unwrap()
-                .per_second(),
-            450.0
         );
         assert_eq!(
             meter

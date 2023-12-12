@@ -21,11 +21,11 @@ impl Rate {
         }
     }
 
-    pub fn new_per_second(value: f64) -> Self {
+    pub const fn new_per_second(value: f64) -> Self {
         Rate { value }
     }
 
-    pub fn per_second(&self) -> f64 {
+    pub const fn per_second(&self) -> f64 {
         self.value
     }
 

@@ -90,7 +90,7 @@ impl RequestDensityTracker {
     }
 }
 
-pub(super) struct DensityMap {
+pub(crate) struct DensityMap {
     neighbor_request_counts: BTreeMap<Location, usize>,
 }
 
