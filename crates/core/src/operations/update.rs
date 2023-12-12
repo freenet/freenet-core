@@ -1,9 +1,13 @@
 // TODO: complete update logic in the network
 
+use freenet_stdlib::prelude::*;
 use futures::future::BoxFuture;
 
 use super::{OpError, OpOutcome, Operation};
-use crate::{client_events::ClientId, node::NetworkBridge};
+use crate::{
+    client_events::ClientId,
+    node::{NetworkBridge, OpManager},
+};
 
 pub(crate) use self::messages::UpdateMsg;
 
@@ -57,6 +61,19 @@ impl Operation for UpdateOp {
     > {
         todo!()
     }
+}
+
+// todo: new_state should be a delta when possible!
+pub(crate) fn start_op(_key: ContractKey, _new_state: WrappedState, _htl: usize) -> UpdateOp {
+    todo!()
+}
+
+pub(crate) async fn request_update(
+    _op_manager: &OpManager,
+    _update_op: UpdateOp,
+    _client_id: Option<ClientId>,
+) -> Result<(), OpError> {
+    todo!()
 }
 
 mod messages {

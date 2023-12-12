@@ -391,6 +391,7 @@ impl P2pConnManager {
                     continue;
                 }
                 id = executor_channel.transaction_from_executor() => {
+                    let id = id.map_err(|err| anyhow::anyhow!(err))?;
                     pending_from_executor.insert(id);
                     continue;
                 }
@@ -414,7 +415,7 @@ impl P2pConnManager {
                         msg => {
                             let executor_callback = pending_from_executor
                                 .remove(msg.id())
-                                .then(|| executor_channel.clone());
+                                .then(|| executor_channel.callback());
                             let pending_client_req = tx_to_client.get(msg.id()).copied();
                             let client_req_handler_callback = if pending_client_req.is_some() {
                                 debug_assert!(client_id.is_none());

@@ -28,8 +28,8 @@ use crate::{
     config::Config,
     config::GlobalExecutor,
     contract::{
-        ClientResponses, ClientResponsesSender, ContractError, ExecutorToEventLoopChannel,
-        NetworkContractHandler, NetworkEventListenerHalve, OperationMode,
+        Callback, ClientResponses, ClientResponsesSender, ContractError,
+        ExecutorToEventLoopChannel, NetworkContractHandler, OperationMode,
     },
     message::{NetMessage, NodeEvent, Transaction, TransactionType},
     operations::{
@@ -479,7 +479,7 @@ async fn report_result(
     tx: Option<Transaction>,
     op_result: Result<Option<OpEnum>, OpError>,
     op_manager: &OpManager,
-    executor_callback: Option<ExecutorToEventLoopChannel<NetworkEventListenerHalve>>,
+    executor_callback: Option<ExecutorToEventLoopChannel<Callback>>,
     client_req_handler_callback: Option<(ClientId, ClientResponsesSender)>,
     event_listener: &mut dyn NetEventRegister,
 ) {
@@ -587,7 +587,7 @@ async fn process_message<CB>(
     op_manager: Arc<OpManager>,
     mut conn_manager: CB,
     mut event_listener: Box<dyn NetEventRegister>,
-    executor_callback: Option<ExecutorToEventLoopChannel<NetworkEventListenerHalve>>,
+    executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
     client_req_handler_callback: Option<ClientResponsesSender>,
     client_id: Option<ClientId>,
 ) where

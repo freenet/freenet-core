@@ -99,8 +99,7 @@ impl ContractHandler for NetworkContractHandler<Runtime> {
         Self: Sized + 'static,
     {
         async {
-            let mut executor = Executor::from_config(config).await?;
-            executor.event_loop_channel(executor_request_sender);
+            let mut executor = Executor::from_config(config, Some(executor_request_sender)).await?;
             Ok(Self { executor, channel })
         }
         .boxed()
@@ -138,14 +137,14 @@ impl ContractHandler for NetworkContractHandler<super::MockRuntime> {
 
     fn build(
         channel: ContractHandlerChannel<ContractHandlerHalve>,
-        _executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
+        executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
         identifier: Self::Builder,
     ) -> BoxFuture<'static, Result<Self, DynError>>
     where
         Self: Sized + 'static,
     {
         async move {
-            let executor = Executor::new_mock(&identifier).await?;
+            let executor = Executor::new_mock(&identifier, executor_request_sender).await?;
             Ok(Self { executor, channel })
         }
         .boxed()

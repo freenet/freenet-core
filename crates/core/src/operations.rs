@@ -154,6 +154,33 @@ impl OpEnum {
     }
 }
 
+macro_rules! try_from_op_enum {
+    ($op_enum:path, $op_type:ty, $transaction_type:expr) => {
+        impl TryFrom<OpEnum> for $op_type {
+            type Error = OpError;
+
+            fn try_from(value: OpEnum) -> Result<Self, Self::Error> {
+                match value {
+                    $op_enum(op) => Ok(op),
+                    other => Err(OpError::IncorrectTxType(
+                        $transaction_type,
+                        other.id().transaction_type(),
+                    )),
+                }
+            }
+        }
+    };
+}
+
+try_from_op_enum!(OpEnum::Put, put::PutOp, TransactionType::Put);
+try_from_op_enum!(OpEnum::Get, get::GetOp, TransactionType::Get);
+try_from_op_enum!(
+    OpEnum::Subscribe,
+    subscribe::SubscribeOp,
+    TransactionType::Subscribe
+);
+try_from_op_enum!(OpEnum::Update, update::UpdateOp, TransactionType::Update);
+
 pub(crate) enum OpOutcome<'a> {
     /// An op which involves a contract completed successfully.
     ContractOpSuccess {

@@ -30,7 +30,7 @@ pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
 ///
 /// A transaction may span different messages sent across the network.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
-pub struct Transaction {
+pub(crate) struct Transaction {
     id: Ulid,
 }
 

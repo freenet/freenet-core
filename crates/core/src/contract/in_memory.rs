@@ -22,11 +22,14 @@ pub(crate) struct MemoryContractHandler {
 impl MemoryContractHandler {
     pub async fn new(
         channel: ContractHandlerChannel<ContractHandlerHalve>,
+        executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
         identifier: &str,
     ) -> Self {
         MemoryContractHandler {
             channel,
-            runtime: Executor::new_mock(identifier).await.unwrap(),
+            runtime: Executor::new_mock(identifier, executor_request_sender)
+                .await
+                .unwrap(),
         }
     }
 }
@@ -37,13 +40,16 @@ impl ContractHandler for MemoryContractHandler {
 
     fn build(
         channel: ContractHandlerChannel<ContractHandlerHalve>,
-        _executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
+        executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
         identifier: Self::Builder,
     ) -> BoxFuture<'static, Result<Self, DynError>>
     where
         Self: Sized + 'static,
     {
-        async move { Ok(MemoryContractHandler::new(channel, &identifier).await) }.boxed()
+        async move {
+            Ok(MemoryContractHandler::new(channel, executor_request_sender, &identifier).await)
+        }
+        .boxed()
     }
 
     fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve> {

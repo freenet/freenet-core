@@ -7,7 +7,7 @@ mod in_memory;
 pub mod storages;
 
 pub(crate) use executor::{
-    executor_channel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
+    executor_channel, Callback, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
 };
 pub(crate) use handler::{
     contract_handler_channel, ClientResponses, ClientResponsesSender, ContractHandler,
