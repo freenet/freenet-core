@@ -21,8 +21,11 @@ use crate::tracing::CombinedRegister;
 use crate::{
     client_events::test::{MemoryEventsGen, RandomEventGenerator},
     config::GlobalExecutor,
-    contract,
-    message::{NetMessage, NodeEvent},
+    contract::{
+        self, ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
+        WaitingResolution,
+    },
+    message::{NetMessage, NodeEvent, Transaction},
     node::{InitPeerNode, NetEventRegister, NodeConfig},
     operations::connect,
     ring::{Distance, Location, PeerKeyLocation},
@@ -34,7 +37,9 @@ mod inter_process;
 
 pub use self::inter_process::SimPeer;
 
-use super::{network_bridge::EventLoopNotifications, ConnectionError, NetworkBridge, PeerId};
+use super::{
+    network_bridge::EventLoopNotificationsReceiver, ConnectionError, NetworkBridge, PeerId,
+};
 
 pub fn get_free_port() -> Result<u16, ()> {
     let mut port;
@@ -975,9 +980,11 @@ where
     conn_manager: NB,
     /// Set on creation, taken on run
     user_events: Option<UsrEv>,
-    notification_channel: EventLoopNotifications,
+    notification_channel: EventLoopNotificationsReceiver,
     event_register: Box<dyn NetEventRegister>,
     gateways: Vec<PeerKeyLocation>,
+    executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
+    client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
 }
 
 async fn run_node<NB, UsrEv>(mut config: RunnerConfig<NB, UsrEv>) -> Result<(), anyhow::Error>
@@ -992,7 +999,7 @@ where
         &config.gateways,
     )
     .await?;
-    let (client_responses, cli_response_sender) = contract::ClientResponses::channel();
+    let (client_responses, cli_response_sender) = contract::client_responses_channel();
     let span = {
         config
             .parent_span
@@ -1029,7 +1036,7 @@ where
 
 /// Starts listening to incoming events. Will attempt to join the ring if any gateways have been provided.
 async fn run_event_listener<NB, UsrEv>(
-    _client_responses: contract::ClientResponsesSender,
+    cli_response_sender: contract::ClientResponsesSender,
     mut node_controller_rx: tokio::sync::mpsc::Receiver<NodeEvent>,
     RunnerConfig {
         peer_key,
@@ -1039,6 +1046,8 @@ async fn run_event_listener<NB, UsrEv>(
         mut conn_manager,
         mut notification_channel,
         mut event_register,
+        mut executor_listener,
+        client_wait_for_transaction: mut wait_for_event,
         ..
     }: RunnerConfig<NB, UsrEv>,
 ) -> Result<(), anyhow::Error>
@@ -1046,12 +1055,14 @@ where
     NB: NetworkBridge + NetworkBridgeExt,
     UsrEv: ClientEventsProxy + Send + 'static,
 {
+    let mut pending_from_executor = HashSet::new();
+    let mut tx_to_client: HashMap<Transaction, crate::client_events::ClientId> = HashMap::new();
     loop {
         let msg = tokio::select! {
             msg = conn_manager.recv() => { msg.map(Either::Left) }
             msg = notification_channel.recv() => {
                 if let Some(msg) = msg {
-                    Ok(msg.map_left(|(msg, _cli_id)| msg))
+                    Ok(msg)
                 } else {
                     anyhow::bail!("notification channel shutdown, fatal error");
                 }
@@ -1062,6 +1073,18 @@ where
                 } else {
                     anyhow::bail!("node controller channel shutdown, fatal error");
                 }
+            }
+            event_id = wait_for_event.recv_from_client_event() => {
+                if let Ok((client_id, transaction)) = event_id {
+                   tx_to_client.insert(transaction, client_id);
+                }
+                continue;
+            }
+            id = executor_listener.transaction_from_executor() => {
+                if let Ok(res) = id {
+                    pending_from_executor.insert(res);
+                }
+                continue;
             }
         };
 
@@ -1131,14 +1154,24 @@ where
                 })
         };
 
+        let executor_callback = pending_from_executor
+            .remove(msg.id())
+            .then(|| executor_listener.callback());
+        let pending_client_req = tx_to_client.get(msg.id()).copied();
+        let client_req_handler_callback = if pending_client_req.is_some() {
+            Some(cli_response_sender.clone())
+        } else {
+            None
+        };
+
         let msg = super::process_message(
             msg,
             op_manager,
             conn_manager.clone(),
             event_listener,
-            None,
-            None,
-            None,
+            executor_callback,
+            client_req_handler_callback,
+            pending_client_req,
         )
         .instrument(span);
         GlobalExecutor::spawn(msg);

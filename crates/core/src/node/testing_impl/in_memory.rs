@@ -8,7 +8,7 @@ use crate::{
     config::GlobalExecutor,
     contract::{self, executor_channel, ContractHandler, MemoryContractHandler},
     node::{
-        network_bridge::{in_memory::MemoryConnManager, EventLoopNotifications},
+        network_bridge::{event_loop_notification_channel, in_memory::MemoryConnManager},
         op_state_manager::OpManager,
         NetEventRegister, NetworkBridge,
     },
@@ -29,8 +29,8 @@ impl<ER> Builder<ER> {
     {
         let gateways = self.config.get_gateways()?;
 
-        let (notification_channel, notification_tx) = EventLoopNotifications::channel();
-        let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
+        let (notification_channel, notification_tx) = event_loop_notification_channel();
+        let (ops_ch_channel, ch_channel, wait_for_event) = contract::contract_handler_channel();
 
         let _guard = parent_span.enter();
         let op_manager = Arc::new(OpManager::new(
@@ -40,7 +40,7 @@ impl<ER> Builder<ER> {
             self.event_register.clone(),
         )?);
         std::mem::drop(_guard);
-        let (_executor_listener, executor_sender) = executor_channel(op_manager.clone());
+        let (executor_listener, executor_sender) = executor_channel(op_manager.clone());
         let contract_handler =
             MemoryContractHandler::build(ch_channel, executor_sender, self.contract_handler_name)
                 .await
@@ -66,6 +66,8 @@ impl<ER> Builder<ER> {
             user_events: Some(user_events),
             notification_channel,
             event_register: self.event_register.trait_clone(),
+            executor_listener,
+            client_wait_for_transaction: wait_for_event,
         };
         config
             .append_contracts(self.contracts, self.contract_subscribers)
@@ -98,18 +100,15 @@ where
         for (contract, state) in contracts {
             let key: ContractKey = contract.key();
             self.op_manager
-                .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()), None)
+                .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
                 .await?;
             self.op_manager
-                .notify_contract_handler(
-                    ContractHandlerEvent::PutQuery {
-                        key: key.clone(),
-                        state,
-                        related_contracts: RelatedContracts::default(),
-                        contract: Some(contract),
-                    },
-                    None,
-                )
+                .notify_contract_handler(ContractHandlerEvent::PutQuery {
+                    key: key.clone(),
+                    state,
+                    related_contracts: RelatedContracts::default(),
+                    contract: Some(contract),
+                })
                 .await?;
             tracing::debug!(
                 "Appended contract {} to peer {}",

@@ -828,7 +828,7 @@ impl Ring {
             },
         };
         let id = *msg.id();
-        notifier.send(Either::Left((msg.into(), None))).await?;
+        notifier.send(Either::Left(msg.into())).await?;
         Ok(Some(id))
     }
 }

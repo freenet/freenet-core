@@ -29,7 +29,7 @@ use crate::{
     config::Config,
     config::GlobalExecutor,
     contract::{
-        Callback, ClientResponses, ClientResponsesSender, ContractError,
+        Callback, ClientResponsesReceiver, ClientResponsesSender, ContractError,
         ExecutorToEventLoopChannel, NetworkContractHandler, OperationMode,
     },
     message::{NetMessage, NodeEvent, Transaction, TransactionType},
@@ -308,7 +308,7 @@ impl InitPeerNode {
 async fn client_event_handling<ClientEv>(
     op_manager: Arc<OpManager>,
     mut client_events: ClientEv,
-    mut client_responses: ClientResponses,
+    mut client_responses: ClientResponsesReceiver,
     node_controller: tokio::sync::mpsc::Sender<NodeEvent>,
 ) where
     ClientEv: ClientEventsProxy + Send + 'static,
@@ -356,6 +356,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
     // this will indirectly start actions on the local contract executor
     let fut = async move {
         let client_id = request.client_id;
+
         let mut missing_contract = false;
         match *request.request {
             ClientRequest::ContractOp(ops) => match ops {
@@ -375,7 +376,11 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                         state,
                         op_manager.ring.max_hops_to_live,
                     );
-                    if let Err(err) = put::request_put(&op_manager, op, Some(client_id)).await {
+                    let _ = op_manager
+                        .ch_outbound
+                        .waiting_for_transaction(op.id, client_id)
+                        .await;
+                    if let Err(err) = put::request_put(&op_manager, op).await {
                         tracing::error!("{}", err);
                     }
                 }
@@ -399,7 +404,11 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                         "Received get from user event",
                     );
                     let op = get::start_op(key, contract);
-                    if let Err(err) = get::request_get(&op_manager, op, Some(client_id)).await {
+                    let _ = op_manager
+                        .ch_outbound
+                        .waiting_for_transaction(op.id, client_id)
+                        .await;
+                    if let Err(err) = get::request_get(&op_manager, op).await {
                         tracing::error!("{}", err);
                     }
                 }
@@ -409,17 +418,18 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                         // Initialize a subscribe op.
                         loop {
                             let op = subscribe::start_op(key.clone());
-                            match subscribe::request_subscribe(&op_manager, op, Some(client_id))
-                                .await
-                            {
+                            let _ = op_manager
+                                .ch_outbound
+                                .waiting_for_transaction(op.id, client_id)
+                                .await;
+                            match subscribe::request_subscribe(&op_manager, op).await {
                                 Err(OpError::ContractError(ContractError::ContractNotFound(
                                     key,
                                 ))) if !missing_contract => {
                                     tracing::info!(%key, "Trying to subscribe to a contract not present, requesting it first");
                                     missing_contract = true;
                                     let get_op = get::start_op(key.clone(), true);
-                                    if let Err(error) =
-                                        get::request_get(&op_manager, get_op, Some(client_id)).await
+                                    if let Err(error) = get::request_get(&op_manager, get_op).await
                                     {
                                         tracing::error!(%key, %error, "Failed getting the contract while previously trying to subscribe; bailing");
                                         break;
@@ -604,13 +614,9 @@ async fn process_message<CB>(
         match &msg {
             NetMessage::Connect(op) => {
                 // log_handling_msg!("join", op.id(), op_manager);
-                let op_result = handle_op_request::<connect::ConnectOp, _>(
-                    &op_manager,
-                    &mut conn_manager,
-                    op,
-                    client_id,
-                )
-                .await;
+                let op_result =
+                    handle_op_request::<connect::ConnectOp, _>(&op_manager, &mut conn_manager, op)
+                        .await;
                 handle_op_not_available!(op_result);
                 break report_result(
                     tx,
@@ -624,13 +630,8 @@ async fn process_message<CB>(
             }
             NetMessage::Put(op) => {
                 // log_handling_msg!("put", *op.id(), op_manager);
-                let op_result = handle_op_request::<put::PutOp, _>(
-                    &op_manager,
-                    &mut conn_manager,
-                    op,
-                    client_id,
-                )
-                .await;
+                let op_result =
+                    handle_op_request::<put::PutOp, _>(&op_manager, &mut conn_manager, op).await;
                 handle_op_not_available!(op_result);
                 break report_result(
                     tx,
@@ -644,13 +645,8 @@ async fn process_message<CB>(
             }
             NetMessage::Get(op) => {
                 // log_handling_msg!("get", op.id(), op_manager);
-                let op_result = handle_op_request::<get::GetOp, _>(
-                    &op_manager,
-                    &mut conn_manager,
-                    op,
-                    client_id,
-                )
-                .await;
+                let op_result =
+                    handle_op_request::<get::GetOp, _>(&op_manager, &mut conn_manager, op).await;
                 handle_op_not_available!(op_result);
                 break report_result(
                     tx,
@@ -668,7 +664,6 @@ async fn process_message<CB>(
                     &op_manager,
                     &mut conn_manager,
                     op,
-                    client_id,
                 )
                 .await;
                 handle_op_not_available!(op_result);

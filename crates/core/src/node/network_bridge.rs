@@ -8,10 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use super::PeerId;
-use crate::{
-    client_events::ClientId,
-    message::{NetMessage, NodeEvent},
-};
+use crate::message::{NetMessage, NodeEvent};
 
 pub(crate) mod in_memory;
 pub(crate) mod inter_process;
@@ -86,41 +83,35 @@ impl Clone for ConnectionError {
     }
 }
 
-pub(super) struct EventLoopNotifications(
-    Receiver<Either<(NetMessage, Option<ClientId>), NodeEvent>>,
-);
-
-impl EventLoopNotifications {
-    pub fn channel() -> (EventLoopNotifications, EventLoopNotificationsSender) {
-        let (notification_tx, notification_rx) = mpsc::channel(100);
-        (
-            EventLoopNotifications(notification_rx),
-            EventLoopNotificationsSender(notification_tx),
-        )
-    }
+pub fn event_loop_notification_channel(
+) -> (EventLoopNotificationsReceiver, EventLoopNotificationsSender) {
+    let (notification_tx, notification_rx) = mpsc::channel(100);
+    (
+        EventLoopNotificationsReceiver(notification_rx),
+        EventLoopNotificationsSender(notification_tx),
+    )
 }
+pub(super) struct EventLoopNotificationsReceiver(Receiver<Either<NetMessage, NodeEvent>>);
 
-impl Deref for EventLoopNotifications {
-    type Target = Receiver<Either<(NetMessage, Option<ClientId>), NodeEvent>>;
+impl Deref for EventLoopNotificationsReceiver {
+    type Target = Receiver<Either<NetMessage, NodeEvent>>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl DerefMut for EventLoopNotifications {
+impl DerefMut for EventLoopNotificationsReceiver {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct EventLoopNotificationsSender(
-    Sender<Either<(NetMessage, Option<ClientId>), NodeEvent>>,
-);
+pub(crate) struct EventLoopNotificationsSender(Sender<Either<NetMessage, NodeEvent>>);
 
 impl Deref for EventLoopNotificationsSender {
-    type Target = Sender<Either<(NetMessage, Option<ClientId>), NodeEvent>>;
+    type Target = Sender<Either<NetMessage, NodeEvent>>;
 
     fn deref(&self) -> &Self::Target {
         &self.0

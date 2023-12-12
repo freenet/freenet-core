@@ -1,8 +1,7 @@
 use std::collections::BTreeMap;
 use std::hash::Hash;
-use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use freenet_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use freenet_stdlib::prelude::*;
@@ -20,16 +19,14 @@ use crate::client_events::HostResult;
 use crate::message::Transaction;
 use crate::{client_events::ClientId, node::PeerCliConfig, wasm_runtime::Runtime, DynError};
 
-pub(crate) struct ClientResponses(UnboundedReceiver<(ClientId, HostResult)>);
+pub(crate) struct ClientResponsesReceiver(UnboundedReceiver<(ClientId, HostResult)>);
 
-impl ClientResponses {
-    pub fn channel() -> (Self, ClientResponsesSender) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (Self(rx), ClientResponsesSender(tx))
-    }
+pub fn client_responses_channel() -> (ClientResponsesReceiver, ClientResponsesSender) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (ClientResponsesReceiver(rx), ClientResponsesSender(tx))
 }
 
-impl std::ops::Deref for ClientResponses {
+impl std::ops::Deref for ClientResponsesReceiver {
     type Target = UnboundedReceiver<(ClientId, HostResult)>;
 
     fn deref(&self) -> &Self::Target {
@@ -37,7 +34,7 @@ impl std::ops::Deref for ClientResponses {
     }
 }
 
-impl std::ops::DerefMut for ClientResponses {
+impl std::ops::DerefMut for ClientResponsesReceiver {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
@@ -177,24 +174,6 @@ impl ContractHandler for NetworkContractHandler<super::MockRuntime> {
 #[derive(Eq)]
 pub(crate) struct EventId {
     id: u64,
-    client_id: Option<ClientId>,
-    transaction: Option<Transaction>,
-}
-
-impl EventId {
-    pub fn client_id(&self) -> Option<ClientId> {
-        self.client_id
-    }
-
-    pub fn transaction(&self) -> Option<Transaction> {
-        self.transaction
-    }
-
-    // FIXME: this should be used somewhere to inform than an event is pending
-    // a transaction resolution
-    pub fn with_transaction(&mut self, transaction: Transaction) {
-        self.transaction = Some(transaction);
-    }
 }
 
 impl PartialEq for EventId {
@@ -212,45 +191,70 @@ impl Hash for EventId {
 /// A bidirectional channel which keeps track of the initiator half
 /// and sends the corresponding response to the listener of the operation.
 pub(crate) struct ContractHandlerChannel<End: sealed::ChannelHalve> {
-    rx: mpsc::UnboundedReceiver<InternalCHEvent>,
-    tx: mpsc::UnboundedSender<InternalCHEvent>,
-    queue: BTreeMap<u64, ContractHandlerEvent>,
-    _halve: PhantomData<End>,
+    end: End,
 }
 
-pub(crate) struct ContractHandlerHalve;
-pub(crate) struct SenderHalve;
+pub(crate) struct ContractHandlerHalve {
+    event_receiver: mpsc::UnboundedReceiver<InternalCHEvent>,
+    waiting_response: BTreeMap<u64, tokio::sync::oneshot::Sender<(EventId, ContractHandlerEvent)>>,
+}
+
+pub(crate) struct SenderHalve {
+    event_sender: mpsc::UnboundedSender<InternalCHEvent>,
+    wait_for_res_tx: mpsc::Sender<(ClientId, Transaction)>,
+}
+
+/// Communicates that a client is waiting for a transaction resolution
+/// to continue processing this event.
+pub(crate) struct WaitingResolution {
+    wait_for_res_rx: mpsc::Receiver<(ClientId, Transaction)>,
+}
 
 mod sealed {
-    use super::{ContractHandlerHalve, SenderHalve};
+    use super::{ContractHandlerHalve, SenderHalve, WaitingResolution};
     pub(crate) trait ChannelHalve {}
     impl ChannelHalve for ContractHandlerHalve {}
     impl ChannelHalve for SenderHalve {}
+    impl ChannelHalve for WaitingResolution {}
 }
 
 pub(crate) fn contract_handler_channel() -> (
     ContractHandlerChannel<SenderHalve>,
     ContractHandlerChannel<ContractHandlerHalve>,
+    ContractHandlerChannel<WaitingResolution>,
 ) {
-    let (notification_tx, notification_channel) = mpsc::unbounded_channel();
-    let (ch_tx, ch_listener) = mpsc::unbounded_channel();
+    let (event_sender, event_receiver) = mpsc::unbounded_channel();
+    let (wait_for_res_tx, wait_for_res_rx) = mpsc::channel(10);
     (
         ContractHandlerChannel {
-            rx: notification_channel,
-            tx: ch_tx,
-            queue: BTreeMap::new(),
-            _halve: PhantomData,
+            end: SenderHalve {
+                event_sender,
+                wait_for_res_tx,
+            },
         },
         ContractHandlerChannel {
-            rx: ch_listener,
-            tx: notification_tx,
-            queue: BTreeMap::new(),
-            _halve: PhantomData,
+            end: ContractHandlerHalve {
+                event_receiver,
+                waiting_response: BTreeMap::new(),
+            },
+        },
+        ContractHandlerChannel {
+            end: WaitingResolution { wait_for_res_rx },
         },
     )
 }
 
 static EV_ID: AtomicU64 = AtomicU64::new(0);
+
+impl ContractHandlerChannel<WaitingResolution> {
+    pub async fn recv_from_client_event(&mut self) -> Result<(ClientId, Transaction), DynError> {
+        self.end
+            .wait_for_res_rx
+            .recv()
+            .await
+            .ok_or_else(|| "channel dropped".into())
+    }
+}
 
 impl ContractHandlerChannel<SenderHalve> {
     // TODO: the timeout should be derived from whatever is the worst
@@ -262,66 +266,55 @@ impl ContractHandlerChannel<SenderHalve> {
 
     /// Send an event to the contract handler and receive a response event if successful.
     pub async fn send_to_handler(
-        &mut self,
+        &self,
         ev: ContractHandlerEvent,
-        client_id: Option<ClientId>,
     ) -> Result<ContractHandlerEvent, ContractError> {
         let id = EV_ID.fetch_add(1, SeqCst);
-        self.tx
-            .send(InternalCHEvent { ev, id, client_id })
+        let (result, result_receiver) = tokio::sync::oneshot::channel();
+        self.end
+            .event_sender
+            .send(InternalCHEvent { ev, id, result })
             .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))?;
-        if let Some(handler) = self.queue.remove(&id) {
-            Ok(handler)
-        } else {
-            let started_op = Instant::now();
-            loop {
-                if started_op.elapsed() > Self::CH_EV_RESPONSE_TIME_OUT {
-                    break Err(ContractError::NoEvHandlerResponse);
-                }
-                while let Some(msg) = self.rx.recv().await {
-                    if msg.id == id {
-                        return Ok(msg.ev);
-                    } else {
-                        self.queue.insert(id, msg.ev); // should never be duplicates
-                    }
-                }
-                tokio::time::sleep(Duration::from_nanos(100)).await;
-            }
+        match tokio::time::timeout(Self::CH_EV_RESPONSE_TIME_OUT, result_receiver).await {
+            Ok(Ok((_, res))) => Ok(res),
+            Ok(Err(_)) | Err(_) => Err(ContractError::NoEvHandlerResponse),
         }
     }
 
-    pub async fn recv_from_handler(&mut self) -> EventId {
-        todo!()
+    pub async fn waiting_for_transaction(
+        &self,
+        transaction: Transaction,
+        client_id: ClientId,
+    ) -> Result<(), ContractError> {
+        self.end
+            .wait_for_res_tx
+            .send((client_id, transaction))
+            .await
+            .map_err(|_| ContractError::NoEvHandlerResponse)
     }
 }
 
 impl ContractHandlerChannel<ContractHandlerHalve> {
     pub async fn send_to_sender(
-        &self,
+        &mut self,
         id: EventId,
         ev: ContractHandlerEvent,
     ) -> Result<(), ContractError> {
-        self.tx
-            .send(InternalCHEvent {
-                ev,
-                id: id.id,
-                client_id: id.client_id,
-            })
-            .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))
+        if let Some(response) = self.end.waiting_response.remove(&id.id) {
+            response
+                .send((id, ev))
+                .map_err(|_| ContractError::NoEvHandlerResponse)
+        } else {
+            Err(ContractError::NoEvHandlerResponse)
+        }
     }
 
     pub async fn recv_from_sender(
         &mut self,
     ) -> Result<(EventId, ContractHandlerEvent), ContractError> {
-        if let Some(msg) = self.rx.recv().await {
-            return Ok((
-                EventId {
-                    id: msg.id,
-                    client_id: msg.client_id,
-                    transaction: None,
-                },
-                msg.ev,
-            ));
+        if let Some(InternalCHEvent { ev, id, result }) = self.end.event_receiver.recv().await {
+            self.end.waiting_response.insert(id, result);
+            return Ok((EventId { id }, ev));
         }
         Err(ContractError::NoEvHandlerResponse)
     }
@@ -336,7 +329,8 @@ pub(crate) struct StoreResponse {
 struct InternalCHEvent {
     ev: ContractHandlerEvent,
     id: u64,
-    client_id: Option<ClientId>,
+    // client_id: Option<ClientId>,
+    result: tokio::sync::oneshot::Sender<(EventId, ContractHandlerEvent)>,
 }
 
 #[derive(Debug)]
@@ -421,7 +415,7 @@ pub mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn channel_test() -> Result<(), anyhow::Error> {
-        let (mut send_halve, mut rcv_halve) = contract_handler_channel();
+        let (send_halve, mut rcv_halve, _) = contract_handler_channel();
 
         let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
             Arc::new(ContractCode::from(vec![0, 1, 2, 3])),
@@ -431,7 +425,7 @@ pub mod test {
         let contract_cp = contract.clone();
         let h = GlobalExecutor::spawn(async move {
             send_halve
-                .send_to_handler(ContractHandlerEvent::Cache(contract_cp), None)
+                .send_to_handler(ContractHandlerEvent::Cache(contract_cp))
                 .await
         });
         let (id, ev) =

@@ -6,7 +6,6 @@ use futures::future::BoxFuture;
 use futures::FutureExt;
 
 use crate::{
-    client_events::ClientId,
     contract::{ContractError, ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
@@ -27,7 +26,7 @@ const MAX_RETRIES: usize = 10;
 const MAX_GET_RETRY_HOPS: usize = 1;
 
 pub(crate) struct GetOp {
-    id: Transaction,
+    pub id: Transaction,
     state: Option<GetState>,
     pub(super) result: Option<GetResult>,
     stats: Option<GetStats>,
@@ -183,7 +182,6 @@ impl Operation for GetOp {
         conn_manager: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
-        client_id: Option<ClientId>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let return_msg;
@@ -308,13 +306,10 @@ impl Operation for GetOp {
                         key: returned_key,
                         response: value,
                     } = op_manager
-                        .notify_contract_handler(
-                            ContractHandlerEvent::GetQuery {
-                                key: key.clone(),
-                                fetch_contract,
-                            },
-                            client_id,
-                        )
+                        .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                            key: key.clone(),
+                            fetch_contract,
+                        })
                         .await?
                     {
                         match check_contract_found(
@@ -473,10 +468,9 @@ impl Operation for GetOp {
                         if let Some(contract) = &contract {
                             // store contract first
                             let res = op_manager
-                                .notify_contract_handler(
-                                    ContractHandlerEvent::Cache(contract.clone()),
-                                    client_id,
-                                )
+                                .notify_contract_handler(ContractHandlerEvent::Cache(
+                                    contract.clone(),
+                                ))
                                 .await?;
                             match res {
                                 ContractHandlerEvent::CacheResult(Ok(_)) => {
@@ -517,7 +511,6 @@ impl Operation for GetOp {
                                         target: *target,
                                     }),
                                     OpEnum::Get(op),
-                                    None,
                                 )
                                 .await?;
                             return Err(OpError::StatePushed);
@@ -525,15 +518,12 @@ impl Operation for GetOp {
                     }
 
                     let res = op_manager
-                        .notify_contract_handler(
-                            ContractHandlerEvent::PutQuery {
-                                key: key.clone(),
-                                state: value.clone(),
-                                related_contracts: RelatedContracts::default(),
-                                contract: contract.clone(),
-                            },
-                            client_id,
-                        )
+                        .notify_contract_handler(ContractHandlerEvent::PutQuery {
+                            key: key.clone(),
+                            state: value.clone(),
+                            related_contracts: RelatedContracts::default(),
+                            contract: contract.clone(),
+                        })
                         .await?;
                     match res {
                         ContractHandlerEvent::PutResponse { new_value: Ok(_) } => {}
@@ -699,11 +689,7 @@ enum GetState {
 }
 
 /// Request to get the current value from a contract.
-pub(crate) async fn request_get(
-    op_manager: &OpManager,
-    get_op: GetOp,
-    client_id: Option<ClientId>,
-) -> Result<(), OpError> {
+pub(crate) async fn request_get(op_manager: &OpManager, get_op: GetOp) -> Result<(), OpError> {
     let (target, id) = if let Some(GetState::PrepareRequest { key, id, .. }) = &get_op.state {
         const EMPTY: &[PeerId] = &[];
         // the initial request must provide:
@@ -758,7 +744,7 @@ pub(crate) async fn request_get(
             };
 
             op_manager
-                .notify_op_change(NetMessage::from(msg), OpEnum::Get(op), client_id)
+                .notify_op_change(NetMessage::from(msg), OpEnum::Get(op))
                 .await?;
         }
         _ => return Err(OpError::invalid_transition(get_op.id)),

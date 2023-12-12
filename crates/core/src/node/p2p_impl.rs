@@ -13,15 +13,17 @@ use tracing::Instrument;
 
 use super::{
     client_event_handling,
-    network_bridge::{p2p_protoc::P2pConnManager, EventLoopNotifications},
+    network_bridge::{
+        event_loop_notification_channel, p2p_protoc::P2pConnManager, EventLoopNotificationsReceiver,
+    },
     NetEventRegister, PeerId as FreenetPeerId,
 };
 use crate::{
     client_events::{combinator::ClientEventsCombinator, BoxedClient},
     config::{self, GlobalExecutor},
     contract::{
-        self, ClientResponsesSender, ContractHandler, ExecutorToEventLoopChannel,
-        NetworkEventListenerHalve,
+        self, ClientResponsesSender, ContractHandler, ContractHandlerChannel,
+        ExecutorToEventLoopChannel, NetworkEventListenerHalve, WaitingResolution,
     },
     message::NodeEvent,
     node::NodeConfig,
@@ -33,7 +35,8 @@ use super::OpManager;
 pub(super) struct NodeP2P {
     pub(crate) peer_key: FreenetPeerId,
     pub(crate) op_manager: Arc<OpManager>,
-    notification_channel: EventLoopNotifications,
+    notification_channel: EventLoopNotificationsReceiver,
+    client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
     pub(super) conn_manager: P2pConnManager,
     executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
     cli_response_sender: ClientResponsesSender,
@@ -60,6 +63,7 @@ impl NodeP2P {
         self.conn_manager
             .run_event_listener(
                 self.op_manager.clone(),
+                self.client_wait_for_transaction,
                 self.notification_channel,
                 self.executor_listener,
                 self.cli_response_sender,
@@ -81,9 +85,9 @@ impl NodeP2P {
     {
         let peer_key = config.peer_id;
 
-        let (notification_channel, notification_tx) = EventLoopNotifications::channel();
-        let (ch_outbound, ch_inbound) = contract::contract_handler_channel();
-        let (client_responses, cli_response_sender) = contract::ClientResponses::channel();
+        let (notification_channel, notification_tx) = event_loop_notification_channel();
+        let (ch_outbound, ch_inbound, wait_for_event) = contract::contract_handler_channel();
+        let (client_responses, cli_response_sender) = contract::client_responses_channel();
 
         let op_manager = Arc::new(OpManager::new(
             notification_tx,
@@ -128,6 +132,7 @@ impl NodeP2P {
             peer_key,
             conn_manager,
             notification_channel,
+            client_wait_for_transaction: wait_for_event,
             op_manager,
             executor_listener,
             cli_response_sender,

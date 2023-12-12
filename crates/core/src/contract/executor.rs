@@ -329,7 +329,7 @@ impl ComposeNetworkMessage<operations::get::GetOp> for GetContract {
     }
 
     async fn resume_op(op: operations::get::GetOp, op_manager: &OpManager) -> Result<(), OpError> {
-        operations::get::request_get(op_manager, op, None).await
+        operations::get::request_get(op_manager, op).await
     }
 }
 
@@ -348,7 +348,7 @@ impl ComposeNetworkMessage<operations::subscribe::SubscribeOp> for SubscribeCont
         op: operations::subscribe::SubscribeOp,
         op_manager: &OpManager,
     ) -> Result<(), OpError> {
-        operations::subscribe::request_subscribe(op_manager, op, None).await
+        operations::subscribe::request_subscribe(op_manager, op).await
     }
 }
 
@@ -376,7 +376,7 @@ impl ComposeNetworkMessage<operations::put::PutOp> for PutContract {
     }
 
     async fn resume_op(op: operations::put::PutOp, op_manager: &OpManager) -> Result<(), OpError> {
-        operations::put::request_put(op_manager, op, None).await
+        operations::put::request_put(op_manager, op).await
     }
 }
 

@@ -6,7 +6,6 @@ use std::{collections::HashSet, time::Duration};
 
 use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::{
-    client_events::ClientId,
     message::{InnerMessage, NetMessage, Transaction},
     node::{ConnectionError, NetworkBridge, OpManager, PeerId},
     operations::OpEnum,
@@ -120,7 +119,6 @@ impl Operation for ConnectOp {
         network_bridge: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
-        _client_id: Option<ClientId>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let return_msg;
@@ -459,11 +457,7 @@ impl Operation for ConnectOp {
                             backoff: self.backoff,
                         };
                         op_manager
-                            .notify_op_change(
-                                NetMessage::Aborted(*id),
-                                OpEnum::Connect(op.into()),
-                                None,
-                            )
+                            .notify_op_change(NetMessage::Aborted(*id), OpEnum::Connect(op.into()))
                             .await?;
                         return Err(OpError::StatePushed);
                     }

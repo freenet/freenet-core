@@ -55,7 +55,7 @@ impl Operation for UpdateOp {
         _conn_manager: &'a mut NB,
         _op_manager: &'a crate::node::OpManager,
         _input: &Self::Message,
-        _client_id: Option<ClientId>,
+        // _client_id: Option<ClientId>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<super::OperationResult, OpError>> + Send + 'a>,
     > {

@@ -13,7 +13,6 @@ use futures::FutureExt;
 
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::{
-    client_events::ClientId,
     contract::ContractHandlerEvent,
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
@@ -21,7 +20,7 @@ use crate::{
 };
 
 pub(crate) struct PutOp {
-    id: Transaction,
+    pub id: Transaction,
     state: Option<PutState>,
     stats: Option<PutStats>,
 }
@@ -169,7 +168,6 @@ impl Operation for PutOp {
         conn_manager: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
-        client_id: Option<ClientId>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let return_msg;
@@ -234,7 +232,7 @@ impl Operation for PutOp {
                             .within_caching_distance(&Location::from(&key))
                     {
                         tracing::debug!(tx = %id, %key, "Contract not cached @ peer {}", target.peer);
-                        match try_to_cache_contract(op_manager, contract, &key, client_id).await {
+                        match try_to_cache_contract(op_manager, contract, &key).await {
                             Ok(_) => {}
                             Err(err) => return Err(err),
                         }
@@ -257,7 +255,6 @@ impl Operation for PutOp {
                         value.clone(),
                         related_contracts.clone(),
                         contract,
-                        client_id,
                     )
                     .await?;
                     tracing::debug!(tx = %id, "Contract successfully updated");
@@ -299,7 +296,7 @@ impl Operation for PutOp {
                     );
 
                     match try_to_broadcast(
-                        (*id, client_id),
+                        *id,
                         op_manager,
                         self.state,
                         broadcast_to,
@@ -332,7 +329,6 @@ impl Operation for PutOp {
                         new_value.clone(),
                         RelatedContracts::default(),
                         contract,
-                        client_id,
                     )
                     .await?;
                     tracing::debug!("Contract successfully updated");
@@ -357,7 +353,7 @@ impl Operation for PutOp {
                     );
 
                     match try_to_broadcast(
-                        (*id, client_id),
+                        *id,
                         op_manager,
                         self.state,
                         broadcast_to,
@@ -470,7 +466,7 @@ impl Operation for PutOp {
                         .ring
                         .within_caching_distance(&Location::from(&key));
                     if !cached_contract && within_caching_dist {
-                        match try_to_cache_contract(op_manager, contract, &key, client_id).await {
+                        match try_to_cache_contract(op_manager, contract, &key).await {
                             Ok(_) => {}
                             Err(err) => return Err(err),
                         }
@@ -488,7 +484,6 @@ impl Operation for PutOp {
                         new_value.clone(),
                         RelatedContracts::default(),
                         contract,
-                        client_id,
                     )
                     .await?;
 
@@ -532,11 +527,10 @@ pub(super) async fn try_to_cache_contract<'a>(
     op_manager: &'a OpManager,
     contract: &ContractContainer,
     key: &ContractKey,
-    client_id: Option<ClientId>,
 ) -> Result<(), OpError> {
     // this node does not have the contract, so instead store the contract and execute the put op.
     let res = op_manager
-        .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()), client_id)
+        .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
         .await?;
     if let ContractHandlerEvent::CacheResult(Ok(_)) = res {
         op_manager.ring.contract_cached(key);
@@ -551,7 +545,7 @@ pub(super) async fn try_to_cache_contract<'a>(
 }
 
 async fn try_to_broadcast(
-    (id, client_id): (Transaction, Option<ClientId>),
+    id: Transaction,
     op_manager: &OpManager,
     state: Option<PutState>,
     broadcast_to: Vec<PeerKeyLocation>,
@@ -590,11 +584,7 @@ async fn try_to_broadcast(
                     stats: None,
                 };
                 op_manager
-                    .notify_op_change(
-                        NetMessage::from(return_msg.unwrap()),
-                        OpEnum::Put(op),
-                        client_id,
-                    )
+                    .notify_op_change(NetMessage::from(return_msg.unwrap()), OpEnum::Put(op))
                     .await?;
                 return Err(OpError::StatePushed);
             }
@@ -656,11 +646,7 @@ enum PutState {
 }
 
 /// Request to insert/update a value into a contract.
-pub(crate) async fn request_put(
-    op_manager: &OpManager,
-    mut put_op: PutOp,
-    client_id: Option<ClientId>,
-) -> Result<(), OpError> {
+pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Result<(), OpError> {
     let key = if let Some(PutState::PrepareRequest { contract, .. }) = &put_op.state {
         contract.key()
     } else {
@@ -709,7 +695,7 @@ pub(crate) async fn request_put(
             };
 
             op_manager
-                .notify_op_change(NetMessage::from(msg), OpEnum::Put(op), client_id)
+                .notify_op_change(NetMessage::from(msg), OpEnum::Put(op))
                 .await?;
         }
         _ => return Err(OpError::invalid_transition(put_op.id)),
@@ -724,19 +710,15 @@ async fn put_contract(
     state: WrappedState,
     related_contracts: RelatedContracts<'static>,
     contract: &ContractContainer,
-    client_id: Option<ClientId>,
 ) -> Result<WrappedState, OpError> {
     // after the contract has been cached, push the update query
     match op_manager
-        .notify_contract_handler(
-            ContractHandlerEvent::PutQuery {
-                key,
-                state,
-                related_contracts,
-                contract: Some(contract.clone()),
-            },
-            client_id,
-        )
+        .notify_contract_handler(ContractHandlerEvent::PutQuery {
+            key,
+            state,
+            related_contracts,
+            contract: Some(contract.clone()),
+        })
         .await
     {
         Ok(ContractHandlerEvent::PutResponse {

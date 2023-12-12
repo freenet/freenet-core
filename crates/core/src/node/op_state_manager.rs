@@ -2,13 +2,11 @@ use std::{cmp::Reverse, collections::BTreeSet, sync::Arc, time::Duration};
 
 use dashmap::{DashMap, DashSet};
 use either::Either;
-use tokio::sync::Mutex;
 use tracing::Instrument;
 
 use crate::{
     config::GlobalExecutor,
     contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent, SenderHalve},
-    dev_tool::ClientId,
     message::{NetMessage, Transaction, TransactionType},
     operations::{
         connect::ConnectOp, get::GetOp, put::PutOp, subscribe::SubscribeOp, update::UpdateOp,
@@ -53,15 +51,14 @@ pub(crate) struct OpManager {
     pub ring: Arc<Ring>,
     ops: Arc<Ops>,
     to_event_listener: EventLoopNotificationsSender,
-    // todo: remove the need for a mutex here if possible
-    ch_outbound: Mutex<ContractHandlerChannel<SenderHalve>>,
+    pub ch_outbound: ContractHandlerChannel<SenderHalve>,
     new_transactions: tokio::sync::mpsc::Sender<Transaction>,
 }
 
 impl OpManager {
     pub(super) fn new<ER: NetEventRegister + Clone>(
         notification_channel: EventLoopNotificationsSender,
-        contract_handler: ContractHandlerChannel<SenderHalve>,
+        ch_outbound: ContractHandlerChannel<SenderHalve>,
         config: &NodeConfig,
         event_register: ER,
     ) -> Result<Self, anyhow::Error> {
@@ -94,7 +91,7 @@ impl OpManager {
             ring,
             ops,
             to_event_listener: notification_channel,
-            ch_outbound: Mutex::new(contract_handler),
+            ch_outbound,
             new_transactions,
         })
     }
@@ -104,16 +101,11 @@ impl OpManager {
     ///
     /// Useful when transitioning between states that do not require any network communication
     /// with other nodes, like intermediate states before returning.
-    pub async fn notify_op_change(
-        &self,
-        msg: NetMessage,
-        op: OpEnum,
-        client_id: Option<ClientId>,
-    ) -> Result<(), OpError> {
+    pub async fn notify_op_change(&self, msg: NetMessage, op: OpEnum) -> Result<(), OpError> {
         // push back the state to the stack
         self.push(*msg.id(), op).await?;
         self.to_event_listener
-            .send(Either::Left((msg, client_id)))
+            .send(Either::Left(msg))
             .await
             .map_err(Into::into)
     }
@@ -122,18 +114,8 @@ impl OpManager {
     pub async fn notify_contract_handler(
         &self,
         msg: ContractHandlerEvent,
-        client_id: Option<ClientId>,
     ) -> Result<ContractHandlerEvent, ContractError> {
-        self.ch_outbound
-            .lock()
-            .await
-            .send_to_handler(msg, client_id)
-            .await
-    }
-
-    pub async fn recv_from_handler(&self) -> crate::contract::EventId {
-        // self.ch_outbound.lock().await.recv_from_handler();
-        todo!()
+        self.ch_outbound.send_to_handler(msg).await
     }
 
     pub async fn push(&self, id: Transaction, op: OpEnum) -> Result<(), OpError> {

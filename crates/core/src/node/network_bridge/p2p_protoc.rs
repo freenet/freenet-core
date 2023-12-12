@@ -35,11 +35,14 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::Instrument;
 use unsigned_varint::codec::UviBytes;
 
-use super::{ConnectionError, EventLoopNotifications, NetworkBridge};
+use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::{
     client_events::ClientId,
     config::{self, GlobalExecutor},
-    contract::{ClientResponsesSender, ExecutorToEventLoopChannel, NetworkEventListenerHalve},
+    contract::{
+        ClientResponsesSender, ContractHandlerChannel, ExecutorToEventLoopChannel,
+        NetworkEventListenerHalve, WaitingResolution,
+    },
     message::{NetMessage, NodeEvent, Transaction},
     node::{
         handle_aborted_op, process_message, InitPeerNode, NetEventRegister, NodeConfig, OpManager,
@@ -268,8 +271,9 @@ impl P2pConnManager {
     pub async fn run_event_listener(
         mut self,
         op_manager: Arc<OpManager>,
-        mut notification_channel: EventLoopNotifications,
-        mut executor_channel: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
+        mut client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
+        mut notification_channel: EventLoopNotificationsReceiver,
+        mut executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         cli_response_sender: ClientResponsesSender,
         mut node_controller: Receiver<NodeEvent>,
     ) -> Result<(), anyhow::Error> {
@@ -289,7 +293,7 @@ impl P2pConnManager {
             let network_msg = self.swarm.select_next_some().map(|event| match event {
                 SwarmEvent::Behaviour(NetEvent::Freenet(msg)) => {
                     tracing::debug!("Message inbound: {:?}", msg);
-                    Ok(Left((*msg, None)))
+                    Ok(Left(*msg))
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
                     Ok(Right(ConnMngrActions::ConnectionClosed {
@@ -360,7 +364,7 @@ impl P2pConnManager {
 
             let notification_msg = notification_channel.0.recv().map(|m| match m {
                 None => Ok(Right(ClosedChannel)),
-                Some(Left((msg, cli_id))) => Ok(Left((msg, cli_id))),
+                Some(Left(msg)) => Ok(Left(msg)),
                 Some(Right(action)) => Ok(Right(NodeAction(action))),
             });
 
@@ -384,13 +388,12 @@ impl P2pConnManager {
                         Ok(Right(ClosedChannel))
                     }
                 }
-                event_id = op_manager.recv_from_handler() => {
-                    if let Some((client_id, transaction)) = event_id.client_id().zip(event_id.transaction()) {
-                        tx_to_client.insert(transaction, client_id);
-                    }
+                event_id = client_wait_for_transaction.recv_from_client_event() => {
+                    let (client_id, transaction) = event_id.map_err(|err| anyhow::anyhow!(err))?;
+                    tx_to_client.insert(transaction, client_id);
                     continue;
                 }
-                id = executor_channel.transaction_from_executor() => {
+                id = executor_listener.transaction_from_executor() => {
                     let id = id.map_err(|err| anyhow::anyhow!(err))?;
                     pending_from_executor.insert(id);
                     continue;
@@ -398,7 +401,7 @@ impl P2pConnManager {
             };
 
             match msg {
-                Ok(Left((msg, client_id))) => {
+                Ok(Left(msg)) => {
                     let cb = self.bridge.clone();
                     match msg {
                         NetMessage::Aborted(tx) => {
@@ -415,10 +418,9 @@ impl P2pConnManager {
                         msg => {
                             let executor_callback = pending_from_executor
                                 .remove(msg.id())
-                                .then(|| executor_channel.callback());
+                                .then(|| executor_listener.callback());
                             let pending_client_req = tx_to_client.get(msg.id()).copied();
                             let client_req_handler_callback = if pending_client_req.is_some() {
-                                debug_assert!(client_id.is_none());
                                 Some(cli_response_sender.clone())
                             } else {
                                 None
@@ -438,7 +440,7 @@ impl P2pConnManager {
                                     self.event_listener.trait_clone(),
                                     executor_callback,
                                     client_req_handler_callback,
-                                    client_id,
+                                    pending_client_req,
                                 )
                                 .instrument(span),
                             );

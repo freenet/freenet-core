@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::{
-    client_events::ClientId,
     contract::ContractError,
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
@@ -19,7 +18,7 @@ pub(crate) use self::messages::SubscribeMsg;
 const MAX_RETRIES: usize = 10;
 
 pub(crate) struct SubscribeOp {
-    id: Transaction,
+    pub id: Transaction,
     state: Option<SubscribeState>,
 }
 
@@ -100,7 +99,7 @@ impl Operation for SubscribeOp {
         conn_manager: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
-        client_id: Option<ClientId>,
+        // client_id: Option<ClientId>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let return_msg;
@@ -268,27 +267,24 @@ impl Operation for SubscribeOp {
                     id,
                     target,
                     ..
-                } => {
-                    match self.state {
-                        Some(SubscribeState::AwaitingResponse { .. }) => {
-                            tracing::info!(
-                                tx = %id,
-                                %key,
-                                this_peer = %target.peer,
-                                provider = %sender.peer,
-                                "Subscribed to contract"
-                            );
-                            op_manager.ring.add_subscription(key.clone());
-                            // fixme: should inform back to the network event loop in case a client is waiting for response
-                            let _ = client_id;
-                            new_state = Some(SubscribeState::Completed);
-                            return_msg = None;
-                        }
-                        _other => {
-                            return Err(OpError::invalid_transition(self.id));
-                        }
+                } => match self.state {
+                    Some(SubscribeState::AwaitingResponse { .. }) => {
+                        tracing::info!(
+                            tx = %id,
+                            %key,
+                            this_peer = %target.peer,
+                            provider = %sender.peer,
+                            "Subscribed to contract"
+                        );
+                        op_manager.ring.add_subscription(key.clone());
+
+                        new_state = Some(SubscribeState::Completed);
+                        return_msg = None;
                     }
-                }
+                    _other => {
+                        return Err(OpError::invalid_transition(self.id));
+                    }
+                },
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
@@ -339,7 +335,6 @@ enum SubscribeState {
 pub(crate) async fn request_subscribe(
     op_manager: &OpManager,
     sub_op: SubscribeOp,
-    client_id: Option<ClientId>,
 ) -> Result<(), OpError> {
     let (target, _id) = if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
         if !op_manager.ring.is_contract_cached(key) {
@@ -373,7 +368,7 @@ pub(crate) async fn request_subscribe(
                 state: new_state,
             };
             op_manager
-                .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op), client_id)
+                .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op))
                 .await?;
         }
         _ => return Err(OpError::invalid_transition(sub_op.id)),

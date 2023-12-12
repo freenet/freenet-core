@@ -36,7 +36,6 @@ pub(crate) async fn handle_op_request<Op, NB>(
     op_manager: &OpManager,
     network_bridge: &mut NB,
     msg: &Op::Message,
-    client_id: Option<ClientId>,
 ) -> Result<Option<OpEnum>, OpError>
 where
     Op: Operation,
@@ -47,8 +46,7 @@ where
     let result = {
         let OpInitialization { sender: s, op } = Op::load_or_init(op_manager, msg).await?;
         sender = s;
-        op.process_message(network_bridge, op_manager, msg, client_id)
-            .await
+        op.process_message(network_bridge, op_manager, msg).await
     };
     handle_op_result(op_manager, network_bridge, result, tx, sender).await
 }
@@ -301,6 +299,6 @@ where
         conn_manager: &'a mut CB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
-        client_id: Option<ClientId>,
+        // client_id: Option<ClientId>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>>;
 }
