@@ -1,4 +1,3 @@
-#![allow(unused)] // FIXME: remove this
 use std::collections::BTreeMap;
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -19,7 +18,7 @@ use super::{
 };
 use crate::client_events::HostResult;
 use crate::message::Transaction;
-use crate::{client_events::ClientId, node::PeerCliConfig, runtime::Runtime, DynError};
+use crate::{client_events::ClientId, node::PeerCliConfig, wasm_runtime::Runtime, DynError};
 
 pub(crate) struct ClientResponses(UnboundedReceiver<(ClientId, HostResult)>);
 
@@ -99,7 +98,7 @@ impl ContractHandler for NetworkContractHandler<Runtime> {
         Self: Sized + 'static,
     {
         async {
-            let mut executor = Executor::from_config(config, Some(executor_request_sender)).await?;
+            let executor = Executor::from_config(config, Some(executor_request_sender)).await?;
             Ok(Self { executor, channel })
         }
         .boxed()
@@ -454,6 +453,92 @@ pub mod test {
         };
         assert_eq!(contract.data(), vec![0, 1, 2, 3]);
 
+        Ok(())
+    }
+}
+
+pub(super) mod in_memory {
+    use crate::client_events::ClientId;
+    use freenet_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
+    use futures::{future::BoxFuture, FutureExt};
+    use tokio::sync::mpsc::UnboundedSender;
+
+    use super::{
+        super::{
+            executor::{ExecutorHalve, ExecutorToEventLoopChannel},
+            Executor, MockRuntime,
+        },
+        ContractHandler, ContractHandlerChannel, ContractHandlerHalve,
+    };
+    use crate::DynError;
+
+    pub(crate) struct MemoryContractHandler {
+        channel: ContractHandlerChannel<ContractHandlerHalve>,
+        runtime: Executor<MockRuntime>,
+    }
+
+    impl MemoryContractHandler {
+        pub async fn new(
+            channel: ContractHandlerChannel<ContractHandlerHalve>,
+            executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
+            identifier: &str,
+        ) -> Self {
+            MemoryContractHandler {
+                channel,
+                runtime: Executor::new_mock(identifier, executor_request_sender)
+                    .await
+                    .unwrap(),
+            }
+        }
+    }
+
+    impl ContractHandler for MemoryContractHandler {
+        type Builder = String;
+        type ContractExecutor = Executor<MockRuntime>;
+
+        fn build(
+            channel: ContractHandlerChannel<ContractHandlerHalve>,
+            executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
+            identifier: Self::Builder,
+        ) -> BoxFuture<'static, Result<Self, DynError>>
+        where
+            Self: Sized + 'static,
+        {
+            async move {
+                Ok(MemoryContractHandler::new(channel, executor_request_sender, &identifier).await)
+            }
+            .boxed()
+        }
+
+        fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve> {
+            &mut self.channel
+        }
+
+        fn handle_request<'a, 's: 'a>(
+            &'s mut self,
+            _req: ClientRequest<'a>,
+            _client_id: ClientId,
+            _updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
+        ) -> BoxFuture<'static, Result<HostResponse, DynError>> {
+            unreachable!()
+        }
+
+        fn executor(&mut self) -> &mut Self::ContractExecutor {
+            &mut self.runtime
+        }
+    }
+
+    #[test]
+    fn serialization() -> Result<(), anyhow::Error> {
+        use freenet_stdlib::prelude::WrappedContract;
+        let bytes = crate::util::test::random_bytes_1kb();
+        let mut gen = arbitrary::Unstructured::new(&bytes);
+        let contract: WrappedContract = gen.arbitrary()?;
+
+        let serialized = bincode::serialize(&contract)?;
+        let deser: WrappedContract = bincode::deserialize(&serialized)?;
+        assert_eq!(deser.code(), contract.code());
+        assert_eq!(deser.key(), contract.key());
         Ok(())
     }
 }

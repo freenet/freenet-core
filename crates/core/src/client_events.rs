@@ -1,3 +1,5 @@
+//! Clients events related logic and type definitions. For example, receival of client events from applications throught the HTTP gateway.
+
 use freenet_stdlib::client_api::ClientRequest;
 use freenet_stdlib::client_api::{ClientError, HostResponse};
 use futures::future::BoxFuture;

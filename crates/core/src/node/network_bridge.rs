@@ -1,4 +1,4 @@
-//! Types and definitions to handle all socket communication for the peer nodes.
+//! Types and definitions to handle all inter-peer communication.
 
 use std::ops::{Deref, DerefMut};
 

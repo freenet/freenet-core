@@ -1,14 +1,7 @@
 //! Ring protocol logic and supporting types.
 //!
-//! # Routing
-//! The routing mechanism consist in a greedy routing algorithm which just targets
-//! the closest location to the target destination iteratively in each hop, until it reaches
-//! the destination.
-//!
-//! Path is limited to local knowledge, at any given point only 3 data points are known:
-//! - previous node
-//! - next node
-//! - final location
+//! Mainly maintains a healthy and optimal pool of connections to other peers in the network
+//! and routes requests to the optimal peers.
 
 use std::hash::Hash;
 use std::sync::atomic::AtomicBool;

@@ -412,7 +412,7 @@ impl EventRegister {
             Ok(file) => file,
             Err(err) => {
                 tracing::error!("Failed openning log file {:?} with: {err}", event_log_path);
-                panic!("Failed openning log file"); // fixme: propagate this to the main thread
+                panic!("Failed openning log file"); // fixme: propagate this to the main event loop
             }
         };
         let mut num_written = 0;

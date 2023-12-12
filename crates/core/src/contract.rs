@@ -1,20 +1,23 @@
+//! Handling of contracts and delegates, including storage, execution, caching, etc.
+//!
+//! Internally uses the wasm_runtime module to execute contract and/or delegate instructions.
+
 use either::Either;
 use freenet_stdlib::prelude::*;
 
 mod executor;
 mod handler;
-mod in_memory;
 pub mod storages;
 
 pub(crate) use executor::{
-    executor_channel, Callback, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
+    executor_channel, mock_runtime::MockRuntime, Callback, ExecutorToEventLoopChannel,
+    NetworkEventListenerHalve,
 };
 pub(crate) use handler::{
-    contract_handler_channel, ClientResponses, ClientResponsesSender, ContractHandler,
-    ContractHandlerChannel, ContractHandlerEvent, EventId, NetworkContractHandler, SenderHalve,
-    StoreResponse,
+    contract_handler_channel, in_memory::MemoryContractHandler, ClientResponses,
+    ClientResponsesSender, ContractHandler, ContractHandlerChannel, ContractHandlerEvent, EventId,
+    NetworkContractHandler, SenderHalve, StoreResponse,
 };
-pub(crate) use in_memory::{MemoryContractHandler, MockRuntime};
 
 pub use executor::{Executor, ExecutorError, OperationMode};
 

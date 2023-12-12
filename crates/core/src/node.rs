@@ -5,7 +5,8 @@
 //! Node comes with different underlying implementations that can be used upon construction.
 //! Those implementations are:
 //! - libp2p: all the connection is handled by libp2p.
-//! - In memory: a simplifying node used for emulation purposes mainly.
+//! - in-memory: a simplifying node used for emulation purposes mainly.
+//! - inter-process: similar to in-memory, but can be rana cross multiple processes, closer to the real p2p impl
 
 use std::{
     fmt::Display,
@@ -382,7 +383,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                     key: _key,
                     data: _delta,
                 } => {
-                    // FIXME: DO THIS
+                    // FIXME: perform updates
                     tracing::debug!(
                         this_peer = %op_manager.ring.peer_key,
                         "Received update from user event",
