@@ -1,5 +1,7 @@
-use crate::ring::Location;
+use crate::ring::{Connection, Location};
+use parking_lot::RwLock;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Tracks requests sent by a node to its neighbors and creates a density map, which
@@ -12,15 +14,20 @@ pub(crate) struct RequestDensityTracker {
     request_list: VecDeque<Location>,
     window_size: usize,
     samples: usize,
+    neighbors: Arc<RwLock<BTreeMap<Location, Vec<Connection>>>>,
 }
 
 impl RequestDensityTracker {
-    pub(crate) fn new(window_size: usize) -> Self {
+    pub(crate) fn new(
+        window_size: usize,
+        neighbors: Arc<RwLock<BTreeMap<Location, Vec<Connection>>>>,
+    ) -> Self {
         Self {
             request_locations: BTreeMap::new(),
             request_list: VecDeque::with_capacity(window_size),
             window_size,
             samples: 0,
+            neighbors,
         }
     }
 
@@ -42,11 +49,8 @@ impl RequestDensityTracker {
         }
     }
 
-    pub(crate) fn create_density_map(
-        &self,
-        neighbors: &BTreeMap<Location, usize>,
-    ) -> Result<DensityMap, DensityMapError> {
-        debug_assert!(!neighbors.is_empty());
+    pub(crate) fn create_density_map(&self) -> Result<DensityMap, DensityMapError> {
+        let neighbors = self.neighbors.read();
         if neighbors.is_empty() {
             return Err(DensityMapError::EmptyNeighbors);
         }
@@ -198,12 +202,8 @@ impl CachedDensityMap {
         CachedDensityMap { density_map: None }
     }
 
-    pub fn set(
-        &mut self,
-        tracker: &RequestDensityTracker,
-        current_neighbors: &BTreeMap<Location, usize>,
-    ) -> Result<(), DensityMapError> {
-        let density_map = tracker.create_density_map(current_neighbors)?;
+    pub fn set(&mut self, tracker: &RequestDensityTracker) -> Result<(), DensityMapError> {
+        let density_map = tracker.create_density_map()?;
         self.density_map = Some(density_map);
         Ok(())
     }
@@ -225,18 +225,17 @@ mod tests {
 
     #[test]
     fn test_create_density_map() {
-        let mut sw = RequestDensityTracker::new(5);
+        let mut neighbors = BTreeMap::new();
+        neighbors.insert(Location::new(0.2), Vec::new());
+        neighbors.insert(Location::new(0.6), Vec::new());
+        let mut sw = RequestDensityTracker::new(5, Arc::new(RwLock::new(neighbors)));
         sw.sample(Location::new(0.21));
         sw.sample(Location::new(0.22));
         sw.sample(Location::new(0.23));
         sw.sample(Location::new(0.61));
         sw.sample(Location::new(0.62));
 
-        let mut neighbors = BTreeMap::new();
-        neighbors.insert(Location::new(0.2), 1);
-        neighbors.insert(Location::new(0.6), 1);
-
-        let result = sw.create_density_map(&neighbors);
+        let result = sw.create_density_map();
         assert!(result.is_ok());
         let result = result.unwrap();
         assert_eq!(

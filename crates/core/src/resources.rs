@@ -72,12 +72,13 @@ mod running_average;
 use self::meter::{AttributionSource, Meter, ResourceType};
 use crate::resources::meter::ALL_RESOURCE_TYPES;
 use crate::resources::rate::{Rate, RateProportion};
-use crate::ring::{Location, PeerKeyLocation};
+use crate::ring::{Connection, Location, PeerKeyLocation};
 use crate::topology::request_density_tracker::RequestDensityTracker;
 use crate::topology::TopologyManager;
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -95,13 +96,17 @@ pub(crate) struct ResourceManager {
 }
 
 impl ResourceManager {
-    pub fn new(limits: Limits) -> Self {
+    pub fn new(
+        limits: Limits,
+        neighbors: Arc<RwLock<BTreeMap<Location, Vec<Connection>>>>,
+    ) -> Self {
         ResourceManager {
             meter: Meter::new_with_window_size(100),
             limits,
             source_creation_times: DashMap::new(),
             request_density_tracker: RwLock::new(RequestDensityTracker::new(
                 REQUEST_DENSITY_TRACKER_SAMPLE_SIZE,
+                neighbors,
             )),
             topology_manager: TopologyManager::new(),
         }
@@ -120,8 +125,7 @@ impl ResourceManager {
         now: Instant,
     ) {
         if !self.source_creation_times.contains_key(attribution) {
-            self.source_creation_times
-                .insert(attribution.clone(), now);
+            self.source_creation_times.insert(attribution.clone(), now);
         }
 
         self.meter.report(attribution, resource, value);
@@ -185,7 +189,16 @@ impl ResourceManager {
     }
 
     /// Adds a single connection (one at a time to avoid overshooting)
-    fn add_connections(&mut self, usage: &Usage) {}
+    fn add_connections(&mut self, usage: &Usage) {
+        let neighbors: BTreeMap<Location, usize> = BTreeMap::new();
+        todo!("""
+        Need to get the neighbors, Ring will need to keep Resources up-to-date
+        """);
+        let desired_location = self
+            .request_density_tracker
+            .read()
+            .create_density_map(neighbors);
+    }
 
     /// Calculates which peers should be deleted in order to bring the total
     /// resource usage below the specified limit.

@@ -135,8 +135,8 @@ impl Display for PeerKeyLocation {
     }
 }
 
-struct Connection {
-    location: PeerKeyLocation,
+pub(crate) struct Connection {
+    pub(crate) location: PeerKeyLocation,
     open_at: Instant,
 }
 
@@ -275,8 +275,11 @@ impl Ring {
 
         // Just initialize with a fake location, this will be later updated when the peer has an actual location assigned.
 
+        let connections_by_location = Arc::new(RwLock::new(BTreeMap::new()));
+
         let resource_manager = RwLock::new(ResourceManager::new(
             Self::DEFAULT_LIMITS,
+            connections_by_location,
         ));
 
         let ring = Ring {
@@ -287,7 +290,7 @@ impl Ring {
             router,
             resource_manager,
             fast_acquisition: AtomicBool::new(true),
-            connections_by_location: RwLock::new(BTreeMap::new()),
+            connections_by_location,
             location_for_peer: RwLock::new(BTreeMap::new()),
             cached_contracts: DashSet::new(),
             own_location,
@@ -439,8 +442,7 @@ impl Ring {
     }
 
     pub fn record_request(&self, requested_location: Location, request_type: TransactionType) {
-        self
-            .resource_manager
+        self.resource_manager
             .write()
             .topology_manager
             .record_request(requested_location, request_type);
@@ -463,7 +465,11 @@ impl Ring {
     fn refresh_density_request_cache(&self) {
         let cbl = self.connections_by_location.read();
         let current_neighbors = &Self::current_neighbors(&cbl);
-        let _ = self.resource_manager.write().topology_manager.refresh_cache(current_neighbors);
+        let _ = self
+            .resource_manager
+            .write()
+            .topology_manager
+            .refresh_cache(current_neighbors);
     }
 
     /// Return the most optimal peer caching a given contract.
