@@ -217,7 +217,7 @@ impl Operation for PutOp {
                     target,
                 } => {
                     let key = contract.key();
-                    let is_cached_contract = op_manager.ring.is_contract_cached(&key);
+                    let is_cached_contract = op_manager.ring.is_subscribed_to_contract(&key);
 
                     tracing::debug!(
                         tx = %id,
@@ -229,10 +229,10 @@ impl Operation for PutOp {
                     if !is_cached_contract
                         && op_manager
                             .ring
-                            .within_caching_distance(&Location::from(&key))
+                            .within_subscribing_distance(&Location::from(&key))
                     {
                         tracing::debug!(tx = %id, %key, "Contract not cached @ peer {}", target.peer);
-                        match try_to_cache_contract(op_manager, contract, &key).await {
+                        match try_subscribing_to_contract(op_manager, key.clone()).await {
                             Ok(_) => {}
                             Err(err) => return Err(err),
                         }
@@ -257,7 +257,13 @@ impl Operation for PutOp {
                         contract,
                     )
                     .await?;
-                    tracing::debug!(tx = %id, "Contract successfully updated");
+                    tracing::debug!(
+                        tx = %id,
+                        "Successfully updated a value for contract {} @ {:?}",
+                        key,
+                        target.location
+                    );
+
                     // if the change was successful, communicate this back to the requestor and broadcast the change
                     conn_manager
                         .send(
@@ -288,12 +294,6 @@ impl Operation for PutOp {
                         .subscribers_of(&key)
                         .map(|i| i.value().to_vec())
                         .unwrap_or_default();
-                    tracing::debug!(
-                        tx = %id,
-                        "Successfully updated a value for contract {} @ {:?}",
-                        key,
-                        target.location
-                    );
 
                     match try_to_broadcast(
                         *id,
@@ -320,6 +320,7 @@ impl Operation for PutOp {
                     sender,
                     sender_subscribers,
                 } => {
+                    // todo: check if we can get rid of passing sender_subscribers now that we have anti write-amplification
                     let target = op_manager.ring.own_location();
 
                     tracing::debug!("Attempting contract value update");
@@ -461,12 +462,12 @@ impl Operation for PutOp {
                         "Forwarding changes, trying put the contract"
                     );
 
-                    let cached_contract = op_manager.ring.is_contract_cached(&key);
+                    let cached_contract = op_manager.ring.is_subscribed_to_contract(&key);
                     let within_caching_dist = op_manager
                         .ring
-                        .within_caching_distance(&Location::from(&key));
+                        .within_subscribing_distance(&Location::from(&key));
                     if !cached_contract && within_caching_dist {
-                        match try_to_cache_contract(op_manager, contract, &key).await {
+                        match try_subscribing_to_contract(op_manager, key.clone()).await {
                             Ok(_) => {}
                             Err(err) => return Err(err),
                         }
@@ -523,17 +524,20 @@ fn build_op_result(
     })
 }
 
-pub(super) async fn try_to_cache_contract<'a>(
-    op_manager: &'a OpManager,
-    contract: &ContractContainer,
-    key: &ContractKey,
+pub(super) async fn try_subscribing_to_contract(
+    op_manager: &OpManager,
+    key: ContractKey,
 ) -> Result<(), OpError> {
     // this node does not have the contract, so instead store the contract and execute the put op.
     let res = op_manager
-        .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
+        .notify_contract_handler(ContractHandlerEvent::Subscribe { key: key.clone() })
         .await?;
-    if let ContractHandlerEvent::CacheResult(Ok(_)) = res {
-        op_manager.ring.contract_cached(key);
+    if let ContractHandlerEvent::SubscribeResponse {
+        response: Ok(subcribed_to),
+        ..
+    } = res
+    {
+        op_manager.ring.add_subscription(key, subcribed_to);
         tracing::debug!("Contract successfully cached");
         Ok(())
     } else {
@@ -944,6 +948,7 @@ mod test {
         )
         .await;
         let mut locations = sim_nw.get_locations_by_node();
+        let gw0_loc = locations.remove(&"gateway-0".into()).unwrap();
         let node0_loc = locations.remove(&"node-1".into()).unwrap();
         let node1_loc = locations.remove(&"node-2".into()).unwrap();
 
@@ -952,18 +957,20 @@ mod test {
             owned_contracts: vec![(
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone())),
                 contract_val.clone(),
+                Some(gw0_loc),
             )],
             events_to_generate: HashMap::new(),
-            contract_subscribers: HashMap::from_iter([(key.clone(), vec![node1_loc])]),
+            contract_subscribers: HashMap::new(),
         };
 
         let node_2 = NodeSpecification {
             owned_contracts: vec![(
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone())),
                 contract_val.clone(),
+                Some(gw0_loc),
             )],
             events_to_generate: HashMap::new(),
-            contract_subscribers: HashMap::from_iter([(key.clone(), vec![node0_loc])]),
+            contract_subscribers: HashMap::new(),
         };
 
         let put_event = ContractRequest::Put {
@@ -977,9 +984,10 @@ mod test {
             owned_contracts: vec![(
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone())),
                 contract_val,
+                None,
             )],
             events_to_generate: HashMap::from_iter([(1, put_event)]),
-            contract_subscribers: HashMap::new(),
+            contract_subscribers: HashMap::from_iter([(key.clone(), vec![node0_loc, node1_loc])]),
         };
 
         // establish network

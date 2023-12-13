@@ -7,11 +7,10 @@ use tokio::sync::mpsc::error::SendError;
 
 use crate::{
     client_events::{ClientId, HostResult},
-    contract::ContractError,
+    contract::{ContractError, ExecutorError},
     message::{InnerMessage, NetMessage, Transaction, TransactionType},
     node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
-    DynError,
 };
 
 pub(crate) mod connect;
@@ -212,7 +211,7 @@ pub(crate) enum OpError {
     #[error(transparent)]
     ContractError(#[from] ContractError),
     #[error(transparent)]
-    ExecutorError(DynError),
+    ExecutorError(#[from] ExecutorError),
 
     #[error("unexpected operation state")]
     UnexpectedOpState,
@@ -226,7 +225,6 @@ pub(crate) enum OpError {
     },
     #[error("failed notifying, channel closed")]
     NotificationError,
-    #[cfg(debug_assertions)]
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
     IncorrectTxType(TransactionType, TransactionType),
     #[error("op not present: {0}")]

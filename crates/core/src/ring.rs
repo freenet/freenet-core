@@ -20,7 +20,7 @@ use std::{
 };
 
 use anyhow::bail;
-use dashmap::{mapref::one::Ref as DmRef, DashMap, DashSet};
+use dashmap::{mapref::one::Ref as DmRef, DashMap};
 use either::Either;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
@@ -173,8 +173,6 @@ pub(crate) struct Ring {
     fast_acquisition: AtomicBool,
     connections_by_location: RwLock<BTreeMap<Location, Vec<Connection>>>,
     location_for_peer: RwLock<BTreeMap<PeerId, Location>>,
-    /// contracts in the ring cached by this node
-    cached_contracts: DashSet<ContractKey>,
     own_location: AtomicU64,
     /// The container for subscriber is a vec instead of something like a hashset
     /// that would allow for blind inserts of duplicate peers subscribing because
@@ -182,7 +180,8 @@ pub(crate) struct Ring {
     /// of subscribers more often than inserting, and anyways is a relatively short sequence
     /// then is more optimal to just use a vector for it's compact memory layout.
     subscribers: DashMap<ContractKey, Vec<PeerKeyLocation>>,
-    subscriptions: RwLock<Vec<ContractKey>>,
+    /// Contracts this peer is subscribed to.
+    subscriptions: DashMap<ContractKey, PeerKeyLocation>,
     /// Interim connections ongoing handshake or successfully open connections
     /// Is important to keep track of this so no more connections are accepted prematurely.
     open_connections: AtomicUsize,
@@ -271,11 +270,10 @@ impl Ring {
             fast_acquisition: AtomicBool::new(true),
             connections_by_location: RwLock::new(BTreeMap::new()),
             location_for_peer: RwLock::new(BTreeMap::new()),
-            cached_contracts: DashSet::new(),
             own_location,
             peer_key,
             subscribers: DashMap::new(),
-            subscriptions: RwLock::new(Vec::new()),
+            subscriptions: DashMap::new(),
             open_connections: AtomicUsize::new(0),
             live_tx_tracker: live_tx_tracker.clone(),
             event_register: Box::new(event_register),
@@ -338,25 +336,23 @@ impl Ring {
         }
     }
 
-    #[inline(always)]
-    /// Return if a location is within appropiate caching distance.
-    pub fn within_caching_distance(&self, _loc: &Location) -> bool {
-        // This always returns true as of current version since LRU cache will make sure
-        // to remove contracts when capacity is fully utilized.
-        // So all nodes along the path will be caching all the contracts.
-        // This will be changed in the future as the caching logic gets more complicated.
-        true
+    /// Return if a location is within appropiate subscription distance.
+    pub fn within_subscribing_distance(&self, loc: &Location) -> bool {
+        const CACHING_DISTANCE: f64 = 0.05;
+        const MAX_CACHED: usize = 100;
+        let caching_distance = Distance::new(CACHING_DISTANCE);
+        self.subscriptions.len() < MAX_CACHED
+            && self
+                .own_location()
+                .location
+                .map(|own_loc| own_loc.distance(loc) <= caching_distance)
+                .unwrap_or(false)
     }
 
-    /// Whether this node already has this contract cached or not.
+    /// Whether this node already is subscribed to this contract or not.
     #[inline]
-    pub fn is_contract_cached(&self, key: &ContractKey) -> bool {
-        self.cached_contracts.contains(key)
-    }
-
-    #[inline]
-    pub fn contract_cached(&self, key: &ContractKey) {
-        self.cached_contracts.insert(key.clone());
+    pub fn is_subscribed_to_contract(&self, key: &ContractKey) -> bool {
+        self.subscriptions.contains_key(key)
     }
 
     /// Update this node location.
@@ -560,8 +556,8 @@ impl Ring {
     }
 
     /// Add a new subscription for this peer.
-    pub fn add_subscription(&self, contract: ContractKey) {
-        self.subscriptions.write().push(contract);
+    pub fn add_subscription(&self, contract: ContractKey, peer: PeerKeyLocation) {
+        self.subscriptions.insert(contract, peer);
     }
 
     pub fn subscribers_of(

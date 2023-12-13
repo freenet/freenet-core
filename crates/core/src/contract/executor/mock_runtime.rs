@@ -108,6 +108,15 @@ impl ContractExecutor for Executor<MockRuntime> {
             _ => unreachable!(),
         }
     }
+
+    async fn subscribe_to_contract(
+        &mut self,
+        key: ContractKey,
+    ) -> Result<PeerKeyLocation, ExecutorError> {
+        let request = SubscribeContract { key };
+        let result: operations::subscribe::SubscribeResult = self.op_request(request).await?;
+        Ok(result.subscribed_to)
+    }
 }
 
 #[cfg(test)]

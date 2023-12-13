@@ -28,22 +28,25 @@ impl SubscribeOp {
     }
 
     pub(super) fn finalized(&self) -> bool {
-        matches!(self.state, Some(SubscribeState::Completed))
+        matches!(self.state, Some(SubscribeState::Completed { .. }))
     }
 
     pub(super) fn record_transfer(&mut self) {}
 }
 
-pub(crate) struct SubscribeResult {}
+pub(crate) struct SubscribeResult {
+    pub subscribed_to: PeerKeyLocation,
+}
 
 impl TryFrom<SubscribeOp> for SubscribeResult {
     type Error = OpError;
 
     fn try_from(value: SubscribeOp) -> Result<Self, Self::Error> {
-        value
-            .finalized()
-            .then_some(SubscribeResult {})
-            .ok_or(OpError::UnexpectedOpState)
+        if let Some(SubscribeState::Completed { subscribed_to }) = value.state {
+            Ok(SubscribeResult { subscribed_to })
+        } else {
+            Err(OpError::UnexpectedOpState)
+        }
     }
 }
 
@@ -120,7 +123,7 @@ impl Operation for SubscribeOp {
                         target: *target,
                         subscriber: sender,
                         skip_list: vec![sender.peer],
-                        htl: 0,
+                        htl: op_manager.ring.max_hops_to_live,
                     });
                 }
                 SubscribeMsg::SeekNode {
@@ -145,7 +148,7 @@ impl Operation for SubscribeOp {
                         }
                     };
 
-                    if !op_manager.ring.is_contract_cached(key) {
+                    if !op_manager.ring.is_subscribed_to_contract(key) {
                         tracing::debug!(tx = %id, "Contract {} not found at {}, trying other peer", key, target.peer);
 
                         let Some(new_target) = op_manager
@@ -276,9 +279,11 @@ impl Operation for SubscribeOp {
                             provider = %sender.peer,
                             "Subscribed to contract"
                         );
-                        op_manager.ring.add_subscription(key.clone());
+                        op_manager.ring.add_subscription(key.clone(), *sender);
 
-                        new_state = Some(SubscribeState::Completed);
+                        new_state = Some(SubscribeState::Completed {
+                            subscribed_to: *sender,
+                        });
                         return_msg = None;
                     }
                     _other => {
@@ -328,7 +333,9 @@ enum SubscribeState {
         skip_list: Vec<PeerId>,
         retries: usize,
     },
-    Completed,
+    Completed {
+        subscribed_to: PeerKeyLocation,
+    },
 }
 
 /// Request to subscribe to value changes from a contract.
@@ -337,7 +344,7 @@ pub(crate) async fn request_subscribe(
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
     let (target, _id) = if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        if !op_manager.ring.is_contract_cached(key) {
+        if !op_manager.ring.is_subscribed_to_contract(key) {
             return Err(OpError::ContractError(ContractError::ContractNotFound(
                 key.clone(),
             )));
@@ -495,6 +502,7 @@ mod test {
             owned_contracts: vec![(
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
                 contract_val,
+                None,
             )],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::new(),

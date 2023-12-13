@@ -17,6 +17,7 @@ use super::{
 };
 use crate::client_events::HostResult;
 use crate::message::Transaction;
+use crate::ring::PeerKeyLocation;
 use crate::{client_events::ClientId, node::PeerCliConfig, wasm_runtime::Runtime, DynError};
 
 pub(crate) struct ClientResponsesReceiver(UnboundedReceiver<(ClientId, HostResult)>);
@@ -335,31 +336,35 @@ struct InternalCHEvent {
 
 #[derive(Debug)]
 pub(crate) enum ContractHandlerEvent {
-    /// Try to push/put a new value into the contract.
+    /// Try to push/put a new value into the contract
     PutQuery {
         key: ContractKey,
         state: WrappedState,
         related_contracts: RelatedContracts<'static>,
         contract: Option<ContractContainer>,
     },
-    /// The response to a push query.
+    /// The response to a push query
     PutResponse {
-        new_value: Result<WrappedState, DynError>,
+        new_value: Result<WrappedState, ExecutorError>,
     },
-    /// Fetch a supposedly existing contract value in this node, and optionally the contract itself.  
+    /// Fetch a supposedly existing contract value in this node, and optionally the contract itself
     GetQuery {
         key: ContractKey,
         fetch_contract: bool,
     },
-    /// The response to a FetchQuery event
+    /// The response to a get query event
     GetResponse {
         key: ContractKey,
-        response: Result<StoreResponse, DynError>,
+        response: Result<StoreResponse, ExecutorError>,
     },
-    /// Store a contract in the local store.
-    Cache(ContractContainer),
-    /// Result of a caching operation.
-    CacheResult(Result<(), ExecutorError>),
+    /// Subscribe to a contract.
+    Subscribe { key: ContractKey },
+    /// The response to a subscribe event
+    SubscribeResponse {
+        key: ContractKey,
+        /// If successful, returns the peer to which it subscribed to for updates.
+        response: Result<PeerKeyLocation, ExecutorError>,
+    },
 }
 
 impl std::fmt::Display for ContractHandlerEvent {
@@ -394,12 +399,23 @@ impl std::fmt::Display for ContractHandlerEvent {
                     write!(f, "get query failed {{ {key} }}",)
                 }
             },
-            ContractHandlerEvent::Cache(container) => {
-                write!(f, "caching {{ {} }}", container.key())
+            ContractHandlerEvent::Subscribe { key } => {
+                write!(f, "subscribe {{ {key} }}")
             }
-            ContractHandlerEvent::CacheResult(r) => {
-                write!(f, "caching result {{ {} }}", r.is_ok())
-            }
+            ContractHandlerEvent::SubscribeResponse { key, response } => match response {
+                Ok(_) => {
+                    write!(f, "subscribe response {{ {key} }}",)
+                }
+                Err(_) => {
+                    write!(f, "subscribe failed {{ {key} }}",)
+                }
+            },
+            // ContractHandlerEvent::Cache(container) => {
+            //     write!(f, "caching {{ {} }}", container.key())
+            // }
+            // ContractHandlerEvent::CacheResult(r) => {
+            //     write!(f, "caching result {{ {} }}", r.is_ok())
+            // }
         }
     }
 }
@@ -422,30 +438,40 @@ pub mod test {
             Parameters::from(vec![4, 5]),
         )));
 
-        let contract_cp = contract.clone();
         let h = GlobalExecutor::spawn(async move {
             send_halve
-                .send_to_handler(ContractHandlerEvent::Cache(contract_cp))
+                .send_to_handler(ContractHandlerEvent::PutQuery {
+                    key: contract.key(),
+                    state: vec![6, 7, 8].into(),
+                    related_contracts: RelatedContracts::default(),
+                    contract: Some(contract),
+                })
                 .await
         });
         let (id, ev) =
             tokio::time::timeout(Duration::from_millis(100), rcv_halve.recv_from_sender())
                 .await??;
 
-        let ContractHandlerEvent::Cache(contract) = ev else {
+        let ContractHandlerEvent::PutQuery { state, .. } = ev else {
             anyhow::bail!("invalid event");
         };
-        assert_eq!(contract.data(), vec![0, 1, 2, 3]);
+        assert_eq!(state.as_ref(), &[6, 7, 8]);
 
         tokio::time::timeout(
             Duration::from_millis(100),
-            rcv_halve.send_to_sender(id, ContractHandlerEvent::Cache(contract)),
+            rcv_halve.send_to_sender(
+                id,
+                ContractHandlerEvent::PutResponse {
+                    new_value: Ok(vec![0, 7].into()),
+                },
+            ),
         )
         .await??;
-        let ContractHandlerEvent::Cache(contract) = h.await?? else {
+        let ContractHandlerEvent::PutResponse { new_value } = h.await?? else {
             anyhow::bail!("invalid event!");
         };
-        assert_eq!(contract.data(), vec![0, 1, 2, 3]);
+        let new_value = new_value.map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(new_value.as_ref(), &[0, 7]);
 
         Ok(())
     }

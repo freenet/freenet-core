@@ -78,7 +78,7 @@ impl<ER> Builder<ER> {
     #[cfg(test)]
     pub fn append_contracts(
         &mut self,
-        contracts: Vec<(ContractContainer, WrappedState)>,
+        contracts: Vec<(ContractContainer, WrappedState, Option<PeerKeyLocation>)>,
         contract_subscribers: std::collections::HashMap<ContractKey, Vec<PeerKeyLocation>>,
     ) {
         self.contracts.extend(contracts);
@@ -93,15 +93,12 @@ where
 {
     async fn append_contracts(
         &mut self,
-        contracts: Vec<(ContractContainer, WrappedState)>,
+        contracts: Vec<(ContractContainer, WrappedState, Option<PeerKeyLocation>)>,
         contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
     ) -> Result<(), anyhow::Error> {
         use crate::contract::ContractHandlerEvent;
-        for (contract, state) in contracts {
+        for (contract, state, subscription) in contracts {
             let key: ContractKey = contract.key();
-            self.op_manager
-                .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()))
-                .await?;
             self.op_manager
                 .notify_contract_handler(ContractHandlerEvent::PutQuery {
                     key: key.clone(),
@@ -115,7 +112,11 @@ where
                 key,
                 self.op_manager.ring.peer_key
             );
-            self.op_manager.ring.contract_cached(&key);
+            if let Some(subscription) = subscription {
+                self.op_manager
+                    .ring
+                    .add_subscription(key.clone(), subscription);
+            }
             if let Some(subscribers) = contract_subscribers.get(&key) {
                 // add contract subscribers
                 for subscriber in subscribers {

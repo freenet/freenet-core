@@ -25,6 +25,7 @@ use crate::node::OpManager;
 ))]
 use crate::operations::get::GetResult;
 use crate::operations::{OpEnum, OpError};
+use crate::ring::PeerKeyLocation;
 use crate::wasm_runtime::{
     ContractRuntimeInterface, ContractStore, DelegateRuntimeInterface, DelegateStore, Runtime,
     SecretsStore, StateStore, StateStoreError,
@@ -417,6 +418,11 @@ pub(crate) trait ContractExecutor: Send + 'static {
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
     ) -> Result<WrappedState, ExecutorError>;
+
+    async fn subscribe_to_contract(
+        &mut self,
+        key: ContractKey,
+    ) -> Result<PeerKeyLocation, ExecutorError>;
 }
 
 /// A WASM executor which will run any contracts, delegates, etc. registered.
@@ -432,9 +438,13 @@ pub struct Executor<R = Runtime> {
     mode: OperationMode,
     runtime: R,
     pub state_store: StateStore<Storage>,
+    /// Notification channels for any clients subscribed to updates for a given contract.
     update_notifications: HashMap<ContractKey, Vec<(ClientId, mpsc::UnboundedSender<HostResult>)>>,
+    /// Summaries of the state of all clients subscribed to a given contract.
     subscriber_summaries: HashMap<ContractKey, HashMap<ClientId, Option<StateSummary<'static>>>>,
+    /// Attested contract instances for a given delegate.
     delegate_attested_ids: HashMap<DelegateKey, Vec<ContractInstanceId>>,
+
     event_loop_channel: Option<ExecutorToEventLoopChannel<ExecutorHalve>>,
 }
 

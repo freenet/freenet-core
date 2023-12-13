@@ -70,7 +70,7 @@ where
                                 id,
                                 ContractHandlerEvent::GetResponse {
                                     key,
-                                    response: Err(err.into()),
+                                    response: Err(err),
                                 },
                             )
                             .await
@@ -111,36 +111,23 @@ where
                         error
                     })?;
             }
-            ContractHandlerEvent::Cache(contract) => {
-                let key = contract.key();
-                match contract_handler
+            ContractHandlerEvent::Subscribe { key } => {
+                let response = contract_handler
                     .executor()
-                    .store_contract(contract)
-                    .instrument(tracing::info_span!("store_contract", %key))
+                    .subscribe_to_contract(key.clone())
+                    .await;
+                contract_handler
+                    .channel()
+                    .send_to_sender(
+                        id,
+                        ContractHandlerEvent::SubscribeResponse { key, response },
+                    )
                     .await
-                {
-                    Ok(_) => {
-                        contract_handler
-                            .channel()
-                            .send_to_sender(id, ContractHandlerEvent::CacheResult(Ok(())))
-                            .await
-                            .map_err(|error| {
-                                tracing::debug!(%error, "shutting down contract handler");
-                                error
-                            })?;
-                    }
-                    Err(err) => {
-                        tracing::error!("Error while caching: {err}");
-                        contract_handler
-                            .channel()
-                            .send_to_sender(id, ContractHandlerEvent::CacheResult(Err(err)))
-                            .await
-                            .map_err(|error| {
-                                tracing::debug!(%error, "shutting down contract handler");
-                                error
-                            })?;
-                    }
-                }
+                    .map_err(|error| {
+                        tracing::debug!(%error, "shutting down contract handler");
+                        error
+                    })?;
+                todo!()
             }
             _ => unreachable!(),
         }

@@ -5,13 +5,13 @@ use freenet_stdlib::prelude::*;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 
+use crate::contract::ExecutorError;
 use crate::{
     contract::{ContractError, ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
     operations::{OpInitialization, Operation},
     ring::{Location, PeerKeyLocation, RingError},
-    DynError,
 };
 
 use super::{OpEnum, OpError, OpOutcome, OperationResult};
@@ -20,10 +20,6 @@ pub(crate) use self::messages::GetMsg;
 
 /// Maximum number of retries to get values.
 const MAX_RETRIES: usize = 10;
-/// Maximum number of hops performed while trying to perform a get (a hop will be performed
-/// when the current node cannot perform a get for whichever reason, eg. being out of the caching
-/// distance for the contract)
-const MAX_GET_RETRY_HOPS: usize = 1;
 
 pub(crate) struct GetOp {
     pub id: Transaction,
@@ -217,7 +213,7 @@ impl Operation for GetOp {
                         target: *target,
                         sender: own_loc,
                         fetch_contract: *fetch_contract,
-                        htl: MAX_GET_RETRY_HOPS,
+                        htl: op_manager.ring.max_hops_to_live,
                     });
                 }
                 GetMsg::SeekNode {
@@ -233,7 +229,7 @@ impl Operation for GetOp {
                     let key: ContractKey = key.clone();
                     let fetch_contract = *fetch_contract;
 
-                    let is_cached_contract = op_manager.ring.is_contract_cached(&key);
+                    let is_cached_contract = op_manager.ring.is_subscribed_to_contract(&key);
                     if let Some(s) = stats.as_mut() {
                         s.caching_peer = Some(*target);
                     }
@@ -403,7 +399,7 @@ impl Operation for GetOp {
                                         target,
                                         sender: *this_peer,
                                         fetch_contract,
-                                        htl: MAX_GET_RETRY_HOPS,
+                                        htl: op_manager.ring.max_hops_to_live,
                                     });
                                 } else {
                                     return Err(RingError::NoCachingPeers(key.clone()).into());
@@ -464,57 +460,37 @@ impl Operation for GetOp {
                     );
 
                     // received a response with a contract value
-                    if require_contract {
-                        if let Some(contract) = &contract {
-                            // store contract first
-                            let res = op_manager
-                                .notify_contract_handler(ContractHandlerEvent::Cache(
-                                    contract.clone(),
-                                ))
-                                .await?;
-                            match res {
-                                ContractHandlerEvent::CacheResult(Ok(_)) => {
-                                    op_manager.ring.contract_cached(&key);
-                                }
-                                ContractHandlerEvent::CacheResult(Err(err)) => {
-                                    return Err(OpError::ExecutorError(err.into()));
-                                }
-                                _ => unreachable!(),
-                            }
-                            let key = contract.key();
-                            tracing::debug!(tx = %id, "Contract `{}` successfully cached", key);
-                        } else {
-                            // no contract, consider this like an error ignoring the incoming update value
-                            tracing::warn!(
-                                tx = %id,
-                                "Contract not received from peer {} while required",
-                                sender.peer
-                            );
+                    if require_contract && contract.is_none() {
+                        // no contract, consider this like an error ignoring the incoming update value
+                        tracing::warn!(
+                            tx = %id,
+                            "Contract not received from peer {} while required",
+                            sender.peer
+                        );
 
-                            let op = GetOp {
-                                id,
-                                state: self.state,
-                                result: None,
-                                stats,
-                            };
+                        let op = GetOp {
+                            id,
+                            state: self.state,
+                            result: None,
+                            stats,
+                        };
 
-                            op_manager
-                                .notify_op_change(
-                                    NetMessage::from(GetMsg::ReturnGet {
-                                        id,
-                                        key,
-                                        value: StoreResponse {
-                                            state: None,
-                                            contract: None,
-                                        },
-                                        sender: *sender,
-                                        target: *target,
-                                    }),
-                                    OpEnum::Get(op),
-                                )
-                                .await?;
-                            return Err(OpError::StatePushed);
-                        }
+                        op_manager
+                            .notify_op_change(
+                                NetMessage::from(GetMsg::ReturnGet {
+                                    id,
+                                    key,
+                                    value: StoreResponse {
+                                        state: None,
+                                        contract: None,
+                                    },
+                                    sender: *sender,
+                                    target: *target,
+                                }),
+                                OpEnum::Get(op),
+                            )
+                            .await?;
+                        return Err(OpError::StatePushed);
                     }
 
                     let res = op_manager
@@ -621,7 +597,7 @@ fn check_contract_found(
     key: ContractKey,
     id: Transaction,
     fetch_contract: bool,
-    value: &Result<StoreResponse, DynError>,
+    value: &Result<StoreResponse, ExecutorError>,
     returned_key: ContractKey,
 ) -> Result<(), OpError> {
     if returned_key != key {
@@ -871,6 +847,7 @@ mod test {
             owned_contracts: vec![(
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
                 contract_val,
+                None,
             )],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::new(),
@@ -965,6 +942,7 @@ mod test {
             owned_contracts: vec![(
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
                 contract_val,
+                None,
             )],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::new(),
