@@ -505,7 +505,8 @@ impl Operation for PutOp {
 
 impl OpManager {
     fn get_broadcast_targets(&self, key: &ContractKey, sender: &PeerId) -> Vec<PeerKeyLocation> {
-        self.ring
+        let mut subscribers = self
+            .ring
             .subscribers_of(key)
             .map(|subs| {
                 subs.value()
@@ -514,7 +515,11 @@ impl OpManager {
                     .copied()
                     .collect::<Vec<_>>()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if let Some(peer) = self.ring.subscribed_to_contract(key) {
+            subscribers.push(peer);
+        }
+        subscribers
     }
 }
 

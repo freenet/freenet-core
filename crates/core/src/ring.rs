@@ -130,10 +130,6 @@ impl LiveTransactionTracker {
         }
     }
 
-    fn prune_transactions_from_peer(&self, peer: &PeerId) {
-        self.tx_per_peer.remove(peer);
-    }
-
     fn new() -> (Self, sync::mpsc::Receiver<PeerId>) {
         let (missing_peer, rx) = sync::mpsc::channel(10);
         (
@@ -143,6 +139,10 @@ impl LiveTransactionTracker {
             },
             rx,
         )
+    }
+
+    fn prune_transactions_from_peer(&self, peer: &PeerId) {
+        self.tx_per_peer.remove(peer);
     }
 
     fn has_live_connection(&self, peer: &PeerId) -> bool {
@@ -353,6 +353,11 @@ impl Ring {
     #[inline]
     pub fn is_subscribed_to_contract(&self, key: &ContractKey) -> bool {
         self.subscriptions.contains_key(key)
+    }
+
+    #[inline]
+    pub fn subscribed_to_contract(&self, key: &ContractKey) -> Option<PeerKeyLocation> {
+        self.subscriptions.get(key).map(|v| *v.value())
     }
 
     /// Update this node location.
