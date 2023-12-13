@@ -627,19 +627,14 @@ impl SimNetwork {
         self.event_listener.is_connected(&self.labels[pos].1)
     }
 
-    pub fn has_put_contract(
-        &self,
-        peer: impl Into<NodeLabel>,
-        key: &ContractKey,
-        value: &WrappedState,
-    ) -> bool {
+    pub fn has_put_contract(&self, peer: impl Into<NodeLabel>, key: &ContractKey) -> bool {
         let peer = peer.into();
         let pos = self
             .labels
             .binary_search_by(|(label, _)| label.cmp(&peer))
             .expect("peer not found");
         self.event_listener
-            .has_put_contract(&self.labels[pos].1, key, value)
+            .has_put_contract(&self.labels[pos].1, key)
     }
 
     pub fn has_got_contract(&self, peer: impl Into<NodeLabel>, key: &ContractKey) -> bool {

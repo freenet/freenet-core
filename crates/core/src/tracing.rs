@@ -241,12 +241,9 @@ impl<'a> NetEventLog<'a> {
                     key,
                 })
             }
-            NetMessage::Put(PutMsg::SuccessfulUpdate { new_value, .. }) => {
-                EventKind::Put(PutEvent::PutSuccess {
-                    requester: op_manager.ring.peer_key,
-                    value: new_value.clone(),
-                })
-            }
+            NetMessage::Put(PutMsg::SuccessfulPut { .. }) => EventKind::Put(PutEvent::PutSuccess {
+                requester: op_manager.ring.peer_key,
+            }),
             NetMessage::Put(PutMsg::Broadcasting {
                 new_value,
                 broadcast_to,
@@ -1111,7 +1108,6 @@ enum PutEvent {
     },
     PutSuccess {
         requester: PeerId,
-        value: WrappedState,
     },
     BroadcastEmitted {
         /// subscribed peers
@@ -1301,12 +1297,7 @@ pub(super) mod test {
             })
         }
 
-        pub fn has_put_contract(
-            &self,
-            peer: &PeerId,
-            for_key: &ContractKey,
-            expected_value: &WrappedState,
-        ) -> bool {
+        pub fn has_put_contract(&self, peer: &PeerId, for_key: &ContractKey) -> bool {
             let Ok(logs) = self.logs.try_lock() else {
                 return false;
             };
@@ -1320,7 +1311,6 @@ pub(super) mod test {
             });
 
             for (_tx, events) in put_ops {
-                let mut is_expected_value = false;
                 let mut is_expected_key = false;
                 let mut is_expected_peer = false;
                 for ev in events {
@@ -1329,16 +1319,13 @@ pub(super) mod test {
                         PutEvent::Request { key, .. } if key == for_key => {
                             is_expected_key = true;
                         }
-                        PutEvent::PutSuccess { requester, value }
-                            if requester == peer && value == expected_value =>
-                        {
+                        PutEvent::PutSuccess { requester } if requester == peer => {
                             is_expected_peer = true;
-                            is_expected_value = true;
                         }
                         _ => {}
                     }
                 }
-                if is_expected_value && is_expected_peer && is_expected_key {
+                if is_expected_peer && is_expected_key {
                     return true;
                 }
             }
