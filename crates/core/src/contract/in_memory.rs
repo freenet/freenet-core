@@ -1,8 +1,5 @@
 use crate::{client_events::ClientId, runtime::ContractStore};
-use freenet_stdlib::{
-    client_api::{ClientError, ClientRequest, HostResponse},
-    prelude::WrappedContract,
-};
+use freenet_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use futures::{future::BoxFuture, FutureExt};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -25,11 +22,11 @@ pub(crate) struct MemoryContractHandler {
 impl MemoryContractHandler {
     pub async fn new(
         channel: ContractHandlerChannel<ContractHandlerHalve>,
-        data_dir: &str,
+        identifier: &str,
     ) -> Self {
         MemoryContractHandler {
             channel,
-            runtime: Executor::new_mock(data_dir).await.unwrap(),
+            runtime: Executor::new_mock(identifier).await.unwrap(),
         }
     }
 }
@@ -41,12 +38,12 @@ impl ContractHandler for MemoryContractHandler {
     fn build(
         channel: ContractHandlerChannel<ContractHandlerHalve>,
         _executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
-        config: Self::Builder,
+        identifier: Self::Builder,
     ) -> BoxFuture<'static, Result<Self, DynError>>
     where
         Self: Sized + 'static,
     {
-        async move { Ok(MemoryContractHandler::new(channel, &config).await) }.boxed()
+        async move { Ok(MemoryContractHandler::new(channel, &identifier).await) }.boxed()
     }
 
     fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve> {
@@ -69,6 +66,7 @@ impl ContractHandler for MemoryContractHandler {
 
 #[test]
 fn serialization() -> Result<(), anyhow::Error> {
+    use freenet_stdlib::prelude::WrappedContract;
     let bytes = crate::util::test::random_bytes_1kb();
     let mut gen = arbitrary::Unstructured::new(&bytes);
     let contract: WrappedContract = gen.arbitrary()?;

@@ -7,14 +7,14 @@ use libp2p::swarm::StreamUpgradeError;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
-use super::PeerKey;
+use super::PeerId;
 use crate::{
     client_events::ClientId,
-    message::{Message, NodeEvent},
+    message::{NetMessage, NodeEvent},
 };
 
-#[cfg(test)]
 pub(crate) mod in_memory;
+pub(crate) mod inter_process;
 pub(crate) mod p2p_protoc;
 
 // TODO: use this constants when we do real net i/o
@@ -27,11 +27,11 @@ pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 /// to other peers in the network with whom connection has been established.
 #[async_trait::async_trait]
 pub(crate) trait NetworkBridge: Send + Sync {
-    async fn add_connection(&mut self, peer: PeerKey) -> ConnResult<()>;
+    async fn add_connection(&mut self, peer: PeerId) -> ConnResult<()>;
 
-    async fn drop_connection(&mut self, peer: &PeerKey) -> ConnResult<()>;
+    async fn drop_connection(&mut self, peer: &PeerId) -> ConnResult<()>;
 
-    async fn send(&self, target: &PeerKey, msg: Message) -> ConnResult<()>;
+    async fn send(&self, target: &PeerId, msg: NetMessage) -> ConnResult<()>;
 }
 
 #[derive(Debug, thiserror::Error, Serialize, Deserialize)]
@@ -86,7 +86,9 @@ impl Clone for ConnectionError {
     }
 }
 
-pub(super) struct EventLoopNotifications(Receiver<Either<(Message, Option<ClientId>), NodeEvent>>);
+pub(super) struct EventLoopNotifications(
+    Receiver<Either<(NetMessage, Option<ClientId>), NodeEvent>>,
+);
 
 impl EventLoopNotifications {
     pub fn channel() -> (EventLoopNotifications, EventLoopNotificationsSender) {
@@ -99,7 +101,7 @@ impl EventLoopNotifications {
 }
 
 impl Deref for EventLoopNotifications {
-    type Target = Receiver<Either<(Message, Option<ClientId>), NodeEvent>>;
+    type Target = Receiver<Either<(NetMessage, Option<ClientId>), NodeEvent>>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -114,11 +116,11 @@ impl DerefMut for EventLoopNotifications {
 
 #[derive(Clone)]
 pub(crate) struct EventLoopNotificationsSender(
-    Sender<Either<(Message, Option<ClientId>), NodeEvent>>,
+    Sender<Either<(NetMessage, Option<ClientId>), NodeEvent>>,
 );
 
 impl Deref for EventLoopNotificationsSender {
-    type Target = Sender<Either<(Message, Option<ClientId>), NodeEvent>>;
+    type Target = Sender<Either<(NetMessage, Option<ClientId>), NodeEvent>>;
 
     fn deref(&self) -> &Self::Target {
         &self.0

@@ -1,0 +1,42 @@
+namespace topology;
+
+table AddedConnection {
+  transaction: string;
+  from: string(required); // encoded PeerId
+  from_location: float64;
+  to: string(required);   // encoded PeerId
+  to_location: float64;
+}
+
+table RemovedConnection {
+  at: string(required);
+  from: string(required);
+}
+
+table Error {
+  message: string(required);
+}
+
+union PeerChangeType {
+  AddedConnection,
+  RemovedConnection,
+  Error,
+}
+
+table PeerChange {
+    current_state: [AddedConnection];
+    change: PeerChangeType;
+}
+
+table Ok {
+  message: string;
+}
+
+union Response {
+  Error,
+  Ok
+}
+
+table ControllerResponse {
+  response:Response(required);
+}

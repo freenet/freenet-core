@@ -7,30 +7,30 @@ use futures::{future::BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs::OpenOptions,
-    io::AsyncSeekExt,
+    net::TcpStream,
     sync::{
         mpsc::{self},
         Mutex,
     },
 };
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use super::PeerKey;
 use crate::{
     config::GlobalExecutor,
     contract::StoreResponse,
-    message::{Message, Transaction},
+    message::{NetMessage, Transaction},
+    node::PeerId,
     operations::{connect, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg},
-    ring::{Location, PeerKeyLocation},
+    ring::{Location, PeerKeyLocation, Ring},
     router::RouteEvent,
     DynError,
 };
 
 #[cfg(feature = "trace-ot")]
-pub(super) use opentelemetry_tracer::OTEventRegister;
-#[cfg(test)]
-pub(super) use test::TestEventListener;
+pub(crate) use opentelemetry_tracer::OTEventRegister;
+pub(crate) use test::TestEventListener;
 
-use super::OpManager;
+use crate::node::OpManager;
 
 #[derive(Debug, Clone, Copy)]
 struct ListenerLogId(usize);
@@ -38,17 +38,11 @@ struct ListenerLogId(usize);
 /// A type that reacts to incoming messages from the network and records information about them.
 pub(crate) trait NetEventRegister: std::any::Any + Send + Sync + 'static {
     fn register_events<'a>(
-        &'a mut self,
+        &'a self,
         events: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
     ) -> BoxFuture<'a, ()>;
-    fn trait_clone(&self) -> Box<dyn NetEventRegister>;
-    fn as_any(&self) -> &dyn std::any::Any
-    where
-        Self: Sized,
-    {
-        self as _
-    }
     fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<()>;
+    fn trait_clone(&self) -> Box<dyn NetEventRegister>;
 }
 
 #[cfg(feature = "trace-ot")]
@@ -64,11 +58,11 @@ impl<const N: usize> CombinedRegister<N> {
 #[cfg(feature = "trace-ot")]
 impl<const N: usize> NetEventRegister for CombinedRegister<N> {
     fn register_events<'a>(
-        &'a mut self,
+        &'a self,
         events: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
     ) -> BoxFuture<'a, ()> {
         async move {
-            for registry in &mut self.0 {
+            for registry in &self.0 {
                 registry.register_events(events.clone()).await;
             }
         }
@@ -105,37 +99,48 @@ impl<const N: usize> Clone for CombinedRegister<N> {
 #[derive(Clone)]
 pub(crate) struct NetEventLog<'a> {
     tx: &'a Transaction,
-    peer_id: &'a PeerKey,
+    peer_id: &'a PeerId,
     kind: EventKind,
 }
 
 impl<'a> NetEventLog<'a> {
     pub fn route_event(
         tx: &'a Transaction,
-        op_storage: &'a OpManager,
+        op_manager: &'a OpManager,
         route_event: &RouteEvent,
     ) -> Self {
         NetEventLog {
             tx,
-            peer_id: &op_storage.ring.peer_key,
+            peer_id: &op_manager.ring.peer_key,
             kind: EventKind::Route(route_event.clone()),
         }
     }
 
-    pub fn disconnected(from: &'a PeerKey) -> Self {
+    pub fn connected(ring: &'a Ring, peer: PeerId, location: Location) -> Self {
         NetEventLog {
             tx: Transaction::NULL,
-            peer_id: from,
-            kind: EventKind::Disconnected,
+            peer_id: &ring.peer_key,
+            kind: EventKind::Connect(ConnectEvent::Connected {
+                this: ring.own_location(),
+                connected: PeerKeyLocation {
+                    peer,
+                    location: Some(location),
+                },
+            }),
         }
     }
 
-    pub fn from_outbound_msg(
-        msg: &'a Message,
-        op_storage: &'a OpManager,
-    ) -> Either<Self, Vec<Self>> {
+    pub fn disconnected(ring: &'a Ring, from: &'a PeerId) -> Self {
+        NetEventLog {
+            tx: Transaction::NULL,
+            peer_id: &ring.peer_key,
+            kind: EventKind::Disconnected { from: *from },
+        }
+    }
+
+    pub fn from_outbound_msg(msg: &'a NetMessage, ring: &'a Ring) -> Either<Self, Vec<Self>> {
         let kind = match msg {
-            Message::Connect(connect::ConnectMsg::Response {
+            NetMessage::Connect(connect::ConnectMsg::Response {
                 msg:
                     connect::ConnectResponse::AcceptedBy {
                         peers,
@@ -144,7 +149,7 @@ impl<'a> NetEventLog<'a> {
                     },
                 ..
             }) => {
-                let this_peer = op_storage.ring.own_location();
+                let this_peer = ring.own_location();
                 if peers.contains(&this_peer) {
                     EventKind::Connect(ConnectEvent::Connected {
                         this: this_peer,
@@ -157,7 +162,7 @@ impl<'a> NetEventLog<'a> {
                     EventKind::Ignored
                 }
             }
-            Message::Connect(connect::ConnectMsg::Response {
+            NetMessage::Connect(connect::ConnectMsg::Response {
                 msg:
                     connect::ConnectResponse::Proxy {
                         accepted_by,
@@ -165,7 +170,7 @@ impl<'a> NetEventLog<'a> {
                     },
                 ..
             }) => {
-                let this_peer = op_storage.ring.own_location();
+                let this_peer = ring.own_location();
                 if accepted_by.contains(&this_peer) {
                     EventKind::Connect(ConnectEvent::Connected {
                         this: this_peer,
@@ -182,17 +187,17 @@ impl<'a> NetEventLog<'a> {
         };
         Either::Left(NetEventLog {
             tx: msg.id(),
-            peer_id: &op_storage.ring.peer_key,
+            peer_id: &ring.peer_key,
             kind,
         })
     }
 
     pub fn from_inbound_msg(
-        msg: &'a Message,
-        op_storage: &'a OpManager,
+        msg: &'a NetMessage,
+        op_manager: &'a OpManager,
     ) -> Either<Self, Vec<Self>> {
         let kind = match msg {
-            Message::Connect(connect::ConnectMsg::Response {
+            NetMessage::Connect(connect::ConnectMsg::Response {
                 msg:
                     connect::ConnectResponse::AcceptedBy {
                         peers,
@@ -201,7 +206,7 @@ impl<'a> NetEventLog<'a> {
                     },
                 ..
             }) => {
-                let this_peer = &op_storage.ring.peer_key;
+                let this_peer = &op_manager.ring.peer_key;
                 let mut events = peers
                     .iter()
                     .map(|peer| {
@@ -231,7 +236,7 @@ impl<'a> NetEventLog<'a> {
                 }
                 return Either::Right(events);
             }
-            Message::Put(PutMsg::RequestPut {
+            NetMessage::Put(PutMsg::RequestPut {
                 contract, target, ..
             }) => {
                 let key = contract.key();
@@ -240,13 +245,13 @@ impl<'a> NetEventLog<'a> {
                     key,
                 })
             }
-            Message::Put(PutMsg::SuccessfulUpdate { new_value, .. }) => {
+            NetMessage::Put(PutMsg::SuccessfulUpdate { new_value, .. }) => {
                 EventKind::Put(PutEvent::PutSuccess {
-                    requester: op_storage.ring.peer_key,
+                    requester: op_manager.ring.peer_key,
                     value: new_value.clone(),
                 })
             }
-            Message::Put(PutMsg::Broadcasting {
+            NetMessage::Put(PutMsg::Broadcasting {
                 new_value,
                 broadcast_to,
                 key,
@@ -256,7 +261,7 @@ impl<'a> NetEventLog<'a> {
                 key: key.clone(),
                 value: new_value.clone(),
             }),
-            Message::Put(PutMsg::BroadcastTo {
+            NetMessage::Put(PutMsg::BroadcastTo {
                 sender,
                 new_value,
                 key,
@@ -266,12 +271,12 @@ impl<'a> NetEventLog<'a> {
                 key: key.clone(),
                 value: new_value.clone(),
             }),
-            Message::Get(GetMsg::ReturnGet {
+            NetMessage::Get(GetMsg::ReturnGet {
                 key,
                 value: StoreResponse { state: Some(_), .. },
                 ..
             }) => EventKind::Get { key: key.clone() },
-            Message::Subscribe(SubscribeMsg::ReturnSub {
+            NetMessage::Subscribe(SubscribeMsg::ReturnSub {
                 subscribed: true,
                 key,
                 sender,
@@ -284,7 +289,7 @@ impl<'a> NetEventLog<'a> {
         };
         Either::Left(NetEventLog {
             tx: msg.id(),
-            peer_id: &op_storage.ring.peer_key,
+            peer_id: &op_manager.ring.peer_key,
             kind,
         })
     }
@@ -295,7 +300,7 @@ impl<'a> NetEventLog<'a> {
 struct NetLogMessage {
     tx: Transaction,
     datetime: DateTime<Utc>,
-    peer_id: PeerKey,
+    peer_id: PeerId,
     kind: EventKind,
 }
 
@@ -378,11 +383,17 @@ pub(crate) struct EventRegister {
 static NEW_RECORDS_TS: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
 static FILE_LOCK: Mutex<()> = Mutex::const_new(());
 
+const EVENT_REGISTER_BATCH_SIZE: usize = 100;
+
+const DEFAULT_METRICS_SERVER_PORT: u16 = 55010;
+
 impl EventRegister {
     #[cfg(not(test))]
     const MAX_LOG_RECORDS: usize = 100_000;
     #[cfg(test)]
     const MAX_LOG_RECORDS: usize = 10_000;
+
+    const BATCH_SIZE: usize = EVENT_REGISTER_BATCH_SIZE;
 
     pub fn new() -> Self {
         let (log_sender, log_recv) = mpsc::channel(1000);
@@ -392,107 +403,10 @@ impl EventRegister {
     }
 
     async fn record_logs(mut log_recv: mpsc::Receiver<NetLogMessage>) {
-        const BATCH_SIZE: usize = 100;
+        use futures::StreamExt;
 
-        async fn num_lines(path: &Path) -> io::Result<usize> {
-            use tokio::fs::File;
-            use tokio::io::AsyncReadExt;
-
-            let mut file = tokio::io::BufReader::new(File::open(path).await?);
-            let mut num_records = 0;
-            let mut buf = [0; 4]; // Read the u32 length prefix
-
-            loop {
-                let bytes_read = file.read_exact(&mut buf).await;
-                if bytes_read.is_err() {
-                    break;
-                }
-                num_records += 1;
-
-                // Seek to the next record without reading its contents
-                let length = u32::from_le_bytes(buf) as u64;
-                if (file.seek(io::SeekFrom::Current(length as i64)).await).is_err() {
-                    break;
-                }
-            }
-
-            Ok(num_records)
-        }
-
-        async fn truncate_records(
-            file: &mut tokio::fs::File,
-            remove_records: usize,
-        ) -> Result<(), Box<dyn std::error::Error>> {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-            let _guard = FILE_LOCK.lock().await;
-            file.rewind().await?;
-            // tracing::debug!(position = file.stream_position().await.unwrap());
-            let mut records_count = 0;
-            while records_count < remove_records {
-                let mut length_bytes = [0u8; 4];
-                if let Err(error) = file.read_exact(&mut length_bytes).await {
-                    if matches!(error.kind(), io::ErrorKind::UnexpectedEof) {
-                        break;
-                    }
-                    let pos = file.stream_position().await;
-                    tracing::error!(%error, ?pos, "error while trying to read file");
-                    return Err(error.into());
-                }
-                let length = u32::from_be_bytes(length_bytes);
-                if let Err(error) = file.seek(io::SeekFrom::Current(length as i64)).await {
-                    if matches!(error.kind(), io::ErrorKind::UnexpectedEof) {
-                        break;
-                    }
-                    let pos = file.stream_position().await;
-                    tracing::error!(%error, ?pos, "error while trying to read file");
-                    return Err(error.into());
-                }
-                records_count += 1;
-            }
-
-            // Copy the rest of the file to the buffer
-            let mut buffer = Vec::new();
-            if let Err(error) = file.read_to_end(&mut buffer).await {
-                if !matches!(error.kind(), io::ErrorKind::UnexpectedEof) {
-                    let pos = file.stream_position().await;
-                    tracing::error!(%error, ?pos, "error while trying to read file");
-                    return Err(error.into());
-                }
-            }
-
-            #[cfg(test)]
-            {
-                assert!(!buffer.is_empty());
-                let mut unique = std::collections::HashSet::new();
-                let mut read_buf = &*buffer;
-                let mut length_bytes: [u8; 4] = [0u8; 4];
-                let mut cursor = 0;
-                while read_buf.read_exact(&mut length_bytes).await.is_ok() {
-                    let length = u32::from_be_bytes(length_bytes) as usize;
-                    cursor += 4;
-                    let log: NetLogMessage =
-                        bincode::deserialize(&buffer[cursor..cursor + length]).unwrap();
-                    cursor += length;
-                    read_buf = &buffer[cursor..];
-                    unique.insert(log.peer_id);
-                    // tracing::debug!(?log, %cursor);
-                }
-                assert!(unique.len() > 1);
-            }
-
-            // Seek back to the beginning and write the remaining content
-            file.rewind().await?;
-            file.write_all(&buffer).await?;
-
-            // Truncate the file to the new size
-            file.set_len(buffer.len() as u64).await?;
-            file.seek(io::SeekFrom::End(0)).await?;
-            Ok(())
-        }
-
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await; // wait for the node to start
         let event_log_path = crate::config::Config::conf().event_log();
-        tracing::info!(?event_log_path);
         let mut event_log = match OpenOptions::new()
             .write(true)
             .read(true)
@@ -506,80 +420,234 @@ impl EventRegister {
             }
         };
         let mut num_written = 0;
-        let mut batch_buf = vec![];
-        let mut log_batch = Vec::with_capacity(BATCH_SIZE);
+        let mut log_batch = Vec::with_capacity(Self::BATCH_SIZE);
 
-        let mut num_recs = num_lines(event_log_path.as_path())
+        let mut num_recs = Self::num_lines(event_log_path.as_path())
             .await
             .expect("non IO error");
 
-        while let Some(log) = log_recv.recv().await {
-            log_batch.push(log);
+        let mut ws = connect_to_metrics_server().await;
 
-            if log_batch.len() >= BATCH_SIZE {
-                let num_logs: usize = log_batch.len();
-                let moved_batch = std::mem::replace(&mut log_batch, Vec::with_capacity(BATCH_SIZE));
-                let serialization_task = tokio::task::spawn_blocking(move || {
-                    let mut batch_serialized_data = Vec::with_capacity(BATCH_SIZE * 1024);
-                    for log_item in &moved_batch {
-                        let mut serialized = match bincode::serialize(log_item) {
-                            Err(err) => {
-                                tracing::error!("Failed serializing log: {err}");
-                                return Err(err);
-                            }
-                            Ok(serialized) => serialized,
-                        };
-                        {
-                            use byteorder::{BigEndian, WriteBytesExt};
-                            batch_serialized_data
-                                .write_u32::<BigEndian>(serialized.len() as u32)
-                                .expect("enough memory");
-                        }
-                        batch_serialized_data.append(&mut serialized);
+        loop {
+            let ws_recv = if let Some(ws) = &mut ws {
+                ws.next().boxed()
+            } else {
+                futures::future::pending().boxed()
+            };
+            tokio::select! {
+                log = log_recv.recv() => {
+                    let Some(log) = log else { break; };
+                    if let Some(ws) = ws.as_mut() {
+                        send_to_metrics_server(ws, &log).await;
                     }
-                    Ok(batch_serialized_data)
-                });
-
-                match serialization_task.await {
-                    Ok(Ok(serialized_data)) => {
-                        // tracing::debug!(bytes = %serialized_data.len(), %num_logs, "serialized logs");
-                        batch_buf = serialized_data;
-                        num_written += num_logs;
-                        log_batch.clear(); // Clear the batch for new data
-                    }
-                    _ => {
-                        panic!("Failed serializing log");
+                    Self::persist_log(&mut log_batch, &mut num_written, &mut num_recs, &mut event_log, log).await;
+                }
+                ws_msg = ws_recv => {
+                    if let Some((ws, ws_msg)) = ws.as_mut().zip(ws_msg) {
+                        received_from_metrics_server(ws, ws_msg).await;
                     }
                 }
             }
+        }
 
-            if num_written >= BATCH_SIZE {
-                {
-                    use tokio::io::AsyncWriteExt;
-                    let _guard = FILE_LOCK.lock().await;
-                    if let Err(err) = event_log.write_all(&batch_buf).await {
-                        tracing::error!("Failed writting to event log: {err}");
-                        panic!("Failed writting event log");
-                    }
+        // store remaining logs
+        let mut batch_serialized_data = Vec::with_capacity(log_batch.len() * 1024);
+        for log_item in log_batch {
+            let mut serialized = match bincode::serialize(&log_item) {
+                Err(err) => {
+                    tracing::error!("Failed serializing log: {err}");
+                    break;
                 }
-                num_recs += num_written;
-                num_written = 0;
+                Ok(serialized) => serialized,
+            };
+            {
+                use byteorder::{BigEndian, WriteBytesExt};
+                batch_serialized_data
+                    .write_u32::<BigEndian>(serialized.len() as u32)
+                    .expect("enough memory");
             }
-
-            // Check the number of lines and truncate if needed
-            if num_recs > Self::MAX_LOG_RECORDS {
-                const REMOVE_RECS: usize = 1000 + BATCH_SIZE; // making space for 1000 new records
-                if let Err(err) = truncate_records(&mut event_log, REMOVE_RECS).await {
-                    tracing::error!("Failed truncating log file: {:?}", err);
-                    panic!("Failed truncating log file");
-                }
-                num_recs -= REMOVE_RECS;
+            batch_serialized_data.append(&mut serialized);
+        }
+        if !batch_serialized_data.is_empty() {
+            use tokio::io::AsyncWriteExt;
+            let _guard = FILE_LOCK.lock().await;
+            if let Err(err) = event_log.write_all(&batch_serialized_data).await {
+                tracing::error!("Failed writting to event log: {err}");
+                panic!("Failed writting event log");
             }
         }
     }
 
+    async fn persist_log(
+        log_batch: &mut Vec<NetLogMessage>,
+        num_written: &mut usize,
+        num_recs: &mut usize,
+        event_log: &mut tokio::fs::File,
+        log: NetLogMessage,
+    ) {
+        log_batch.push(log);
+        let mut batch_buf = vec![];
+
+        if log_batch.len() >= Self::BATCH_SIZE {
+            let num_logs: usize = log_batch.len();
+            let moved_batch = std::mem::replace(log_batch, Vec::with_capacity(Self::BATCH_SIZE));
+            let serialization_task = tokio::task::spawn_blocking(move || {
+                let mut batch_serialized_data = Vec::with_capacity(Self::BATCH_SIZE * 1024);
+                for log_item in &moved_batch {
+                    let mut serialized = match bincode::serialize(log_item) {
+                        Err(err) => {
+                            tracing::error!("Failed serializing log: {err}");
+                            return Err(err);
+                        }
+                        Ok(serialized) => serialized,
+                    };
+                    {
+                        use byteorder::{BigEndian, WriteBytesExt};
+                        batch_serialized_data
+                            .write_u32::<BigEndian>(serialized.len() as u32)
+                            .expect("enough memory");
+                    }
+                    batch_serialized_data.append(&mut serialized);
+                }
+                Ok(batch_serialized_data)
+            });
+
+            match serialization_task.await {
+                Ok(Ok(serialized_data)) => {
+                    // tracing::debug!(bytes = %serialized_data.len(), %num_logs, "serialized logs");
+                    batch_buf = serialized_data;
+                    *num_written += num_logs;
+                    log_batch.clear(); // Clear the batch for new data
+                }
+                _ => {
+                    panic!("Failed serializing log");
+                }
+            }
+        }
+
+        if *num_written >= Self::BATCH_SIZE {
+            {
+                use tokio::io::AsyncWriteExt;
+                let _guard = FILE_LOCK.lock().await;
+                if let Err(err) = event_log.write_all(&batch_buf).await {
+                    tracing::error!("Failed writting to event log: {err}");
+                    panic!("Failed writting event log");
+                }
+            }
+            *num_recs += *num_written;
+            *num_written = 0;
+        }
+
+        // Check the number of lines and truncate if needed
+        if *num_recs > Self::MAX_LOG_RECORDS {
+            const REMOVE_RECS: usize = 1000 + EVENT_REGISTER_BATCH_SIZE; // making space for 1000 new records
+            if let Err(err) = Self::truncate_records(event_log, REMOVE_RECS).await {
+                tracing::error!("Failed truncating log file: {:?}", err);
+                panic!("Failed truncating log file");
+            }
+            *num_recs -= REMOVE_RECS;
+        }
+    }
+
+    async fn num_lines(path: &Path) -> io::Result<usize> {
+        use tokio::fs::File;
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+        let mut file = tokio::io::BufReader::new(File::open(path).await?);
+        let mut num_records = 0;
+        let mut buf = [0; 4]; // Read the u32 length prefix
+
+        loop {
+            let bytes_read = file.read_exact(&mut buf).await;
+            if bytes_read.is_err() {
+                break;
+            }
+            num_records += 1;
+
+            // Seek to the next record without reading its contents
+            let length = u32::from_le_bytes(buf) as u64;
+            if (file.seek(io::SeekFrom::Current(length as i64)).await).is_err() {
+                break;
+            }
+        }
+
+        Ok(num_records)
+    }
+
+    async fn truncate_records(
+        file: &mut tokio::fs::File,
+        remove_records: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+        let _guard = FILE_LOCK.lock().await;
+        file.rewind().await?;
+        // tracing::debug!(position = file.stream_position().await.unwrap());
+        let mut records_count = 0;
+        while records_count < remove_records {
+            let mut length_bytes = [0u8; 4];
+            if let Err(error) = file.read_exact(&mut length_bytes).await {
+                if matches!(error.kind(), io::ErrorKind::UnexpectedEof) {
+                    break;
+                }
+                let pos = file.stream_position().await;
+                tracing::error!(%error, ?pos, "error while trying to read file");
+                return Err(error.into());
+            }
+            let length = u32::from_be_bytes(length_bytes);
+            if let Err(error) = file.seek(io::SeekFrom::Current(length as i64)).await {
+                if matches!(error.kind(), io::ErrorKind::UnexpectedEof) {
+                    break;
+                }
+                let pos = file.stream_position().await;
+                tracing::error!(%error, ?pos, "error while trying to read file");
+                return Err(error.into());
+            }
+            records_count += 1;
+        }
+
+        // Copy the rest of the file to the buffer
+        let mut buffer = Vec::new();
+        if let Err(error) = file.read_to_end(&mut buffer).await {
+            if !matches!(error.kind(), io::ErrorKind::UnexpectedEof) {
+                let pos = file.stream_position().await;
+                tracing::error!(%error, ?pos, "error while trying to read file");
+                return Err(error.into());
+            }
+        }
+
+        #[cfg(test)]
+        {
+            assert!(!buffer.is_empty());
+            let mut unique = std::collections::HashSet::new();
+            let mut read_buf = &*buffer;
+            let mut length_bytes: [u8; 4] = [0u8; 4];
+            let mut cursor = 0;
+            while read_buf.read_exact(&mut length_bytes).await.is_ok() {
+                let length = u32::from_be_bytes(length_bytes) as usize;
+                cursor += 4;
+                let log: NetLogMessage =
+                    bincode::deserialize(&buffer[cursor..cursor + length]).unwrap();
+                cursor += length;
+                read_buf = &buffer[cursor..];
+                unique.insert(log.peer_id);
+                // tracing::debug!(?log, %cursor);
+            }
+            assert!(unique.len() > 1);
+        }
+
+        // Seek back to the beginning and write the remaining content
+        file.rewind().await?;
+        file.write_all(&buffer).await?;
+
+        // Truncate the file to the new size
+        file.set_len(buffer.len() as u64).await?;
+        file.seek(io::SeekFrom::End(0)).await?;
+        Ok(())
+    }
+
     pub async fn get_router_events(max_event_number: usize) -> Result<Vec<RouteEvent>, DynError> {
-        use tokio::io::AsyncReadExt;
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
         const MAX_EVENT_HISTORY: usize = 10_000;
         let event_num = max_event_number.min(MAX_EVENT_HISTORY);
 
@@ -644,7 +712,7 @@ impl EventRegister {
 
 impl NetEventRegister for EventRegister {
     fn register_events<'a>(
-        &'a mut self,
+        &'a self,
         logs: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
     ) -> BoxFuture<'a, ()> {
         async {
@@ -664,6 +732,79 @@ impl NetEventRegister for EventRegister {
     }
 }
 
+async fn connect_to_metrics_server() -> Option<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    let port = std::env::var("FDEV_NETWORK_METRICS_SERVER_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_METRICS_SERVER_PORT);
+
+    tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/push-stats/"))
+        .await
+        .map(|(ws_stream, _)| {
+            tracing::info!("Connected to network metrics server");
+            ws_stream
+        })
+        .ok()
+}
+
+async fn send_to_metrics_server(
+    ws_stream: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    send_msg: &NetLogMessage,
+) {
+    use crate::generated::PeerChange;
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let res = match &send_msg.kind {
+        EventKind::Connect(ConnectEvent::Connected {
+            this:
+                PeerKeyLocation {
+                    peer: from_peer,
+                    location: Some(from_loc),
+                },
+            connected:
+                PeerKeyLocation {
+                    peer: to_peer,
+                    location: Some(to_loc),
+                },
+        }) => {
+            let msg = PeerChange::added_connection_msg(
+                (&send_msg.tx != Transaction::NULL).then(|| send_msg.tx.to_string()),
+                (*from_peer, from_loc.as_f64()),
+                (*to_peer, to_loc.as_f64()),
+            );
+            ws_stream.send(Message::Binary(msg)).await
+        }
+        EventKind::Disconnected { from } => {
+            let msg = PeerChange::removed_connection_msg(*from, send_msg.peer_id);
+            ws_stream.send(Message::Binary(msg)).await
+        }
+        _ => Ok(()),
+    };
+    if let Err(error) = res {
+        tracing::warn!(%error, "Error while sending message to network metrics server");
+    }
+}
+
+async fn received_from_metrics_server(
+    ws_stream: &mut tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>,
+    msg: tokio_tungstenite::tungstenite::Result<tokio_tungstenite::tungstenite::Message>,
+) {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    match msg {
+        Ok(Message::Ping(ping)) => {
+            let _ = ws_stream.send(Message::Pong(ping)).await;
+        }
+        Ok(Message::Close(_)) => {
+            if let Err(error) = ws_stream.send(Message::Close(None)).await {
+                tracing::warn!(%error, "Error while closing websocket with network metrics server");
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(feature = "trace-ot")]
 mod opentelemetry_tracer {
     #[cfg(not(test))]
@@ -674,6 +815,7 @@ mod opentelemetry_tracer {
     use opentelemetry::{
         global,
         trace::{self, Span},
+        KeyValue,
     };
 
     use super::*;
@@ -705,6 +847,10 @@ mod opentelemetry_tracer {
                 start_time: Some(start_time),
                 span_id: Some(trace::SpanId::from_bytes(span_id)),
                 trace_id: Some(trace::TraceId::from_bytes(tx_bytes)),
+                attributes: Some(vec![
+                    KeyValue::new("transaction", transaction.to_string()),
+                    KeyValue::new("tx_type", transaction.transaction_type().description()),
+                ]),
                 ..Default::default()
             });
             OTSpan {
@@ -769,7 +915,7 @@ mod opentelemetry_tracer {
     }
 
     #[derive(Clone)]
-    pub(in crate::node) struct OTEventRegister {
+    pub(crate) struct OTEventRegister {
         log_sender: mpsc::Sender<NetLogMessage>,
         finished_tx_notifier: mpsc::Sender<Transaction>,
     }
@@ -895,7 +1041,7 @@ mod opentelemetry_tracer {
 
     impl NetEventRegister for OTEventRegister {
         fn register_events<'a>(
-            &'a mut self,
+            &'a self,
             logs: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
         ) -> BoxFuture<'a, ()> {
             async {
@@ -938,21 +1084,23 @@ enum EventKind {
         at: PeerKeyLocation,
     },
     Ignored,
-    Disconnected,
+    Disconnected {
+        from: PeerId,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 enum ConnectEvent {
     StartConnection {
-        from: PeerKey,
+        from: PeerId,
     },
     Connected {
         this: PeerKeyLocation,
         connected: PeerKeyLocation,
     },
     Finished {
-        initiator: PeerKey,
+        initiator: PeerId,
         location: Location,
     },
 }
@@ -961,11 +1109,11 @@ enum ConnectEvent {
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 enum PutEvent {
     Request {
-        performer: PeerKey,
+        performer: PeerId,
         key: ContractKey,
     },
     PutSuccess {
-        requester: PeerKey,
+        requester: PeerId,
         value: WrappedState,
     },
     BroadcastEmitted {
@@ -978,7 +1126,7 @@ enum PutEvent {
     },
     BroadcastReceived {
         /// peer who started the broadcast op
-        requester: PeerKey,
+        requester: PeerId,
         /// key of the contract which value was being updated
         key: ContractKey,
         /// value that was put
@@ -986,7 +1134,85 @@ enum PutEvent {
     },
 }
 
-#[cfg(test)]
+#[cfg(feature = "trace")]
+pub(crate) mod tracer {
+    use tracing_subscriber::{Layer, Registry};
+
+    use crate::DynError;
+
+    pub fn init_tracer() -> Result<(), DynError> {
+        let default_filter = if cfg!(any(test, debug_assertions)) {
+            tracing_subscriber::filter::LevelFilter::DEBUG
+        } else {
+            tracing_subscriber::filter::LevelFilter::INFO
+        };
+        let filter_layer = tracing_subscriber::EnvFilter::builder()
+            .with_default_directive(default_filter.into())
+            .from_env_lossy()
+            .add_directive("stretto=off".parse().expect("infallible"))
+            .add_directive("sqlx=error".parse().expect("infallible"));
+
+        // use opentelemetry_sdk::propagation::TraceContextPropagator;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let disabled_logs = std::env::var("FREENET_DISABLE_LOGS").is_ok();
+        let to_stderr = std::env::var("FREENET_LOG_TO_STDERR").is_ok();
+        let layers = {
+            let fmt_layer = tracing_subscriber::fmt::layer().with_level(true);
+            let fmt_layer = if cfg!(any(test, debug_assertions)) {
+                fmt_layer.with_file(true).with_line_number(true)
+            } else {
+                fmt_layer
+            };
+            let fmt_layer = if to_stderr {
+                fmt_layer.with_writer(std::io::stderr).boxed()
+            } else {
+                fmt_layer.boxed()
+            };
+
+            #[cfg(feature = "trace-ot")]
+            {
+                let disabled_ot_traces = std::env::var("FREENET_DISABLE_TRACES").is_ok();
+                let identifier = if let Ok(peer) = std::env::var("FREENET_PEER_ID") {
+                    format!("freenet-core-{peer}")
+                } else {
+                    "freenet-core".to_string()
+                };
+                let tracing_ot_layer = {
+                    // Connect the Jaeger OT tracer with the tracing middleware
+                    let ot_jaeger_tracer =
+                        opentelemetry_jaeger::config::agent::AgentPipeline::default()
+                            .with_service_name(identifier)
+                            .install_simple()?;
+                    // Get a tracer which will route OT spans to a Jaeger agent
+                    tracing_opentelemetry::layer().with_tracer(ot_jaeger_tracer)
+                };
+                if !disabled_logs && !disabled_ot_traces {
+                    fmt_layer.and_then(tracing_ot_layer).boxed()
+                } else if !disabled_ot_traces {
+                    tracing_ot_layer.boxed()
+                } else {
+                    return Ok(());
+                }
+            }
+            #[cfg(not(feature = "trace-ot"))]
+            {
+                if disabled_logs {
+                    return Ok(());
+                }
+                fmt_layer.boxed()
+            }
+        };
+        let filtered = layers.with_filter(filter_layer);
+        // Create a subscriber which includes the tracing Jaeger OT layer and a fmt layer
+        let subscriber = Registry::default().with(filtered);
+
+        // Set the global subscriber
+        tracing::subscriber::set_global_default(subscriber).expect("Error setting subscriber");
+        Ok(())
+    }
+}
+
 pub(super) mod test {
     use std::{
         collections::HashMap,
@@ -994,26 +1220,26 @@ pub(super) mod test {
             atomic::{AtomicUsize, Ordering::SeqCst},
             Arc,
         },
-        time::Duration,
     };
 
     use dashmap::DashMap;
-    use parking_lot::Mutex;
+    use tokio_tungstenite::WebSocketStream;
 
     use super::*;
-    use crate::{node::tests::NodeLabel, ring::Distance};
+    use crate::{node::testing_impl::NodeLabel, ring::Distance};
 
     static LOG_ID: AtomicUsize = AtomicUsize::new(0);
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn event_register_read_write() -> Result<(), DynError> {
+        use std::time::Duration;
         let event_log_path = crate::config::Config::conf().event_log();
         // truncate the log if it exists
         std::fs::File::create(event_log_path).unwrap();
 
         // force a truncation
         const TEST_LOGS: usize = EventRegister::MAX_LOG_RECORDS + 100;
-        let mut register = EventRegister::new();
+        let register = EventRegister::new();
         let bytes = crate::util::test::random_bytes_2mb();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let mut transactions = vec![];
@@ -1022,7 +1248,7 @@ pub(super) mod test {
         for _ in 0..TEST_LOGS {
             let tx: Transaction = gen.arbitrary()?;
             transactions.push(tx);
-            let peer: PeerKey = gen.arbitrary()?;
+            let peer: PeerId = gen.arbitrary()?;
             peers.push(peer);
         }
         for _ in 0..TEST_LOGS {
@@ -1045,26 +1271,33 @@ pub(super) mod test {
 
     #[derive(Clone)]
     pub(crate) struct TestEventListener {
-        node_labels: Arc<DashMap<NodeLabel, PeerKey>>,
+        node_labels: Arc<DashMap<NodeLabel, PeerId>>,
         tx_log: Arc<DashMap<Transaction, Vec<ListenerLogId>>>,
-        logs: Arc<Mutex<Vec<NetLogMessage>>>,
+        logs: Arc<tokio::sync::Mutex<Vec<NetLogMessage>>>,
+        network_metrics_server:
+            Arc<tokio::sync::Mutex<Option<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
     }
 
     impl TestEventListener {
-        pub fn new() -> Self {
+        pub async fn new() -> Self {
             TestEventListener {
                 node_labels: Arc::new(DashMap::new()),
                 tx_log: Arc::new(DashMap::new()),
-                logs: Arc::new(Mutex::new(Vec::new())),
+                logs: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                network_metrics_server: Arc::new(tokio::sync::Mutex::new(
+                    connect_to_metrics_server().await,
+                )),
             }
         }
 
-        pub fn add_node(&mut self, label: NodeLabel, peer: PeerKey) {
+        pub fn add_node(&mut self, label: NodeLabel, peer: PeerId) {
             self.node_labels.insert(label, peer);
         }
 
-        pub fn is_connected(&self, peer: &PeerKey) -> bool {
-            let logs = self.logs.lock();
+        pub fn is_connected(&self, peer: &PeerId) -> bool {
+            let Ok(logs) = self.logs.try_lock() else {
+                return false;
+            };
             logs.iter().any(|log| {
                 &log.peer_id == peer
                     && matches!(log.kind, EventKind::Connect(ConnectEvent::Connected { .. }))
@@ -1073,11 +1306,13 @@ pub(super) mod test {
 
         pub fn has_put_contract(
             &self,
-            peer: &PeerKey,
+            peer: &PeerId,
             for_key: &ContractKey,
             expected_value: &WrappedState,
         ) -> bool {
-            let logs = self.logs.lock();
+            let Ok(logs) = self.logs.try_lock() else {
+                return false;
+            };
             let put_ops = logs.iter().filter_map(|l| match &l.kind {
                 EventKind::Put(ev) => Some((&l.tx, ev)),
                 _ => None,
@@ -1114,8 +1349,11 @@ pub(super) mod test {
         }
 
         /// The contract was broadcasted from one peer to an other successfully.
+        #[cfg(test)]
         pub fn contract_broadcasted(&self, for_key: &ContractKey) -> bool {
-            let logs = self.logs.lock();
+            let Ok(logs) = self.logs.try_lock() else {
+                return false;
+            };
             let put_broadcast_ops = logs.iter().filter_map(|l| match &l.kind {
                 EventKind::Put(ev @ PutEvent::BroadcastEmitted { .. })
                 | EventKind::Put(ev @ PutEvent::BroadcastReceived { .. }) => Some((&l.tx, ev)),
@@ -1147,20 +1385,20 @@ pub(super) mod test {
             false
         }
 
-        pub fn has_got_contract(&self, peer: &PeerKey, expected_key: &ContractKey) -> bool {
-            let logs = self.logs.lock();
+        pub fn has_got_contract(&self, peer: &PeerId, expected_key: &ContractKey) -> bool {
+            let Ok(logs) = self.logs.try_lock() else {
+                return false;
+            };
             logs.iter().any(|log| {
                 &log.peer_id == peer
                     && matches!(log.kind, EventKind::Get { ref key } if key == expected_key  )
             })
         }
 
-        pub fn is_subscribed_to_contract(
-            &self,
-            peer: &PeerKey,
-            expected_key: &ContractKey,
-        ) -> bool {
-            let logs = self.logs.lock();
+        pub fn is_subscribed_to_contract(&self, peer: &PeerId, expected_key: &ContractKey) -> bool {
+            let Ok(logs) = self.logs.try_lock() else {
+                return false;
+            };
             logs.iter().any(|log| {
                 &log.peer_id == peer
                     && matches!(log.kind, EventKind::Subscribed { ref key, .. } if key == expected_key  )
@@ -1168,17 +1406,20 @@ pub(super) mod test {
         }
 
         /// Unique connections for a given peer and their relative distance to other peers.
-        pub fn connections(&self, peer: PeerKey) -> impl Iterator<Item = (PeerKey, Distance)> {
-            let logs = self.logs.lock();
+        pub fn connections(&self, peer: PeerId) -> Box<dyn Iterator<Item = (PeerId, Distance)>> {
+            let Ok(logs) = self.logs.try_lock() else {
+                return Box::new([].into_iter());
+            };
             let disconnects = logs
                 .iter()
-                .filter(|l| matches!(l.kind, EventKind::Disconnected))
+                .filter(|l| matches!(l.kind, EventKind::Disconnected { .. }))
                 .fold(HashMap::<_, Vec<_>>::new(), |mut map, log| {
                     map.entry(log.peer_id).or_default().push(log.datetime);
                     map
                 });
 
-            logs.iter()
+            let iter = logs
+                .iter()
                 .filter_map(|l| {
                     if let EventKind::Connect(ConnectEvent::Connected { this, connected }) = l.kind
                     {
@@ -1196,7 +1437,8 @@ pub(super) mod test {
                     None
                 })
                 .collect::<HashMap<_, _>>()
-                .into_iter()
+                .into_iter();
+            Box::new(iter)
         }
 
         fn create_log(log: NetEventLog) -> (NetLogMessage, ListenerLogId) {
@@ -1214,27 +1456,36 @@ pub(super) mod test {
 
     impl super::NetEventRegister for TestEventListener {
         fn register_events<'a>(
-            &'a mut self,
+            &'a self,
             logs: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
         ) -> BoxFuture<'a, ()> {
-            match logs {
-                Either::Left(log) => {
-                    let tx = log.tx;
-                    let (msg_log, log_id) = Self::create_log(log);
-                    self.logs.lock().push(msg_log);
-                    self.tx_log.entry(*tx).or_default().push(log_id);
-                }
-                Either::Right(logs) => {
-                    let logs_list = &mut *self.logs.lock();
-                    for log in logs {
+            async {
+                match logs {
+                    Either::Left(log) => {
                         let tx = log.tx;
                         let (msg_log, log_id) = Self::create_log(log);
-                        logs_list.push(msg_log);
+                        if let Some(conn) = &mut *self.network_metrics_server.lock().await {
+                            send_to_metrics_server(conn, &msg_log).await;
+                        }
+                        self.logs.lock().await.push(msg_log);
                         self.tx_log.entry(*tx).or_default().push(log_id);
+                    }
+                    Either::Right(logs) => {
+                        let logs_list = &mut *self.logs.lock().await;
+                        let mut lock = self.network_metrics_server.lock().await;
+                        for log in logs {
+                            let tx = log.tx;
+                            let (msg_log, log_id) = Self::create_log(log);
+                            if let Some(conn) = &mut *lock {
+                                send_to_metrics_server(conn, &msg_log).await;
+                            }
+                            logs_list.push(msg_log);
+                            self.tx_log.entry(*tx).or_default().push(log_id);
+                        }
                     }
                 }
             }
-            async {}.boxed()
+            .boxed()
         }
 
         fn trait_clone(&self) -> Box<dyn NetEventRegister> {
@@ -1246,19 +1497,19 @@ pub(super) mod test {
         }
     }
 
-    #[test]
-    fn test_get_connections() -> Result<(), anyhow::Error> {
+    #[tokio::test]
+    async fn test_get_connections() -> Result<(), anyhow::Error> {
         use crate::ring::Location;
-        let peer_id = PeerKey::random();
+        let peer_id = PeerId::random();
         let loc = Location::try_from(0.5)?;
         let tx = Transaction::new::<connect::ConnectMsg>();
         let locations = [
-            (PeerKey::random(), Location::try_from(0.5)?),
-            (PeerKey::random(), Location::try_from(0.75)?),
-            (PeerKey::random(), Location::try_from(0.25)?),
+            (PeerId::random(), Location::try_from(0.5)?),
+            (PeerId::random(), Location::try_from(0.75)?),
+            (PeerId::random(), Location::try_from(0.25)?),
         ];
 
-        let mut listener = TestEventListener::new();
+        let listener = TestEventListener::new().await;
         locations.iter().for_each(|(other, location)| {
             listener.register_events(Either::Left(NetEventLog {
                 tx: &tx,

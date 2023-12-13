@@ -8,8 +8,8 @@ use tokio::sync::mpsc::error::SendError;
 use crate::{
     client_events::{ClientId, HostResult},
     contract::ContractError,
-    message::{InnerMessage, Message, Transaction, TransactionType},
-    node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable, PeerKey},
+    message::{InnerMessage, NetMessage, Transaction, TransactionType},
+    node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
     DynError,
 };
@@ -22,18 +22,18 @@ pub(crate) mod update;
 
 pub(crate) struct OperationResult {
     /// Inhabited if there is a message to return to the other peer.
-    pub return_msg: Option<Message>,
+    pub return_msg: Option<NetMessage>,
     /// None if the operation has been completed.
     pub state: Option<OpEnum>,
 }
 
 pub(crate) struct OpInitialization<Op> {
-    sender: Option<PeerKey>,
+    sender: Option<PeerId>,
     op: Op,
 }
 
 pub(crate) async fn handle_op_request<Op, NB>(
-    op_storage: &OpManager,
+    op_manager: &OpManager,
     network_bridge: &mut NB,
     msg: &Op::Message,
     client_id: Option<ClientId>,
@@ -45,25 +45,24 @@ where
     let sender;
     let tx = *msg.id();
     let result = {
-        let OpInitialization { sender: s, op } = Op::load_or_init(op_storage, msg).await?;
+        let OpInitialization { sender: s, op } = Op::load_or_init(op_manager, msg).await?;
         sender = s;
-        op.process_message(network_bridge, op_storage, msg, client_id)
+        op.process_message(network_bridge, op_manager, msg, client_id)
             .await
     };
-    handle_op_result(op_storage, network_bridge, result, tx, sender).await
+    handle_op_result(op_manager, network_bridge, result, tx, sender).await
 }
 
 async fn handle_op_result<CB>(
-    op_storage: &OpManager,
+    op_manager: &OpManager,
     network_bridge: &mut CB,
     result: Result<OperationResult, OpError>,
     tx_id: Transaction,
-    sender: Option<PeerKey>,
+    sender: Option<PeerId>,
 ) -> Result<Option<OpEnum>, OpError>
 where
     CB: NetworkBridge,
 {
-    // FIXME: register changes in the future op commit log
     match result {
         Err(OpError::StatePushed) => {
             // do nothing and continue, the operation will just continue later on
@@ -72,7 +71,7 @@ where
         Err(err) => {
             if let Some(sender) = sender {
                 network_bridge
-                    .send(&sender, Message::Aborted(tx_id))
+                    .send(&sender, NetMessage::Aborted(tx_id))
                     .await?;
             }
             return Err(err);
@@ -86,7 +85,7 @@ where
             if let Some(target) = msg.target().cloned() {
                 network_bridge.send(&target.peer, msg).await?;
             }
-            op_storage.push(id, updated_state).await?;
+            op_manager.push(id, updated_state).await?;
         }
 
         Ok(OperationResult {
@@ -94,7 +93,7 @@ where
             state: Some(final_state),
         }) if final_state.finalized() => {
             // operation finished_completely with result
-            op_storage.completed(tx_id);
+            op_manager.completed(tx_id);
             return Ok(Some(final_state));
         }
         Ok(OperationResult {
@@ -103,13 +102,13 @@ where
         }) => {
             // interim state
             let id = *updated_state.id();
-            op_storage.push(id, updated_state).await?;
+            op_manager.push(id, updated_state).await?;
         }
         Ok(OperationResult {
             return_msg: Some(msg),
             state: None,
         }) => {
-            op_storage.completed(tx_id);
+            op_manager.completed(tx_id);
             // finished the operation at this node, informing back
             if let Some(target) = msg.target().cloned() {
                 network_bridge.send(&target.peer, msg).await?;
@@ -120,7 +119,7 @@ where
             state: None,
         }) => {
             // operation finished_completely
-            op_storage.completed(tx_id);
+            op_manager.completed(tx_id);
         }
     }
     Ok(None)
@@ -263,7 +262,7 @@ where
     type Result;
 
     fn load_or_init<'a>(
-        op_storage: &'a OpManager,
+        op_manager: &'a OpManager,
         msg: &'a Self::Message,
     ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>>;
 
@@ -273,7 +272,7 @@ where
     fn process_message<'a, CB: NetworkBridge>(
         self,
         conn_manager: &'a mut CB,
-        op_storage: &'a OpManager,
+        op_manager: &'a OpManager,
         input: &'a Self::Message,
         client_id: Option<ClientId>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>>;

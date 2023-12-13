@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 
 use axum::response::{Html, IntoResponse};
-use bytes::Bytes;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
     prelude::*,
@@ -129,7 +128,9 @@ pub(super) async fn contract_home(
             result: Err(err), ..
         }) => {
             tracing::error!("error getting contract `{key}`: {err}");
-            return Err(WebSocketApiError::AxumError { error: err.kind() });
+            return Err(WebSocketApiError::AxumError {
+                error: err.kind().clone(),
+            });
         }
         None => {
             return Err(WebSocketApiError::NodeError {
@@ -170,7 +171,7 @@ pub(super) async fn variable_content(
 
     // serve the file
     let mut serve_file = tower_http::services::fs::ServeFile::new(&file_path);
-    let fake_req = axum::http::Request::new(axum::body::Empty::<Bytes>::new());
+    let fake_req = axum::http::Request::new(axum::body::Body::empty());
     serve_file
         .try_call(fake_req)
         .await

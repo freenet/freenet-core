@@ -8,7 +8,6 @@ use super::super::Runtime;
 const TEST_CONTRACT_1: &str = "test_contract_1";
 
 #[test]
-#[ignore]
 fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {
         contract_store,
@@ -39,7 +38,6 @@ fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-#[ignore]
 fn validate_delta() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {
         contract_store,
@@ -68,7 +66,6 @@ fn validate_delta() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-#[ignore]
 fn update_state() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {
         contract_store,
@@ -94,7 +91,6 @@ fn update_state() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-#[ignore]
 fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {
         contract_store,
@@ -116,7 +112,6 @@ fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-#[ignore]
 fn get_state_delta() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {
         contract_store,

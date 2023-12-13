@@ -31,7 +31,7 @@ use crate::runtime::{
 };
 use crate::{
     client_events::{ClientId, HostResult},
-    node::NodeConfig,
+    node::PeerCliConfig,
     operations::{self, Operation},
     DynError,
 };
@@ -260,7 +260,7 @@ pub struct Executor<R = Runtime> {
     ))]
     mode: OperationMode,
     runtime: R,
-    state_store: StateStore<Storage>,
+    pub state_store: StateStore<Storage>,
     update_notifications: HashMap<ContractKey, Vec<(ClientId, mpsc::UnboundedSender<HostResult>)>>,
     subscriber_summaries: HashMap<ContractKey, HashMap<ClientId, Option<StateSummary<'static>>>>,
     delegate_attested_ids: HashMap<DelegateKey, Vec<ContractInstanceId>>,
@@ -377,7 +377,7 @@ impl<R> Executor<R> {
     }
 
     async fn get_stores(
-        config: &NodeConfig,
+        config: &PeerCliConfig,
     ) -> Result<
         (
             ContractStore,
@@ -391,7 +391,9 @@ impl<R> Executor<R> {
         const MAX_MEM_CACHE: u32 = 10_000_000;
         let static_conf = crate::config::Config::conf();
 
-        let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
+        let db_path = crate::config::Config::conf().db_dir();
+        let state_store =
+            StateStore::new(Storage::new(Some(&db_path)).await?, MAX_MEM_CACHE).unwrap();
 
         let contract_dir = config
             .node_data_dir
@@ -419,7 +421,7 @@ impl<R> Executor<R> {
 }
 
 impl Executor<Runtime> {
-    pub async fn from_config(config: NodeConfig) -> Result<Self, DynError> {
+    pub async fn from_config(config: PeerCliConfig) -> Result<Self, DynError> {
         let (contract_store, delegate_store, secret_store, state_store) =
             Self::get_stores(&config).await?;
         let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
@@ -1196,17 +1198,20 @@ impl Executor<Runtime> {
     }
 }
 
-#[cfg(test)]
 impl Executor<crate::contract::MockRuntime> {
-    pub async fn new_mock(data_dir: &str) -> Result<Self, DynError> {
-        let tmp_path = std::env::temp_dir().join(format!("freenet-executor-{data_dir}"));
+    pub async fn new_mock(identifier: &str) -> Result<Self, DynError> {
+        let data_dir = std::env::temp_dir().join(format!("freenet-executor-{identifier}"));
 
-        let contracts_data_dir = tmp_path.join("contracts");
+        let contracts_data_dir = data_dir.join("contracts");
         std::fs::create_dir_all(&contracts_data_dir).expect("directory created");
         let contract_store = ContractStore::new(contracts_data_dir, u16::MAX as i64)?;
 
-        // uses inmemory SQLite
-        let state_store = StateStore::new(Storage::new().await?, u16::MAX as u32).unwrap();
+        let db_path = data_dir.join("db");
+        std::fs::create_dir_all(&db_path).expect("directory created");
+        let log_file = data_dir.join("_EVENT_LOG_LOCAL");
+        crate::config::Config::set_event_log(log_file);
+        let state_store =
+            StateStore::new(Storage::new(Some(&db_path)).await?, u16::MAX as u32).unwrap();
 
         let executor = Executor::new(
             state_store,
@@ -1267,7 +1272,6 @@ impl ContractExecutor for Executor<Runtime> {
     }
 }
 
-#[cfg(test)]
 #[async_trait::async_trait]
 impl ContractExecutor for Executor<crate::contract::MockRuntime> {
     async fn fetch_contract(
@@ -1338,9 +1342,9 @@ mod test {
     async fn local_node_handle() -> Result<(), Box<dyn std::error::Error>> {
         const MAX_SIZE: i64 = 10 * 1024 * 1024;
         const MAX_MEM_CACHE: u32 = 10_000_000;
-        let tmp_path = std::env::temp_dir().join("freenet-test");
-        let contract_store = ContractStore::new(tmp_path.join("executor-test"), MAX_SIZE)?;
-        let state_store = StateStore::new(Storage::new().await?, MAX_MEM_CACHE).unwrap();
+        let tmp_dir = tempfile::tempdir()?;
+        let contract_store = ContractStore::new(tmp_dir.path().join("executor-test"), MAX_SIZE)?;
+        let state_store = StateStore::new(Storage::new(None).await?, MAX_MEM_CACHE).unwrap();
         let mut counter = 0;
         Executor::new(
             state_store,

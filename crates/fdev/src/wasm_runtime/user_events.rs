@@ -17,7 +17,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{util, CommandSender};
 
-use super::{state::AppState, DeserializationFmt, LocalNodeCliConfig};
+use super::{state::AppState, DeserializationFmt, ExecutorConfig};
 
 const HELP: &str = "Freenet Contract Development Environment
 
@@ -31,7 +31,7 @@ SUBCOMMANDS:
 type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
 
 pub(super) async fn user_fn_handler(
-    config: LocalNodeCliConfig,
+    config: ExecutorConfig,
     command_sender: CommandSender,
     app_state: AppState,
 ) -> Result<(), anyhow::Error> {
@@ -53,7 +53,7 @@ pub(super) async fn user_fn_handler(
 }
 
 struct StdInput {
-    config: LocalNodeCliConfig,
+    config: ExecutorConfig,
     contract: ContractContainer,
     input: File,
     buf: Vec<u8>,
@@ -61,7 +61,7 @@ struct StdInput {
 }
 
 impl StdInput {
-    fn new(config: LocalNodeCliConfig, app_state: AppState) -> Result<Self, anyhow::Error> {
+    fn new(config: ExecutorConfig, app_state: AppState) -> Result<Self, anyhow::Error> {
         let params = config
             .params
             .as_ref()
@@ -309,14 +309,25 @@ impl ClientEventsProxy for StdInput {
                             ));
                         }
                         Ok(Command::GetParams) => {
-                            // FIXME: related to issue 272
-                            let _node = &*self.app_state.local_node.read().await;
-                            // let p = node
-                            //     .contract_state
-                            //     .get_params(self.contract.key())
-                            //     .await
-                            //     .unwrap();
-                            // self.app_state.printout_deser(&p);
+                            let node = &*self.app_state.local_node.read().await;
+                            let key = self.contract.key();
+                            let p = node
+                                .state_store
+                                .get_params(&key)
+                                .await
+                                .map_err(|e| {
+                                    ClientError::from(ErrorKind::Unhandled {
+                                        cause: format!("{e}"),
+                                    })
+                                })?
+                                .ok_or_else(|| {
+                                    ClientError::from(ErrorKind::Unhandled {
+                                        cause: format!("missing contract parameters: {key}",),
+                                    })
+                                })?;
+                            if let Err(e) = self.app_state.printout_deser(&p) {
+                                tracing::error!("error printing params: {e}");
+                            }
                         }
                         Ok(cmd) => {
                             return Ok(Either::Left(

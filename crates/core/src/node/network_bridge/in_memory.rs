@@ -7,32 +7,31 @@ use std::{
 };
 
 use crossbeam::channel::{self, Receiver, Sender};
+use futures::{future::BoxFuture, FutureExt};
 use once_cell::sync::OnceCell;
 use rand::{prelude::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use tokio::sync::Mutex;
 
-use super::{ConnectionError, NetworkBridge, PeerKey};
+use super::{ConnectionError, NetworkBridge, PeerId};
 use crate::{
     config::GlobalExecutor,
-    message::Message,
-    node::{network_event_log::NetEventLog, NetEventRegister, OpManager},
+    message::NetMessage,
+    node::{testing_impl::NetworkBridgeExt, NetEventRegister, OpManager},
+    tracing::NetEventLog,
 };
 
-static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
-    OnceCell::new();
-
+#[derive(Clone)]
 pub(in crate::node) struct MemoryConnManager {
-    pub transport: InMemoryTransport,
-    log_register: Arc<Mutex<Box<dyn NetEventRegister>>>,
+    transport: InMemoryTransport,
+    log_register: Arc<dyn NetEventRegister>,
     op_manager: Arc<OpManager>,
-    msg_queue: Arc<Mutex<Vec<Message>>>,
-    peer: PeerKey,
+    msg_queue: Arc<Mutex<Vec<NetMessage>>>,
 }
 
 impl MemoryConnManager {
     pub fn new(
-        peer: PeerKey,
-        log_register: Box<dyn NetEventRegister>,
+        peer: PeerId,
+        log_register: impl NetEventRegister,
         op_manager: Arc<OpManager>,
         add_noise: bool,
     ) -> Self {
@@ -47,58 +46,26 @@ impl MemoryConnManager {
                 let Some(msg) = transport_cp.msg_stack_queue.lock().await.pop() else {
                     continue;
                 };
-                let msg_data: Message = bincode::deserialize_from(Cursor::new(msg.data)).unwrap();
+                let msg_data: NetMessage =
+                    bincode::deserialize_from(Cursor::new(msg.data)).unwrap();
                 msg_queue_cp.lock().await.push(msg_data);
             }
         });
 
         Self {
             transport,
-            log_register: Arc::new(Mutex::new(log_register)),
+            log_register: Arc::new(log_register),
             op_manager,
             msg_queue,
-            peer,
-        }
-    }
-
-    pub async fn recv(&self) -> Result<Message, ConnectionError> {
-        loop {
-            let mut queue = self.msg_queue.lock().await;
-            let Some(msg) = queue.pop() else {
-                std::mem::drop(queue);
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                continue;
-            };
-            return Ok(msg);
-        }
-    }
-}
-
-impl Clone for MemoryConnManager {
-    fn clone(&self) -> Self {
-        let log_register = loop {
-            if let Ok(lr) = self.log_register.try_lock() {
-                break lr.trait_clone();
-            }
-            std::thread::sleep(Duration::from_nanos(50));
-        };
-        Self {
-            transport: self.transport.clone(),
-            log_register: Arc::new(Mutex::new(log_register)),
-            op_manager: self.op_manager.clone(),
-            msg_queue: self.msg_queue.clone(),
-            peer: self.peer,
         }
     }
 }
 
 #[async_trait::async_trait]
 impl NetworkBridge for MemoryConnManager {
-    async fn send(&self, target: &PeerKey, msg: Message) -> super::ConnResult<()> {
+    async fn send(&self, target: &PeerId, msg: NetMessage) -> super::ConnResult<()> {
         self.log_register
-            .try_lock()
-            .expect("unique lock")
-            .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager))
+            .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager.ring))
             .await;
         self.op_manager.sending_transaction(target, &msg);
         let msg = bincode::serialize(&msg)?;
@@ -106,25 +73,45 @@ impl NetworkBridge for MemoryConnManager {
         Ok(())
     }
 
-    async fn add_connection(&mut self, _peer: PeerKey) -> super::ConnResult<()> {
+    async fn add_connection(&mut self, _peer: PeerId) -> super::ConnResult<()> {
         Ok(())
     }
 
-    async fn drop_connection(&mut self, _peer: &PeerKey) -> super::ConnResult<()> {
+    async fn drop_connection(&mut self, _peer: &PeerId) -> super::ConnResult<()> {
         Ok(())
+    }
+}
+
+impl NetworkBridgeExt for MemoryConnManager {
+    fn recv(&mut self) -> BoxFuture<'_, Result<NetMessage, ConnectionError>> {
+        async {
+            loop {
+                let mut queue = self.msg_queue.lock().await;
+                let Some(msg) = queue.pop() else {
+                    std::mem::drop(queue);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                };
+                return Ok(msg);
+            }
+        }
+        .boxed()
     }
 }
 
 #[derive(Clone, Debug)]
 struct MessageOnTransit {
-    origin: PeerKey,
-    target: PeerKey,
+    origin: PeerId,
+    target: PeerId,
     data: Vec<u8>,
 }
 
+static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
+    OnceCell::new();
+
 #[derive(Clone, Debug)]
-pub struct InMemoryTransport {
-    interface_peer: PeerKey,
+struct InMemoryTransport {
+    interface_peer: PeerId,
     /// received messages per each peer awaiting processing
     msg_stack_queue: Arc<Mutex<Vec<MessageOnTransit>>>,
     /// all messages 'traversing' the network at a given time
@@ -132,7 +119,7 @@ pub struct InMemoryTransport {
 }
 
 impl InMemoryTransport {
-    fn new(interface_peer: PeerKey, add_noise: bool) -> Self {
+    fn new(interface_peer: PeerId, add_noise: bool) -> Self {
         let msg_stack_queue = Arc::new(Mutex::new(Vec::new()));
         let (network_tx, network_rx) = NETWORK_WIRES.get_or_init(crossbeam::channel::unbounded);
 
@@ -198,7 +185,7 @@ impl InMemoryTransport {
         }
     }
 
-    fn send(&self, peer: PeerKey, message: Vec<u8>) {
+    fn send(&self, peer: PeerId, message: Vec<u8>) {
         let send_res = self.network.send(MessageOnTransit {
             origin: self.interface_peer,
             target: peer,

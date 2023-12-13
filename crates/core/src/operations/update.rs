@@ -36,7 +36,7 @@ impl Operation for UpdateOp {
     type Result = UpdateResult;
 
     fn load_or_init<'a>(
-        _op_storage: &'a crate::node::OpManager,
+        _op_manager: &'a crate::node::OpManager,
         _msg: &'a Self::Message,
     ) -> BoxFuture<'a, Result<super::OpInitialization<Self>, OpError>> {
         todo!()
@@ -49,7 +49,7 @@ impl Operation for UpdateOp {
     fn process_message<'a, NB: NetworkBridge>(
         self,
         _conn_manager: &'a mut NB,
-        _op_storage: &'a crate::node::OpManager,
+        _op_manager: &'a crate::node::OpManager,
         _input: &Self::Message,
         _client_id: Option<ClientId>,
     ) -> std::pin::Pin<
@@ -85,7 +85,7 @@ mod messages {
             todo!()
         }
 
-        fn requested_location(&self) -> Option<crate::network_sim::Location> {
+        fn requested_location(&self) -> Option<crate::ring::Location> {
             todo!()
         }
     }

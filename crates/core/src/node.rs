@@ -11,18 +11,18 @@ use std::{
     fmt::Display,
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
+    str::FromStr,
     sync::Arc,
     time::Duration,
 };
 
 use either::Either;
-use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
-use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
+use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ErrorKind};
+use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId as Libp2pPeerId};
+use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
-#[cfg(test)]
-use self::in_memory_impl::NodeInMemory;
-use self::{network_event_log::NetEventLog, p2p_impl::NodeP2P};
+use self::p2p_impl::NodeP2P;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
     config::Config,
@@ -31,33 +31,31 @@ use crate::{
         ClientResponses, ClientResponsesSender, ContractError, ExecutorToEventLoopChannel,
         NetworkContractHandler, NetworkEventListenerHalve, OperationMode,
     },
-    message::{Message, Transaction, TransactionType},
+    message::{NetMessage, NodeEvent, Transaction, TransactionType},
     operations::{
         connect::{self, ConnectMsg, ConnectOp},
         get, put, subscribe, OpEnum, OpError, OpOutcome,
     },
     ring::{Location, PeerKeyLocation},
     router::{RouteEvent, RouteOutcome},
+    tracing::{EventRegister, NetEventLog, NetEventRegister},
     util::ExponentialBackoff,
     DynError,
 };
 
 use crate::operations::handle_op_request;
+pub use network_bridge::inter_process::InterProcessConnManager;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
-pub(crate) use network_event_log::{EventRegister, NetEventRegister};
+
 pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
-#[cfg(test)]
-mod in_memory_impl;
 mod network_bridge;
-mod network_event_log;
 mod op_state_manager;
 mod p2p_impl;
-#[cfg(test)]
-pub(crate) mod tests;
+pub(crate) mod testing_impl;
 
 #[derive(clap::Parser, Clone, Debug)]
-pub struct NodeConfig {
+pub struct PeerCliConfig {
     /// Node operation mode.
     #[clap(value_enum, default_value_t=OperationMode::Local)]
     pub mode: OperationMode,
@@ -92,9 +90,10 @@ impl Node {
 ///
 /// If both are provided but also additional peers are added via the [`Self::add_gateway()`] method, this node will
 /// be listening but also try to connect to an existing peer.
-pub struct NodeBuilder<const CLIENTS: usize> {
-    /// local peer private key in
-    pub(crate) local_key: identity::Keypair,
+#[derive(Serialize, Deserialize)]
+pub struct NodeConfig {
+    /// public identifier for the peer
+    pub peer_id: PeerId,
     // optional local info, in case this is an initial bootstrap node
     /// IP to bind to the listener
     pub(crate) local_ip: Option<IpAddr>,
@@ -113,14 +112,13 @@ pub struct NodeBuilder<const CLIENTS: usize> {
     pub(crate) rnd_if_htl_above: Option<usize>,
     pub(crate) max_number_conn: Option<usize>,
     pub(crate) min_number_conn: Option<usize>,
-    pub(crate) clients: [BoxedClient; CLIENTS],
 }
 
-impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
-    pub fn new(clients: [BoxedClient; CLIENTS]) -> NodeBuilder<CLIENTS> {
-        let local_key = Config::conf().local_peer_keypair.clone();
-        NodeBuilder {
-            local_key,
+impl NodeConfig {
+    pub fn new() -> NodeConfig {
+        let local_key = Config::conf().local_peer_keypair.public().into();
+        NodeConfig {
+            peer_id: local_key,
             remote_nodes: Vec::with_capacity(1),
             local_ip: None,
             local_port: None,
@@ -131,7 +129,6 @@ impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
             rnd_if_htl_above: None,
             max_number_conn: None,
             min_number_conn: None,
-            clients,
         }
     }
 
@@ -167,8 +164,8 @@ impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
 
     /// Optional identity key of this node.
     /// If not provided it will be either obtained from the configuration or freshly generated.
-    pub fn with_key(&mut self, key: identity::Keypair) -> &mut Self {
-        self.local_key = key;
+    pub fn with_key(&mut self, key: PeerId) -> &mut Self {
+        self.peer_id = key;
         self
     }
 
@@ -184,11 +181,16 @@ impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
     }
 
     /// Builds a node using the default backend connection manager.
-    pub async fn build(self, config: NodeConfig) -> Result<Node, anyhow::Error> {
+    pub async fn build<const CLIENTS: usize>(
+        self,
+        config: PeerCliConfig,
+        clients: [BoxedClient; CLIENTS],
+        private_key: identity::Keypair,
+    ) -> Result<Node, anyhow::Error> {
         let event_register = {
             #[cfg(feature = "trace-ot")]
             {
-                use super::node::network_event_log::{CombinedRegister, OTEventRegister};
+                use super::tracing::{CombinedRegister, OTEventRegister};
                 CombinedRegister::new([
                     Box::new(EventRegister::new()),
                     Box::new(OTEventRegister::new()),
@@ -199,23 +201,28 @@ impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
                 EventRegister::new()
             }
         };
-        let node =
-            NodeP2P::build::<NetworkContractHandler, CLIENTS, _>(self, event_register, config)
-                .await?;
+        let node = NodeP2P::build::<NetworkContractHandler, CLIENTS, _>(
+            self,
+            private_key,
+            clients,
+            event_register,
+            config,
+        )
+        .await?;
         Ok(Node(node))
     }
 
     /// Returns all specified gateways for this peer. Returns an error if the peer is not a gateway
     /// and no gateways are specified.
     fn get_gateways(&self) -> Result<Vec<PeerKeyLocation>, anyhow::Error> {
-        let peer = PeerKey::from(self.local_key.public());
+        let peer = self.peer_id;
         let gateways: Vec<_> = self
             .remote_nodes
             .iter()
             .filter_map(|node| {
                 if node.addr.is_some() {
                     Some(PeerKeyLocation {
-                        peer: PeerKey::from(node.identifier),
+                        peer: node.identifier,
                         location: Some(node.location),
                     })
                 } else {
@@ -234,8 +241,14 @@ impl<const CLIENTS: usize> NodeBuilder<CLIENTS> {
     }
 }
 
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Gateway node to bootstrap the network.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct InitPeerNode {
     addr: Option<Multiaddr>,
     identifier: PeerId,
@@ -243,10 +256,10 @@ pub struct InitPeerNode {
 }
 
 impl InitPeerNode {
-    pub fn new(identifier: PeerId, location: Location) -> Self {
+    pub fn new(identifier: Libp2pPeerId, location: Location) -> Self {
         Self {
             addr: None,
-            identifier,
+            identifier: PeerId(identifier),
             location,
         }
     }
@@ -255,8 +268,8 @@ impl InitPeerNode {
     ///
     /// # Panic
     /// Will panic if is not a valid representation.
-    pub fn decode_peer_id<T: AsMut<[u8]>>(mut bytes: T) -> PeerId {
-        PeerId::from_public_key(
+    pub fn decode_peer_id<T: AsMut<[u8]>>(mut bytes: T) -> Libp2pPeerId {
+        Libp2pPeerId::from_public_key(
             &identity::Keypair::try_from(
                 identity::ed25519::Keypair::try_from_bytes(bytes.as_mut()).unwrap(),
             )
@@ -289,9 +302,9 @@ impl InitPeerNode {
 
 async fn join_ring_request<CM>(
     backoff: Option<ExponentialBackoff>,
-    peer_key: PeerKey,
+    peer_key: PeerId,
     gateway: &PeerKeyLocation,
-    op_storage: &OpManager,
+    op_manager: &OpManager,
     conn_manager: &mut CM,
 ) -> Result<(), OpError>
 where
@@ -299,7 +312,7 @@ where
 {
     let tx_id = Transaction::new::<ConnectMsg>();
     let mut op =
-        connect::initial_request(peer_key, *gateway, op_storage.ring.max_hops_to_live, tx_id);
+        connect::initial_request(peer_key, *gateway, op_manager.ring.max_hops_to_live, tx_id);
     if let Some(mut backoff) = backoff {
         // backoff to retry later in case it failed
         tracing::warn!("Performing a new join, attempt {}", backoff.retries() + 1);
@@ -309,15 +322,16 @@ where
         }
         op.backoff = Some(backoff);
     }
-    connect::connect_request(tx_id, op_storage, conn_manager, op).await?;
+    connect::connect_request(tx_id, op_manager, conn_manager, op).await?;
     Ok(())
 }
 
 /// Process client events.
 async fn client_event_handling<ClientEv>(
-    op_storage: Arc<OpManager>,
+    op_manager: Arc<OpManager>,
     mut client_events: ClientEv,
     mut client_responses: ClientResponses,
+    node_controller: tokio::sync::mpsc::Sender<NodeEvent>,
 ) where
     ClientEv: ClientEventsProxy + Send + 'static,
 {
@@ -325,25 +339,29 @@ async fn client_event_handling<ClientEv>(
         tokio::select! {
             client_request = client_events.recv() => {
                 let req = match client_request {
-                    Ok(req) => {
-                        tracing::debug!(%req, "got client request event");
-                        req
+                    Ok(request) => {
+                        tracing::debug!(%request, "got client request event");
+                        request
                     }
-                    Err(err) => {
-                        tracing::debug!(error = %err, "client error");
+                    Err(error) if matches!(error.kind(), ErrorKind::Shutdown) => {
+                        node_controller.send(NodeEvent::Disconnect { cause: None }).await.ok();
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "client error");
                         continue;
                     }
                 };
-                if let ClientRequest::Disconnect { .. } = &*req.request {
-                    // todo: notify executor of disconnect
-                    continue;
+                if let ClientRequest::Disconnect { cause } = &*req.request {
+                    node_controller.send(NodeEvent::Disconnect { cause: cause.clone() }).await.ok();
+                    break;
                 }
-                process_open_request(req, op_storage.clone()).await;
+                process_open_request(req, op_manager.clone()).await;
             }
             res = client_responses.recv() => {
                 if let Some((cli_id, res)) = res {
-                    if let Ok(res) = &res {
-                        tracing::debug!(%res, "sending client response");
+                    if let Ok(result) = &res {
+                        tracing::debug!(%result, "sending client response");
                     }
                     if let Err(err) = client_events.send(cli_id, res).await {
                         tracing::debug!("channel closed: {err}");
@@ -356,7 +374,7 @@ async fn client_event_handling<ClientEv>(
 }
 
 #[inline]
-async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpManager>) {
+async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpManager>) {
     // this will indirectly start actions on the local contract executor
     let fut = async move {
         let client_id = request.client_id;
@@ -370,16 +388,16 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
                 } => {
                     // Initialize a put op.
                     tracing::debug!(
-                        "Received put from user event @ {}",
-                        &op_storage.ring.peer_key
+                        this_peer = %op_manager.ring.peer_key,
+                        "Received put from user event",
                     );
                     let op = put::start_op(
                         contract,
                         related_contracts,
                         state,
-                        op_storage.ring.max_hops_to_live,
+                        op_manager.ring.max_hops_to_live,
                     );
-                    if let Err(err) = put::request_put(&op_storage, op, Some(client_id)).await {
+                    if let Err(err) = put::request_put(&op_manager, op, Some(client_id)).await {
                         tracing::error!("{}", err);
                     }
                 }
@@ -387,7 +405,11 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
                     key: _key,
                     data: _delta,
                 } => {
-                    todo!()
+                    // FIXME: DO THIS
+                    tracing::debug!(
+                        this_peer = %op_manager.ring.peer_key,
+                        "Received update from user event",
+                    );
                 }
                 ContractRequest::Get {
                     key,
@@ -395,50 +417,58 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
                 } => {
                     // Initialize a get op.
                     tracing::debug!(
-                        "Received get from user event @ {}",
-                        &op_storage.ring.peer_key
+                        this_peer = %op_manager.ring.peer_key,
+                        "Received get from user event",
                     );
                     let op = get::start_op(key, contract);
-                    if let Err(err) = get::request_get(&op_storage, op, Some(client_id)).await {
+                    if let Err(err) = get::request_get(&op_manager, op, Some(client_id)).await {
                         tracing::error!("{}", err);
                     }
                 }
                 ContractRequest::Subscribe { key, .. } => {
-                    // Initialize a subscribe op.
-                    loop {
-                        let op = subscribe::start_op(key.clone());
-                        match subscribe::request_subscribe(&op_storage, op, Some(client_id)).await {
-                            Err(OpError::ContractError(ContractError::ContractNotFound(key)))
-                                if !missing_contract =>
+                    const TIMEOUT: Duration = Duration::from_secs(10);
+                    let timeout = tokio::time::timeout(TIMEOUT, async {
+                        // Initialize a subscribe op.
+                        loop {
+                            let op = subscribe::start_op(key.clone());
+                            match subscribe::request_subscribe(&op_manager, op, Some(client_id))
+                                .await
                             {
-                                tracing::info!("Trying to subscribe to a contract not present: {key}, requesting it first");
-                                missing_contract = true;
-                                let get_op = get::start_op(key.clone(), true);
-                                if let Err(err) =
-                                    get::request_get(&op_storage, get_op, Some(client_id)).await
-                                {
-                                    tracing::error!("Failed getting the contract `{key}` while previously trying to subscribe; bailing: {err}");
+                                Err(OpError::ContractError(ContractError::ContractNotFound(
+                                    key,
+                                ))) if !missing_contract => {
+                                    tracing::info!(%key, "Trying to subscribe to a contract not present, requesting it first");
+                                    missing_contract = true;
+                                    let get_op = get::start_op(key.clone(), true);
+                                    if let Err(error) =
+                                        get::request_get(&op_manager, get_op, Some(client_id)).await
+                                    {
+                                        tracing::error!(%key, %error, "Failed getting the contract while previously trying to subscribe; bailing");
+                                        break;
+                                    }
+                                }
+                                Err(OpError::ContractError(ContractError::ContractNotFound(_))) => {
+                                    tracing::warn!("Still waiting for {key} contract");
+                                    tokio::time::sleep(Duration::from_secs(2)).await
+                                }
+                                Err(err) => {
+                                    tracing::error!("{}", err);
+                                    break;
+                                }
+                                Ok(()) => {
+                                    if missing_contract {
+                                        tracing::debug!(%key,
+                                            "Got back the missing contract while subscribing"
+                                        );
+                                    }
+                                    tracing::debug!(%key, "Starting subscribe request");
                                     break;
                                 }
                             }
-                            Err(OpError::ContractError(ContractError::ContractNotFound(_))) => {
-                                tracing::warn!("Still waiting for {key} contract");
-                                tokio::time::sleep(Duration::from_secs(2)).await
-                            }
-                            Err(err) => {
-                                tracing::error!("{}", err);
-                                break;
-                            }
-                            Ok(()) => {
-                                if missing_contract {
-                                    tracing::debug!(
-                                        "Got back the missing contract ({key}) while subscribing"
-                                    );
-                                }
-                                tracing::debug!("Starting subscribe request to {key}");
-                                break;
-                            }
                         }
+                    });
+                    if timeout.await.is_err() {
+                        tracing::error!(%key, "Timeout while waiting for contract");
                     }
                 }
                 _ => {
@@ -452,19 +482,18 @@ async fn process_open_request(request: OpenRequest<'static>, op_storage: Arc<OpM
             }
         }
     };
-    GlobalExecutor::spawn(fut.instrument(tracing::span!(
-        tracing::Level::INFO,
-        "process_client_request"
-    )));
+    GlobalExecutor::spawn(fut.instrument(
+        tracing::info_span!(parent: tracing::Span::current(), "process_client_request"),
+    ));
 }
 
 #[allow(unused)]
 macro_rules! log_handling_msg {
-    ($op:expr, $id:expr, $op_storage:ident) => {
+    ($op:expr, $id:expr, $op_manager:ident) => {
         tracing::debug!(
             tx = %$id,
-            concat!("Handling ", $op, " request @ {}"),
-            $op_storage.ring.peer_key,
+            this_peer = %$op_manager.ring.peer_key,
+            concat!("Handling ", $op, " request"),
         );
     };
 }
@@ -472,7 +501,7 @@ macro_rules! log_handling_msg {
 async fn report_result(
     tx: Option<Transaction>,
     op_result: Result<Option<OpEnum>, OpError>,
-    op_storage: &OpManager,
+    op_manager: &OpManager,
     executor_callback: Option<ExecutorToEventLoopChannel<NetworkEventListenerHalve>>,
     client_req_handler_callback: Option<(ClientId, ClientResponsesSender)>,
     event_listener: &mut dyn NetEventRegister,
@@ -505,18 +534,18 @@ async fn report_result(
                     event_listener
                         .register_events(Either::Left(NetEventLog::route_event(
                             op_res.id(),
-                            op_storage,
+                            op_manager,
                             &event,
                         )))
                         .await;
-                    op_storage.ring.routing_finished(event);
+                    op_manager.ring.routing_finished(event);
                 }
                 // todo: handle failures, need to track timeouts and other potential failures
                 // OpOutcome::ContractOpFailure {
                 //     target_peer: Some(target_peer),
                 //     contract_location,
                 // } => {
-                //     op_storage.ring.routing_finished(RouteEvent {
+                //     op_manager.ring.routing_finished(RouteEvent {
                 //         peer: *target_peer,
                 //         contract_location,
                 //         outcome: RouteOutcome::Failure,
@@ -532,9 +561,9 @@ async fn report_result(
         Err(err) => {
             // just mark the operation as completed so no redundant messages are processed for this transaction anymore
             if let Some(tx) = tx {
-                op_storage.completed(tx);
+                op_manager.completed(tx);
             }
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, test))]
             {
                 let OpError::InvalidStateTransition { tx, state, trace } = err else {
                     tracing::error!("Finished transaction with error: {err}");
@@ -554,7 +583,7 @@ async fn report_result(
                 tracing::error!(%tx, ?state, "Wrong state");
                 eprintln!("Operation error trace:\n{trace}");
             }
-            #[cfg(not(debug_assertions))]
+            #[cfg(not(any(debug_assertions, test)))]
             {
                 tracing::debug!("Finished transaction with error: {err}");
             }
@@ -577,8 +606,8 @@ macro_rules! handle_op_not_available {
 }
 
 async fn process_message<CB>(
-    msg: Message,
-    op_storage: Arc<OpManager>,
+    msg: NetMessage,
+    op_manager: Arc<OpManager>,
     mut conn_manager: CB,
     mut event_listener: Box<dyn NetEventRegister>,
     executor_callback: Option<ExecutorToEventLoopChannel<NetworkEventListenerHalve>>,
@@ -591,14 +620,14 @@ async fn process_message<CB>(
 
     let tx = Some(*msg.id());
     event_listener
-        .register_events(NetEventLog::from_inbound_msg(&msg, &op_storage))
+        .register_events(NetEventLog::from_inbound_msg(&msg, &op_manager))
         .await;
     loop {
         match &msg {
-            Message::Connect(op) => {
-                // log_handling_msg!("join", op.id(), op_storage);
+            NetMessage::Connect(op) => {
+                // log_handling_msg!("join", op.id(), op_manager);
                 let op_result = handle_op_request::<connect::ConnectOp, _>(
-                    &op_storage,
+                    &op_manager,
                     &mut conn_manager,
                     op,
                     client_id,
@@ -608,17 +637,17 @@ async fn process_message<CB>(
                 break report_result(
                     tx,
                     op_result,
-                    &op_storage,
+                    &op_manager,
                     executor_callback,
                     cli_req,
                     &mut *event_listener,
                 )
                 .await;
             }
-            Message::Put(op) => {
-                // log_handling_msg!("put", *op.id(), op_storage);
+            NetMessage::Put(op) => {
+                // log_handling_msg!("put", *op.id(), op_manager);
                 let op_result = handle_op_request::<put::PutOp, _>(
-                    &op_storage,
+                    &op_manager,
                     &mut conn_manager,
                     op,
                     client_id,
@@ -628,17 +657,17 @@ async fn process_message<CB>(
                 break report_result(
                     tx,
                     op_result,
-                    &op_storage,
+                    &op_manager,
                     executor_callback,
                     cli_req,
                     &mut *event_listener,
                 )
                 .await;
             }
-            Message::Get(op) => {
-                // log_handling_msg!("get", op.id(), op_storage);
+            NetMessage::Get(op) => {
+                // log_handling_msg!("get", op.id(), op_manager);
                 let op_result = handle_op_request::<get::GetOp, _>(
-                    &op_storage,
+                    &op_manager,
                     &mut conn_manager,
                     op,
                     client_id,
@@ -648,17 +677,17 @@ async fn process_message<CB>(
                 break report_result(
                     tx,
                     op_result,
-                    &op_storage,
+                    &op_manager,
                     executor_callback,
                     cli_req,
                     &mut *event_listener,
                 )
                 .await;
             }
-            Message::Subscribe(op) => {
-                // log_handling_msg!("subscribe", op.id(), op_storage);
+            NetMessage::Subscribe(op) => {
+                // log_handling_msg!("subscribe", op.id(), op_manager);
                 let op_result = handle_op_request::<subscribe::SubscribeOp, _>(
-                    &op_storage,
+                    &op_manager,
                     &mut conn_manager,
                     op,
                     client_id,
@@ -668,7 +697,7 @@ async fn process_message<CB>(
                 break report_result(
                     tx,
                     op_result,
-                    &op_storage,
+                    &op_manager,
                     executor_callback,
                     cli_req,
                     &mut *event_listener,
@@ -682,8 +711,8 @@ async fn process_message<CB>(
 
 async fn handle_cancelled_op<CM>(
     tx: Transaction,
-    peer_key: PeerKey,
-    op_storage: &OpManager,
+    peer_key: PeerId,
+    op_manager: &OpManager,
     conn_manager: &mut CM,
 ) -> Result<(), OpError>
 where
@@ -692,7 +721,7 @@ where
     if let TransactionType::Connect = tx.transaction_type() {
         // the attempt to join the network failed, this could be a fatal error since the node
         // is useless without connecting to the network, we will retry with exponential backoff
-        match op_storage.pop(&tx) {
+        match op_manager.pop(&tx) {
             Ok(Some(OpEnum::Connect(op))) if op.has_backoff() => {
                 let ConnectOp {
                     gateway, backoff, ..
@@ -700,7 +729,7 @@ where
                 if let Some(gateway) = gateway {
                     let backoff = backoff.expect("infallible");
                     tracing::warn!("Retry connecting to gateway {}", gateway.peer);
-                    join_ring_request(Some(backoff), peer_key, &gateway, op_storage, conn_manager)
+                    join_ring_request(Some(backoff), peer_key, &gateway, op_manager, conn_manager)
                         .await?;
                 }
             }
@@ -714,24 +743,24 @@ where
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
-pub struct PeerKey(PeerId);
+pub struct PeerId(Libp2pPeerId);
 
 #[cfg(test)]
-impl<'a> arbitrary::Arbitrary<'a> for PeerKey {
+impl<'a> arbitrary::Arbitrary<'a> for PeerId {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let data: [u8; 32] = u.arbitrary()?;
-        let id =
-            PeerId::from_multihash(libp2p::multihash::Multihash::wrap(0, data.as_slice()).unwrap())
-                .unwrap();
+        let id = Libp2pPeerId::from_multihash(
+            libp2p::multihash::Multihash::wrap(0, data.as_slice()).unwrap(),
+        )
+        .unwrap();
         Ok(Self(id))
     }
 }
 
-impl PeerKey {
-    #[cfg(test)]
+impl PeerId {
     pub fn random() -> Self {
         use libp2p::identity::Keypair;
-        PeerKey::from(Keypair::generate_ed25519().public())
+        PeerId::from(Keypair::generate_ed25519().public())
     }
 
     #[cfg(test)]
@@ -740,37 +769,45 @@ impl PeerKey {
     }
 }
 
-impl std::fmt::Debug for PeerKey {
+impl std::fmt::Debug for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         <Self as Display>::fmt(self, f)
     }
 }
 
-impl Display for PeerKey {
+impl Display for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-impl From<identity::PublicKey> for PeerKey {
+impl From<identity::PublicKey> for PeerId {
     fn from(val: identity::PublicKey) -> Self {
-        PeerKey(PeerId::from(val))
+        PeerId(Libp2pPeerId::from(val))
     }
 }
 
-impl From<PeerId> for PeerKey {
-    fn from(val: PeerId) -> Self {
-        PeerKey(val)
+impl From<Libp2pPeerId> for PeerId {
+    fn from(val: Libp2pPeerId) -> Self {
+        PeerId(val)
+    }
+}
+
+impl FromStr for PeerId {
+    type Err = libp2p_identity::ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Libp2pPeerId::from_str(s)?))
     }
 }
 
 mod serialization {
-    use libp2p::PeerId;
+    use libp2p::PeerId as Libp2pPeerId;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    use super::PeerKey;
+    use super::PeerId;
 
-    impl Serialize for PeerKey {
+    impl Serialize for PeerId {
         fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where
             S: Serializer,
@@ -779,14 +816,14 @@ mod serialization {
         }
     }
 
-    impl<'de> Deserialize<'de> for PeerKey {
+    impl<'de> Deserialize<'de> for PeerId {
         fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
         where
             D: Deserializer<'de>,
         {
             let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
-            Ok(PeerKey(
-                PeerId::from_bytes(&bytes).expect("failed deserialization of PeerKey"),
+            Ok(PeerId(
+                Libp2pPeerId::from_bytes(&bytes).expect("failed deserialization of PeerKey"),
             ))
         }
     }

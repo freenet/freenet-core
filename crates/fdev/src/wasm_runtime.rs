@@ -8,7 +8,7 @@ mod user_events;
 
 const DEFAULT_MAX_CONTRACT_SIZE: i64 = 50 * 1024 * 1024;
 
-pub async fn run_local_node_client(config: LocalNodeCliConfig) -> Result<(), anyhow::Error> {
+pub async fn run_local_executor(config: ExecutorConfig) -> Result<(), anyhow::Error> {
     if config.disable_tui_mode {
         anyhow::bail!("TUI mode not yet implemented");
     }
@@ -38,7 +38,7 @@ pub enum DeserializationFmt {
     Json,
 }
 
-/// A CLI utility for testing out contracts against a Freenet local node.
+/// An interactive runtime for WASM for testing contracts and delegates development.
 #[derive(clap::Parser, Clone)]
 #[clap(name = "Freenet Local Development Node Environment")]
 #[clap(author = "The Freenet Project Inc.")]
@@ -47,7 +47,7 @@ pub enum DeserializationFmt {
         .required(true)
         .args(&["output-file", "terminal-output"])
 ))]
-pub struct LocalNodeCliConfig {
+pub struct ExecutorConfig {
     /// Cleanups all state which was created locally during execution
     #[clap(long, requires = "fmt")]
     pub(crate) clean_exit: bool,
