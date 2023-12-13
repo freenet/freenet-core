@@ -1,6 +1,6 @@
 use crate::ring::{Connection, Location};
 use parking_lot::RwLock;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -14,7 +14,6 @@ pub(crate) struct RequestDensityTracker {
     request_list: VecDeque<Location>,
     window_size: usize,
     samples: usize,
-    neighbors: Arc<RwLock<BTreeMap<Location, Vec<Connection>>>>,
 }
 
 impl RequestDensityTracker {
@@ -49,8 +48,10 @@ impl RequestDensityTracker {
         }
     }
 
-    pub(crate) fn create_density_map(&self) -> Result<DensityMap, DensityMapError> {
-        let neighbors = self.neighbors.read();
+    pub(crate) fn create_density_map(
+        &self,
+        neighbors: &BTreeSet<Location>,
+    ) -> Result<DensityMap, DensityMapError> {
         if neighbors.is_empty() {
             return Err(DensityMapError::EmptyNeighbors);
         }
@@ -68,7 +69,7 @@ impl RequestDensityTracker {
                 .or_else(|| neighbors.iter().next());
 
             match (previous_neighbor, next_neighbor) {
-                (Some((previous_neighbor_location, _)), Some((next_neighbor_location, _))) => {
+                (Some(previous_neighbor_location), Some(next_neighbor_location)) => {
                     if sample_location.distance(*previous_neighbor_location)
                         < sample_location.distance(*next_neighbor_location)
                     {
