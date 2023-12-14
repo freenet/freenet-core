@@ -6,7 +6,6 @@ use std::{collections::HashSet, time::Duration};
 
 use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::{
-    client_events::ClientId,
     message::{InnerMessage, NetMessage, Transaction},
     node::{ConnectionError, NetworkBridge, OpManager, PeerId},
     operations::OpEnum,
@@ -120,7 +119,6 @@ impl Operation for ConnectOp {
         network_bridge: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
-        _client_id: Option<ClientId>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let return_msg;
@@ -233,7 +231,7 @@ impl Operation for ConnectOp {
 
                     // todo: location should be based on your public IP
                     let new_location = assigned_location.unwrap_or_else(Location::random);
-                    let accepted_by = if op_manager.ring.should_accept(new_location) {
+                    let accepted_by = if op_manager.ring.should_accept(new_location, joiner) {
                         tracing::debug!(tx = %id, %joiner, "Accepting connection from");
                         HashSet::from_iter([*this_peer])
                     } else {
@@ -313,10 +311,10 @@ impl Operation for ConnectOp {
                         %hops_to_live,
                         "Proxy connect request received to connect with peer",
                     );
-                    if op_manager
-                        .ring
-                        .should_accept(joiner.location.ok_or(ConnectionError::LocationUnknown)?)
-                    {
+                    if op_manager.ring.should_accept(
+                        joiner.location.ok_or(ConnectionError::LocationUnknown)?,
+                        &joiner.peer,
+                    ) {
                         tracing::debug!(tx = %id, "Accepting proxy connection from {}", joiner.peer);
                         accepted_by.insert(own_loc);
                     } else {
@@ -428,7 +426,7 @@ impl Operation for ConnectOp {
                         op_manager.ring.update_location(Some(*your_location));
 
                         for other_peer in accepted_by.iter().filter(|pl| pl.peer != target.peer) {
-                            let _ = propagate_oc_to_accepted_peers(
+                            let _ = propagate_oc_to_responding_peers(
                                 network_bridge,
                                 op_manager,
                                 gateway,
@@ -459,11 +457,7 @@ impl Operation for ConnectOp {
                             backoff: self.backoff,
                         };
                         op_manager
-                            .notify_op_change(
-                                NetMessage::Aborted(*id),
-                                OpEnum::Connect(op.into()),
-                                None,
-                            )
+                            .notify_op_change(NetMessage::Aborted(*id), OpEnum::Connect(op.into()))
                             .await?;
                         return Err(OpError::StatePushed);
                     }
@@ -559,7 +553,7 @@ impl Operation for ConnectOp {
                                 new_state = None;
                             } else {
                                 for peer in accepted_by {
-                                    propagate_oc_to_accepted_peers(
+                                    propagate_oc_to_responding_peers(
                                         network_bridge,
                                         op_manager,
                                         *sender,
@@ -718,7 +712,7 @@ fn try_returning_proxy_connection(
     (new_state, return_msg)
 }
 
-async fn propagate_oc_to_accepted_peers<NB: NetworkBridge>(
+async fn propagate_oc_to_responding_peers<NB: NetworkBridge>(
     network_bridge: &mut NB,
     op_manager: &OpManager,
     sender: PeerKeyLocation,
@@ -730,6 +724,7 @@ async fn propagate_oc_to_accepted_peers<NB: NetworkBridge>(
         other_peer
             .location
             .ok_or(ConnectionError::LocationUnknown)?,
+        &other_peer.peer,
     ) {
         tracing::info!(tx = %id, from = %sender.peer, to = %other_peer.peer, "Established connection");
         network_bridge.add_connection(other_peer.peer).await?;
@@ -801,7 +796,83 @@ impl ConnectState {
     }
 }
 
-pub(crate) fn initial_request(
+/// # Arguments
+///
+/// - gateways: Inmutable list of known gateways. Passed when starting up the node.
+/// After the initial connections through the gateways are established all other connections
+/// (to gateways or regular peers) will be treated as regular connections.
+///
+/// - is_gateway: Whether this peer is a gateway or not.
+pub(crate) async fn initial_join_procedure<CM>(
+    op_manager: &OpManager,
+    conn_manager: &mut CM,
+    this_peer: PeerId,
+    gateways: &[PeerKeyLocation],
+) -> Result<(), OpError>
+where
+    CM: NetworkBridge + Send,
+{
+    use crate::util::IterExt;
+    let number_of_parallel_connections = {
+        let max_potential_conns_per_gw = op_manager.ring.max_hops_to_live;
+        // e.g. 10 gateways and htl 5 -> only need 2 connections in parallel
+        let needed_to_cover_max = gateways
+            .iter()
+            .filter(|conn| conn.peer != this_peer)
+            .count()
+            / max_potential_conns_per_gw;
+        needed_to_cover_max.max(1)
+    };
+    tracing::info!(
+        "Attempting to connect to {} gateways in parallel",
+        number_of_parallel_connections
+    );
+    for gateway in gateways
+        .iter()
+        .shuffle()
+        .filter(|conn| conn.peer != this_peer)
+        .take(number_of_parallel_connections)
+    {
+        join_ring_request(None, this_peer, gateway, op_manager, conn_manager).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn join_ring_request<CM>(
+    backoff: Option<ExponentialBackoff>,
+    peer_key: PeerId,
+    gateway: &PeerKeyLocation,
+    op_manager: &OpManager,
+    conn_manager: &mut CM,
+) -> Result<(), OpError>
+where
+    CM: NetworkBridge + Send,
+{
+    let tx_id = Transaction::new::<ConnectMsg>();
+    let mut op = initial_request(peer_key, *gateway, op_manager.ring.max_hops_to_live, tx_id);
+    if let Some(mut backoff) = backoff {
+        // backoff to retry later in case it failed
+        tracing::warn!("Performing a new join, attempt {}", backoff.retries() + 1);
+        if backoff.sleep().await.is_none() {
+            tracing::error!("Max number of retries reached");
+            if op_manager.ring.open_connections() == 0 {
+                // only consider this a complete failure if no connections were established at all
+                // if connections where established the peer should incrementally acquire more over time
+                return Err(OpError::MaxRetriesExceeded(tx_id, tx_id.transaction_type()));
+            } else {
+                return Ok(());
+            }
+        }
+        // on first run the backoff will be initialized at the `initial_request` function
+        // if the op was to fail and retried this function will be called with the previous backoff
+        // passed as an argument and advanced
+        op.backoff = Some(backoff);
+    }
+    connect_request(tx_id, op_manager, conn_manager, op).await?;
+    Ok(())
+}
+
+fn initial_request(
     this_peer: PeerId,
     gateway: PeerKeyLocation,
     max_hops_to_live: usize,
@@ -831,7 +902,7 @@ pub(crate) fn initial_request(
 }
 
 /// Join ring routine, called upon performing a join operation for this node.
-pub(crate) async fn connect_request<NB>(
+async fn connect_request<NB>(
     tx: Transaction,
     op_manager: &OpManager,
     conn_bridge: &mut NB,

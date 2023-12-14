@@ -1,6 +1,6 @@
 use freenet_stdlib::prelude::*;
 
-use crate::runtime::tests::TestSetup;
+use crate::wasm_runtime::tests::TestSetup;
 
 use super::super::contract::*;
 use super::super::Runtime;

@@ -104,14 +104,10 @@ pub(crate) struct NetEventLog<'a> {
 }
 
 impl<'a> NetEventLog<'a> {
-    pub fn route_event(
-        tx: &'a Transaction,
-        op_manager: &'a OpManager,
-        route_event: &RouteEvent,
-    ) -> Self {
+    pub fn route_event(tx: &'a Transaction, ring: &'a Ring, route_event: &RouteEvent) -> Self {
         NetEventLog {
             tx,
-            peer_id: &op_manager.ring.peer_key,
+            peer_id: &ring.peer_key,
             kind: EventKind::Route(route_event.clone()),
         }
     }
@@ -241,16 +237,13 @@ impl<'a> NetEventLog<'a> {
             }) => {
                 let key = contract.key();
                 EventKind::Put(PutEvent::Request {
-                    performer: target.peer,
+                    requester: target.peer,
                     key,
                 })
             }
-            NetMessage::Put(PutMsg::SuccessfulUpdate { new_value, .. }) => {
-                EventKind::Put(PutEvent::PutSuccess {
-                    requester: op_manager.ring.peer_key,
-                    value: new_value.clone(),
-                })
-            }
+            NetMessage::Put(PutMsg::SuccessfulPut { .. }) => EventKind::Put(PutEvent::PutSuccess {
+                requester: op_manager.ring.peer_key,
+            }),
             NetMessage::Put(PutMsg::Broadcasting {
                 new_value,
                 broadcast_to,
@@ -416,7 +409,7 @@ impl EventRegister {
             Ok(file) => file,
             Err(err) => {
                 tracing::error!("Failed openning log file {:?} with: {err}", event_log_path);
-                panic!("Failed openning log file"); // fixme: propagate this to the main thread
+                panic!("Failed openning log file"); // fixme: propagate this to the main event loop
             }
         };
         let mut num_written = 0;
@@ -779,6 +772,7 @@ async fn send_to_metrics_server(
             let msg = PeerChange::removed_connection_msg(*from, send_msg.peer_id);
             ws_stream.send(Message::Binary(msg)).await
         }
+        // todo: send op events too 8put, get, update, etc) so we can keep track of transactions
         _ => Ok(()),
     };
     if let Err(error) = res {
@@ -1109,12 +1103,11 @@ enum ConnectEvent {
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 enum PutEvent {
     Request {
-        performer: PeerId,
+        requester: PeerId,
         key: ContractKey,
     },
     PutSuccess {
         requester: PeerId,
-        value: WrappedState,
     },
     BroadcastEmitted {
         /// subscribed peers
@@ -1304,12 +1297,7 @@ pub(super) mod test {
             })
         }
 
-        pub fn has_put_contract(
-            &self,
-            peer: &PeerId,
-            for_key: &ContractKey,
-            expected_value: &WrappedState,
-        ) -> bool {
+        pub fn has_put_contract(&self, peer: &PeerId, for_key: &ContractKey) -> bool {
             let Ok(logs) = self.logs.try_lock() else {
                 return false;
             };
@@ -1323,7 +1311,6 @@ pub(super) mod test {
             });
 
             for (_tx, events) in put_ops {
-                let mut is_expected_value = false;
                 let mut is_expected_key = false;
                 let mut is_expected_peer = false;
                 for ev in events {
@@ -1332,16 +1319,13 @@ pub(super) mod test {
                         PutEvent::Request { key, .. } if key == for_key => {
                             is_expected_key = true;
                         }
-                        PutEvent::PutSuccess { requester, value }
-                            if requester == peer && value == expected_value =>
-                        {
+                        PutEvent::PutSuccess { requester } if requester == peer => {
                             is_expected_peer = true;
-                            is_expected_value = true;
                         }
                         _ => {}
                     }
                 }
-                if is_expected_value && is_expected_peer && is_expected_key {
+                if is_expected_peer && is_expected_key {
                     return true;
                 }
             }
@@ -1510,22 +1494,26 @@ pub(super) mod test {
         ];
 
         let listener = TestEventListener::new().await;
-        locations.iter().for_each(|(other, location)| {
-            listener.register_events(Either::Left(NetEventLog {
-                tx: &tx,
-                peer_id: &peer_id,
-                kind: EventKind::Connect(ConnectEvent::Connected {
-                    this: PeerKeyLocation {
-                        peer: peer_id,
-                        location: Some(loc),
-                    },
-                    connected: PeerKeyLocation {
-                        peer: *other,
-                        location: Some(*location),
-                    },
-                }),
-            }));
-        });
+        let futs = futures::stream::FuturesUnordered::from_iter(locations.iter().map(
+            |(other, location)| {
+                listener.register_events(Either::Left(NetEventLog {
+                    tx: &tx,
+                    peer_id: &peer_id,
+                    kind: EventKind::Connect(ConnectEvent::Connected {
+                        this: PeerKeyLocation {
+                            peer: peer_id,
+                            location: Some(loc),
+                        },
+                        connected: PeerKeyLocation {
+                            peer: *other,
+                            location: Some(*location),
+                        },
+                    }),
+                }))
+            },
+        ));
+
+        futures::future::join_all(futs).await;
 
         let distances: Vec<_> = listener.connections(peer_id).collect();
         assert!(distances.len() == 3);

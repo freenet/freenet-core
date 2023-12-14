@@ -1,21 +1,23 @@
-use crate::runtime::ContractError as ContractRtError;
+//! Handling of contracts and delegates, including storage, execution, caching, etc.
+//!
+//! Internally uses the wasm_runtime module to execute contract and/or delegate instructions.
+
 use either::Either;
 use freenet_stdlib::prelude::*;
 
 mod executor;
 mod handler;
-mod in_memory;
 pub mod storages;
 
 pub(crate) use executor::{
-    executor_channel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
+    executor_channel, mock_runtime::MockRuntime, Callback, ExecutorToEventLoopChannel,
+    NetworkEventListenerHalve,
 };
 pub(crate) use handler::{
-    contract_handler_channel, ClientResponses, ClientResponsesSender, ContractHandler,
-    ContractHandlerChannel, ContractHandlerEvent, EventId, NetworkContractHandler, SenderHalve,
-    StoreResponse,
+    client_responses_channel, contract_handler_channel, in_memory::MemoryContractHandler,
+    ClientResponsesReceiver, ClientResponsesSender, ContractHandler, ContractHandlerChannel,
+    ContractHandlerEvent, NetworkContractHandler, SenderHalve, StoreResponse, WaitingResolution,
 };
-pub(crate) use in_memory::{MemoryContractHandler, MockRuntime};
 
 pub use executor::{Executor, ExecutorError, OperationMode};
 
@@ -68,41 +70,9 @@ where
                                 id,
                                 ContractHandlerEvent::GetResponse {
                                     key,
-                                    response: Err(err.into()),
+                                    response: Err(err),
                                 },
                             )
-                            .await
-                            .map_err(|error| {
-                                tracing::debug!(%error, "shutting down contract handler");
-                                error
-                            })?;
-                    }
-                }
-            }
-            ContractHandlerEvent::Cache(contract) => {
-                let key = contract.key();
-                match contract_handler
-                    .executor()
-                    .store_contract(contract)
-                    .instrument(tracing::info_span!("store_contract", %key))
-                    .await
-                {
-                    Ok(_) => {
-                        contract_handler
-                            .channel()
-                            .send_to_sender(id, ContractHandlerEvent::CacheResult(Ok(())))
-                            .await
-                            .map_err(|error| {
-                                tracing::debug!(%error, "shutting down contract handler");
-                                error
-                            })?;
-                    }
-                    Err(err) => {
-                        tracing::error!("Error while caching: {err}");
-                        let err = ContractError::ContractRuntimeError(err);
-                        contract_handler
-                            .channel()
-                            .send_to_sender(id, ContractHandlerEvent::CacheResult(Err(err)))
                             .await
                             .map_err(|error| {
                                 tracing::debug!(%error, "shutting down contract handler");
@@ -115,7 +85,7 @@ where
                 key,
                 state,
                 related_contracts,
-                parameters,
+                contract,
             } => {
                 let put_result = contract_handler
                     .executor()
@@ -123,17 +93,16 @@ where
                         key.clone(),
                         Either::Left(state),
                         related_contracts,
-                        parameters,
+                        contract,
                     )
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
-                    .await
-                    .map_err(Into::into);
+                    .await;
                 contract_handler
                     .channel()
                     .send_to_sender(
                         id,
                         ContractHandlerEvent::PutResponse {
-                            new_value: put_result,
+                            new_value: put_result.map_err(Into::into),
                         },
                     )
                     .await
@@ -141,6 +110,24 @@ where
                         tracing::debug!(%error, "shutting down contract handler");
                         error
                     })?;
+            }
+            ContractHandlerEvent::Subscribe { key } => {
+                let response = contract_handler
+                    .executor()
+                    .subscribe_to_contract(key.clone())
+                    .await;
+                contract_handler
+                    .channel()
+                    .send_to_sender(
+                        id,
+                        ContractHandlerEvent::SubscribeResponse { key, response },
+                    )
+                    .await
+                    .map_err(|error| {
+                        tracing::debug!(%error, "shutting down contract handler");
+                        error
+                    })?;
+                todo!()
             }
             _ => unreachable!(),
         }
@@ -153,8 +140,6 @@ pub(crate) enum ContractError {
     ChannelDropped(Box<ContractHandlerEvent>),
     #[error("contract {0} not found in storage")]
     ContractNotFound(ContractKey),
-    #[error(transparent)]
-    ContractRuntimeError(ContractRtError),
     #[error("{0}")]
     IOError(#[from] std::io::Error),
     #[error("no response received from handler")]

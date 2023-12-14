@@ -346,7 +346,8 @@ async fn record_saver(
         change: Change,
     }
 
-    // FIXME: this ain't flushing correctly after test ends
+    // FIXME: this ain't flushing correctly after test ends,
+    // for now flushing each single time we get a new record
     // let mut batch = Vec::with_capacity(1024);
     while let Ok(change) = incoming_rec.recv().await {
         let change = WithTimestamp {

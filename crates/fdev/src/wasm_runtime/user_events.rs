@@ -102,19 +102,19 @@ impl StdInput {
     {
         self.input.rewind().map_err(|e| {
             Box::new(ClientError::from(ErrorKind::Unhandled {
-                cause: format!("{e}"),
+                cause: format!("{e}").into(),
             }))
         })?;
         match self.config.ser_format {
             Some(DeserializationFmt::Json) => {
                 let state: serde_json::Value = self.read_input().map_err(|e| {
                     Box::new(ClientError::from(ErrorKind::Unhandled {
-                        cause: format!("deserialization error: {e}"),
+                        cause: format!("deserialization error: {e}").into(),
                     }))
                 })?;
                 let json_str = serde_json::to_string_pretty(&state).map_err(|e| {
                     Box::new(ClientError::from(ErrorKind::Unhandled {
-                        cause: format!("{e}"),
+                        cause: format!("{e}").into(),
                     }))
                 })?;
                 tracing::debug!("{cmd:?} value:\n{json_str}");
@@ -135,7 +135,7 @@ impl StdInput {
             _ => {
                 let state: Vec<u8> = self.read_input().map_err(|e| {
                     Box::new(ClientError::from(ErrorKind::Unhandled {
-                        cause: format!("deserialization error: {e}"),
+                        cause: format!("deserialization error: {e}").into(),
                     }))
                 })?;
                 Ok(state.into())
@@ -242,7 +242,7 @@ impl From<CommandInfo> for OpenRequest<'static> {
                 ContractRequest::Update { key, data }.into()
             }
             Command::Exit => ClientRequest::Disconnect {
-                cause: Some("shutdown".to_owned()),
+                cause: Some("shutdown".to_owned().into()),
             },
             _ => unreachable!(),
         };
@@ -317,12 +317,13 @@ impl ClientEventsProxy for StdInput {
                                 .await
                                 .map_err(|e| {
                                     ClientError::from(ErrorKind::Unhandled {
-                                        cause: format!("{e}"),
+                                        cause: format!("{e}").into(),
                                     })
                                 })?
                                 .ok_or_else(|| {
                                     ClientError::from(ErrorKind::Unhandled {
-                                        cause: format!("missing contract parameters: {key}",),
+                                        cause: format!("missing contract parameters: {key}",)
+                                            .into(),
                                     })
                                 })?;
                             if let Err(e) = self.app_state.printout_deser(&p) {

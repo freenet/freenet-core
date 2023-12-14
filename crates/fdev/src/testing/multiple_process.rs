@@ -45,6 +45,11 @@ impl super::TestConfig {
         args.push("--min-connections".to_owned());
         args.push(self.min_connections.to_string());
 
+        if let Some(start_backoff) = self.peer_start_backoff_ms {
+            args.push("--peer-start-backoff-ms".to_owned());
+            args.push(start_backoff.to_string());
+        }
+
         if let Some(max_contract_number) = self.max_contract_number {
             args.push("--max_contract_number".to_owned());
             args.push(max_contract_number.to_string());
@@ -120,7 +125,7 @@ async fn supervisor(config: &super::TestConfig) -> anyhow::Result<(), Error> {
         .collect();
     let mut events = EventChain::new(peers, user_ev_controller, config.events, true);
     let next_event_wait_time = config
-        .event_wait_time
+        .event_wait_ms
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_millis(200));
     let (connectivity_timeout, network_connection_percent) = config.get_connection_check_params();
@@ -376,7 +381,7 @@ impl SubProcess {
     }
 }
 
-async fn child(config: &super::TestConfig, id: usize) -> anyhow::Result<()> {
+async fn child(test_config: &super::TestConfig, id: usize) -> anyhow::Result<()> {
     // write logs to stderr so stdout and stdin are free of unexpected data
     std::env::set_var("FREENET_LOG_TO_STDERR", "1");
 
@@ -394,15 +399,22 @@ async fn child(config: &super::TestConfig, id: usize) -> anyhow::Result<()> {
     let mut event_generator = MemoryEventsGen::<fastrand::Rng>::new_with_seed(
         receiver_ch.clone(),
         node_config.peer_id,
-        config.seed.expect("seed should be set for child process"),
+        test_config
+            .seed
+            .expect("seed should be set for child process"),
     );
     event_generator.rng_params(
         id,
-        config.gateways + config.nodes,
-        config.max_contract_number.unwrap_or(config.nodes * 10),
-        config.events as usize,
+        test_config.gateways + test_config.nodes,
+        test_config
+            .max_contract_number
+            .unwrap_or(test_config.nodes * 10),
+        test_config.events as usize,
     );
     let config = SimPeer::from(node_config);
+    if let Some(backoff) = test_config.peer_start_backoff_ms {
+        tokio::time::sleep(Duration::from_millis(backoff)).await;
+    }
     tokio::task::spawn(this_child.event_loop());
     config.start_child(event_generator).await?;
     Ok(())

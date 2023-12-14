@@ -7,11 +7,10 @@ use tokio::sync::mpsc::error::SendError;
 
 use crate::{
     client_events::{ClientId, HostResult},
-    contract::ContractError,
+    contract::{ContractError, ExecutorError},
     message::{InnerMessage, NetMessage, Transaction, TransactionType},
     node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
-    DynError,
 };
 
 pub(crate) mod connect;
@@ -36,7 +35,6 @@ pub(crate) async fn handle_op_request<Op, NB>(
     op_manager: &OpManager,
     network_bridge: &mut NB,
     msg: &Op::Message,
-    client_id: Option<ClientId>,
 ) -> Result<Option<OpEnum>, OpError>
 where
     Op: Operation,
@@ -47,12 +45,12 @@ where
     let result = {
         let OpInitialization { sender: s, op } = Op::load_or_init(op_manager, msg).await?;
         sender = s;
-        op.process_message(network_bridge, op_manager, msg, client_id)
-            .await
+        op.process_message(network_bridge, op_manager, msg).await
     };
     handle_op_result(op_manager, network_bridge, result, tx, sender).await
 }
 
+#[inline(always)]
 async fn handle_op_result<CB>(
     op_manager: &OpManager,
     network_bridge: &mut CB,
@@ -154,6 +152,33 @@ impl OpEnum {
     }
 }
 
+macro_rules! try_from_op_enum {
+    ($op_enum:path, $op_type:ty, $transaction_type:expr) => {
+        impl TryFrom<OpEnum> for $op_type {
+            type Error = OpError;
+
+            fn try_from(value: OpEnum) -> Result<Self, Self::Error> {
+                match value {
+                    $op_enum(op) => Ok(op),
+                    other => Err(OpError::IncorrectTxType(
+                        $transaction_type,
+                        other.id().transaction_type(),
+                    )),
+                }
+            }
+        }
+    };
+}
+
+try_from_op_enum!(OpEnum::Put, put::PutOp, TransactionType::Put);
+try_from_op_enum!(OpEnum::Get, get::GetOp, TransactionType::Get);
+try_from_op_enum!(
+    OpEnum::Subscribe,
+    subscribe::SubscribeOp,
+    TransactionType::Subscribe
+);
+try_from_op_enum!(OpEnum::Update, update::UpdateOp, TransactionType::Update);
+
 pub(crate) enum OpOutcome<'a> {
     /// An op which involves a contract completed successfully.
     ContractOpSuccess {
@@ -187,7 +212,7 @@ pub(crate) enum OpError {
     #[error(transparent)]
     ContractError(#[from] ContractError),
     #[error(transparent)]
-    ExecutorError(DynError),
+    ExecutorError(#[from] ExecutorError),
 
     #[error("unexpected operation state")]
     UnexpectedOpState,
@@ -201,7 +226,6 @@ pub(crate) enum OpError {
     },
     #[error("failed notifying, channel closed")]
     NotificationError,
-    #[cfg(debug_assertions)]
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
     IncorrectTxType(TransactionType, TransactionType),
     #[error("op not present: {0}")]
@@ -211,7 +235,7 @@ pub(crate) enum OpError {
     #[error("op not available")]
     OpNotAvailable(#[from] OpNotAvailable),
 
-    // user for control flow
+    // used for control flow
     /// This is used as an early interrumpt of an op update when an op
     /// was sent throught the fast path back to the storage.
     #[error("early push of state into the op stack")]
@@ -274,6 +298,6 @@ where
         conn_manager: &'a mut CB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
-        client_id: Option<ClientId>,
+        // client_id: Option<ClientId>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>>;
 }

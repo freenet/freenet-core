@@ -8,7 +8,7 @@ use crate::{
     contract::{self, ContractHandler, MemoryContractHandler},
     dev_tool::{ClientEventsProxy, NodeConfig},
     node::{
-        network_bridge::{inter_process::InterProcessConnManager, EventLoopNotifications},
+        network_bridge::{event_loop_notification_channel, inter_process::InterProcessConnManager},
         OpManager,
     },
     tracing::{EventRegister, NetEventRegister},
@@ -52,19 +52,17 @@ impl SimPeer {
         ER: NetEventRegister + Send + Clone + 'static,
     {
         let gateways = self.config.get_gateways()?;
-        let is_gateway = self.config.local_ip.zip(self.config.local_port).is_some();
 
-        let (notification_channel, notification_tx) = EventLoopNotifications::channel();
-        let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
+        let (notification_channel, notification_tx) = event_loop_notification_channel();
+        let (ops_ch_channel, ch_channel, wait_for_event) = contract::contract_handler_channel();
 
         let op_manager = Arc::new(OpManager::new(
             notification_tx,
             ops_ch_channel,
             &self.config,
-            &gateways,
             event_register.clone(),
         )?);
-        let (_executor_listener, executor_sender) = contract::executor_channel(op_manager.clone());
+        let (executor_listener, executor_sender) = contract::executor_channel(op_manager.clone());
         let contract_handler = MemoryContractHandler::build(
             ch_channel,
             executor_sender,
@@ -83,13 +81,14 @@ impl SimPeer {
         let running_node = super::RunnerConfig {
             peer_key: self.config.peer_id,
             op_manager,
-            gateways,
             notification_channel,
             conn_manager,
             event_register: Box::new(event_register),
-            is_gateway,
             user_events: Some(event_generator),
             parent_span: None,
+            gateways,
+            executor_listener,
+            client_wait_for_transaction: wait_for_event,
         };
         super::run_node(running_node).await
     }

@@ -16,7 +16,7 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
 
     let events = config.events;
     let next_event_wait_time = config
-        .event_wait_time
+        .event_wait_ms
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_millis(200));
     let (connectivity_timeout, network_connection_percent) = config.get_connection_check_params();

@@ -168,7 +168,7 @@ async fn execute_command(
     let state_store = StateStore::new(Storage::new(Some(&database_path)).await?, MAX_MEM_CACHE)?;
     let rt =
         freenet::dev_tool::Runtime::build(contract_store, delegate_store, secret_store, false)?;
-    let mut executor = Executor::new(state_store, || Ok(()), OperationMode::Local, rt)
+    let mut executor = Executor::new(state_store, || Ok(()), OperationMode::Local, rt, None)
         .await
         .map_err(|err| anyhow::anyhow!(err))?;
 

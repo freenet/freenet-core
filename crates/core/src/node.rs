@@ -5,7 +5,8 @@
 //! Node comes with different underlying implementations that can be used upon construction.
 //! Those implementations are:
 //! - libp2p: all the connection is handled by libp2p.
-//! - In memory: a simplifying node used for emulation purposes mainly.
+//! - in-memory: a simplifying node used for emulation purposes mainly.
+//! - inter-process: similar to in-memory, but can be rana cross multiple processes, closer to the real p2p impl
 
 use std::{
     fmt::Display,
@@ -28,18 +29,17 @@ use crate::{
     config::Config,
     config::GlobalExecutor,
     contract::{
-        ClientResponses, ClientResponsesSender, ContractError, ExecutorToEventLoopChannel,
-        NetworkContractHandler, NetworkEventListenerHalve, OperationMode,
+        Callback, ClientResponsesReceiver, ClientResponsesSender, ContractError,
+        ExecutorToEventLoopChannel, NetworkContractHandler, OperationMode,
     },
     message::{NetMessage, NodeEvent, Transaction, TransactionType},
     operations::{
-        connect::{self, ConnectMsg, ConnectOp},
+        connect::{self, ConnectOp},
         get, put, subscribe, OpEnum, OpError, OpOutcome,
     },
     ring::{Location, PeerKeyLocation},
     router::{RouteEvent, RouteOutcome},
     tracing::{EventRegister, NetEventLog, NetEventRegister},
-    util::ExponentialBackoff,
     DynError,
 };
 
@@ -212,6 +212,10 @@ impl NodeConfig {
         Ok(Node(node))
     }
 
+    pub fn is_gateway(&self) -> bool {
+        self.local_ip.is_some() && self.local_port.is_some() && self.location.is_some()
+    }
+
     /// Returns all specified gateways for this peer. Returns an error if the peer is not a gateway
     /// and no gateways are specified.
     fn get_gateways(&self) -> Result<Vec<PeerKeyLocation>, anyhow::Error> {
@@ -300,37 +304,11 @@ impl InitPeerNode {
     }
 }
 
-async fn join_ring_request<CM>(
-    backoff: Option<ExponentialBackoff>,
-    peer_key: PeerId,
-    gateway: &PeerKeyLocation,
-    op_manager: &OpManager,
-    conn_manager: &mut CM,
-) -> Result<(), OpError>
-where
-    CM: NetworkBridge + Send,
-{
-    let tx_id = Transaction::new::<ConnectMsg>();
-    let mut op =
-        connect::initial_request(peer_key, *gateway, op_manager.ring.max_hops_to_live, tx_id);
-    if let Some(mut backoff) = backoff {
-        // backoff to retry later in case it failed
-        tracing::warn!("Performing a new join, attempt {}", backoff.retries() + 1);
-        if backoff.sleep().await.is_none() {
-            tracing::error!("Max number of retries reached");
-            return Err(OpError::MaxRetriesExceeded(tx_id, tx_id.transaction_type()));
-        }
-        op.backoff = Some(backoff);
-    }
-    connect::connect_request(tx_id, op_manager, conn_manager, op).await?;
-    Ok(())
-}
-
 /// Process client events.
 async fn client_event_handling<ClientEv>(
     op_manager: Arc<OpManager>,
     mut client_events: ClientEv,
-    mut client_responses: ClientResponses,
+    mut client_responses: ClientResponsesReceiver,
     node_controller: tokio::sync::mpsc::Sender<NodeEvent>,
 ) where
     ClientEv: ClientEventsProxy + Send + 'static,
@@ -378,6 +356,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
     // this will indirectly start actions on the local contract executor
     let fut = async move {
         let client_id = request.client_id;
+
         let mut missing_contract = false;
         match *request.request {
             ClientRequest::ContractOp(ops) => match ops {
@@ -397,7 +376,11 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                         state,
                         op_manager.ring.max_hops_to_live,
                     );
-                    if let Err(err) = put::request_put(&op_manager, op, Some(client_id)).await {
+                    let _ = op_manager
+                        .ch_outbound
+                        .waiting_for_transaction(op.id, client_id)
+                        .await;
+                    if let Err(err) = put::request_put(&op_manager, op).await {
                         tracing::error!("{}", err);
                     }
                 }
@@ -405,7 +388,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                     key: _key,
                     data: _delta,
                 } => {
-                    // FIXME: DO THIS
+                    // FIXME: perform updates
                     tracing::debug!(
                         this_peer = %op_manager.ring.peer_key,
                         "Received update from user event",
@@ -421,7 +404,11 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                         "Received get from user event",
                     );
                     let op = get::start_op(key, contract);
-                    if let Err(err) = get::request_get(&op_manager, op, Some(client_id)).await {
+                    let _ = op_manager
+                        .ch_outbound
+                        .waiting_for_transaction(op.id, client_id)
+                        .await;
+                    if let Err(err) = get::request_get(&op_manager, op).await {
                         tracing::error!("{}", err);
                     }
                 }
@@ -431,17 +418,18 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                         // Initialize a subscribe op.
                         loop {
                             let op = subscribe::start_op(key.clone());
-                            match subscribe::request_subscribe(&op_manager, op, Some(client_id))
-                                .await
-                            {
+                            let _ = op_manager
+                                .ch_outbound
+                                .waiting_for_transaction(op.id, client_id)
+                                .await;
+                            match subscribe::request_subscribe(&op_manager, op).await {
                                 Err(OpError::ContractError(ContractError::ContractNotFound(
                                     key,
                                 ))) if !missing_contract => {
                                     tracing::info!(%key, "Trying to subscribe to a contract not present, requesting it first");
                                     missing_contract = true;
                                     let get_op = get::start_op(key.clone(), true);
-                                    if let Err(error) =
-                                        get::request_get(&op_manager, get_op, Some(client_id)).await
+                                    if let Err(error) = get::request_get(&op_manager, get_op).await
                                     {
                                         tracing::error!(%key, %error, "Failed getting the contract while previously trying to subscribe; bailing");
                                         break;
@@ -502,7 +490,7 @@ async fn report_result(
     tx: Option<Transaction>,
     op_result: Result<Option<OpEnum>, OpError>,
     op_manager: &OpManager,
-    executor_callback: Option<ExecutorToEventLoopChannel<NetworkEventListenerHalve>>,
+    executor_callback: Option<ExecutorToEventLoopChannel<Callback>>,
     client_req_handler_callback: Option<(ClientId, ClientResponsesSender)>,
     event_listener: &mut dyn NetEventRegister,
 ) {
@@ -534,7 +522,7 @@ async fn report_result(
                     event_listener
                         .register_events(Either::Left(NetEventLog::route_event(
                             op_res.id(),
-                            op_manager,
+                            &op_manager.ring,
                             &event,
                         )))
                         .await;
@@ -610,7 +598,7 @@ async fn process_message<CB>(
     op_manager: Arc<OpManager>,
     mut conn_manager: CB,
     mut event_listener: Box<dyn NetEventRegister>,
-    executor_callback: Option<ExecutorToEventLoopChannel<NetworkEventListenerHalve>>,
+    executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
     client_req_handler_callback: Option<ClientResponsesSender>,
     client_id: Option<ClientId>,
 ) where
@@ -626,13 +614,9 @@ async fn process_message<CB>(
         match &msg {
             NetMessage::Connect(op) => {
                 // log_handling_msg!("join", op.id(), op_manager);
-                let op_result = handle_op_request::<connect::ConnectOp, _>(
-                    &op_manager,
-                    &mut conn_manager,
-                    op,
-                    client_id,
-                )
-                .await;
+                let op_result =
+                    handle_op_request::<connect::ConnectOp, _>(&op_manager, &mut conn_manager, op)
+                        .await;
                 handle_op_not_available!(op_result);
                 break report_result(
                     tx,
@@ -646,13 +630,8 @@ async fn process_message<CB>(
             }
             NetMessage::Put(op) => {
                 // log_handling_msg!("put", *op.id(), op_manager);
-                let op_result = handle_op_request::<put::PutOp, _>(
-                    &op_manager,
-                    &mut conn_manager,
-                    op,
-                    client_id,
-                )
-                .await;
+                let op_result =
+                    handle_op_request::<put::PutOp, _>(&op_manager, &mut conn_manager, op).await;
                 handle_op_not_available!(op_result);
                 break report_result(
                     tx,
@@ -666,13 +645,8 @@ async fn process_message<CB>(
             }
             NetMessage::Get(op) => {
                 // log_handling_msg!("get", op.id(), op_manager);
-                let op_result = handle_op_request::<get::GetOp, _>(
-                    &op_manager,
-                    &mut conn_manager,
-                    op,
-                    client_id,
-                )
-                .await;
+                let op_result =
+                    handle_op_request::<get::GetOp, _>(&op_manager, &mut conn_manager, op).await;
                 handle_op_not_available!(op_result);
                 break report_result(
                     tx,
@@ -690,7 +664,6 @@ async fn process_message<CB>(
                     &op_manager,
                     &mut conn_manager,
                     op,
-                    client_id,
                 )
                 .await;
                 handle_op_not_available!(op_result);
@@ -709,32 +682,62 @@ async fn process_message<CB>(
     }
 }
 
-async fn handle_cancelled_op<CM>(
+async fn handle_aborted_op<CM>(
     tx: Transaction,
-    peer_key: PeerId,
+    this_peer: PeerId,
     op_manager: &OpManager,
     conn_manager: &mut CM,
+    gateways: &[PeerKeyLocation],
 ) -> Result<(), OpError>
 where
     CM: NetworkBridge + Send,
 {
+    use crate::util::IterExt;
     if let TransactionType::Connect = tx.transaction_type() {
-        // the attempt to join the network failed, this could be a fatal error since the node
+        // attempt to establish a connection failed, this could be a fatal error since the node
         // is useless without connecting to the network, we will retry with exponential backoff
+        // if necessary
         match op_manager.pop(&tx) {
-            Ok(Some(OpEnum::Connect(op))) if op.has_backoff() => {
+            // only keep attempting to connect if the node hasn't got enough connections yet
+            Ok(Some(OpEnum::Connect(op)))
+                if op.has_backoff()
+                    && op_manager.ring.open_connections() < op_manager.ring.min_connections =>
+            {
                 let ConnectOp {
                     gateway, backoff, ..
                 } = *op;
                 if let Some(gateway) = gateway {
-                    let backoff = backoff.expect("infallible");
                     tracing::warn!("Retry connecting to gateway {}", gateway.peer);
-                    join_ring_request(Some(backoff), peer_key, &gateway, op_manager, conn_manager)
-                        .await?;
+                    connect::join_ring_request(
+                        backoff,
+                        this_peer,
+                        &gateway,
+                        op_manager,
+                        conn_manager,
+                    )
+                    .await?;
                 }
             }
             Ok(Some(OpEnum::Connect(_))) => {
-                return Err(OpError::MaxRetriesExceeded(tx, tx.transaction_type()));
+                // if no connections were achieved just fail
+                if op_manager.ring.open_connections() == 0 {
+                    tracing::warn!("Retrying joining the ring with an other gateway");
+                    if let Some(gateway) = gateways
+                        .iter()
+                        .shuffle()
+                        .next()
+                        .filter(|p| p.peer != this_peer)
+                    {
+                        connect::join_ring_request(
+                            None,
+                            this_peer,
+                            gateway,
+                            op_manager,
+                            conn_manager,
+                        )
+                        .await?
+                    }
+                }
             }
             _ => {}
         }

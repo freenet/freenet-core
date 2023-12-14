@@ -4,7 +4,7 @@ use freenet_stdlib::prelude::*;
 use rocksdb::{Options, DB};
 
 use crate::contract::ContractKey;
-use crate::runtime::StateStorage;
+use crate::wasm_runtime::StateStorage;
 
 pub struct RocksDb(DB);
 

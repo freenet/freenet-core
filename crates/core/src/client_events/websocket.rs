@@ -380,7 +380,7 @@ async fn process_client_request(
                 Err(err) => {
                     let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
                         ErrorKind::DeserializationError {
-                            cause: format!("{err}"),
+                            cause: format!("{err}").into(),
                         }
                         .into(),
                     ))

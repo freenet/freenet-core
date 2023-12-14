@@ -50,6 +50,7 @@ impl AppState {
                     },
                     OperationMode::Local,
                     rt,
+                    None,
                 )
                 .map_err(|err| anyhow::anyhow!(err))
                 .await?,
