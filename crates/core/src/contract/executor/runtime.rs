@@ -50,10 +50,12 @@ impl ContractExecutor for Executor<Runtime> {
                 })?
         };
 
-        let contract = if let Some(code) = self.runtime.contract_store.fetch_contract(&key, &params)
+        let remove_if_fail = if self
+            .runtime
+            .contract_store
+            .fetch_contract(&key, &params)
+            .is_none()
         {
-            code
-        } else {
             let code = code.ok_or_else(|| {
                 ExecutorError::request(StdContractError::MissingContract {
                     key: key.clone().into(),
@@ -63,7 +65,9 @@ impl ContractExecutor for Executor<Runtime> {
                 .contract_store
                 .store_contract(code.clone())
                 .map_err(ExecutorError::other)?;
-            code
+            true
+        } else {
+            false
         };
 
         let mut updates = match update {
@@ -72,7 +76,9 @@ impl ContractExecutor for Executor<Runtime> {
                     .runtime
                     .validate_state(&key, &params, &incoming_state, &related_contracts)
                     .map_err(|err| {
-                        let _ = self.runtime.contract_store.remove_contract(&key);
+                        if remove_if_fail {
+                            let _ = self.runtime.contract_store.remove_contract(&key);
+                        }
                         ExecutorError::other(err)
                     })?;
                 match result {
@@ -91,13 +97,6 @@ impl ContractExecutor for Executor<Runtime> {
                     }
                 }
 
-                let request = PutContract {
-                    contract,
-                    state: incoming_state.clone(),
-                    related_contracts: related_contracts.clone(),
-                };
-                let _op: operations::put::PutResult = self.op_request(request).await?;
-
                 vec![UpdateData::State(incoming_state.clone().into())]
             }
             Either::Right(delta) => {
@@ -105,7 +104,9 @@ impl ContractExecutor for Executor<Runtime> {
                     .runtime
                     .validate_delta(&key, &params, &delta)
                     .map_err(|err| {
-                        let _ = self.runtime.contract_store.remove_contract(&key);
+                        if remove_if_fail {
+                            let _ = self.runtime.contract_store.remove_contract(&key);
+                        }
                         ExecutorError::other(err)
                     })?;
                 if !valid {
@@ -154,15 +155,6 @@ impl ContractExecutor for Executor<Runtime> {
             }
         };
         Ok(updated_state)
-    }
-
-    async fn subscribe_to_contract(
-        &mut self,
-        key: ContractKey,
-    ) -> Result<PeerKeyLocation, ExecutorError> {
-        let request = SubscribeContract { key };
-        let result: operations::subscribe::SubscribeResult = self.op_request(request).await?;
-        Ok(result.subscribed_to)
     }
 }
 

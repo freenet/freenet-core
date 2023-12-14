@@ -340,7 +340,11 @@ impl Ring {
     pub fn within_subscribing_distance(&self, loc: &Location) -> bool {
         const CACHING_DISTANCE: f64 = 0.05;
         const MAX_CACHED: usize = 100;
+        const MIN_CACHED: usize = MAX_CACHED / 4;
         let caching_distance = Distance::new(CACHING_DISTANCE);
+        if self.subscriptions.len() < MIN_CACHED {
+            return true;
+        }
         self.subscriptions.len() < MAX_CACHED
             && self
                 .own_location()

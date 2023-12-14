@@ -17,7 +17,6 @@ use super::{
 };
 use crate::client_events::HostResult;
 use crate::message::Transaction;
-use crate::ring::PeerKeyLocation;
 use crate::{client_events::ClientId, node::PeerCliConfig, wasm_runtime::Runtime, DynError};
 
 pub(crate) struct ClientResponsesReceiver(UnboundedReceiver<(ClientId, HostResult)>);
@@ -357,14 +356,6 @@ pub(crate) enum ContractHandlerEvent {
         key: ContractKey,
         response: Result<StoreResponse, ExecutorError>,
     },
-    /// Subscribe to a contract.
-    Subscribe { key: ContractKey },
-    /// The response to a subscribe event
-    SubscribeResponse {
-        key: ContractKey,
-        /// If successful, returns the peer to which it subscribed to for updates.
-        response: Result<PeerKeyLocation, ExecutorError>,
-    },
 }
 
 impl std::fmt::Display for ContractHandlerEvent {
@@ -399,23 +390,6 @@ impl std::fmt::Display for ContractHandlerEvent {
                     write!(f, "get query failed {{ {key} }}",)
                 }
             },
-            ContractHandlerEvent::Subscribe { key } => {
-                write!(f, "subscribe {{ {key} }}")
-            }
-            ContractHandlerEvent::SubscribeResponse { key, response } => match response {
-                Ok(_) => {
-                    write!(f, "subscribe response {{ {key} }}",)
-                }
-                Err(_) => {
-                    write!(f, "subscribe failed {{ {key} }}",)
-                }
-            },
-            // ContractHandlerEvent::Cache(container) => {
-            //     write!(f, "caching {{ {} }}", container.key())
-            // }
-            // ContractHandlerEvent::CacheResult(r) => {
-            //     write!(f, "caching result {{ {} }}", r.is_ok())
-            // }
         }
     }
 }

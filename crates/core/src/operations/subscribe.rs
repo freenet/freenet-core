@@ -32,21 +32,17 @@ enum SubscribeState {
         retries: usize,
         upstream_subscriber: Option<PeerKeyLocation>,
     },
-    Completed {
-        subscribed_to: PeerKeyLocation,
-    },
+    Completed {},
 }
 
-pub(crate) struct SubscribeResult {
-    pub subscribed_to: PeerKeyLocation,
-}
+pub(crate) struct SubscribeResult {}
 
 impl TryFrom<SubscribeOp> for SubscribeResult {
     type Error = OpError;
 
     fn try_from(value: SubscribeOp) -> Result<Self, Self::Error> {
-        if let Some(SubscribeState::Completed { subscribed_to }) = value.state {
-            Ok(SubscribeResult { subscribed_to })
+        if let Some(SubscribeState::Completed {}) = value.state {
+            Ok(SubscribeResult {})
         } else {
             Err(OpError::UnexpectedOpState)
         }
@@ -365,9 +361,7 @@ impl Operation for SubscribeOp {
                         );
                         op_manager.ring.add_subscription(key.clone(), *sender);
 
-                        new_state = Some(SubscribeState::Completed {
-                            subscribed_to: *sender,
-                        });
+                        new_state = Some(SubscribeState::Completed {});
                         if let Some(upstream_subscriber) = upstream_subscriber {
                             return_msg = Some(SubscribeMsg::ReturnSub {
                                 id: *id,

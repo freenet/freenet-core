@@ -84,7 +84,7 @@ impl ContractExecutor for Executor<MockRuntime> {
         &mut self,
         key: ContractKey,
         state: Either<WrappedState, StateDelta<'static>>,
-        related_contracts: RelatedContracts<'static>,
+        _related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
     ) -> Result<WrappedState, ExecutorError> {
         // todo: instead allow to perform mutations per contract based on incoming value so we can track
@@ -95,27 +95,10 @@ impl ContractExecutor for Executor<MockRuntime> {
                     .store(key, incoming_state.clone(), contract.params().into_owned())
                     .await
                     .map_err(ExecutorError::other)?;
-
-                let request = PutContract {
-                    contract,
-                    state: incoming_state.clone(),
-                    related_contracts,
-                };
-                let _op: Result<operations::put::PutResult, _> = self.op_request(request).await;
-
                 return Ok(incoming_state);
             }
             _ => unreachable!(),
         }
-    }
-
-    async fn subscribe_to_contract(
-        &mut self,
-        key: ContractKey,
-    ) -> Result<PeerKeyLocation, ExecutorError> {
-        let request = SubscribeContract { key };
-        let result: operations::subscribe::SubscribeResult = self.op_request(request).await?;
-        Ok(result.subscribed_to)
     }
 }
 

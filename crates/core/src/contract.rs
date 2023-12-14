@@ -111,23 +111,6 @@ where
                         error
                     })?;
             }
-            ContractHandlerEvent::Subscribe { key } => {
-                let response = contract_handler
-                    .executor()
-                    .subscribe_to_contract(key.clone())
-                    .await;
-                contract_handler
-                    .channel()
-                    .send_to_sender(
-                        id,
-                        ContractHandlerEvent::SubscribeResponse { key, response },
-                    )
-                    .await
-                    .map_err(|error| {
-                        tracing::debug!(%error, "shutting down contract handler");
-                        error
-                    })?;
-            }
             _ => unreachable!(),
         }
     }
