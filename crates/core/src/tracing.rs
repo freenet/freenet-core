@@ -1494,22 +1494,26 @@ pub(super) mod test {
         ];
 
         let listener = TestEventListener::new().await;
-        locations.iter().for_each(|(other, location)| {
-            listener.register_events(Either::Left(NetEventLog {
-                tx: &tx,
-                peer_id: &peer_id,
-                kind: EventKind::Connect(ConnectEvent::Connected {
-                    this: PeerKeyLocation {
-                        peer: peer_id,
-                        location: Some(loc),
-                    },
-                    connected: PeerKeyLocation {
-                        peer: *other,
-                        location: Some(*location),
-                    },
-                }),
-            }));
-        });
+        let futs = futures::stream::FuturesUnordered::from_iter(locations.iter().map(
+            |(other, location)| {
+                listener.register_events(Either::Left(NetEventLog {
+                    tx: &tx,
+                    peer_id: &peer_id,
+                    kind: EventKind::Connect(ConnectEvent::Connected {
+                        this: PeerKeyLocation {
+                            peer: peer_id,
+                            location: Some(loc),
+                        },
+                        connected: PeerKeyLocation {
+                            peer: *other,
+                            location: Some(*location),
+                        },
+                    }),
+                }))
+            },
+        ));
+
+        futures::future::join_all(futs).await;
 
         let distances: Vec<_> = listener.connections(peer_id).collect();
         assert!(distances.len() == 3);

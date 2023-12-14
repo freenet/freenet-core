@@ -50,6 +50,7 @@ where
     handle_op_result(op_manager, network_bridge, result, tx, sender).await
 }
 
+#[inline(always)]
 async fn handle_op_result<CB>(
     op_manager: &OpManager,
     network_bridge: &mut CB,
@@ -234,7 +235,7 @@ pub(crate) enum OpError {
     #[error("op not available")]
     OpNotAvailable(#[from] OpNotAvailable),
 
-    // user for control flow
+    // used for control flow
     /// This is used as an early interrumpt of an op update when an op
     /// was sent throught the fast path back to the storage.
     #[error("early push of state into the op stack")]
