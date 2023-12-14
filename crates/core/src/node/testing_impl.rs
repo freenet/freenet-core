@@ -1050,6 +1050,7 @@ where
     NB: NetworkBridge + NetworkBridgeExt,
     UsrEv: ClientEventsProxy + Send + 'static,
 {
+    // todo: this two containers need to be clean up on transaction time-out
     let mut pending_from_executor = HashSet::new();
     let mut tx_to_client: HashMap<Transaction, crate::client_events::ClientId> = HashMap::new();
     loop {

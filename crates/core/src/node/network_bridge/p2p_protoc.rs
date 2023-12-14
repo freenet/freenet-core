@@ -279,6 +279,7 @@ impl P2pConnManager {
     ) -> Result<(), anyhow::Error> {
         use ConnMngrActions::*;
 
+        // FIXME: this two containers need to be clean up on transaction time-out
         let mut pending_from_executor = HashSet::new();
         let mut tx_to_client: HashMap<Transaction, ClientId> = HashMap::new();
 

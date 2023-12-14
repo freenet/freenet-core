@@ -342,8 +342,8 @@ pub(crate) mod test {
             while state.current_iteration < state.max_iterations {
                 state.current_iteration += 1;
                 let for_this_peer = self.gen_range(0..state.num_peers) == state.this_peer;
-                match self.gen_range(0..4) {
-                    0 => {
+                match self.gen_range(0..100) {
+                    val if (0..10).contains(&val) => {
                         if state.max_contract_num <= state.existing_contracts.len() {
                             continue;
                         }
@@ -360,7 +360,21 @@ pub(crate) mod test {
                             return Some(request.into());
                         }
                     }
-                    1 => {
+                    val if (10..35).contains(&val) => {
+                        if let Some(contract) = self.choose(&state.existing_contracts) {
+                            if !for_this_peer {
+                                continue;
+                            }
+                            let key = contract.key();
+                            let fetch_contract = state.owns_contracts.contains(&key);
+                            let request = ContractRequest::Get {
+                                key,
+                                fetch_contract,
+                            };
+                            return Some(request.into());
+                        }
+                    }
+                    val if (35..85).contains(&val) => {
                         if let Some(contract) = self.choose(&state.existing_contracts) {
                             let delta = UpdateData::Delta(StateDelta::from(self.random_byte_vec()));
                             if !for_this_peer {
@@ -375,21 +389,7 @@ pub(crate) mod test {
                             }
                         }
                     }
-                    2 => {
-                        if let Some(contract) = self.choose(&state.existing_contracts) {
-                            if !for_this_peer {
-                                continue;
-                            }
-                            let key = contract.key();
-                            let fetch_contract = state.owns_contracts.contains(&key);
-                            let request = ContractRequest::Get {
-                                key,
-                                fetch_contract,
-                            };
-                            return Some(request.into());
-                        }
-                    }
-                    3 => {
+                    val if (85..100).contains(&val) => {
                         if let Some(contract) = self.choose(&state.existing_contracts) {
                             let key = contract.key();
                             let summary = StateSummary::from(self.random_byte_vec());
