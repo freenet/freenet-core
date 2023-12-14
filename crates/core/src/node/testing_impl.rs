@@ -776,7 +776,7 @@ impl SimNetwork {
 
         tracing::info!("Number of simulated nodes: {num_nodes}");
 
-        let missing_percent = (num_nodes - missing.len()) as f64 / num_nodes as f64;
+        let missing_percent = 1.0 - ((num_nodes - missing.len()) as f64 / num_nodes as f64);
         if missing_percent > (percent + 0.01/* 1% error tolerance */) {
             missing.sort();
             let show_max = missing.len().min(100);

@@ -74,7 +74,12 @@ impl TestConfig {
             Duration::from_millis(self.connection_wait_ms.unwrap_or_else(|| {
                 // expect a peer to take max 200ms to connect, this should happen in parallel
                 // but err on the side of safety
-                (conns_per_gw * 200.0).ceil() as u64
+                (conns_per_gw
+                    * self
+                        .peer_start_backoff_ms
+                        .map(|ms| ms as f64)
+                        .unwrap_or(200.0))
+                .ceil() as u64
             }));
         (connectivity_timeout, conn_percent)
     }
