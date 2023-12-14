@@ -127,7 +127,6 @@ where
                         tracing::debug!(%error, "shutting down contract handler");
                         error
                     })?;
-                todo!()
             }
             _ => unreachable!(),
         }
