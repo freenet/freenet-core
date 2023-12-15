@@ -3,6 +3,7 @@ use crate::{
     ring::{Distance, Location},
 };
 use request_density_tracker::CachedDensityMap;
+use std::sync::RwLockReadGuard;
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
@@ -12,6 +13,7 @@ pub mod connection_evaluator;
 pub mod request_density_tracker;
 mod small_world_rand;
 
+use crate::ring::Connection;
 use request_density_tracker::DensityMapError;
 use small_world_rand::random_link_distance;
 
@@ -65,10 +67,10 @@ impl TopologyManager {
 
     pub(crate) fn refresh_cache(
         &mut self,
-        current_neighbors: &BTreeMap<Location, usize>,
+        neighbor_locations: &RwLockReadGuard<BTreeMap<Location, Vec<Connection>>>,
     ) -> Result<(), DensityMapError> {
         self.cached_density_map
-            .set(&self.request_density_tracker, current_neighbors)?;
+            .set(&self.request_density_tracker, neighbor_locations)?;
         Ok(())
     }
 
@@ -132,7 +134,10 @@ impl TopologyManager {
     }
 
     /// Get the ideal location for a new connection based on current neighbors and request density
-    pub(crate) fn get_best_candidate_location(&self, this_peer_location : &Location) -> Result<Location, DensityMapError> {
+    pub(crate) fn get_best_candidate_location(
+        &self,
+        this_peer_location: &Location,
+    ) -> Result<Location, DensityMapError> {
         let density_map = self
             .cached_density_map
             .get()
@@ -155,7 +160,7 @@ impl TopologyManager {
 
     /// Generates a random location that is close to the current peer location with a small
     /// world distribution.
-    fn random_location(&self, this_peer_location : &Location) -> Location {
+    fn random_location(&self, this_peer_location: &Location) -> Location {
         tracing::debug!("Generating random location");
         let distance = random_link_distance(Distance::new(RANDOM_CLOSEST_DISTANCE));
         let location_f64 = if rand::random() {
@@ -208,7 +213,9 @@ mod tests {
             )
             .unwrap();
 
-        let best_candidate_location = topology_manager.get_best_candidate_location(&this_peer_location).unwrap();
+        let best_candidate_location = topology_manager
+            .get_best_candidate_location(&this_peer_location)
+            .unwrap();
         // Should be half way between 0.3 and 0.4 as that is where the most requests were.
         assert_eq!(best_candidate_location, Location::new(0.35));
 

@@ -93,7 +93,7 @@ impl Display for PeerKeyLocation {
     }
 }
 
-struct Connection {
+pub(crate) struct Connection {
     location: PeerKeyLocation,
     open_at: Instant,
 }
@@ -265,7 +265,7 @@ impl Ring {
         GlobalExecutor::spawn(Self::refresh_router::<ER>(router.clone()));
 
         // Just initialize with a fake location, this will be later updated when the peer has an actual location assigned.
-        let topology_manager = RwLock::new(TopologyManager::new(Location::new(0.0)));
+        let topology_manager = RwLock::new(TopologyManager::new());
 
         let ring = Ring {
             rnd_if_htl_above,

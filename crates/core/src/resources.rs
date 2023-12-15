@@ -77,8 +77,8 @@ use crate::topology::request_density_tracker::RequestDensityTracker;
 use crate::topology::TopologyManager;
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, RwLockReadGuard};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -96,17 +96,13 @@ pub(crate) struct ResourceManager {
 }
 
 impl ResourceManager {
-    pub fn new(
-        limits: Limits,
-        neighbors: Arc<RwLock<BTreeMap<Location, Vec<Connection>>>>,
-    ) -> Self {
+    pub fn new(limits: Limits) -> Self {
         ResourceManager {
             meter: Meter::new_with_window_size(100),
             limits,
             source_creation_times: DashMap::new(),
             request_density_tracker: RwLock::new(RequestDensityTracker::new(
                 REQUEST_DENSITY_TRACKER_SAMPLE_SIZE,
-                neighbors,
             )),
             topology_manager: TopologyManager::new(),
         }
@@ -158,7 +154,12 @@ impl ResourceManager {
 
     // A function that will determine if any peers should be added or removed based on
     // the current resource usage, and either add or remove them
-    fn adjust_topology(&mut self, resource_type: ResourceType, now: Instant) {
+    fn adjust_topology(
+        &mut self,
+        resource_type: ResourceType,
+        neighbor_locations: &RwLockReadGuard<BTreeMap<Location, Vec<Connection>>>,
+        now: Instant,
+    ) {
         let increase_usage_if_below_prop: RateProportion = RateProportion::new(0.5);
         let decrease_usage_if_above_prop: RateProportion = RateProportion::new(0.9);
 
@@ -171,7 +172,7 @@ impl ResourceManager {
                 resource_type,
                 usage_proportion
             );
-            self.add_connections(&usage);
+            self.add_connections(&usage, neighbor_locations);
         } else if usage_proportion > decrease_usage_if_above_prop {
             tracing::debug!(
                 "{:?} resource usage is too high, removing connections: {:?}",
@@ -189,15 +190,12 @@ impl ResourceManager {
     }
 
     /// Adds a single connection (one at a time to avoid overshooting)
-    fn add_connections(&mut self, usage: &Usage) {
-        let neighbors: BTreeMap<Location, usize> = BTreeMap::new();
-        todo!("""
-        Need to get the neighbors, Ring will need to keep Resources up-to-date
-        """);
-        let desired_location = self
-            .request_density_tracker
-            .read()
-            .create_density_map(neighbors);
+    fn add_connections(
+        &mut self,
+        usage: &Usage,
+        neighbor_locations: &RwLockReadGuard<BTreeMap<Location, Vec<Connection>>>,
+    ) {
+        todo!();
     }
 
     /// Calculates which peers should be deleted in order to bring the total
