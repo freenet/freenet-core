@@ -45,7 +45,7 @@ impl RequestDensityTracker {
 
     pub(crate) fn create_density_map(
         &self,
-        neighbor_locations: &RwLockReadGuard<BTreeMap<Location, Vec<Connection>>>,
+        neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
     ) -> Result<DensityMap, DensityMapError> {
         if neighbor_locations.is_empty() {
             return Err(DensityMapError::EmptyNeighbors);
@@ -200,7 +200,7 @@ impl CachedDensityMap {
     pub fn set(
         &mut self,
         tracker: &RequestDensityTracker,
-        neighbor_locations: &RwLockReadGuard<BTreeMap<Location, Vec<Connection>>>,
+        neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
     ) -> Result<(), DensityMapError> {
         let density_map = tracker.create_density_map(neighbor_locations)?;
         self.density_map = Some(density_map);
@@ -226,8 +226,8 @@ mod tests {
     #[test]
     fn test_create_density_map() {
         let mut neighbors = RwLock::new(BTreeMap::new());
-        neighbors.write().insert(Location::new(0.2), vec![]);
-        neighbors.write().insert(Location::new(0.6), vec![]);
+        neighbors.write().unwrap().insert(Location::new(0.2), vec![]);
+        neighbors.write().unwrap().insert(Location::new(0.6), vec![]);
 
         let mut neighbors = neighbors.read();
 
@@ -238,7 +238,7 @@ mod tests {
         sw.sample(Location::new(0.61));
         sw.sample(Location::new(0.62));
 
-        let result = sw.create_density_map(&neighbors);
+        let result = sw.create_density_map(&neighbors.unwrap());
         assert!(result.is_ok());
         let result = result.unwrap();
         assert_eq!(
@@ -261,8 +261,8 @@ mod tests {
         sw.sample(Location::new(0.62));
 
         let mut neighbors = BTreeMap::new();
-        neighbors.insert(Location::new(0.6), 1);
-        neighbors.insert(Location::new(0.9), 1);
+        neighbors.insert(Location::new(0.6), vec![]);
+        neighbors.insert(Location::new(0.9), vec![]);
 
         let result = sw.create_density_map(&neighbors);
         assert!(result.is_ok());
@@ -287,8 +287,8 @@ mod tests {
         sw.sample(Location::new(0.60));
 
         let mut neighbors = BTreeMap::new();
-        neighbors.insert(Location::new(0.2), 1);
-        neighbors.insert(Location::new(0.6), 1);
+        neighbors.insert(Location::new(0.2), vec![]);
+        neighbors.insert(Location::new(0.6), vec![]);
 
         let result = sw.create_density_map(&neighbors);
         assert!(result.is_ok());
@@ -323,8 +323,8 @@ mod tests {
         sw.sample(Location::new(0.62));
 
         let mut neighbors = BTreeMap::new();
-        neighbors.insert(Location::new(0.2), 1);
-        neighbors.insert(Location::new(0.6), 1);
+        neighbors.insert(Location::new(0.2), vec![]);
+        neighbors.insert(Location::new(0.6), vec![]);
 
         let result = sw.create_density_map(&neighbors);
         assert!(result.is_ok());

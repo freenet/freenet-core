@@ -36,14 +36,14 @@ pub struct Transaction {
 impl Transaction {
     pub const NULL: &'static Transaction = &Transaction { id: Ulid(0) };
 
-    pub fn new<T: TxType>() -> Self {
+    pub(crate) fn new<T: TxType>() -> Self {
         let ty = <T as TxType>::tx_type_id();
         let id = Ulid::new();
         Self::update(ty.0, id)
         // Self { id }
     }
 
-    pub fn transaction_type(&self) -> TransactionType {
+    pub(crate) fn transaction_type(&self) -> TransactionType {
         let id_byte = (self.id.0 & 0xFFu128) as u8;
         match id_byte {
             0 => TransactionType::Connect,

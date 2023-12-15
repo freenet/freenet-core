@@ -157,7 +157,7 @@ impl ResourceManager {
     fn adjust_topology(
         &mut self,
         resource_type: ResourceType,
-        neighbor_locations: &RwLockReadGuard<BTreeMap<Location, Vec<Connection>>>,
+        neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
         now: Instant,
     ) {
         let increase_usage_if_below_prop: RateProportion = RateProportion::new(0.5);
@@ -193,9 +193,9 @@ impl ResourceManager {
     fn add_connections(
         &mut self,
         usage: &Usage,
-        neighbor_locations: &RwLockReadGuard<BTreeMap<Location, Vec<Connection>>>,
+        neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
     ) {
-        todo!();
+        self.request_density_tracker.read().create_density_map(neighbor_locations);
     }
 
     /// Calculates which peers should be deleted in order to bring the total

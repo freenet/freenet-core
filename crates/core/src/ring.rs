@@ -307,11 +307,9 @@ impl Ring {
         } else {
             tracing::info_span!(parent: current_span, "connection_maintenance")
         };
-        GlobalExecutor::spawn(
-            ring.clone()
-                .connection_maintenance(event_loop_notifier, live_tx_tracker, missing_candidate_rx)
-                .instrument(span),
-        );
+
+        todo!("Spawn connection Maintainence thread");
+
         Ok(ring)
     }
 
@@ -372,7 +370,6 @@ impl Ring {
                 u64::from_le_bytes(loc.0.to_le_bytes()),
                 std::sync::atomic::Ordering::Release,
             );
-            self.topology_manager.write().this_peer_location = loc;
         } else {
             self.own_location.store(
                 u64::from_le_bytes((-1f64).to_le_bytes()),
@@ -465,9 +462,8 @@ impl Ring {
 
     fn refresh_density_request_cache(&self) {
         let cbl = self.connections_by_location.read();
-        let current_neighbors = &Self::current_neighbors(&cbl);
         let topology_manager = &mut *self.topology_manager.write();
-        let _ = topology_manager.refresh_cache(current_neighbors);
+        let _ = topology_manager.refresh_cache(&cbl);
     }
 
     /// Return the most optimal peer caching a given contract.
@@ -615,17 +611,6 @@ impl Ring {
             .next_back()
     }
 
-    fn current_neighbors(
-        connections_by_location: &BTreeMap<Location, Vec<Connection>>,
-    ) -> BTreeMap<Location, usize> {
-        connections_by_location
-            .iter()
-            .fold(BTreeMap::new(), |mut map, (loc, conns)| {
-                map.insert(*loc, conns.len());
-                map
-            })
-    }
-
     async fn connection_maintenance(
         self: Arc<Self>,
         notifier: EventLoopNotificationsSender,
@@ -705,16 +690,26 @@ impl Ring {
                     .store(true, std::sync::atomic::Ordering::Release);
                 // requires more connections
                 let ideal_location = {
-                    let loc = { self.topology_manager.read().get_best_candidate_location() };
-                    match loc {
-                        Ok(loc) => loc,
-                        Err(_) => {
-                            tracing::trace!(peer = %self.own_location(), "Insufficient data gathered by the topology manager");
+                    match self.own_location().location {
+                        Some(location) => {
+                            let loc = self.topology_manager.read().get_best_candidate_location(&location);
+                            match loc {
+                                Ok(loc) => loc,
+                                Err(_) => {
+                                    tracing::trace!(peer = %self.own_location(), "Insufficient data gathered by the topology manager");
+                                    acquire_max_connections.tick().await;
+                                    continue;
+                                }
+                            }
+                        },
+                        None => {
+                            tracing::warn!("Location is None, indicating the peer hasn't been assigned a location yet");
                             acquire_max_connections.tick().await;
                             continue;
                         }
                     }
                 };
+
                 live_tx = self
                     .acquire_new(
                         ideal_location,
@@ -749,11 +744,20 @@ impl Ring {
                 self.fast_acquisition
                     .store(false, std::sync::atomic::Ordering::Release);
                 let ideal_location = {
-                    let loc = { self.topology_manager.read().get_best_candidate_location() };
-                    match loc {
-                        Ok(loc) => loc,
-                        Err(_) => {
-                            tracing::debug!(peer = %self.own_location(), "Insufficient data gathered by the topology manager");
+                    match self.own_location().location {
+                        Some(location) => {
+                            let loc = self.topology_manager.read().get_best_candidate_location(&location);
+                            match loc {
+                                Ok(loc) => loc,
+                                Err(_) => {
+                                    tracing::debug!(peer = %self.own_location(), "Insufficient data gathered by the topology manager");
+                                    check_interval.tick().await;
+                                    continue;
+                                }
+                            }
+                        },
+                        None => {
+                            tracing::debug!("Location is None, indicating the peer hasn't been assigned a location yet");
                             check_interval.tick().await;
                             continue;
                         }

@@ -67,7 +67,7 @@ impl TopologyManager {
 
     pub(crate) fn refresh_cache(
         &mut self,
-        neighbor_locations: &RwLockReadGuard<BTreeMap<Location, Vec<Connection>>>,
+        neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
     ) -> Result<(), DensityMapError> {
         self.cached_density_map
             .set(&self.request_density_tracker, neighbor_locations)?;
@@ -194,7 +194,7 @@ mod tests {
 
         // Insert neighbors from 0.0 to 0.9
         for i in 0..10 {
-            current_neighbors.insert(Location::new(i as f64 / 10.0), 0);
+            current_neighbors.insert(Location::new(i as f64 / 10.0), vec![]);
         }
 
         let this_peer_location = Location::new(0.39);
