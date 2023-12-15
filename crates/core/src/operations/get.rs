@@ -605,7 +605,9 @@ impl Operation for GetOp {
                             })
                             .await?;
                         match res {
-                            ContractHandlerEvent::PutResponse { new_value: Ok(_) } => {}
+                            ContractHandlerEvent::PutResponse { new_value: Ok(_) } => {
+                                super::start_subscription(op_manager, key.clone(), false).await;
+                            }
                             ContractHandlerEvent::PutResponse {
                                 new_value: Err(err),
                             } => {
@@ -614,7 +616,6 @@ impl Operation for GetOp {
                             }
                             _ => unreachable!(),
                         }
-                        super::start_subscription(op_manager, key.clone(), false).await;
                     }
 
                     match self.state {
