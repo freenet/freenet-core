@@ -5,7 +5,7 @@ use futures::future::BoxFuture;
 
 use super::{OpError, OpOutcome, Operation};
 use crate::{
-    client_events::ClientId,
+    client_events::{ClientId, HostResult},
     node::{NetworkBridge, OpManager},
 };
 
@@ -23,6 +23,10 @@ impl UpdateOp {
     }
 
     pub fn record_transfer(&mut self) {}
+
+    pub(super) fn to_host_result(&self) -> HostResult {
+        todo!()
+    }
 }
 
 pub(crate) struct UpdateResult {}

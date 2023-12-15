@@ -247,7 +247,9 @@ pub(crate) fn contract_handler_channel() -> (
 static EV_ID: AtomicU64 = AtomicU64::new(0);
 
 impl ContractHandlerChannel<WaitingResolution> {
-    pub async fn recv_from_client_event(&mut self) -> Result<(ClientId, Transaction), DynError> {
+    pub async fn relay_transaction_result_to_client(
+        &mut self,
+    ) -> Result<(ClientId, Transaction), DynError> {
         self.end
             .wait_for_res_rx
             .recv()
@@ -281,7 +283,7 @@ impl ContractHandlerChannel<SenderHalve> {
         }
     }
 
-    pub async fn waiting_for_transaction(
+    pub async fn waiting_for_transaction_result(
         &self,
         transaction: Transaction,
         client_id: ClientId,

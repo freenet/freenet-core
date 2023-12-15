@@ -48,7 +48,7 @@ impl ContractExecutor for Executor<MockRuntime> {
     async fn fetch_contract(
         &mut self,
         key: ContractKey,
-        _fetch_contract: bool,
+        fetch_contract: bool,
     ) -> Result<(WrappedState, Option<ContractContainer>), ExecutorError> {
         let Some(parameters) = self
             .state_store
@@ -57,18 +57,21 @@ impl ContractExecutor for Executor<MockRuntime> {
             .map_err(ExecutorError::other)?
         else {
             return Err(ExecutorError::other(format!(
-                "missing parameters for contract {key}"
+                "missing state and/or parameters for contract {key}"
             )));
+        };
+        let contract = if fetch_contract {
+            self.runtime
+                .contract_store
+                .fetch_contract(&key, &parameters)
+        } else {
+            None
         };
         let Ok(state) = self.state_store.get(&key).await else {
             return Err(ExecutorError::other(format!(
                 "missing state for contract {key}"
             )));
         };
-        let contract = self
-            .runtime
-            .contract_store
-            .fetch_contract(&key, &parameters);
         Ok((state, contract))
     }
 
@@ -91,13 +94,25 @@ impl ContractExecutor for Executor<MockRuntime> {
         // state values over the network
         match (state, code) {
             (Either::Left(incoming_state), Some(contract)) => {
+                self.runtime
+                    .contract_store
+                    .store_contract(contract.clone())
+                    .map_err(ExecutorError::other)?;
                 self.state_store
                     .store(key, incoming_state.clone(), contract.params().into_owned())
                     .await
                     .map_err(ExecutorError::other)?;
                 return Ok(incoming_state);
             }
-            _ => unreachable!(),
+            // (Either::Left(_), None) => {
+            //     return Err(ExecutorError::request(RequestError::from(
+            //         StdContractError::Get {
+            //             key: key.clone(),
+            //             cause: "Missing contract or parameters".into(),
+            //         },
+            //     )));
+            // }
+            (update, contract) => unreachable!("{update:?}, {contract:?}"),
         }
     }
 }

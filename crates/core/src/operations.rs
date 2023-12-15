@@ -6,7 +6,7 @@ use futures::{future::BoxFuture, Future};
 use tokio::sync::mpsc::error::SendError;
 
 use crate::{
-    client_events::{ClientId, HostResult},
+    client_events::HostResult,
     contract::{ContractError, ExecutorError},
     message::{InnerMessage, NetMessage, Transaction, TransactionType},
     node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable, PeerId},
@@ -18,6 +18,31 @@ pub(crate) mod get;
 pub(crate) mod put;
 pub(crate) mod subscribe;
 pub(crate) mod update;
+
+pub(crate) trait Operation
+where
+    Self: Sized + TryInto<Self::Result>,
+{
+    type Message: InnerMessage + std::fmt::Display;
+
+    type Result;
+
+    fn load_or_init<'a>(
+        op_manager: &'a OpManager,
+        msg: &'a Self::Message,
+    ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>>;
+
+    fn id(&self) -> &Transaction;
+
+    #[allow(clippy::type_complexity)]
+    fn process_message<'a, CB: NetworkBridge>(
+        self,
+        conn_manager: &'a mut CB,
+        op_manager: &'a OpManager,
+        input: &'a Self::Message,
+        // client_id: Option<ClientId>,
+    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>>;
+}
 
 pub(crate) struct OperationResult {
     /// Inhabited if there is a message to return to the other peer.
@@ -144,11 +169,8 @@ impl OpEnum {
             pub fn outcome(&self) -> OpOutcome;
             pub fn finalized(&self) -> bool;
             pub fn record_transfer(&mut self);
+            pub fn to_host_result(&self) -> HostResult;
         }
-    }
-
-    pub fn to_host_result(&self, _client_id: ClientId) -> HostResult {
-        todo!()
     }
 }
 
@@ -277,27 +299,10 @@ impl<T> From<SendError<T>> for OpError {
     }
 }
 
-pub(crate) trait Operation
-where
-    Self: Sized + TryInto<Self::Result>,
-{
-    type Message: InnerMessage + std::fmt::Display;
-
-    type Result;
-
-    fn load_or_init<'a>(
-        op_manager: &'a OpManager,
-        msg: &'a Self::Message,
-    ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>>;
-
-    fn id(&self) -> &Transaction;
-
-    #[allow(clippy::type_complexity)]
-    fn process_message<'a, CB: NetworkBridge>(
-        self,
-        conn_manager: &'a mut CB,
-        op_manager: &'a OpManager,
-        input: &'a Self::Message,
-        // client_id: Option<ClientId>,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>>;
+#[inline]
+async fn start_subscription(op_manager: &OpManager, key: freenet_stdlib::prelude::ContractKey) {
+    let op = subscribe::start_op(key.clone());
+    if let Err(error) = subscribe::request_subscribe(op_manager, op).await {
+        tracing::warn!(%error, "Error subscribing to contract");
+    }
 }

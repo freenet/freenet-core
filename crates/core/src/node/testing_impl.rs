@@ -1070,7 +1070,7 @@ where
                     anyhow::bail!("node controller channel shutdown, fatal error");
                 }
             }
-            event_id = wait_for_event.recv_from_client_event() => {
+            event_id = wait_for_event.relay_transaction_result_to_client() => {
                 if let Ok((client_id, transaction)) = event_id {
                    tx_to_client.insert(transaction, client_id);
                 }

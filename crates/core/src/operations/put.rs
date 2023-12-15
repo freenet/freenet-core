@@ -7,12 +7,16 @@ use std::pin::Pin;
 use std::time::Instant;
 
 pub(crate) use self::messages::PutMsg;
-use freenet_stdlib::prelude::*;
+use freenet_stdlib::{
+    client_api::{ErrorKind, HostResponse},
+    prelude::*,
+};
 use futures::future::BoxFuture;
 use futures::FutureExt;
 
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::{
+    client_events::HostResult,
     contract::ContractHandlerEvent,
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
@@ -60,6 +64,7 @@ impl PutOp {
             .as_ref()
             .map(|s| matches!(s.step, RecordingStats::Completed))
             .unwrap_or(false)
+            || matches!(self.state, Some(PutState::Finished { .. }))
     }
 
     pub(super) fn record_transfer(&mut self) {
@@ -77,6 +82,19 @@ impl PutOp {
                 }
                 RecordingStats::Completed => {}
             }
+        }
+    }
+
+    pub(super) fn to_host_result(&self) -> HostResult {
+        if let Some(PutState::Finished { key }) = &self.state {
+            Ok(HostResponse::ContractResponse(
+                freenet_stdlib::client_api::ContractResponse::PutResponse { key: key.clone() },
+            ))
+        } else {
+            Err(ErrorKind::OperationError {
+                cause: "put didn't finish successfully".into(),
+            }
+            .into())
         }
     }
 }
@@ -422,10 +440,15 @@ impl Operation for PutOp {
                                     .within_subscribing_distance(&Location::from(&key))
                             {
                                 tracing::debug!(tx = %id, %key, peer = %op_manager.ring.peer_key, "Contract not cached @ peer, caching");
-                                start_subscription(op_manager, key.clone()).await;
+                                super::start_subscription(op_manager, key.clone()).await;
                             }
-                            tracing::debug!(tx = %id, "Successfully updated value for {key}");
-                            new_state = None;
+                            tracing::info!(
+                                tx = %id,
+                                %key,
+                                this_peer = %op_manager.ring.peer_key,
+                                "Peer completed contract value put",
+                            );
+                            new_state = Some(PutState::Finished { key });
                             if let Some(upstream) = upstream {
                                 return_msg = Some(PutMsg::SuccessfulPut {
                                     id: *id,
@@ -437,10 +460,6 @@ impl Operation for PutOp {
                         }
                         _ => return Err(OpError::invalid_transition(self.id)),
                     };
-                    tracing::info!(
-                        this_peer = %op_manager.ring.peer_key,
-                        "Peer completed contract value put",
-                    );
                 }
                 PutMsg::PutForward {
                     id,
@@ -575,14 +594,6 @@ fn build_op_result(
     })
 }
 
-#[inline]
-async fn start_subscription(op_manager: &OpManager, key: ContractKey) {
-    let op = super::subscribe::start_op(key.clone());
-    if let Err(error) = super::subscribe::request_subscribe(op_manager, op).await {
-        tracing::warn!(%error, "Error subscribing to contract");
-    }
-}
-
 async fn try_to_broadcast(
     id: Transaction,
     last_hop: bool,
@@ -653,10 +664,7 @@ pub(crate) fn start_op(
 ) -> PutOp {
     let key = contract.key();
     let contract_location = Location::from(&key);
-    tracing::debug!(
-        "Requesting put to contract {} @ loc({contract_location})",
-        key,
-    );
+    tracing::debug!(%contract_location, %key, "Requesting put");
 
     let id = Transaction::new::<PutMsg>();
     // let payload_size = contract.data().len();
@@ -681,7 +689,7 @@ pub(crate) fn start_op(
     }
 }
 
-enum PutState {
+pub enum PutState {
     ReceivedRequest,
     PrepareRequest {
         contract: ContractContainer,
@@ -694,6 +702,9 @@ enum PutState {
         upstream: Option<PeerKeyLocation>,
     },
     BroadcastOngoing,
+    Finished {
+        key: ContractKey,
+    },
 }
 
 /// Request to insert/update a value into a contract.

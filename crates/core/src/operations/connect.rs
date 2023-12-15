@@ -1,10 +1,12 @@
 //! Operation which seeks new connections in the ring.
+use freenet_stdlib::client_api::HostResponse;
 use futures::future::BoxFuture;
 use futures::{Future, FutureExt};
 use std::pin::Pin;
 use std::{collections::HashSet, time::Duration};
 
 use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
+use crate::client_events::HostResult;
 use crate::{
     message::{InnerMessage, NetMessage, Transaction},
     node::{ConnectionError, NetworkBridge, OpManager, PeerId},
@@ -37,6 +39,11 @@ impl ConnectOp {
     }
 
     pub(super) fn record_transfer(&mut self) {}
+
+    pub(super) fn to_host_result(&self) -> HostResult {
+        // this should't ever be called since clients can't request explicit connects
+        Ok(HostResponse::Ok)
+    }
 }
 
 /// Not really used since client requests will never interact with this directly.

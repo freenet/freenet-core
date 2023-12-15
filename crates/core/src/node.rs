@@ -10,6 +10,7 @@
 
 use std::{
     fmt::Display,
+    io::Write,
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
     str::FromStr,
@@ -378,7 +379,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                     );
                     let _ = op_manager
                         .ch_outbound
-                        .waiting_for_transaction(op.id, client_id)
+                        .waiting_for_transaction_result(op.id, client_id)
                         .await;
                     if let Err(err) = put::request_put(&op_manager, op).await {
                         tracing::error!("{}", err);
@@ -406,7 +407,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                     let op = get::start_op(key, contract);
                     let _ = op_manager
                         .ch_outbound
-                        .waiting_for_transaction(op.id, client_id)
+                        .waiting_for_transaction_result(op.id, client_id)
                         .await;
                     if let Err(err) = get::request_get(&op_manager, op).await {
                         tracing::error!("{}", err);
@@ -420,7 +421,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                             let op = subscribe::start_op(key.clone());
                             let _ = op_manager
                                 .ch_outbound
-                                .waiting_for_transaction(op.id, client_id)
+                                .waiting_for_transaction_result(op.id, client_id)
                                 .await;
                             match subscribe::request_subscribe(&op_manager, op).await {
                                 Err(OpError::ContractError(ContractError::ContractNotFound(
@@ -497,7 +498,7 @@ async fn report_result(
     match op_result {
         Ok(Some(op_res)) => {
             if let Some((client_id, cb)) = client_req_handler_callback {
-                let _ = cb.send((client_id, op_res.to_host_result(client_id)));
+                let _ = cb.send((client_id, op_res.to_host_result()));
             }
             // check operations.rs:handle_op_result to see what's the meaning of each state
             // in case more cases want to be handled when feeding information to the OpManager
@@ -568,8 +569,9 @@ async fn report_result(
                         second_trace_lines.join("\n")
                     })
                     .unwrap_or_default();
-                tracing::error!(%tx, ?state, "Wrong state");
-                eprintln!("Operation error trace:\n{trace}");
+                let log =
+                    format!("Transaction ({tx}) error trace:\n {trace} \nstate:\n {state:?}\n");
+                std::io::stderr().write_all(log.as_bytes()).unwrap();
             }
             #[cfg(not(any(debug_assertions, test)))]
             {

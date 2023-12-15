@@ -1,12 +1,16 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use freenet_stdlib::prelude::*;
+use freenet_stdlib::{
+    client_api::{ErrorKind, HostResponse},
+    prelude::*,
+};
 use futures::{future::BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
 
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::{
+    client_events::HostResult,
     contract::ContractError,
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
@@ -117,6 +121,17 @@ impl SubscribeOp {
     }
 
     pub(super) fn record_transfer(&mut self) {}
+
+    pub(super) fn to_host_result(&self) -> HostResult {
+        if let Some(SubscribeState::Completed {}) = self.state {
+            Ok(HostResponse::Ok)
+        } else {
+            Err(ErrorKind::OperationError {
+                cause: "subscribe didn't finish successfully".into(),
+            }
+            .into())
+        }
+    }
 }
 
 impl Operation for SubscribeOp {

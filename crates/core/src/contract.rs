@@ -39,11 +39,11 @@ where
                 match contract_handler
                     .executor()
                     .fetch_contract(key.clone(), fetch_contract)
-                    .instrument(tracing::info_span!("fetch_contract", %key))
+                    .instrument(tracing::info_span!("fetch_contract", %key, %fetch_contract))
                     .await
                 {
                     Ok((state, contract)) => {
-                        tracing::debug!("Fetched contract {key}");
+                        tracing::debug!(with_contract = %fetch_contract, has_contract = %contract.is_some(), "Fetched contract {key}");
                         contract_handler
                             .channel()
                             .send_to_sender(
