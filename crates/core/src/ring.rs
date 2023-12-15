@@ -308,7 +308,11 @@ impl Ring {
             tracing::info_span!(parent: current_span, "connection_maintenance")
         };
 
-        todo!("Spawn connection Maintainence thread");
+        GlobalExecutor::spawn(
+            ring.clone()
+                .connection_maintenance(event_loop_notifier, live_tx_tracker, missing_candidate_rx)
+                .instrument(span),
+        );
 
         Ok(ring)
     }
