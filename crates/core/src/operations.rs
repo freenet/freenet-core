@@ -299,10 +299,26 @@ impl<T> From<SendError<T>> for OpError {
     }
 }
 
-#[inline]
-async fn start_subscription(op_manager: &OpManager, key: freenet_stdlib::prelude::ContractKey) {
-    let op = subscribe::start_op(key.clone());
-    if let Err(error) = subscribe::request_subscribe(op_manager, op).await {
-        tracing::warn!(%error, "Error subscribing to contract");
+/// If the contract is not found, it will try to get it first if the `try_get` parameter is set.
+async fn start_subscription(
+    op_manager: &OpManager,
+    key: freenet_stdlib::prelude::ContractKey,
+    try_get: bool,
+) {
+    let sub_op = subscribe::start_op(key.clone());
+    if let Err(error) = subscribe::request_subscribe(op_manager, sub_op).await {
+        if !try_get {
+            tracing::warn!(%error, "Error subscribing to contract");
+            return;
+        }
+        if let OpError::ContractError(ContractError::ContractNotFound(_)) = &error {
+            tracing::debug!(%key, "Contract not found, trying to get it first");
+            let get_op = get::start_op(key, true);
+            if let Err(error) = get::request_get(op_manager, get_op).await {
+                tracing::warn!(%error, "Error getting contract");
+            }
+        } else {
+            tracing::warn!(%error, "Error subscribing to contract");
+        }
     }
 }

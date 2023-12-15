@@ -1,7 +1,7 @@
 //! Clients events related logic and type definitions. For example, receival of client events from applications throught the HTTP gateway.
 
 use freenet_stdlib::client_api::ClientRequest;
-use freenet_stdlib::client_api::{ClientError, HostResponse};
+use freenet_stdlib::client_api::{ClientError, ContractResponse, HostResponse};
 use futures::future::BoxFuture;
 use std::fmt::Debug;
 use std::fmt::Display;
@@ -300,8 +300,18 @@ pub(crate) mod test {
         fn send(
             &mut self,
             _id: ClientId,
-            _response: Result<HostResponse, ClientError>,
+            response: Result<HostResponse, ClientError>,
         ) -> BoxFuture<'_, Result<(), ClientError>> {
+            if let Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key, ..
+            })) = response
+            {
+                self.internal_state
+                    .as_mut()
+                    .expect("state should be set")
+                    .owns_contracts
+                    .insert(key);
+            }
             async { Ok(()) }.boxed()
         }
     }
@@ -347,18 +357,17 @@ pub(crate) mod test {
                         if state.max_contract_num <= state.existing_contracts.len() {
                             continue;
                         }
+                        if !for_this_peer {
+                            continue;
+                        }
                         let contract = self.gen_contract_container();
                         let request = ContractRequest::Put {
                             contract: contract.clone(),
                             state: WrappedState::new(self.random_byte_vec()),
                             related_contracts: RelatedContracts::new(),
                         };
-                        let key = contract.key();
                         state.existing_contracts.push(contract);
-                        if for_this_peer {
-                            state.owns_contracts.insert(key);
-                            return Some(request.into());
-                        }
+                        return Some(request.into());
                     }
                     val if (10..35).contains(&val) => {
                         if let Some(contract) = self.choose(&state.existing_contracts) {
@@ -366,10 +375,9 @@ pub(crate) mod test {
                                 continue;
                             }
                             let key = contract.key();
-                            let fetch_contract = state.owns_contracts.contains(&key);
                             let request = ContractRequest::Get {
                                 key,
-                                fetch_contract,
+                                fetch_contract: true,
                             };
                             return Some(request.into());
                         }

@@ -440,7 +440,7 @@ impl Operation for PutOp {
                                     .within_subscribing_distance(&Location::from(&key))
                             {
                                 tracing::debug!(tx = %id, %key, peer = %op_manager.ring.peer_key, "Contract not cached @ peer, caching");
-                                super::start_subscription(op_manager, key.clone()).await;
+                                super::start_subscription(op_manager, key.clone(), true).await;
                             }
                             tracing::info!(
                                 tx = %id,

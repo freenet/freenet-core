@@ -362,18 +362,8 @@ impl Operation for GetOp {
                     let fetch_contract = *fetch_contract;
                     let this_peer = *target;
 
-                    let is_subscribed_contract = op_manager.ring.is_subscribed_to_contract(&key);
                     if let Some(s) = stats.as_mut() {
                         s.next_peer = Some(this_peer);
-                    }
-
-                    if !is_subscribed_contract
-                        && op_manager
-                            .ring
-                            .within_subscribing_distance(&Location::from(&key))
-                    {
-                        tracing::debug!(tx = %id, %key, peer = %op_manager.ring.peer_key, "Contract not cached @ peer, caching");
-                        super::start_subscription(op_manager, key.clone()).await;
                     }
 
                     let get_result = op_manager
@@ -599,23 +589,32 @@ impl Operation for GetOp {
                         return Err(OpError::StatePushed);
                     }
 
-                    let res = op_manager
-                        .notify_contract_handler(ContractHandlerEvent::PutQuery {
-                            key: key.clone(),
-                            state: value.clone(),
-                            related_contracts: RelatedContracts::default(),
-                            contract: contract.clone(),
-                        })
-                        .await?;
-                    match res {
-                        ContractHandlerEvent::PutResponse { new_value: Ok(_) } => {}
-                        ContractHandlerEvent::PutResponse {
-                            new_value: Err(err),
-                        } => {
-                            tracing::debug!(tx = %id, error = %err, "Failed put at executor");
-                            return Err(OpError::ExecutorError(err));
+                    let is_subscribed_contract = op_manager.ring.is_subscribed_to_contract(&key);
+                    if !is_subscribed_contract
+                        && op_manager
+                            .ring
+                            .within_subscribing_distance(&Location::from(&key))
+                    {
+                        tracing::debug!(tx = %id, %key, peer = %op_manager.ring.peer_key, "Contract not cached @ peer, caching");
+                        let res = op_manager
+                            .notify_contract_handler(ContractHandlerEvent::PutQuery {
+                                key: key.clone(),
+                                state: value.clone(),
+                                related_contracts: RelatedContracts::default(),
+                                contract: contract.clone(),
+                            })
+                            .await?;
+                        match res {
+                            ContractHandlerEvent::PutResponse { new_value: Ok(_) } => {}
+                            ContractHandlerEvent::PutResponse {
+                                new_value: Err(err),
+                            } => {
+                                tracing::debug!(tx = %id, error = %err, "Failed put at executor");
+                                return Err(OpError::ExecutorError(err));
+                            }
+                            _ => unreachable!(),
                         }
-                        _ => unreachable!(),
+                        super::start_subscription(op_manager, key.clone(), false).await;
                     }
 
                     match self.state {
