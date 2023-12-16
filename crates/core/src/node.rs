@@ -97,9 +97,9 @@ pub struct NodeConfig {
     pub peer_id: PeerId,
     // optional local info, in case this is an initial bootstrap node
     /// IP to bind to the listener
-    pub(crate) local_ip: Option<IpAddr>,
+    pub local_ip: Option<IpAddr>,
     /// socket port to bind to the listener
-    pub(crate) local_port: Option<u16>,
+    pub local_port: Option<u16>,
     /// IP dialers should connect to
     pub(crate) public_ip: Option<IpAddr>,
     /// socket port dialers should connect to

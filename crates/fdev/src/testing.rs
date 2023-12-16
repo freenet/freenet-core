@@ -1,7 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::Error;
-use freenet::dev_tool::SimNetwork;
+use freenet::dev_tool::{PeerCliConfig, SimNetwork};
 
 mod multiple_process;
 mod network;
@@ -109,7 +109,7 @@ pub enum TestMode {
     /// Runs multiple simulated nodes in multiple processes.
     MultiProcess(multiple_process::MultiProcessConfig),
     /// Runs multiple simulated nodes in multiple processes and multiple machines.
-    Network,
+    Network(network::NetworkProcessConfig),
 }
 
 pub(crate) async fn test_framework(base_config: TestConfig) -> anyhow::Result<(), Error> {
@@ -125,7 +125,7 @@ pub(crate) async fn test_framework(base_config: TestConfig) -> anyhow::Result<()
     let res = match &base_config.command {
         TestMode::SingleProcess => single_process::run(&base_config).await,
         TestMode::MultiProcess(config) => multiple_process::run(&base_config, config).await,
-        TestMode::Network => network::run(&base_config).await,
+        TestMode::Network(config) => network::run(&base_config, config).await,
     };
     if let Some(server) = server {
         server.abort();
