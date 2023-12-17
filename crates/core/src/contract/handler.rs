@@ -365,7 +365,14 @@ impl std::fmt::Display for ContractHandlerEvent {
         match self {
             ContractHandlerEvent::PutQuery { key, contract, .. } => {
                 if let Some(contract) = contract {
-                    write!(f, "put query {{ {key}, params: {:?} }}", contract.params())
+                    use std::fmt::Write;
+                    let mut params = String::new();
+                    params.push_str("0x");
+                    for b in contract.params().as_ref().iter().take(8) {
+                        write!(&mut params, "{:02x}", b)?;
+                    }
+                    params.push_str("...");
+                    write!(f, "put query {{ {key}, params: {params} }}",)
                 } else {
                     write!(f, "put query {{ {key} }}")
                 }

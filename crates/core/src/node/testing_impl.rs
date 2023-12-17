@@ -54,7 +54,7 @@ pub fn get_free_port() -> Result<u16, ()> {
     Err(())
 }
 
-pub fn get_dynamic_port() -> u16 {
+fn get_dynamic_port() -> u16 {
     const FIRST_DYNAMIC_PORT: u16 = 49152;
     const LAST_DYNAMIC_PORT: u16 = 65535;
     rand::thread_rng().gen_range(FIRST_DYNAMIC_PORT..LAST_DYNAMIC_PORT)
