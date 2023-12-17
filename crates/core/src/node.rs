@@ -331,6 +331,7 @@ async fn client_event_handling<ClientEv>(
                         continue;
                     }
                 };
+                // fixme: only allow in certain modes (e.g. while testing)
                 if let ClientRequest::Disconnect { cause } = &*req.request {
                     node_controller.send(NodeEvent::Disconnect { cause: cause.clone() }).await.ok();
                     break;
@@ -358,7 +359,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
     let fut = async move {
         let client_id = request.client_id;
 
-        let mut missing_contract = false;
+        // fixme: communicate back errors in this loop to the client somehow
         match *request.request {
             ClientRequest::ContractOp(ops) => match ops {
                 ContractRequest::Put {
@@ -414,7 +415,8 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                     }
                 }
                 ContractRequest::Subscribe { key, .. } => {
-                    const TIMEOUT: Duration = Duration::from_secs(10);
+                    const TIMEOUT: Duration = Duration::from_secs(30);
+                    let mut missing_contract = false;
                     let timeout = tokio::time::timeout(TIMEOUT, async {
                         // Initialize a subscribe op.
                         loop {
@@ -433,8 +435,9 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                                     if let Err(error) = get::request_get(&op_manager, get_op).await
                                     {
                                         tracing::error!(%key, %error, "Failed getting the contract while previously trying to subscribe; bailing");
-                                        break;
+                                        break Err(error);
                                     }
+                                    continue;
                                 }
                                 Err(OpError::ContractError(ContractError::ContractNotFound(_))) => {
                                     tracing::warn!("Still waiting for {key} contract");
@@ -442,7 +445,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                                 }
                                 Err(err) => {
                                     tracing::error!("{}", err);
-                                    break;
+                                    break Err(err);
                                 }
                                 Ok(()) => {
                                     if missing_contract {
@@ -451,13 +454,21 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                                         );
                                     }
                                     tracing::debug!(%key, "Starting subscribe request");
-                                    break;
+                                    break Ok(());
                                 }
                             }
                         }
                     });
-                    if timeout.await.is_err() {
-                        tracing::error!(%key, "Timeout while waiting for contract");
+                    match timeout.await {
+                        Err(_) => {
+                            tracing::error!(%key, "Timeout while waiting for contract to start subscription");
+                        }
+                        Ok(Err(error)) => {
+                            tracing::error!(%key, %error, "Error while subscribing to contract");
+                        }
+                        Ok(Ok(_)) => {
+                            tracing::debug!(%key, "Started subscription to contract");
+                        }
                     }
                 }
                 _ => {

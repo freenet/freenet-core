@@ -65,10 +65,26 @@ pub(crate) async fn request_subscribe(
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
     let (target, _id) = if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        if !op_manager.ring.is_subscribed_to_contract(key) {
-            return Err(OpError::ContractError(ContractError::ContractNotFound(
-                key.clone(),
-            )));
+        match op_manager
+            .notify_contract_handler(crate::contract::ContractHandlerEvent::GetQuery {
+                key: key.clone(),
+                fetch_contract: false,
+            })
+            .await?
+        {
+            crate::contract::ContractHandlerEvent::GetResponse {
+                response: Ok(crate::contract::StoreResponse { state: Some(_), .. }),
+                ..
+            } => {}
+            crate::contract::ContractHandlerEvent::GetResponse {
+                key,
+                response: Ok(crate::contract::StoreResponse { state: None, .. }),
+            } => {
+                return Err(OpError::ContractError(ContractError::ContractNotFound(
+                    key.clone(),
+                )));
+            }
+            _ => return Err(OpError::UnexpectedOpState),
         }
         const EMPTY: &[PeerId] = &[];
         (
