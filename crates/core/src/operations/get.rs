@@ -109,6 +109,7 @@ pub(crate) async fn request_get(op_manager: &OpManager, get_op: GetOp) -> Result
     Ok(())
 }
 
+#[derive(Debug)]
 enum GetState {
     /// A new petition for a get op.
     ReceivedRequest,
@@ -706,7 +707,13 @@ impl Operation for GetOp {
                                 skip_list: skip_list.clone(),
                             });
                         }
-                        _ => return Err(OpError::invalid_transition(self.id)),
+                        Some(other) => {
+                            return Err(OpError::invalid_transition_with_state(
+                                self.id,
+                                Box::new(other),
+                            ))
+                        }
+                        None => return Err(OpError::invalid_transition(self.id)),
                     };
                 }
             }
@@ -784,7 +791,7 @@ async fn try_forward_or_return(
 
     let Some(new_target) = op_manager
         .ring
-        .closest_potentially_caching(&key, [&sender.peer].as_slice())
+        .closest_potentially_caching(&key, new_skip_list.as_slice())
     else {
         tracing::warn!(
             tx = %id,
