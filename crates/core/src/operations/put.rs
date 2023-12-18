@@ -7,12 +7,16 @@ use std::pin::Pin;
 use std::time::Instant;
 
 pub(crate) use self::messages::PutMsg;
-use freenet_stdlib::prelude::*;
+use freenet_stdlib::{
+    client_api::{ErrorKind, HostResponse},
+    prelude::*,
+};
 use futures::future::BoxFuture;
 use futures::FutureExt;
 
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::{
+    client_events::HostResult,
     contract::ContractHandlerEvent,
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
@@ -60,6 +64,7 @@ impl PutOp {
             .as_ref()
             .map(|s| matches!(s.step, RecordingStats::Completed))
             .unwrap_or(false)
+            || matches!(self.state, Some(PutState::Finished { .. }))
     }
 
     pub(super) fn record_transfer(&mut self) {
@@ -77,6 +82,19 @@ impl PutOp {
                 }
                 RecordingStats::Completed => {}
             }
+        }
+    }
+
+    pub(super) fn to_host_result(&self) -> HostResult {
+        if let Some(PutState::Finished { key }) = &self.state {
+            Ok(HostResponse::ContractResponse(
+                freenet_stdlib::client_api::ContractResponse::PutResponse { key: key.clone() },
+            ))
+        } else {
+            Err(ErrorKind::OperationError {
+                cause: "put didn't finish successfully".into(),
+            }
+            .into())
         }
     }
 }
@@ -231,14 +249,6 @@ impl Operation for PutOp {
                             .ring
                             .within_subscribing_distance(&Location::from(&key))
                     {
-                        if !is_subscribed_contract {
-                            tracing::debug!(tx = %id, %key, "Contract not cached @ peer {}", target.peer);
-                            match try_subscribing_to_contract(op_manager, key.clone()).await {
-                                Ok(_) => {}
-                                Err(err) => return Err(err),
-                            }
-                        }
-                        // after the contract has been cached, push the update query
                         tracing::debug!(tx = %id, "Attempting contract value update");
                         put_contract(
                             op_manager,
@@ -256,7 +266,7 @@ impl Operation for PutOp {
                         );
                     }
 
-                    if let Some(new_htl) = htl.checked_sub(1) {
+                    let last_hop = if let Some(new_htl) = htl.checked_sub(1) {
                         // forward changes in the contract to nodes closer to the contract location, if possible
                         let put_here = forward_put(
                             op_manager,
@@ -265,6 +275,7 @@ impl Operation for PutOp {
                             value.clone(),
                             *id,
                             new_htl,
+                            vec![sender.peer],
                         )
                         .await;
                         if put_here && !is_subscribed_contract {
@@ -278,14 +289,27 @@ impl Operation for PutOp {
                             )
                             .await?;
                         }
-                    }
+                        put_here
+                    } else {
+                        // should put in this location, no hops left
+                        put_contract(
+                            op_manager,
+                            key.clone(),
+                            value.clone(),
+                            RelatedContracts::default(),
+                            contract,
+                        )
+                        .await?;
+                        true
+                    };
 
                     let broadcast_to = op_manager.get_broadcast_targets(&key, &sender.peer);
                     match try_to_broadcast(
                         *id,
+                        last_hop,
                         op_manager,
                         self.state,
-                        broadcast_to,
+                        (broadcast_to, *sender),
                         key.clone(),
                         (contract.clone(), value.clone()),
                     )
@@ -327,9 +351,10 @@ impl Operation for PutOp {
 
                     match try_to_broadcast(
                         *id,
+                        false,
                         op_manager,
                         self.state,
-                        broadcast_to,
+                        (broadcast_to, *sender),
                         key.clone(),
                         (contract.clone(), new_value),
                     )
@@ -349,6 +374,7 @@ impl Operation for PutOp {
                     key,
                     new_value,
                     contract,
+                    upstream,
                 } => {
                     let sender = op_manager.ring.own_location();
                     let mut broadcasted_to = *broadcasted_to;
@@ -393,26 +419,48 @@ impl Operation for PutOp {
 
                     broadcasted_to += broadcast_to.len() - incorrect_results;
                     tracing::debug!(
-                        "successfully broadcasted put into contract {key} to {broadcasted_to} peers"
+                        "Successfully broadcasted put into contract {key} to {broadcasted_to} peers"
                     );
 
                     // Subscriber nodes have been notified of the change, the operation is completed
-                    return_msg = Some(PutMsg::SuccessfulPut { id: *id });
+                    return_msg = Some(PutMsg::SuccessfulPut {
+                        id: *id,
+                        target: *upstream,
+                    });
                     new_state = None;
                 }
-                PutMsg::SuccessfulPut { .. } => {
+                PutMsg::SuccessfulPut { id, .. } => {
                     match self.state {
-                        Some(PutState::AwaitingResponse { contract, .. }) => {
-                            tracing::debug!("Successfully updated value for {}", contract,);
-                            new_state = None;
-                            return_msg = None;
+                        Some(PutState::AwaitingResponse { key, upstream }) => {
+                            let is_subscribed_contract =
+                                op_manager.ring.is_subscribed_to_contract(&key);
+                            if !is_subscribed_contract
+                                && op_manager
+                                    .ring
+                                    .within_subscribing_distance(&Location::from(&key))
+                            {
+                                tracing::debug!(tx = %id, %key, peer = %op_manager.ring.peer_key, "Contract not cached @ peer, caching");
+                                super::start_subscription_request(op_manager, key.clone(), true)
+                                    .await;
+                            }
+                            tracing::info!(
+                                tx = %id,
+                                %key,
+                                this_peer = %op_manager.ring.peer_key,
+                                "Peer completed contract value put",
+                            );
+                            new_state = Some(PutState::Finished { key });
+                            if let Some(upstream) = upstream {
+                                return_msg = Some(PutMsg::SuccessfulPut {
+                                    id: *id,
+                                    target: upstream,
+                                });
+                            } else {
+                                return_msg = None;
+                            }
                         }
                         _ => return Err(OpError::invalid_transition(self.id)),
                     };
-                    tracing::info!(
-                        this_peer = %op_manager.ring.peer_key,
-                        "Peer completed contract value put",
-                    );
                 }
                 PutMsg::PutForward {
                     id,
@@ -420,6 +468,7 @@ impl Operation for PutOp {
                     new_value,
                     htl,
                     sender,
+                    skip_list,
                 } => {
                     let key = contract.key();
                     let peer_loc = op_manager.ring.own_location();
@@ -435,13 +484,6 @@ impl Operation for PutOp {
                         .ring
                         .within_subscribing_distance(&Location::from(&key));
                     if is_subscribed_contract || within_caching_dist {
-                        if !is_subscribed_contract {
-                            tracing::debug!(%key, "Contract not cached @ peer {}", peer_loc.peer);
-                            match try_subscribing_to_contract(op_manager, key.clone()).await {
-                                Ok(_) => {}
-                                Err(err) => return Err(err),
-                            }
-                        }
                         // after the contract has been cached, push the update query
                         put_contract(
                             op_manager,
@@ -454,7 +496,10 @@ impl Operation for PutOp {
                     }
 
                     // if successful, forward to the next closest peers (if any)
-                    if let Some(new_htl) = htl.checked_sub(1) {
+                    let last_hop = if let Some(new_htl) = htl.checked_sub(1) {
+                        let mut new_skip_list = skip_list.clone();
+                        new_skip_list.push(sender.peer);
+                        // only hop forward if there are closer peers
                         let put_here = forward_put(
                             op_manager,
                             conn_manager,
@@ -462,6 +507,7 @@ impl Operation for PutOp {
                             new_value.clone(),
                             *id,
                             new_htl,
+                            new_skip_list,
                         )
                         .await;
                         if put_here && !is_subscribed_contract {
@@ -475,14 +521,27 @@ impl Operation for PutOp {
                             )
                             .await?;
                         }
-                    }
+                        put_here
+                    } else {
+                        // should put in this location, no hops left
+                        put_contract(
+                            op_manager,
+                            key.clone(),
+                            new_value.clone(),
+                            RelatedContracts::default(),
+                            contract,
+                        )
+                        .await?;
+                        true
+                    };
 
                     let broadcast_to = op_manager.get_broadcast_targets(&key, &sender.peer);
                     match try_to_broadcast(
                         *id,
+                        last_hop,
                         op_manager,
                         self.state,
-                        broadcast_to,
+                        (broadcast_to, *sender),
                         key.clone(),
                         (contract.clone(), new_value.clone()),
                     )
@@ -536,35 +595,12 @@ fn build_op_result(
     })
 }
 
-pub(super) async fn try_subscribing_to_contract(
-    op_manager: &OpManager,
-    key: ContractKey,
-) -> Result<(), OpError> {
-    // this node does not have the contract, so instead store the contract and execute the put op.
-    let res = op_manager
-        .notify_contract_handler(ContractHandlerEvent::Subscribe { key: key.clone() })
-        .await?;
-    if let ContractHandlerEvent::SubscribeResponse {
-        response: Ok(subcribed_to),
-        ..
-    } = res
-    {
-        op_manager.ring.add_subscription(key, subcribed_to);
-        tracing::debug!("Contract successfully cached");
-        Ok(())
-    } else {
-        tracing::error!(
-            "Contract handler returned wrong event when trying to cache contract, this should not happen!"
-        );
-        Err(OpError::UnexpectedOpState)
-    }
-}
-
 async fn try_to_broadcast(
     id: Transaction,
+    last_hop: bool,
     op_manager: &OpManager,
     state: Option<PutState>,
-    broadcast_to: Vec<PeerKeyLocation>,
+    (broadcast_to, upstream): (Vec<PeerKeyLocation>, PeerKeyLocation),
     key: ContractKey,
     (contract, new_value): (ContractContainer, WrappedState),
 ) -> Result<(Option<PutState>, Option<PutMsg>), OpError> {
@@ -573,16 +609,19 @@ async fn try_to_broadcast(
 
     match state {
         Some(PutState::ReceivedRequest | PutState::BroadcastOngoing { .. }) => {
-            if broadcast_to.is_empty() {
+            if broadcast_to.is_empty() && !last_hop {
                 // broadcast complete
                 tracing::debug!(
                     "Empty broadcast list while updating value for contract {}",
                     key
                 );
                 // means the whole tx finished so can return early
-                new_state = Some(PutState::AwaitingResponse { contract: key });
+                new_state = Some(PutState::AwaitingResponse {
+                    key,
+                    upstream: Some(upstream),
+                });
                 return_msg = None;
-            } else {
+            } else if !broadcast_to.is_empty() {
                 tracing::debug!("Callback to start broadcasting to other nodes");
                 new_state = Some(PutState::BroadcastOngoing);
                 return_msg = Some(PutMsg::Broadcasting {
@@ -592,6 +631,7 @@ async fn try_to_broadcast(
                     broadcast_to,
                     key,
                     contract,
+                    upstream,
                 });
 
                 let op = PutOp {
@@ -603,6 +643,12 @@ async fn try_to_broadcast(
                     .notify_op_change(NetMessage::from(return_msg.unwrap()), OpEnum::Put(op))
                     .await?;
                 return Err(OpError::StatePushed);
+            } else {
+                new_state = None;
+                return_msg = Some(PutMsg::SuccessfulPut {
+                    id,
+                    target: upstream,
+                });
             }
         }
         _ => return Err(OpError::invalid_transition(id)),
@@ -619,10 +665,7 @@ pub(crate) fn start_op(
 ) -> PutOp {
     let key = contract.key();
     let contract_location = Location::from(&key);
-    tracing::debug!(
-        "Requesting put to contract {} @ loc({contract_location})",
-        key,
-    );
+    tracing::debug!(%contract_location, %key, "Requesting put");
 
     let id = Transaction::new::<PutMsg>();
     // let payload_size = contract.data().len();
@@ -647,7 +690,7 @@ pub(crate) fn start_op(
     }
 }
 
-enum PutState {
+pub enum PutState {
     ReceivedRequest,
     PrepareRequest {
         contract: ContractContainer,
@@ -656,9 +699,13 @@ enum PutState {
         htl: usize,
     },
     AwaitingResponse {
-        contract: ContractKey,
+        key: ContractKey,
+        upstream: Option<PeerKeyLocation>,
     },
     BroadcastOngoing,
+    Finished {
+        key: ContractKey,
+    },
 }
 
 /// Request to insert/update a value into a contract.
@@ -694,7 +741,10 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
             related_contracts,
         }) => {
             let key = contract.key();
-            let new_state = Some(PutState::AwaitingResponse { contract: key });
+            let new_state = Some(PutState::AwaitingResponse {
+                key,
+                upstream: None,
+            });
             let msg = PutMsg::RequestPut {
                 id,
                 contract,
@@ -763,14 +813,16 @@ async fn forward_put<CB>(
     new_value: WrappedState,
     id: Transaction,
     htl: usize,
+    skip_list: Vec<PeerId>,
 ) -> bool
 where
     CB: NetworkBridge,
 {
     let key = contract.key();
     let contract_loc = Location::from(&key);
-    const EMPTY: &[PeerId] = &[];
-    let forward_to = op_manager.ring.closest_potentially_caching(&key, EMPTY);
+    let forward_to = op_manager
+        .ring
+        .closest_potentially_caching(&key, &*skip_list);
     let own_pkloc = op_manager.ring.own_location();
     let own_loc = own_pkloc.location.expect("infallible");
     if let Some(peer) = forward_to {
@@ -789,6 +841,7 @@ where
                         contract: contract.clone(),
                         new_value: new_value.clone(),
                         htl,
+                        skip_list,
                     })
                     .into(),
                 )
@@ -830,9 +883,13 @@ mod messages {
             new_value: WrappedState,
             /// current htl, reduced by one at each hop
             htl: usize,
+            skip_list: Vec<PeerId>,
         },
         /// Value successfully inserted/updated.
-        SuccessfulPut { id: Transaction },
+        SuccessfulPut {
+            id: Transaction,
+            target: PeerKeyLocation,
+        },
         /// Target the node which is closest to the key
         SeekNode {
             id: Transaction,
@@ -853,6 +910,7 @@ mod messages {
             key: ContractKey,
             new_value: WrappedState,
             contract: ContractContainer,
+            upstream: PeerKeyLocation,
         },
         /// Broadcasting a change to a peer, which then will relay the changes to other peers.
         BroadcastTo {
@@ -881,6 +939,7 @@ mod messages {
             match self {
                 Self::SeekNode { target, .. } => Some(target),
                 Self::RequestPut { target, .. } => Some(target),
+                Self::SuccessfulPut { target, .. } => Some(target),
                 _ => None,
             }
         }

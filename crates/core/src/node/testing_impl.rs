@@ -54,7 +54,7 @@ pub fn get_free_port() -> Result<u16, ()> {
     Err(())
 }
 
-pub fn get_dynamic_port() -> u16 {
+fn get_dynamic_port() -> u16 {
     const FIRST_DYNAMIC_PORT: u16 = 49152;
     const LAST_DYNAMIC_PORT: u16 = 65535;
     rand::thread_rng().gen_range(FIRST_DYNAMIC_PORT..LAST_DYNAMIC_PORT)
@@ -1050,6 +1050,7 @@ where
     NB: NetworkBridge + NetworkBridgeExt,
     UsrEv: ClientEventsProxy + Send + 'static,
 {
+    // todo: this two containers need to be clean up on transaction time-out
     let mut pending_from_executor = HashSet::new();
     let mut tx_to_client: HashMap<Transaction, crate::client_events::ClientId> = HashMap::new();
     loop {
@@ -1069,7 +1070,7 @@ where
                     anyhow::bail!("node controller channel shutdown, fatal error");
                 }
             }
-            event_id = wait_for_event.recv_from_client_event() => {
+            event_id = wait_for_event.relay_transaction_result_to_client() => {
                 if let Ok((client_id, transaction)) = event_id {
                    tx_to_client.insert(transaction, client_id);
                 }

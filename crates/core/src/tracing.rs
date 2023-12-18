@@ -772,7 +772,7 @@ async fn send_to_metrics_server(
             let msg = PeerChange::removed_connection_msg(*from, send_msg.peer_id);
             ws_stream.send(Message::Binary(msg)).await
         }
-        // todo: send op events too 8put, get, update, etc) so we can keep track of transactions
+        // todo: send op events too (put, get, update, etc) so we can keep track of transactions
         _ => Ok(()),
     };
     if let Err(error) = res {

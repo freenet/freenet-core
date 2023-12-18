@@ -25,7 +25,6 @@ use crate::node::OpManager;
 ))]
 use crate::operations::get::GetResult;
 use crate::operations::{OpEnum, OpError};
-use crate::ring::PeerKeyLocation;
 use crate::wasm_runtime::{
     ContractRuntimeInterface, ContractStore, DelegateRuntimeInterface, DelegateStore, Runtime,
     SecretsStore, StateStore, StateStoreError,
@@ -220,8 +219,16 @@ impl ExecutorToEventLoopChannel<ExecutorHalve> {
     {
         let op = message.initiate_op(&self.op_manager);
         let tx = *op.id();
-        self.end.waiting_for_op_tx.send(tx).await?;
-        <T as ComposeNetworkMessage<Op>>::resume_op(op, &self.op_manager).await?;
+        self.end.waiting_for_op_tx.send(tx).await.map_err(|e| {
+            tracing::debug!("failed to send request to executor, channel closed");
+            e
+        })?;
+        <T as ComposeNetworkMessage<Op>>::resume_op(op, &self.op_manager)
+            .await
+            .map_err(|e| {
+                tracing::debug!("failed to resume operation: {e}");
+                e
+            })?;
         Ok(tx)
     }
 
@@ -418,11 +425,6 @@ pub(crate) trait ContractExecutor: Send + 'static {
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
     ) -> Result<WrappedState, ExecutorError>;
-
-    async fn subscribe_to_contract(
-        &mut self,
-        key: ContractKey,
-    ) -> Result<PeerKeyLocation, ExecutorError>;
 }
 
 /// A WASM executor which will run any contracts, delegates, etc. registered.

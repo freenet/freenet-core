@@ -10,6 +10,7 @@
 
 use std::{
     fmt::Display,
+    io::Write,
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
     str::FromStr,
@@ -330,6 +331,7 @@ async fn client_event_handling<ClientEv>(
                         continue;
                     }
                 };
+                // fixme: only allow in certain modes (e.g. while testing)
                 if let ClientRequest::Disconnect { cause } = &*req.request {
                     node_controller.send(NodeEvent::Disconnect { cause: cause.clone() }).await.ok();
                     break;
@@ -357,7 +359,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
     let fut = async move {
         let client_id = request.client_id;
 
-        let mut missing_contract = false;
+        // fixme: communicate back errors in this loop to the client somehow
         match *request.request {
             ClientRequest::ContractOp(ops) => match ops {
                 ContractRequest::Put {
@@ -378,7 +380,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                     );
                     let _ = op_manager
                         .ch_outbound
-                        .waiting_for_transaction(op.id, client_id)
+                        .waiting_for_transaction_result(op.id, client_id)
                         .await;
                     if let Err(err) = put::request_put(&op_manager, op).await {
                         tracing::error!("{}", err);
@@ -406,21 +408,22 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                     let op = get::start_op(key, contract);
                     let _ = op_manager
                         .ch_outbound
-                        .waiting_for_transaction(op.id, client_id)
+                        .waiting_for_transaction_result(op.id, client_id)
                         .await;
                     if let Err(err) = get::request_get(&op_manager, op).await {
                         tracing::error!("{}", err);
                     }
                 }
                 ContractRequest::Subscribe { key, .. } => {
-                    const TIMEOUT: Duration = Duration::from_secs(10);
+                    const TIMEOUT: Duration = Duration::from_secs(30);
+                    let mut missing_contract = false;
                     let timeout = tokio::time::timeout(TIMEOUT, async {
                         // Initialize a subscribe op.
                         loop {
                             let op = subscribe::start_op(key.clone());
                             let _ = op_manager
                                 .ch_outbound
-                                .waiting_for_transaction(op.id, client_id)
+                                .waiting_for_transaction_result(op.id, client_id)
                                 .await;
                             match subscribe::request_subscribe(&op_manager, op).await {
                                 Err(OpError::ContractError(ContractError::ContractNotFound(
@@ -432,8 +435,9 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                                     if let Err(error) = get::request_get(&op_manager, get_op).await
                                     {
                                         tracing::error!(%key, %error, "Failed getting the contract while previously trying to subscribe; bailing");
-                                        break;
+                                        break Err(error);
                                     }
+                                    continue;
                                 }
                                 Err(OpError::ContractError(ContractError::ContractNotFound(_))) => {
                                     tracing::warn!("Still waiting for {key} contract");
@@ -441,7 +445,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                                 }
                                 Err(err) => {
                                     tracing::error!("{}", err);
-                                    break;
+                                    break Err(err);
                                 }
                                 Ok(()) => {
                                     if missing_contract {
@@ -450,13 +454,21 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                                         );
                                     }
                                     tracing::debug!(%key, "Starting subscribe request");
-                                    break;
+                                    break Ok(());
                                 }
                             }
                         }
                     });
-                    if timeout.await.is_err() {
-                        tracing::error!(%key, "Timeout while waiting for contract");
+                    match timeout.await {
+                        Err(_) => {
+                            tracing::error!(%key, "Timeout while waiting for contract to start subscription");
+                        }
+                        Ok(Err(error)) => {
+                            tracing::error!(%key, %error, "Error while subscribing to contract");
+                        }
+                        Ok(Ok(_)) => {
+                            tracing::debug!(%key, "Started subscription to contract");
+                        }
                     }
                 }
                 _ => {
@@ -497,7 +509,7 @@ async fn report_result(
     match op_result {
         Ok(Some(op_res)) => {
             if let Some((client_id, cb)) = client_req_handler_callback {
-                let _ = cb.send((client_id, op_res.to_host_result(client_id)));
+                let _ = cb.send((client_id, op_res.to_host_result()));
             }
             // check operations.rs:handle_op_result to see what's the meaning of each state
             // in case more cases want to be handled when feeding information to the OpManager
@@ -568,8 +580,9 @@ async fn report_result(
                         second_trace_lines.join("\n")
                     })
                     .unwrap_or_default();
-                tracing::error!(%tx, ?state, "Wrong state");
-                eprintln!("Operation error trace:\n{trace}");
+                let log =
+                    format!("Transaction ({tx}) error trace:\n {trace} \nstate:\n {state:?}\n");
+                std::io::stderr().write_all(log.as_bytes()).unwrap();
             }
             #[cfg(not(any(debug_assertions, test)))]
             {

@@ -48,7 +48,7 @@ impl ContractExecutor for Executor<MockRuntime> {
     async fn fetch_contract(
         &mut self,
         key: ContractKey,
-        _fetch_contract: bool,
+        fetch_contract: bool,
     ) -> Result<(WrappedState, Option<ContractContainer>), ExecutorError> {
         let Some(parameters) = self
             .state_store
@@ -57,18 +57,21 @@ impl ContractExecutor for Executor<MockRuntime> {
             .map_err(ExecutorError::other)?
         else {
             return Err(ExecutorError::other(format!(
-                "missing parameters for contract {key}"
+                "missing state and/or parameters for contract {key}"
             )));
+        };
+        let contract = if fetch_contract {
+            self.runtime
+                .contract_store
+                .fetch_contract(&key, &parameters)
+        } else {
+            None
         };
         let Ok(state) = self.state_store.get(&key).await else {
             return Err(ExecutorError::other(format!(
                 "missing state for contract {key}"
             )));
         };
-        let contract = self
-            .runtime
-            .contract_store
-            .fetch_contract(&key, &parameters);
         Ok((state, contract))
     }
 
@@ -84,38 +87,33 @@ impl ContractExecutor for Executor<MockRuntime> {
         &mut self,
         key: ContractKey,
         state: Either<WrappedState, StateDelta<'static>>,
-        related_contracts: RelatedContracts<'static>,
+        _related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
     ) -> Result<WrappedState, ExecutorError> {
         // todo: instead allow to perform mutations per contract based on incoming value so we can track
         // state values over the network
         match (state, code) {
             (Either::Left(incoming_state), Some(contract)) => {
+                self.runtime
+                    .contract_store
+                    .store_contract(contract.clone())
+                    .map_err(ExecutorError::other)?;
                 self.state_store
                     .store(key, incoming_state.clone(), contract.params().into_owned())
                     .await
                     .map_err(ExecutorError::other)?;
-
-                let request = PutContract {
-                    contract,
-                    state: incoming_state.clone(),
-                    related_contracts,
-                };
-                let _op: Result<operations::put::PutResult, _> = self.op_request(request).await;
-
                 return Ok(incoming_state);
             }
-            _ => unreachable!(),
+            // (Either::Left(_), None) => {
+            //     return Err(ExecutorError::request(RequestError::from(
+            //         StdContractError::Get {
+            //             key: key.clone(),
+            //             cause: "Missing contract or parameters".into(),
+            //         },
+            //     )));
+            // }
+            (update, contract) => unreachable!("{update:?}, {contract:?}"),
         }
-    }
-
-    async fn subscribe_to_contract(
-        &mut self,
-        key: ContractKey,
-    ) -> Result<PeerKeyLocation, ExecutorError> {
-        let request = SubscribeContract { key };
-        let result: operations::subscribe::SubscribeResult = self.op_request(request).await?;
-        Ok(result.subscribed_to)
     }
 }
 

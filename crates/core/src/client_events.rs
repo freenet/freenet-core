@@ -1,7 +1,7 @@
 //! Clients events related logic and type definitions. For example, receival of client events from applications throught the HTTP gateway.
 
 use freenet_stdlib::client_api::ClientRequest;
-use freenet_stdlib::client_api::{ClientError, HostResponse};
+use freenet_stdlib::client_api::{ClientError, ContractResponse, HostResponse};
 use futures::future::BoxFuture;
 use std::fmt::Debug;
 use std::fmt::Display;
@@ -300,8 +300,18 @@ pub(crate) mod test {
         fn send(
             &mut self,
             _id: ClientId,
-            _response: Result<HostResponse, ClientError>,
+            response: Result<HostResponse, ClientError>,
         ) -> BoxFuture<'_, Result<(), ClientError>> {
+            if let Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key, ..
+            })) = response
+            {
+                self.internal_state
+                    .as_mut()
+                    .expect("state should be set")
+                    .owns_contracts
+                    .insert(key);
+            }
             async { Ok(()) }.boxed()
         }
     }
@@ -314,7 +324,6 @@ pub(crate) mod test {
         max_iterations: usize,
         max_contract_num: usize,
         owns_contracts: HashSet<ContractKey>,
-        subcribed_contract: HashSet<ContractKey>,
         existing_contracts: Vec<ContractContainer>,
     }
 
@@ -326,6 +335,15 @@ pub(crate) mod test {
         fn gen_range(&mut self, range: std::ops::Range<usize>) -> usize;
 
         fn choose<'a, T>(&mut self, vec: &'a [T]) -> Option<&'a T>;
+
+        fn choose_random_from_iter<'a, T>(
+            &mut self,
+            mut iter: impl ExactSizeIterator<Item = &'a T> + 'a,
+        ) -> Option<&'a T> {
+            let len = iter.len();
+            let idx = self.gen_range(0..len);
+            iter.nth(idx)
+        }
 
         /// The goal of this function is to generate a random event that is valid for the current
         /// global state of the network.
@@ -342,8 +360,8 @@ pub(crate) mod test {
             while state.current_iteration < state.max_iterations {
                 state.current_iteration += 1;
                 let for_this_peer = self.gen_range(0..state.num_peers) == state.this_peer;
-                match self.gen_range(0..4) {
-                    0 => {
+                match self.gen_range(0..100) {
+                    val if (0..5).contains(&val) => {
                         if state.max_contract_num <= state.existing_contracts.len() {
                             continue;
                         }
@@ -353,14 +371,26 @@ pub(crate) mod test {
                             state: WrappedState::new(self.random_byte_vec()),
                             related_contracts: RelatedContracts::new(),
                         };
-                        let key = contract.key();
                         state.existing_contracts.push(contract);
-                        if for_this_peer {
-                            state.owns_contracts.insert(key);
+                        if !for_this_peer {
+                            continue;
+                        }
+                        return Some(request.into());
+                    }
+                    val if (5..35).contains(&val) => {
+                        if let Some(contract) = self.choose(&state.existing_contracts) {
+                            if !for_this_peer {
+                                continue;
+                            }
+                            let key = contract.key();
+                            let request = ContractRequest::Get {
+                                key,
+                                fetch_contract: true,
+                            };
                             return Some(request.into());
                         }
                     }
-                    1 => {
+                    val if (35..80).contains(&val) => {
                         if let Some(contract) = self.choose(&state.existing_contracts) {
                             let delta = UpdateData::Delta(StateDelta::from(self.random_byte_vec()));
                             if !for_this_peer {
@@ -375,33 +405,23 @@ pub(crate) mod test {
                             }
                         }
                     }
-                    2 => {
-                        if let Some(contract) = self.choose(&state.existing_contracts) {
-                            if !for_this_peer {
-                                continue;
-                            }
-                            let key = contract.key();
-                            let fetch_contract = state.owns_contracts.contains(&key);
-                            let request = ContractRequest::Get {
-                                key,
-                                fetch_contract,
-                            };
-                            return Some(request.into());
+                    val if (80..100).contains(&val) => {
+                        let summary = StateSummary::from(self.random_byte_vec());
+
+                        let Some(from_existing) = self.choose(state.existing_contracts.as_slice())
+                        else {
+                            continue;
+                        };
+
+                        let key = from_existing.key();
+                        if !for_this_peer {
+                            continue;
                         }
-                    }
-                    3 => {
-                        if let Some(contract) = self.choose(&state.existing_contracts) {
-                            let key = contract.key();
-                            let summary = StateSummary::from(self.random_byte_vec());
-                            if !for_this_peer || state.subcribed_contract.contains(&key) {
-                                continue;
-                            }
-                            let request = ContractRequest::Subscribe {
-                                key,
-                                summary: Some(summary),
-                            };
-                            return Some(request.into());
-                        }
+                        let request = ContractRequest::Subscribe {
+                            key,
+                            summary: Some(summary),
+                        };
+                        return Some(request.into());
                     }
                     _ => unreachable!(),
                 }

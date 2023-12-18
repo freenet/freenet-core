@@ -17,7 +17,6 @@ use super::{
 };
 use crate::client_events::HostResult;
 use crate::message::Transaction;
-use crate::ring::PeerKeyLocation;
 use crate::{client_events::ClientId, node::PeerCliConfig, wasm_runtime::Runtime, DynError};
 
 pub(crate) struct ClientResponsesReceiver(UnboundedReceiver<(ClientId, HostResult)>);
@@ -248,7 +247,9 @@ pub(crate) fn contract_handler_channel() -> (
 static EV_ID: AtomicU64 = AtomicU64::new(0);
 
 impl ContractHandlerChannel<WaitingResolution> {
-    pub async fn recv_from_client_event(&mut self) -> Result<(ClientId, Transaction), DynError> {
+    pub async fn relay_transaction_result_to_client(
+        &mut self,
+    ) -> Result<(ClientId, Transaction), DynError> {
         self.end
             .wait_for_res_rx
             .recv()
@@ -282,7 +283,7 @@ impl ContractHandlerChannel<SenderHalve> {
         }
     }
 
-    pub async fn waiting_for_transaction(
+    pub async fn waiting_for_transaction_result(
         &self,
         transaction: Transaction,
         client_id: ClientId,
@@ -357,14 +358,6 @@ pub(crate) enum ContractHandlerEvent {
         key: ContractKey,
         response: Result<StoreResponse, ExecutorError>,
     },
-    /// Subscribe to a contract.
-    Subscribe { key: ContractKey },
-    /// The response to a subscribe event
-    SubscribeResponse {
-        key: ContractKey,
-        /// If successful, returns the peer to which it subscribed to for updates.
-        response: Result<PeerKeyLocation, ExecutorError>,
-    },
 }
 
 impl std::fmt::Display for ContractHandlerEvent {
@@ -372,7 +365,14 @@ impl std::fmt::Display for ContractHandlerEvent {
         match self {
             ContractHandlerEvent::PutQuery { key, contract, .. } => {
                 if let Some(contract) = contract {
-                    write!(f, "put query {{ {key}, params: {:?} }}", contract.params())
+                    use std::fmt::Write;
+                    let mut params = String::new();
+                    params.push_str("0x");
+                    for b in contract.params().as_ref().iter().take(8) {
+                        write!(&mut params, "{:02x}", b)?;
+                    }
+                    params.push_str("...");
+                    write!(f, "put query {{ {key}, params: {params} }}",)
                 } else {
                     write!(f, "put query {{ {key} }}")
                 }
@@ -399,23 +399,6 @@ impl std::fmt::Display for ContractHandlerEvent {
                     write!(f, "get query failed {{ {key} }}",)
                 }
             },
-            ContractHandlerEvent::Subscribe { key } => {
-                write!(f, "subscribe {{ {key} }}")
-            }
-            ContractHandlerEvent::SubscribeResponse { key, response } => match response {
-                Ok(_) => {
-                    write!(f, "subscribe response {{ {key} }}",)
-                }
-                Err(_) => {
-                    write!(f, "subscribe failed {{ {key} }}",)
-                }
-            },
-            // ContractHandlerEvent::Cache(container) => {
-            //     write!(f, "caching {{ {} }}", container.key())
-            // }
-            // ContractHandlerEvent::CacheResult(r) => {
-            //     write!(f, "caching result {{ {} }}", r.is_ok())
-            // }
         }
     }
 }

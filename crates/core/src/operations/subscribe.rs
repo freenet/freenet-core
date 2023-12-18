@@ -1,12 +1,16 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use freenet_stdlib::prelude::*;
+use freenet_stdlib::{
+    client_api::{ErrorKind, HostResponse},
+    prelude::*,
+};
 use futures::{future::BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
 
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::{
+    client_events::HostResult,
     contract::ContractError,
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
@@ -32,21 +36,17 @@ enum SubscribeState {
         retries: usize,
         upstream_subscriber: Option<PeerKeyLocation>,
     },
-    Completed {
-        subscribed_to: PeerKeyLocation,
-    },
+    Completed {},
 }
 
-pub(crate) struct SubscribeResult {
-    pub subscribed_to: PeerKeyLocation,
-}
+pub(crate) struct SubscribeResult {}
 
 impl TryFrom<SubscribeOp> for SubscribeResult {
     type Error = OpError;
 
     fn try_from(value: SubscribeOp) -> Result<Self, Self::Error> {
-        if let Some(SubscribeState::Completed { subscribed_to }) = value.state {
-            Ok(SubscribeResult { subscribed_to })
+        if let Some(SubscribeState::Completed {}) = value.state {
+            Ok(SubscribeResult {})
         } else {
             Err(OpError::UnexpectedOpState)
         }
@@ -65,10 +65,26 @@ pub(crate) async fn request_subscribe(
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
     let (target, _id) = if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        if !op_manager.ring.is_subscribed_to_contract(key) {
-            return Err(OpError::ContractError(ContractError::ContractNotFound(
-                key.clone(),
-            )));
+        match op_manager
+            .notify_contract_handler(crate::contract::ContractHandlerEvent::GetQuery {
+                key: key.clone(),
+                fetch_contract: false,
+            })
+            .await?
+        {
+            crate::contract::ContractHandlerEvent::GetResponse {
+                response: Ok(crate::contract::StoreResponse { state: Some(_), .. }),
+                ..
+            } => {}
+            crate::contract::ContractHandlerEvent::GetResponse {
+                key,
+                response: Ok(crate::contract::StoreResponse { state: None, .. }),
+            } => {
+                return Err(OpError::ContractError(ContractError::ContractNotFound(
+                    key.clone(),
+                )));
+            }
+            _ => return Err(OpError::UnexpectedOpState),
         }
         const EMPTY: &[PeerId] = &[];
         (
@@ -121,6 +137,17 @@ impl SubscribeOp {
     }
 
     pub(super) fn record_transfer(&mut self) {}
+
+    pub(super) fn to_host_result(&self) -> HostResult {
+        if let Some(SubscribeState::Completed {}) = self.state {
+            Ok(HostResponse::Ok)
+        } else {
+            Err(ErrorKind::OperationError {
+                cause: "subscribe didn't finish successfully".into(),
+            }
+            .into())
+        }
+    }
 }
 
 impl Operation for SubscribeOp {
@@ -365,9 +392,7 @@ impl Operation for SubscribeOp {
                         );
                         op_manager.ring.add_subscription(key.clone(), *sender);
 
-                        new_state = Some(SubscribeState::Completed {
-                            subscribed_to: *sender,
-                        });
+                        new_state = Some(SubscribeState::Completed {});
                         if let Some(upstream_subscriber) = upstream_subscriber {
                             return_msg = Some(SubscribeMsg::ReturnSub {
                                 id: *id,

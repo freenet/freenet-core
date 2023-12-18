@@ -7,6 +7,8 @@ impl ContractExecutor for Executor<Runtime> {
         key: ContractKey,
         fetch_contract: bool,
     ) -> Result<(WrappedState, Option<ContractContainer>), ExecutorError> {
+        // FIXME: this logic shouldn't be the same as when requested from apps
+        // since we don't have to try get from network when is not present locally!
         match self.perform_contract_get(fetch_contract, key).await {
             Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                 contract,
@@ -50,10 +52,12 @@ impl ContractExecutor for Executor<Runtime> {
                 })?
         };
 
-        let contract = if let Some(code) = self.runtime.contract_store.fetch_contract(&key, &params)
+        let remove_if_fail = if self
+            .runtime
+            .contract_store
+            .fetch_contract(&key, &params)
+            .is_none()
         {
-            code
-        } else {
             let code = code.ok_or_else(|| {
                 ExecutorError::request(StdContractError::MissingContract {
                     key: key.clone().into(),
@@ -63,7 +67,9 @@ impl ContractExecutor for Executor<Runtime> {
                 .contract_store
                 .store_contract(code.clone())
                 .map_err(ExecutorError::other)?;
-            code
+            true
+        } else {
+            false
         };
 
         let mut updates = match update {
@@ -72,7 +78,9 @@ impl ContractExecutor for Executor<Runtime> {
                     .runtime
                     .validate_state(&key, &params, &incoming_state, &related_contracts)
                     .map_err(|err| {
-                        let _ = self.runtime.contract_store.remove_contract(&key);
+                        if remove_if_fail {
+                            let _ = self.runtime.contract_store.remove_contract(&key);
+                        }
                         ExecutorError::other(err)
                     })?;
                 match result {
@@ -91,13 +99,6 @@ impl ContractExecutor for Executor<Runtime> {
                     }
                 }
 
-                let request = PutContract {
-                    contract,
-                    state: incoming_state.clone(),
-                    related_contracts: related_contracts.clone(),
-                };
-                let _op: operations::put::PutResult = self.op_request(request).await?;
-
                 vec![UpdateData::State(incoming_state.clone().into())]
             }
             Either::Right(delta) => {
@@ -105,7 +106,9 @@ impl ContractExecutor for Executor<Runtime> {
                     .runtime
                     .validate_delta(&key, &params, &delta)
                     .map_err(|err| {
-                        let _ = self.runtime.contract_store.remove_contract(&key);
+                        if remove_if_fail {
+                            let _ = self.runtime.contract_store.remove_contract(&key);
+                        }
                         ExecutorError::other(err)
                     })?;
                 if !valid {
@@ -154,15 +157,6 @@ impl ContractExecutor for Executor<Runtime> {
             }
         };
         Ok(updated_state)
-    }
-
-    async fn subscribe_to_contract(
-        &mut self,
-        key: ContractKey,
-    ) -> Result<PeerKeyLocation, ExecutorError> {
-        let request = SubscribeContract { key };
-        let result: operations::subscribe::SubscribeResult = self.op_request(request).await?;
-        Ok(result.subscribed_to)
     }
 }
 
@@ -599,7 +593,9 @@ impl Executor<Runtime> {
                         {
                             let state = match self.local_state_or_from_network(&id).await? {
                                 Either::Left(state) => state,
-                                Either::Right(GetResult { state, contract }) => {
+                                Either::Right(GetResult {
+                                    state, contract, ..
+                                }) => {
                                     let Some(contract) = contract else {
                                         return Err(ExecutorError::request(
                                             RequestError::ContractError(StdContractError::Get {
@@ -666,7 +662,7 @@ impl Executor<Runtime> {
         Ok(new_state)
     }
 
-    async fn perform_contract_get(&mut self, contract: bool, key: ContractKey) -> Response {
+    async fn perform_contract_get(&mut self, fetch_contract: bool, key: ContractKey) -> Response {
         let mut got_contract = None;
 
         #[cfg(any(
@@ -674,23 +670,23 @@ impl Executor<Runtime> {
             all(feature = "local-mode", feature = "network-mode"),
         ))]
         {
-            if contract && self.mode == OperationMode::Local {
+            if fetch_contract && self.mode == OperationMode::Local {
                 let Some(contract) = self.get_contract_locally(&key).await? else {
                     return Err(ExecutorError::request(RequestError::from(
                         StdContractError::Get {
                             key: key.clone(),
-                            cause: "Missing contract or parameters".into(),
+                            cause: "Missing contract and/or parameters".into(),
                         },
                     )));
                 };
                 got_contract = Some(contract);
-            } else if contract {
+            } else if fetch_contract {
                 got_contract = self.get_contract_from_network(key.clone()).await?;
             }
         }
 
         #[cfg(all(feature = "local-mode", not(feature = "network-mode")))]
-        if contract {
+        if fetch_contract {
             let Some(contract) = self
                 .get_contract_locally(&key)
                 .await
@@ -703,13 +699,13 @@ impl Executor<Runtime> {
                     },
                 )));
             };
-            got_contract = Some(contract);
+            got_contract = Some(fetch_contract);
         }
 
         #[cfg(all(feature = "network-mode", not(feature = "local-mode")))]
-        if contract {
+        if fetch_contract {
             if let Ok(Some(contract)) = self.get_contract_locally(&key).await {
-                got_contract = Some(contract);
+                got_contract = Some(fetch_contract);
             } else {
                 got_contract = self.get_contract_from_network(key.clone()).await?;
             }
@@ -997,7 +993,9 @@ impl Executor<Runtime> {
                     .local_state_or_from_network(&key.clone().into())
                     .await?
                 {
-                    Either::Right(GetResult { state, contract }) => {
+                    Either::Right(GetResult {
+                        state, contract, ..
+                    }) => {
                         let Some(contract) = contract else {
                             return Err(ExecutorError::request(RequestError::ContractError(
                                 StdContractError::Get {
