@@ -30,13 +30,15 @@ impl SimPeer {
             {
                 use crate::tracing::{CombinedRegister, OTEventRegister};
                 CombinedRegister::new([
-                    Box::new(EventRegister::new()),
+                    Box::new(EventRegister::new(
+                        crate::config::Config::conf().event_log(),
+                    )),
                     Box::new(OTEventRegister::new()),
                 ])
             }
             #[cfg(not(feature = "trace-ot"))]
             {
-                EventRegister::new()
+                EventRegister::new(crate::config::Config::conf().event_log())
             }
         };
         self.run_node(event_generator, event_register).await

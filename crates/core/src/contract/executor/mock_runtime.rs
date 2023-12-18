@@ -9,7 +9,7 @@ impl Executor<MockRuntime> {
         identifier: &str,
         event_loop_channel: ExecutorToEventLoopChannel<ExecutorHalve>,
     ) -> Result<Self, DynError> {
-        let data_dir = std::env::temp_dir().join(format!("freenet-executor-{identifier}"));
+        let data_dir = Self::test_data_dir(identifier);
 
         let contracts_data_dir = data_dir.join("contracts");
         std::fs::create_dir_all(&contracts_data_dir).expect("directory created");
@@ -17,8 +17,6 @@ impl Executor<MockRuntime> {
 
         let db_path = data_dir.join("db");
         std::fs::create_dir_all(&db_path).expect("directory created");
-        let log_file = data_dir.join("_EVENT_LOG_LOCAL");
-        crate::config::Config::set_event_log(log_file);
         let state_store =
             StateStore::new(Storage::new(Some(&db_path)).await?, u16::MAX as u32).unwrap();
 

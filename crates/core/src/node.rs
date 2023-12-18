@@ -193,13 +193,15 @@ impl NodeConfig {
             {
                 use super::tracing::{CombinedRegister, OTEventRegister};
                 CombinedRegister::new([
-                    Box::new(EventRegister::new()),
+                    Box::new(EventRegister::new(
+                        crate::config::Config::conf().event_log(),
+                    )),
                     Box::new(OTEventRegister::new()),
                 ])
             }
             #[cfg(not(feature = "trace-ot"))]
             {
-                EventRegister::new()
+                EventRegister::new(crate::config::Config::conf().event_log())
             }
         };
         let node = NodeP2P::build::<NetworkContractHandler, CLIENTS, _>(

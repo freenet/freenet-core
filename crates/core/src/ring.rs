@@ -32,7 +32,7 @@ use tracing::Instrument;
 
 use crate::message::TransactionType;
 use crate::topology::{AcquisitionStrategy, TopologyManager};
-use crate::tracing::{EventRegister, NetEventLog, NetEventRegister};
+use crate::tracing::{NetEventLog, NetEventRegister};
 use crate::util::Contains;
 use crate::{
     config::GlobalExecutor,
@@ -217,7 +217,7 @@ impl Ring {
     /// Max hops to be performed for certain operations (e.g. propagating connection of a peer in the network).
     const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
 
-    pub fn new<ER: NetEventRegister>(
+    pub fn new<ER: NetEventRegister + Clone>(
         config: &NodeConfig,
         event_loop_notifier: EventLoopNotificationsSender,
         event_register: ER,
@@ -255,7 +255,7 @@ impl Ring {
         };
 
         let router = Arc::new(RwLock::new(Router::new(&[])));
-        GlobalExecutor::spawn(Self::refresh_router::<ER>(router.clone()));
+        GlobalExecutor::spawn(Self::refresh_router(router.clone(), event_register.clone()));
 
         // Just initialize with a fake location, this will be later updated when the peer has an actual location assigned.
         let topology_manager = RwLock::new(TopologyManager::new(Location::new(0.0)));
@@ -307,32 +307,23 @@ impl Ring {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    async fn refresh_router<ER: NetEventRegister>(router: Arc<RwLock<Router>>) {
+    async fn refresh_router<ER: NetEventRegister>(router: Arc<RwLock<Router>>, register: ER) {
         let mut interval = tokio::time::interval(Duration::from_secs(60 * 5));
         interval.tick().await;
         loop {
             interval.tick().await;
-            #[cfg(feature = "trace-ot")]
-            let should_route = std::any::type_name::<ER>()
-                == std::any::type_name::<EventRegister>()
-                || std::any::type_name::<ER>()
-                    == std::any::type_name::<crate::tracing::CombinedRegister<2>>();
-            #[cfg(not(feature = "trace-ot"))]
-            let should_route =
-                std::any::type_name::<ER>() == std::any::type_name::<EventRegister>();
-            let history = if should_route {
-                EventRegister::get_router_events(10_000)
-                    .await
-                    .map_err(|error| {
-                        tracing::error!("shutting down refresh router task");
-                        error
-                    })
-                    .expect("todo: propagate this to main thread")
-            } else {
-                vec![]
-            };
-            let router_ref = &mut *router.write();
-            *router_ref = Router::new(&history);
+            let history = register
+                .get_router_events(10_000)
+                .await
+                .map_err(|error| {
+                    tracing::error!("shutting down refresh router task");
+                    error
+                })
+                .expect("todo: propagate this to main thread");
+            if !history.is_empty() {
+                let router_ref = &mut *router.write();
+                *router_ref = Router::new(&history);
+            }
         }
     }
 

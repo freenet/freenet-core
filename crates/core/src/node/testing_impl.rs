@@ -816,7 +816,7 @@ impl SimNetwork {
     /// meaning that:
     ///
     /// - at least 50% of the peers have more than the minimum connections
-    /// -
+    /// - the average number of connections per peer is above the mean between max and min connections
     pub fn network_connectivity_quality(&self) -> Result<(), anyhow::Error> {
         const HIGHER_THAN_MIN_THRESHOLD: f64 = 0.5;
         let num_nodes = self.number_of_nodes;
