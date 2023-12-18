@@ -35,20 +35,21 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::Instrument;
 use unsigned_varint::codec::UviBytes;
 
-use super::{ConnectionError, EventLoopNotifications, NetworkBridge};
+use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::{
     client_events::ClientId,
     config::{self, GlobalExecutor},
-    contract::{ClientResponsesSender, ExecutorToEventLoopChannel, NetworkEventListenerHalve},
-    message::{NetMessage, NodeEvent, Transaction, TransactionType},
-    node::{
-        handle_cancelled_op, join_ring_request, process_message, InitPeerNode, NetEventRegister,
-        NodeConfig, OpManager, PeerId as FreenetPeerId,
+    contract::{
+        ClientResponsesSender, ContractHandlerChannel, ExecutorToEventLoopChannel,
+        NetworkEventListenerHalve, WaitingResolution,
     },
-    operations::OpError,
+    message::{NetMessage, NodeEvent, Transaction},
+    node::{
+        handle_aborted_op, process_message, InitPeerNode, NetEventRegister, NodeConfig, OpManager,
+        PeerId as FreenetPeerId,
+    },
     ring::PeerKeyLocation,
     tracing::NetEventLog,
-    util::IterExt,
 };
 
 /// The default maximum size for a varint length-delimited packet.
@@ -270,13 +271,15 @@ impl P2pConnManager {
     pub async fn run_event_listener(
         mut self,
         op_manager: Arc<OpManager>,
-        mut notification_channel: EventLoopNotifications,
-        mut executor_channel: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
+        mut client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
+        mut notification_channel: EventLoopNotificationsReceiver,
+        mut executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         cli_response_sender: ClientResponsesSender,
         mut node_controller: Receiver<NodeEvent>,
     ) -> Result<(), anyhow::Error> {
         use ConnMngrActions::*;
 
+        // FIXME: this two containers need to be clean up on transaction time-out
         let mut pending_from_executor = HashSet::new();
         let mut tx_to_client: HashMap<Transaction, ClientId> = HashMap::new();
 
@@ -291,7 +294,7 @@ impl P2pConnManager {
             let network_msg = self.swarm.select_next_some().map(|event| match event {
                 SwarmEvent::Behaviour(NetEvent::Freenet(msg)) => {
                     tracing::debug!("Message inbound: {:?}", msg);
-                    Ok(Left((*msg, None)))
+                    Ok(Left(*msg))
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
                     Ok(Right(ConnMngrActions::ConnectionClosed {
@@ -362,7 +365,7 @@ impl P2pConnManager {
 
             let notification_msg = notification_channel.0.recv().map(|m| match m {
                 None => Ok(Right(ClosedChannel)),
-                Some(Left((msg, cli_id))) => Ok(Left((msg, cli_id))),
+                Some(Left(msg)) => Ok(Left(msg)),
                 Some(Right(action)) => Ok(Right(NodeAction(action))),
             });
 
@@ -386,59 +389,39 @@ impl P2pConnManager {
                         Ok(Right(ClosedChannel))
                     }
                 }
-                event_id = op_manager.recv_from_handler() => {
-                    if let Some((client_id, transaction)) = event_id.client_id().zip(event_id.transaction()) {
-                        tx_to_client.insert(transaction, client_id);
-                    }
+                event_id = client_wait_for_transaction.relay_transaction_result_to_client() => {
+                    let (client_id, transaction) = event_id.map_err(|err| anyhow::anyhow!(err))?;
+                    tx_to_client.insert(transaction, client_id);
                     continue;
                 }
-                id = executor_channel.transaction_from_executor() => {
+                id = executor_listener.transaction_from_executor() => {
+                    let id = id.map_err(|err| anyhow::anyhow!(err))?;
                     pending_from_executor.insert(id);
                     continue;
                 }
             };
 
             match msg {
-                Ok(Left((msg, client_id))) => {
+                Ok(Left(msg)) => {
                     let cb = self.bridge.clone();
                     match msg {
                         NetMessage::Aborted(tx) => {
-                            let tx_type = tx.transaction_type();
-                            let res = handle_cancelled_op(
+                            handle_aborted_op(
                                 tx,
                                 op_manager.ring.peer_key,
                                 &op_manager,
                                 &mut self.bridge,
+                                &self.gateways,
                             )
-                            .await;
-                            match res {
-                                Err(OpError::MaxRetriesExceeded(_, _))
-                                    if tx_type == TransactionType::Connect
-                                        && self.public_addr.is_none() /* FIXME: this should be not a gateway instead */ =>
-                                {
-                                    tracing::warn!("Retrying joining the ring with an other peer");
-                                    let gateway = self.gateways.iter().shuffle().next().unwrap();
-                                    join_ring_request(
-                                        None,
-                                        op_manager.ring.peer_key,
-                                        gateway,
-                                        &op_manager,
-                                        &mut self.bridge,
-                                    )
-                                    .await?
-                                }
-                                Err(err) => return Err(anyhow::anyhow!(err)),
-                                Ok(_) => {}
-                            }
+                            .await?;
                             continue;
                         }
                         msg => {
                             let executor_callback = pending_from_executor
                                 .remove(msg.id())
-                                .then(|| executor_channel.clone());
+                                .then(|| executor_listener.callback());
                             let pending_client_req = tx_to_client.get(msg.id()).copied();
                             let client_req_handler_callback = if pending_client_req.is_some() {
-                                debug_assert!(client_id.is_none());
                                 Some(cli_response_sender.clone())
                             } else {
                                 None
@@ -458,7 +441,7 @@ impl P2pConnManager {
                                     self.event_listener.trait_clone(),
                                     executor_callback,
                                     client_req_handler_callback,
-                                    client_id,
+                                    pending_client_req,
                                 )
                                 .instrument(span),
                             );

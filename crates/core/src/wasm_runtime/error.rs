@@ -1,10 +1,10 @@
 use std::fmt::Display;
 
-use freenet_stdlib::prelude::{ContractKey, DelegateKey, SecretsId};
+use freenet_stdlib::prelude::{ContractKey, DelegateKey};
 
 use crate::DynError;
 
-use super::{delegate, secrets_store, wasm_runtime, DelegateExecError};
+use super::{delegate, runtime, secrets_store};
 
 pub type RuntimeResult<T> = std::result::Result<T, ContractError>;
 
@@ -12,50 +12,8 @@ pub type RuntimeResult<T> = std::result::Result<T, ContractError>;
 pub struct ContractError(Box<RuntimeInnerError>);
 
 impl ContractError {
-    pub fn is_contract_exec_error(&self) -> bool {
-        matches!(&*self.0, RuntimeInnerError::ContractExecError(_))
-    }
-
-    pub fn is_delegate_exec_error(&self) -> bool {
-        matches!(&*self.0, RuntimeInnerError::DelegateExecError(_))
-    }
-
-    pub fn delegate_auth_access(&self) -> Option<&SecretsId> {
-        match &*self.0 {
-            RuntimeInnerError::DelegateExecError(DelegateExecError::UnauthorizedSecretAccess {
-                secret,
-                ..
-            }) => Some(secret),
-            _ => None,
-        }
-    }
-
-    pub fn is_execution_error(&self) -> bool {
-        use RuntimeInnerError::*;
-        matches!(
-            &*self.0,
-            WasmInstantiationError(_) | WasmExportError(_) | WasmCompileError(_)
-        )
-    }
-
-    pub fn delegate_is_missing(&self) -> bool {
-        matches!(&*self.0, RuntimeInnerError::DelegateNotFound(_))
-    }
-
-    pub fn secret_is_missing(&self) -> bool {
-        matches!(
-            &*self.0,
-            RuntimeInnerError::SecretStoreError(secrets_store::SecretStoreError::MissingSecret(_))
-        )
-    }
-
-    pub fn get_secret_id(&self) -> SecretsId {
-        match &*self.0 {
-            RuntimeInnerError::SecretStoreError(
-                secrets_store::SecretStoreError::MissingSecret(id),
-            ) => id.clone(),
-            _ => panic!(),
-        }
+    pub(crate) fn deref(&self) -> &RuntimeInnerError {
+        &self.0
     }
 }
 
@@ -87,7 +45,7 @@ impl_err!(std::io::Error);
 impl_err!(secrets_store::SecretStoreError);
 impl_err!(bincode::Error);
 impl_err!(delegate::DelegateExecError);
-impl_err!(wasm_runtime::ContractExecError);
+impl_err!(runtime::ContractExecError);
 impl_err!(wasmer::CompileError);
 impl_err!(wasmer::ExportError);
 impl_err!(wasmer::InstantiationError);
@@ -123,7 +81,7 @@ pub(crate) enum RuntimeInnerError {
     ContractNotFound(ContractKey),
 
     #[error(transparent)]
-    ContractExecError(#[from] wasm_runtime::ContractExecError),
+    ContractExecError(#[from] runtime::ContractExecError),
 
     #[error("failed while unwrapping contract to raw bytes")]
     UnwrapContract,

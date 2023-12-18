@@ -2,11 +2,14 @@ import * as flatbuffers from "flatbuffers";
 import * as fbTopology from "./generated/topology";
 import { handleChange } from "./topology";
 
-const socket = new WebSocket("ws://127.0.0.1:55010/pull-stats/");
+const PEER_CHANGES = new WebSocket(
+  "ws://127.0.0.1:55010/pull-stats/peer-changes/"
+);
+PEER_CHANGES.onmessage = handlePeerChanges;
 
-socket.onmessage = handleMessage;
+// const DELIVER_MESSAGE = new WebSocket("ws://127.0.0.1:55010/pull-stats/network-events/");
 
-function handleMessage(event: MessageEvent) {
+function handlePeerChanges(event: MessageEvent) {
   const data = event.data as Blob;
   convertBlobToUint8Array(data)
     .then((uint8Array) => {

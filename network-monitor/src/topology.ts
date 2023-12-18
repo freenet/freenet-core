@@ -51,6 +51,7 @@ export class PeerId {
 }
 
 export function handleChange(peerChange: fbTopology.PeerChange) {
+  const previousPeers = Object.keys(peers).length;
   try {
     const unpacked = peerChange.unpack();
     switch (unpacked.changeType) {
@@ -74,11 +75,13 @@ export function handleChange(peerChange: fbTopology.PeerChange) {
     unpacked.currentState.forEach((connection) => {
       handleAddedConnection(connection, false);
     });
-    ringHistogram(Object.values(peers));
   } catch (e) {
     console.error(e);
   } finally {
-    updateTable();
+    if (previousPeers !== Object.keys(peers).length) {
+      ringHistogram(Object.values(peers));
+      updateTable();
+    }
   }
 }
 
@@ -382,8 +385,8 @@ function updateTable() {
 
   const rows = Array.from(tbody.querySelectorAll("tr"));
   const sortedRows = rows.sort((a, b) => {
-    const cellA = a.cells[1].textContent!;
-    const cellB = b.cells[1].textContent!;
+    const cellA = a.cells[2].textContent!;
+    const cellB = b.cells[2].textContent!;
     return cellA.localeCompare(cellB);
   });
 
@@ -395,6 +398,7 @@ const sortDirections: number[] = [];
 
 document.addEventListener("DOMContentLoaded", () => {
   ringHistogram(Object.values(peers));
+
   document
     .querySelector("#peers-table-h")!
     .querySelectorAll("th")!
@@ -402,6 +406,12 @@ document.addEventListener("DOMContentLoaded", () => {
       sortDirections.push(1);
       tableSorting(header, index);
     });
+
+  (window as any).resetPeersTable = function () {
+    peers = {};
+    updateTable();
+    ringHistogram(Object.values(peers));
+  };
 });
 
 function tableSorting(header: HTMLTableCellElement, index: number) {

@@ -1,14 +1,7 @@
 //! Ring protocol logic and supporting types.
 //!
-//! # Routing
-//! The routing mechanism consist in a greedy routing algorithm which just targets
-//! the closest location to the target destination iteratively in each hop, until it reaches
-//! the destination.
-//!
-//! Path is limited to local knowledge, at any given point only 3 data points are known:
-//! - previous node
-//! - next node
-//! - final location
+//! Mainly maintains a healthy and optimal pool of connections to other peers in the network
+//! and routes requests to the optimal peers.
 
 use std::hash::Hash;
 use std::sync::atomic::AtomicBool;
@@ -27,7 +20,7 @@ use std::{
 };
 
 use anyhow::bail;
-use dashmap::{mapref::one::Ref as DmRef, DashMap, DashSet};
+use dashmap::{mapref::one::Ref as DmRef, DashMap};
 use either::Either;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
@@ -137,10 +130,6 @@ impl LiveTransactionTracker {
         }
     }
 
-    fn prune_transactions_from_peer(&self, peer: &PeerId) {
-        self.tx_per_peer.remove(peer);
-    }
-
     fn new() -> (Self, sync::mpsc::Receiver<PeerId>) {
         let (missing_peer, rx) = sync::mpsc::channel(10);
         (
@@ -150,6 +139,10 @@ impl LiveTransactionTracker {
             },
             rx,
         )
+    }
+
+    fn prune_transactions_from_peer(&self, peer: &PeerId) {
+        self.tx_per_peer.remove(peer);
     }
 
     fn has_live_connection(&self, peer: &PeerId) -> bool {
@@ -164,15 +157,15 @@ impl LiveTransactionTracker {
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
 ///
-/// Note: For now internally we wrap some of the types internally with locks and/or use
-/// multithreaded maps. In the future if performance requires it some of this can be moved
-/// towards a more lock-free multithreading model if necessary.
+// Note: For now internally we wrap some of the types internally with locks and/or use
+// multithreaded maps. In the future if performance requires it some of this can be moved
+// towards a more lock-free multithreading model if necessary.
 pub(crate) struct Ring {
     pub rnd_if_htl_above: usize,
     pub max_hops_to_live: usize,
     pub peer_key: PeerId,
-    max_connections: usize,
-    min_connections: usize,
+    pub max_connections: usize,
+    pub min_connections: usize,
     router: Arc<RwLock<Router>>,
     topology_manager: RwLock<TopologyManager>,
     /// Fast is for when there are less than our target number of connections so we want to acquire new connections quickly.
@@ -180,8 +173,6 @@ pub(crate) struct Ring {
     fast_acquisition: AtomicBool,
     connections_by_location: RwLock<BTreeMap<Location, Vec<Connection>>>,
     location_for_peer: RwLock<BTreeMap<PeerId, Location>>,
-    /// contracts in the ring cached by this node
-    cached_contracts: DashSet<ContractKey>,
     own_location: AtomicU64,
     /// The container for subscriber is a vec instead of something like a hashset
     /// that would allow for blind inserts of duplicate peers subscribing because
@@ -189,7 +180,8 @@ pub(crate) struct Ring {
     /// of subscribers more often than inserting, and anyways is a relatively short sequence
     /// then is more optimal to just use a vector for it's compact memory layout.
     subscribers: DashMap<ContractKey, Vec<PeerKeyLocation>>,
-    subscriptions: RwLock<Vec<ContractKey>>,
+    /// Contracts this peer is subscribed to.
+    subscriptions: DashMap<ContractKey, PeerKeyLocation>,
     /// Interim connections ongoing handshake or successfully open connections
     /// Is important to keep track of this so no more connections are accepted prematurely.
     open_connections: AtomicUsize,
@@ -198,6 +190,9 @@ pub(crate) struct Ring {
     // todo: add blacklist
     // contract_blacklist: Arc<DashMap<ContractKey, Vec<Blacklisted>>>,
     event_register: Box<dyn NetEventRegister>,
+    /// Whether this peer is a gateway or not. This will affect behavior of the node when acquiring
+    /// and dropping connections.
+    is_gateway: bool,
 }
 
 // /// A data type that represents the fact that a peer has been blacklisted
@@ -209,26 +204,24 @@ pub(crate) struct Ring {
 // }
 
 impl Ring {
-    const MIN_CONNECTIONS: usize = 10;
+    const DEFAULT_MIN_CONNECTIONS: usize = 10;
 
-    const MAX_CONNECTIONS: usize = 20;
+    const DEFAULT_MAX_CONNECTIONS: usize = 20;
 
     /// Max number of subscribers for a contract.
     const MAX_SUBSCRIBERS: usize = 10;
 
-    /// Above this number of remaining hops,
-    /// randomize which of node a message which be forwarded to.
-    const RAND_WALK_ABOVE_HTL: usize = 7;
+    /// Above this number of remaining hops, randomize which node a message which be forwarded to.
+    const DEFAULT_RAND_WALK_ABOVE_HTL: usize = 7;
 
-    /// Max hops to be performed for certain operations (e.g. propagating
-    /// connection of a peer in the network).
-    const MAX_HOPS_TO_LIVE: usize = 10;
+    /// Max hops to be performed for certain operations (e.g. propagating connection of a peer in the network).
+    const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
 
     pub fn new<ER: NetEventRegister>(
         config: &NodeConfig,
-        gateways: &[PeerKeyLocation],
         event_loop_notifier: EventLoopNotificationsSender,
         event_register: ER,
+        is_gateway: bool,
     ) -> Result<Arc<Self>, anyhow::Error> {
         let (live_tx_tracker, missing_candidate_rx) = LiveTransactionTracker::new();
 
@@ -240,25 +233,25 @@ impl Ring {
         let max_hops_to_live = if let Some(v) = config.max_hops_to_live {
             v
         } else {
-            Self::MAX_HOPS_TO_LIVE
+            Self::DEFAULT_MAX_HOPS_TO_LIVE
         };
 
         let rnd_if_htl_above = if let Some(v) = config.rnd_if_htl_above {
             v
         } else {
-            Self::RAND_WALK_ABOVE_HTL
+            Self::DEFAULT_RAND_WALK_ABOVE_HTL
         };
 
         let min_connections = if let Some(v) = config.min_number_conn {
             v
         } else {
-            Self::MIN_CONNECTIONS
+            Self::DEFAULT_MIN_CONNECTIONS
         };
 
         let max_connections = if let Some(v) = config.max_number_conn {
             v
         } else {
-            Self::MAX_CONNECTIONS
+            Self::DEFAULT_MAX_CONNECTIONS
         };
 
         let router = Arc::new(RwLock::new(Router::new(&[])));
@@ -277,27 +270,21 @@ impl Ring {
             fast_acquisition: AtomicBool::new(true),
             connections_by_location: RwLock::new(BTreeMap::new()),
             location_for_peer: RwLock::new(BTreeMap::new()),
-            cached_contracts: DashSet::new(),
             own_location,
             peer_key,
             subscribers: DashMap::new(),
-            subscriptions: RwLock::new(Vec::new()),
+            subscriptions: DashMap::new(),
             open_connections: AtomicUsize::new(0),
             live_tx_tracker: live_tx_tracker.clone(),
             event_register: Box::new(event_register),
+            is_gateway,
         };
 
         if let Some(loc) = config.location {
             if config.local_ip.is_none() || config.local_port.is_none() {
                 return Err(anyhow::anyhow!("IP and port are required for gateways"));
             }
-
             ring.update_location(Some(loc));
-            for PeerKeyLocation { peer, location } in gateways {
-                // FIXME: this is problematic cause gateways will take all spots then!
-                // all gateways are aware of each other
-                ring.add_connection((*location).unwrap(), *peer);
-            }
         }
 
         let ring = Arc::new(ring);
@@ -315,6 +302,11 @@ impl Ring {
         );
 
         Ok(ring)
+    }
+
+    pub fn open_connections(&self) -> usize {
+        self.open_connections
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     async fn refresh_router<ER: NetEventRegister>(router: Arc<RwLock<Router>>) {
@@ -346,25 +338,32 @@ impl Ring {
         }
     }
 
-    #[inline(always)]
-    /// Return if a location is within appropiate caching distance.
-    pub fn within_caching_distance(&self, _loc: &Location) -> bool {
-        // This always returns true as of current version since LRU cache will make sure
-        // to remove contracts when capacity is fully utilized.
-        // So all nodes along the path will be caching all the contracts.
-        // This will be changed in the future as the caching logic gets more complicated.
-        true
+    /// Return if a location is within appropiate subscription distance.
+    pub fn within_subscribing_distance(&self, loc: &Location) -> bool {
+        const CACHING_DISTANCE: f64 = 0.05;
+        const MAX_CACHED: usize = 100;
+        const MIN_CACHED: usize = MAX_CACHED / 4;
+        let caching_distance = Distance::new(CACHING_DISTANCE);
+        if self.subscriptions.len() < MIN_CACHED {
+            return true;
+        }
+        self.subscriptions.len() < MAX_CACHED
+            && self
+                .own_location()
+                .location
+                .map(|own_loc| own_loc.distance(loc) <= caching_distance)
+                .unwrap_or(false)
     }
 
-    /// Whether this node already has this contract cached or not.
+    /// Whether this node already is subscribed to this contract or not.
     #[inline]
-    pub fn is_contract_cached(&self, key: &ContractKey) -> bool {
-        self.cached_contracts.contains(key)
+    pub fn is_subscribed_to_contract(&self, key: &ContractKey) -> bool {
+        self.subscriptions.contains_key(key)
     }
 
     #[inline]
-    pub fn contract_cached(&self, key: &ContractKey) {
-        self.cached_contracts.insert(key.clone());
+    pub fn subscribed_to_contract(&self, key: &ContractKey) -> Option<PeerKeyLocation> {
+        self.subscriptions.get(key).map(|v| *v.value())
     }
 
     /// Update this node location.
@@ -405,10 +404,16 @@ impl Ring {
     ///
     /// # Panic
     /// Will panic if the node checking for this condition has no location assigned.
-    pub fn should_accept(&self, location: Location) -> bool {
+    pub fn should_accept(&self, location: Location, peer: &PeerId) -> bool {
         let open_conn = self
             .open_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.location_for_peer.read().get(peer).is_some() {
+            // avoid connecting mroe than once to the same peer
+            self.open_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return false;
+        }
         let my_location = self
             .own_location()
             .location
@@ -560,8 +565,8 @@ impl Ring {
     }
 
     /// Add a new subscription for this peer.
-    pub fn add_subscription(&self, contract: ContractKey) {
-        self.subscriptions.write().push(contract);
+    pub fn add_subscription(&self, contract: ContractKey, peer: PeerKeyLocation) {
+        self.subscriptions.insert(contract, peer);
     }
 
     pub fn subscribers_of(
@@ -621,9 +626,14 @@ impl Ring {
         live_tx_tracker: LiveTransactionTracker,
         mut missing_candidates: sync::mpsc::Receiver<PeerId>,
     ) -> Result<(), DynError> {
-        /// Peers whose connection should be acquired.
-        fn should_swap<'a>(_connections: impl Iterator<Item = &'a PeerKeyLocation>) -> Vec<PeerId> {
+        /// Peers whose connection should be dropped.
+        fn should_swap<'a>(
+            _connections: impl Iterator<Item = &'a PeerKeyLocation>,
+            is_gateway: bool,
+        ) -> Vec<PeerId> {
             // todo: instead we should be using ConnectionEvaluator here
+            // todo: if the peer is a gateway behaviour on how quickly we drop connections may be different
+            let _ = is_gateway;
             vec![]
         }
 
@@ -742,6 +752,7 @@ impl Ring {
                                 && !live_tx_tracker.has_live_connection(&conn.location.peer)
                         })
                         .map(|conn| &conn.location),
+                    self.is_gateway,
                 )
             };
             if !should_swap.is_empty() {
@@ -830,7 +841,7 @@ impl Ring {
             },
         };
         let id = *msg.id();
-        notifier.send(Either::Left((msg.into(), None))).await?;
+        notifier.send(Either::Left(msg.into())).await?;
         Ok(Some(id))
     }
 }

@@ -8,7 +8,7 @@ use sqlx::{
 
 use crate::{
     contract::ContractKey,
-    runtime::{ContractError, StateStorage, StateStoreError},
+    wasm_runtime::{ContractError, StateStorage, StateStoreError},
 };
 
 async fn create_contracts_table(pool: &SqlitePool) -> Result<(), SqlDbError> {

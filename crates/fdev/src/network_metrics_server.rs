@@ -72,7 +72,7 @@ async fn run_server(
     let router = Router::new()
         .route("/", get(home))
         .route("/push-stats/", get(push_stats))
-        .route("/pull-stats/", get(pull_stats))
+        .route("/pull-stats/peer-changes/", get(pull_peer_changes))
         .with_state(Arc::new(ServerState {
             changes,
             peer_data: DashMap::new(),
@@ -153,7 +153,7 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
     Ok(())
 }
 
-async fn pull_stats(
+async fn pull_peer_changes(
     ws: WebSocketUpgrade,
     State(state): State<Arc<ServerState>>,
 ) -> axum::response::Response {
@@ -346,7 +346,8 @@ async fn record_saver(
         change: Change,
     }
 
-    // FIXME: this ain't flushing correctly after test ends
+    // FIXME: this ain't flushing correctly after test ends,
+    // for now flushing each single time we get a new record
     // let mut batch = Vec::with_capacity(1024);
     while let Ok(change) = incoming_rec.recv().await {
         let change = WithTimestamp {

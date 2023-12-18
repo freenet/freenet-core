@@ -8,7 +8,7 @@ use crate::{
     config::GlobalExecutor,
     contract::{self, executor_channel, ContractHandler, MemoryContractHandler},
     node::{
-        network_bridge::{in_memory::MemoryConnManager, EventLoopNotifications},
+        network_bridge::{event_loop_notification_channel, in_memory::MemoryConnManager},
         op_state_manager::OpManager,
         NetEventRegister, NetworkBridge,
     },
@@ -28,21 +28,19 @@ impl<ER> Builder<ER> {
         ER: NetEventRegister + Clone,
     {
         let gateways = self.config.get_gateways()?;
-        let is_gateway = self.config.local_ip.zip(self.config.local_port).is_some();
 
-        let (notification_channel, notification_tx) = EventLoopNotifications::channel();
-        let (ops_ch_channel, ch_channel) = contract::contract_handler_channel();
+        let (notification_channel, notification_tx) = event_loop_notification_channel();
+        let (ops_ch_channel, ch_channel, wait_for_event) = contract::contract_handler_channel();
 
         let _guard = parent_span.enter();
         let op_manager = Arc::new(OpManager::new(
             notification_tx,
             ops_ch_channel,
             &self.config,
-            &gateways,
             self.event_register.clone(),
         )?);
         std::mem::drop(_guard);
-        let (_executor_listener, executor_sender) = executor_channel(op_manager.clone());
+        let (executor_listener, executor_sender) = executor_channel(op_manager.clone());
         let contract_handler =
             MemoryContractHandler::build(ch_channel, executor_sender, self.contract_handler_name)
                 .await
@@ -61,7 +59,6 @@ impl<ER> Builder<ER> {
         );
         let mut config = super::RunnerConfig {
             peer_key: self.peer_key,
-            is_gateway,
             gateways,
             parent_span: Some(parent_span),
             op_manager,
@@ -69,6 +66,8 @@ impl<ER> Builder<ER> {
             user_events: Some(user_events),
             notification_channel,
             event_register: self.event_register.trait_clone(),
+            executor_listener,
+            client_wait_for_transaction: wait_for_event,
         };
         config
             .append_contracts(self.contracts, self.contract_subscribers)
@@ -79,7 +78,7 @@ impl<ER> Builder<ER> {
     #[cfg(test)]
     pub fn append_contracts(
         &mut self,
-        contracts: Vec<(ContractContainer, WrappedState)>,
+        contracts: Vec<(ContractContainer, WrappedState, Option<PeerKeyLocation>)>,
         contract_subscribers: std::collections::HashMap<ContractKey, Vec<PeerKeyLocation>>,
     ) {
         self.contracts.extend(contracts);
@@ -94,33 +93,30 @@ where
 {
     async fn append_contracts(
         &mut self,
-        contracts: Vec<(ContractContainer, WrappedState)>,
+        contracts: Vec<(ContractContainer, WrappedState, Option<PeerKeyLocation>)>,
         contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
     ) -> Result<(), anyhow::Error> {
         use crate::contract::ContractHandlerEvent;
-        for (contract, state) in contracts {
+        for (contract, state, subscription) in contracts {
             let key: ContractKey = contract.key();
-            let parameters = contract.params();
             self.op_manager
-                .notify_contract_handler(ContractHandlerEvent::Cache(contract.clone()), None)
-                .await?;
-            self.op_manager
-                .notify_contract_handler(
-                    ContractHandlerEvent::PutQuery {
-                        key: key.clone(),
-                        state,
-                        related_contracts: RelatedContracts::default(),
-                        parameters: Some(parameters),
-                    },
-                    None,
-                )
+                .notify_contract_handler(ContractHandlerEvent::PutQuery {
+                    key: key.clone(),
+                    state,
+                    related_contracts: RelatedContracts::default(),
+                    contract: Some(contract),
+                })
                 .await?;
             tracing::debug!(
                 "Appended contract {} to peer {}",
                 key,
                 self.op_manager.ring.peer_key
             );
-            self.op_manager.ring.contract_cached(&key);
+            if let Some(subscription) = subscription {
+                self.op_manager
+                    .ring
+                    .add_subscription(key.clone(), subscription);
+            }
             if let Some(subscribers) = contract_subscribers.get(&key) {
                 // add contract subscribers
                 for subscriber in subscribers {

@@ -1,9 +1,7 @@
-#![allow(unused)] // FIXME: remove this
 use std::collections::BTreeMap;
 use std::hash::Hash;
-use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use freenet_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use freenet_stdlib::prelude::*;
@@ -12,24 +10,23 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use super::executor::{ExecutorHalve, ExecutorToEventLoopChannel};
+use super::ExecutorError;
 use super::{
     executor::{ContractExecutor, Executor},
     ContractError,
 };
 use crate::client_events::HostResult;
 use crate::message::Transaction;
-use crate::{client_events::ClientId, node::PeerCliConfig, runtime::Runtime, DynError};
+use crate::{client_events::ClientId, node::PeerCliConfig, wasm_runtime::Runtime, DynError};
 
-pub(crate) struct ClientResponses(UnboundedReceiver<(ClientId, HostResult)>);
+pub(crate) struct ClientResponsesReceiver(UnboundedReceiver<(ClientId, HostResult)>);
 
-impl ClientResponses {
-    pub fn channel() -> (Self, ClientResponsesSender) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (Self(rx), ClientResponsesSender(tx))
-    }
+pub fn client_responses_channel() -> (ClientResponsesReceiver, ClientResponsesSender) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (ClientResponsesReceiver(rx), ClientResponsesSender(tx))
 }
 
-impl std::ops::Deref for ClientResponses {
+impl std::ops::Deref for ClientResponsesReceiver {
     type Target = UnboundedReceiver<(ClientId, HostResult)>;
 
     fn deref(&self) -> &Self::Target {
@@ -37,7 +34,7 @@ impl std::ops::Deref for ClientResponses {
     }
 }
 
-impl std::ops::DerefMut for ClientResponses {
+impl std::ops::DerefMut for ClientResponsesReceiver {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
@@ -98,8 +95,7 @@ impl ContractHandler for NetworkContractHandler<Runtime> {
         Self: Sized + 'static,
     {
         async {
-            let mut executor = Executor::from_config(config).await?;
-            executor.event_loop_channel(executor_request_sender);
+            let executor = Executor::from_config(config, Some(executor_request_sender)).await?;
             Ok(Self { executor, channel })
         }
         .boxed()
@@ -137,14 +133,14 @@ impl ContractHandler for NetworkContractHandler<super::MockRuntime> {
 
     fn build(
         channel: ContractHandlerChannel<ContractHandlerHalve>,
-        _executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
+        executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
         identifier: Self::Builder,
     ) -> BoxFuture<'static, Result<Self, DynError>>
     where
         Self: Sized + 'static,
     {
         async move {
-            let executor = Executor::new_mock(&identifier).await?;
+            let executor = Executor::new_mock(&identifier, executor_request_sender).await?;
             Ok(Self { executor, channel })
         }
         .boxed()
@@ -178,24 +174,6 @@ impl ContractHandler for NetworkContractHandler<super::MockRuntime> {
 #[derive(Eq)]
 pub(crate) struct EventId {
     id: u64,
-    client_id: Option<ClientId>,
-    transaction: Option<Transaction>,
-}
-
-impl EventId {
-    pub fn client_id(&self) -> Option<ClientId> {
-        self.client_id
-    }
-
-    pub fn transaction(&self) -> Option<Transaction> {
-        self.transaction
-    }
-
-    // FIXME: this should be used somewhere to inform than an event is pending
-    // a transaction resolution
-    pub fn with_transaction(&mut self, transaction: Transaction) {
-        self.transaction = Some(transaction);
-    }
 }
 
 impl PartialEq for EventId {
@@ -213,45 +191,72 @@ impl Hash for EventId {
 /// A bidirectional channel which keeps track of the initiator half
 /// and sends the corresponding response to the listener of the operation.
 pub(crate) struct ContractHandlerChannel<End: sealed::ChannelHalve> {
-    rx: mpsc::UnboundedReceiver<InternalCHEvent>,
-    tx: mpsc::UnboundedSender<InternalCHEvent>,
-    queue: BTreeMap<u64, ContractHandlerEvent>,
-    _halve: PhantomData<End>,
+    end: End,
 }
 
-pub(crate) struct ContractHandlerHalve;
-pub(crate) struct SenderHalve;
+pub(crate) struct ContractHandlerHalve {
+    event_receiver: mpsc::UnboundedReceiver<InternalCHEvent>,
+    waiting_response: BTreeMap<u64, tokio::sync::oneshot::Sender<(EventId, ContractHandlerEvent)>>,
+}
+
+pub(crate) struct SenderHalve {
+    event_sender: mpsc::UnboundedSender<InternalCHEvent>,
+    wait_for_res_tx: mpsc::Sender<(ClientId, Transaction)>,
+}
+
+/// Communicates that a client is waiting for a transaction resolution
+/// to continue processing this event.
+pub(crate) struct WaitingResolution {
+    wait_for_res_rx: mpsc::Receiver<(ClientId, Transaction)>,
+}
 
 mod sealed {
-    use super::{ContractHandlerHalve, SenderHalve};
+    use super::{ContractHandlerHalve, SenderHalve, WaitingResolution};
     pub(crate) trait ChannelHalve {}
     impl ChannelHalve for ContractHandlerHalve {}
     impl ChannelHalve for SenderHalve {}
+    impl ChannelHalve for WaitingResolution {}
 }
 
 pub(crate) fn contract_handler_channel() -> (
     ContractHandlerChannel<SenderHalve>,
     ContractHandlerChannel<ContractHandlerHalve>,
+    ContractHandlerChannel<WaitingResolution>,
 ) {
-    let (notification_tx, notification_channel) = mpsc::unbounded_channel();
-    let (ch_tx, ch_listener) = mpsc::unbounded_channel();
+    let (event_sender, event_receiver) = mpsc::unbounded_channel();
+    let (wait_for_res_tx, wait_for_res_rx) = mpsc::channel(10);
     (
         ContractHandlerChannel {
-            rx: notification_channel,
-            tx: ch_tx,
-            queue: BTreeMap::new(),
-            _halve: PhantomData,
+            end: SenderHalve {
+                event_sender,
+                wait_for_res_tx,
+            },
         },
         ContractHandlerChannel {
-            rx: ch_listener,
-            tx: notification_tx,
-            queue: BTreeMap::new(),
-            _halve: PhantomData,
+            end: ContractHandlerHalve {
+                event_receiver,
+                waiting_response: BTreeMap::new(),
+            },
+        },
+        ContractHandlerChannel {
+            end: WaitingResolution { wait_for_res_rx },
         },
     )
 }
 
 static EV_ID: AtomicU64 = AtomicU64::new(0);
+
+impl ContractHandlerChannel<WaitingResolution> {
+    pub async fn relay_transaction_result_to_client(
+        &mut self,
+    ) -> Result<(ClientId, Transaction), DynError> {
+        self.end
+            .wait_for_res_rx
+            .recv()
+            .await
+            .ok_or_else(|| "channel dropped".into())
+    }
+}
 
 impl ContractHandlerChannel<SenderHalve> {
     // TODO: the timeout should be derived from whatever is the worst
@@ -263,66 +268,55 @@ impl ContractHandlerChannel<SenderHalve> {
 
     /// Send an event to the contract handler and receive a response event if successful.
     pub async fn send_to_handler(
-        &mut self,
+        &self,
         ev: ContractHandlerEvent,
-        client_id: Option<ClientId>,
     ) -> Result<ContractHandlerEvent, ContractError> {
         let id = EV_ID.fetch_add(1, SeqCst);
-        self.tx
-            .send(InternalCHEvent { ev, id, client_id })
+        let (result, result_receiver) = tokio::sync::oneshot::channel();
+        self.end
+            .event_sender
+            .send(InternalCHEvent { ev, id, result })
             .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))?;
-        if let Some(handler) = self.queue.remove(&id) {
-            Ok(handler)
-        } else {
-            let started_op = Instant::now();
-            loop {
-                if started_op.elapsed() > Self::CH_EV_RESPONSE_TIME_OUT {
-                    break Err(ContractError::NoEvHandlerResponse);
-                }
-                while let Some(msg) = self.rx.recv().await {
-                    if msg.id == id {
-                        return Ok(msg.ev);
-                    } else {
-                        self.queue.insert(id, msg.ev); // should never be duplicates
-                    }
-                }
-                tokio::time::sleep(Duration::from_nanos(100)).await;
-            }
+        match tokio::time::timeout(Self::CH_EV_RESPONSE_TIME_OUT, result_receiver).await {
+            Ok(Ok((_, res))) => Ok(res),
+            Ok(Err(_)) | Err(_) => Err(ContractError::NoEvHandlerResponse),
         }
     }
 
-    pub async fn recv_from_handler(&mut self) -> EventId {
-        todo!()
+    pub async fn waiting_for_transaction_result(
+        &self,
+        transaction: Transaction,
+        client_id: ClientId,
+    ) -> Result<(), ContractError> {
+        self.end
+            .wait_for_res_tx
+            .send((client_id, transaction))
+            .await
+            .map_err(|_| ContractError::NoEvHandlerResponse)
     }
 }
 
 impl ContractHandlerChannel<ContractHandlerHalve> {
     pub async fn send_to_sender(
-        &self,
+        &mut self,
         id: EventId,
         ev: ContractHandlerEvent,
     ) -> Result<(), ContractError> {
-        self.tx
-            .send(InternalCHEvent {
-                ev,
-                id: id.id,
-                client_id: id.client_id,
-            })
-            .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))
+        if let Some(response) = self.end.waiting_response.remove(&id.id) {
+            response
+                .send((id, ev))
+                .map_err(|_| ContractError::NoEvHandlerResponse)
+        } else {
+            Err(ContractError::NoEvHandlerResponse)
+        }
     }
 
     pub async fn recv_from_sender(
         &mut self,
     ) -> Result<(EventId, ContractHandlerEvent), ContractError> {
-        if let Some(msg) = self.rx.recv().await {
-            return Ok((
-                EventId {
-                    id: msg.id,
-                    client_id: msg.client_id,
-                    transaction: None,
-                },
-                msg.ev,
-            ));
+        if let Some(InternalCHEvent { ev, id, result }) = self.end.event_receiver.recv().await {
+            self.end.waiting_response.insert(id, result);
+            return Ok((EventId { id }, ev));
         }
         Err(ContractError::NoEvHandlerResponse)
     }
@@ -337,46 +331,48 @@ pub(crate) struct StoreResponse {
 struct InternalCHEvent {
     ev: ContractHandlerEvent,
     id: u64,
-    client_id: Option<ClientId>,
+    // client_id: Option<ClientId>,
+    result: tokio::sync::oneshot::Sender<(EventId, ContractHandlerEvent)>,
 }
 
 #[derive(Debug)]
 pub(crate) enum ContractHandlerEvent {
-    /// Try to push/put a new value into the contract.
+    /// Try to push/put a new value into the contract
     PutQuery {
         key: ContractKey,
         state: WrappedState,
         related_contracts: RelatedContracts<'static>,
-        parameters: Option<Parameters<'static>>,
+        contract: Option<ContractContainer>,
     },
-    /// The response to a push query.
+    /// The response to a push query
     PutResponse {
-        new_value: Result<WrappedState, DynError>,
+        new_value: Result<WrappedState, ExecutorError>,
     },
-    /// Fetch a supposedly existing contract value in this node, and optionally the contract itself.  
+    /// Fetch a supposedly existing contract value in this node, and optionally the contract itself
     GetQuery {
         key: ContractKey,
         fetch_contract: bool,
     },
-    /// The response to a FetchQuery event
+    /// The response to a get query event
     GetResponse {
         key: ContractKey,
-        response: Result<StoreResponse, DynError>,
+        response: Result<StoreResponse, ExecutorError>,
     },
-    /// Store a contract in the local store.
-    Cache(ContractContainer),
-    /// Result of a caching operation.
-    CacheResult(Result<(), ContractError>),
 }
 
 impl std::fmt::Display for ContractHandlerEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ContractHandlerEvent::PutQuery {
-                key, parameters, ..
-            } => {
-                if let Some(params) = parameters {
-                    write!(f, "put query {{ {key}, params: {:?} }}", params.as_ref())
+            ContractHandlerEvent::PutQuery { key, contract, .. } => {
+                if let Some(contract) = contract {
+                    use std::fmt::Write;
+                    let mut params = String::new();
+                    params.push_str("0x");
+                    for b in contract.params().as_ref().iter().take(8) {
+                        write!(&mut params, "{:02x}", b)?;
+                    }
+                    params.push_str("...");
+                    write!(f, "put query {{ {key}, params: {params} }}",)
                 } else {
                     write!(f, "put query {{ {key} }}")
                 }
@@ -403,12 +399,6 @@ impl std::fmt::Display for ContractHandlerEvent {
                     write!(f, "get query failed {{ {key} }}",)
                 }
             },
-            ContractHandlerEvent::Cache(container) => {
-                write!(f, "caching {{ {} }}", container.key())
-            }
-            ContractHandlerEvent::CacheResult(r) => {
-                write!(f, "caching result {{ {} }}", r.is_ok())
-            }
         }
     }
 }
@@ -424,38 +414,134 @@ pub mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn channel_test() -> Result<(), anyhow::Error> {
-        let (mut send_halve, mut rcv_halve) = contract_handler_channel();
+        let (send_halve, mut rcv_halve, _) = contract_handler_channel();
 
         let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
             Arc::new(ContractCode::from(vec![0, 1, 2, 3])),
             Parameters::from(vec![4, 5]),
         )));
 
-        let contract_cp = contract.clone();
         let h = GlobalExecutor::spawn(async move {
             send_halve
-                .send_to_handler(ContractHandlerEvent::Cache(contract_cp), None)
+                .send_to_handler(ContractHandlerEvent::PutQuery {
+                    key: contract.key(),
+                    state: vec![6, 7, 8].into(),
+                    related_contracts: RelatedContracts::default(),
+                    contract: Some(contract),
+                })
                 .await
         });
         let (id, ev) =
             tokio::time::timeout(Duration::from_millis(100), rcv_halve.recv_from_sender())
                 .await??;
 
-        let ContractHandlerEvent::Cache(contract) = ev else {
+        let ContractHandlerEvent::PutQuery { state, .. } = ev else {
             anyhow::bail!("invalid event");
         };
-        assert_eq!(contract.data(), vec![0, 1, 2, 3]);
+        assert_eq!(state.as_ref(), &[6, 7, 8]);
 
         tokio::time::timeout(
             Duration::from_millis(100),
-            rcv_halve.send_to_sender(id, ContractHandlerEvent::Cache(contract)),
+            rcv_halve.send_to_sender(
+                id,
+                ContractHandlerEvent::PutResponse {
+                    new_value: Ok(vec![0, 7].into()),
+                },
+            ),
         )
         .await??;
-        let ContractHandlerEvent::Cache(contract) = h.await?? else {
+        let ContractHandlerEvent::PutResponse { new_value } = h.await?? else {
             anyhow::bail!("invalid event!");
         };
-        assert_eq!(contract.data(), vec![0, 1, 2, 3]);
+        let new_value = new_value.map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(new_value.as_ref(), &[0, 7]);
 
+        Ok(())
+    }
+}
+
+pub(super) mod in_memory {
+    use crate::client_events::ClientId;
+    use freenet_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
+    use futures::{future::BoxFuture, FutureExt};
+    use tokio::sync::mpsc::UnboundedSender;
+
+    use super::{
+        super::{
+            executor::{ExecutorHalve, ExecutorToEventLoopChannel},
+            Executor, MockRuntime,
+        },
+        ContractHandler, ContractHandlerChannel, ContractHandlerHalve,
+    };
+    use crate::DynError;
+
+    pub(crate) struct MemoryContractHandler {
+        channel: ContractHandlerChannel<ContractHandlerHalve>,
+        runtime: Executor<MockRuntime>,
+    }
+
+    impl MemoryContractHandler {
+        pub async fn new(
+            channel: ContractHandlerChannel<ContractHandlerHalve>,
+            executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
+            identifier: &str,
+        ) -> Self {
+            MemoryContractHandler {
+                channel,
+                runtime: Executor::new_mock(identifier, executor_request_sender)
+                    .await
+                    .unwrap(),
+            }
+        }
+    }
+
+    impl ContractHandler for MemoryContractHandler {
+        type Builder = String;
+        type ContractExecutor = Executor<MockRuntime>;
+
+        fn build(
+            channel: ContractHandlerChannel<ContractHandlerHalve>,
+            executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
+            identifier: Self::Builder,
+        ) -> BoxFuture<'static, Result<Self, DynError>>
+        where
+            Self: Sized + 'static,
+        {
+            async move {
+                Ok(MemoryContractHandler::new(channel, executor_request_sender, &identifier).await)
+            }
+            .boxed()
+        }
+
+        fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve> {
+            &mut self.channel
+        }
+
+        fn handle_request<'a, 's: 'a>(
+            &'s mut self,
+            _req: ClientRequest<'a>,
+            _client_id: ClientId,
+            _updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
+        ) -> BoxFuture<'static, Result<HostResponse, DynError>> {
+            unreachable!()
+        }
+
+        fn executor(&mut self) -> &mut Self::ContractExecutor {
+            &mut self.runtime
+        }
+    }
+
+    #[test]
+    fn serialization() -> Result<(), anyhow::Error> {
+        use freenet_stdlib::prelude::WrappedContract;
+        let bytes = crate::util::test::random_bytes_1kb();
+        let mut gen = arbitrary::Unstructured::new(&bytes);
+        let contract: WrappedContract = gen.arbitrary()?;
+
+        let serialized = bincode::serialize(&contract)?;
+        let deser: WrappedContract = bincode::deserialize(&serialized)?;
+        assert_eq!(deser.code(), contract.code());
+        assert_eq!(deser.key(), contract.key());
         Ok(())
     }
 }
