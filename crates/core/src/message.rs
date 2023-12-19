@@ -116,7 +116,7 @@ impl Transaction {
 impl<'a> arbitrary::Arbitrary<'a> for Transaction {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let ty: TransactionTypeId = u.arbitrary()?;
-        let bytes: u128 = u.arbitrary()?;
+        let bytes: u128 = Ulid::new().0;
         Ok(Self::update(ty.0, Ulid(bytes)))
     }
 }

@@ -1221,11 +1221,27 @@ mod test {
 
     /// Given a network of one node and one gateway test that both are connected.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn one_node_connects_to_gw() {
-        let mut sim_nodes = SimNetwork::new("join_one_node_connects_to_gw", 1, 1, 1, 1, 2, 2).await;
-        sim_nodes.start().await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(sim_nodes.connected(&"node-0".into()));
+    async fn one_node_connects_to_gw() -> Result<(), anyhow::Error> {
+        const NUM_NODES: usize = 1usize;
+        const NUM_GW: usize = 1usize;
+        const MAX_HTL: usize = 1usize;
+        const RAND_IF_HTL_ABOVE: usize = 1usize;
+        const MAX_CONNS: usize = 1usize;
+        const MIN_CONNS: usize = 1usize;
+        let mut sim_nw = SimNetwork::new(
+            "join_one_node_connects_to_gw",
+            NUM_NODES,
+            NUM_GW,
+            MAX_HTL,
+            RAND_IF_HTL_ABOVE,
+            MAX_CONNS,
+            MIN_CONNS,
+        )
+        .await;
+        sim_nw.start().await;
+        sim_nw.check_connectivity(Duration::from_secs(1))?;
+        assert!(sim_nw.connected(&"node-1".into()));
+        Ok(())
     }
 
     /// Once a gateway is left without remaining open slots, ensure forwarding connects
@@ -1233,14 +1249,18 @@ mod test {
     async fn forward_connection_to_node() -> Result<(), anyhow::Error> {
         const NUM_NODES: usize = 3usize;
         const NUM_GW: usize = 1usize;
+        const MAX_HTL: usize = 2usize;
+        const RAND_IF_HTL_ABOVE: usize = 1usize;
+        const MAX_CONNS: usize = 2usize;
+        const MIN_CONNS: usize = 1usize;
         let mut sim_nw = SimNetwork::new(
             "join_forward_connection_to_node",
             NUM_GW,
             NUM_NODES,
-            2,
-            1,
-            2,
-            1,
+            MAX_HTL,
+            RAND_IF_HTL_ABOVE,
+            MAX_CONNS,
+            MIN_CONNS,
         )
         .await;
         // sim_nw.with_start_backoff(Duration::from_millis(100));
@@ -1264,17 +1284,20 @@ mod test {
         // crate::config::set_logger();
         const NUM_NODES: usize = 10usize;
         const NUM_GW: usize = 2usize;
+        const MAX_HTL: usize = 5usize;
+        const RAND_IF_HTL_ABOVE: usize = 3usize;
+        const MAX_CONNS: usize = 4usize;
+        const MIN_CONNS: usize = 2usize;
         let mut sim_nw = SimNetwork::new(
             "join_all_nodes_should_connect",
             NUM_GW,
             NUM_NODES,
-            5,
-            3,
-            6,
-            2,
+            MAX_HTL,
+            RAND_IF_HTL_ABOVE,
+            MAX_CONNS,
+            MIN_CONNS,
         )
         .await;
-        sim_nw.with_start_backoff(Duration::from_millis(100));
         sim_nw.start().await;
         sim_nw.check_connectivity(Duration::from_secs(10))?;
         // wait for a bit so peers can acquire more connections
