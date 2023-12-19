@@ -2,6 +2,7 @@
 use std::backtrace::Backtrace as StdTrace;
 use std::{pin::Pin, time::Duration};
 
+use freenet_stdlib::prelude::ContractKey;
 use futures::{future::BoxFuture, Future};
 use tokio::sync::mpsc::error::SendError;
 
@@ -300,11 +301,7 @@ impl<T> From<SendError<T>> for OpError {
 }
 
 /// If the contract is not found, it will try to get it first if the `try_get` parameter is set.
-async fn start_subscription_request(
-    op_manager: &OpManager,
-    key: freenet_stdlib::prelude::ContractKey,
-    try_get: bool,
-) {
+async fn start_subscription_request(op_manager: &OpManager, key: ContractKey, try_get: bool) {
     let sub_op = subscribe::start_op(key.clone());
     if let Err(error) = subscribe::request_subscribe(op_manager, sub_op).await {
         if !try_get {
@@ -320,5 +317,25 @@ async fn start_subscription_request(
         } else {
             tracing::warn!(%error, "Error subscribing to contract");
         }
+    }
+}
+
+async fn has_contract(op_manager: &OpManager, key: ContractKey) -> Result<bool, OpError> {
+    match op_manager
+        .notify_contract_handler(crate::contract::ContractHandlerEvent::GetQuery {
+            key,
+            fetch_contract: false,
+        })
+        .await?
+    {
+        crate::contract::ContractHandlerEvent::GetResponse {
+            response: Ok(crate::contract::StoreResponse { state: Some(_), .. }),
+            ..
+        } => Ok(true),
+        crate::contract::ContractHandlerEvent::GetResponse {
+            response: Ok(crate::contract::StoreResponse { state: None, .. }),
+            ..
+        } => Ok(false),
+        _ => Err(OpError::UnexpectedOpState),
     }
 }
