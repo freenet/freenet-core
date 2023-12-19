@@ -81,6 +81,7 @@ pub(crate) async fn request_get(op_manager: &OpManager, get_op: GetOp) -> Result
                 retries: 0,
                 fetch_contract,
                 requester: None,
+                current_hop: op_manager.ring.max_hops_to_live,
             });
 
             let msg = GetMsg::RequestGet {
@@ -109,6 +110,7 @@ pub(crate) async fn request_get(op_manager: &OpManager, get_op: GetOp) -> Result
     Ok(())
 }
 
+#[derive(Debug)]
 enum GetState {
     /// A new petition for a get op.
     ReceivedRequest,
@@ -124,6 +126,7 @@ enum GetState {
         requester: Option<PeerKeyLocation>,
         fetch_contract: bool,
         retries: usize,
+        current_hop: usize,
     },
 }
 
@@ -465,7 +468,7 @@ impl Operation for GetOp {
                             fetch_contract,
                             retries,
                             requester,
-                            ..
+                            current_hop,
                         }) => {
                             // todo: register in the stats for the outcome of the op that failed to get a response from this peer
                             if retries < MAX_RETRIES {
@@ -484,7 +487,7 @@ impl Operation for GetOp {
                                         target,
                                         sender: *this_peer,
                                         fetch_contract,
-                                        htl: op_manager.ring.max_hops_to_live,
+                                        htl: current_hop,
                                         skip_list: new_skip_list.clone(),
                                     });
                                 } else {
@@ -494,6 +497,7 @@ impl Operation for GetOp {
                                     retries: retries + 1,
                                     fetch_contract,
                                     requester,
+                                    current_hop,
                                 });
                             } else {
                                 tracing::error!(
@@ -706,7 +710,13 @@ impl Operation for GetOp {
                                 skip_list: skip_list.clone(),
                             });
                         }
-                        _ => return Err(OpError::invalid_transition(self.id)),
+                        Some(other) => {
+                            return Err(OpError::invalid_transition_with_state(
+                                self.id,
+                                Box::new(other),
+                            ))
+                        }
+                        None => return Err(OpError::invalid_transition(self.id)),
                     };
                 }
             }
@@ -784,7 +794,7 @@ async fn try_forward_or_return(
 
     let Some(new_target) = op_manager
         .ring
-        .closest_potentially_caching(&key, [&sender.peer].as_slice())
+        .closest_potentially_caching(&key, new_skip_list.as_slice())
     else {
         tracing::warn!(
             tx = %id,
@@ -806,6 +816,7 @@ async fn try_forward_or_return(
             requester: Some(sender),
             retries: 0,
             fetch_contract,
+            current_hop: new_htl,
         }),
         Some(GetMsg::SeekNode {
             id,

@@ -6,8 +6,12 @@ use std::{
 };
 
 use anyhow::anyhow;
-use freenet::dev_tool::{
-    EventChain, InterProcessConnManager, MemoryEventsGen, NodeConfig, NodeLabel, PeerId, SimPeer,
+use freenet::{
+    dev_tool::{
+        EventChain, InterProcessConnManager, MemoryEventsGen, NodeConfig, NodeLabel, PeerId,
+        Runtime, SimPeer,
+    },
+    local_node::Executor,
 };
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use rand::Rng;
@@ -69,6 +73,8 @@ pub struct MultiProcessConfig {
     pub mode: Process,
     #[arg(long)]
     id: Option<usize>,
+    #[arg(long)]
+    data_dir: Option<String>,
 }
 
 #[derive(Default, Clone, clap::ValueEnum)]
@@ -93,7 +99,7 @@ pub(super) async fn run(
 ) -> anyhow::Result<(), Error> {
     match cmd_config.mode {
         Process::Supervisor => supervisor(config).await,
-        Process::Child => child(config, cmd_config.id.expect("id should be set for child")).await,
+        Process::Child => child(config, cmd_config).await,
     }
 }
 
@@ -320,11 +326,15 @@ struct SubProcess {
 
 impl SubProcess {
     fn start(cmd_args: &[String], label: &NodeLabel, id: PeerId) -> anyhow::Result<Self, Error> {
+        // the identifier used for multi-process tests is the peer id
+        let data_dir = Executor::<Runtime>::test_data_dir(&id.to_string());
         let child = Command::new("fdev")
             .kill_on_drop(true)
             .args(cmd_args)
             .arg("--id")
             .arg(label.number().to_string())
+            .arg("--data-dir")
+            .arg(data_dir.to_str().expect("valid path"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -381,9 +391,18 @@ impl SubProcess {
     }
 }
 
-async fn child(test_config: &super::TestConfig, id: usize) -> anyhow::Result<()> {
+async fn child(
+    test_config: &super::TestConfig,
+    child_config: &MultiProcessConfig,
+) -> anyhow::Result<()> {
+    let id = child_config.id.expect("id should be set for child process");
+    let data_dir = child_config
+        .data_dir
+        .as_ref()
+        .expect("data_dir should be set for child process");
     // write logs to stderr so stdout and stdin are free of unexpected data
     std::env::set_var("FREENET_LOG_TO_STDERR", "1");
+    std::env::set_var("FREENET_DATA_DIR", data_dir);
 
     let (user_ev_controller, mut receiver_ch) = tokio::sync::watch::channel((0, PeerId::random()));
     receiver_ch.borrow_and_update();

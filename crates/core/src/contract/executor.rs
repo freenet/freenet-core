@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -473,6 +474,10 @@ impl<R> Executor<R> {
             delegate_attested_ids: HashMap::default(),
             event_loop_channel,
         })
+    }
+
+    pub fn test_data_dir(identifier: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("freenet-executor-{identifier}"))
     }
 
     async fn get_stores(

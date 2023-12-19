@@ -193,13 +193,15 @@ impl NodeConfig {
             {
                 use super::tracing::{CombinedRegister, OTEventRegister};
                 CombinedRegister::new([
-                    Box::new(EventRegister::new()),
+                    Box::new(EventRegister::new(
+                        crate::config::Config::conf().event_log(),
+                    )),
                     Box::new(OTEventRegister::new()),
                 ])
             }
             #[cfg(not(feature = "trace-ot"))]
             {
-                EventRegister::new()
+                EventRegister::new(crate::config::Config::conf().event_log())
             }
         };
         let node = NodeP2P::build::<NetworkContractHandler, CLIENTS, _>(
@@ -580,8 +582,10 @@ async fn report_result(
                         second_trace_lines.join("\n")
                     })
                     .unwrap_or_default();
-                let log =
-                    format!("Transaction ({tx}) error trace:\n {trace} \nstate:\n {state:?}\n");
+                let peer = &op_manager.ring.peer_key;
+                let log = format!(
+                    "Transaction ({tx} @ {peer}) error trace:\n {trace} \nstate:\n {state:?}\n"
+                );
                 std::io::stderr().write_all(log.as_bytes()).unwrap();
             }
             #[cfg(not(any(debug_assertions, test)))]
