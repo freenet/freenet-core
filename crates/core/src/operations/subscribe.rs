@@ -35,6 +35,7 @@ enum SubscribeState {
         skip_list: Vec<PeerId>,
         retries: usize,
         upstream_subscriber: Option<PeerKeyLocation>,
+        current_hop: usize,
     },
     Completed {},
 }
@@ -105,6 +106,7 @@ pub(crate) async fn request_subscribe(
             let new_state = Some(SubscribeState::AwaitingResponse {
                 skip_list: vec![],
                 retries: 0,
+                current_hop: op_manager.ring.max_hops_to_live,
                 upstream_subscriber: None,
             });
             let msg = SubscribeMsg::RequestSub { id, key, target };
@@ -236,7 +238,7 @@ impl Operation for SubscribeOp {
                     retries,
                 } => {
                     let this_peer = op_manager.ring.own_location();
-                    let return_err = || -> OperationResult {
+                    let return_not_subbed = || -> OperationResult {
                         OperationResult {
                             return_msg: Some(NetMessage::from(SubscribeMsg::ReturnSub {
                                 key: key.clone(),
@@ -250,31 +252,33 @@ impl Operation for SubscribeOp {
                     };
 
                     if !op_manager.ring.is_subscribed_to_contract(key) {
-                        tracing::debug!(tx = %id, "Contract {} not found at {}, trying other peer", key, target.peer);
+                        tracing::debug!(tx = %id, %key, "Contract not found, trying other peer");
 
                         let Some(new_target) = op_manager
                             .ring
                             .closest_potentially_caching(key, skip_list.as_slice())
                         else {
-                            tracing::warn!(tx = %id, "No peer found while trying getting contract {key}");
-                            return Err(OpError::RingError(RingError::NoCachingPeers(key.clone())));
+                            tracing::warn!(tx = %id, %key, "No target peer found while trying getting contract");
+                            return Ok(return_not_subbed());
                         };
                         let new_htl = htl - 1;
 
                         if new_htl == 0 {
-                            return Ok(return_err());
+                            tracing::debug!(tx = %id, %key, "Max number of hops reached while trying to get contract");
+                            return Ok(return_not_subbed());
                         }
 
                         let mut new_skip_list = skip_list.clone();
                         new_skip_list.push(target.peer);
 
-                        tracing::debug!(tx = %id, "Forward request to peer: {}", new_target.peer);
+                        tracing::debug!(tx = %id, new_target = %new_target.peer, "Forward request to peer");
                         // Retry seek node when the contract to subscribe has not been found in this node
                         return build_op_result(
                             *id,
                             Some(SubscribeState::AwaitingResponse {
                                 skip_list: new_skip_list.clone(),
                                 retries: *retries,
+                                current_hop: new_htl,
                                 upstream_subscriber: Some(*subscriber),
                             }),
                             (SubscribeMsg::SeekNode {
@@ -291,8 +295,9 @@ impl Operation for SubscribeOp {
                     }
 
                     if op_manager.ring.add_subscriber(key, *subscriber).is_err() {
+                        tracing::debug!(tx = %id, %key, "Max number of subscribers reached for contract");
                         // max number of subscribers for this contract reached
-                        return Ok(return_err());
+                        return Ok(return_not_subbed());
                     }
 
                     match self.state {
@@ -334,6 +339,7 @@ impl Operation for SubscribeOp {
                             mut skip_list,
                             retries,
                             upstream_subscriber,
+                            current_hop,
                         }) => {
                             if retries < MAX_RETRIES {
                                 skip_list.push(sender.peer);
@@ -350,7 +356,7 @@ impl Operation for SubscribeOp {
                                         subscriber,
                                         target,
                                         skip_list: skip_list.clone(),
-                                        htl: op_manager.ring.max_hops_to_live,
+                                        htl: current_hop,
                                         retries: retries + 1,
                                     });
                                 } else {
@@ -360,6 +366,7 @@ impl Operation for SubscribeOp {
                                     skip_list,
                                     retries: retries + 1,
                                     upstream_subscriber,
+                                    current_hop,
                                 });
                             } else {
                                 return Err(OpError::MaxRetriesExceeded(

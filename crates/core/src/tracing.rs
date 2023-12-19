@@ -1263,8 +1263,12 @@ pub(super) mod test {
             let peer: PeerId = gen.arbitrary()?;
             peers.push(peer);
         }
+        let mut total_route_events = 0;
         for i in 0..TEST_LOGS {
             let kind: EventKind = gen.arbitrary()?;
+            if matches!(kind, EventKind::Route(_)) {
+                total_route_events += 1;
+            }
             events.push(NetEventLog {
                 tx: &transactions[i],
                 peer_id: &peers[i],
@@ -1275,10 +1279,10 @@ pub(super) mod test {
         while register.log_sender.capacity() != 1000 {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        tokio::time::sleep(Duration::from_millis(3_000)).await;
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
         let ev =
             EventRegister::get_router_events(EventRegister::MAX_LOG_RECORDS, &log_path).await?;
-        assert_eq!(ev.len(), EventRegister::MAX_LOG_RECORDS);
+        assert_eq!(ev.len(), total_route_events);
         Ok(())
     }
 
