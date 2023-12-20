@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 
 use aes_gcm::{
-    aead::{generic_array::GenericArray, rand_core::SeedableRng, AeadMutInPlace},
+    aead::{generic_array::GenericArray, rand_core::SeedableRng, AeadInPlace},
     Aes128Gcm,
 };
 use rand::{prelude::SmallRng, thread_rng, Rng};
@@ -16,7 +16,7 @@ pub(super) const MAX_PACKET_SIZE: usize = 1500;
 const NONCE_SIZE: usize = 12;
 const TAG_SIZE: usize = 16;
 
-const MAX_DATA_SIZE: usize = MAX_PACKET_SIZE - NONCE_SIZE - TAG_SIZE;
+pub(super) const MAX_DATA_SIZE: usize = MAX_PACKET_SIZE - NONCE_SIZE - TAG_SIZE;
 
 thread_local! {
     // This must be very fast, but doesn't need to be cryptographically secure.
@@ -33,6 +33,7 @@ impl<const N: usize> AssertSize<N> {
 
 // trying to bypass limitations with const generic checks on where clauses
 const fn _check_valid_size<const N: usize>() {
+    #[allow(clippy::let_unit_value)]
     let () = AssertSize::<N>::OK;
 }
 
@@ -47,7 +48,7 @@ pub(super) const fn packet_size<const DATA_SIZE: usize>() -> usize {
 }
 
 impl<const N: usize> PacketData<N> {
-    pub(super) fn encrypted_with_cipher(data: &[u8], cipher: &mut Aes128Gcm) -> Self {
+    pub(super) fn encrypted_with_cipher(data: &[u8], cipher: &Aes128Gcm) -> Self {
         _check_valid_size::<N>();
         debug_assert!(data.len() <= MAX_DATA_SIZE);
 
@@ -93,7 +94,7 @@ impl<const N: usize> PacketData<N> {
         &self.data[..self.size]
     }
 
-    pub(super) fn decrypt(self, inbound_sym_key: &mut Aes128Gcm) -> Result<Self, aes_gcm::Error> {
+    pub(super) fn decrypt(self, inbound_sym_key: &Aes128Gcm) -> Result<Self, aes_gcm::Error> {
         debug_assert!(self.data.len() >= NONCE_SIZE + TAG_SIZE);
 
         let nonce = GenericArray::from_slice(&self.data[..NONCE_SIZE]);
@@ -137,15 +138,15 @@ mod tests {
         let key = GenericArray::from_slice(&key);
 
         // Create a new AES-128-GCM instance
-        let mut cipher = Aes128Gcm::new(key);
+        let cipher = Aes128Gcm::new(key);
         const ORIGINAL_DATA: &[u8] = b"Hello, world!";
         let packet_data: PacketData<{ packet_size::<{ ORIGINAL_DATA.len() }>() }> =
-            PacketData::encrypted_with_cipher(ORIGINAL_DATA, &mut cipher);
+            PacketData::encrypted_with_cipher(ORIGINAL_DATA, &cipher);
 
         // Ensure data is not plainly visible
         assert_ne!(packet_data.data[..packet_data.size], *ORIGINAL_DATA);
 
-        test_decryption(packet_data, &mut cipher, ORIGINAL_DATA);
+        test_decryption(packet_data, &cipher, ORIGINAL_DATA);
     }
 
     // Test encryption/decryption where message size is the maximum allowed
@@ -159,16 +160,16 @@ mod tests {
         let key = GenericArray::from_slice(&key);
 
         // Create a new AES-128-GCM instance
-        let mut cipher = Aes128Gcm::new(key);
+        let cipher = Aes128Gcm::new(key);
         const ORIGINAL_DATA: &[u8] = b"Hello, world!";
         let packet_data: PacketData<{ packet_size::<{ ORIGINAL_DATA.len() }>() }> =
-            PacketData::encrypted_with_cipher(ORIGINAL_DATA, &mut cipher);
+            PacketData::encrypted_with_cipher(ORIGINAL_DATA, &cipher);
 
         // Ensure data is not plainly visible
         let overlap = longest_common_subsequence(&packet_data.data, ORIGINAL_DATA);
         assert!(overlap < 20);
 
-        test_decryption(packet_data, &mut cipher, ORIGINAL_DATA);
+        test_decryption(packet_data, &cipher, ORIGINAL_DATA);
     }
 
     // Test detection of packet corruption
@@ -182,16 +183,16 @@ mod tests {
         let key = GenericArray::from_slice(&key);
 
         // Create a new AES-128-GCM instance
-        let mut cipher = Aes128Gcm::new(key);
+        let cipher = Aes128Gcm::new(key);
         const ORIGINAL_DATA: &[u8] = b"Hello, world!";
         let mut packet_data: PacketData<{ packet_size::<{ ORIGINAL_DATA.len() }>() }> =
-            PacketData::encrypted_with_cipher(ORIGINAL_DATA, &mut cipher);
+            PacketData::encrypted_with_cipher(ORIGINAL_DATA, &cipher);
 
         // Corrupt the packet data
         packet_data.data[packet_data.size / 2] = 0;
 
         // Ensure decryption fails
-        match packet_data.decrypt(&mut cipher) {
+        match packet_data.decrypt(&cipher) {
             Ok(_) => panic!("Decryption succeeded when it should have failed"),
             Err(e) => assert_eq!(e, aes_gcm::Error),
         }
@@ -199,7 +200,7 @@ mod tests {
 
     fn test_decryption<const N: usize, T: AsRef<[u8]>>(
         packet_data: PacketData<N>,
-        cipher: &mut Aes128Gcm,
+        cipher: &Aes128Gcm,
         original_data: T,
     ) {
         match packet_data.decrypt(cipher) {

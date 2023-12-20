@@ -11,17 +11,21 @@ use super::{packet_data::MAX_PACKET_SIZE, PacketData};
 pub(super) struct SymmetricMessage {
     // todo: make sure we handle wrapping around the u16 properly
     pub message_id: u16,
+    // todo: profile what is better here on average in the future
+    // (vec, fixed array size of what given length etc.
     #[serde_as(as = "Option<[_; 50]>")]
     pub confirm_receipt: Option<[u16; 50]>,
     pub payload: SymmetricMessagePayload,
 }
+
+const FIRST_MESSAGE_ID: u16 = 0u16;
 
 impl SymmetricMessage {
     pub fn deser(bytes: &[u8]) -> Result<Self, bincode::Error> {
         bincode::deserialize(bytes)
     }
 
-    pub fn ack_error(inbound_sym_key: &mut Aes128Gcm) -> Result<PacketData, bincode::Error> {
+    pub fn ack_error(inbound_sym_key: &Aes128Gcm) -> Result<PacketData, bincode::Error> {
         static SERIALIZED: OnceLock<Box<[u8]>> = OnceLock::new();
         let bytes = SERIALIZED.get_or_init(|| {
             let mut packet = [0u8; MAX_PACKET_SIZE];
@@ -29,10 +33,11 @@ impl SymmetricMessage {
             bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_ERROR).unwrap();
             (&packet[..size as usize]).into()
         });
+        // todo: we need exact size of this packer so we can return an optimized PacketData
         Ok(PacketData::encrypted_with_cipher(bytes, inbound_sym_key))
     }
 
-    pub fn ack_ok(inbound_sym_key: &mut Aes128Gcm) -> Result<PacketData, bincode::Error> {
+    pub fn ack_ok(inbound_sym_key: &Aes128Gcm) -> Result<PacketData, bincode::Error> {
         static SERIALIZED: OnceLock<Box<[u8]>> = OnceLock::new();
         let bytes = SERIALIZED.get_or_init(|| {
             let mut packet = [0u8; MAX_PACKET_SIZE];
@@ -40,13 +45,15 @@ impl SymmetricMessage {
             bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_ERROR).unwrap();
             (&packet[..size as usize]).into()
         });
+        // todo: we need exact size of this packer so we can return an optimized PacketData
         Ok(PacketData::encrypted_with_cipher(bytes, inbound_sym_key))
     }
 
     const ACK_ERROR: SymmetricMessage = SymmetricMessage {
-        message_id: 0,
+        message_id: FIRST_MESSAGE_ID,
         confirm_receipt: None,
         payload: SymmetricMessagePayload::AckConnection {
+            // todo: change to return UnsupportedProtocolVersion
             result: Err(Cow::Borrowed(
                 "remote is using a different protocol version",
             )),
@@ -54,7 +61,7 @@ impl SymmetricMessage {
     };
 
     const ACK_OK: SymmetricMessage = SymmetricMessage {
-        message_id: 0,
+        message_id: FIRST_MESSAGE_ID,
         confirm_receipt: None,
         payload: SymmetricMessagePayload::AckConnection { result: Ok(()) },
     };
@@ -73,12 +80,12 @@ pub(super) enum SymmetricMessagePayload {
 #[test]
 fn ack_error_msg() -> Result<(), Box<dyn std::error::Error>> {
     use aes_gcm::KeyInit;
-    let mut key = Aes128Gcm::new(&[0; 16].into());
-    let packet = SymmetricMessage::ack_error(&mut key)?;
+    let key = Aes128Gcm::new(&[0; 16].into());
+    let packet = SymmetricMessage::ack_error(&key)?;
 
-    let _packet = PacketData::<1501>::encrypted_with_cipher(packet.send_data(), &mut key);
+    let _packet = PacketData::<1501>::encrypted_with_cipher(packet.send_data(), &key);
 
-    let data = packet.decrypt(&mut key).unwrap();
+    let data = packet.decrypt(&key).unwrap();
     let deser = SymmetricMessage::deser(data.send_data())?;
     assert!(matches!(
         deser.payload,

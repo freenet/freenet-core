@@ -34,17 +34,6 @@
 //! peer it is connecting to. The encrypted key is then sent to the peer in the first message
 //! of the connection, repeated until a correctly encrypted response is received. The peer
 //! receiving the message will decrypt the key and use it to encrypt future messages.
-//!
-//! ## Opening a Connection
-//!
-//! ### Neither peer is a gateway
-//!
-//! 1. Peer A sends a `ConnectionStart` message to Peer B with its chosen symmetric key
-//!    encrypted with Peer B's public key, resending every 200ms until...
-//! 2. Peer B receives the message and decrypts the symmetric key, it then sends a `ConnectionAck`
-//!    message to Peer A encrypted with the symmetric key.
-//! 3. Peer B stores the `ConnectionStart` and `ConnectionAck` messages in [UdpConnection] and
-//!    if its sees that message again it resends the `ConnectionAck` message.
 
 mod bw;
 mod connection_handler;
@@ -53,9 +42,14 @@ mod crypto;
 mod packet_data;
 mod symmetric_message;
 
+use futures::sink::Sink;
+use tokio::sync::mpsc;
+
 use crate::transport::packet_data::PacketData;
 
-use self::connection_info::ConnectionError;
+use self::connection_handler::ConnectionError;
+
+type StreamBytes = Vec<u8>;
 
 struct ReceiverStream {}
 
@@ -76,11 +70,41 @@ struct StreamedMessagePart {
     message_size: usize,
 }
 
+/// Handles breaking a message into parts, encryption, etc.
 struct SenderStream {}
 
 impl SenderStream {
-    /// Will await until the message is sent, handles breaking the message into parts, encryption, etc.
-    async fn send_message(&self, _data: &[u8]) -> Result<(), SenderStreamError> {
+    fn new(sender: &mut mpsc::Sender<connection_handler::SerializedMessage>) -> Self {
+        todo!()
+    }
+}
+
+impl Sink<StreamBytes> for SenderStream {
+    type Error = SenderStreamError;
+
+    fn poll_ready(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        todo!()
+    }
+
+    fn start_send(self: std::pin::Pin<&mut Self>, data: StreamBytes) -> Result<(), Self::Error> {
+        // we break the message into parts, encrypt them, and send them
+        todo!()
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        todo!()
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
         todo!()
     }
 }

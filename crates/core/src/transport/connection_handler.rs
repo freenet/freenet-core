@@ -1,20 +1,26 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::vec::Vec;
 use std::{borrow::Cow, time::Duration};
 
 use aes_gcm::{Aes128Gcm, KeyInit};
 use futures::channel::oneshot;
+use futures::SinkExt;
 use serde::Serialize;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task;
 
-use crate::transport::packet_data::MAX_PACKET_SIZE;
-use crate::transport::symmetric_message::{SymmetricMessage, SymmetricMessagePayload};
+use crate::transport::{
+    packet_data::{MAX_DATA_SIZE, MAX_PACKET_SIZE},
+    symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
+    ReceiverStream, SenderStream,
+};
 
+use super::SenderStreamError;
 use super::{
-    connection_info::{ConnectionError, ConnectionInfo},
+    connection_info::ConnectionInfo,
     crypto::{TransportKeypair, TransportPublicKey},
     BytesPerSecond, PacketData,
 };
@@ -33,7 +39,7 @@ const INITIAL_INTERVAL: Duration = Duration::from_millis(200);
 const INTERVAL_INCREASE_FACTOR: u64 = 2;
 const MAX_INTERVAL: Duration = Duration::from_millis(5000); // Maximum interval limit
 
-type SerializedMessage = Vec<u8>;
+pub(super) type SerializedMessage = Vec<u8>;
 
 pub struct PeerConnection {
     inbound_recv: mpsc::Receiver<PacketData>,
@@ -42,7 +48,7 @@ pub struct PeerConnection {
 
 impl PeerConnection {
     pub async fn recv(&mut self) -> Result<Vec<u8>, ConnectionError> {
-        let packet_data = self
+        let _packet_data = self
             .inbound_recv
             .recv()
             .await
@@ -51,16 +57,20 @@ impl PeerConnection {
     }
 
     pub async fn send<T: Serialize>(&mut self, data: &T) -> Result<(), ConnectionError> {
-        let _serialized_data = bincode::serialize(data).unwrap();
-        // todo: send this to the udp listener and send in one packet or stream the message
-        todo!()
+        let serialized_data = bincode::serialize(data).unwrap();
+        if serialized_data.len() > MAX_DATA_SIZE {
+            let mut sender = SenderStream::new(&mut self.outbound_sender);
+            sender.start_send_unpin(serialized_data)?;
+            Ok(())
+        } else {
+            self.outbound_sender.send(serialized_data).await.unwrap();
+            todo!()
+        }
     }
 }
 
 pub(crate) struct ConnectionHandler {
-    listen_port: u16,
-    is_gateway: bool,
-    max_upstream_rate: BytesPerSecond,
+    max_upstream_rate: Arc<arc_swap::ArcSwap<BytesPerSecond>>,
     send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>,
 }
 
@@ -77,17 +87,18 @@ impl ConnectionHandler {
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (send_queue, send_queue_receiver) = mpsc::channel(1);
 
+        let max_upstream_rate = Arc::new(arc_swap::ArcSwap::from_pointee(max_upstream_rate));
         let transport = UdpPacketsListener {
             connection_raw_packet_senders: HashMap::new(),
             socket,
             send_queue: send_queue_receiver,
             this_peer_keypair: keypair,
+            max_upstream_rate: max_upstream_rate.clone(),
+            is_gateway,
         };
         let connection_handler = ConnectionHandler {
-            listen_port,
-            is_gateway,
-            max_upstream_rate,
             send_queue,
+            max_upstream_rate,
         };
 
         task::spawn(transport.listen());
@@ -124,19 +135,7 @@ impl ConnectionHandler {
     }
 
     fn update_max_upstream_rate(&mut self, max_upstream_rate: BytesPerSecond) {
-        self.max_upstream_rate = max_upstream_rate;
-    }
-
-    fn handle_unrecognized_message(&self, (_socket, packet): (SocketAddr, PacketData)) {
-        if !self.is_gateway {
-            tracing::warn!(
-                packet = ?packet.send_data(),
-                "Received unrecognized message, ignoring because not a gateway",
-            );
-            return;
-        }
-        // use self.keypair to decrypt the message, which should contain a symmetric key
-        todo!()
+        self.max_upstream_rate.store(Arc::new(max_upstream_rate));
     }
 }
 
@@ -146,6 +145,8 @@ struct UdpPacketsListener {
     connection_raw_packet_senders: HashMap<SocketAddr, (ConnectionInfo, mpsc::Sender<PacketData>)>,
     send_queue: mpsc::Receiver<(SocketAddr, ConnectionEvent)>,
     this_peer_keypair: TransportKeypair,
+    max_upstream_rate: Arc<arc_swap::ArcSwap<BytesPerSecond>>,
+    is_gateway: bool,
 }
 
 impl UdpPacketsListener {
@@ -159,6 +160,9 @@ impl UdpPacketsListener {
                         Ok((size, addr)) => {
                             match self.connection_raw_packet_senders.get_mut(&addr) {
                                 Some((conn_info, sender)) => {
+                                    // todo: check if is streamed or a single packet
+                                    // then handle both cases
+
                                     // let packet_data = PacketData::decrypt(std::mem::replace(&mut buf, [0; MAX_PACKET_SIZE]),  &mut conn_info.outbound_symmetric_key).unwrap();
                                     // if let Err(e) = sender.send(packet_data).await {
                                     //     tracing::warn!("Failed to send raw packet to connection sender: {:?}", e);
@@ -166,7 +170,7 @@ impl UdpPacketsListener {
                                 }
                                 None => {
                                     self
-                                        .handle_unrecognized_remote(addr);
+                                        .handle_unrecogized_remote(addr, &buf[..size]);
                                 }
                             }
                         }
@@ -224,7 +228,7 @@ impl UdpPacketsListener {
         let mut state = ConnectionState::Start;
 
         let inbound_sym_key_bytes = rand::random::<[u8; 16]>();
-        let mut inbound_sym_key = Aes128Gcm::new(&inbound_sym_key_bytes.into());
+        let inbound_sym_key = Aes128Gcm::new(&inbound_sym_key_bytes.into());
         let mut outbound_sym_key: Option<Aes128Gcm> = None;
 
         let outbound_intro_packet = {
@@ -275,7 +279,7 @@ impl UdpPacketsListener {
                                 tracing::debug!("Received unexpect packet from remote");
                                 continue;
                             };
-                            let mut key = Aes128Gcm::new_from_slice(&data[PROTOC_VERSION.len()..])
+                            let key = Aes128Gcm::new_from_slice(&data[PROTOC_VERSION.len()..])
                                 .map_err(|_| TransportError::ConnectionEstablishmentFailure {
                                     cause: "invalid symmetric key".into(),
                                 })?;
@@ -296,7 +300,7 @@ impl UdpPacketsListener {
                                     bincode::serialize_into(packet.as_mut_slice(), &msg)?;
                                     PacketData::<MAX_PACKET_SIZE>::encrypted_with_cipher(
                                         &packet[..],
-                                        &mut key,
+                                        &key,
                                     )
                                 };
                                 let _ = self.socket.send_to(packet.send_data(), remote_addr).await;
@@ -316,7 +320,7 @@ impl UdpPacketsListener {
                         ConnectionState::AckConnection => {
                             let packet: PacketData<MAX_PACKET_SIZE> =
                                 (std::mem::replace(&mut packet, [0; MAX_PACKET_SIZE]), size).into();
-                            let decrypted = packet.decrypt(&mut inbound_sym_key).unwrap();
+                            let decrypted = packet.decrypt(&inbound_sym_key).unwrap();
                             let packet =
                                 bincode::deserialize::<SymmetricMessage>(decrypted.send_data())?;
                             if let SymmetricMessagePayload::AckConnection { result: Ok(_) } =
@@ -374,8 +378,13 @@ impl UdpPacketsListener {
         })
     }
 
-    fn handle_unrecognized_remote(&mut self, _remote: SocketAddr) {
-        tracing::warn!("Received unrecognized remote, ignoring");
+    fn handle_unrecogized_remote(&self, _socket: SocketAddr, _packet: &[u8]) {
+        // todo: try to decrypt with the rsa keypair to see if is an other peer initiating a connection
+        // fail otherwise
+        // then jump to nat_traversal, passing the apporopiuate state and parameters so we skip
+        // unnecessary steps
+        // logic for gateway should be slightly different cause we don't need to do nat traversal
+        todo!()
     }
 }
 
@@ -404,4 +413,12 @@ pub(super) enum TransportError {
     Other(#[from] anyhow::Error),
     #[error(transparent)]
     Serialization(#[from] bincode::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ConnectionError {
+    #[error(transparent)]
+    StreamingError(#[from] SenderStreamError),
+    #[error("Connection closed")]
+    ChannelClosed,
 }
