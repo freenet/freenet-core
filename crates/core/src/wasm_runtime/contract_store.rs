@@ -64,7 +64,7 @@ impl ContractStore {
     }
 
     /// Returns a copy of the contract bytes if available, none otherwise.
-    // FIXME: instead return Result<Option<_>, _> to handle IO errors upstream
+    // todo: instead return Result<Option<_>, _> to handle IO errors upstream
     pub fn fetch_contract(
         &self,
         key: &ContractKey,
