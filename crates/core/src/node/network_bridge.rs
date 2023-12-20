@@ -83,15 +83,14 @@ impl Clone for ConnectionError {
     }
 }
 
-pub fn event_loop_notification_channel(
-) -> (EventLoopNotificationsReceiver, EventLoopNotificationsSender) {
+pub(crate) fn event_loop_notification_channel() -> (EventLoopNotificationsReceiver, EventLoopNotificationsSender) {
     let (notification_tx, notification_rx) = mpsc::channel(100);
     (
         EventLoopNotificationsReceiver(notification_rx),
         EventLoopNotificationsSender(notification_tx),
     )
 }
-pub(super) struct EventLoopNotificationsReceiver(Receiver<Either<NetMessage, NodeEvent>>);
+pub(crate) struct EventLoopNotificationsReceiver(Receiver<Either<NetMessage, NodeEvent>>);
 
 impl Deref for EventLoopNotificationsReceiver {
     type Target = Receiver<Either<NetMessage, NodeEvent>>;

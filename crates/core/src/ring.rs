@@ -753,7 +753,6 @@ impl Ring {
                                 && !live_tx_tracker.has_live_connection(&conn.location.peer)
                         })
                         .map(|conn| &conn.location),
-                    self.is_gateway,
                 )
             };
             if !should_disconnect_peers.is_empty() {
