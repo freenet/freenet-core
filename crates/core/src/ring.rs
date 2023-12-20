@@ -623,7 +623,7 @@ impl Ring {
         ) -> Vec<PeerId> {
             // todo: instead we should be using ConnectionEvaluator here
             // todo: if the peer is a gateway behaviour on how quickly we drop connections may be different
-            let _ = is_gateway;
+         //   let _ = is_gateway;
             vec![]
         }
 
@@ -658,6 +658,8 @@ impl Ring {
 
         let mut live_tx = None;
         'outer: loop {
+
+            //
             loop {
                 match missing_candidates.try_recv() {
                     Ok(missing_candidate) => {
