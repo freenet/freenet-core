@@ -6,7 +6,7 @@ use freenet_stdlib::prelude::{
 use std::{fs::File, io::Write, path::PathBuf, sync::Arc};
 use stretto::Cache;
 
-use crate::runtime::store::SafeWriter;
+use crate::wasm_runtime::store::SafeWriter;
 
 use super::store::StoreFsManagement;
 use super::RuntimeResult;

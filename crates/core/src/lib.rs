@@ -1,19 +1,33 @@
+/// Clients events related logic and type definitions.
 pub(crate) mod client_events;
+/// Peer node configuration.
 pub mod config;
+/// Handling of contracts and delegates functionality.
 mod contract;
+/// Generated messages from the flatbuffers schema for the network monitor.
 pub mod generated;
+/// Network messages for transactions.
 mod message;
+/// Node configuration, implementations and execution (entry points for the binaries).
 mod node;
+/// Network operation/transaction state machines.
 mod operations;
+/// Resource usage tracking.
 mod resources;
+/// Ring connections and routing.
 mod ring;
+/// Router implementation.
 mod router;
-mod runtime;
+/// Local server used to communicate with the peer core.
 #[cfg(feature = "websocket")]
 pub mod server;
+/// Local network topology management.
 mod topology;
+/// Tracing and loging infrastructure. Includes our custom event log register. Tracing collectors, etc.
 mod tracing;
 pub mod util;
+/// WASM code execution runtime, tailored for the contract and delegate APIs.
+mod wasm_runtime;
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -37,5 +51,5 @@ pub mod dev_tool {
         InitPeerNode, InterProcessConnManager, NodeConfig, PeerCliConfig, PeerId,
     };
     pub use ring::Location;
-    pub use runtime::{ContractStore, DelegateStore, Runtime, SecretsStore, StateStore};
+    pub use wasm_runtime::{ContractStore, DelegateStore, Runtime, SecretsStore, StateStore};
 }

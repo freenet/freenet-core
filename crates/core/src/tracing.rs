@@ -1,4 +1,9 @@
-use std::{io, path::Path, time::SystemTime};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::SystemTime,
+};
 
 use chrono::{DateTime, Utc};
 use either::Either;
@@ -43,6 +48,7 @@ pub(crate) trait NetEventRegister: std::any::Any + Send + Sync + 'static {
     ) -> BoxFuture<'a, ()>;
     fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<()>;
     fn trait_clone(&self) -> Box<dyn NetEventRegister>;
+    fn get_router_events(&self, number: usize) -> BoxFuture<Result<Vec<RouteEvent>, DynError>>;
 }
 
 #[cfg(feature = "trace-ot")]
@@ -81,6 +87,19 @@ impl<const N: usize> NetEventRegister for CombinedRegister<N> {
         }
         .boxed()
     }
+
+    fn get_router_events(&self, number: usize) -> BoxFuture<Result<Vec<RouteEvent>, DynError>> {
+        async move {
+            for reg in &self.0 {
+                let events = reg.get_router_events(number).await?;
+                if !events.is_empty() {
+                    return Ok(events);
+                }
+            }
+            Ok(vec![])
+        }
+        .boxed()
+    }
 }
 
 #[cfg(feature = "trace-ot")]
@@ -104,14 +123,10 @@ pub(crate) struct NetEventLog<'a> {
 }
 
 impl<'a> NetEventLog<'a> {
-    pub fn route_event(
-        tx: &'a Transaction,
-        op_manager: &'a OpManager,
-        route_event: &RouteEvent,
-    ) -> Self {
+    pub fn route_event(tx: &'a Transaction, ring: &'a Ring, route_event: &RouteEvent) -> Self {
         NetEventLog {
             tx,
-            peer_id: &op_manager.ring.peer_key,
+            peer_id: &ring.peer_key,
             kind: EventKind::Route(route_event.clone()),
         }
     }
@@ -241,16 +256,13 @@ impl<'a> NetEventLog<'a> {
             }) => {
                 let key = contract.key();
                 EventKind::Put(PutEvent::Request {
-                    performer: target.peer,
+                    requester: target.peer,
                     key,
                 })
             }
-            NetMessage::Put(PutMsg::SuccessfulUpdate { new_value, .. }) => {
-                EventKind::Put(PutEvent::PutSuccess {
-                    requester: op_manager.ring.peer_key,
-                    value: new_value.clone(),
-                })
-            }
+            NetMessage::Put(PutMsg::SuccessfulPut { .. }) => EventKind::Put(PutEvent::PutSuccess {
+                requester: op_manager.ring.peer_key,
+            }),
             NetMessage::Put(PutMsg::Broadcasting {
                 new_value,
                 broadcast_to,
@@ -376,6 +388,7 @@ impl<'a> From<&'a NetLogMessage> for Option<Vec<opentelemetry::KeyValue>> {
 
 #[derive(Clone)]
 pub(crate) struct EventRegister {
+    log_file: Arc<PathBuf>,
     log_sender: mpsc::Sender<NetLogMessage>,
 }
 
@@ -395,28 +408,34 @@ impl EventRegister {
 
     const BATCH_SIZE: usize = EVENT_REGISTER_BATCH_SIZE;
 
-    pub fn new() -> Self {
+    pub fn new(event_log_path: PathBuf) -> Self {
         let (log_sender, log_recv) = mpsc::channel(1000);
         NEW_RECORDS_TS.get_or_init(SystemTime::now);
-        GlobalExecutor::spawn(Self::record_logs(log_recv));
-        Self { log_sender }
+        let log_file = Arc::new(event_log_path);
+        GlobalExecutor::spawn(Self::record_logs(log_recv, log_file.clone()));
+        Self {
+            log_sender,
+            log_file,
+        }
     }
 
-    async fn record_logs(mut log_recv: mpsc::Receiver<NetLogMessage>) {
+    async fn record_logs(
+        mut log_recv: mpsc::Receiver<NetLogMessage>,
+        event_log_path: Arc<PathBuf>,
+    ) {
         use futures::StreamExt;
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await; // wait for the node to start
-        let event_log_path = crate::config::Config::conf().event_log();
         let mut event_log = match OpenOptions::new()
             .write(true)
             .read(true)
-            .open(&event_log_path)
+            .open(&*event_log_path)
             .await
         {
             Ok(file) => file,
             Err(err) => {
                 tracing::error!("Failed openning log file {:?} with: {err}", event_log_path);
-                panic!("Failed openning log file"); // fixme: propagate this to the main thread
+                panic!("Failed openning log file"); // fixme: propagate this to the main event loop
             }
         };
         let mut num_written = 0;
@@ -616,26 +635,6 @@ impl EventRegister {
             }
         }
 
-        #[cfg(test)]
-        {
-            assert!(!buffer.is_empty());
-            let mut unique = std::collections::HashSet::new();
-            let mut read_buf = &*buffer;
-            let mut length_bytes: [u8; 4] = [0u8; 4];
-            let mut cursor = 0;
-            while read_buf.read_exact(&mut length_bytes).await.is_ok() {
-                let length = u32::from_be_bytes(length_bytes) as usize;
-                cursor += 4;
-                let log: NetLogMessage =
-                    bincode::deserialize(&buffer[cursor..cursor + length]).unwrap();
-                cursor += length;
-                read_buf = &buffer[cursor..];
-                unique.insert(log.peer_id);
-                // tracing::debug!(?log, %cursor);
-            }
-            assert!(unique.len() > 1);
-        }
-
         // Seek back to the beginning and write the remaining content
         file.rewind().await?;
         file.write_all(&buffer).await?;
@@ -646,12 +645,14 @@ impl EventRegister {
         Ok(())
     }
 
-    pub async fn get_router_events(max_event_number: usize) -> Result<Vec<RouteEvent>, DynError> {
+    pub async fn get_router_events(
+        max_event_number: usize,
+        event_log_path: &Path,
+    ) -> Result<Vec<RouteEvent>, DynError> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         const MAX_EVENT_HISTORY: usize = 10_000;
         let event_num = max_event_number.min(MAX_EVENT_HISTORY);
 
-        let event_log_path = crate::config::Config::conf().event_log();
         // tracing::info!(?event_log_path);
         let _guard: tokio::sync::MutexGuard<'_, ()> = FILE_LOCK.lock().await;
         let mut file =
@@ -730,6 +731,10 @@ impl NetEventRegister for EventRegister {
     fn notify_of_time_out(&mut self, _: Transaction) -> BoxFuture<()> {
         async {}.boxed()
     }
+
+    fn get_router_events(&self, number: usize) -> BoxFuture<Result<Vec<RouteEvent>, DynError>> {
+        async move { EventRegister::get_router_events(number, &self.log_file).await }.boxed()
+    }
 }
 
 async fn connect_to_metrics_server() -> Option<WebSocketStream<MaybeTlsStream<TcpStream>>> {
@@ -779,6 +784,7 @@ async fn send_to_metrics_server(
             let msg = PeerChange::removed_connection_msg(*from, send_msg.peer_id);
             ws_stream.send(Message::Binary(msg)).await
         }
+        // todo: send op events too (put, get, update, etc) so we can keep track of transactions
         _ => Ok(()),
     };
     if let Err(error) = res {
@@ -1064,6 +1070,13 @@ mod opentelemetry_tracer {
             }
             .boxed()
         }
+
+        fn get_router_events(
+            &self,
+            _number: usize,
+        ) -> BoxFuture<Result<Vec<RouteEvent>, DynError>> {
+            async { Ok(vec![]) }.boxed()
+        }
     }
 }
 
@@ -1109,12 +1122,11 @@ enum ConnectEvent {
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 enum PutEvent {
     Request {
-        performer: PeerId,
+        requester: PeerId,
         key: ContractKey,
     },
     PutSuccess {
         requester: PeerId,
-        value: WrappedState,
     },
     BroadcastEmitted {
         /// subscribed peers
@@ -1233,13 +1245,13 @@ pub(super) mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn event_register_read_write() -> Result<(), DynError> {
         use std::time::Duration;
-        let event_log_path = crate::config::Config::conf().event_log();
-        // truncate the log if it exists
-        std::fs::File::create(event_log_path).unwrap();
+        let temp_dir = tempfile::tempdir()?;
+        let log_path = temp_dir.path().join("event_log");
+        std::fs::File::create(&log_path)?;
 
         // force a truncation
         const TEST_LOGS: usize = EventRegister::MAX_LOG_RECORDS + 100;
-        let register = EventRegister::new();
+        let register = EventRegister::new(log_path.clone());
         let bytes = crate::util::test::random_bytes_2mb();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let mut transactions = vec![];
@@ -1251,11 +1263,15 @@ pub(super) mod test {
             let peer: PeerId = gen.arbitrary()?;
             peers.push(peer);
         }
-        for _ in 0..TEST_LOGS {
+        let mut total_route_events = 0;
+        for i in 0..TEST_LOGS {
             let kind: EventKind = gen.arbitrary()?;
+            if matches!(kind, EventKind::Route(_)) {
+                total_route_events += 1;
+            }
             events.push(NetEventLog {
-                tx: transactions.last().unwrap(),
-                peer_id: peers.last().unwrap(),
+                tx: &transactions[i],
+                peer_id: &peers[i],
                 kind,
             });
         }
@@ -1263,9 +1279,10 @@ pub(super) mod test {
         while register.log_sender.capacity() != 1000 {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        tokio::time::sleep(Duration::from_millis(3_000)).await;
-        let ev = EventRegister::get_router_events(100).await?;
-        assert!(!ev.is_empty());
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        let ev =
+            EventRegister::get_router_events(EventRegister::MAX_LOG_RECORDS, &log_path).await?;
+        assert_eq!(ev.len(), total_route_events);
         Ok(())
     }
 
@@ -1304,12 +1321,7 @@ pub(super) mod test {
             })
         }
 
-        pub fn has_put_contract(
-            &self,
-            peer: &PeerId,
-            for_key: &ContractKey,
-            expected_value: &WrappedState,
-        ) -> bool {
+        pub fn has_put_contract(&self, peer: &PeerId, for_key: &ContractKey) -> bool {
             let Ok(logs) = self.logs.try_lock() else {
                 return false;
             };
@@ -1323,7 +1335,6 @@ pub(super) mod test {
             });
 
             for (_tx, events) in put_ops {
-                let mut is_expected_value = false;
                 let mut is_expected_key = false;
                 let mut is_expected_peer = false;
                 for ev in events {
@@ -1332,16 +1343,13 @@ pub(super) mod test {
                         PutEvent::Request { key, .. } if key == for_key => {
                             is_expected_key = true;
                         }
-                        PutEvent::PutSuccess { requester, value }
-                            if requester == peer && value == expected_value =>
-                        {
+                        PutEvent::PutSuccess { requester } if requester == peer => {
                             is_expected_peer = true;
-                            is_expected_value = true;
                         }
                         _ => {}
                     }
                 }
-                if is_expected_value && is_expected_peer && is_expected_key {
+                if is_expected_peer && is_expected_key {
                     return true;
                 }
             }
@@ -1495,6 +1503,13 @@ pub(super) mod test {
         fn notify_of_time_out(&mut self, _: Transaction) -> BoxFuture<()> {
             async {}.boxed()
         }
+
+        fn get_router_events(
+            &self,
+            _number: usize,
+        ) -> BoxFuture<Result<Vec<RouteEvent>, DynError>> {
+            async { Ok(vec![]) }.boxed()
+        }
     }
 
     #[tokio::test]
@@ -1510,22 +1525,26 @@ pub(super) mod test {
         ];
 
         let listener = TestEventListener::new().await;
-        locations.iter().for_each(|(other, location)| {
-            listener.register_events(Either::Left(NetEventLog {
-                tx: &tx,
-                peer_id: &peer_id,
-                kind: EventKind::Connect(ConnectEvent::Connected {
-                    this: PeerKeyLocation {
-                        peer: peer_id,
-                        location: Some(loc),
-                    },
-                    connected: PeerKeyLocation {
-                        peer: *other,
-                        location: Some(*location),
-                    },
-                }),
-            }));
-        });
+        let futs = futures::stream::FuturesUnordered::from_iter(locations.iter().map(
+            |(other, location)| {
+                listener.register_events(Either::Left(NetEventLog {
+                    tx: &tx,
+                    peer_id: &peer_id,
+                    kind: EventKind::Connect(ConnectEvent::Connected {
+                        this: PeerKeyLocation {
+                            peer: peer_id,
+                            location: Some(loc),
+                        },
+                        connected: PeerKeyLocation {
+                            peer: *other,
+                            location: Some(*location),
+                        },
+                    }),
+                }))
+            },
+        ));
+
+        futures::future::join_all(futs).await;
 
         let distances: Vec<_> = listener.connections(peer_id).collect();
         assert!(distances.len() == 3);

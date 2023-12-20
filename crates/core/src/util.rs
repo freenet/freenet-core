@@ -237,6 +237,12 @@ impl<'x> Contains<PeerId> for &'x [&PeerId] {
     }
 }
 
+impl<'x> Contains<PeerId> for &'x Vec<&PeerId> {
+    fn has_element(&self, target: &PeerId) -> bool {
+        self.contains(&target)
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
 

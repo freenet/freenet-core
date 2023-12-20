@@ -14,7 +14,6 @@ use std::{
 use directories::ProjectDirs;
 use libp2p::{identity, PeerId};
 use once_cell::sync::Lazy;
-use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 
 use crate::local_node::OperationMode;
@@ -103,7 +102,7 @@ pub struct ConfigPaths {
     delegates_dir: PathBuf,
     secrets_dir: PathBuf,
     db_dir: PathBuf,
-    event_log: Mutex<PathBuf>,
+    event_log: PathBuf,
 }
 
 impl ConfigPaths {
@@ -118,8 +117,8 @@ impl ConfigPaths {
         Ok(app_data_dir)
     }
 
-    fn new() -> std::io::Result<ConfigPaths> {
-        let app_data_dir = Self::app_data_dir()?;
+    fn new(data_dir: Option<PathBuf>) -> std::io::Result<ConfigPaths> {
+        let app_data_dir = data_dir.map(Ok).unwrap_or_else(Self::app_data_dir)?;
         let contracts_dir = app_data_dir.join("contracts");
         let delegates_dir = app_data_dir.join("delegates");
         let secrets_dir = app_data_dir.join("secrets");
@@ -158,7 +157,7 @@ impl ConfigPaths {
             delegates_dir,
             secrets_dir,
             db_dir,
-            event_log: Mutex::new(event_log),
+            event_log,
         })
     }
 }
@@ -205,22 +204,12 @@ impl Config {
 
     pub fn event_log(&self) -> PathBuf {
         if self.local_mode.load(std::sync::atomic::Ordering::SeqCst) {
-            let mut local_file = self.config_paths.event_log.lock().clone();
+            let mut local_file = self.config_paths.event_log.clone();
             local_file.set_file_name("_EVENT_LOG_LOCAL");
             local_file
         } else {
-            self.config_paths.event_log.lock().to_owned()
+            self.config_paths.event_log.to_owned()
         }
-    }
-
-    pub fn set_event_log(path: PathBuf) {
-        tracing::debug!("setting event log file to: {:?}", &path);
-        fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .open(&path)
-            .expect("couln't create event log file");
-        *Self::conf().config_paths.event_log.lock() = path;
     }
 
     pub fn conf() -> &'static Config {
@@ -264,7 +253,9 @@ impl Config {
             .flatten()
             .unwrap_or(tracing::log::LevelFilter::Info);
         let (bootstrap_ip, bootstrap_port, bootstrap_id) = Config::get_bootstrap_host(&settings)?;
-        let config_paths = ConfigPaths::new()?;
+
+        let data_dir = settings.get_string("data_dir").ok().map(PathBuf::from);
+        let config_paths = ConfigPaths::new(data_dir)?;
 
         let local_mode = settings.get_string("network_mode").is_err();
 

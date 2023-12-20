@@ -2,16 +2,16 @@
 use std::backtrace::Backtrace as StdTrace;
 use std::{pin::Pin, time::Duration};
 
+use freenet_stdlib::prelude::ContractKey;
 use futures::{future::BoxFuture, Future};
 use tokio::sync::mpsc::error::SendError;
 
 use crate::{
-    client_events::{ClientId, HostResult},
-    contract::ContractError,
+    client_events::HostResult,
+    contract::{ContractError, ExecutorError},
     message::{InnerMessage, NetMessage, Transaction, TransactionType},
     node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
-    DynError,
 };
 
 pub(crate) mod connect;
@@ -19,6 +19,31 @@ pub(crate) mod get;
 pub(crate) mod put;
 pub(crate) mod subscribe;
 pub(crate) mod update;
+
+pub(crate) trait Operation
+where
+    Self: Sized + TryInto<Self::Result>,
+{
+    type Message: InnerMessage + std::fmt::Display;
+
+    type Result;
+
+    fn load_or_init<'a>(
+        op_manager: &'a OpManager,
+        msg: &'a Self::Message,
+    ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>>;
+
+    fn id(&self) -> &Transaction;
+
+    #[allow(clippy::type_complexity)]
+    fn process_message<'a, CB: NetworkBridge>(
+        self,
+        conn_manager: &'a mut CB,
+        op_manager: &'a OpManager,
+        input: &'a Self::Message,
+        // client_id: Option<ClientId>,
+    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>>;
+}
 
 pub(crate) struct OperationResult {
     /// Inhabited if there is a message to return to the other peer.
@@ -36,7 +61,6 @@ pub(crate) async fn handle_op_request<Op, NB>(
     op_manager: &OpManager,
     network_bridge: &mut NB,
     msg: &Op::Message,
-    client_id: Option<ClientId>,
 ) -> Result<Option<OpEnum>, OpError>
 where
     Op: Operation,
@@ -47,12 +71,12 @@ where
     let result = {
         let OpInitialization { sender: s, op } = Op::load_or_init(op_manager, msg).await?;
         sender = s;
-        op.process_message(network_bridge, op_manager, msg, client_id)
-            .await
+        op.process_message(network_bridge, op_manager, msg).await
     };
     handle_op_result(op_manager, network_bridge, result, tx, sender).await
 }
 
+#[inline(always)]
 async fn handle_op_result<CB>(
     op_manager: &OpManager,
     network_bridge: &mut CB,
@@ -146,13 +170,37 @@ impl OpEnum {
             pub fn outcome(&self) -> OpOutcome;
             pub fn finalized(&self) -> bool;
             pub fn record_transfer(&mut self);
+            pub fn to_host_result(&self) -> HostResult;
         }
     }
-
-    pub fn to_host_result(&self, _client_id: ClientId) -> HostResult {
-        todo!()
-    }
 }
+
+macro_rules! try_from_op_enum {
+    ($op_enum:path, $op_type:ty, $transaction_type:expr) => {
+        impl TryFrom<OpEnum> for $op_type {
+            type Error = OpError;
+
+            fn try_from(value: OpEnum) -> Result<Self, Self::Error> {
+                match value {
+                    $op_enum(op) => Ok(op),
+                    other => Err(OpError::IncorrectTxType(
+                        $transaction_type,
+                        other.id().transaction_type(),
+                    )),
+                }
+            }
+        }
+    };
+}
+
+try_from_op_enum!(OpEnum::Put, put::PutOp, TransactionType::Put);
+try_from_op_enum!(OpEnum::Get, get::GetOp, TransactionType::Get);
+try_from_op_enum!(
+    OpEnum::Subscribe,
+    subscribe::SubscribeOp,
+    TransactionType::Subscribe
+);
+try_from_op_enum!(OpEnum::Update, update::UpdateOp, TransactionType::Update);
 
 pub(crate) enum OpOutcome<'a> {
     /// An op which involves a contract completed successfully.
@@ -187,7 +235,7 @@ pub(crate) enum OpError {
     #[error(transparent)]
     ContractError(#[from] ContractError),
     #[error(transparent)]
-    ExecutorError(DynError),
+    ExecutorError(#[from] ExecutorError),
 
     #[error("unexpected operation state")]
     UnexpectedOpState,
@@ -201,7 +249,6 @@ pub(crate) enum OpError {
     },
     #[error("failed notifying, channel closed")]
     NotificationError,
-    #[cfg(debug_assertions)]
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
     IncorrectTxType(TransactionType, TransactionType),
     #[error("op not present: {0}")]
@@ -211,7 +258,7 @@ pub(crate) enum OpError {
     #[error("op not available")]
     OpNotAvailable(#[from] OpNotAvailable),
 
-    // user for control flow
+    // used for control flow
     /// This is used as an early interrumpt of an op update when an op
     /// was sent throught the fast path back to the storage.
     #[error("early push of state into the op stack")]
@@ -253,27 +300,42 @@ impl<T> From<SendError<T>> for OpError {
     }
 }
 
-pub(crate) trait Operation
-where
-    Self: Sized + TryInto<Self::Result>,
-{
-    type Message: InnerMessage + std::fmt::Display;
+/// If the contract is not found, it will try to get it first if the `try_get` parameter is set.
+async fn start_subscription_request(op_manager: &OpManager, key: ContractKey, try_get: bool) {
+    let sub_op = subscribe::start_op(key.clone());
+    if let Err(error) = subscribe::request_subscribe(op_manager, sub_op).await {
+        if !try_get {
+            tracing::warn!(%error, "Error subscribing to contract");
+            return;
+        }
+        if let OpError::ContractError(ContractError::ContractNotFound(key)) = &error {
+            tracing::debug!(%key, "Contract not found, trying to get it first");
+            let get_op = get::start_op(key.clone(), true);
+            if let Err(error) = get::request_get(op_manager, get_op).await {
+                tracing::warn!(%error, "Error getting contract");
+            }
+        } else {
+            tracing::warn!(%error, "Error subscribing to contract");
+        }
+    }
+}
 
-    type Result;
-
-    fn load_or_init<'a>(
-        op_manager: &'a OpManager,
-        msg: &'a Self::Message,
-    ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>>;
-
-    fn id(&self) -> &Transaction;
-
-    #[allow(clippy::type_complexity)]
-    fn process_message<'a, CB: NetworkBridge>(
-        self,
-        conn_manager: &'a mut CB,
-        op_manager: &'a OpManager,
-        input: &'a Self::Message,
-        client_id: Option<ClientId>,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>>;
+async fn has_contract(op_manager: &OpManager, key: ContractKey) -> Result<bool, OpError> {
+    match op_manager
+        .notify_contract_handler(crate::contract::ContractHandlerEvent::GetQuery {
+            key,
+            fetch_contract: false,
+        })
+        .await?
+    {
+        crate::contract::ContractHandlerEvent::GetResponse {
+            response: Ok(crate::contract::StoreResponse { state: Some(_), .. }),
+            ..
+        } => Ok(true),
+        crate::contract::ContractHandlerEvent::GetResponse {
+            response: Ok(crate::contract::StoreResponse { state: None, .. }),
+            ..
+        } => Ok(false),
+        _ => Err(OpError::UnexpectedOpState),
+    }
 }

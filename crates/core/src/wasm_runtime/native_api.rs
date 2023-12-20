@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use wasmer::{Function, Imports};
 
-use super::wasm_runtime::InstanceInfo;
+use super::runtime::InstanceInfo;
 
 /// This is a map of starting addresses of the instance memory space.
 ///

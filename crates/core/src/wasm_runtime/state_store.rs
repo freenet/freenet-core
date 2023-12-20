@@ -11,12 +11,12 @@ pub enum StateStoreError {
     MissingContract(ContractKey),
 }
 
-impl From<StateStoreError> for crate::runtime::ContractError {
+impl From<StateStoreError> for crate::wasm_runtime::ContractError {
     fn from(value: StateStoreError) -> Self {
         match value {
-            StateStoreError::Any(err) => crate::runtime::ContractError::from(err),
+            StateStoreError::Any(err) => crate::wasm_runtime::ContractError::from(err),
             err @ StateStoreError::MissingContract(_) => {
-                crate::runtime::ContractError::from(Into::<DynError>::into(format!("{err}")))
+                crate::wasm_runtime::ContractError::from(Into::<DynError>::into(format!("{err}")))
             }
         }
     }

@@ -1,6 +1,7 @@
 //! Network messaging between peers.
 
 use std::{
+    borrow::Cow,
     fmt::Display,
     time::{Duration, SystemTime},
 };
@@ -29,7 +30,7 @@ pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
 ///
 /// A transaction may span different messages sent across the network.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
-pub struct Transaction {
+pub(crate) struct Transaction {
     id: Ulid,
 }
 
@@ -115,7 +116,7 @@ impl Transaction {
 impl<'a> arbitrary::Arbitrary<'a> for Transaction {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let ty: TransactionTypeId = u.arbitrary()?;
-        let bytes: u128 = u.arbitrary()?;
+        let bytes: u128 = Ulid::new().0;
         Ok(Self::update(ty.0, Ulid(bytes)))
     }
 }
@@ -257,7 +258,7 @@ pub(crate) enum NodeEvent {
     #[serde(skip)]
     Error(ConnectionError),
     Disconnect {
-        cause: Option<String>,
+        cause: Option<Cow<'static, str>>,
     },
 }
 
