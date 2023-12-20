@@ -622,7 +622,9 @@ impl Ring {
         mut missing_candidates: sync::mpsc::Receiver<PeerId>,
     ) -> Result<(), DynError> {
         /// Peers whose connection should be acquired.
-        fn should_swap<'a>(_connections: impl Iterator<Item = &'a PeerKeyLocation>) -> Vec<PeerId> {
+        fn should_disconnect_peers<'a>(
+            _connections: impl Iterator<Item = &'a PeerKeyLocation>,
+        ) -> Vec<PeerId> {
             // todo: instead we should be using ConnectionEvaluator here
             vec![]
         }
@@ -673,12 +675,15 @@ impl Ring {
 
             // eventually peers which failed to return candidates should be retried when enough time has passed
             let retry_missing_candidates_until = Instant::now() - retry_interval;
+
+            // remove all missing candidates which have been retried
             missing.split_off(&Reverse(retry_missing_candidates_until));
 
             let open_connections = self
                 .open_connections
                 .load(std::sync::atomic::Ordering::SeqCst);
 
+            // if there are no open connections, we need to acquire more
             if let Some(tx) = &live_tx {
                 if !live_tx_tracker.still_alive(tx) {
                     let _ = live_tx.take();
@@ -689,14 +694,20 @@ impl Ring {
                 }
             }
 
+            // If we have less than max connections then acquire more
+            // TODO: Use [Meter] to decide whether to add or remove connections
             if open_connections < self.max_connections {
                 self.fast_acquisition
                     .store(true, std::sync::atomic::Ordering::Release);
                 // requires more connections
+
                 let ideal_location = {
                     match self.own_location().location {
                         Some(location) => {
-                            let loc = self.topology_manager.read().get_best_candidate_location(&location);
+                            let loc = self
+                                .topology_manager
+                                .read()
+                                .get_best_candidate_location(&location);
                             match loc {
                                 Ok(loc) => loc,
                                 Err(_) => {
@@ -705,7 +716,7 @@ impl Ring {
                                     continue;
                                 }
                             }
-                        },
+                        }
                         None => {
                             tracing::warn!("Location is None, indicating the peer hasn't been assigned a location yet");
                             acquire_max_connections.tick().await;
@@ -731,9 +742,9 @@ impl Ring {
                 continue;
             }
 
-            let mut should_swap = {
+            let mut should_disconnect_peers = {
                 let peers = self.connections_by_location.read();
-                should_swap(
+                should_disconnect_peers(
                     peers
                         .values()
                         .flatten()
@@ -744,13 +755,16 @@ impl Ring {
                         .map(|conn| &conn.location),
                 )
             };
-            if !should_swap.is_empty() {
+            if !should_disconnect_peers.is_empty() {
                 self.fast_acquisition
                     .store(false, std::sync::atomic::Ordering::Release);
                 let ideal_location = {
                     match self.own_location().location {
                         Some(location) => {
-                            let loc = self.topology_manager.read().get_best_candidate_location(&location);
+                            let loc = self
+                                .topology_manager
+                                .read()
+                                .get_best_candidate_location(&location);
                             match loc {
                                 Ok(loc) => loc,
                                 Err(_) => {
@@ -759,7 +773,7 @@ impl Ring {
                                     continue;
                                 }
                             }
-                        },
+                        }
                         None => {
                             tracing::debug!("Location is None, indicating the peer hasn't been assigned a location yet");
                             check_interval.tick().await;
@@ -772,14 +786,14 @@ impl Ring {
                         ideal_location,
                         &missing.values().collect::<Vec<_>>(),
                         &notifier,
-                        should_swap.len(),
+                        should_disconnect_peers.len(),
                     )
                     .await
                     .map_err(|error| {
                         tracing::warn!(?error, "Shutting down connection maintenance task");
                         error
                     })?;
-                for peer in should_swap.drain(..) {
+                for peer in should_disconnect_peers.drain(..) {
                     notifier
                         .send(Either::Right(crate::message::NodeEvent::DropConnection(
                             peer,
