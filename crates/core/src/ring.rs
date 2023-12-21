@@ -156,6 +156,8 @@ impl LiveTransactionTracker {
     }
 }
 
+struct Score(f64);
+
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
 ///
@@ -180,7 +182,7 @@ pub(crate) struct Ring {
     /// then is more optimal to just use a vector for it's compact memory layout.
     subscribers: DashMap<ContractKey, Vec<PeerKeyLocation>>,
     /// Contracts this peer is subscribed to.
-    subscriptions: DashMap<ContractKey, PeerKeyLocation>,
+    seeding_contract: DashMap<ContractKey, Score>,
     /// Interim connections ongoing handshake or successfully open connections
     /// Is important to keep track of this so no more connections are accepted prematurely.
     open_connections: AtomicUsize,
@@ -214,6 +216,9 @@ impl Ring {
 
     /// Max number of subscribers for a contract.
     const MAX_SUBSCRIBERS: usize = 10;
+
+    /// All subscribers, including the upstream subscriber.
+    const TOTAL_MAX_SUBSCRIPTIONS: usize = Self::MAX_SUBSCRIBERS + 1;
 
     /// Above this number of remaining hops, randomize which node a message which be forwarded to.
     const DEFAULT_RAND_WALK_ABOVE_HTL: usize = 7;
@@ -293,7 +298,7 @@ impl Ring {
             own_location,
             peer_key,
             subscribers: DashMap::new(),
-            subscriptions: DashMap::new(),
+            seeding_contract: DashMap::new(),
             open_connections: AtomicUsize::new(0),
             live_tx_tracker: live_tx_tracker.clone(),
             event_register: Box::new(event_register),
@@ -349,32 +354,35 @@ impl Ring {
         }
     }
 
-    /// Return if a location is within appropiate subscription distance.
-    pub fn within_subscribing_distance(&self, loc: &Location) -> bool {
+    /// Return if a contract is within appropiate seeding distance.
+    pub fn should_seed(&self, key: &ContractKey) -> bool {
         const CACHING_DISTANCE: f64 = 0.05;
         const MAX_CACHED: usize = 100;
         const MIN_CACHED: usize = MAX_CACHED / 4;
         let caching_distance = Distance::new(CACHING_DISTANCE);
-        if self.subscriptions.len() < MIN_CACHED {
+        if self.seeding_contract.len() < MIN_CACHED {
             return true;
         }
-        self.subscriptions.len() < MAX_CACHED
-            && self
-                .own_location()
-                .location
-                .map(|own_loc| own_loc.distance(loc) <= caching_distance)
-                .unwrap_or(false)
+        let key_loc = Location::from(key);
+        let own_loc = self.own_location().location.expect("should be set");
+        if self.seeding_contract.len() < MAX_CACHED {
+            return own_loc.distance(key_loc) <= caching_distance;
+        }
+        false
     }
 
-    /// Whether this node already is subscribed to this contract or not.
-    #[inline]
-    pub fn is_subscribed_to_contract(&self, key: &ContractKey) -> bool {
-        self.subscriptions.contains_key(key)
+    fn calculate_seed_score(&self, key: &ContractKey) -> Score {
+        let location = self.own_location().location.expect("should be set");
+        let key_loc = Location::from(key);
+        let distance = key_loc.distance(location);
+        let score = 0.5 - distance.as_f64();
+        Score(score)
     }
 
+    /// Whether this node already is seeding to this contract or not.
     #[inline]
-    pub fn subscribed_to_contract(&self, key: &ContractKey) -> Option<PeerKeyLocation> {
-        self.subscriptions.get(key).map(|v| *v.value())
+    pub fn is_seeding_contract(&self, key: &ContractKey) -> bool {
+        self.seeding_contract.contains_key(key)
     }
 
     /// Update this node location.
@@ -551,6 +559,14 @@ impl Ring {
         }
     }
 
+    pub fn register_subscription(&self, contract: &ContractKey, subscriber: PeerKeyLocation) {
+        self.subscribers
+            .entry(contract.clone())
+            .or_insert(Vec::with_capacity(Self::TOTAL_MAX_SUBSCRIPTIONS))
+            .value_mut()
+            .push(subscriber);
+    }
+
     /// Will return an error in case the max number of subscribers has been added.
     pub fn add_subscriber(
         &self,
@@ -560,7 +576,7 @@ impl Ring {
         let mut subs = self
             .subscribers
             .entry(contract.clone())
-            .or_insert(Vec::with_capacity(Self::MAX_SUBSCRIBERS));
+            .or_insert(Vec::with_capacity(Self::TOTAL_MAX_SUBSCRIPTIONS));
         if subs.len() >= Self::MAX_SUBSCRIBERS {
             return Err(());
         }
@@ -576,8 +592,9 @@ impl Ring {
     }
 
     /// Add a new subscription for this peer.
-    pub fn add_subscription(&self, contract: ContractKey, peer: PeerKeyLocation) {
-        self.subscriptions.insert(contract, peer);
+    pub fn seed_contract(&self, contract: ContractKey) {
+        let seed_score = self.calculate_seed_score(&contract);
+        self.seeding_contract.insert(contract, seed_score);
     }
 
     pub fn subscribers_of(
