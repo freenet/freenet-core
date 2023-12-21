@@ -156,7 +156,22 @@ impl LiveTransactionTracker {
     }
 }
 
+#[derive(PartialEq, Clone, Copy)]
 struct Score(f64);
+
+impl PartialOrd for Score {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Score {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+impl Eq for Score {}
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
@@ -225,6 +240,12 @@ impl Ring {
 
     /// Max hops to be performed for certain operations (e.g. propagating connection of a peer in the network).
     const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
+
+    /// Max number of seeding contracts.
+    const MAX_SEEDING_CONTRACTS: usize = 100;
+
+    /// Min number of seeding contracts.
+    const MIN_SEEDING_CONTRACTS: usize = Self::MAX_SEEDING_CONTRACTS / 4;
 
     pub fn new<ER: NetEventRegister + Clone>(
         config: &NodeConfig,
@@ -357,18 +378,46 @@ impl Ring {
     /// Return if a contract is within appropiate seeding distance.
     pub fn should_seed(&self, key: &ContractKey) -> bool {
         const CACHING_DISTANCE: f64 = 0.05;
-        const MAX_CACHED: usize = 100;
-        const MIN_CACHED: usize = MAX_CACHED / 4;
         let caching_distance = Distance::new(CACHING_DISTANCE);
-        if self.seeding_contract.len() < MIN_CACHED {
+        if self.seeding_contract.len() < Self::MIN_SEEDING_CONTRACTS {
             return true;
         }
         let key_loc = Location::from(key);
         let own_loc = self.own_location().location.expect("should be set");
-        if self.seeding_contract.len() < MAX_CACHED {
+        if self.seeding_contract.len() < Self::MAX_SEEDING_CONTRACTS {
             return own_loc.distance(key_loc) <= caching_distance;
         }
-        false
+
+        let contract_score = self.calculate_seed_score(key);
+        let r = self
+            .seeding_contract
+            .iter()
+            .min_by_key(|v| *v.value())
+            .unwrap();
+        let min_score = *r.value();
+        contract_score > min_score
+    }
+
+    /// Add a new subscription for this peer.
+    pub fn seed_contract(&self, key: ContractKey) {
+        let seed_score = self.calculate_seed_score(&key);
+        if self.seeding_contract.len() < Self::MAX_SEEDING_CONTRACTS {
+            let contract_to_drop = self
+                .seeding_contract
+                .iter()
+                .min_by_key(|v| *v.value())
+                .unwrap()
+                .key()
+                .clone();
+            self.seeding_contract.remove(&contract_to_drop);
+            if let Some((_, _subscribers_of_contract)) = self.subscribers.remove(&contract_to_drop)
+            {
+                // fixme: somehow notify subscribers of this contract that they should subscribe to a new peer?
+                // fixme: also related, when a peer connection drops if we were subscribed to that peer we should
+                // seek a new subscriber for that contract
+            }
+        }
+        self.seeding_contract.insert(key, seed_score);
     }
 
     fn calculate_seed_score(&self, key: &ContractKey) -> Score {
@@ -589,12 +638,6 @@ impl Ring {
             }
         }
         Ok(())
-    }
-
-    /// Add a new subscription for this peer.
-    pub fn seed_contract(&self, contract: ContractKey) {
-        let seed_score = self.calculate_seed_score(&contract);
-        self.seeding_contract.insert(contract, seed_score);
     }
 
     pub fn subscribers_of(
