@@ -159,48 +159,65 @@ impl ResourceManager {
         resource_type: ResourceType,
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
         now: Instant,
-    ) {
+    ) -> TopologyAdjustment {
         let increase_usage_if_below_prop: RateProportion = RateProportion::new(0.5);
         let decrease_usage_if_above_prop: RateProportion = RateProportion::new(0.9);
 
         let usage = self.extrapolated_usage(resource_type, now);
         let total_limit: Rate = self.limits.get(resource_type);
         let usage_proportion = total_limit.proportion_of(&self.limits.get(resource_type));
-        if usage_proportion < increase_usage_if_below_prop {
+        let adjustment: TopologyAdjustment = if usage_proportion < increase_usage_if_below_prop {
             tracing::debug!(
                 "{:?} resource usage is too low, adding connections: {:?}",
                 resource_type,
                 usage_proportion
             );
-            self.add_connections(&usage, neighbor_locations);
+            self.add_connections(&usage, neighbor_locations)
         } else if usage_proportion > decrease_usage_if_above_prop {
             tracing::debug!(
                 "{:?} resource usage is too high, removing connections: {:?}",
                 resource_type,
                 usage_proportion
             );
-            self.remove_connections(&usage);
+
+            // Identify the peer that has the highest usage of the resource type relative to outbound requests
+            // to that peer
+            // 1. need to get outbound requests per neighbor
+            // 2. need to get usage per neighbor relative to value
+            // 3. need to get the peer with the highest usage per value
+            // 4. return that peer to be removed
         } else {
             tracing::debug!(
                 "{:?} resource usage is within acceptable bounds: {:?}",
                 resource_type,
                 usage_proportion
             );
-        }
+            TopologyAdjustment::NoChange
+        };
+        adjustment
     }
 
-    /// Adds a single connection (one at a time to avoid overshooting)
     fn add_connections(
         &mut self,
         usage: &Usage,
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
-    ) {
-        self.request_density_tracker.read().create_density_map(neighbor_locations);
+    ) -> TopologyAdjustment {
+        todo!()
     }
 
-    /// Calculates which peers should be deleted in order to bring the total
-    /// resource usage below the specified limit.
-    fn remove_connections(&mut self, usage: &Usage) {}
+    fn remove_connections(
+        &mut self,
+        resource_type: &ResourceType,
+        usage_rate: &Rate,
+        usage: &Usage,
+    ) -> TopologyAdjustment {
+    }
+}
+
+pub(crate) enum TopologyAdjustment {
+    AddConnections(Vec<Location>),
+    RemoveConnections(Vec<Connection>),
+    NoChange,
 }
 
 pub(crate) struct Usage {
