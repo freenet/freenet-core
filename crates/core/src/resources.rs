@@ -186,6 +186,7 @@ impl ResourceManager {
             // 2. need to get usage per neighbor relative to value
             // 3. need to get the peer with the highest usage per value
             // 4. return that peer to be removed
+            todo!()
         } else {
             tracing::debug!(
                 "{:?} resource usage is within acceptable bounds: {:?}",

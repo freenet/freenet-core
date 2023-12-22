@@ -695,7 +695,7 @@ impl Ring {
             }
 
             // If we have less than max connections then acquire more
-            // TODO: Use [Meter] to decide whether to add or remove connections
+            // TODO: Use [ResourceManager] to decide whether to add or remove connections
             if open_connections < self.max_connections {
                 self.fast_acquisition
                     .store(true, std::sync::atomic::Ordering::Release);
