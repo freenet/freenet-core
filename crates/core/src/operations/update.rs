@@ -27,7 +27,11 @@ impl UpdateOp {
     }
 
     pub fn finalized(&self) -> bool {
-        todo!()
+        self.stats
+            .as_ref()
+            .map(|s| matches!(s.step, RecordingStats::Completed))
+            .unwrap_or(false)
+            || matches!(self.state, Some(UpdateState::Finished { .. }))
     }
 
     pub fn record_transfer(&mut self) {}
@@ -135,12 +139,13 @@ impl Operation for UpdateOp {
                     target,
                     key,
                     new_state,
+                    htl,
                 } => {
                     let sender = op_manager.ring.own_location();
 
                     let key = contract.key();
                     tracing::debug!(
-                        "Requesting put for contract {} from {} to {}",
+                        "Requesting update for contract {} from {} to {}",
                         key,
                         sender.peer,
                         target.peer
@@ -174,7 +179,7 @@ impl Operation for UpdateOp {
                         tx = %id,
                         %key,
                         target = %target.peer,
-                        "Puttting contract at target peer",
+                        "Updating contract at target peer",
                     );
 
                     if is_subscribed_contract
@@ -183,7 +188,14 @@ impl Operation for UpdateOp {
                             .within_subscribing_distance(&Location::from(&key))
                     {
                         tracing::debug!(tx = %id, "Attempting contract value update");
-                        put_contract(op_manager, key.clone(), value.clone(), contract).await?;
+                        update_contract(
+                            op_manager,
+                            key.clone(),
+                            new_state.clone(),
+                            RelatedContracts::default(),
+                            contract,
+                        )
+                        .await?;
                         tracing::debug!(
                             tx = %id,
                             "Successfully updated a value for contract {} @ {:?}",
@@ -194,34 +206,37 @@ impl Operation for UpdateOp {
 
                     let last_hop = if let Some(new_htl) = htl.checked_sub(1) {
                         // forward changes in the contract to nodes closer to the contract location, if possible
-                        let put_here = forward_put(
+                        let put_here = forward_update(
                             op_manager,
                             conn_manager,
                             contract,
-                            value.clone(),
+                            new_state.clone(),
                             *id,
                             new_htl,
-                            vec![sender.peer],
                         )
                         .await;
                         if put_here && !is_subscribed_contract {
                             // if already subscribed the value was already put and merging succeeded
-                            put_contract(
-                                op_manager,
-                                key.clone(),
-                                value.clone(),
-                                RelatedContracts::default(),
-                                contract,
-                            )
-                            .await?;
+
+                            // if is not subscribed it means it doesnt exists here and there's
+                            // nothing to update then
+
+                            // update_contract(
+                            //     op_manager,
+                            //     key.clone(),
+                            //     new_state.clone(),
+                            //     RelatedContracts::default(),
+                            //     contract,
+                            // )
+                            // .await?;
                         }
                         put_here
                     } else {
                         // should put in this location, no hops left
-                        put_contract(
+                        update_contract(
                             op_manager,
                             key.clone(),
-                            value.clone(),
+                            new_state.clone(),
                             RelatedContracts::default(),
                             contract,
                         )
@@ -237,7 +252,7 @@ impl Operation for UpdateOp {
                         self.state,
                         (broadcast_to, *sender),
                         key.clone(),
-                        (contract.clone(), value.clone()),
+                        (contract.clone(), new_state.clone()),
                     )
                     .await
                     {
@@ -258,7 +273,7 @@ impl Operation for UpdateOp {
                     let target = op_manager.ring.own_location();
 
                     tracing::debug!("Attempting contract value update");
-                    let new_value = put_contract(
+                    let new_value = update_contract(
                         op_manager,
                         key.clone(),
                         new_state.clone(),
@@ -484,6 +499,18 @@ impl Operation for UpdateOp {
     }
 }
 
+async fn try_to_broadcast(
+    id: Transaction,
+    last_hop: bool,
+    op_manager: &OpManager,
+    state: Option<UpdateState>,
+    sender: (Vec<PeerKeyLocation>, PeerKeyLocation),
+    clone_1: ContractKey,
+    clone_2: _,
+) -> Result<(&WrappedState, Option<UpdateMsg>), OpError> {
+    todo!()
+}
+
 async fn forward_update<NB: NetworkBridge>(
     op_manager: &OpManager,
     conn_manager: &mut NB,
@@ -537,6 +564,7 @@ mod messages {
             target: PeerKeyLocation,
             key: ContractKey,
             new_state: WrappedState,
+            htl: usize,
         },
         /// Forward a contract and it's latest value to an other node
         UpdateForward {
