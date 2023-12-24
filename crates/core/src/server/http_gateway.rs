@@ -62,8 +62,8 @@ impl HttpGateway {
         let router = Router::new()
             .route("/", get(home))
             .route("/contract/web/:key/", get(web_home))
-            .route("/contract/api/GET:key/", get(web_home))
-            .route("/contract/api/POST:key/", get(web_home))
+            .route("/contract/api/GET/:key/", get(web_home))
+            .route("/contract/api/POST/:key/", get(web_home))
             .with_state(config)
             .route("/contract/web/:key/*path", get(web_subpages))
             .layer(Extension(HttpGatewayRequest(proxy_request_sender)));
