@@ -226,8 +226,14 @@ mod tests {
     #[test]
     fn test_create_density_map() {
         let mut neighbors = RwLock::new(BTreeMap::new());
-        neighbors.write().unwrap().insert(Location::new(0.2), vec![]);
-        neighbors.write().unwrap().insert(Location::new(0.6), vec![]);
+        neighbors
+            .write()
+            .unwrap()
+            .insert(Location::new(0.2), vec![]);
+        neighbors
+            .write()
+            .unwrap()
+            .insert(Location::new(0.6), vec![]);
 
         let mut neighbors = neighbors.read();
 

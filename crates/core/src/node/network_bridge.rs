@@ -83,7 +83,8 @@ impl Clone for ConnectionError {
     }
 }
 
-pub(crate) fn event_loop_notification_channel() -> (EventLoopNotificationsReceiver, EventLoopNotificationsSender) {
+pub(crate) fn event_loop_notification_channel(
+) -> (EventLoopNotificationsReceiver, EventLoopNotificationsSender) {
     let (notification_tx, notification_rx) = mpsc::channel(100);
     (
         EventLoopNotificationsReceiver(notification_rx),

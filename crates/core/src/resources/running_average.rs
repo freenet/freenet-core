@@ -20,11 +20,7 @@ impl RunningAverage {
         }
     }
 
-    pub fn insert(&mut self, value: f64) {
-        self.insert_with_time(Instant::now(), value);
-    }
-
-    fn insert_with_time(&mut self, now: Instant, value: f64) {
+    pub(crate) fn insert_with_time(&mut self, now: Instant, value: f64) {
         // Require that now is after the last sample time
         if let Some((last_sample_time, _)) = self.samples.back() {
             assert!(now >= *last_sample_time);
@@ -39,11 +35,7 @@ impl RunningAverage {
         }
     }
 
-    pub fn get_rate(&self) -> Option<Rate> {
-        self.get_rate_at_time(Instant::now())
-    }
-
-    fn get_rate_at_time(&self, now: Instant) -> Option<Rate> {
+    pub(crate) fn get_rate_at_time(&self, now: Instant) -> Option<Rate> {
         if self.samples.is_empty() {
             return None;
         }
