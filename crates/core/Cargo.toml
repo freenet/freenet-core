@@ -38,7 +38,7 @@ fastrand = { workspace = true }
 flatbuffers = "23.5.26"
 futures = "0.3.21"
 headers = "0.4"
-itertools = "0.11"
+itertools = "0.12"
 libp2p = { default-features = false, features = ["autonat", "dns", "ed25519", "identify", "macros", "noise", "ping", "tcp", "tokio", "yamux"], version = "0.52.3" }
 libp2p-identity = { features = ["ed25519", "rand"], version = "0.2.7" }
 notify = "6"
