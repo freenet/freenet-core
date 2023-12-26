@@ -470,7 +470,7 @@ mod tests {
         let mut resource_manager = setup_resource_manager(1000.0);
         // Generate 5 peers with locations specified in a vec!
         let mut peers: Vec<PeerKeyLocation> = generate_random_peers(5);
-        let peer_locations: Vec<Location> = vec![0.1, 0.3, 0.5, 0.7, 0.9]
+        let peer_location: Vec<Location> = vec![0.1, 0.3, 0.5, 0.7, 0.9]
             .iter()
             .map(|&x| Location::new(x))
             .collect();
