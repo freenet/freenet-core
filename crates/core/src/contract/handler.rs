@@ -358,6 +358,17 @@ pub(crate) enum ContractHandlerEvent {
         key: ContractKey,
         response: Result<StoreResponse, ExecutorError>,
     },
+    /// Updates a supposedly existing contract in this node
+    UpdateQuery {
+        key: ContractKey,
+        state: WrappedState,
+        related_contracts: RelatedContracts<'static>,
+        contract: Option<ContractContainer>,
+    },
+    /// The response to an update query
+    UpdateResponse {
+        new_value: Result<WrappedState, ExecutorError>,
+    },
 }
 
 impl std::fmt::Display for ContractHandlerEvent {
@@ -397,6 +408,28 @@ impl std::fmt::Display for ContractHandlerEvent {
                 }
                 Err(_) => {
                     write!(f, "get query failed {{ {key} }}",)
+                }
+            },
+            ContractHandlerEvent::UpdateQuery { key, contract, .. } => {
+                if let Some(contract) = contract {
+                    use std::fmt::Write;
+                    let mut params = String::new();
+                    params.push_str("0x");
+                    for b in contract.params().as_ref().iter().take(8) {
+                        write!(&mut params, "{:02x}", b)?;
+                    }
+                    params.push_str("...");
+                    write!(f, "update query {{ {key}, params: {params} }}",)
+                } else {
+                    write!(f, "update query {{ {key} }}")
+                }
+            }
+            ContractHandlerEvent::UpdateResponse { new_value } => match new_value {
+                Ok(v) => {
+                    write!(f, "update query response {{ {v} }}",)
+                }
+                Err(e) => {
+                    write!(f, "update query failed {{ {e} }}",)
                 }
             },
         }

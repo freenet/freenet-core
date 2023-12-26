@@ -563,7 +563,11 @@ impl Operation for PutOp {
 }
 
 impl OpManager {
-    fn get_broadcast_targets(&self, key: &ContractKey, sender: &PeerId) -> Vec<PeerKeyLocation> {
+    pub(crate) fn get_broadcast_targets(
+        &self,
+        key: &ContractKey,
+        sender: &PeerId,
+    ) -> Vec<PeerKeyLocation> {
         let mut subscribers = self
             .ring
             .subscribers_of(key)
