@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::time::{Duration, Instant};
 
@@ -46,11 +47,9 @@ impl Meter {
         resource: &ResourceType,
         at_time: Instant,
     ) -> Option<Rate> {
-        // Try to get a mutable reference to the AttributionMeters for the given attribution
-        match self.attribution_meters.get_mut(attribution) {
+        match self.attribution_meters.get(attribution) {
             Some(attribution_meters) => {
-                // Try to get a mutable reference to the Meter for the given resource
-                match attribution_meters.map.get_mut(&resource) {
+                match attribution_meters.map.get(&resource) {
                     Some(meter) => {
                         // Get the current measurement value
                         meter.get_rate_at_time(at_time)
@@ -76,7 +75,7 @@ impl Meter {
     /// # Returns
     ///
     /// An `Option<Rate>` which is `Some(rate)` if an estimated rate is available, or `None` if it can't be determined.
-    pub(crate) fn get_estimated_usage_rate(
+    pub(crate) fn get_adjusted_usage_rate(
         &mut self,
         resource: &ResourceType,
         at_time: Instant,
@@ -96,6 +95,26 @@ impl Meter {
             }
             None => None,
         }
+    }
+
+    /// Returns a HashMap of AttributionSource to Rate of the usage rate for
+    /// each attribution source. This does not adjust the usage rate for sources
+    /// that are ramping up.
+    pub(crate) fn get_usage_rates(
+        &self,
+        resource: &ResourceType,
+        at_time: Instant,
+    ) -> HashMap<AttributionSource, Rate> {
+        let mut rates = HashMap::new();
+
+        for attribution_meter in self.attribution_meters.iter() {
+            let attribution = attribution_meter.key();
+            if let Some(rate) = self.attributed_usage_rate(attribution, resource, at_time) {
+                rates.insert(attribution.clone(), rate);
+            }
+        }
+
+        rates
     }
 
     /// Estimates the usage rate for a given resource type based on existing data.

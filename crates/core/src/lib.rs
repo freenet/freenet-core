@@ -53,3 +53,6 @@ pub mod dev_tool {
     pub use ring::Location;
     pub use wasm_runtime::{ContractStore, DelegateStore, Runtime, SecretsStore, StateStore};
 }
+
+#[cfg(test)]
+pub mod test_utils;

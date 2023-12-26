@@ -23,7 +23,7 @@ impl RunningAverage {
     pub(crate) fn insert_with_time(&mut self, now: Instant, value: f64) {
         // Require that now is after the last sample time
         if let Some((last_sample_time, _)) = self.samples.back() {
-            assert!(now >= *last_sample_time);
+            debug_assert!(now >= *last_sample_time);
         }
         self.total_sample_count += 1;
         if self.samples.len() < self.max_samples {

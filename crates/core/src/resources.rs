@@ -98,6 +98,10 @@ const REQUEST_DENSITY_TRACKER_SAMPLE_SIZE: usize = 5000;
 
 const OUTBOUND_REQUEST_COUNTER_WINDOW_SIZE: usize = 10000;
 
+const MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION: f64 = 0.5;
+
+const MAXIMUM_DESIRED_RESOURCE_USAGE_PROPORTION: f64 = 0.9;
+
 pub(crate) struct ResourceManager {
     limits: Limits,
     meter: Meter,
@@ -152,21 +156,25 @@ impl ResourceManager {
     fn extrapolated_usage(&mut self, resource_type: ResourceType, now: Instant) -> Usage {
         let mut total_usage: Rate = Rate::new_per_second(0.0);
         let mut usage_per_source: HashMap<AttributionSource, Rate> = HashMap::new();
+
+        // Step 1: Collect data
+        let mut usage_data = Vec::new();
         for source_entry in self.source_creation_times.iter() {
             let source = source_entry.key();
             let creation_time = source_entry.value();
             let ramping_up = now.duration_since(*creation_time) <= SOURCE_RAMP_UP_TIME;
+            usage_data.push((source.clone(), ramping_up));
+        }
+
+        // Step 2: Process data
+        for (source, ramping_up) in usage_data {
             let usage_rate: Option<Rate> = if ramping_up {
-                self.meter.get_estimated_usage_rate(&resource_type, now)
+                self.meter.get_adjusted_usage_rate(&resource_type, now)
             } else {
-                self.meter
-                    .attributed_usage_rate(source, &resource_type, now)
+                self.attributed_usage_rate(&source, &resource_type, now)
             };
             total_usage += usage_rate.unwrap_or(Rate::new_per_second(0.0));
-            usage_per_source.insert(
-                source.clone(),
-                usage_rate.unwrap_or(Rate::new_per_second(0.0)),
-            );
+            usage_per_source.insert(source, usage_rate.unwrap_or(Rate::new_per_second(0.0)));
         }
 
         Usage {
@@ -175,36 +183,47 @@ impl ResourceManager {
         }
     }
 
+    pub(crate) fn attributed_usage_rate(
+        &mut self,
+        source: &AttributionSource,
+        resource_type: &ResourceType,
+        now: Instant,
+    ) -> Option<Rate> {
+        self.meter.attributed_usage_rate(source, resource_type, now)
+    }
+
     // A function that will determine if any peers should be added or removed based on
     // the current resource usage, and either add or remove them
     fn adjust_topology(
         &mut self,
         resource_type: ResourceType,
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
-        now: Instant,
+        at_time: Instant,
     ) -> TopologyAdjustment {
-        let increase_usage_if_below_prop: RateProportion = RateProportion::new(0.5);
-        let decrease_usage_if_above_prop: RateProportion = RateProportion::new(0.9);
+        let increase_usage_if_below: RateProportion =
+            RateProportion::new(MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION);
+        let decrease_usage_if_above: RateProportion =
+            RateProportion::new(MAXIMUM_DESIRED_RESOURCE_USAGE_PROPORTION);
 
-        let usage = self.extrapolated_usage(resource_type, now);
+        let usage = self.extrapolated_usage(resource_type, at_time);
         let total_limit: Rate = self.limits.get(resource_type);
         let usage_proportion = total_limit.proportion_of(&self.limits.get(resource_type));
         let adjustment: anyhow::Result<TopologyAdjustment> =
-            if usage_proportion < increase_usage_if_below_prop {
+            if usage_proportion < increase_usage_if_below {
                 tracing::debug!(
                     "{:?} resource usage is too low, adding connections: {:?}",
                     resource_type,
                     usage_proportion
                 );
                 self.select_connections_to_add(&usage, neighbor_locations)
-            } else if usage_proportion > decrease_usage_if_above_prop {
+            } else if usage_proportion > decrease_usage_if_above {
                 tracing::debug!(
                     "{:?} resource usage is too high, removing connections: {:?}",
                     resource_type,
                     usage_proportion
                 );
 
-                Ok(self.select_connections_to_remove(&resource_type, &usage.total, &usage))
+                Ok(self.select_connections_to_remove(&resource_type, &usage.total, at_time))
             } else {
                 tracing::debug!(
                     "{:?} resource usage is within acceptable bounds: {:?}",
@@ -253,20 +272,20 @@ impl ResourceManager {
         &mut self,
         resource_type: &ResourceType,
         usage_rate: &Rate,
-        usage: &Usage,
+        at_time: Instant,
     ) -> TopologyAdjustment {
         let function_span = span!(Level::INFO, "remove_connections");
         let _enter = function_span.enter();
 
         let mut worst: Option<(PeerKeyLocation, f64)> = None;
 
-        for (source, source_usage) in &usage.per_source {
+        for (source, source_usage) in self.meter.get_usage_rates(resource_type, at_time) {
             let loop_span = span!(Level::DEBUG, "source_loop", ?source);
             let _loop_enter = loop_span.enter();
 
             event!(Level::DEBUG, "Checking source");
 
-            if let Some(creation_time) = self.source_creation_times.get(source) {
+            if let Some(creation_time) = self.source_creation_times.get(&source) {
                 if Instant::now().duration_since(*creation_time) <= SOURCE_RAMP_UP_TIME {
                     event!(Level::DEBUG, "Source is in ramp-up time, skipping");
                     continue;
@@ -281,14 +300,14 @@ impl ResourceManager {
                     let peer_span = span!(Level::DEBUG, "peer_processing", ?peer);
                     let _peer_enter = peer_span.enter();
 
-                    let value_per_usage = self.outbound_request_counter.get_request_count(peer)
+                    let value_per_usage = self.outbound_request_counter.get_request_count(&peer)
                         as f64
                         / source_usage.per_second();
 
                     event!(
                         Level::DEBUG,
                         request_count =
-                            self.outbound_request_counter.get_request_count(peer) as f64,
+                            self.outbound_request_counter.get_request_count(&peer) as f64,
                         usage = source_usage.per_second(),
                         value_per_usage = value_per_usage
                     );
@@ -370,6 +389,7 @@ mod tests {
     use crate::resources::{Limits, ResourceManager};
 
     use super::*;
+    use crate::test_utils::setup_tracing;
     use std::time::Instant;
 
     #[test]
@@ -404,13 +424,13 @@ mod tests {
     }
 
     #[test]
-    fn test_resource_manager_should_recommend_removal_of_peers_if_limits_exceeded() {
+    fn test_remove_connections() {
         setup_tracing();
 
         let mut resource_manager = setup_resource_manager(1000.0);
         let peers = generate_random_peers(5);
         // Total bw usage will be way higher than the limit of 1000
-        let bw_usage_by_peer = vec![1000, 1500, 1500, 1000, 1000];
+        let bw_usage_by_peer = vec![1000, 1100, 1200, 2000, 1600];
         // Report usage from outside the ramp-up time window so it isn't ignored
         let report_time = Instant::now() - SOURCE_RAMP_UP_TIME - Duration::from_secs(30);
         report_resource_usage(
@@ -419,9 +439,10 @@ mod tests {
             &bw_usage_by_peer,
             report_time,
         );
-        let requests_per_peer = vec![10, 10, 20, 5, 5];
+        let requests_per_peer = vec![20, 19, 18, 9, 9];
         report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
         let worst_ix = find_worst_peer(&peers, &bw_usage_by_peer, &requests_per_peer);
+        assert_eq!(worst_ix, 3);
         let worst_peer = &peers[worst_ix];
         let mut neighbor_locations = BTreeMap::new();
         for peer in &peers {
@@ -431,7 +452,7 @@ mod tests {
         let adjustment = resource_manager.adjust_topology(
             ResourceType::InboundBandwidthBytes,
             &neighbor_locations,
-            Instant::now() - SOURCE_RAMP_UP_TIME,
+            Instant::now(),
         );
         match adjustment {
             TopologyAdjustment::RemoveConnections(peers) => {
@@ -440,6 +461,48 @@ mod tests {
             }
             _ => panic!("Expected to remove a peer, adjustment was {:?}", adjustment),
         }
+    }
+
+    #[test]
+    fn test_add_connections() {
+        setup_tracing();
+
+        let mut resource_manager = setup_resource_manager(1000.0);
+        // Generate 5 peers with locations specified in a vec!
+        let mut peers: Vec<PeerKeyLocation> = generate_random_peers(5);
+        let peer_locations: Vec<Location> = vec![0.1, 0.3, 0.5, 0.7, 0.9]
+            .iter()
+            .map(|&x| Location::new(x))
+            .collect();
+        for (ix, mut peer) in peers.iter_mut().enumerate() {
+            peer.location = Some(peer_locations[ix]);
+        }
+
+        // Total bw usage will be way lower than MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION
+        let bw_usage_by_peer = vec![10, 20, 30, 25, 30];
+        // Report usage from outside the ramp-up time window so it isn't ignored
+        let report_time = Instant::now() - SOURCE_RAMP_UP_TIME - Duration::from_secs(30);
+        report_resource_usage(
+            &mut resource_manager,
+            &peers,
+            &bw_usage_by_peer,
+            report_time,
+        );
+        let requests_per_peer = vec![20, 19, 18, 9, 9];
+        report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
+        let worst_ix = find_worst_peer(&peers, &bw_usage_by_peer, &requests_per_peer);
+        assert_eq!(worst_ix, 3);
+        let worst_peer = &peers[worst_ix];
+        let mut neighbor_locations = BTreeMap::new();
+        for peer in &peers {
+            neighbor_locations.insert(peer.location.unwrap(), vec![]);
+        }
+
+        let adjustment = resource_manager.adjust_topology(
+            ResourceType::InboundBandwidthBytes,
+            &neighbor_locations,
+            Instant::now(),
+        );
     }
 
     fn setup_resource_manager(rate: f64) -> ResourceManager {
@@ -463,12 +526,15 @@ mod tests {
         now: Instant,
     ) {
         for (i, peer) in peers.iter().enumerate() {
-            resource_manager.report_resource_usage(
-                &AttributionSource::Peer(peer.clone()),
-                ResourceType::InboundBandwidthBytes,
-                500.0 * (i as f64),
-                now,
-            );
+            for seconds in 1..60 {
+                let report_time = now - Duration::from_secs(60 - seconds);
+                resource_manager.report_resource_usage(
+                    &AttributionSource::Peer(peer.clone()),
+                    ResourceType::InboundBandwidthBytes,
+                    bw_usage_by_peer[i] as f64,
+                    report_time,
+                );
+            }
         }
     }
 
@@ -536,13 +602,4 @@ mod tests {
             Rate::new_per_second(2000.0)
         );
     }
-}
-
-fn setup_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_line_number(true)
-        .with_file(true) // Enable line numbers
-        .with_span_events(FmtSpan::CLOSE) // You can customize this as needed
-        .init();
 }
