@@ -57,7 +57,7 @@ pub struct NetworkProcessConfig {
     #[arg(long, default_value_t = Process::Supervisor)]
     pub mode: Process,
     #[arg(long)]
-    id: Option<usize>,
+    id: Option<String>,
 }
 
 pub(super) async fn run(
@@ -75,9 +75,9 @@ pub(super) async fn run(
             Ok(())
         }
         Process::Peer => {
-            if let Some(peer_id) = cmd_config.id {
-                let peer = Peer::new(peer_id).await;
-                let _ = peer.run(config, peer_id).await;
+            if let Some(peer_id) = cmd_config.id.clone() {
+                let peer = Peer::new(peer_id.clone()).await?;
+                peer.run(config, peer_id).await?;
             }
             Ok(())
         }
@@ -138,7 +138,7 @@ impl SubProcess {
             .kill_on_drop(true)
             .args(cmd_args)
             .arg("--id")
-            .arg(label.number().to_string())
+            .arg(label.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -197,6 +197,8 @@ impl Supervisor {
             return Err(NetworkSimulationError::ServerStartError(
                 error_msg.to_string(),
             ));
+        } else {
+            tracing::info!("Server started");
         }
         Ok(())
     }
@@ -252,6 +254,7 @@ async fn config_handler(
 ) -> axum::response::Response {
     let config = peers_config.lock().await;
     let id = NodeLabel::from(peer_id.as_str());
+    tracing::info!("Received config request for peer_id: {}", peer_id);
     match config.get(&id) {
         Some(node_config) => axum::response::Json(node_config.clone()).into_response(),
         None => {
@@ -293,32 +296,30 @@ async fn handle_socket(mut socket: WebSocket) {
 }
 
 struct Peer {
-    id: usize,
+    id: String,
     config: NodeConfig,
     ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
 }
 
 impl Peer {
-    async fn new(peer_id: usize) -> Self {
-        let config_url = format!("http://localhost:3000/config/{}", peer_id);
-        let peer_config: NodeConfig = reqwest::get(&config_url)
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+    async fn new(peer_id: String) -> Result<Self, Error> {
         let (ws_stream, _) = tokio_tungstenite::connect_async("ws://localhost:3000/ws")
             .await
             .expect("Failed to connect to supervisor");
 
-        Peer {
+        let config_url = format!("http://localhost:3000/config/{}", peer_id);
+        let response = reqwest::get(&config_url).await?;
+        tracing::info!("Response config from server: {:?}", response);
+        let peer_config = response.json::<NodeConfig>().await?;
+
+        Ok(Peer {
             id: peer_id,
             config: peer_config,
             ws_client: Arc::new(Mutex::new(ws_stream)),
-        }
+        })
     }
 
-    async fn run(&self, test_config: &super::TestConfig, peer_id: usize) -> anyhow::Result<()> {
+    async fn run(&self, test_config: &super::TestConfig, peer_id: String) -> anyhow::Result<()> {
         let (user_ev_controller, mut receiver_ch) =
             tokio::sync::watch::channel((0, self.config.peer_id));
         receiver_ch.borrow_and_update();
@@ -329,8 +330,9 @@ impl Peer {
                 .seed
                 .expect("seed should be set for child process"),
         );
+        let peer_id = NodeLabel::from(peer_id.as_str()).number();
         memory_event_generator.rng_params(
-            self.id,
+            peer_id,
             test_config.gateways + test_config.nodes,
             test_config
                 .max_contract_number
@@ -382,7 +384,7 @@ mod tests {
     async fn test_supervisor() {
         let network_config = NetworkProcessConfig {
             mode: Process::Supervisor,
-            id: Some(0),
+            id: None,
         };
         let config = super::super::TestConfig {
             name: Some("TestName".to_string()),
