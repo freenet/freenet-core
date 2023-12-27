@@ -36,7 +36,7 @@ pub enum NetworkSimulationError {
     ServerStartError(String),
 }
 
-#[derive(clap::Parser, Default, Clone)]
+#[derive(Default, Clone, clap::ValueEnum)]
 pub enum Process {
     #[default]
     Supervisor,
@@ -54,7 +54,7 @@ impl Display for Process {
 
 #[derive(clap::Parser, Clone)]
 pub struct NetworkProcessConfig {
-    #[clap(subcommand)]
+    #[arg(long, default_value_t = Process::Supervisor)]
     pub mode: Process,
     #[arg(long)]
     id: Option<usize>,
@@ -128,7 +128,7 @@ impl SubProcess {
 
         args.push("network".to_owned());
         args.push("--mode".to_owned());
-        args.push("child".to_owned());
+        args.push("peer".to_owned());
 
         args
     }
