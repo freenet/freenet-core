@@ -1,7 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::Error;
-use freenet::dev_tool::{PeerCliConfig, SimNetwork};
+use freenet::dev_tool::SimNetwork;
 
 mod multiple_process;
 mod network;

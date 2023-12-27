@@ -16,7 +16,7 @@ use freenet::dev_tool::{
 };
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use http::{Response, StatusCode};
 use libp2p_identity::Keypair;
 use reqwest;
@@ -24,11 +24,17 @@ use std::fmt::Display;
 use std::process::Stdio;
 use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use thiserror::Error;
 use tokio::net::TcpStream;
-use tokio::process::{ChildStdout, Command};
+use tokio::process::Command;
 use tokio::sync::{oneshot, Mutex};
-use tokio::task::JoinHandle;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+#[derive(Debug, Error)]
+pub enum NetworkSimulationError {
+    #[error("Server start failed")]
+    ServerStartError(String),
+}
 
 #[derive(clap::Parser, Default, Clone)]
 pub enum Process {
@@ -63,14 +69,15 @@ pub(super) async fn run(
             let mut network = super::config_sim_network(config).await.unwrap();
             network.debug(); // set to avoid deleting temp dirs created
 
-            let mut supervisor = Supervisor::new(config, &mut network).await;
+            let mut supervisor = Supervisor::new(&mut network).await;
+            supervisor.start_server().await?;
             supervisor.run_network(config, network).await;
             Ok(())
         }
         Process::Peer => {
             if let Some(peer_id) = cmd_config.id {
                 let peer = Peer::new(peer_id).await;
-                peer.run(config, peer_id).await;
+                let _ = peer.run(config, peer_id).await;
             }
             Ok(())
         }
@@ -149,7 +156,7 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub async fn new(config: &super::TestConfig, network: &mut SimNetwork) -> Self {
+    pub async fn new(network: &mut SimNetwork) -> Self {
         let peers = network.build_peers();
         let peers_config = Arc::new(Mutex::new(peers.into_iter().collect::<HashMap<_, _>>()));
 
@@ -160,10 +167,10 @@ impl Supervisor {
         }
     }
 
-    async fn server_task(
-        peers_config: Arc<Mutex<HashMap<NodeLabel, NodeConfig>>>,
-        startup_sender: oneshot::Sender<()>,
-    ) -> JoinHandle<Result<(), ()>> {
+    pub async fn start_server(&mut self) -> Result<(), NetworkSimulationError> {
+        let (startup_sender, startup_receiver) = oneshot::channel();
+        let peers_config = self.peers_config.clone();
+
         let router = Router::new().route("/ws", get(ws_handler)).route(
             "/config/:peer_id",
             get(|path: Path<String>| config_handler(peers_config, path)),
@@ -181,20 +188,21 @@ impl Supervisor {
                 tracing::error!("Error while running HTTP supervisor server: {e}");
                 ()
             })
-        })
+        });
+
+        // Wait for the startup_receiver message
+        if startup_receiver.await.is_err() {
+            let error_msg = "Server startup failed";
+            tracing::error!(error_msg);
+            return Err(NetworkSimulationError::ServerStartError(
+                error_msg.to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub async fn run_network(&mut self, test_config: &TestConfig, network: SimNetwork) {
-        let (startup_sender, startup_receiver) = oneshot::channel();
-        let server_task = Self::server_task(self.peers_config.clone(), startup_sender);
         let (user_ev_controller, event_rx) = tokio::sync::mpsc::channel(1);
-
-        // Wait for server to start
-        tokio::pin!(server_task);
-        if startup_receiver.await.is_err() {
-            tracing::error!("Server failed to start");
-            return;
-        }
 
         let cmd_args = SubProcess::build_command(&test_config, test_config.seed());
         for (label, config) in self.peers_config.lock().await.iter() {
