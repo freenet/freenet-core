@@ -11,12 +11,12 @@ use axum::{
     Router,
 };
 use freenet::dev_tool::{
-    EventChain, MemoryEventsGen, NetworkEventGenerator, NodeConfig, NodeLabel, OperationMode,
-    PeerCliConfig, PeerId, SimNetwork,
+    EventChain, Executor, MemoryEventsGen, NetworkEventGenerator, NodeConfig, NodeLabel,
+    OperationMode, PeerCliConfig, PeerId, Runtime, SimNetwork,
 };
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use http::{Response, StatusCode};
 use libp2p_identity::Keypair;
 use reqwest;
@@ -133,7 +133,11 @@ impl SubProcess {
         args
     }
 
-    fn start(cmd_args: &[String], label: &NodeLabel, id: PeerId) -> anyhow::Result<Self, Error> {
+    async fn start(
+        cmd_args: &[String],
+        label: &NodeLabel,
+        id: PeerId,
+    ) -> anyhow::Result<Self, Error> {
         let child = Command::new("fdev")
             .kill_on_drop(true)
             .args(cmd_args)
@@ -143,6 +147,8 @@ impl SubProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()?;
+        // Wait for the child process to start
+        tokio::time::sleep(Duration::from_millis(100)).await;
         Ok(Self { child, id })
     }
 }
@@ -208,7 +214,9 @@ impl Supervisor {
 
         let cmd_args = SubProcess::build_command(&test_config, test_config.seed());
         for (label, config) in self.peers_config.lock().await.iter() {
-            let process = SubProcess::start(&cmd_args, &label, config.peer_id).unwrap();
+            let process = SubProcess::start(&cmd_args, &label, config.peer_id)
+                .await
+                .unwrap();
             self.processes.insert(config.peer_id, process);
         }
 
@@ -256,7 +264,10 @@ async fn config_handler(
     let id = NodeLabel::from(peer_id.as_str());
     tracing::info!("Received config request for peer_id: {}", peer_id);
     match config.get(&id) {
-        Some(node_config) => axum::response::Json(node_config.clone()).into_response(),
+        Some(node_config) => {
+            tracing::info!("Found config for peer_id: {}", peer_id);
+            axum::response::Json(node_config.clone()).into_response()
+        }
         None => {
             let body = format!("No config found for peer_id: {}", peer_id);
             let response = Response::builder()
@@ -269,8 +280,9 @@ async fn config_handler(
     }
 }
 
-async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(handle_socket)
+async fn ws_handler(ws: WebSocketUpgrade) -> axum::response::Response {
+    let on_upgrade = move |ws: WebSocket| async move { handle_socket(ws).await };
+    ws.on_upgrade(on_upgrade)
 }
 
 async fn handle_socket(mut socket: WebSocket) {
@@ -284,7 +296,9 @@ async fn handle_socket(mut socket: WebSocket) {
                         println!("Received message: {:?}", msg);
                         todo!("handle message")
                     }
-                    Message::Text(_) => {}
+                    Message::Text(error_msg) => {
+                        tracing::error!("Received error message: {:?}", error_msg);
+                    }
                     Message::Ping(_) => {}
                     Message::Pong(_) => {}
                     Message::Close(_) => {}
@@ -323,6 +337,9 @@ impl Peer {
         let (user_ev_controller, mut receiver_ch) =
             tokio::sync::watch::channel((0, self.config.peer_id));
         receiver_ch.borrow_and_update();
+
+        Self::send_error_msg(self, "Starting node".to_string()).await;
+
         let mut memory_event_generator = MemoryEventsGen::<fastrand::Rng>::new_with_seed(
             receiver_ch.clone(),
             self.config.peer_id,
@@ -330,9 +347,9 @@ impl Peer {
                 .seed
                 .expect("seed should be set for child process"),
         );
-        let peer_id = NodeLabel::from(peer_id.as_str()).number();
+        let peer_id_num = NodeLabel::from(peer_id.as_str()).number();
         memory_event_generator.rng_params(
-            peer_id,
+            peer_id_num,
             test_config.gateways + test_config.nodes,
             test_config
                 .max_contract_number
@@ -345,9 +362,11 @@ impl Peer {
         // Obtain an identity::Keypair instance for the private_key
         let private_key = Keypair::generate_ed25519();
 
+        let data_dir = Executor::<Runtime>::test_data_dir(peer_id.as_str());
+
         let cli_config = PeerCliConfig {
             mode: OperationMode::Network,
-            node_data_dir: None,
+            node_data_dir: Some(data_dir),
             address: self.config.local_ip.unwrap(),
             port: self.config.local_port.unwrap(),
         };
@@ -364,6 +383,7 @@ impl Peer {
                 }
                 Err(e) => {
                     tracing::error!("Node {} failed: {}", peer_id, e);
+                    Self::send_error_msg(self, format!("Node {} failed: {}", peer_id, e)).await;
                 }
             },
             Err(e) => {
@@ -373,12 +393,30 @@ impl Peer {
 
         Ok(())
     }
+
+    async fn send_error_msg(&self, msg: String) {
+        self.ws_client
+            .lock()
+            .await
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Text(msg))
+            .await
+            .unwrap();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
     use tokio;
+
+    fn build_supervisor() -> Supervisor {
+        Supervisor {
+            peers_config: Arc::new(Mutex::new(HashMap::new())),
+            processes: HashMap::new(),
+            responses: FuturesUnordered::new(),
+        }
+    }
 
     #[tokio::test]
     async fn test_supervisor() {
@@ -408,6 +446,55 @@ mod tests {
             }),
         };
         let res = run(&config, &network_config).await.unwrap();
+        let a = 2;
+    }
+
+    #[tokio::test]
+    async fn test_peer() {
+        let mut supervisor = build_supervisor();
+
+        let network_config = NetworkProcessConfig {
+            mode: Process::Peer,
+            id: Some("1".to_string()),
+        };
+        let config = super::super::TestConfig {
+            name: Some("TestName".to_string()),
+            seed: Some(12345),
+            gateways: 1,
+            nodes: 2,
+            ring_max_htl: 20,
+            rnd_if_htl_above: 10,
+            max_connections: 20,
+            min_connections: 10,
+            max_contract_number: Some(100),
+            events: 5,
+            event_wait_ms: Some(1000),
+            connection_wait_ms: Some(2000),
+            peer_start_backoff_ms: Some(2000),
+            execution_data: None,
+            disable_metrics: false,
+            command: super::super::TestMode::Network(NetworkProcessConfig {
+                mode: Process::Peer,
+                id: Some("1".to_string()),
+            }),
+        };
+
+        supervisor.start_server().await.unwrap();
+        let (ws_stream, _) = tokio_tungstenite::connect_async("ws://localhost:3000/ws")
+            .await
+            .expect("Failed to connect to supervisor");
+
+        let mut node_config = NodeConfig::new();
+        node_config
+            .with_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .with_port(3001);
+
+        let peer = Peer {
+            id: "node-1".to_string(),
+            config: node_config.clone(),
+            ws_client: Arc::new(Mutex::new(ws_stream)),
+        };
+        let res = peer.run(&config, peer.id.clone()).await.unwrap();
         let a = 2;
     }
 }
