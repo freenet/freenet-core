@@ -200,6 +200,13 @@ impl ResourceManager {
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
         at_time: Instant,
     ) -> TopologyAdjustment {
+        debug!(
+            "Adjusting topology for {:?} at {:?}. Current neighbors: {:?}",
+            resource_type,
+            at_time,
+            neighbor_locations.len()
+        );
+
         let increase_usage_if_below: RateProportion =
             RateProportion::new(MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION);
         let decrease_usage_if_above: RateProportion =
@@ -207,22 +214,33 @@ impl ResourceManager {
 
         let usage = self.extrapolated_usage(resource_type, at_time);
         let total_limit: Rate = self.limits.get(resource_type);
-        let usage_proportion = total_limit.proportion_of(&self.limits.get(resource_type));
+        let usage_proportion = usage.total.proportion_of(&total_limit);
+
+        // Detailed resource usage information
+        tracing::debug!(
+            "Resource type {:?} usage: {:?}, Total limit: {:?}, Usage proportion: {:?}",
+            resource_type,
+            usage.total,
+            total_limit,
+            usage_proportion
+        );
+
         let adjustment: anyhow::Result<TopologyAdjustment> =
             if usage_proportion < increase_usage_if_below {
                 tracing::debug!(
-                    "{:?} resource usage is too low, adding connections: {:?}",
+                    "{:?} resource usage ({:?}) is below threshold ({:?}), adding connections",
                     resource_type,
-                    usage_proportion
+                    usage_proportion,
+                    increase_usage_if_below
                 );
                 self.select_connections_to_add(&usage, neighbor_locations)
             } else if usage_proportion > decrease_usage_if_above {
                 tracing::debug!(
-                    "{:?} resource usage is too high, removing connections: {:?}",
+                    "{:?} resource usage ({:?}) is above threshold ({:?}), removing connections",
                     resource_type,
-                    usage_proportion
+                    usage_proportion,
+                    decrease_usage_if_above
                 );
-
                 Ok(self.select_connections_to_remove(&resource_type, &usage.total, at_time))
             } else {
                 tracing::debug!(
@@ -232,6 +250,22 @@ impl ResourceManager {
                 );
                 Ok(TopologyAdjustment::NoChange)
             };
+
+        match &adjustment {
+            Ok(TopologyAdjustment::AddConnections(connections)) => {
+                tracing::debug!("Added connections: {:?}", connections);
+            }
+            Ok(TopologyAdjustment::RemoveConnections(connections)) => {
+                tracing::debug!("Removed connections: {:?}", connections);
+            }
+            Ok(TopologyAdjustment::NoChange) => {
+                tracing::debug!("No topology change required.");
+            }
+            Err(e) => {
+                tracing::error!("Error adjusting topology: {:?}", e);
+            }
+        }
+
         adjustment.unwrap_or(TopologyAdjustment::NoChange)
     }
 
@@ -478,7 +512,8 @@ mod tests {
             peer.location = Some(peer_locations[ix]);
         }
 
-        // Total bw usage will be way lower than MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION
+        // Total bw usage will be way lower than MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION, triggering
+        // the ResourceManager to add a connection
         let bw_usage_by_peer = vec![10, 20, 30, 25, 30];
         // Report usage from outside the ramp-up time window so it isn't ignored
         let report_time = Instant::now() - SOURCE_RAMP_UP_TIME - Duration::from_secs(30);
@@ -490,9 +525,7 @@ mod tests {
         );
         let requests_per_peer = vec![20, 19, 18, 9, 9];
         report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
-        let worst_ix = find_worst_peer(&peers, &bw_usage_by_peer, &requests_per_peer);
-        assert_eq!(worst_ix, 3);
-        let worst_peer = &peers[worst_ix];
+
         let mut neighbor_locations = BTreeMap::new();
         for peer in &peers {
             neighbor_locations.insert(peer.location.unwrap(), vec![]);
@@ -503,6 +536,58 @@ mod tests {
             &neighbor_locations,
             Instant::now(),
         );
+
+        match adjustment {
+            TopologyAdjustment::AddConnections(locations) => {
+                assert_eq!(locations.len(), 1);
+                // Location should be between peers[0] and peers[1] because they have the highest
+                // number of requests per hour for any adjacent peers
+                assert!(locations[0] >= peers[0].location.unwrap());
+                assert!(locations[0] <= peers[1].location.unwrap());
+            }
+            _ => panic!(
+                "Expected to add a connection, adjustment was {:?}",
+                adjustment
+            ),
+        }
+    }
+
+    // Test with no adjustment because the usage is within acceptable bounds
+    #[test]
+    fn test_no_adjustment() {
+        setup_tracing();
+
+        let mut resource_manager = setup_resource_manager(1000.0);
+        let peers = generate_random_peers(5);
+        // Total bw usage will be way lower than MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION, triggering
+        // the ResourceManager to add a connection
+        let bw_usage_by_peer = vec![150, 200, 100, 100, 200];
+        // Report usage from outside the ramp-up time window so it isn't ignored
+        let report_time = Instant::now() - SOURCE_RAMP_UP_TIME - Duration::from_secs(30);
+        report_resource_usage(
+            &mut resource_manager,
+            &peers,
+            &bw_usage_by_peer,
+            report_time,
+        );
+        let requests_per_peer = vec![20, 19, 18, 9, 9];
+        report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
+
+        let mut neighbor_locations = BTreeMap::new();
+        for peer in &peers {
+            neighbor_locations.insert(peer.location.unwrap(), vec![]);
+        }
+
+        let adjustment = resource_manager.adjust_topology(
+            ResourceType::InboundBandwidthBytes,
+            &neighbor_locations,
+            report_time,
+        );
+
+        match adjustment {
+            TopologyAdjustment::NoChange => {}
+            _ => panic!("Expected no adjustment, adjustment was {:?}", adjustment),
+        }
     }
 
     fn setup_resource_manager(rate: f64) -> ResourceManager {
@@ -528,6 +613,10 @@ mod tests {
         for (i, peer) in peers.iter().enumerate() {
             for seconds in 1..60 {
                 let report_time = now - Duration::from_secs(60 - seconds);
+                debug!(
+                    "Reporting {} bytes of inbound bandwidth for peer {:?} at {:?}",
+                    bw_usage_by_peer[i], peer, report_time
+                );
                 resource_manager.report_resource_usage(
                     &AttributionSource::Peer(peer.clone()),
                     ResourceType::InboundBandwidthBytes,
@@ -545,8 +634,10 @@ mod tests {
     ) {
         for (i, requests) in requests_per_peer.iter().enumerate() {
             for _ in 0..*requests {
-                let unimportant_location = Location::random();
-                resource_manager.report_outbound_request(peers[i].clone(), unimportant_location);
+                // For simplicity we'll just assume that the target location of the request is the
+                // neighboring peer's own location
+                resource_manager
+                    .report_outbound_request(peers[i].clone(), peers[i].location.unwrap());
             }
         }
     }

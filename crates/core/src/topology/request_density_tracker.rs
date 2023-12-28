@@ -137,7 +137,10 @@ impl DensityMap {
     }
 
     pub fn get_max_density(&self) -> Result<Location, DensityMapError> {
+        tracing::debug!("get_max_density called");
+
         if self.neighbor_request_counts.is_empty() {
+            tracing::warn!("No neighbors to get max density from");
             return Err(DensityMapError::EmptyNeighbors);
         }
 
@@ -145,6 +148,8 @@ impl DensityMap {
         // with the highest combined request count
         let mut max_density_location = Location::new(0.0);
         let mut max_density = 0;
+
+        tracing::debug!("Starting to iterate over neighbor pairs");
 
         for (
             (previous_neighbor_location, previous_neighbor_count),
@@ -154,14 +159,30 @@ impl DensityMap {
             .iter()
             .zip(self.neighbor_request_counts.iter().skip(1))
         {
+            // tracing span with location of first and last neighbor locations
+            let span = tracing::debug_span!(
+                "neighbor_pair",
+                previous_neighbor_location = previous_neighbor_location.as_f64(),
+                next_neighbor_location = next_neighbor_location.as_f64()
+            );
+            let _enter = span.enter();
             let combined_count = previous_neighbor_count + next_neighbor_count;
+            tracing::debug!("Combined count for neighbor pair: {}", combined_count);
+
             if combined_count > max_density {
+                tracing::debug!(
+                    "New max density found: {} at location {:?}",
+                    combined_count,
+                    max_density_location
+                );
                 max_density = combined_count;
                 max_density_location = Location::new(
                     (previous_neighbor_location.as_f64() + next_neighbor_location.as_f64()) / 2.0,
                 );
             }
         }
+
+        tracing::debug!("Checking first and last neighbors");
 
         // We need to also check the first and last neighbors as locations are circular
         let first_neighbor = self.neighbor_request_counts.iter().next();
@@ -172,6 +193,11 @@ impl DensityMap {
         ) = (first_neighbor, last_neighbor)
         {
             let combined_count = first_neighbor_count + last_neighbor_count;
+            tracing::debug!(
+                "Combined count for first and last neighbor: {}",
+                combined_count
+            );
+
             if combined_count > max_density {
                 // max_density = combined_count; Not needed as this is the last check
                 let distance = first_neighbor_location.distance(*last_neighbor_location);
@@ -180,9 +206,14 @@ impl DensityMap {
                     mp += 1.0;
                 }
                 max_density_location = Location::new(mp);
+                tracing::debug!(
+                    "New max density found at the edge: location {:?}",
+                    max_density_location
+                );
             }
         }
 
+        tracing::debug!("Returning max density location: {:?}", max_density_location);
         Ok(max_density_location)
     }
 }
@@ -235,7 +266,7 @@ mod tests {
             .unwrap()
             .insert(Location::new(0.6), vec![]);
 
-        let mut neighbors = neighbors.read();
+        let neighbors = neighbors.read();
 
         let mut sw = RequestDensityTracker::new(5);
         sw.sample(Location::new(0.21));
