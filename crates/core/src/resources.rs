@@ -6,7 +6,7 @@
 //!
 //! ## Resources
 //!
-//! The resource management module tracks usage of the following resources:
+//! The [ResourceManager] tracks usage of the following resources:
 //!
 //! * Upstream and downstream bandwidth
 //!
@@ -56,6 +56,23 @@
 //! usage along with which peers (or delegates, or UIs) are responsible for that
 //! usage.
 //!
+//! ## Integration notes
+//!
+//! The user of the [ResourceManager] is responsible for calling the
+//! [ResourceManager::report_resource_usage] function whenever a resource (currently
+//! only bandwidth) is used, and the [ResourceManager::report_outbound_request]
+//! function whenever a request is sent to a neighboring peer.
+//!
+//! The user of the resource manager should call the
+//! [ResourceManager::adjust_topology] function at regular intervals, perhaps every 10
+//! seconds. This function will return a [TopologyAdjustment] which will indicate
+//! whether any peers should be added or removed, along with relevant
+//! details.
+//!
+//! If there are fewer than [HARD_MINIMUM_NUM_PEERS] peers, the [ResourceManager] will
+//! recommend adding peers at random locations until the minimum number of peers is
+//! reached.
+//!
 //! ## Future Improvements
 //!
 //! * Track non-flow resources like memory and storage
@@ -86,6 +103,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLockReadGuard};
 use std::time::Duration;
 use std::time::Instant;
+use tracing::field::debug;
 use tracing::{debug, error, event, info, span, trace, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
@@ -100,6 +118,10 @@ const OUTBOUND_REQUEST_COUNTER_WINDOW_SIZE: usize = 10000;
 const MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION: f64 = 0.5;
 
 const MAXIMUM_DESIRED_RESOURCE_USAGE_PROPORTION: f64 = 0.9;
+
+const HARD_MINIMUM_NUM_PEERS: usize = 5;
+
+const HARD_MAXIMUM_NUM_PEERS: usize = 200;
 
 pub(crate) struct ResourceManager {
     limits: Limits,
@@ -238,6 +260,23 @@ impl ResourceManager {
             neighbor_locations.len()
         );
 
+        if neighbor_locations.len() < HARD_MINIMUM_NUM_PEERS {
+            let mut locations = Vec::new();
+            let below_threshold = HARD_MINIMUM_NUM_PEERS - neighbor_locations.len();
+            if (below_threshold > 0) {
+                for i in 0..below_threshold {
+                    locations.push(Location::random());
+                }
+                info!(
+                    minimum_num_peers_hard_limit = HARD_MINIMUM_NUM_PEERS,
+                    num_peers = neighbor_locations.len(),
+                    to_add = below_threshold,
+                    "Adding peers at random locations to reach minimum number of peers"
+                );
+            }
+            return TopologyAdjustment::AddConnections(locations);
+        }
+
         let increase_usage_if_below: RateProportion =
             RateProportion::new(MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION);
         let decrease_usage_if_above: RateProportion =
@@ -248,52 +287,51 @@ impl ResourceManager {
         let usage_proportion = usage.total.proportion_of(&total_limit);
 
         // Detailed resource usage information
-        tracing::debug!(
+        debug!(
             "Resource type {:?} usage: {:?}, Total limit: {:?}, Usage proportion: {:?}",
-            resource_type,
-            usage.total,
-            total_limit,
-            usage_proportion
+            resource_type, usage.total, total_limit, usage_proportion
         );
 
         let adjustment: anyhow::Result<TopologyAdjustment> =
-            if usage_proportion < increase_usage_if_below {
-                tracing::debug!(
+            if neighbor_locations.len() > HARD_MAXIMUM_NUM_PEERS {
+                debug!(
+                    "Number of neighbors ({:?}) is above maximum ({:?}), removing connections",
+                    neighbor_locations.len(),
+                    HARD_MAXIMUM_NUM_PEERS
+                );
+                Ok(self.select_connections_to_remove(&resource_type, &usage.total, at_time))
+            } else if usage_proportion < increase_usage_if_below {
+                debug!(
                     "{:?} resource usage ({:?}) is below threshold ({:?}), adding connections",
-                    resource_type,
-                    usage_proportion,
-                    increase_usage_if_below
+                    resource_type, usage_proportion, increase_usage_if_below
                 );
                 self.select_connections_to_add(&usage, neighbor_locations)
             } else if usage_proportion > decrease_usage_if_above {
-                tracing::debug!(
+                debug!(
                     "{:?} resource usage ({:?}) is above threshold ({:?}), removing connections",
-                    resource_type,
-                    usage_proportion,
-                    decrease_usage_if_above
+                    resource_type, usage_proportion, decrease_usage_if_above
                 );
                 Ok(self.select_connections_to_remove(&resource_type, &usage.total, at_time))
             } else {
-                tracing::debug!(
+                debug!(
                     "{:?} resource usage is within acceptable bounds: {:?}",
-                    resource_type,
-                    usage_proportion
+                    resource_type, usage_proportion
                 );
                 Ok(TopologyAdjustment::NoChange)
             };
 
         match &adjustment {
             Ok(TopologyAdjustment::AddConnections(connections)) => {
-                tracing::debug!("Added connections: {:?}", connections);
+                debug!("Added connections: {:?}", connections);
             }
             Ok(TopologyAdjustment::RemoveConnections(connections)) => {
-                tracing::debug!("Removed connections: {:?}", connections);
+                debug!("Removed connections: {:?}", connections);
             }
             Ok(TopologyAdjustment::NoChange) => {
-                tracing::debug!("No topology change required.");
+                debug!("No topology change required.");
             }
             Err(e) => {
-                tracing::error!("Error adjusting topology: {:?}", e);
+                tracing::error!("Couldn't adjust topology due to error: {:?}", e);
             }
         }
 
@@ -619,6 +657,44 @@ mod tests {
             match adjustment {
                 TopologyAdjustment::NoChange => {}
                 _ => panic!("Expected no adjustment, adjustment was {:?}", adjustment),
+            }
+        });
+    }
+
+    // Test with no peers
+    #[test]
+    fn test_no_peers() {
+        with_tracing(|| {
+            let mut resource_manager = setup_resource_manager(1000.0);
+            let peers = generate_random_peers(0);
+            // Total bw usage will be way lower than MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION, triggering
+            // the ResourceManager to add a connection
+            let bw_usage_by_peer = vec![];
+            // Report usage from outside the ramp-up time window so it isn't ignored
+            let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
+            report_resource_usage(
+                &mut resource_manager,
+                &peers,
+                &bw_usage_by_peer,
+                report_time,
+            );
+            let requests_per_peer = vec![];
+            report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
+
+            let mut neighbor_locations = BTreeMap::new();
+            for peer in &peers {
+                neighbor_locations.insert(peer.location.unwrap(), vec![]);
+            }
+
+            let adjustment = resource_manager.adjust_topology(
+                ResourceType::InboundBandwidthBytes,
+                &neighbor_locations,
+                report_time,
+            );
+
+            match adjustment {
+                TopologyAdjustment::AddConnections(v) => {}
+                _ => panic!("Expected AddConnections, but was: {:?}", adjustment),
             }
         });
     }
