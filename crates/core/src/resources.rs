@@ -87,12 +87,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLockReadGuard};
 use std::time::Duration;
 use std::time::Instant;
-use tracing::{debug, error, event, info, span, Level};
+use tracing::{debug, error, event, info, span, trace, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
 
 // TODO: Reevaluate this value once we have realistic data
-const SOURCE_RAMP_UP_TIME: Duration = Duration::from_secs(5 * 60);
+const SOURCE_RAMP_UP_DURATION: Duration = Duration::from_secs(5 * 60);
 
 const REQUEST_DENSITY_TRACKER_SAMPLE_SIZE: usize = 5000;
 
@@ -138,7 +138,12 @@ impl ResourceManager {
         value: f64,
         at_time: Instant,
     ) {
-        if !self.source_creation_times.contains_key(attribution) {
+        if let Some(creation_time) = self.source_creation_times.get(attribution) {
+            if at_time < *creation_time {
+                self.source_creation_times
+                    .insert(attribution.clone(), at_time);
+            }
+        } else {
             self.source_creation_times
                 .insert(attribution.clone(), at_time);
         }
@@ -153,29 +158,56 @@ impl ResourceManager {
         self.outbound_request_counter.record_request(peer);
     }
 
+    /// Calculate total usage for a resource type extrapolating usage for resources that
+    /// are younger than [SOURCE_RAMP_UP_DURATION]
     fn extrapolated_usage(&mut self, resource_type: ResourceType, now: Instant) -> Usage {
+        let function_span = span!(Level::DEBUG, "extrapolated_usage_function");
+        let _enter = function_span.enter();
+
+        debug!("Function called");
+        debug!("Resource type: {:?}", resource_type);
+        debug!("Current time: {:?}", now);
+
         let mut total_usage: Rate = Rate::new_per_second(0.0);
         let mut usage_per_source: HashMap<AttributionSource, Rate> = HashMap::new();
 
         // Step 1: Collect data
+        let collect_data_span = span!(Level::DEBUG, "collect_data");
+        let _collect_data_guard = collect_data_span.enter();
+        debug!("Collecting data from source_creation_times");
         let mut usage_data = Vec::new();
         for source_entry in self.source_creation_times.iter() {
             let source = source_entry.key();
             let creation_time = source_entry.value();
-            let ramping_up = now.duration_since(*creation_time) <= SOURCE_RAMP_UP_TIME;
+            let ramping_up = now.duration_since(*creation_time) <= SOURCE_RAMP_UP_DURATION;
+            debug!(
+                "Source: {:?}, Creation time: {:?}, Ramping up: {}",
+                source, creation_time, ramping_up
+            );
             usage_data.push((source.clone(), ramping_up));
         }
+        drop(_collect_data_guard);
 
         // Step 2: Process data
+        let process_data_span = span!(Level::DEBUG, "process_data");
+        let _process_data_guard = process_data_span.enter();
+        debug!("Processing data for usage calculation");
         for (source, ramping_up) in usage_data {
             let usage_rate: Option<Rate> = if ramping_up {
+                debug!("Source {:?} is ramping up", source);
                 self.meter.get_adjusted_usage_rate(&resource_type, now)
             } else {
+                debug!("Source {:?} is not ramping up", source);
                 self.attributed_usage_rate(&source, &resource_type, now)
             };
+            debug!("Usage rate for source {:?}: {:?}", source, usage_rate);
             total_usage += usage_rate.unwrap_or(Rate::new_per_second(0.0));
             usage_per_source.insert(source, usage_rate.unwrap_or(Rate::new_per_second(0.0)));
         }
+        drop(_process_data_guard);
+
+        debug!("Total usage: {:?}", total_usage);
+        debug!("Usage per source: {:?}", usage_per_source);
 
         Usage {
             total: total_usage,
@@ -320,7 +352,7 @@ impl ResourceManager {
             event!(Level::DEBUG, "Checking source");
 
             if let Some(creation_time) = self.source_creation_times.get(&source) {
-                if Instant::now().duration_since(*creation_time) <= SOURCE_RAMP_UP_TIME {
+                if Instant::now().duration_since(*creation_time) <= SOURCE_RAMP_UP_DURATION {
                     event!(Level::DEBUG, "Source is in ramp-up time, skipping");
                     continue;
                 }
@@ -466,7 +498,7 @@ mod tests {
         // Total bw usage will be way higher than the limit of 1000
         let bw_usage_by_peer = vec![1000, 1100, 1200, 2000, 1600];
         // Report usage from outside the ramp-up time window so it isn't ignored
-        let report_time = Instant::now() - SOURCE_RAMP_UP_TIME - Duration::from_secs(30);
+        let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
         report_resource_usage(
             &mut resource_manager,
             &peers,
@@ -516,7 +548,7 @@ mod tests {
         // the ResourceManager to add a connection
         let bw_usage_by_peer = vec![10, 20, 30, 25, 30];
         // Report usage from outside the ramp-up time window so it isn't ignored
-        let report_time = Instant::now() - SOURCE_RAMP_UP_TIME - Duration::from_secs(30);
+        let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
         report_resource_usage(
             &mut resource_manager,
             &peers,
@@ -563,7 +595,7 @@ mod tests {
         // the ResourceManager to add a connection
         let bw_usage_by_peer = vec![150, 200, 100, 100, 200];
         // Report usage from outside the ramp-up time window so it isn't ignored
-        let report_time = Instant::now() - SOURCE_RAMP_UP_TIME - Duration::from_secs(30);
+        let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
         report_resource_usage(
             &mut resource_manager,
             &peers,
@@ -608,14 +640,17 @@ mod tests {
         resource_manager: &mut ResourceManager,
         peers: &[PeerKeyLocation],
         bw_usage_by_peer: &[usize],
-        now: Instant,
+        up_to_time: Instant,
     ) {
         for (i, peer) in peers.iter().enumerate() {
-            for seconds in 1..60 {
-                let report_time = now - Duration::from_secs(60 - seconds);
-                debug!(
+            // Report usage for the last 10 minutes, which is 2X longer than the ramp-up time
+            for seconds in 1..600 {
+                let report_time = up_to_time - Duration::from_secs(600 - seconds);
+                trace!(
                     "Reporting {} bytes of inbound bandwidth for peer {:?} at {:?}",
-                    bw_usage_by_peer[i], peer, report_time
+                    bw_usage_by_peer[i],
+                    peer,
+                    report_time
                 );
                 resource_manager.report_resource_usage(
                     &AttributionSource::Peer(peer.clone()),

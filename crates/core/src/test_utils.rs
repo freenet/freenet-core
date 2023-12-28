@@ -1,11 +1,17 @@
-use tracing_subscriber::fmt::format::FmtSpan;
-use tracing_subscriber::EnvFilter;
+use lazy_static::lazy_static;
+use std::sync::Once;
+
+lazy_static! {
+    static ref TRACING_INIT: Once = Once::new();
+}
 
 pub fn setup_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_line_number(true)
-        .with_file(true) // Enable line numbers
-        .with_span_events(FmtSpan::CLOSE)
-        .init();
+    TRACING_INIT.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_line_number(true)
+            .with_file(true)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .init();
+    });
 }

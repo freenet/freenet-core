@@ -1627,6 +1627,7 @@ dependencies = [
  "headers",
  "itertools 0.11.0",
  "itertools 0.12.0",
+ "lazy_static",
  "libp2p",
  "libp2p-identity",
  "notify",
