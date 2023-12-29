@@ -417,11 +417,11 @@ impl ResourceManager {
 
                     if let Some((_, worst_value_per_usage)) = worst {
                         if value_per_usage < worst_value_per_usage {
-                            worst = Some((peer.clone(), value_per_usage));
+                            worst = Some((peer, value_per_usage));
                             event!(Level::DEBUG, "Found a worse peer");
                         }
                     } else {
-                        worst = Some((peer.clone(), value_per_usage));
+                        worst = Some((peer, value_per_usage));
                         event!(Level::DEBUG, "Setting initial worst peer");
                     }
                 }
@@ -476,8 +476,8 @@ pub struct Limits {
 impl Limits {
     pub fn get(&self, resource_type: ResourceType) -> Rate {
         match resource_type {
-            ResourceType::OutboundBandwidthBytes => self.max_upstream_bandwidth.clone(),
-            ResourceType::InboundBandwidthBytes => self.max_downstream_bandwidth.clone(),
+            ResourceType::OutboundBandwidthBytes => self.max_upstream_bandwidth,
+            ResourceType::InboundBandwidthBytes => self.max_downstream_bandwidth,
         }
     }
 }
@@ -574,9 +574,9 @@ mod tests {
             let mut resource_manager = setup_resource_manager(1000.0);
             // Generate 5 peers with locations specified in a vec!
             let mut peers: Vec<PeerKeyLocation> = generate_random_peers(5);
-            let peer_locations: Vec<Location> = vec![0.1, 0.3, 0.5, 0.7, 0.9]
-                .iter()
-                .map(|&x| Location::new(x))
+            let peer_locations: Vec<Location> = [0.1, 0.3, 0.5, 0.7, 0.9]
+                .into_iter()
+                .map(Location::new)
                 .collect();
             for (ix, mut peer) in peers.iter_mut().enumerate() {
                 peer.location = Some(peer_locations[ix]);
@@ -730,7 +730,7 @@ mod tests {
                     report_time
                 );
                 resource_manager.report_resource_usage(
-                    &AttributionSource::Peer(peer.clone()),
+                    &AttributionSource::Peer(*peer),
                     ResourceType::InboundBandwidthBytes,
                     bw_usage_by_peer[i] as f64,
                     report_time,
@@ -748,8 +748,7 @@ mod tests {
             for _ in 0..*requests {
                 // For simplicity we'll just assume that the target location of the request is the
                 // neighboring peer's own location
-                resource_manager
-                    .report_outbound_request(peers[i].clone(), peers[i].location.unwrap());
+                resource_manager.report_outbound_request(peers[i], peers[i].location.unwrap());
             }
         }
     }

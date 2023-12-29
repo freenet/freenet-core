@@ -3,7 +3,6 @@ use crate::{
     ring::{Distance, Location},
 };
 use request_density_tracker::CachedDensityMap;
-use std::sync::RwLockReadGuard;
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},

@@ -1,6 +1,5 @@
 use crate::ring::{Connection, Location};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Arc, RwLockReadGuard};
+use std::collections::{BTreeMap, VecDeque};
 use thiserror::Error;
 
 /// Tracks requests sent by a node to its neighbors and creates a density map, which
@@ -256,7 +255,7 @@ mod tests {
 
     #[test]
     fn test_create_density_map() {
-        let mut neighbors = RwLock::new(BTreeMap::new());
+        let neighbors = RwLock::new(BTreeMap::new());
         neighbors
             .write()
             .unwrap()

@@ -1,6 +1,3 @@
-use lazy_static::lazy_static;
-use std::sync::Once;
-
 pub fn with_tracing<T>(f: impl FnOnce() -> T) -> T {
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())

@@ -192,6 +192,7 @@ pub(crate) struct Ring {
     event_register: Box<dyn NetEventRegister>,
     /// Whether this peer is a gateway or not. This will affect behavior of the node when acquiring
     /// and dropping connections.
+    #[allow(unused)]
     is_gateway: bool,
 }
 

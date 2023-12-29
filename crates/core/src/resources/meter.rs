@@ -49,7 +49,7 @@ impl Meter {
     ) -> Option<Rate> {
         match self.attribution_meters.get(attribution) {
             Some(attribution_meters) => {
-                match attribution_meters.map.get(&resource) {
+                match attribution_meters.map.get(resource) {
                     Some(meter) => {
                         // Get the current measurement value
                         meter.get_rate_at_time(at_time)
@@ -83,14 +83,14 @@ impl Meter {
         if let Some(cached) = self.cached_estimated_usage_rate.get(resource) {
             let (cached_rate, cached_time) = cached.value();
             if at_time - *cached_time <= ESTIMATED_USAGE_RATE_CACHE_TIME {
-                return Some(cached_rate.clone());
+                return Some(*cached_rate);
             }
         }
 
         match self.calculate_estimated_usage_rate(resource, at_time) {
             Some(estimated_usage_rate) => {
                 self.cached_estimated_usage_rate
-                    .insert(resource.clone(), (estimated_usage_rate.clone(), at_time));
+                    .insert(*resource, (estimated_usage_rate, at_time));
                 Some(estimated_usage_rate)
             }
             None => None,

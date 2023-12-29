@@ -50,7 +50,7 @@ impl Ord for Rate {
 
 impl PartialOrd for Rate {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.value.partial_cmp(&other.value)
+        Some(self.cmp(other))
     }
 }
 
@@ -89,7 +89,7 @@ impl std::ops::AddAssign for Rate {
 impl RateProportion {
     pub(crate) fn new(value: f64) -> Self {
         debug_assert!(
-            value >= 0.0 && value <= 1.0,
+            (0.0..=1.0).contains(&value),
             "Proportion must be between 0 and 1"
         );
         RateProportion { value }
