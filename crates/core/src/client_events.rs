@@ -319,14 +319,14 @@ pub(crate) mod test {
         }
     }
 
-    pub struct NetworkEventGenerator {
-        memory_event_generator: MemoryEventsGen<fastrand::Rng>,
+    pub struct NetworkEventGenerator<R = rand::rngs::SmallRng> {
+        memory_event_generator: MemoryEventsGen<R>,
         ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
     }
 
-    impl NetworkEventGenerator {
+    impl<R> NetworkEventGenerator<R> {
         pub fn new(
-            memory_event_generator: MemoryEventsGen<fastrand::Rng>,
+            memory_event_generator: MemoryEventsGen<R>,
             ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
         ) -> Self {
             Self {
@@ -336,7 +336,10 @@ pub(crate) mod test {
         }
     }
 
-    impl ClientEventsProxy for NetworkEventGenerator {
+    impl<R> ClientEventsProxy for NetworkEventGenerator<R>
+    where
+        R: RandomEventGenerator + Send,
+    {
         fn recv(&mut self) -> BoxFuture<'_, HostIncomingMsg> {
             async {
                 loop {
