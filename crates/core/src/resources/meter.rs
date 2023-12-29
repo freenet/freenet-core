@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 use crate::resources::rate::Rate;
 use dashmap::DashMap;
 use freenet_stdlib::prelude::*;
-use itertools::{sorted, Itertools};
 
 use crate::ring::PeerKeyLocation;
 
@@ -246,13 +245,12 @@ impl ResourceTotals {
 #[cfg(test)]
 mod tests {
     use crate::DynError;
-    use std::time::Duration;
 
     use super::*;
 
     #[test]
     fn test_empty_meter() {
-        let mut meter = Meter::new_with_window_size(100);
+        let meter = Meter::new_with_window_size(100);
 
         assert!(meter
             .attributed_usage_rate(

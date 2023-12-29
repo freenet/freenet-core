@@ -79,34 +79,28 @@
 //! * Responses to specific requests will contain information about the resources used
 //!   by downstream peers to fulfill the request, however how this information is used
 //!   will require careful consideration.
-#![allow(dead_code, unused)] // FIXME: remove after integration
-
-mod meter;
-mod outbound_request_counter;
-pub mod rate;
-mod running_average;
-
-use self::meter::{AttributionSource, Meter, ResourceType};
-use crate::resources::meter::ALL_RESOURCE_TYPES;
-use crate::resources::outbound_request_counter::OutboundRequestCounter;
-use crate::resources::rate::{Rate, RateProportion};
-use crate::ring::{Connection, Location, PeerKeyLocation};
-use crate::topology::request_density_tracker::{
-    DensityMap, DensityMapError, RequestDensityTracker,
-};
-use crate::topology::TopologyManager;
 use anyhow::anyhow;
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use std::cmp::max;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, RwLockReadGuard};
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 use std::time::Instant;
-use tracing::field::debug;
-use tracing::{debug, error, event, info, span, trace, Level};
-use tracing_subscriber::fmt::format::FmtSpan;
-use tracing_subscriber::EnvFilter;
+use tracing::{debug, error, event, info, span, Level};
+
+use self::{
+    outbound_request_counter::OutboundRequestCounter,
+    rate::{Rate, RateProportion},
+};
+use crate::ring::{Connection, Location, PeerKeyLocation};
+use crate::topology::request_density_tracker::RequestDensityTracker;
+use crate::topology::TopologyManager;
+pub(crate) use meter::ResourceType;
+use meter::{AttributionSource, Meter};
+
+mod meter;
+mod outbound_request_counter;
+pub(crate) mod rate;
+mod running_average;
 
 // TODO: Reevaluate this value once we have realistic data
 const SOURCE_RAMP_UP_DURATION: Duration = Duration::from_secs(5 * 60);
@@ -247,7 +241,7 @@ impl ResourceManager {
 
     // A function that will determine if any peers should be added or removed based on
     // the current resource usage, and either add or remove them
-    fn adjust_topology(
+    pub(crate) fn adjust_topology(
         &mut self,
         resource_type: ResourceType,
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
@@ -263,7 +257,7 @@ impl ResourceManager {
         if neighbor_locations.len() < HARD_MINIMUM_NUM_PEERS {
             let mut locations = Vec::new();
             let below_threshold = HARD_MINIMUM_NUM_PEERS - neighbor_locations.len();
-            if (below_threshold > 0) {
+            if below_threshold > 0 {
                 for i in 0..below_threshold {
                     locations.push(Location::random());
                 }
@@ -466,7 +460,7 @@ struct CandidateCost {
     cost_per_value: f64,
 }
 
-pub struct Limits {
+pub(crate) struct Limits {
     pub max_upstream_bandwidth: Rate,
     pub max_downstream_bandwidth: Rate,
     pub min_connections: usize,
@@ -723,7 +717,7 @@ mod tests {
             // Report usage for the last 10 minutes, which is 2X longer than the ramp-up time
             for seconds in 1..600 {
                 let report_time = up_to_time - Duration::from_secs(600 - seconds);
-                trace!(
+                tracing::trace!(
                     "Reporting {} bytes of inbound bandwidth for peer {:?} at {:?}",
                     bw_usage_by_peer[i],
                     peer,
