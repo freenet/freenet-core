@@ -7,8 +7,8 @@ use futures::FutureExt;
 
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation};
 use crate::contract::ContractHandlerEvent;
-use crate::message::{InnerMessage, Transaction};
-use crate::ring::{Location, PeerKeyLocation};
+use crate::message::{InnerMessage, NetMessage, Transaction};
+use crate::ring::{Location, PeerKeyLocation, RingError};
 use crate::{
     client_events::{ClientId, HostResult},
     node::{NetworkBridge, OpManager, PeerId},
@@ -136,7 +136,7 @@ impl Operation for UpdateOp {
             match input {
                 UpdateMsg::RequestUpdate {
                     id,
-                    contract,
+                    key,
                     target,
                     related_contracts,
                     value,
@@ -144,7 +144,6 @@ impl Operation for UpdateOp {
                 } => {
                     let sender = op_manager.ring.own_location();
 
-                    let key = contract.key();
                     tracing::debug!(
                         "Requesting update for contract {} from {} to {}",
                         key,
@@ -158,7 +157,7 @@ impl Operation for UpdateOp {
                         sender,
                         target: *target,
                         value: value.clone(),
-                        contract: contract.clone(),
+                        key: key.clone(),
                         related_contracts: related_contracts.clone(),
                         htl: *htl,
                     });
@@ -169,13 +168,12 @@ impl Operation for UpdateOp {
                 UpdateMsg::SeekNode {
                     id,
                     value,
-                    contract,
+                    key,
                     related_contracts,
                     htl,
                     target,
                     sender,
                 } => {
-                    let key = contract.key();
                     let is_subscribed_contract = op_manager.ring.is_subscribed_to_contract(&key);
 
                     tracing::debug!(
@@ -188,7 +186,7 @@ impl Operation for UpdateOp {
                     if is_subscribed_contract
                         || op_manager
                             .ring
-                            .within_subscribing_distance(&Location::from(&key))
+                            .within_subscribing_distance(&Location::from(key))
                     {
                         tracing::debug!(tx = %id, "Attempting contract value update");
                         update_contract(
@@ -196,7 +194,6 @@ impl Operation for UpdateOp {
                             key.clone(),
                             value.clone(),
                             related_contracts.clone(),
-                            contract,
                         )
                         .await?;
                         tracing::debug!(
@@ -212,7 +209,7 @@ impl Operation for UpdateOp {
                         let put_here = forward_update(
                             op_manager,
                             conn_manager,
-                            contract,
+                            key,
                             value.clone(),
                             *id,
                             new_htl,
@@ -241,7 +238,6 @@ impl Operation for UpdateOp {
                             key.clone(),
                             value.clone(),
                             RelatedContracts::default(),
-                            contract,
                         )
                         .await?;
                         true
@@ -255,7 +251,7 @@ impl Operation for UpdateOp {
                         self.state,
                         (broadcast_to, *sender),
                         key.clone(),
-                        (contract.clone(), value.clone()),
+                        value.clone(),
                     )
                     .await
                     {
@@ -281,7 +277,6 @@ impl Operation for UpdateOp {
                         key.clone(),
                         new_value.clone(),
                         RelatedContracts::default(),
-                        contract,
                     )
                     .await?;
                     tracing::debug!("Contract successfully updated");
@@ -300,7 +295,7 @@ impl Operation for UpdateOp {
                         self.state,
                         (broadcast_to, *sender),
                         key.clone(),
-                        (contract.clone(), new_value),
+                        new_value,
                     )
                     .await
                     {
@@ -408,12 +403,11 @@ impl Operation for UpdateOp {
                 }
                 UpdateMsg::UpdateForward {
                     id,
-                    contract,
+                    key,
                     new_value,
                     htl,
                     sender,
                 } => {
-                    let key = contract.key();
                     let peer_loc = op_manager.ring.own_location();
 
                     tracing::debug!(
@@ -425,7 +419,7 @@ impl Operation for UpdateOp {
                     let is_subscribed_contract = op_manager.ring.is_subscribed_to_contract(&key);
                     let within_caching_dist = op_manager
                         .ring
-                        .within_subscribing_distance(&Location::from(&key));
+                        .within_subscribing_distance(&Location::from(key));
                     if is_subscribed_contract || within_caching_dist {
                         // after the contract has been cached, push the update query
                         update_contract(
@@ -433,7 +427,6 @@ impl Operation for UpdateOp {
                             key.clone(),
                             new_value.clone(),
                             RelatedContracts::default(),
-                            contract,
                         )
                         .await?;
                     }
@@ -444,7 +437,7 @@ impl Operation for UpdateOp {
                         let put_here = forward_update(
                             op_manager,
                             conn_manager,
-                            contract,
+                            key,
                             new_value.clone(),
                             *id,
                             new_htl,
@@ -457,7 +450,6 @@ impl Operation for UpdateOp {
                                 key.clone(),
                                 new_value.clone(),
                                 RelatedContracts::default(),
-                                contract,
                             )
                             .await?;
                         }
@@ -469,7 +461,6 @@ impl Operation for UpdateOp {
                             key.clone(),
                             new_value.clone(),
                             RelatedContracts::default(),
-                            contract,
                         )
                         .await?;
                         true
@@ -483,7 +474,7 @@ impl Operation for UpdateOp {
                         self.state,
                         (broadcast_to, *sender),
                         key.clone(),
-                        (contract.clone(), new_value.clone()),
+                        new_value.clone(),
                     )
                     .await
                     {
@@ -509,7 +500,7 @@ async fn try_to_broadcast(
     state: Option<UpdateState>,
     (broadcast_to, upstream): (Vec<PeerKeyLocation>, PeerKeyLocation),
     key: ContractKey,
-    (contract, new_value): (ContractContainer, WrappedState),
+    new_value: WrappedState,
 ) -> Result<(Option<UpdateState>, Option<UpdateMsg>), OpError> {
     todo!();
 }
@@ -526,8 +517,8 @@ fn build_op_result(
 async fn forward_update<NB: NetworkBridge>(
     op_manager: &OpManager,
     conn_manager: &mut NB,
-    contract: &ContractContainer,
-    clone: WrappedState,
+    key: &ContractKey,
+    value: WrappedState,
     id: Transaction,
     new_htl: usize,
 ) -> bool {
@@ -539,14 +530,12 @@ async fn update_contract(
     key: ContractKey,
     state: WrappedState,
     related_contracts: RelatedContracts<'static>,
-    contract: &ContractContainer,
 ) -> Result<WrappedState, OpError> {
     match op_manager
         .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
             key,
             state,
             related_contracts,
-            contract: Some(contract.clone()),
         })
         .await
     {
@@ -564,17 +553,102 @@ async fn update_contract(
     }
 }
 
+/// This will be called from the node when processing an open request
 // todo: new_state should be a delta when possible!
-pub(crate) fn start_op(_key: ContractKey, _new_state: WrappedState, _htl: usize) -> UpdateOp {
-    todo!()
+pub(crate) fn start_op(
+    key: ContractKey,
+    new_state: WrappedState,
+    related_contracts: RelatedContracts<'static>,
+    htl: usize,
+) -> UpdateOp {
+    let contract_location = Location::from(&key);
+    tracing::debug!(%contract_location, %key, "Requesting put");
+    let id = Transaction::new::<UpdateMsg>();
+    // let payload_size = contract.data().len();
+    let state = Some(UpdateState::PrepareRequest {
+        key,
+        related_contracts,
+        value: new_state,
+        htl,
+    });
+
+    UpdateOp {
+        id,
+        state,
+        stats: Some(UpdateStats {
+            // contract_location,
+            // payload_size,
+            target: None,
+            // first_response_time: None,
+            transfer_time: None,
+            step: Default::default(),
+        }),
+    }
 }
 
+/// Entry point from node to operations logic
 pub(crate) async fn request_update(
-    _op_manager: &OpManager,
-    _update_op: UpdateOp,
-    _client_id: Option<ClientId>,
+    op_manager: &OpManager,
+    mut update_op: UpdateOp,
+    client_id: Option<ClientId>,
 ) -> Result<(), OpError> {
-    todo!()
+    let key = if let Some(UpdateState::PrepareRequest { key, .. }) = &update_op.state {
+        key
+    } else {
+        return Err(OpError::UnexpectedOpState);
+    };
+
+    let sender = op_manager.ring.own_location();
+
+    // the initial request must provide:
+    // - a peer as close as possible to the contract location
+    // - and the value to put
+    let target = op_manager
+        .ring
+        .closest_potentially_caching(&key, [&sender.peer].as_slice())
+        .into_iter()
+        .next()
+        .ok_or(RingError::EmptyRing)?;
+
+    let id = update_op.id;
+    if let Some(stats) = &mut update_op.stats {
+        stats.target = Some(target);
+    }
+
+    match update_op.state {
+        Some(UpdateState::PrepareRequest {
+            key,
+            value,
+            htl,
+            related_contracts,
+        }) => {
+            let new_state = Some(UpdateState::AwaitingResponse {
+                key: key.clone(),
+                upstream: None,
+            });
+            let msg = UpdateMsg::RequestUpdate {
+                id,
+                key,
+                related_contracts,
+                htl,
+                target,
+                value,
+            };
+
+            let op = UpdateOp {
+                state: new_state,
+                id,
+                stats: update_op.stats,
+            };
+
+            op_manager
+                .notify_op_change(NetMessage::from(msg), OpEnum::Update(op))
+                .await?;
+        }
+        _ => return Err(OpError::invalid_transition(update_op.id)),
+    };
+
+    Ok(())
 }
 
 mod messages {
@@ -592,7 +666,7 @@ mod messages {
     pub(crate) enum UpdateMsg {
         RequestUpdate {
             id: Transaction,
-            contract: ContractContainer,
+            key: ContractKey,
             target: PeerKeyLocation,
             #[serde(deserialize_with = "RelatedContracts::deser_related_contracts")]
             related_contracts: RelatedContracts<'static>,
@@ -603,7 +677,7 @@ mod messages {
         UpdateForward {
             id: Transaction,
             sender: PeerKeyLocation,
-            contract: ContractContainer,
+            key: ContractKey,
             new_value: WrappedState,
             /// current htl, reduced by one at each hop
             htl: usize,
@@ -621,7 +695,7 @@ mod messages {
             sender: PeerKeyLocation,
             target: PeerKeyLocation,
             value: WrappedState,
-            contract: ContractContainer,
+            key: ContractKey,
             #[serde(deserialize_with = "RelatedContracts::deser_related_contracts")]
             related_contracts: RelatedContracts<'static>,
             /// max hops to live
@@ -691,5 +765,11 @@ enum UpdateState {
     },
     Finished {
         key: ContractKey,
+    },
+    PrepareRequest {
+        key: ContractKey,
+        related_contracts: RelatedContracts<'static>,
+        value: WrappedState,
+        htl: usize,
     },
 }

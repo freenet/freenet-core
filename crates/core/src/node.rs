@@ -19,7 +19,10 @@ use std::{
 };
 
 use either::Either;
-use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ErrorKind};
+use freenet_stdlib::{
+    client_api::{ClientRequest, ContractRequest, ErrorKind},
+    prelude::{RelatedContracts, State, WrappedState},
+};
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId as Libp2pPeerId};
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
@@ -36,7 +39,7 @@ use crate::{
     message::{NetMessage, NodeEvent, Transaction, TransactionType},
     operations::{
         connect::{self, ConnectOp},
-        get, put, subscribe, OpEnum, OpError, OpOutcome,
+        get, put, subscribe, update, OpEnum, OpError, OpOutcome,
     },
     ring::{Location, PeerKeyLocation},
     router::{RouteEvent, RouteOutcome},
@@ -388,15 +391,38 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                         tracing::error!("{}", err);
                     }
                 }
-                ContractRequest::Update {
-                    key: _key,
-                    data: _delta,
-                } => {
+                ContractRequest::Update { key, data } => {
                     // FIXME: perform updates
                     tracing::debug!(
                         this_peer = %op_manager.ring.peer_key,
                         "Received update from user event",
                     );
+                    // calculate new state from delta
+                    // let a = match data {
+                    //     freenet_stdlib::prelude::UpdateData::State(s) => true,
+                    //     _ => false,
+                    // };
+
+                    let state = match data {
+                        freenet_stdlib::prelude::UpdateData::State(s) => s,
+                        freenet_stdlib::prelude::UpdateData::Delta(sd) => {
+                            unreachable!();
+                        }
+                        _ => {
+                            unreachable!();
+                        }
+                    };
+
+                    let wrapped_state = WrappedState::from(state.into_bytes());
+
+                    let related_contracts = RelatedContracts::default();
+
+                    let op = update::start_op(key, wrapped_state, related_contracts, 3_usize);
+
+                    if let Err(err) = update::request_update(&op_manager, op, Some(client_id)).await
+                    {
+                        tracing::error!("{}", err)
+                    }
                 }
                 ContractRequest::Get {
                     key,

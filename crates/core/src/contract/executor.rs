@@ -399,7 +399,13 @@ struct UpdateContract {
 impl ComposeNetworkMessage<operations::update::UpdateOp> for UpdateContract {
     fn initiate_op(self, op_manager: &OpManager) -> operations::update::UpdateOp {
         let UpdateContract { key, new_state } = self;
-        operations::update::start_op(key, new_state, op_manager.ring.max_hops_to_live)
+        let related_contracts = RelatedContracts::default();
+        operations::update::start_op(
+            key,
+            new_state,
+            related_contracts,
+            op_manager.ring.max_hops_to_live,
+        )
     }
 
     async fn resume_op(
