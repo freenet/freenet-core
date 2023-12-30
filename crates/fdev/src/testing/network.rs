@@ -157,7 +157,7 @@ pub(super) async fn run(
 
             let supervisor = Arc::new(Supervisor::new(&mut network).await);
             start_server(supervisor.clone()).await?;
-            run_network(supervisor, config, network).await;
+            run_network(supervisor, config, network).await?;
             Ok(())
         }
         Process::Peer => {
@@ -215,9 +215,7 @@ pub async fn run_network(
     supervisor: Arc<Supervisor>,
     test_config: &TestConfig,
     network: SimNetwork,
-) {
-    let (user_ev_controller, event_rx) = tokio::sync::mpsc::channel(1);
-
+) -> Result<(), Error> {
     tracing::info!("Starting network");
 
     let cmd_args = SubProcess::build_command(&test_config, test_config.seed());
@@ -248,7 +246,10 @@ pub async fn run_network(
         .map(|(label, config)| (label.clone(), config.peer_id))
         .collect();
 
-    let mut events = EventChain::new(peers, user_ev_controller, test_config.events, true);
+    let events_sender = supervisor.user_ev_controller.lock().await.clone();
+    let events_receiver = supervisor.event_rx.lock().await;
+
+    let mut events = EventChain::new(peers, events_sender, test_config.events, true);
     let next_event_wait_time = test_config
         .event_wait_ms
         .map(Duration::from_millis)
@@ -273,23 +274,63 @@ pub async fn run_network(
 
     tokio::pin!(events_generated);
     tokio::pin!(ctrl_c);
+
+    loop {
+        tokio::select! {
+            _ = &mut ctrl_c  /* SIGINT handling */ => {
+                break;
+            }
+            res = &mut events_generated => {
+                match res? {
+                    Ok(()) => {
+                        tracing::info!("Test events generated successfully");
+                        *events_generated = tokio::task::spawn(futures::future::pending::<anyhow::Result<()>>());
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!("Test finalized with error: {}", e);
+                        return Err(e);
+                    }
+                }
+            }
+            // finalized = &mut supervisor_task => {
+            //     match finalized? {
+            //         Ok(_) => {
+            //             tracing::info!("Test finalized successfully");
+            //             break;
+            //         }
+            //         Err(e) => {
+            //             tracing::error!("Test finalized with error: {}", e);
+            //             return Err(e);
+            //         }
+            //     }
+            // }
+        }
+    }
+
+    Ok(())
 }
 
 pub struct Supervisor {
     peers_config: Arc<Mutex<HashMap<NodeLabel, NodeConfig>>>,
     processes: Mutex<HashMap<PeerId, SubProcess>>,
     waiting_peers: Arc<Mutex<VecDeque<usize>>>,
+    user_ev_controller: Arc<Mutex<tokio::sync::mpsc::Sender<(u32, PeerId)>>>,
+    event_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<(u32, PeerId)>>>,
 }
 
 impl Supervisor {
     pub async fn new(network: &mut SimNetwork) -> Self {
         let peers = network.build_peers();
         let peers_config = Arc::new(Mutex::new(peers.into_iter().collect::<HashMap<_, _>>()));
+        let (user_ev_controller, event_rx) = tokio::sync::mpsc::channel(1);
 
         Supervisor {
             peers_config,
             processes: Mutex::new(HashMap::new()),
             waiting_peers: Arc::new(Mutex::new(VecDeque::new())),
+            user_ev_controller: Arc::new(Mutex::new(user_ev_controller)),
+            event_rx: Arc::new(Mutex::new(event_rx)),
         }
     }
 
@@ -341,42 +382,51 @@ async fn ws_handler(ws: WebSocketUpgrade, supervisor: Arc<Supervisor>) -> axum::
 }
 
 async fn handle_socket(mut socket: WebSocket, supervisor: Arc<Supervisor>) {
-    while let Some(result) = socket.recv().await {
-        match result {
-            Ok(message) => match message {
-                Message::Binary(bytes) => {
-                    let peer_msg: PeerMessage = bincode::deserialize(&bytes).unwrap();
-                    println!("Received message: {:?}", peer_msg);
+    let mut event_receiver = supervisor.event_rx.lock().await;
+    loop {
+        tokio::select! {
+            Some(result) = socket.recv() => {
+                match result {
+                    Ok(message) => match message {
+                        Message::Binary(bytes) => {
+                            let peer_msg: PeerMessage = bincode::deserialize(&bytes).unwrap();
+                            println!("Received message: {:?}", peer_msg);
 
-                    match peer_msg {
-                        PeerMessage::Event(event) => {
-                            todo!("Handle event");
-                            tracing::info!("Received event: {:?}", event);
-                        }
-                        PeerMessage::Status(status) => {
-                            tracing::info!("Received status: {:?}", status);
-                            match status {
-                                PeerStatus::Finished(id) => {
-                                    supervisor.dequeue_peer(id).await;
+                            match peer_msg {
+                                PeerMessage::Event(event) => {
+                                    todo!("Handle event");
+                                    tracing::info!("Received event: {:?}", event);
                                 }
-                                PeerStatus::Error(error_msg) => {
-                                    tracing::error!("{}", error_msg)
+                                PeerMessage::Status(status) => {
+                                    tracing::info!("Received status: {:?}", status);
+                                    match status {
+                                        PeerStatus::Finished(id) => {
+                                            supervisor.dequeue_peer(id).await;
+                                        }
+                                        PeerStatus::Error(error_msg) => {
+                                            tracing::error!("{}", error_msg)
+                                        }
+                                    }
+                                }
+                                PeerMessage::Info(info_msg) => {
+                                    tracing::info!("{}", info_msg);
                                 }
                             }
                         }
-                        PeerMessage::Info(info_msg) => {
-                            tracing::info!("{}", info_msg);
+                        Message::Text(error_msg) => {
+                            tracing::error!("Received error message: {:?}", error_msg);
                         }
-                    }
+                        _ => {
+                            tracing::error!("Received unexpected message: {:?}", message);
+                        }
+                    },
+                    Err(e) => eprintln!("Error in WebSocket communication: {}", e),
                 }
-                Message::Text(error_msg) => {
-                    tracing::error!("Received error message: {:?}", error_msg);
-                }
-                Message::Ping(_) => {}
-                Message::Pong(_) => {}
-                Message::Close(_) => {}
             },
-            Err(e) => eprintln!("Error in WebSocket communication: {}", e),
+            Some((event, peer_id)) = event_receiver.recv() => {
+                tracing::info!("Received event {} for peer {}", event, peer_id);
+                todo!()
+            }
         }
     }
 }
@@ -447,8 +497,12 @@ impl Peer {
                 .unwrap_or(test_config.nodes * 10),
             test_config.events as usize,
         );
-        let event_generator =
-            NetworkEventGenerator::new(memory_event_generator, self.ws_client.clone());
+        let event_generator = NetworkEventGenerator::new(
+            self.config.peer_id,
+            memory_event_generator,
+            self.ws_client.clone(),
+            test_config.seed(),
+        );
 
         // Obtain an identity::Keypair instance for the private_key
         let private_key = Keypair::generate_ed25519();

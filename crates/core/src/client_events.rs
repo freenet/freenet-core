@@ -153,6 +153,7 @@ pub trait ClientEventsProxy {
 }
 
 pub(crate) mod test {
+    use fastrand::Rng;
     use std::{
         collections::{HashMap, HashSet},
         time::Duration,
@@ -162,11 +163,12 @@ pub(crate) mod test {
         client_api::{ContractRequest, ErrorKind},
         prelude::*,
     };
-    use futures::{FutureExt, SinkExt};
+    use futures::{FutureExt, SinkExt, StreamExt};
     use rand::{seq::SliceRandom, SeedableRng};
     use tokio::net::TcpStream;
     use tokio::sync::watch::Receiver;
     use tokio::sync::Mutex;
+    use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
     use crate::node::{testing_impl::EventId, PeerId};
@@ -320,36 +322,90 @@ pub(crate) mod test {
     }
 
     pub struct NetworkEventGenerator<R = rand::rngs::SmallRng> {
+        id: PeerId,
         memory_event_generator: MemoryEventsGen<R>,
         ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+        rng: Option<R>,
+        internal_state: Option<InternalGeneratorState>,
+        events_to_gen: HashMap<EventId, ClientRequest<'static>>,
     }
 
-    impl<R> NetworkEventGenerator<R> {
+    impl<R> NetworkEventGenerator<R>
+    where
+        R: RandomEventGenerator,
+    {
         pub fn new(
+            id: PeerId,
             memory_event_generator: MemoryEventsGen<R>,
             ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+            seed: u64,
         ) -> Self {
             Self {
+                id,
                 memory_event_generator,
                 ws_client,
+                rng: Some(R::seed_from_u64(seed)),
+                internal_state: None,
+                events_to_gen: HashMap::new(),
             }
         }
     }
 
     impl<R> ClientEventsProxy for NetworkEventGenerator<R>
     where
-        R: RandomEventGenerator + Send,
+        R: RandomEventGenerator + Send + Clone,
     {
         fn recv(&mut self) -> BoxFuture<'_, HostIncomingMsg> {
-            async {
+            let ws_client_clone = self.ws_client.clone();
+
+            async move {
                 loop {
-                    tokio::select! {
-                        event = self.memory_event_generator.recv() => {
-                            let serialized_message = bincode::serialize(&event?.request).unwrap();
-                             self.ws_client.lock().await.send(
-                                tokio_tungstenite::tungstenite::protocol::Message::Binary(serialized_message)
-                            ).await.unwrap();
+                    let message = {
+                        let mut lock = ws_client_clone.lock().await;
+                        lock.next().await
+                    };
+
+                    match message {
+                        Some(Ok(Message::Binary(data))) => {
+                            if let Ok((ev_id, pk)) =
+                                bincode::deserialize::<(EventId, PeerId)>(&data)
+                            {
+                                if self.rng.is_some() && pk == self.id {
+                                    let res = OpenRequest {
+                                        client_id: ClientId::FIRST,
+                                        request: self
+                                            .memory_event_generator
+                                            .generate_rand_event()
+                                            .await
+                                            .ok_or_else(|| {
+                                                ClientError::from(ErrorKind::Disconnect)
+                                            })?
+                                            .into(),
+                                        notification_channel: None,
+                                        token: None,
+                                    };
+                                    return Ok(res.into_owned());
+                                } else if pk == self.id {
+                                    let res = OpenRequest {
+                                        client_id: ClientId::FIRST,
+                                        request: self
+                                            .memory_event_generator
+                                            .generate_deterministic_event(&ev_id)
+                                            .expect("event not found")
+                                            .into(),
+                                        notification_channel: None,
+                                        token: None,
+                                    };
+                                    return Ok(res.into_owned());
+                                }
+                            } else {
+                                continue;
+                            }
                         }
+                        None => {
+                            return Err(ClientError::from(ErrorKind::Disconnect));
+                        }
+                        _ => continue,
                     }
                 }
             }
