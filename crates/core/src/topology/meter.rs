@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::time::{Duration, Instant};
 
-use crate::resources::rate::Rate;
 use dashmap::DashMap;
 use freenet_stdlib::prelude::*;
 
 use crate::ring::PeerKeyLocation;
+use crate::topology::rate::Rate;
 
 use super::running_average::RunningAverage;
 
@@ -23,7 +23,7 @@ const ESTIMATED_USAGE_RATE_CACHE_TIME: Duration = Duration::from_secs(60);
 /// A structure that keeps track of the usage of dynamic resources which are consumed over time.
 /// It provides methods to report and query resource usage, both total and attributed to specific
 /// sources.
-pub(super) struct Meter {
+pub(crate) struct Meter {
     attribution_meters: AttributionMeters,
     running_average_window_size: usize,
     cached_estimated_usage_rate: DashMap<ResourceType, (Rate, Instant)>,
@@ -216,7 +216,7 @@ pub(crate) enum AttributionSource {
 }
 
 #[derive(Eq, Hash, PartialEq, Clone, Copy, Debug)]
-pub enum ResourceType {
+pub(crate) enum ResourceType {
     InboundBandwidthBytes,
     OutboundBandwidthBytes,
 }

@@ -1,9 +1,9 @@
-use crate::resources::rate::Rate;
+use crate::topology::rate::Rate;
 use std::time::Duration;
 use std::{collections::VecDeque, time::Instant};
 
 #[derive(Clone, Debug)]
-pub(super) struct RunningAverage {
+pub(crate) struct RunningAverage {
     max_samples: usize,
     samples: VecDeque<(Instant, f64)>,
     sum_samples: f64,

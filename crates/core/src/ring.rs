@@ -32,9 +32,9 @@ use tokio::sync;
 use tracing::Instrument;
 
 use crate::message::TransactionType;
-use crate::resources::rate::Rate;
-use crate::resources::{Limits, ResourceManager, ResourceType, TopologyAdjustment};
-use crate::topology::AcquisitionStrategy;
+use crate::topology::meter::ResourceType;
+use crate::topology::rate::Rate;
+use crate::topology::{AcquisitionStrategy, Limits, TopologyAdjustment, TopologyManager};
 use crate::tracing::{NetEventLog, NetEventRegister};
 use crate::util::Contains;
 use crate::{
@@ -171,7 +171,7 @@ pub(crate) struct Ring {
     pub max_connections: usize,
     pub min_connections: usize,
     router: Arc<RwLock<Router>>,
-    resource_manager: RwLock<ResourceManager>,
+    topology_manager: RwLock<TopologyManager>,
     /// Fast is for when there are less than our target number of connections so we want to acquire new connections quickly.
     /// Slow is for when there are enough connections so we need to drop a connection in order to replace it.
     fast_acquisition: AtomicBool,
@@ -209,9 +209,13 @@ pub(crate) struct Ring {
 // }
 
 impl Ring {
-    const DEFAULT_MIN_CONNECTIONS: usize = 10;
+    const DEFAULT_MIN_CONNECTIONS: usize = 5;
 
-    const DEFAULT_MAX_CONNECTIONS: usize = 20;
+    const DEFAULT_MAX_CONNECTIONS: usize = 200;
+
+    const DEFAULT_MAX_UPSTREAM_BANDWIDTH: Rate = Rate::new_per_second(1_000_000.0);
+
+    const DEFAULT_MAX_DOWNSTREAM_BANDWIDTH: Rate = Rate::new_per_second(1_000_000.0);
 
     /// Max number of subscribers for a contract.
     const MAX_SUBSCRIBERS: usize = 10;
@@ -259,15 +263,27 @@ impl Ring {
             Self::DEFAULT_MAX_CONNECTIONS
         };
 
-        let router = Arc::new(RwLock::new(Router::new(&[])));
-        GlobalExecutor::spawn(Self::refresh_router(router.clone(), event_register.clone()));
+        let max_upstream_bandwidth = if let Some(v) = config.max_upstream_bandwidth {
+            v
+        } else {
+            Self::DEFAULT_MAX_UPSTREAM_BANDWIDTH
+        };
 
-        let resource_manager = RwLock::new(ResourceManager::new(Limits {
-            max_upstream_bandwidth: Rate::new_per_second(100.0),
-            max_downstream_bandwidth: Rate::new_per_second(100.0),
+        let max_downstream_bandwidth = if let Some(v) = config.max_downstream_bandwidth {
+            v
+        } else {
+            Self::DEFAULT_MAX_DOWNSTREAM_BANDWIDTH
+        };
+
+        let topology_manager = RwLock::new(TopologyManager::new(Limits {
+            max_upstream_bandwidth,
+            max_downstream_bandwidth,
             min_connections,
             max_connections,
         }));
+
+        let router = Arc::new(RwLock::new(Router::new(&[])));
+        GlobalExecutor::spawn(Self::refresh_router(router.clone(), event_register.clone()));
 
         // Just initialize with a fake location, this will be later updated when the peer has an actual location assigned.
         let ring = Ring {
@@ -276,7 +292,7 @@ impl Ring {
             max_connections,
             min_connections,
             router,
-            resource_manager,
+            topology_manager,
             fast_acquisition: AtomicBool::new(true),
             connections_by_location: RwLock::new(BTreeMap::new()),
             location_for_peer: RwLock::new(BTreeMap::new()),
@@ -436,10 +452,9 @@ impl Ring {
             } else {
                 AcquisitionStrategy::Slow
             };
-            self.resource_manager
+            self.topology_manager
                 .write()
-                .topology_manager
-                .evaluate_new_connection(location, strategy)
+                .evaluate_new_connection(location, strategy, Instant::now())
                 .unwrap_or(false)
         };
         if !accepted {
@@ -450,9 +465,8 @@ impl Ring {
     }
 
     pub fn record_request(&self, requested_location: Location, request_type: TransactionType) {
-        self.resource_manager
+        self.topology_manager
             .write()
-            .topology_manager
             .record_request(requested_location, request_type);
     }
 
@@ -474,7 +488,7 @@ impl Ring {
 
     fn refresh_density_request_cache(&self) {
         let cbl = self.connections_by_location.read();
-        let topology_manager = &mut self.resource_manager.write().topology_manager;
+        let topology_manager = &mut self.topology_manager.write();
         let _ = topology_manager.refresh_cache(&cbl);
     }
 
@@ -510,7 +524,7 @@ impl Ring {
     }
 
     pub fn routing_finished(&self, event: crate::router::RouteEvent) {
-        self.resource_manager
+        self.topology_manager
             .write()
             .report_outbound_request(event.peer, event.contract_location);
         self.router.write().add_event(event);
@@ -721,7 +735,7 @@ impl Ring {
 
             // todo: when we are actually trackign the resources, pass the resource type
             // which is most constraint at the moment when calling this function
-            let adjustment = self.resource_manager.write().adjust_topology(
+            let adjustment = self.topology_manager.write().adjust_topology(
                 ResourceType::InboundBandwidthBytes,
                 &neighbor_locations,
                 Instant::now(),

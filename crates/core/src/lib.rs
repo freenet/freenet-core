@@ -12,8 +12,6 @@ mod message;
 mod node;
 /// Network operation/transaction state machines.
 mod operations;
-/// Resource usage tracking.
-mod resources;
 /// Ring connections and routing.
 mod ring;
 /// Router implementation.
