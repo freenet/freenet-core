@@ -464,10 +464,15 @@ impl Ring {
         accepted
     }
 
-    pub fn record_request(&self, requested_location: Location, request_type: TransactionType) {
+    pub fn record_request(
+        &self,
+        recipient: PeerKeyLocation,
+        target: Location,
+        request_type: TransactionType,
+    ) {
         self.topology_manager
             .write()
-            .record_request(requested_location, request_type);
+            .record_request(recipient, target, request_type);
     }
 
     pub fn add_connection(&self, loc: Location, peer: PeerId) {

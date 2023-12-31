@@ -1,7 +1,4 @@
-use crate::{
-    message::TransactionType,
-    ring::{Distance, Location},
-};
+use crate::{message::TransactionType, ring::Location};
 use anyhow::anyhow;
 use connection_evaluator::ConnectionEvaluator;
 use dashmap::DashMap;
@@ -16,6 +13,7 @@ use std::{
 use tracing::{debug, error, event, info, span, Level};
 
 pub mod connection_evaluator;
+mod constants;
 pub(crate) mod meter;
 pub(crate) mod outbound_request_counter;
 pub(crate) mod rate;
@@ -26,18 +24,8 @@ mod small_world_rand;
 use crate::ring::{Connection, PeerKeyLocation};
 use crate::topology::meter::{AttributionSource, ResourceType};
 use crate::topology::rate::{Rate, RateProportion};
+use constants::*;
 use request_density_tracker::DensityMapError;
-use small_world_rand::random_link_distance;
-
-const SLOW_CONNECTION_EVALUATOR_WINDOW_DURATION: Duration = Duration::from_secs(5 * 60);
-const FAST_CONNECTION_EVALUATOR_WINDOW_DURATION: Duration = Duration::from_secs(60);
-const REQUEST_DENSITY_TRACKER_WINDOW_SIZE: usize = 10_000;
-const RANDOM_CLOSEST_DISTANCE: f64 = 1.0 / 1000.0;
-const SOURCE_RAMP_UP_DURATION: Duration = Duration::from_secs(5 * 60);
-const REQUEST_DENSITY_TRACKER_SAMPLE_SIZE: usize = 5000;
-const OUTBOUND_REQUEST_COUNTER_WINDOW_SIZE: usize = 10000;
-const MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION: f64 = 0.5;
-const MAXIMUM_DESIRED_RESOURCE_USAGE_PROPORTION: f64 = 0.9;
 
 /// The goal of `TopologyManager` is to select new connections such that the
 /// distribution of connections is as close as possible to the
@@ -104,11 +92,14 @@ impl TopologyManager {
     /// Record a request and the location it's targeting
     pub(crate) fn record_request(
         &mut self,
-        requested_location: Location,
+        recipient: PeerKeyLocation,
+        target: Location,
         request_type: TransactionType,
     ) {
-        tracing::debug!(%request_type, %requested_location, "Recording request for location");
-        self.request_density_tracker.sample(requested_location);
+        debug!(%request_type, %recipient, "Recording request sent to peer");
+
+        self.request_density_tracker.sample(target);
+        self.outbound_request_counter.record_request(recipient);
     }
 
     /// Decide whether to accept a connection from a new candidate peer based on its location
@@ -160,31 +151,17 @@ impl TopologyManager {
 
         let best_location = match density_map.get_max_density() {
             Ok(location) => {
-                tracing::debug!("Max density found at location: {:?}", location);
+                debug!("Max density found at location: {:?}", location);
                 location
             }
             Err(_) => {
-                tracing::debug!(
+                debug!(
                     "An error occurred while getting max density, falling back to random location"
                 );
-                self.random_location(this_peer_location)
+                this_peer_location.clone()
             }
         };
         Ok(best_location)
-    }
-
-    /// Generates a random location that is close to the current peer location with a small
-    /// world distribution.
-    fn random_location(&self, this_peer_location: &Location) -> Location {
-        tracing::debug!("Generating random location");
-        let distance = random_link_distance(Distance::new(RANDOM_CLOSEST_DISTANCE));
-        let location_f64 = if rand::random() {
-            this_peer_location.as_f64() - distance.as_f64()
-        } else {
-            this_peer_location.as_f64() + distance.as_f64()
-        };
-        let location_f64 = location_f64.rem_euclid(1.0); // Ensure result is in [0.0, 1.0)
-        Location::new(location_f64)
     }
 
     pub fn update_limits(&mut self, limits: Limits) {
@@ -211,8 +188,7 @@ impl TopologyManager {
         self.meter.report(attribution, resource, value, at_time);
     }
 
-    // TODO: This should be called when a request is sent to a neighbor,
-    //       could be any type of request (GET, PUT, SUBSCRIBE)
+    // TODO:
     pub(crate) fn report_outbound_request(&mut self, peer: PeerKeyLocation, target: Location) {
         self.request_density_tracker.sample(target);
         self.outbound_request_counter.record_request(peer);
@@ -513,8 +489,13 @@ mod tests {
 
         // Simulate a bunch of random requests clustered around 0.35
         for _ in 0..NUM_REQUESTS {
-            let requested_location = topology_manager.random_location(&this_peer_location);
-            topology_manager.record_request(requested_location, TransactionType::Get);
+            let requested_location = random_location(&random_location(&this_peer_location));
+            // FIXME: Is PeerKeyLocation unimportant for this test?
+            topology_manager.record_request(
+                PeerKeyLocation::random(),
+                requested_location,
+                TransactionType::Get,
+            );
         }
 
         topology_manager
@@ -554,8 +535,24 @@ mod tests {
         assert_eq!(best_location, Location::new(0.4));
     }
 
+    /// Generates a random location that is close to the current peer location with a small
+    /// world distribution.
+    fn random_location(this_peer_location: &Location) -> Location {
+        tracing::debug!("Generating random location");
+        let distance = random_link_distance(Distance::new(RANDOM_CLOSEST_DISTANCE));
+        let location_f64 = if rand::random() {
+            this_peer_location.as_f64() - distance.as_f64()
+        } else {
+            this_peer_location.as_f64() + distance.as_f64()
+        };
+        let location_f64 = location_f64.rem_euclid(1.0);
+        Location::new(location_f64)
+    }
+
     use super::*;
+    use crate::ring::Distance;
     use crate::test_utils::with_tracing;
+    use small_world_rand::random_link_distance;
     use std::time::Instant;
 
     #[test]
