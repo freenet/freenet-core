@@ -172,7 +172,7 @@ impl TopologyManager {
         &mut self,
         attribution: &AttributionSource,
         resource: ResourceType,
-        value: f64,
+        amount: f64,
         at_time: Instant,
     ) {
         if let Some(creation_time) = self.source_creation_times.get(attribution) {
@@ -185,10 +185,10 @@ impl TopologyManager {
                 .insert(attribution.clone(), at_time);
         }
 
-        self.meter.report(attribution, resource, value, at_time);
+        self.meter.report(attribution, resource, amount, at_time);
     }
 
-    // TODO:
+    /// Record an outbound request to a peer, along with the target Location of that request
     pub(crate) fn report_outbound_request(&mut self, peer: PeerKeyLocation, target: Location) {
         self.request_density_tracker.sample(target);
         self.outbound_request_counter.record_request(peer);
@@ -314,7 +314,7 @@ impl TopologyManager {
                     neighbor_locations.len(),
                     self.limits.max_connections
                 );
-                Ok(self.select_connections_to_remove(&resource_type, &usage.total, at_time))
+                Ok(self.select_connections_to_remove(&resource_type, at_time))
             } else if usage_proportion < increase_usage_if_below {
                 debug!(
                     "{:?} resource usage ({:?}) is below threshold ({:?}), adding connections",
@@ -326,7 +326,7 @@ impl TopologyManager {
                     "{:?} resource usage ({:?}) is above threshold ({:?}), removing connections",
                     resource_type, usage_proportion, decrease_usage_if_above
                 );
-                Ok(self.select_connections_to_remove(&resource_type, &usage.total, at_time))
+                Ok(self.select_connections_to_remove(&resource_type, at_time))
             } else {
                 debug!(
                     "{:?} resource usage is within acceptable bounds: {:?}",
@@ -346,7 +346,7 @@ impl TopologyManager {
                 debug!("No topology change required.");
             }
             Err(e) => {
-                tracing::error!("Couldn't adjust topology due to error: {:?}", e);
+                error!("Couldn't adjust topology due to error: {:?}", e);
             }
         }
 
@@ -388,7 +388,6 @@ impl TopologyManager {
     fn select_connections_to_remove(
         &mut self,
         resource_type: &ResourceType,
-        usage_rate: &Rate,
         at_time: Instant,
     ) -> TopologyAdjustment {
         let function_span = span!(Level::INFO, "remove_connections");
@@ -417,14 +416,14 @@ impl TopologyManager {
                     let peer_span = span!(Level::DEBUG, "peer_processing", ?peer);
                     let _peer_enter = peer_span.enter();
 
-                    let value_per_usage = self.outbound_request_counter.get_request_count(&peer)
-                        as f64
-                        / source_usage.per_second();
+                    let request_count =
+                        self.outbound_request_counter.get_request_count(&peer) as f64;
+
+                    let value_per_usage = request_count / source_usage.per_second();
 
                     event!(
                         Level::DEBUG,
-                        request_count =
-                            self.outbound_request_counter.get_request_count(&peer) as f64,
+                        request_count = request_count,
                         usage = source_usage.per_second(),
                         value_per_usage = value_per_usage
                     );
