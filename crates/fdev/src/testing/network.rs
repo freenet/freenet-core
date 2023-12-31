@@ -1,4 +1,5 @@
 use super::{Error, TestConfig};
+use anyhow::anyhow;
 use axum::{
     body::Body,
     extract::{
@@ -13,6 +14,7 @@ use freenet::dev_tool::{
     EventChain, Executor, MemoryEventsGen, NetworkEventGenerator, NodeConfig, NodeLabel,
     OperationMode, PeerCliConfig, PeerId, Runtime, SimNetwork,
 };
+use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use http::{Response, StatusCode};
 use libp2p_identity::Keypair;
@@ -26,7 +28,9 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+
 use thiserror::Error;
+use tokio::task::JoinHandle;
 use tokio::{
     net::TcpStream,
     process::Command,
@@ -376,57 +380,141 @@ async fn config_handler(
 async fn ws_handler(ws: WebSocketUpgrade, supervisor: Arc<Supervisor>) -> axum::response::Response {
     let on_upgrade = move |ws: WebSocket| async move {
         let cloned_supervisor = supervisor.clone();
-        handle_socket(ws, cloned_supervisor).await
+        if let Err(error) = handle_socket(ws, cloned_supervisor).await {
+            tracing::error!("{error}");
+        }
     };
     ws.on_upgrade(on_upgrade)
 }
 
-async fn handle_socket(mut socket: WebSocket, supervisor: Arc<Supervisor>) {
-    let mut event_receiver = supervisor.event_rx.lock().await;
-    loop {
-        tokio::select! {
-            Some(result) = socket.recv() => {
-                match result {
-                    Ok(message) => match message {
-                        Message::Binary(bytes) => {
-                            let peer_msg: PeerMessage = bincode::deserialize(&bytes).unwrap();
-                            println!("Received message: {:?}", peer_msg);
+async fn handle_socket(mut socket: WebSocket, supervisor: Arc<Supervisor>) -> anyhow::Result<()> {
+    // Clone supervisor to allow safe concurrent access in async tasks.
+    let cloned_supervisor = supervisor.clone();
+    let (mut sender, mut receiver): (SplitSink<WebSocket, Message>, SplitStream<WebSocket>) =
+        socket.split();
 
-                            match peer_msg {
-                                PeerMessage::Event(event) => {
-                                    todo!("Handle event");
-                                    tracing::info!("Received event: {:?}", event);
-                                }
-                                PeerMessage::Status(status) => {
-                                    tracing::info!("Received status: {:?}", status);
-                                    match status {
-                                        PeerStatus::Finished(id) => {
-                                            supervisor.dequeue_peer(id).await;
-                                        }
-                                        PeerStatus::Error(error_msg) => {
-                                            tracing::error!("{}", error_msg)
-                                        }
-                                    }
-                                }
-                                PeerMessage::Info(info_msg) => {
-                                    tracing::info!("{}", info_msg);
-                                }
-                            }
-                        }
-                        Message::Text(error_msg) => {
-                            tracing::error!("Received error message: {:?}", error_msg);
-                        }
-                        _ => {
-                            tracing::error!("Received unexpected message: {:?}", message);
-                        }
-                    },
-                    Err(e) => eprintln!("Error in WebSocket communication: {}", e),
+    // Spawn a task for handling outgoing messages.
+    let mut sender_task: JoinHandle<Result<(), Error>> =
+        tokio::spawn(
+            async move { handle_outgoing_messages(&cloned_supervisor, &mut sender).await },
+        );
+
+    // Spawn a task for handling incoming messages.
+    let mut receiver_task: JoinHandle<Result<(), Error>> =
+        tokio::spawn(async move { handle_incoming_messages(&supervisor, &mut receiver).await });
+
+    // Wait for either the sender or receiver task to complete and then clean up.
+    tokio::select! {
+        event_s = &mut sender_task => {
+            match event_s {
+                Ok(_) => {
+                    tracing::info!("Sender task finished");
+                    receiver_task.abort();
+                    Ok(())
                 }
-            },
-            Some((event, peer_id)) = event_receiver.recv() => {
-                tracing::info!("Received event {} for peer {}", event, peer_id);
-                todo!()
+                Err(e) => {
+                    tracing::error!("Sender task failed: {}", e);
+                    receiver_task.abort();
+                    Err(e.into())
+                }
             }
+        }
+        peer_r = &mut receiver_task => {
+            match peer_r {
+                Ok(_) => {
+                    tracing::info!("Receiver task finished");
+                    sender_task.abort();
+                    Ok(())
+                }
+                Err(e) => {
+                    tracing::error!("Receiver task failed: {}", e);
+                    sender_task.abort();
+                    Err(e.into())
+                }
+            }
+        }
+    }
+}
+
+async fn handle_outgoing_messages(
+    supervisor: &Arc<Supervisor>,
+    sender: &mut SplitSink<WebSocket, Message>,
+) -> Result<(), anyhow::Error> {
+    let mut event_rx = supervisor.event_rx.lock().await;
+    while let Some((event, peer_id)) = event_rx.recv().await {
+        tracing::info!("Received event {} for peer {}", event, peer_id);
+        let serialized_msg: Vec<u8> = bincode::serialize(&(event, peer_id))
+            .map_err(|e| anyhow!("Failed to serialize message: {}", e))?;
+
+        if let Err(e) = sender.send(Message::Binary(serialized_msg)).await {
+            tracing::error!("Failed to send event {} for peer {}: {}", event, peer_id, e);
+        }
+    }
+    Ok(())
+}
+
+async fn handle_incoming_messages(
+    supervisor: &Arc<Supervisor>,
+    receiver: &mut SplitStream<WebSocket>,
+) -> Result<(), anyhow::Error> {
+    while let Some(result) = receiver.next().await {
+        // Handle the received message or log the error.
+        match result {
+            Ok(message) => process_message(message, supervisor).await?,
+            Err(e) => eprintln!("Error in WebSocket communication: {}", e),
+        }
+    }
+    Ok(())
+}
+
+async fn process_message(
+    message: Message,
+    supervisor: &Arc<Supervisor>,
+) -> Result<(), anyhow::Error> {
+    match message {
+        Message::Binary(bytes) => {
+            let peer_msg: PeerMessage = bincode::deserialize(&bytes)
+                .map_err(|e| anyhow!("Failed to deserialize message: {}", e))?;
+            handle_peer_message(peer_msg, supervisor).await
+        }
+        Message::Text(error_msg) => {
+            tracing::error!("Received error message: {:?}", error_msg);
+            Ok(())
+        }
+        _ => {
+            tracing::error!("Received unexpected message: {:?}", message);
+            Ok(())
+        }
+    }
+}
+
+async fn handle_peer_message(
+    peer_msg: PeerMessage,
+    supervisor: &Arc<Supervisor>,
+) -> Result<(), anyhow::Error> {
+    match peer_msg {
+        PeerMessage::Event(event) => {
+            // TODO: Implement actual event handling logic here.
+            tracing::info!("Received event: {:?}", event);
+            Ok(())
+        }
+        // Handle Status messages.
+        PeerMessage::Status(status) => {
+            tracing::info!("Received status: {:?}", status);
+            match status {
+                PeerStatus::Finished(id) => {
+                    supervisor.dequeue_peer(id).await;
+                    Ok(())
+                }
+                PeerStatus::Error(error_msg) => {
+                    tracing::error!("{}", error_msg);
+                    Ok(())
+                }
+            }
+        }
+        PeerMessage::Info(info_msg) => {
+            tracing::info!("{}", info_msg);
+            Ok(())
         }
     }
 }
