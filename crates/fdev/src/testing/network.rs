@@ -20,6 +20,7 @@ use http::{Response, StatusCode};
 use libp2p_identity::Keypair;
 use reqwest;
 use serde::{Deserialize, Serialize};
+use std::ops::Deref;
 use std::{
     collections::{HashMap, VecDeque},
     fmt::Display,
@@ -30,6 +31,7 @@ use std::{
 };
 
 use thiserror::Error;
+use tokio::sync::watch::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio::{
     net::TcpStream,
@@ -144,6 +146,10 @@ impl SubProcess {
 
         Ok(Self { child, id })
     }
+
+    async fn close(mut self) {
+        let _ = self.child.kill().await;
+    }
 }
 
 pub(super) async fn run(
@@ -166,7 +172,7 @@ pub(super) async fn run(
         }
         Process::Peer => {
             if let Some(peer_id) = &cmd_config.id {
-                let peer = Peer::new(peer_id.clone()).await?;
+                let mut peer = Peer::new(peer_id.clone()).await?;
                 peer.run(config, peer_id.clone()).await?;
             }
             Ok(())
@@ -251,7 +257,6 @@ pub async fn run_network(
         .collect();
 
     let events_sender = supervisor.user_ev_controller.lock().await.clone();
-    let events_receiver = supervisor.event_rx.lock().await;
 
     let mut events = EventChain::new(peers, events_sender, test_config.events, true);
     let next_event_wait_time = test_config
@@ -297,60 +302,15 @@ pub async fn run_network(
                     }
                 }
             }
-            // finalized = &mut supervisor_task => {
-            //     match finalized? {
-            //         Ok(_) => {
-            //             tracing::info!("Test finalized successfully");
-            //             break;
-            //         }
-            //         Err(e) => {
-            //             tracing::error!("Test finalized with error: {}", e);
-            //             return Err(e);
-            //         }
-            //     }
-            // }
         }
     }
+
+    for (_, subprocess) in supervisor.processes.lock().await.drain() {
+        subprocess.close().await;
+    }
+    tracing::info!("Simulation finished");
 
     Ok(())
-}
-
-pub struct Supervisor {
-    peers_config: Arc<Mutex<HashMap<NodeLabel, NodeConfig>>>,
-    processes: Mutex<HashMap<PeerId, SubProcess>>,
-    waiting_peers: Arc<Mutex<VecDeque<usize>>>,
-    user_ev_controller: Arc<Mutex<tokio::sync::mpsc::Sender<(u32, PeerId)>>>,
-    event_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<(u32, PeerId)>>>,
-}
-
-impl Supervisor {
-    pub async fn new(network: &mut SimNetwork) -> Self {
-        let peers = network.build_peers();
-        let peers_config = Arc::new(Mutex::new(peers.into_iter().collect::<HashMap<_, _>>()));
-        let (user_ev_controller, event_rx) = tokio::sync::mpsc::channel(1);
-
-        Supervisor {
-            peers_config,
-            processes: Mutex::new(HashMap::new()),
-            waiting_peers: Arc::new(Mutex::new(VecDeque::new())),
-            user_ev_controller: Arc::new(Mutex::new(user_ev_controller)),
-            event_rx: Arc::new(Mutex::new(event_rx)),
-        }
-    }
-
-    pub async fn enqueue_peer(&self, id: usize) {
-        tracing::info!("Enqueueing peer {}", id);
-        let mut queue = self.waiting_peers.lock().await;
-        queue.push_back(id);
-    }
-
-    pub async fn dequeue_peer(&self, id: usize) {
-        tracing::info!("Dequeueing peer {}", id);
-        let mut queue = self.waiting_peers.lock().await;
-        if let Some(position) = queue.iter().position(|x| x == &id) {
-            queue.remove(position);
-        }
-    }
 }
 
 async fn config_handler(
@@ -519,6 +479,44 @@ async fn handle_peer_message(
     }
 }
 
+pub struct Supervisor {
+    peers_config: Arc<Mutex<HashMap<NodeLabel, NodeConfig>>>,
+    processes: Mutex<HashMap<PeerId, SubProcess>>,
+    waiting_peers: Arc<Mutex<VecDeque<usize>>>,
+    user_ev_controller: Arc<Mutex<tokio::sync::mpsc::Sender<(u32, PeerId)>>>,
+    event_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<(u32, PeerId)>>>,
+}
+
+impl Supervisor {
+    pub async fn new(network: &mut SimNetwork) -> Self {
+        let peers = network.build_peers();
+        let peers_config = Arc::new(Mutex::new(peers.into_iter().collect::<HashMap<_, _>>()));
+        let (user_ev_controller, event_rx) = tokio::sync::mpsc::channel(1);
+
+        Supervisor {
+            peers_config,
+            processes: Mutex::new(HashMap::new()),
+            waiting_peers: Arc::new(Mutex::new(VecDeque::new())),
+            user_ev_controller: Arc::new(Mutex::new(user_ev_controller)),
+            event_rx: Arc::new(Mutex::new(event_rx)),
+        }
+    }
+
+    pub async fn enqueue_peer(&self, id: usize) {
+        tracing::info!("Enqueueing peer {}", id);
+        let mut queue = self.waiting_peers.lock().await;
+        queue.push_back(id);
+    }
+
+    pub async fn dequeue_peer(&self, id: usize) {
+        tracing::info!("Dequeueing peer {}", id);
+        let mut queue = self.waiting_peers.lock().await;
+        if let Some(position) = queue.iter().position(|x| x == &id) {
+            queue.remove(position);
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 enum PeerStatus {
     Finished(usize),
@@ -536,6 +534,8 @@ struct Peer {
     id: String,
     config: NodeConfig,
     ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+    user_ev_controller: Arc<Sender<(u32, PeerId)>>,
+    receiver_ch: Arc<Receiver<(u32, PeerId)>>,
 }
 
 impl Peer {
@@ -549,16 +549,24 @@ impl Peer {
         tracing::info!("Response config from server: {:?}", response);
         let peer_config = response.json::<NodeConfig>().await?;
 
+        let (user_ev_controller, receiver_ch): (Sender<(u32, PeerId)>, Receiver<(u32, PeerId)>) =
+            tokio::sync::watch::channel((0, peer_config.peer_id));
+
         Ok(Peer {
             id: peer_id,
             config: peer_config,
             ws_client: Arc::new(Mutex::new(ws_stream)),
+            user_ev_controller: Arc::new(user_ev_controller),
+            receiver_ch: Arc::new(receiver_ch),
         })
     }
 
-    async fn run(&self, test_config: &super::TestConfig, peer_id: String) -> anyhow::Result<()> {
-        let (user_ev_controller, mut receiver_ch) =
-            tokio::sync::watch::channel((0, self.config.peer_id));
+    async fn run(
+        &mut self,
+        test_config: &super::TestConfig,
+        peer_id: String,
+    ) -> anyhow::Result<()> {
+        let mut receiver_ch = self.receiver_ch.deref().clone();
         receiver_ch.borrow_and_update();
 
         let conf_str = serde_json::to_string(&self.config).unwrap();
@@ -567,9 +575,8 @@ impl Peer {
             PeerMessage::Info(format!("Node {} with config: {}", peer_id, conf_str)),
         )
         .await;
-
         let mut memory_event_generator = MemoryEventsGen::<fastrand::Rng>::new_with_seed(
-            receiver_ch.clone(),
+            receiver_ch,
             self.config.peer_id,
             test_config
                 .seed
@@ -604,6 +611,10 @@ impl Peer {
             port: self.config.local_port.unwrap(),
         };
 
+        let event_loop_task =
+            Self::event_loop(self.ws_client.clone(), self.user_ev_controller.clone());
+        tokio::task::spawn(event_loop_task);
+
         match self
             .config
             .clone()
@@ -628,6 +639,41 @@ impl Peer {
         }
 
         Ok(())
+    }
+    async fn event_loop(
+        ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+        user_ev_controller: Arc<Sender<(u32, PeerId)>>,
+    ) -> anyhow::Result<()> {
+        let ws_client = ws_client.clone();
+        loop {
+            let msg = ws_client.lock().await.next().await;
+            match msg {
+                Some(Ok(msg)) => match msg {
+                    tokio_tungstenite::tungstenite::protocol::Message::Binary(bytes) => {
+                        let (event, peer_id) = bincode::deserialize(&bytes).unwrap();
+                        user_ev_controller
+                            .send((event, peer_id))
+                            .map_err(|e| anyhow!("Failed to send event: {}", e))?;
+                    }
+                    tokio_tungstenite::tungstenite::protocol::Message::Text(error_msg) => {
+                        tracing::error!("Received error message: {:?}", error_msg);
+                        break Err(anyhow!("Received error message: {:?}", error_msg));
+                    }
+                    _ => {
+                        tracing::error!("Received unexpected message: {:?}", msg);
+                        break Err(anyhow!("Received unexpected message: {:?}", msg));
+                    }
+                },
+                Some(Err(e)) => {
+                    tracing::error!("Failed to receive message: {}", e);
+                    Err(anyhow!("Failed to receive message: {}", e))?;
+                }
+                None => {
+                    tracing::error!("Connection closed");
+                    break Err(anyhow!("Connection closed"));
+                }
+            }
+        }
     }
 
     async fn send_peer_msg(&self, msg: PeerMessage) {
