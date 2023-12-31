@@ -5,9 +5,8 @@ use dashmap::DashMap;
 use meter::Meter;
 use outbound_request_counter::OutboundRequestCounter;
 use request_density_tracker::{CachedDensityMap, RequestDensityTracker};
-use std::collections::HashMap;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     time::{Duration, Instant},
 };
 use tracing::{debug, error, event, info, span, Level};
@@ -260,6 +259,16 @@ impl TopologyManager {
         self.meter.attributed_usage_rate(source, resource_type, now)
     }
 
+    pub(crate) fn calculate_usage_proportion(
+        &mut self,
+        resource_type: ResourceType,
+        total_limit: Rate,
+        at_time: Instant,
+    ) -> RateProportion {
+        let usage = self.extrapolated_usage(resource_type, at_time);
+        usage.total.proportion_of(&total_limit)
+    }
+
     // A function that will determine if any peers should be added or removed based on
     // the current resource usage, and either add or remove them
     pub(crate) fn adjust_topology(
@@ -279,7 +288,7 @@ impl TopologyManager {
             let mut locations = Vec::new();
             let below_threshold = self.limits.min_connections - neighbor_locations.len();
             if below_threshold > 0 {
-                for i in 0..below_threshold {
+                for _i in 0..below_threshold {
                     locations.push(Location::random());
                 }
                 info!(
@@ -297,14 +306,13 @@ impl TopologyManager {
         let decrease_usage_if_above: RateProportion =
             RateProportion::new(MAXIMUM_DESIRED_RESOURCE_USAGE_PROPORTION);
 
-        let usage = self.extrapolated_usage(resource_type, at_time);
         let total_limit: Rate = self.limits.get(resource_type);
-        let usage_proportion = usage.total.proportion_of(&total_limit);
+        let usage_proportion = self.calculate_usage_proportion(resource_type, total_limit, at_time);
 
         // Detailed resource usage information
         debug!(
-            "Resource type {:?} usage: {:?}, Total limit: {:?}, Usage proportion: {:?}",
-            resource_type, usage.total, total_limit, usage_proportion
+            "Resource type {:?}, Total limit: {:?}, Usage proportion: {:?}",
+            resource_type, total_limit, usage_proportion
         );
 
         let adjustment: anyhow::Result<TopologyAdjustment> =
@@ -320,7 +328,7 @@ impl TopologyManager {
                     "{:?} resource usage ({:?}) is below threshold ({:?}), adding connections",
                     resource_type, usage_proportion, increase_usage_if_below
                 );
-                self.select_connections_to_add(&usage, neighbor_locations)
+                self.select_connections_to_add(neighbor_locations)
             } else if usage_proportion > decrease_usage_if_above {
                 debug!(
                     "{:?} resource usage ({:?}) is above threshold ({:?}), removing connections",
@@ -355,7 +363,6 @@ impl TopologyManager {
 
     fn select_connections_to_add(
         &mut self,
-        usage: &Usage,
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
     ) -> anyhow::Result<TopologyAdjustment> {
         let function_span = span!(Level::INFO, "add_connections");
@@ -552,7 +559,7 @@ mod tests {
     use crate::ring::Distance;
     use crate::test_utils::with_tracing;
     use small_world_rand::random_link_distance;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn test_resource_manager_report() {

@@ -38,7 +38,7 @@ fastrand = { workspace = true }
 flatbuffers = "23.5.26"
 futures = "0.3.21"
 headers = "0.4"
-itertools = "0.11"
+itertools = "0.12.0"
 libp2p = { default-features = false, features = ["autonat", "dns", "ed25519", "identify", "macros", "noise", "ping", "tcp", "tokio", "yamux"], version = "0.52.3" }
 libp2p-identity = { features = ["ed25519", "rand"], version = "0.2.7" }
 notify = "6"
@@ -56,7 +56,7 @@ stretto = { features = ["async", "sync"], version = "0.8" }
 tar = { version = "0.4.38" }
 thiserror = "1"
 tokio = { features = ["fs", "macros", "rt-multi-thread", "sync", "process"], version = "1" }
-tokio-tungstenite = "0.20"
+tokio-tungstenite = "0.21.0"
 tower-http = { features = ["fs", "trace"], version = "0.5" }
 ulid = { features = ["serde"], version = "1.1" }
 unsigned-varint = "0.7"

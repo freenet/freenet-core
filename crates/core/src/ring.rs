@@ -738,8 +738,8 @@ impl Ring {
                     .collect()
             };
 
-            // todo: when we are actually trackign the resources, pass the resource type
-            // which is most constraint at the moment when calling this function
+            // TODO: This should be called for each resource type, since any resource exceeding its limit
+            //       should trigger a connection drop.
             let adjustment = self.topology_manager.write().adjust_topology(
                 ResourceType::InboundBandwidthBytes,
                 &neighbor_locations,

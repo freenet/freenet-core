@@ -48,8 +48,8 @@ use crate::operations::handle_op_request;
 pub use network_bridge::inter_process::InterProcessConnManager;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
 
-pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 use crate::topology::rate::Rate;
+pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
 mod network_bridge;
 mod op_state_manager;
