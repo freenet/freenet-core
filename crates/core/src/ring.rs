@@ -5,7 +5,6 @@
 
 use std::collections::VecDeque;
 use std::hash::Hash;
-use std::sync::atomic::AtomicBool;
 use std::{
     cmp::Reverse,
     collections::BTreeMap,
@@ -34,7 +33,7 @@ use tracing::Instrument;
 use crate::message::TransactionType;
 use crate::topology::meter::ResourceType;
 use crate::topology::rate::Rate;
-use crate::topology::{AcquisitionStrategy, Limits, TopologyAdjustment, TopologyManager};
+use crate::topology::{ConnectionAcquisitionStrategy, Limits, TopologyAdjustment, TopologyManager};
 use crate::tracing::{NetEventLog, NetEventRegister};
 use crate::util::Contains;
 use crate::{
@@ -172,9 +171,6 @@ pub(crate) struct Ring {
     pub min_connections: usize,
     router: Arc<RwLock<Router>>,
     topology_manager: RwLock<TopologyManager>,
-    /// Fast is for when there are less than our target number of connections so we want to acquire new connections quickly.
-    /// Slow is for when there are enough connections so we need to drop a connection in order to replace it.
-    fast_acquisition: AtomicBool,
     connections_by_location: RwLock<BTreeMap<Location, Vec<Connection>>>,
     location_for_peer: RwLock<BTreeMap<PeerId, Location>>,
     own_location: AtomicU64,
@@ -293,7 +289,6 @@ impl Ring {
             min_connections,
             router,
             topology_manager,
-            fast_acquisition: AtomicBool::new(true),
             connections_by_location: RwLock::new(BTreeMap::new()),
             location_for_peer: RwLock::new(BTreeMap::new()),
             own_location,
@@ -444,14 +439,11 @@ impl Ring {
         } else if open_conn >= self.max_connections {
             false
         } else {
-            let strategy = if self
-                .fast_acquisition
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                AcquisitionStrategy::Fast
-            } else {
-                AcquisitionStrategy::Slow
-            };
+            let strategy = self
+                .topology_manager
+                .read()
+                .get_connection_acquisition_strategy();
+
             self.topology_manager
                 .write()
                 .evaluate_new_connection(location, strategy, Instant::now())
@@ -738,13 +730,10 @@ impl Ring {
                     .collect()
             };
 
-            // TODO: This should be called for each resource type, since any resource exceeding its limit
-            //       should trigger a connection drop.
-            let adjustment = self.topology_manager.write().adjust_topology(
-                ResourceType::InboundBandwidthBytes,
-                &neighbor_locations,
-                Instant::now(),
-            );
+            let adjustment = self
+                .topology_manager
+                .write()
+                .adjust_topology(&neighbor_locations, Instant::now());
             match adjustment {
                 TopologyAdjustment::AddConnections(target_locs) => {
                     pending_conn_adds.extend(target_locs);

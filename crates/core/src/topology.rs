@@ -5,6 +5,8 @@ use dashmap::DashMap;
 use meter::Meter;
 use outbound_request_counter::OutboundRequestCounter;
 use request_density_tracker::{CachedDensityMap, RequestDensityTracker};
+use std::cmp::Ordering;
+use std::sync::RwLock;
 use std::{
     collections::{BTreeMap, HashMap},
     time::{Duration, Instant},
@@ -21,7 +23,7 @@ pub(crate) mod running_average;
 mod small_world_rand;
 
 use crate::ring::{Connection, PeerKeyLocation};
-use crate::topology::meter::{AttributionSource, ResourceType};
+use crate::topology::meter::{AttributionSource, ResourceType, ALL_RESOURCE_TYPES};
 use crate::topology::rate::{Rate, RateProportion};
 use constants::*;
 use request_density_tracker::DensityMapError;
@@ -54,6 +56,7 @@ pub(crate) struct TopologyManager {
     pub(crate) outbound_request_counter: OutboundRequestCounter,
     /// Must be updated when new neightbors are discovered.
     cached_density_map: CachedDensityMap,
+    connection_acquisition_strategy: RwLock<ConnectionAcquisitionStrategy>,
 }
 
 impl TopologyManager {
@@ -76,6 +79,7 @@ impl TopologyManager {
             outbound_request_counter: OutboundRequestCounter::new(
                 OUTBOUND_REQUEST_COUNTER_WINDOW_SIZE,
             ),
+            connection_acquisition_strategy: RwLock::new(ConnectionAcquisitionStrategy::Fast),
         }
     }
 
@@ -107,7 +111,7 @@ impl TopologyManager {
     pub(crate) fn evaluate_new_connection(
         &mut self,
         candidate_location: Location,
-        acquisition_strategy: AcquisitionStrategy,
+        acquisition_strategy: ConnectionAcquisitionStrategy,
         current_time: Instant,
     ) -> Result<bool, DensityMapError> {
         tracing::debug!(
@@ -121,13 +125,13 @@ impl TopologyManager {
         let score = density_map.get_density_at(candidate_location)?;
 
         let accept = match acquisition_strategy {
-            AcquisitionStrategy::Slow => {
+            ConnectionAcquisitionStrategy::Slow => {
                 self.fast_connection_evaluator
                     .record_only_with_current_time(score, current_time);
                 self.slow_connection_evaluator
                     .record_and_eval_with_current_time(score, current_time)
             }
-            AcquisitionStrategy::Fast => {
+            ConnectionAcquisitionStrategy::Fast => {
                 self.slow_connection_evaluator
                     .record_only_with_current_time(score, current_time);
                 self.fast_connection_evaluator
@@ -195,7 +199,7 @@ impl TopologyManager {
 
     /// Calculate total usage for a resource type extrapolating usage for resources that
     /// are younger than [SOURCE_RAMP_UP_DURATION]
-    fn extrapolated_usage(&mut self, resource_type: ResourceType, now: Instant) -> Usage {
+    fn extrapolated_usage(&mut self, resource_type: &ResourceType, now: Instant) -> Usage {
         let function_span = span!(Level::DEBUG, "extrapolated_usage_function");
         let _enter = function_span.enter();
 
@@ -259,27 +263,35 @@ impl TopologyManager {
         self.meter.attributed_usage_rate(source, resource_type, now)
     }
 
-    pub(crate) fn calculate_usage_proportion(
-        &mut self,
-        resource_type: ResourceType,
-        total_limit: Rate,
-        at_time: Instant,
-    ) -> RateProportion {
-        let usage = self.extrapolated_usage(resource_type, at_time);
-        usage.total.proportion_of(&total_limit)
+    pub(crate) fn calculate_usage_proportion(&mut self, at_time: Instant) -> UsageRates {
+        let mut usage_rate_per_type = HashMap::new();
+        for resource_type in ALL_RESOURCE_TYPES.iter().as_ref() {
+            let usage = self.extrapolated_usage(resource_type, at_time);
+            let proportion = usage.total.proportion_of(&self.limits.get(resource_type));
+            usage_rate_per_type.insert(resource_type.clone(), proportion);
+        }
+
+        let max_usage_rate = usage_rate_per_type
+            .iter()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+            .unwrap();
+
+        UsageRates {
+            // TODO: Is there a way to avoid this clone()?
+            usage_rate_per_type: usage_rate_per_type.clone(),
+            max_usage_rate: (max_usage_rate.0.clone(), *max_usage_rate.1),
+        }
     }
 
     // A function that will determine if any peers should be added or removed based on
     // the current resource usage, and either add or remove them
     pub(crate) fn adjust_topology(
         &mut self,
-        resource_type: ResourceType,
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
         at_time: Instant,
     ) -> TopologyAdjustment {
         debug!(
-            "Adjusting topology for {:?} at {:?}. Current neighbors: {:?}",
-            resource_type,
+            "Adjusting topology at {:?}. Current neighbors: {:?}",
             at_time,
             neighbor_locations.len()
         );
@@ -306,14 +318,12 @@ impl TopologyManager {
         let decrease_usage_if_above: RateProportion =
             RateProportion::new(MAXIMUM_DESIRED_RESOURCE_USAGE_PROPORTION);
 
-        let total_limit: Rate = self.limits.get(resource_type);
-        let usage_proportion = self.calculate_usage_proportion(resource_type, total_limit, at_time);
+        let usage_rates = self.calculate_usage_proportion(at_time);
+
+        let (resource_type, usage_proportion) = usage_rates.max_usage_rate;
 
         // Detailed resource usage information
-        debug!(
-            "Resource type {:?}, Total limit: {:?}, Usage proportion: {:?}",
-            resource_type, total_limit, usage_proportion
-        );
+        debug!("Usage proportions: {:?}", usage_rates);
 
         let adjustment: anyhow::Result<TopologyAdjustment> =
             if neighbor_locations.len() > self.limits.max_connections {
@@ -322,12 +332,16 @@ impl TopologyManager {
                     neighbor_locations.len(),
                     self.limits.max_connections
                 );
+
+                self.update_connection_acquisition_strategy(ConnectionAcquisitionStrategy::Slow);
+
                 Ok(self.select_connections_to_remove(&resource_type, at_time))
             } else if usage_proportion < increase_usage_if_below {
                 debug!(
                     "{:?} resource usage ({:?}) is below threshold ({:?}), adding connections",
                     resource_type, usage_proportion, increase_usage_if_below
                 );
+                self.update_connection_acquisition_strategy(ConnectionAcquisitionStrategy::Fast);
                 self.select_connections_to_add(neighbor_locations)
             } else if usage_proportion > decrease_usage_if_above {
                 debug!(
@@ -359,6 +373,28 @@ impl TopologyManager {
         }
 
         adjustment.unwrap_or(TopologyAdjustment::NoChange)
+    }
+
+    /// get the current connection acquisition strategy, this is used
+    /// to determine how aggressively to search for new connections
+    pub(crate) fn get_connection_acquisition_strategy(&self) -> ConnectionAcquisitionStrategy {
+        *self.connection_acquisition_strategy.read().unwrap()
+    }
+
+    /// modify the current connection acquisition strategy
+    fn update_connection_acquisition_strategy(&self, new_strategy: ConnectionAcquisitionStrategy) {
+        // To avoid acquiring a write lock unnecessarily check if the value is
+        // needs to change
+        {
+            let read_guard = self.connection_acquisition_strategy.read().unwrap();
+            if *read_guard == new_strategy {
+                // The value is already what we want, so we can return early
+                return;
+            }
+        } // The read lock is dropped here
+
+        let mut write_guard = self.connection_acquisition_strategy.write().unwrap();
+        *write_guard = new_strategy;
     }
 
     fn select_connections_to_add(
@@ -394,7 +430,7 @@ impl TopologyManager {
 
     fn select_connections_to_remove(
         &mut self,
-        resource_type: &ResourceType,
+        exceeded_usage_for_resource_type: &ResourceType,
         at_time: Instant,
     ) -> TopologyAdjustment {
         let function_span = span!(Level::INFO, "remove_connections");
@@ -402,7 +438,10 @@ impl TopologyManager {
 
         let mut worst: Option<(PeerKeyLocation, f64)> = None;
 
-        for (source, source_usage) in self.meter.get_usage_rates(resource_type, at_time) {
+        for (source, source_usage) in self
+            .meter
+            .get_usage_rates(exceeded_usage_for_resource_type, at_time)
+        {
             let loop_span = span!(Level::DEBUG, "source_loop", ?source);
             let _loop_enter = loop_span.enter();
 
@@ -461,7 +500,8 @@ impl TopologyManager {
     }
 }
 
-pub(crate) enum AcquisitionStrategy {
+#[derive(PartialEq, Debug, Clone, Copy)]
+pub(crate) enum ConnectionAcquisitionStrategy {
     /// Acquire new connections slowly, be picky
     Slow,
 
@@ -619,11 +659,7 @@ mod tests {
                 neighbor_locations.insert(peer.location.unwrap(), vec![]);
             }
 
-            let adjustment = resource_manager.adjust_topology(
-                ResourceType::InboundBandwidthBytes,
-                &neighbor_locations,
-                Instant::now(),
-            );
+            let adjustment = resource_manager.adjust_topology(&neighbor_locations, Instant::now());
             match adjustment {
                 TopologyAdjustment::RemoveConnections(peers) => {
                     assert_eq!(peers.len(), 1);
@@ -667,11 +703,7 @@ mod tests {
                 neighbor_locations.insert(peer.location.unwrap(), vec![]);
             }
 
-            let adjustment = resource_manager.adjust_topology(
-                ResourceType::InboundBandwidthBytes,
-                &neighbor_locations,
-                Instant::now(),
-            );
+            let adjustment = resource_manager.adjust_topology(&neighbor_locations, Instant::now());
 
             match adjustment {
                 TopologyAdjustment::AddConnections(locations) => {
@@ -714,11 +746,7 @@ mod tests {
                 neighbor_locations.insert(peer.location.unwrap(), vec![]);
             }
 
-            let adjustment = resource_manager.adjust_topology(
-                ResourceType::InboundBandwidthBytes,
-                &neighbor_locations,
-                report_time,
-            );
+            let adjustment = resource_manager.adjust_topology(&neighbor_locations, report_time);
 
             match adjustment {
                 TopologyAdjustment::NoChange => {}
@@ -752,11 +780,7 @@ mod tests {
                 neighbor_locations.insert(peer.location.unwrap(), vec![]);
             }
 
-            let adjustment = resource_manager.adjust_topology(
-                ResourceType::InboundBandwidthBytes,
-                &neighbor_locations,
-                report_time,
-            );
+            let adjustment = resource_manager.adjust_topology(&neighbor_locations, report_time);
 
             match adjustment {
                 TopologyAdjustment::AddConnections(v) => {}
@@ -765,10 +789,11 @@ mod tests {
         });
     }
 
-    fn setup_topology_manager(rate: f64) -> TopologyManager {
+    fn setup_topology_manager(max_downstream_rate: f64) -> TopologyManager {
         let limits = Limits {
-            max_upstream_bandwidth: Rate::new_per_second(rate),
-            max_downstream_bandwidth: Rate::new_per_second(rate),
+            // This won't be used
+            max_upstream_bandwidth: Rate::new_per_second(100000.0),
+            max_downstream_bandwidth: Rate::new_per_second(max_downstream_rate),
             max_connections: 200,
             min_connections: 5,
         };
@@ -905,7 +930,7 @@ pub(crate) struct Limits {
 }
 
 impl Limits {
-    pub fn get(&self, resource_type: ResourceType) -> Rate {
+    pub fn get(&self, resource_type: &ResourceType) -> Rate {
         match resource_type {
             ResourceType::OutboundBandwidthBytes => self.max_upstream_bandwidth,
             ResourceType::InboundBandwidthBytes => self.max_downstream_bandwidth,
@@ -913,7 +938,8 @@ impl Limits {
     }
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct UsageRates {
     pub usage_rate_per_type: HashMap<ResourceType, RateProportion>,
-    pub max_usage_rate: RateProportion,
+    pub max_usage_rate: (ResourceType, RateProportion),
 }

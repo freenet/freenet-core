@@ -221,6 +221,7 @@ pub(crate) enum ResourceType {
     OutboundBandwidthBytes,
 }
 
+// TODO: Use macro like enum_iterator crate to generate this
 pub const ALL_RESOURCE_TYPES: [ResourceType; 2] = [
     ResourceType::InboundBandwidthBytes,
     ResourceType::OutboundBandwidthBytes,
