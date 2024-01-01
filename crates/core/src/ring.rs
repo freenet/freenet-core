@@ -31,9 +31,8 @@ use tokio::sync;
 use tracing::Instrument;
 
 use crate::message::TransactionType;
-use crate::topology::meter::ResourceType;
 use crate::topology::rate::Rate;
-use crate::topology::{ConnectionAcquisitionStrategy, Limits, TopologyAdjustment, TopologyManager};
+use crate::topology::{Limits, TopologyAdjustment, TopologyManager};
 use crate::tracing::{NetEventLog, NetEventRegister};
 use crate::util::Contains;
 use crate::{
@@ -730,10 +729,11 @@ impl Ring {
                     .collect()
             };
 
-            let adjustment = self
-                .topology_manager
-                .write()
-                .adjust_topology(&neighbor_locations, Instant::now());
+            let adjustment = self.topology_manager.write().adjust_topology(
+                &neighbor_locations,
+                &None,
+                Instant::now(),
+            );
             match adjustment {
                 TopologyAdjustment::AddConnections(target_locs) => {
                     pending_conn_adds.extend(target_locs);

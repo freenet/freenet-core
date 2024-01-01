@@ -288,6 +288,7 @@ impl TopologyManager {
     pub(crate) fn adjust_topology(
         &mut self,
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
+        my_location: &Option<Location>,
         at_time: Instant,
     ) -> TopologyAdjustment {
         debug!(
@@ -301,7 +302,14 @@ impl TopologyManager {
             let below_threshold = self.limits.min_connections - neighbor_locations.len();
             if below_threshold > 0 {
                 for _i in 0..below_threshold {
-                    locations.push(Location::random());
+                    match my_location {
+                        Some(location) => {
+                            locations.push(location.clone());
+                        }
+                        None => {
+                            locations.push(Location::random());
+                        }
+                    }
                 }
                 info!(
                     minimum_num_peers_hard_limit = self.limits.min_connections,
@@ -659,7 +667,8 @@ mod tests {
                 neighbor_locations.insert(peer.location.unwrap(), vec![]);
             }
 
-            let adjustment = resource_manager.adjust_topology(&neighbor_locations, Instant::now());
+            let adjustment =
+                resource_manager.adjust_topology(&neighbor_locations, &None, Instant::now());
             match adjustment {
                 TopologyAdjustment::RemoveConnections(peers) => {
                     assert_eq!(peers.len(), 1);
@@ -703,7 +712,8 @@ mod tests {
                 neighbor_locations.insert(peer.location.unwrap(), vec![]);
             }
 
-            let adjustment = resource_manager.adjust_topology(&neighbor_locations, Instant::now());
+            let adjustment =
+                resource_manager.adjust_topology(&neighbor_locations, &None, Instant::now());
 
             match adjustment {
                 TopologyAdjustment::AddConnections(locations) => {
@@ -746,7 +756,8 @@ mod tests {
                 neighbor_locations.insert(peer.location.unwrap(), vec![]);
             }
 
-            let adjustment = resource_manager.adjust_topology(&neighbor_locations, report_time);
+            let adjustment =
+                resource_manager.adjust_topology(&neighbor_locations, &None, report_time);
 
             match adjustment {
                 TopologyAdjustment::NoChange => {}
@@ -780,7 +791,8 @@ mod tests {
                 neighbor_locations.insert(peer.location.unwrap(), vec![]);
             }
 
-            let adjustment = resource_manager.adjust_topology(&neighbor_locations, report_time);
+            let adjustment =
+                resource_manager.adjust_topology(&neighbor_locations, &None, report_time);
 
             match adjustment {
                 TopologyAdjustment::AddConnections(v) => {}
