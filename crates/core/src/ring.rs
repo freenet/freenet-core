@@ -731,7 +731,7 @@ impl Ring {
 
             let adjustment = self.topology_manager.write().adjust_topology(
                 &neighbor_locations,
-                &None,
+                &self.own_location().location,
                 Instant::now(),
             );
             match adjustment {

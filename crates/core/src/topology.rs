@@ -263,26 +263,6 @@ impl TopologyManager {
         self.meter.attributed_usage_rate(source, resource_type, now)
     }
 
-    pub(crate) fn calculate_usage_proportion(&mut self, at_time: Instant) -> UsageRates {
-        let mut usage_rate_per_type = HashMap::new();
-        for resource_type in ALL_RESOURCE_TYPES.iter().as_ref() {
-            let usage = self.extrapolated_usage(resource_type, at_time);
-            let proportion = usage.total.proportion_of(&self.limits.get(resource_type));
-            usage_rate_per_type.insert(resource_type.clone(), proportion);
-        }
-
-        let max_usage_rate = usage_rate_per_type
-            .iter()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
-            .unwrap();
-
-        UsageRates {
-            // TODO: Is there a way to avoid this clone()?
-            usage_rate_per_type: usage_rate_per_type.clone(),
-            max_usage_rate: (max_usage_rate.0.clone(), *max_usage_rate.1),
-        }
-    }
-
     // A function that will determine if any peers should be added or removed based on
     // the current resource usage, and either add or remove them
     pub(crate) fn adjust_topology(
@@ -304,6 +284,9 @@ impl TopologyManager {
                 for _i in 0..below_threshold {
                     match my_location {
                         Some(location) => {
+                            // The first few connect messages should target the peer's own
+                            // location (if known), to reduce the danger of a peer failing to
+                            // cluster
                             locations.push(location.clone());
                         }
                         None => {
@@ -387,6 +370,26 @@ impl TopologyManager {
     /// to determine how aggressively to search for new connections
     pub(crate) fn get_connection_acquisition_strategy(&self) -> ConnectionAcquisitionStrategy {
         *self.connection_acquisition_strategy.read().unwrap()
+    }
+
+    fn calculate_usage_proportion(&mut self, at_time: Instant) -> UsageRates {
+        let mut usage_rate_per_type = HashMap::new();
+        for resource_type in ALL_RESOURCE_TYPES.iter().as_ref() {
+            let usage = self.extrapolated_usage(resource_type, at_time);
+            let proportion = usage.total.proportion_of(&self.limits.get(resource_type));
+            usage_rate_per_type.insert(resource_type.clone(), proportion);
+        }
+
+        let max_usage_rate = usage_rate_per_type
+            .iter()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+            .unwrap();
+
+        UsageRates {
+            // TODO: Is there a way to avoid this clone()?
+            usage_rate_per_type: usage_rate_per_type.clone(),
+            max_usage_rate: (max_usage_rate.0.clone(), *max_usage_rate.1),
+        }
     }
 
     /// modify the current connection acquisition strategy
