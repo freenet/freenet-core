@@ -11,10 +11,6 @@ use crate::topology::rate::Rate;
 
 use super::running_average::RunningAverage;
 
-// Sources younger than this will return default usage rather than actual usage as it
-// may be ramping up and not yet fully representative of its long-term usage.
-const SOURCE_RAMP_UP_TIME: Duration = Duration::from_secs(10 * 60); // 10 minutes
-
 // Default usage is assumed to be the 50th percentile of usage for the resource.
 const DEFAULT_USAGE_PERCENTILE: f64 = 0.5;
 
@@ -167,24 +163,6 @@ impl Meter {
         let estimated_index = percentile_index.min(sorted_rates.len().saturating_sub(1));
 
         sorted_rates.get(estimated_index).cloned()
-    }
-
-    /// Report the use of a resource with multiple attribution sources, splitting the usage
-    /// evenly between the sources.
-    /// This should be done in the lowest-level functions that consume the resource, taking
-    /// an AttributionMeter as a parameter. This will be useful for contracts with multiple
-    /// subscribers - where the responsibility should be split evenly among the subscribers.
-    pub(crate) fn report_split(
-        &mut self,
-        attributions: &[AttributionSource],
-        resource: ResourceType,
-        value: f64,
-        at_time: Instant,
-    ) {
-        let split_value = value / attributions.len() as f64;
-        for attribution in attributions {
-            self.report(attribution, resource, split_value, at_time);
-        }
     }
 
     /// Report the use of a resource. This should be done in the lowest-level

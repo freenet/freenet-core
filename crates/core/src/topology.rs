@@ -171,6 +171,24 @@ impl TopologyManager {
         self.limits = limits;
     }
 
+    /// Report the use of a resource with multiple attribution sources, splitting the usage
+    /// evenly between the sources.
+    /// This should be done in the lowest-level functions that consume the resource, taking
+    /// an AttributionMeter as a parameter. This will be useful for contracts with multiple
+    /// subscribers - where the responsibility should be split evenly among the subscribers.
+    pub(crate) fn report_split_resource_usage(
+        &mut self,
+        attributions: &[AttributionSource],
+        resource: ResourceType,
+        value: f64,
+        at_time: Instant,
+    ) {
+        let split_value = value / attributions.len() as f64;
+        for attribution in attributions {
+            self.report_resource_usage(attribution, resource, split_value, at_time);
+        }
+    }
+
     pub(crate) fn report_resource_usage(
         &mut self,
         attribution: &AttributionSource,
@@ -358,12 +376,6 @@ impl TopologyManager {
         }
 
         adjustment.unwrap_or(TopologyAdjustment::NoChange)
-    }
-
-    /// get the current connection acquisition strategy, this is used
-    /// to determine how aggressively to search for new connections
-    pub(crate) fn get_connection_acquisition_strategy(&self) -> ConnectionAcquisitionStrategy {
-        *self.connection_acquisition_strategy.read().unwrap()
     }
 
     fn calculate_usage_proportion(&mut self, at_time: Instant) -> UsageRates {
@@ -590,7 +602,7 @@ mod tests {
     /// world distribution.
     fn random_location(this_peer_location: &Location) -> Location {
         tracing::debug!("Generating random location");
-        let distance = random_link_distance(Distance::new(RANDOM_CLOSEST_DISTANCE));
+        let distance = random_link_distance(Distance::new(0.001));
         let location_f64 = if rand::random() {
             this_peer_location.as_f64() - distance.as_f64()
         } else {
@@ -616,7 +628,6 @@ mod tests {
                 max_connections: 200,
                 min_connections: 5,
             };
-            let my_location = Some(Location::random());
             let mut resource_manager = TopologyManager::new(limits);
 
             // Report some usage and test that the total and attributed usage are updated
@@ -686,7 +697,7 @@ mod tests {
                 .into_iter()
                 .map(Location::new)
                 .collect();
-            for (ix, mut peer) in peers.iter_mut().enumerate() {
+            for (ix, peer) in peers.iter_mut().enumerate() {
                 peer.location = Some(peer_locations[ix]);
             }
 
@@ -788,11 +799,18 @@ mod tests {
                 neighbor_locations.insert(peer.location.unwrap(), vec![]);
             }
 
+            let my_location = Location::random();
+
             let adjustment =
-                resource_manager.adjust_topology(&neighbor_locations, &None, report_time);
+                resource_manager.adjust_topology(&neighbor_locations, &Some(my_location), report_time);
 
             match adjustment {
-                TopologyAdjustment::AddConnections(v) => {}
+                TopologyAdjustment::AddConnections(v) => {
+                    assert!(v.len() > 0);
+                    for location in v {
+                        assert_eq!(location, my_location);
+                    }
+                }
                 _ => panic!("Expected AddConnections, but was: {:?}", adjustment),
             }
         });
