@@ -768,12 +768,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "acbf1af155f9b9ef647e42cdc158db4b64a1b61f743629225fde6f3e0be2a7c7"
 
 [[package]]
-name = "concurrent-list"
-version = "0.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f66d66e70e04e17c85c330f9584a8c3074fe2513bc748b8f687dd67f4f7731d5"
-
-[[package]]
 name = "concurrent-queue"
 version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1629,7 +1623,6 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "clap",
- "concurrent-list",
  "config",
  "cookie",
  "crossbeam",

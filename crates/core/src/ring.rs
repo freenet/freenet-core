@@ -438,14 +438,9 @@ impl Ring {
         } else if open_conn >= self.max_connections {
             false
         } else {
-            let strategy = self
-                .topology_manager
-                .read()
-                .get_connection_acquisition_strategy();
-
             self.topology_manager
                 .write()
-                .evaluate_new_connection(location, strategy, Instant::now())
+                .evaluate_new_connection(location, Instant::now())
                 .unwrap_or(false)
         };
         if !accepted {

@@ -3,6 +3,7 @@ use std::hash::Hash;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use enum_iterator::{all, All, Sequence};
 use freenet_stdlib::prelude::*;
 
 use crate::ring::PeerKeyLocation;
@@ -215,17 +216,17 @@ pub(crate) enum AttributionSource {
     Delegate(DelegateKey),
 }
 
-#[derive(Eq, Hash, PartialEq, Clone, Copy, Debug)]
+#[derive(Eq, Hash, PartialEq, Clone, Copy, Debug, Sequence)]
 pub(crate) enum ResourceType {
     InboundBandwidthBytes,
     OutboundBandwidthBytes,
 }
 
-// TODO: Use macro like enum_iterator crate to generate this
-pub const ALL_RESOURCE_TYPES: [ResourceType; 2] = [
-    ResourceType::InboundBandwidthBytes,
-    ResourceType::OutboundBandwidthBytes,
-];
+impl ResourceType {
+    pub(crate) fn all() -> All<ResourceType> {
+        all::<ResourceType>()
+    }
+}
 
 type AttributionMeters = DashMap<AttributionSource, ResourceTotals>;
 

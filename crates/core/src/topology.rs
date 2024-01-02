@@ -1,7 +1,6 @@
 use crate::{message::TransactionType, ring::Location};
 use anyhow::anyhow;
 use connection_evaluator::ConnectionEvaluator;
-use dashmap::DashMap;
 use meter::Meter;
 use outbound_request_counter::OutboundRequestCounter;
 use request_density_tracker::{CachedDensityMap, RequestDensityTracker};
@@ -9,7 +8,7 @@ use std::cmp::Ordering;
 use std::sync::RwLock;
 use std::{
     collections::{BTreeMap, HashMap},
-    time::{Duration, Instant},
+    time::Instant,
 };
 use tracing::{debug, error, event, info, span, Level};
 
@@ -23,7 +22,7 @@ pub(crate) mod running_average;
 mod small_world_rand;
 
 use crate::ring::{Connection, PeerKeyLocation};
-use crate::topology::meter::{AttributionSource, ResourceType, ALL_RESOURCE_TYPES};
+use crate::topology::meter::{AttributionSource, ResourceType};
 use crate::topology::rate::{Rate, RateProportion};
 use constants::*;
 use request_density_tracker::DensityMapError;
@@ -49,7 +48,7 @@ use request_density_tracker::DensityMapError;
 pub(crate) struct TopologyManager {
     limits: Limits,
     meter: Meter,
-    source_creation_times: DashMap<AttributionSource, Instant>,
+    source_creation_times: HashMap<AttributionSource, Instant>,
     slow_connection_evaluator: ConnectionEvaluator,
     fast_connection_evaluator: ConnectionEvaluator,
     request_density_tracker: RequestDensityTracker,
@@ -65,7 +64,7 @@ impl TopologyManager {
         TopologyManager {
             meter: Meter::new_with_window_size(100),
             limits,
-            source_creation_times: DashMap::new(),
+            source_creation_times: HashMap::new(),
             slow_connection_evaluator: ConnectionEvaluator::new(
                 SLOW_CONNECTION_EVALUATOR_WINDOW_DURATION,
             ),
@@ -111,7 +110,6 @@ impl TopologyManager {
     pub(crate) fn evaluate_new_connection(
         &mut self,
         candidate_location: Location,
-        acquisition_strategy: ConnectionAcquisitionStrategy,
         current_time: Instant,
     ) -> Result<bool, DensityMapError> {
         tracing::debug!(
@@ -124,7 +122,9 @@ impl TopologyManager {
             .ok_or(DensityMapError::EmptyNeighbors)?;
         let score = density_map.get_density_at(candidate_location)?;
 
-        let accept = match acquisition_strategy {
+        let strategy = self.connection_acquisition_strategy.read().unwrap();
+
+        let accept = match *strategy {
             ConnectionAcquisitionStrategy::Slow => {
                 self.fast_connection_evaluator
                     .record_only_with_current_time(score, current_time);
@@ -203,10 +203,6 @@ impl TopologyManager {
         let function_span = span!(Level::DEBUG, "extrapolated_usage_function");
         let _enter = function_span.enter();
 
-        debug!("Function called");
-        debug!("Resource type: {:?}", resource_type);
-        debug!("Current time: {:?}", now);
-
         let mut total_usage: Rate = Rate::new_per_second(0.0);
         let mut usage_per_source: HashMap<AttributionSource, Rate> = HashMap::new();
 
@@ -215,9 +211,7 @@ impl TopologyManager {
         let _collect_data_guard = collect_data_span.enter();
         debug!("Collecting data from source_creation_times");
         let mut usage_data = Vec::new();
-        for source_entry in self.source_creation_times.iter() {
-            let source = source_entry.key();
-            let creation_time = source_entry.value();
+        for (source, creation_time) in self.source_creation_times.iter() {
             let ramping_up = now.duration_since(*creation_time) <= SOURCE_RAMP_UP_DURATION;
             debug!(
                 "Source: {:?}, Creation time: {:?}, Ramping up: {}",
@@ -374,9 +368,9 @@ impl TopologyManager {
 
     fn calculate_usage_proportion(&mut self, at_time: Instant) -> UsageRates {
         let mut usage_rate_per_type = HashMap::new();
-        for resource_type in ALL_RESOURCE_TYPES.iter().as_ref() {
-            let usage = self.extrapolated_usage(resource_type, at_time);
-            let proportion = usage.total.proportion_of(&self.limits.get(resource_type));
+        for resource_type in ResourceType::all() {
+            let usage = self.extrapolated_usage(&resource_type, at_time);
+            let proportion = usage.total.proportion_of(&self.limits.get(&resource_type));
             usage_rate_per_type.insert(resource_type.clone(), proportion);
         }
 
