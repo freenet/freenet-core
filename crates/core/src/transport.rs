@@ -69,7 +69,13 @@ pub enum ConnectionError {
 }
 
 trait Transport<C: Connection> {
-    fn new(keypair: Keypair, listen_port: u16, is_gateway: bool, max_upstream_rate : BytesPerSecond) -> Result<Self, TransportError>
+    fn new(
+        keypair: Keypair,
+        listen_port: u16,
+        is_gateway: bool,
+        max_upstream_rate : BytesPerSecond,
+        resend_after : Duration,
+    ) -> Result<Self, TransportError>
     where
         Self: Sized,
     {
