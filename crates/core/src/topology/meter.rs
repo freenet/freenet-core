@@ -3,7 +3,6 @@ use std::hash::Hash;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use enum_iterator::{all, All, Sequence};
 use freenet_stdlib::prelude::*;
 
 use crate::ring::PeerKeyLocation;
@@ -168,6 +167,7 @@ impl Meter {
     /// Report the use of a resource. This should be done in the lowest-level
     /// functions that consume the resource, taking an AttributionMeter
     /// as a parameter.
+    #[allow(dead_code)] // fixme: use this
     pub(crate) fn report(
         &mut self,
         attribution: &AttributionSource,
@@ -188,21 +188,25 @@ impl Meter {
     }
 }
 
+#[allow(dead_code)] // todo use this
 #[derive(Eq, Hash, PartialEq, Clone, Debug)]
 pub(crate) enum AttributionSource {
     Peer(PeerKeyLocation),
     Delegate(DelegateKey),
 }
 
-#[derive(Eq, Hash, PartialEq, Clone, Copy, Debug, Sequence)]
+#[derive(Eq, Hash, PartialEq, Clone, Copy, Debug)]
 pub(crate) enum ResourceType {
     InboundBandwidthBytes,
     OutboundBandwidthBytes,
 }
 
 impl ResourceType {
-    pub(crate) fn all() -> All<ResourceType> {
-        all::<ResourceType>()
+    pub(crate) fn all() -> [ResourceType; 2] {
+        [
+            ResourceType::InboundBandwidthBytes,
+            ResourceType::OutboundBandwidthBytes,
+        ]
     }
 }
 

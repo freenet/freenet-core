@@ -282,10 +282,9 @@ impl InitPeerNode {
     /// Will panic if is not a valid representation.
     pub fn decode_peer_id<T: AsMut<[u8]>>(mut bytes: T) -> Libp2pPeerId {
         Libp2pPeerId::from_public_key(
-            &identity::Keypair::try_from(
+            &identity::Keypair::from(
                 identity::ed25519::Keypair::try_from_bytes(bytes.as_mut()).unwrap(),
             )
-            .unwrap()
             .public(),
         )
     }

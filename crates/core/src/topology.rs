@@ -5,7 +5,6 @@ use meter::Meter;
 use outbound_request_counter::OutboundRequestCounter;
 use request_density_tracker::{CachedDensityMap, RequestDensityTracker};
 use std::cmp::Ordering;
-use std::sync::RwLock;
 use std::{
     collections::{BTreeMap, HashMap},
     time::Instant,
@@ -55,7 +54,7 @@ pub(crate) struct TopologyManager {
     pub(crate) outbound_request_counter: OutboundRequestCounter,
     /// Must be updated when new neightbors are discovered.
     cached_density_map: CachedDensityMap,
-    connection_acquisition_strategy: RwLock<ConnectionAcquisitionStrategy>,
+    connection_acquisition_strategy: ConnectionAcquisitionStrategy,
 }
 
 impl TopologyManager {
@@ -78,7 +77,7 @@ impl TopologyManager {
             outbound_request_counter: OutboundRequestCounter::new(
                 OUTBOUND_REQUEST_COUNTER_WINDOW_SIZE,
             ),
-            connection_acquisition_strategy: RwLock::new(ConnectionAcquisitionStrategy::Fast),
+            connection_acquisition_strategy: ConnectionAcquisitionStrategy::Fast,
         }
     }
 
@@ -122,9 +121,7 @@ impl TopologyManager {
             .ok_or(DensityMapError::EmptyNeighbors)?;
         let score = density_map.get_density_at(candidate_location)?;
 
-        let strategy = self.connection_acquisition_strategy.read().unwrap();
-
-        let accept = match *strategy {
+        let accept = match self.connection_acquisition_strategy {
             ConnectionAcquisitionStrategy::Slow => {
                 self.fast_connection_evaluator
                     .record_only_with_current_time(score, current_time);
@@ -142,8 +139,9 @@ impl TopologyManager {
         Ok(accept)
     }
 
+    #[cfg(test)]
     /// Get the ideal location for a new connection based on current neighbors and request density
-    pub(crate) fn get_best_candidate_location(
+    fn get_best_candidate_location(
         &self,
         this_peer_location: &Location,
     ) -> Result<Location, DensityMapError> {
@@ -161,13 +159,14 @@ impl TopologyManager {
                 debug!(
                     "An error occurred while getting max density, falling back to random location"
                 );
-                this_peer_location.clone()
+                *this_peer_location
             }
         };
         Ok(best_location)
     }
 
-    pub fn update_limits(&mut self, limits: Limits) {
+    #[cfg(test)]
+    pub(self) fn update_limits(&mut self, limits: Limits) {
         self.limits = limits;
     }
 
@@ -176,6 +175,7 @@ impl TopologyManager {
     /// This should be done in the lowest-level functions that consume the resource, taking
     /// an AttributionMeter as a parameter. This will be useful for contracts with multiple
     /// subscribers - where the responsibility should be split evenly among the subscribers.
+    #[allow(dead_code)] // todo: maybe use this
     pub(crate) fn report_split_resource_usage(
         &mut self,
         attributions: &[AttributionSource],
@@ -189,6 +189,7 @@ impl TopologyManager {
         }
     }
 
+    #[allow(dead_code)] // fixme: use this
     pub(crate) fn report_resource_usage(
         &mut self,
         attribution: &AttributionSource,
@@ -246,10 +247,10 @@ impl TopologyManager {
         for (source, ramping_up) in usage_data {
             let usage_rate: Option<Rate> = if ramping_up {
                 debug!("Source {:?} is ramping up", source);
-                self.meter.get_adjusted_usage_rate(&resource_type, now)
+                self.meter.get_adjusted_usage_rate(resource_type, now)
             } else {
                 debug!("Source {:?} is not ramping up", source);
-                self.attributed_usage_rate(&source, &resource_type, now)
+                self.attributed_usage_rate(&source, resource_type, now)
             };
             debug!("Usage rate for source {:?}: {:?}", source, usage_rate);
             total_usage += usage_rate.unwrap_or(Rate::new_per_second(0.0));
@@ -299,7 +300,7 @@ impl TopologyManager {
                             // The first few connect messages should target the peer's own
                             // location (if known), to reduce the danger of a peer failing to
                             // cluster
-                            locations.push(location.clone());
+                            locations.push(*location);
                         }
                         None => {
                             locations.push(Location::random());
@@ -383,7 +384,7 @@ impl TopologyManager {
         for resource_type in ResourceType::all() {
             let usage = self.extrapolated_usage(&resource_type, at_time);
             let proportion = usage.total.proportion_of(&self.limits.get(&resource_type));
-            usage_rate_per_type.insert(resource_type.clone(), proportion);
+            usage_rate_per_type.insert(resource_type, proportion);
         }
 
         let max_usage_rate = usage_rate_per_type
@@ -394,24 +395,16 @@ impl TopologyManager {
         UsageRates {
             // TODO: Is there a way to avoid this clone()?
             usage_rate_per_type: usage_rate_per_type.clone(),
-            max_usage_rate: (max_usage_rate.0.clone(), *max_usage_rate.1),
+            max_usage_rate: (*max_usage_rate.0, *max_usage_rate.1),
         }
     }
 
     /// modify the current connection acquisition strategy
-    fn update_connection_acquisition_strategy(&self, new_strategy: ConnectionAcquisitionStrategy) {
-        // To avoid acquiring a write lock unnecessarily check if the value is
-        // needs to change
-        {
-            let read_guard = self.connection_acquisition_strategy.read().unwrap();
-            if *read_guard == new_strategy {
-                // The value is already what we want, so we can return early
-                return;
-            }
-        } // The read lock is dropped here
-
-        let mut write_guard = self.connection_acquisition_strategy.write().unwrap();
-        *write_guard = new_strategy;
+    fn update_connection_acquisition_strategy(
+        &mut self,
+        new_strategy: ConnectionAcquisitionStrategy,
+    ) {
+        self.connection_acquisition_strategy = new_strategy;
     }
 
     fn select_connections_to_add(
@@ -602,7 +595,7 @@ mod tests {
     /// world distribution.
     fn random_location(this_peer_location: &Location) -> Location {
         tracing::debug!("Generating random location");
-        let distance = random_link_distance(Distance::new(0.001));
+        let distance = small_world_rand::test_utils::random_link_distance(Distance::new(0.001));
         let location_f64 = if rand::random() {
             this_peer_location.as_f64() - distance.as_f64()
         } else {
@@ -615,7 +608,6 @@ mod tests {
     use super::*;
     use crate::ring::Distance;
     use crate::test_utils::with_tracing;
-    use small_world_rand::random_link_distance;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -801,12 +793,15 @@ mod tests {
 
             let my_location = Location::random();
 
-            let adjustment =
-                resource_manager.adjust_topology(&neighbor_locations, &Some(my_location), report_time);
+            let adjustment = resource_manager.adjust_topology(
+                &neighbor_locations,
+                &Some(my_location),
+                report_time,
+            );
 
             match adjustment {
                 TopologyAdjustment::AddConnections(v) => {
-                    assert!(v.len() > 0);
+                    assert!(!v.is_empty());
                     for location in v {
                         assert_eq!(location, my_location);
                     }
@@ -931,22 +926,10 @@ pub(crate) enum TopologyAdjustment {
     NoChange,
 }
 
-pub(crate) struct Usage {
-    pub(crate) total: Rate,
-    pub(crate) per_source: HashMap<AttributionSource, Rate>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PeerValue {
-    pub peer: PeerKeyLocation,
-    pub value: f64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CandidateCost {
-    peer: PeerKeyLocation,
-    total_cost: f64,
-    cost_per_value: f64,
+struct Usage {
+    total: Rate,
+    #[allow(unused)]
+    per_source: HashMap<AttributionSource, Rate>,
 }
 
 pub(crate) struct Limits {
@@ -966,7 +949,8 @@ impl Limits {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct UsageRates {
-    pub usage_rate_per_type: HashMap<ResourceType, RateProportion>,
-    pub max_usage_rate: (ResourceType, RateProportion),
+struct UsageRates {
+    #[allow(unused)]
+    usage_rate_per_type: HashMap<ResourceType, RateProportion>,
+    max_usage_rate: (ResourceType, RateProportion),
 }

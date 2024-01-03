@@ -45,10 +45,6 @@ impl RunningAverage {
         let divisor = sample_duration.max(MINIMUM_TIME_WINDOW);
         Some(Rate::new(self.sum_samples, divisor))
     }
-
-    pub fn total_sample_count(&self) -> usize {
-        self.total_sample_count
-    }
 }
 
 #[cfg(test)]
