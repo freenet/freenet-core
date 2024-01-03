@@ -22,6 +22,12 @@
 //! that congestion won't occur if the upstream rate is less than `max_upstream_rate`.
 //! Choosing an appropriate and conservative value for `max_upstream_rate` is therefore
 //! important to avoid congestion.
+//!
+//! ## Encryption
+//!
+//! Each peer chooses a symmetric key that is used to encrypt *inbound* messages for that peer,
+//! the exception is inbound connections to the gateway peer which will use the key provided
+//! by the peer initiating the connection in both directions.
 
 use libp2p_identity::{Keypair, PublicKey};
 use std::net::IpAddr;
