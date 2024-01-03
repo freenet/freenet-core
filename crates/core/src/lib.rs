@@ -26,6 +26,8 @@ mod tracing;
 pub mod util;
 /// WASM code execution runtime, tailored for the contract and delegate APIs.
 mod wasm_runtime;
+/// Code for communicating with other peers over UDP, handles hole-punching, error handling, etc.
+mod transport;
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
