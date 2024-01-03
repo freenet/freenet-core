@@ -471,7 +471,7 @@ mod test {
 
         assert_eq!(outbound.len(), 1);
         assert!(matches!(
-            outbound.get(0),
+            outbound.first(),
             Some(OutboundDelegateMsg::ApplicationMessage(msg)) if *msg.payload == expected_payload
         ));
 
@@ -487,7 +487,7 @@ mod test {
             bincode::serialize(&OutboundAppMessage::MessageSigned(vec![4, 5, 2])).unwrap();
         assert_eq!(outbound.len(), 1);
         assert!(matches!(
-            outbound.get(0),
+            outbound.first(),
             Some(OutboundDelegateMsg::ApplicationMessage(msg)) if *msg.payload == expected_payload
         ));
         std::mem::drop(temp_dir);

@@ -48,6 +48,7 @@ use crate::operations::handle_op_request;
 pub use network_bridge::inter_process::InterProcessConnManager;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
 
+use crate::topology::rate::Rate;
 pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
 mod network_bridge;
@@ -113,6 +114,8 @@ pub struct NodeConfig {
     pub(crate) rnd_if_htl_above: Option<usize>,
     pub(crate) max_number_conn: Option<usize>,
     pub(crate) min_number_conn: Option<usize>,
+    pub(crate) max_upstream_bandwidth: Option<Rate>,
+    pub(crate) max_downstream_bandwidth: Option<Rate>,
 }
 
 impl NodeConfig {
@@ -130,6 +133,8 @@ impl NodeConfig {
             rnd_if_htl_above: None,
             max_number_conn: None,
             min_number_conn: None,
+            max_upstream_bandwidth: None,
+            max_downstream_bandwidth: None,
         }
     }
 
@@ -277,10 +282,9 @@ impl InitPeerNode {
     /// Will panic if is not a valid representation.
     pub fn decode_peer_id<T: AsMut<[u8]>>(mut bytes: T) -> Libp2pPeerId {
         Libp2pPeerId::from_public_key(
-            &identity::Keypair::try_from(
+            &identity::Keypair::from(
                 identity::ed25519::Keypair::try_from_bytes(bytes.as_mut()).unwrap(),
             )
-            .unwrap()
             .public(),
         )
     }

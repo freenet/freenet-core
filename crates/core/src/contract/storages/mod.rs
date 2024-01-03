@@ -1,7 +1,7 @@
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 #[cfg(feature = "sqlite")]
-pub use sqlite::{Pool as SqlitePool, SqlDbError};
+pub use sqlite::Pool as SqlitePool;
 
 #[cfg(feature = "sqlite")]
 pub type Storage = SqlitePool;

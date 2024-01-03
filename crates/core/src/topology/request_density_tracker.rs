@@ -1,11 +1,11 @@
-use crate::ring::Location;
+use crate::ring::{Connection, Location};
 use std::collections::{BTreeMap, VecDeque};
 use thiserror::Error;
 
 /// Tracks requests sent by a node to its neighbors and creates a density map, which
 /// is useful for determining which new neighbors to connect to based on their
 /// location.
-pub(super) struct RequestDensityTracker {
+pub(crate) struct RequestDensityTracker {
     /// Amount of requests done to an specific location.
     request_locations: BTreeMap<Location, usize>,
     /// Request locations sorted by order of execution.
@@ -15,7 +15,7 @@ pub(super) struct RequestDensityTracker {
 }
 
 impl RequestDensityTracker {
-    pub fn new(window_size: usize) -> Self {
+    pub(crate) fn new(window_size: usize) -> Self {
         Self {
             request_locations: BTreeMap::new(),
             request_list: VecDeque::with_capacity(window_size),
@@ -24,7 +24,7 @@ impl RequestDensityTracker {
         }
     }
 
-    pub fn sample(&mut self, value: Location) {
+    pub(crate) fn sample(&mut self, value: Location) {
         self.samples += 1;
 
         self.request_list.push_back(value);
@@ -42,31 +42,30 @@ impl RequestDensityTracker {
         }
     }
 
-    pub fn create_density_map(
+    pub(crate) fn create_density_map(
         &self,
-        neighbors: &BTreeMap<Location, usize>,
+        neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
     ) -> Result<DensityMap, DensityMapError> {
-        debug_assert!(!neighbors.is_empty());
-        if neighbors.is_empty() {
+        if neighbor_locations.is_empty() {
             return Err(DensityMapError::EmptyNeighbors);
         }
 
         let mut neighbor_request_counts = BTreeMap::new();
 
         for (sample_location, sample_count) in self.request_locations.iter() {
-            let previous_neighbor = neighbors
+            let previous_neighbor = neighbor_locations
                 .range(..*sample_location)
                 .next_back()
-                .or_else(|| neighbors.iter().next_back());
-            let next_neighbor = neighbors
+                .or_else(|| neighbor_locations.iter().next_back());
+            let next_neighbor = neighbor_locations
                 .range(*sample_location..)
                 .next()
-                .or_else(|| neighbors.iter().next());
+                .or_else(|| neighbor_locations.iter().next());
 
             match (previous_neighbor, next_neighbor) {
                 (Some((previous_neighbor_location, _)), Some((next_neighbor_location, _))) => {
-                    if sample_location.distance(*previous_neighbor_location)
-                        < sample_location.distance(*next_neighbor_location)
+                    if sample_location.distance(previous_neighbor_location)
+                        < sample_location.distance(next_neighbor_location)
                     {
                         *neighbor_request_counts
                             .entry(*previous_neighbor_location)
@@ -77,7 +76,6 @@ impl RequestDensityTracker {
                             .or_insert(0) += sample_count;
                     }
                 }
-                // The None cases have been removed as they should not occur given the new logic
                 _ => unreachable!(
                     "This shouldn't be possible given that we verify neighbors is not empty"
                 ),
@@ -90,7 +88,7 @@ impl RequestDensityTracker {
     }
 }
 
-pub(super) struct DensityMap {
+pub(crate) struct DensityMap {
     neighbor_request_counts: BTreeMap<Location, usize>,
 }
 
@@ -138,7 +136,10 @@ impl DensityMap {
     }
 
     pub fn get_max_density(&self) -> Result<Location, DensityMapError> {
+        tracing::debug!("get_max_density called");
+
         if self.neighbor_request_counts.is_empty() {
+            tracing::warn!("No neighbors to get max density from");
             return Err(DensityMapError::EmptyNeighbors);
         }
 
@@ -146,6 +147,8 @@ impl DensityMap {
         // with the highest combined request count
         let mut max_density_location = Location::new(0.0);
         let mut max_density = 0;
+
+        tracing::debug!("Starting to iterate over neighbor pairs");
 
         for (
             (previous_neighbor_location, previous_neighbor_count),
@@ -155,14 +158,30 @@ impl DensityMap {
             .iter()
             .zip(self.neighbor_request_counts.iter().skip(1))
         {
+            // tracing span with location of first and last neighbor locations
+            let span = tracing::debug_span!(
+                "neighbor_pair",
+                previous_neighbor_location = previous_neighbor_location.as_f64(),
+                next_neighbor_location = next_neighbor_location.as_f64()
+            );
+            let _enter = span.enter();
             let combined_count = previous_neighbor_count + next_neighbor_count;
+            tracing::debug!("Combined count for neighbor pair: {}", combined_count);
+
             if combined_count > max_density {
+                tracing::debug!(
+                    "New max density found: {} at location {:?}",
+                    combined_count,
+                    max_density_location
+                );
                 max_density = combined_count;
                 max_density_location = Location::new(
                     (previous_neighbor_location.as_f64() + next_neighbor_location.as_f64()) / 2.0,
                 );
             }
         }
+
+        tracing::debug!("Checking first and last neighbors");
 
         // We need to also check the first and last neighbors as locations are circular
         let first_neighbor = self.neighbor_request_counts.iter().next();
@@ -173,6 +192,11 @@ impl DensityMap {
         ) = (first_neighbor, last_neighbor)
         {
             let combined_count = first_neighbor_count + last_neighbor_count;
+            tracing::debug!(
+                "Combined count for first and last neighbor: {}",
+                combined_count
+            );
+
             if combined_count > max_density {
                 // max_density = combined_count; Not needed as this is the last check
                 let distance = first_neighbor_location.distance(*last_neighbor_location);
@@ -181,9 +205,14 @@ impl DensityMap {
                     mp += 1.0;
                 }
                 max_density_location = Location::new(mp);
+                tracing::debug!(
+                    "New max density found at the edge: location {:?}",
+                    max_density_location
+                );
             }
         }
 
+        tracing::debug!("Returning max density location: {:?}", max_density_location);
         Ok(max_density_location)
     }
 }
@@ -201,9 +230,9 @@ impl CachedDensityMap {
     pub fn set(
         &mut self,
         tracker: &RequestDensityTracker,
-        current_neighbors: &BTreeMap<Location, usize>,
+        neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
     ) -> Result<(), DensityMapError> {
-        let density_map = tracker.create_density_map(current_neighbors)?;
+        let density_map = tracker.create_density_map(neighbor_locations)?;
         self.density_map = Some(density_map);
         Ok(())
     }
@@ -222,9 +251,22 @@ pub(crate) enum DensityMapError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::RwLock;
 
     #[test]
     fn test_create_density_map() {
+        let neighbors = RwLock::new(BTreeMap::new());
+        neighbors
+            .write()
+            .unwrap()
+            .insert(Location::new(0.2), vec![]);
+        neighbors
+            .write()
+            .unwrap()
+            .insert(Location::new(0.6), vec![]);
+
+        let neighbors = neighbors.read();
+
         let mut sw = RequestDensityTracker::new(5);
         sw.sample(Location::new(0.21));
         sw.sample(Location::new(0.22));
@@ -232,11 +274,7 @@ mod tests {
         sw.sample(Location::new(0.61));
         sw.sample(Location::new(0.62));
 
-        let mut neighbors = BTreeMap::new();
-        neighbors.insert(Location::new(0.2), 1);
-        neighbors.insert(Location::new(0.6), 1);
-
-        let result = sw.create_density_map(&neighbors);
+        let result = sw.create_density_map(&neighbors.unwrap());
         assert!(result.is_ok());
         let result = result.unwrap();
         assert_eq!(
@@ -259,8 +297,8 @@ mod tests {
         sw.sample(Location::new(0.62));
 
         let mut neighbors = BTreeMap::new();
-        neighbors.insert(Location::new(0.6), 1);
-        neighbors.insert(Location::new(0.9), 1);
+        neighbors.insert(Location::new(0.6), vec![]);
+        neighbors.insert(Location::new(0.9), vec![]);
 
         let result = sw.create_density_map(&neighbors);
         assert!(result.is_ok());
@@ -285,8 +323,8 @@ mod tests {
         sw.sample(Location::new(0.60));
 
         let mut neighbors = BTreeMap::new();
-        neighbors.insert(Location::new(0.2), 1);
-        neighbors.insert(Location::new(0.6), 1);
+        neighbors.insert(Location::new(0.2), vec![]);
+        neighbors.insert(Location::new(0.6), vec![]);
 
         let result = sw.create_density_map(&neighbors);
         assert!(result.is_ok());
@@ -321,8 +359,8 @@ mod tests {
         sw.sample(Location::new(0.62));
 
         let mut neighbors = BTreeMap::new();
-        neighbors.insert(Location::new(0.2), 1);
-        neighbors.insert(Location::new(0.6), 1);
+        neighbors.insert(Location::new(0.2), vec![]);
+        neighbors.insert(Location::new(0.6), vec![]);
 
         let result = sw.create_density_map(&neighbors);
         assert!(result.is_ok());
