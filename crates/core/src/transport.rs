@@ -35,6 +35,7 @@
 //! receiving the message will decrypt the key and use it to encrypt future messages.
 
 pub(crate) mod errors;
+mod udp;
 
 use errors::*;
 use libp2p_identity::{Keypair, PublicKey};
@@ -46,7 +47,7 @@ trait Transport<C: Connection> {
         keypair: Keypair,
         listen_port: u16,
         is_gateway: bool,
-        max_upstream_rate : BytesPerSecond,
+        max_upstream_rate: BytesPerSecond,
     ) -> Result<Self, TransportError>
     where
         Self: Sized,
@@ -65,7 +66,7 @@ trait Transport<C: Connection> {
         todo!()
     }
 
-    fn update_max_upstream_rate(&self, max_upstream_rate : BytesPerSecond) {
+    fn update_max_upstream_rate(&self, max_upstream_rate: BytesPerSecond) {
         todo!()
     }
 
@@ -89,7 +90,10 @@ pub trait Connection {
 
     async fn send_short_message(&self, message: Vec<u8>) -> Result<(), ConnectionError>;
 
-    async fn send_streamed_message(&self, message_length : usize) -> Result<SenderStream, ConnectionError>;
+    async fn send_streamed_message(
+        &self,
+        message_length: usize,
+    ) -> Result<SenderStream, ConnectionError>;
 }
 
 enum ConnectionEvent {

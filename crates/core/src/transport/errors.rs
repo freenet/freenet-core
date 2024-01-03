@@ -38,5 +38,5 @@ enum SendMessageError {
 #[derive(Debug, Error)]
 pub(crate) enum SenderStreamError {
     Closed,
-    MessageExceedsLength { size : usize, max_size: usize },
+    MessageExceedsLength { size: usize, max_size: usize },
 }
