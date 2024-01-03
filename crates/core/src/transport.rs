@@ -35,7 +35,7 @@ pub enum ConnectionError {
 }
 
 trait Transport<C: Connection> {
-    fn new(keypair: Keypair, listen_port: u16, is_gateway: bool) -> Result<Self, TransportError>
+    fn new(keypair: Keypair, listen_port: u16, is_gateway: bool, max_upstream_rate : BytesPerSecond) -> Result<Self, TransportError>
     where
         Self: Sized,
     {
@@ -50,6 +50,10 @@ trait Transport<C: Connection> {
         remote_is_gateway: bool,
         timeout: Duration,
     ) -> Result<C, TransportError> {
+        todo!()
+    }
+
+    fn update_max_upstream_rate(&self, max_upstream_rate : BytesPerSecond) {
         todo!()
     }
 
@@ -93,13 +97,13 @@ impl ReceiverStream {
     }
 }
 
-struct StreamedMessagePart {
+pub(crate) struct StreamedMessagePart {
     data: Vec<u8>,
     part_start_position: usize,
     message_size: usize,
 }
 
-struct SenderStream {}
+pub(crate) struct SenderStream {}
 
 impl SenderStream {
     /// Will block until the message is sent, data must fit in a single UDP packet.
@@ -108,6 +112,15 @@ impl SenderStream {
     }
 }
 
-enum SenderStreamError {
+pub(crate) enum SenderStreamError {
     Closed,
+}
+
+pub(crate) struct BytesPerSecond(f64);
+
+impl BytesPerSecond {
+    pub fn new(bytes_per_second: f64) -> Self {
+        assert!(bytes_per_second >= 0.0);
+        Self(bytes_per_second)
+    }
 }
