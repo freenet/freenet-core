@@ -74,7 +74,6 @@ trait Transport<C: Connection> {
         listen_port: u16,
         is_gateway: bool,
         max_upstream_rate : BytesPerSecond,
-        resend_after : Duration,
     ) -> Result<Self, TransportError>
     where
         Self: Sized,
