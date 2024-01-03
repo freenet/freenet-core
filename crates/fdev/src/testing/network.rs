@@ -229,23 +229,10 @@ pub async fn run_network(
     tracing::info!("Starting network");
 
     let cmd_args = SubProcess::build_command(&test_config, test_config.seed());
-    for (label, config) in supervisor.peers_config.lock().await.iter() {
-        let process = SubProcess::start(&cmd_args, &label, config.peer_id)
-            .await
-            .unwrap();
-        supervisor
-            .processes
-            .lock()
-            .await
-            .insert(config.peer_id, process);
-        supervisor.enqueue_peer(label.number()).await;
-    }
+    start_processes(supervisor.clone(), &cmd_args, test_config).await?;
 
     tracing::info!("Waiting for all peers to start");
-
-    while !supervisor.waiting_peers.lock().await.is_empty() {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    wait_for_peers(supervisor.clone()).await;
     tracing::info!("All peers started");
 
     let peers: Vec<(NodeLabel, PeerId)> = supervisor
@@ -311,6 +298,31 @@ pub async fn run_network(
     tracing::info!("Simulation finished");
 
     Ok(())
+}
+
+async fn start_processes(
+    supervisor: Arc<Supervisor>,
+    cmd_args: &[String],
+    test_config: &TestConfig,
+) -> Result<(), Error> {
+    for (label, config) in supervisor.peers_config.lock().await.iter() {
+        let process = SubProcess::start(&cmd_args, &label, config.peer_id)
+            .await
+            .unwrap();
+        supervisor
+            .processes
+            .lock()
+            .await
+            .insert(config.peer_id, process);
+        supervisor.enqueue_peer(label.number()).await;
+    }
+    Ok(())
+}
+
+async fn wait_for_peers(supervisor: Arc<Supervisor>) {
+    while !supervisor.waiting_peers.lock().await.is_empty() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn config_handler(
@@ -517,6 +529,10 @@ impl Supervisor {
     }
 }
 
+pub trait Runnable {
+    async fn run(&self, config: &TestConfig, peer_id: String) -> anyhow::Result<()>;
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 enum PeerStatus {
     Finished(usize),
@@ -561,85 +577,6 @@ impl Peer {
         })
     }
 
-    async fn run(
-        &mut self,
-        test_config: &super::TestConfig,
-        peer_id: String,
-    ) -> anyhow::Result<()> {
-        let mut receiver_ch = self.receiver_ch.deref().clone();
-        receiver_ch.borrow_and_update();
-
-        let conf_str = serde_json::to_string(&self.config).unwrap();
-        Self::send_peer_msg(
-            self,
-            PeerMessage::Info(format!("Node {} with config: {}", peer_id, conf_str)),
-        )
-        .await;
-        let mut memory_event_generator = MemoryEventsGen::<fastrand::Rng>::new_with_seed(
-            receiver_ch,
-            self.config.peer_id,
-            test_config
-                .seed
-                .expect("seed should be set for child process"),
-        );
-        let peer_id_num = NodeLabel::from(peer_id.as_str()).number();
-
-        memory_event_generator.rng_params(
-            peer_id_num,
-            test_config.gateways + test_config.nodes,
-            test_config
-                .max_contract_number
-                .unwrap_or(test_config.nodes * 10),
-            test_config.events as usize,
-        );
-        let event_generator = NetworkEventGenerator::new(
-            self.config.peer_id,
-            memory_event_generator,
-            self.ws_client.clone(),
-            test_config.seed(),
-        );
-
-        // Obtain an identity::Keypair instance for the private_key
-        let private_key = Keypair::generate_ed25519();
-
-        let data_dir = Executor::<Runtime>::test_data_dir(peer_id.as_str());
-
-        let cli_config = PeerCliConfig {
-            mode: OperationMode::Network,
-            node_data_dir: Some(data_dir),
-            address: self.config.local_ip.unwrap(),
-            port: self.config.local_port.unwrap(),
-        };
-
-        let event_loop_task =
-            Self::event_loop(self.ws_client.clone(), self.user_ev_controller.clone());
-        tokio::task::spawn(event_loop_task);
-
-        match self
-            .config
-            .clone()
-            .build::<1>(cli_config, [Box::new(event_generator)], private_key)
-            .await
-        {
-            Ok(node) => match node.run().await {
-                Ok(_) => {
-                    tracing::info!("Node {} finished", peer_id);
-                    self.send_peer_msg(PeerMessage::Status(PeerStatus::Finished(peer_id_num)))
-                        .await;
-                }
-                Err(e) => {
-                    tracing::error!("Node {} failed: {}", peer_id, e);
-                    Self::send_error_msg(self, format!("Node {} failed: {}", peer_id, e)).await;
-                }
-            },
-            Err(e) => {
-                Self::send_error_msg(self, format!("Failed to build node: {}", e)).await;
-                tracing::error!("Failed to build node: {}", e);
-            }
-        }
-
-        Ok(())
-    }
     async fn event_loop(
         ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
         user_ev_controller: Arc<Sender<(u32, PeerId)>>,
@@ -695,5 +632,190 @@ impl Peer {
             .send(tokio_tungstenite::tungstenite::protocol::Message::Text(msg))
             .await
             .unwrap();
+    }
+}
+
+impl Runnable for Peer {
+    async fn run(&self, config: &TestConfig, peer_id: String) -> anyhow::Result<()> {
+        let mut receiver_ch = self.receiver_ch.deref().clone();
+        receiver_ch.borrow_and_update();
+
+        let conf_str = serde_json::to_string(&self.config).unwrap();
+        Self::send_peer_msg(
+            self,
+            PeerMessage::Info(format!("Node {} with config: {}", peer_id, conf_str)),
+        )
+        .await;
+        let mut memory_event_generator = MemoryEventsGen::<fastrand::Rng>::new_with_seed(
+            receiver_ch,
+            self.config.peer_id,
+            config.seed.expect("seed should be set for child process"),
+        );
+        let peer_id_num = NodeLabel::from(peer_id.as_str()).number();
+
+        memory_event_generator.rng_params(
+            peer_id_num,
+            config.gateways + config.nodes,
+            config.max_contract_number.unwrap_or(config.nodes * 10),
+            config.events as usize,
+        );
+        let event_generator = NetworkEventGenerator::new(
+            self.config.peer_id,
+            memory_event_generator,
+            self.ws_client.clone(),
+            config.seed(),
+        );
+
+        // Obtain an identity::Keypair instance for the private_key
+        let private_key = Keypair::generate_ed25519();
+
+        let data_dir = Executor::<Runtime>::test_data_dir(peer_id.as_str());
+
+        let cli_config = PeerCliConfig {
+            mode: OperationMode::Network,
+            node_data_dir: Some(data_dir),
+            address: self.config.local_ip.unwrap(),
+            port: self.config.local_port.unwrap(),
+        };
+
+        let event_loop_task =
+            Self::event_loop(self.ws_client.clone(), self.user_ev_controller.clone());
+        tokio::task::spawn(event_loop_task);
+
+        match self
+            .config
+            .clone()
+            .build::<1>(cli_config, [Box::new(event_generator)], private_key)
+            .await
+        {
+            Ok(node) => match node.run().await {
+                Ok(_) => {
+                    tracing::info!("Node {} finished", peer_id);
+                    self.send_peer_msg(PeerMessage::Status(PeerStatus::Finished(peer_id_num)))
+                        .await;
+                }
+                Err(e) => {
+                    tracing::error!("Node {} failed: {}", peer_id, e);
+                    Self::send_error_msg(self, format!("Node {} failed: {}", peer_id, e)).await;
+                }
+            },
+            Err(e) => {
+                Self::send_error_msg(self, format!("Failed to build node: {}", e)).await;
+                tracing::error!("Failed to build node: {}", e);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use tokio;
+
+    fn build_supervisor() -> Supervisor {
+        Supervisor {
+            peers_config: Arc::new(Mutex::new(HashMap::new())),
+            processes: Mutex::new(HashMap::new()),
+            waiting_peers: Arc::new(Mutex::new(VecDeque::new())),
+            user_ev_controller: Arc::new(Mutex::new(tokio::sync::mpsc::channel(1).0)),
+            event_rx: Arc::new(Mutex::new(tokio::sync::mpsc::channel(1).1)),
+        }
+    }
+    #[tokio::test]
+    async fn test_peer() {
+        let mut supervisor = build_supervisor();
+
+        let network_config = NetworkProcessConfig {
+            mode: Process::Peer,
+            id: Some("node-1".to_string()),
+        };
+
+        let config = super::super::TestConfig {
+            name: Some("TestName".to_string()),
+            seed: Some(12345),
+            gateways: 0,
+            nodes: 1,
+            ring_max_htl: 20,
+            rnd_if_htl_above: 10,
+            max_connections: 20,
+            min_connections: 0,
+            max_contract_number: Some(100),
+            events: 2,
+            event_wait_ms: Some(1000),
+            connection_wait_ms: Some(2000),
+            peer_start_backoff_ms: Some(2000),
+            execution_data: None,
+            disable_metrics: false,
+            command: super::super::TestMode::Network(NetworkProcessConfig {
+                mode: Process::Peer,
+                id: Some("node-1".to_string()),
+            }),
+        };
+
+        let server_task = start_server(Arc::new(supervisor));
+        tokio::task::spawn(server_task);
+
+        let (ws_client, _) = tokio_tungstenite::connect_async("ws://localhost:3000/ws")
+            .await
+            .expect("Failed to connect to supervisor");
+
+        let (user_ev_controller, mut receiver_ch) =
+            tokio::sync::watch::channel((0, PeerId::random()));
+        receiver_ch.borrow_and_update();
+
+        let mut node_config = NodeConfig::new();
+        node_config
+            .with_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .with_port(3001);
+
+        let mut memory_event_generator = MemoryEventsGen::<fastrand::Rng>::new_with_seed(
+            receiver_ch,
+            node_config.peer_id,
+            config.seed.expect("seed should be set for child process"),
+        );
+        let peer_id_num = NodeLabel::from("node-1").number();
+
+        memory_event_generator.rng_params(
+            peer_id_num,
+            config.gateways + config.nodes,
+            config.max_contract_number.unwrap_or(config.nodes * 10),
+            config.events as usize,
+        );
+        let event_generator = NetworkEventGenerator::new(
+            node_config.peer_id,
+            memory_event_generator,
+            Arc::new(Mutex::new(ws_client)),
+            config.seed(),
+        );
+
+        // Obtain an identity::Keypair instance for the private_key
+        let private_key = Keypair::generate_ed25519();
+
+        let data_dir = Executor::<Runtime>::test_data_dir("node-1");
+
+        let cli_config = PeerCliConfig {
+            mode: OperationMode::Network,
+            node_data_dir: Some(data_dir),
+            address: node_config.local_ip.unwrap(),
+            port: node_config.local_port.unwrap(),
+        };
+
+        let node = node_config
+            .clone()
+            .build::<1>(cli_config, [Box::new(event_generator)], private_key)
+            .await
+            .unwrap();
+
+        match node.run().await {
+            Ok(_) => {
+                tracing::info!("Node {} finished", "1");
+            }
+            Err(e) => {
+                tracing::error!("Node {} failed: {}", "1", e);
+            }
+        };
     }
 }
