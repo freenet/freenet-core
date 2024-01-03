@@ -28,6 +28,11 @@
 //! Each peer chooses a symmetric key that is used to encrypt *inbound* messages for that peer,
 //! the exception is inbound connections to the gateway peer which will use the key provided
 //! by the peer initiating the connection in both directions.
+//!
+//! Each peer initiates a connection by encrypting its chosen key with the public key of the
+//! peer it is connecting to. The encrypted key is then sent to the peer in the first message
+//! of the connection, repeated until a correctly encrypted response is received. The peer
+//! receiving the message will decrypt the key and use it to encrypt future messages.
 
 use libp2p_identity::{Keypair, PublicKey};
 use std::net::IpAddr;
