@@ -150,7 +150,7 @@ pub(crate) struct SenderStream {}
 
 impl SenderStream {
     /// Will block until the message is sent, data must fit in a single UDP packet.
-    async fn send(&self, data: Vec<u8>) -> Result<(), SenderStreamError> {
+    async fn send_part(&self, data: Vec<u8>) -> Result<(), SenderStreamError> {
         todo!()
     }
 }
