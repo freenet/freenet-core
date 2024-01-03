@@ -1,5 +1,28 @@
 #![allow(dead_code)] // TODO: Remove before integration
 
+//! # Transport
+//!
+//! The transport layer is responsible for reliably sending and receiving messages
+//! over the network.
+//!
+//! ## Message Streaming
+//!
+//! The transport layer supports two types of messages:
+//!
+//! - Short messages that can fit in a single UDP packet.
+//! - Streamed messages that are split into multiple UDP packets.
+//!
+//! The purpose of streamed messages is to allow a node to start sending a message before
+//! it has been received completely (although it must know the message size before starting
+//! to send).
+//!
+//! ## Congestion Control
+//!
+//! The transport layer implements a simple congestion control algorithm which assumes
+//! that congestion won't occur if the upstream rate is less than `max_upstream_rate`.
+//! Choosing an appropriate and conservative value for `max_upstream_rate` is therefore
+//! important to avoid congestion.
+
 use libp2p_identity::{Keypair, PublicKey};
 use std::net::IpAddr;
 use std::time::Duration;
