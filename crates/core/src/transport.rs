@@ -58,8 +58,8 @@ pub enum ConnectionError {
     #[error("timeout occurred")]
     Timeout,
 
-    #[error("message too big, max size: {max_size}")]
-    MessageTooBig { max_size: usize },
+    #[error("message too big, size: {size}, max size: {max_size}")]
+    MessageTooBig { size: usize, max_size: usize },
 
     #[error("stream closed unexpectedly")]
     Closed,
@@ -102,11 +102,15 @@ trait Transport<C: Connection> {
 }
 
 pub trait Connection {
-    async fn remote_ip_address(&self) -> IpAddr;
+    fn remote_ip_address(&self) -> IpAddr;
 
-    async fn remote_public_key(&self) -> PublicKey;
+    fn remote_public_key(&self) -> PublicKey;
 
-    async fn remote_port(&self) -> u16;
+    fn remote_port(&self) -> u16;
+
+    fn outbound_symmetric_key(&self) -> Vec<u8>;
+
+    fn inbound_symmetric_key(&self) -> Vec<u8>;
 
     async fn read_event(&self) -> Result<ConnectionEvent, ConnectionError>;
 
