@@ -34,39 +34,12 @@
 //! of the connection, repeated until a correctly encrypted response is received. The peer
 //! receiving the message will decrypt the key and use it to encrypt future messages.
 
+pub(crate) mod errors;
+
+use errors::*;
 use libp2p_identity::{Keypair, PublicKey};
 use std::net::IpAddr;
 use std::time::Duration;
-use thiserror::Error;
-
-// Define a custom error type for the transport layer
-#[derive(Debug, Error)]
-pub enum TransportError {
-    #[error("network error: {0}")]
-    NetworkError(#[from] std::io::Error),
-
-    #[error("connection error: {0}")]
-    ConnectionError(#[from] ConnectionError),
-
-    #[error("initialization error: {0}")]
-    InitializationError(String),
-}
-
-// Define a custom error type for the connection
-#[derive(Debug, Error)]
-pub enum ConnectionError {
-    #[error("timeout occurred")]
-    Timeout,
-
-    #[error("message too big, size: {size}, max size: {max_size}")]
-    MessageTooBig { size: usize, max_size: usize },
-
-    #[error("stream closed unexpectedly")]
-    Closed,
-
-    #[error("protocol error: {0}")]
-    ProtocolError(String),
-}
 
 trait Transport<C: Connection> {
     fn new(
@@ -119,11 +92,6 @@ pub trait Connection {
     async fn send_streamed_message(&self, message_length : usize) -> Result<SenderStream, ConnectionError>;
 }
 
-enum SendMessageError {
-    MessageTooBig { max_size: usize },
-    Closed,
-}
-
 enum ConnectionEvent {
     /// A short message that can fit in a single UDP packet.
     Message(Vec<u8>),
@@ -155,15 +123,15 @@ impl SenderStream {
     }
 }
 
-pub(crate) enum SenderStreamError {
-    Closed,
-}
-
 pub(crate) struct BytesPerSecond(f64);
 
 impl BytesPerSecond {
     pub fn new(bytes_per_second: f64) -> Self {
         assert!(bytes_per_second >= 0.0);
         Self(bytes_per_second)
+    }
+
+    pub fn as_f64(&self) -> f64 {
+        self.0
     }
 }
