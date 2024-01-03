@@ -69,7 +69,7 @@ pub trait Connection {
 
     async fn send_short_message(&self, message: Vec<u8>) -> Result<(), ConnectionError>;
 
-    async fn send_streamed_message(&self) -> Result<SenderStream, ConnectionError>;
+    async fn send_streamed_message(&self, message_length : usize) -> Result<SenderStream, ConnectionError>;
 }
 
 enum SendMessageError {
@@ -104,8 +104,8 @@ impl ReceiverStream {
 
 struct StreamedMessagePart {
     data: Vec<u8>,
-    part_index: usize,
-    total_parts: usize,
+    part_start_position: usize,
+    message_size: usize,
 }
 
 struct SenderStream {}
