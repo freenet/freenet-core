@@ -85,15 +85,6 @@ enum ConnectionEvent {
     Disconnected,
 }
 
-enum SendingMessage {
-    /// A short message that can fit in a single UDP packet.
-    Short(Vec<u8>),
-    /// A message that is streamed over multiple UDP packets, the sender
-    /// will send the parts of the message in order but may not have
-    /// the entire message when it starts sending.
-    Streamed(SenderStream),
-}
-
 struct ReceiverStream {}
 
 impl ReceiverStream {
