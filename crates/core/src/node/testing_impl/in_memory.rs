@@ -57,6 +57,7 @@ impl<ER> Builder<ER> {
             contract::contract_handling(contract_handler)
                 .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
         );
+
         let mut config = super::RunnerConfig {
             peer_key: self.peer_key,
             gateways,

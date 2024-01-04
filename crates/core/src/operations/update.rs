@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 // TODO: complete update logic in the network
 use freenet_stdlib::prelude::*;
 use futures::future::BoxFuture;
@@ -38,7 +39,19 @@ impl UpdateOp {
     pub fn record_transfer(&mut self) {}
 
     pub(super) fn to_host_result(&self) -> HostResult {
-        todo!()
+        if let Some(UpdateState::Finished { key, summary }) = &self.state {
+            Ok(HostResponse::ContractResponse(
+                freenet_stdlib::client_api::ContractResponse::UpdateResponse {
+                    key: key.clone(),
+                    summary: summary.clone(),
+                },
+            ))
+        } else {
+            Err(ErrorKind::OperationError {
+                cause: "update didn't finish successfully".into(),
+            }
+            .into())
+        }
     }
 }
 
@@ -67,8 +80,15 @@ pub(crate) struct UpdateResult {}
 impl TryFrom<UpdateOp> for UpdateResult {
     type Error = OpError;
 
-    fn try_from(_value: UpdateOp) -> Result<Self, Self::Error> {
-        todo!()
+    fn try_from(op: UpdateOp) -> Result<Self, Self::Error> {
+        if let Some(true) = op
+            .stats
+            .map(|s| matches!(s.step, RecordingStats::Completed))
+        {
+            Ok(UpdateResult {})
+        } else {
+            Err(OpError::UnexpectedOpState)
+        }
     }
 }
 
@@ -388,7 +408,14 @@ impl Operation for UpdateOp {
                                 this_peer = %op_manager.ring.peer_key,
                                 "Peer completed contract value update",
                             );
-                            new_state = Some(UpdateState::Finished { key });
+
+                            // TODO: fix this
+                            let fake_summary = StateSummary::from(vec![]);
+
+                            new_state = Some(UpdateState::Finished {
+                                key,
+                                summary: fake_summary,
+                            });
                             if let Some(upstream) = upstream {
                                 return_msg = Some(UpdateMsg::SuccessfulUpdate {
                                     id: *id,
@@ -659,7 +686,7 @@ mod messages {
 
     use crate::{
         message::{InnerMessage, Transaction},
-        ring::PeerKeyLocation,
+        ring::{Location, PeerKeyLocation},
     };
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -723,19 +750,43 @@ mod messages {
 
     impl InnerMessage for UpdateMsg {
         fn id(&self) -> &Transaction {
-            todo!()
+            match self {
+                UpdateMsg::RequestUpdate { id, .. } => id,
+                UpdateMsg::UpdateForward { id, .. } => id,
+                UpdateMsg::SuccessfulUpdate { id, .. } => id,
+                UpdateMsg::AwaitUpdate { id, .. } => id,
+                UpdateMsg::SeekNode { id, .. } => id,
+                UpdateMsg::Broadcasting { id, .. } => id,
+                UpdateMsg::BroadcastTo { id, .. } => id,
+            }
         }
 
         fn target(&self) -> Option<&PeerKeyLocation> {
-            todo!()
+            match self {
+                UpdateMsg::RequestUpdate { target, .. } => Some(target),
+                UpdateMsg::SuccessfulUpdate { target, .. } => Some(target),
+                UpdateMsg::SeekNode { target, .. } => Some(target),
+                _ => None,
+            }
         }
 
         fn terminal(&self) -> bool {
-            todo!()
+            use UpdateMsg::*;
+            matches!(
+                self,
+                SuccessfulUpdate { .. } | UpdateForward { .. } | SeekNode { .. }
+            )
         }
 
         fn requested_location(&self) -> Option<crate::ring::Location> {
-            todo!()
+            match self {
+                UpdateMsg::RequestUpdate { key, .. } => Some(Location::from(key.id())),
+                UpdateMsg::UpdateForward { key, .. } => Some(Location::from(key.id())),
+                UpdateMsg::SeekNode { key, .. } => Some(Location::from(key.id())),
+                UpdateMsg::Broadcasting { key, .. } => Some(Location::from(key.id())),
+                UpdateMsg::BroadcastTo { key, .. } => Some(Location::from(key.id())),
+                _ => None,
+            }
         }
     }
 
@@ -750,8 +801,17 @@ mod messages {
     }
 
     impl Display for UpdateMsg {
-        fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            todo!()
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let id = self.id();
+            match self {
+                UpdateMsg::RequestUpdate { id, .. } => write!(f, "RequestUpdate(id: {id})"),
+                UpdateMsg::UpdateForward { id, .. } => write!(f, "UpdateForward(id: {id})"),
+                UpdateMsg::SuccessfulUpdate { id, .. } => write!(f, "SuccessfulUpdate(id: {id})"),
+                UpdateMsg::AwaitUpdate { id } => write!(f, "AwaitUpdate(id: {id})"),
+                UpdateMsg::SeekNode { id, .. } => write!(f, "SeekNode(id: {id})"),
+                UpdateMsg::Broadcasting { id, .. } => write!(f, "Broadcasting(id: {id})"),
+                UpdateMsg::BroadcastTo { id, .. } => write!(f, "BroadcastTo(id: {id})"),
+            }
         }
     }
 }
@@ -765,6 +825,7 @@ enum UpdateState {
     },
     Finished {
         key: ContractKey,
+        summary: StateSummary<'static>,
     },
     PrepareRequest {
         key: ContractKey,
