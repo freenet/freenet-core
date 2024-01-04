@@ -1,11 +1,15 @@
 use crate::transport::errors::*;
 use crate::transport::{BytesPerSecond, Connection, ConnectionEvent, SenderStream, Transport};
+use dashmap::DashMap;
 use libp2p_identity::ed25519::Keypair;
 use libp2p_identity::PublicKey;
 use std::net::IpAddr;
 use time::Duration;
+use tokio::sync::mpsc;
 
-struct UdpTransport {}
+struct UdpTransport {
+    connections: DashMap<(IpAddr, u16), UdpConnection>,
+}
 
 impl Transport<UdpConnection> for UdpTransport {
     fn new(
@@ -78,3 +82,5 @@ impl Connection for UdpConnection {
         todo!()
     }
 }
+
+enum InternalMessage {}
