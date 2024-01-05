@@ -417,11 +417,15 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
 
                     let related_contracts = RelatedContracts::default();
 
-                    let op = update::start_op(key, wrapped_state, related_contracts, 3_usize);
+                    tracing::debug!("just before update start op");
+
+                    let op = update::start_op(key, wrapped_state, related_contracts, 10_usize);
+
+                    tracing::debug!("just before request update");
 
                     if let Err(err) = update::request_update(&op_manager, op, Some(client_id)).await
                     {
-                        tracing::error!("{}", err)
+                        tracing::error!("request update error {}", err)
                     }
                 }
                 ContractRequest::Get {
@@ -709,6 +713,21 @@ async fn process_message<CB>(
                     op,
                 )
                 .await;
+                handle_op_not_available!(op_result);
+                break report_result(
+                    tx,
+                    op_result,
+                    &op_manager,
+                    executor_callback,
+                    cli_req,
+                    &mut *event_listener,
+                )
+                .await;
+            }
+            NetMessage::Update(op) => {
+                let op_result =
+                    handle_op_request::<update::UpdateOp, _>(&op_manager, &mut conn_manager, op)
+                        .await;
                 handle_op_not_available!(op_result);
                 break report_result(
                     tx,

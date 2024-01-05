@@ -6,7 +6,7 @@ use freenet_stdlib::prelude::*;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 
-use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation};
+use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::contract::ContractHandlerEvent;
 use crate::message::{InnerMessage, NetMessage, Transaction};
 use crate::ring::{Location, PeerKeyLocation, RingError};
@@ -224,15 +224,18 @@ impl Operation for UpdateOp {
                         );
                     }
 
+                    let skip_list = vec![]; // FIXME: placeholder
+
                     let last_hop = if let Some(new_htl) = htl.checked_sub(1) {
                         // forward changes in the contract to nodes closer to the contract location, if possible
                         let put_here = forward_update(
                             op_manager,
                             conn_manager,
-                            key,
+                            key.clone(),
                             value.clone(),
                             *id,
                             new_htl,
+                            skip_list,
                         )
                         .await;
                         if put_here && !is_subscribed_contract {
@@ -286,7 +289,6 @@ impl Operation for UpdateOp {
                     id,
                     key,
                     new_value,
-                    contract,
                     sender,
                 } => {
                     let target = op_manager.ring.own_location();
@@ -332,7 +334,6 @@ impl Operation for UpdateOp {
                     broadcasted_to,
                     key,
                     new_value,
-                    contract,
                     upstream,
                 } => {
                     let sender = op_manager.ring.own_location();
@@ -345,7 +346,6 @@ impl Operation for UpdateOp {
                             key: key.clone(),
                             new_value: new_value.clone(),
                             sender,
-                            contract: contract.clone(),
                         };
                         let f = conn_manager.send(&peer.peer, msg.into());
                         broadcasting.push(f);
@@ -367,7 +367,7 @@ impl Operation for UpdateOp {
                         // remove the failed peers in reverse order
                         let peer = broadcast_to.get(peer_num).unwrap();
                         tracing::warn!(
-                            "failed broadcasting put change to {} with error {}; dropping connection",
+                            "failed broadcasting update change to {} with error {}; dropping connection",
                             peer.peer,
                             err
                         );
@@ -440,7 +440,7 @@ impl Operation for UpdateOp {
                     tracing::debug!(
                         %key,
                         this_peer = % peer_loc.peer,
-                        "Forwarding changes, trying put the contract"
+                        "Forwarding changes, trying to update the contract"
                     );
 
                     let is_subscribed_contract = op_manager.ring.is_subscribed_to_contract(&key);
@@ -458,16 +458,18 @@ impl Operation for UpdateOp {
                         .await?;
                     }
 
-                    // if successful, forward to the next closest peers (if any)
+                    let skip_list = vec![]; // FIXME: placeholder
+                                            // if successful, forward to the next closest peers (if any)
                     let last_hop = if let Some(new_htl) = htl.checked_sub(1) {
                         // only hop forward if there are closer peers
                         let put_here = forward_update(
                             op_manager,
                             conn_manager,
-                            key,
+                            key.clone(),
                             new_value.clone(),
                             *id,
                             new_htl,
+                            skip_list,
                         )
                         .await;
                         if put_here && !is_subscribed_contract {
@@ -529,27 +531,110 @@ async fn try_to_broadcast(
     key: ContractKey,
     new_value: WrappedState,
 ) -> Result<(Option<UpdateState>, Option<UpdateMsg>), OpError> {
-    todo!();
+    let new_state;
+    let return_msg;
+
+    match state {
+        Some(UpdateState::ReceivedRequest | UpdateState::BroadcastOngoing { .. }) => {
+            if broadcast_to.is_empty() && !last_hop {
+                // broadcast complete
+                tracing::debug!(
+                    "Empty broadcast list while updating value for contract {}",
+                    key
+                );
+                // means the whole tx finished so can return early
+                new_state = Some(UpdateState::AwaitingResponse {
+                    key,
+                    upstream: Some(upstream),
+                });
+                return_msg = None;
+            } else if !broadcast_to.is_empty() {
+                tracing::debug!("Callback to start broadcasting to other nodes");
+                new_state = Some(UpdateState::BroadcastOngoing);
+                return_msg = Some(UpdateMsg::Broadcasting {
+                    id,
+                    new_value,
+                    broadcasted_to: 0,
+                    broadcast_to,
+                    key,
+                    upstream,
+                });
+
+                let op = UpdateOp {
+                    id,
+                    state: new_state,
+                    stats: None,
+                };
+                op_manager
+                    .notify_op_change(NetMessage::from(return_msg.unwrap()), OpEnum::Update(op))
+                    .await?;
+                return Err(OpError::StatePushed);
+            } else {
+                new_state = None;
+                return_msg = Some(UpdateMsg::SuccessfulUpdate {
+                    id,
+                    target: upstream,
+                });
+            }
+        }
+        _ => return Err(OpError::invalid_transition(id)),
+    };
+
+    Ok((new_state, return_msg))
 }
 
 fn build_op_result(
     id: Transaction,
-    new_state: Option<UpdateState>,
+    state: Option<UpdateState>,
     return_msg: Option<UpdateMsg>,
     stats: Option<UpdateStats>,
 ) -> Result<super::OperationResult, OpError> {
-    todo!()
+    let output_op = Some(UpdateOp { id, state, stats });
+    Ok(OperationResult {
+        return_msg: return_msg.map(NetMessage::from),
+        state: output_op.map(OpEnum::Update),
+    })
 }
 
 async fn forward_update<NB: NetworkBridge>(
     op_manager: &OpManager,
     conn_manager: &mut NB,
-    key: &ContractKey,
-    value: WrappedState,
+    key: ContractKey,
+    new_value: WrappedState,
     id: Transaction,
-    new_htl: usize,
+    htl: usize,
+    skip_list: Vec<PeerId>,
 ) -> bool {
-    todo!()
+    let contract_loc = Location::from(&key);
+    let forward_to = op_manager
+        .ring
+        .closest_potentially_caching(&key, &*skip_list);
+    let own_pkloc = op_manager.ring.own_location();
+    let own_loc = own_pkloc.location.expect("infallible");
+    if let Some(peer) = forward_to {
+        let other_loc = peer.location.as_ref().expect("infallible");
+        let other_distance = contract_loc.distance(other_loc);
+        let self_distance = contract_loc.distance(own_loc);
+        if other_distance < self_distance {
+            // forward the contract towards this node since it is indeed closer to the contract location
+            // and forget about it, no need to keep track of this op or wait for response
+            let _ = conn_manager
+                .send(
+                    &peer.peer,
+                    (UpdateMsg::UpdateForward {
+                        id,
+                        key,
+                        sender: own_pkloc,
+                        new_value: new_value.clone(),
+                        htl,
+                    })
+                    .into(),
+                )
+                .await;
+            return false;
+        }
+    }
+    true
 }
 
 async fn update_contract(
@@ -589,7 +674,7 @@ pub(crate) fn start_op(
     htl: usize,
 ) -> UpdateOp {
     let contract_location = Location::from(&key);
-    tracing::debug!(%contract_location, %key, "Requesting put");
+    tracing::debug!(%contract_location, %key, "Requesting update");
     let id = Transaction::new::<UpdateMsg>();
     // let payload_size = contract.data().len();
     let state = Some(UpdateState::PrepareRequest {
@@ -629,7 +714,7 @@ pub(crate) async fn request_update(
 
     // the initial request must provide:
     // - a peer as close as possible to the contract location
-    // - and the value to put
+    // - and the value to update
     let target = op_manager
         .ring
         .closest_potentially_caching(&key, [&sender.peer].as_slice())
@@ -735,7 +820,7 @@ mod messages {
             broadcast_to: Vec<PeerKeyLocation>,
             key: ContractKey,
             new_value: WrappedState,
-            contract: ContractContainer,
+            //contract: ContractContainer,
             upstream: PeerKeyLocation,
         },
         /// Broadcasting a change to a peer, which then will relay the changes to other peers.
@@ -744,7 +829,7 @@ mod messages {
             sender: PeerKeyLocation,
             key: ContractKey,
             new_value: WrappedState,
-            contract: ContractContainer,
+            //`contract: ContractContainer,
         },
     }
 
@@ -833,4 +918,5 @@ enum UpdateState {
         value: WrappedState,
         htl: usize,
     },
+    BroadcastOngoing,
 }
