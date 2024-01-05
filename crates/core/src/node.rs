@@ -19,7 +19,10 @@ use std::{
 };
 
 use either::Either;
-use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ErrorKind};
+use freenet_stdlib::{
+    client_api::{ClientRequest, ContractRequest, ErrorKind},
+    prelude::ContractKey,
+};
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId as Libp2pPeerId};
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
@@ -421,61 +424,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                     }
                 }
                 ContractRequest::Subscribe { key, .. } => {
-                    const TIMEOUT: Duration = Duration::from_secs(30);
-                    let mut missing_contract = false;
-                    let timeout = tokio::time::timeout(TIMEOUT, async {
-                        // Initialize a subscribe op.
-                        loop {
-                            let op = subscribe::start_op(key.clone());
-                            let _ = op_manager
-                                .ch_outbound
-                                .waiting_for_transaction_result(op.id, client_id)
-                                .await;
-                            match subscribe::request_subscribe(&op_manager, op).await {
-                                Err(OpError::ContractError(ContractError::ContractNotFound(
-                                    key,
-                                ))) if !missing_contract => {
-                                    tracing::info!(%key, "Trying to subscribe to a contract not present, requesting it first");
-                                    missing_contract = true;
-                                    let get_op = get::start_op(key.clone(), true);
-                                    if let Err(error) = get::request_get(&op_manager, get_op).await
-                                    {
-                                        tracing::error!(%key, %error, "Failed getting the contract while previously trying to subscribe; bailing");
-                                        break Err(error);
-                                    }
-                                    continue;
-                                }
-                                Err(OpError::ContractError(ContractError::ContractNotFound(_))) => {
-                                    tracing::warn!("Still waiting for {key} contract");
-                                    tokio::time::sleep(Duration::from_secs(2)).await
-                                }
-                                Err(err) => {
-                                    tracing::error!("{}", err);
-                                    break Err(err);
-                                }
-                                Ok(()) => {
-                                    if missing_contract {
-                                        tracing::debug!(%key,
-                                            "Got back the missing contract while subscribing"
-                                        );
-                                    }
-                                    tracing::debug!(%key, "Starting subscribe request");
-                                    break Ok(());
-                                }
-                            }
-                        }
-                    });
-                    match timeout.await {
-                        Err(_) => {
-                            tracing::error!(%key, "Timeout while waiting for contract to start subscription");
-                        }
-                        Ok(Err(error)) => {
-                            tracing::error!(%key, %error, "Error while subscribing to contract");
-                        }
-                        Ok(Ok(_)) => {
-                            tracing::debug!(%key, "Started subscription to contract");
-                        }
-                    }
+                    subscribe(op_manager, key, Some(client_id)).await;
                 }
                 _ => {
                     tracing::error!("Op not supported");
@@ -698,7 +647,71 @@ async fn process_message<CB>(
                 )
                 .await;
             }
+            NetMessage::Unsubscribed { key, .. } => {
+                subscribe(op_manager, key.clone(), None).await;
+                break;
+            }
             _ => break,
+        }
+    }
+}
+
+/// Attempts to subscribe to a contract
+async fn subscribe(op_manager: Arc<OpManager>, key: ContractKey, client_id: Option<ClientId>) {
+    const TIMEOUT: Duration = Duration::from_secs(30);
+    let mut missing_contract = false;
+    let timeout = tokio::time::timeout(TIMEOUT, async {
+        // Initialize a subscribe op.
+        loop {
+            let op = subscribe::start_op(key.clone());
+            if let Some(client_id) = client_id {
+                let _ = op_manager
+                    .ch_outbound
+                    .waiting_for_transaction_result(op.id, client_id)
+                    .await;
+            }
+            match subscribe::request_subscribe(&op_manager, op).await {
+                Err(OpError::ContractError(ContractError::ContractNotFound(key)))
+                    if !missing_contract =>
+                {
+                    tracing::info!(%key, "Trying to subscribe to a contract not present, requesting it first");
+                    missing_contract = true;
+                    let get_op = get::start_op(key.clone(), true);
+                    if let Err(error) = get::request_get(&op_manager, get_op).await {
+                        tracing::error!(%key, %error, "Failed getting the contract while previously trying to subscribe; bailing");
+                        break Err(error);
+                    }
+                    continue;
+                }
+                Err(OpError::ContractError(ContractError::ContractNotFound(_))) => {
+                    tracing::warn!("Still waiting for {key} contract");
+                    tokio::time::sleep(Duration::from_secs(2)).await
+                }
+                Err(err) => {
+                    tracing::error!("{}", err);
+                    break Err(err);
+                }
+                Ok(()) => {
+                    if missing_contract {
+                        tracing::debug!(%key,
+                            "Got back the missing contract while subscribing"
+                        );
+                    }
+                    tracing::debug!(%key, "Starting subscribe request");
+                    break Ok(());
+                }
+            }
+        }
+    });
+    match timeout.await {
+        Err(_) => {
+            tracing::error!(%key, "Timeout while waiting for contract to start subscription");
+        }
+        Ok(Err(error)) => {
+            tracing::error!(%key, %error, "Error while subscribing to contract");
+        }
+        Ok(Ok(_)) => {
+            tracing::debug!(%key, "Started subscription to contract");
         }
     }
 }

@@ -509,7 +509,22 @@ impl Operation for PutOp {
                                 contract,
                             )
                             .await?;
-                            op_manager.ring.seed_contract(key.clone());
+                            let (dropped_contract, old_subscribers) =
+                                op_manager.ring.seed_contract(key.clone());
+                            if let Some(key) = dropped_contract {
+                                for subscriber in old_subscribers {
+                                    conn_manager
+                                        .send(
+                                            &subscriber.peer,
+                                            NetMessage::Unsubscribed {
+                                                transaction: Transaction::new::<PutMsg>(),
+                                                key: key.clone(),
+                                                from: op_manager.ring.peer_key,
+                                            },
+                                        )
+                                        .await?;
+                                }
+                            }
                         }
                         put_here
                     } else {

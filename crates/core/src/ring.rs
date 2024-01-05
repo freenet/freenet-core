@@ -196,7 +196,7 @@ pub(crate) struct Ring {
     /// of subscribers more often than inserting, and anyways is a relatively short sequence
     /// then is more optimal to just use a vector for it's compact memory layout.
     subscribers: DashMap<ContractKey, Vec<PeerKeyLocation>>,
-    /// Contracts this peer is subscribed to.
+    /// Contracts this peer is seeding.
     seeding_contract: DashMap<ContractKey, Score>,
     /// Interim connections ongoing handshake or successfully open connections
     /// Is important to keep track of this so no more connections are accepted prematurely.
@@ -399,25 +399,28 @@ impl Ring {
     }
 
     /// Add a new subscription for this peer.
-    pub fn seed_contract(&self, key: ContractKey) {
+    pub fn seed_contract(&self, key: ContractKey) -> (Option<ContractKey>, Vec<PeerKeyLocation>) {
         let seed_score = self.calculate_seed_score(&key);
+        let mut old_subscribers = vec![];
+        let mut contract_to_drop = None;
         if self.seeding_contract.len() < Self::MAX_SEEDING_CONTRACTS {
-            let contract_to_drop = self
+            let dropped_contract = self
                 .seeding_contract
                 .iter()
                 .min_by_key(|v| *v.value())
                 .unwrap()
                 .key()
                 .clone();
-            self.seeding_contract.remove(&contract_to_drop);
-            if let Some((_, _subscribers_of_contract)) = self.subscribers.remove(&contract_to_drop)
+            self.seeding_contract.remove(&dropped_contract);
+            if let Some((_, mut subscribers_of_contract)) =
+                self.subscribers.remove(&dropped_contract)
             {
-                // fixme: somehow notify subscribers of this contract that they should subscribe to a new peer?
-                // fixme: also related, when a peer connection drops if we were subscribed to that peer we should
-                // seek a new subscriber for that contract
+                std::mem::swap(&mut subscribers_of_contract, &mut old_subscribers);
             }
+            contract_to_drop = Some(dropped_contract);
         }
         self.seeding_contract.insert(key, seed_score);
+        (contract_to_drop, old_subscribers)
     }
 
     fn calculate_seed_score(&self, key: &ContractKey) -> Score {
