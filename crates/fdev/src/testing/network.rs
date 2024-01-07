@@ -11,8 +11,8 @@ use axum::{
     Router,
 };
 use freenet::dev_tool::{
-    EventChain, Executor, MemoryEventsGen, NetworkEventGenerator, NodeConfig, NodeLabel,
-    OperationMode, PeerCliConfig, PeerId, Runtime, SimNetwork,
+    EventChain, Executor, MemoryEventsGen, NetworkEventGenerator, NetworkPeer, NodeConfig,
+    NodeLabel, OperationMode, PeerCliConfig, PeerId, PeerMessage, PeerStatus, Runtime, SimNetwork,
 };
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
@@ -133,8 +133,8 @@ impl SubProcess {
             .args(cmd_args)
             .arg("--id")
             .arg(label.to_string())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| {
@@ -171,8 +171,10 @@ pub(super) async fn run(
             Ok(())
         }
         Process::Peer => {
+            std::env::set_var("FREENET_PEER_ID", cmd_config.clone().id.unwrap());
+            freenet::config::set_logger();
             if let Some(peer_id) = &cmd_config.id {
-                let mut peer = Peer::new(peer_id.clone()).await?;
+                let mut peer = NetworkPeer::new(peer_id.clone()).await?;
                 peer.run(config, peer_id.clone()).await?;
             }
             Ok(())
@@ -533,110 +535,9 @@ pub trait Runnable {
     async fn run(&self, config: &TestConfig, peer_id: String) -> anyhow::Result<()>;
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-enum PeerStatus {
-    Finished(usize),
-    Error(String),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-enum PeerMessage {
-    Event(Vec<u8>),
-    Status(PeerStatus),
-    Info(String),
-}
-
-struct Peer {
-    id: String,
-    config: NodeConfig,
-    ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
-    user_ev_controller: Arc<Sender<(u32, PeerId)>>,
-    receiver_ch: Arc<Receiver<(u32, PeerId)>>,
-}
-
-impl Peer {
-    async fn new(peer_id: String) -> Result<Self, Error> {
-        let (ws_stream, _) = tokio_tungstenite::connect_async("ws://localhost:3000/ws")
-            .await
-            .expect("Failed to connect to supervisor");
-
-        let config_url = format!("http://localhost:3000/config/{}", peer_id);
-        let response = reqwest::get(&config_url).await?;
-        tracing::info!("Response config from server: {:?}", response);
-        let peer_config = response.json::<NodeConfig>().await?;
-
-        let (user_ev_controller, receiver_ch): (Sender<(u32, PeerId)>, Receiver<(u32, PeerId)>) =
-            tokio::sync::watch::channel((0, peer_config.peer_id));
-
-        Ok(Peer {
-            id: peer_id,
-            config: peer_config,
-            ws_client: Arc::new(Mutex::new(ws_stream)),
-            user_ev_controller: Arc::new(user_ev_controller),
-            receiver_ch: Arc::new(receiver_ch),
-        })
-    }
-
-    async fn event_loop(
-        ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
-        user_ev_controller: Arc<Sender<(u32, PeerId)>>,
-    ) -> anyhow::Result<()> {
-        let ws_client = ws_client.clone();
-        loop {
-            let msg = ws_client.lock().await.next().await;
-            match msg {
-                Some(Ok(msg)) => match msg {
-                    tokio_tungstenite::tungstenite::protocol::Message::Binary(bytes) => {
-                        let (event, peer_id) = bincode::deserialize(&bytes).unwrap();
-                        user_ev_controller
-                            .send((event, peer_id))
-                            .map_err(|e| anyhow!("Failed to send event: {}", e))?;
-                    }
-                    tokio_tungstenite::tungstenite::protocol::Message::Text(error_msg) => {
-                        tracing::error!("Received error message: {:?}", error_msg);
-                        break Err(anyhow!("Received error message: {:?}", error_msg));
-                    }
-                    _ => {
-                        tracing::error!("Received unexpected message: {:?}", msg);
-                        break Err(anyhow!("Received unexpected message: {:?}", msg));
-                    }
-                },
-                Some(Err(e)) => {
-                    tracing::error!("Failed to receive message: {}", e);
-                    Err(anyhow!("Failed to receive message: {}", e))?;
-                }
-                None => {
-                    tracing::error!("Connection closed");
-                    break Err(anyhow!("Connection closed"));
-                }
-            }
-        }
-    }
-
-    async fn send_peer_msg(&self, msg: PeerMessage) {
-        let serialized_msg: Vec<u8> = bincode::serialize(&msg).unwrap();
-        self.ws_client
-            .lock()
-            .await
-            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
-                serialized_msg,
-            ))
-            .await
-            .unwrap();
-    }
-
-    async fn send_error_msg(&self, msg: String) {
-        self.ws_client
-            .lock()
-            .await
-            .send(tokio_tungstenite::tungstenite::protocol::Message::Text(msg))
-            .await
-            .unwrap();
-    }
-}
-
-impl Runnable for Peer {
+impl Runnable for NetworkPeer {
     async fn run(&self, config: &TestConfig, peer_id: String) -> anyhow::Result<()> {
+        tracing::info!("Starting node {}", peer_id);
         let mut receiver_ch = self.receiver_ch.deref().clone();
         receiver_ch.borrow_and_update();
 
@@ -669,23 +570,8 @@ impl Runnable for Peer {
         // Obtain an identity::Keypair instance for the private_key
         let private_key = Keypair::generate_ed25519();
 
-        let data_dir = Executor::<Runtime>::test_data_dir(peer_id.as_str());
-
-        let cli_config = PeerCliConfig {
-            mode: OperationMode::Network,
-            node_data_dir: Some(data_dir),
-            address: self.config.local_ip.unwrap(),
-            port: self.config.local_port.unwrap(),
-        };
-
-        let event_loop_task =
-            Self::event_loop(self.ws_client.clone(), self.user_ev_controller.clone());
-        tokio::task::spawn(event_loop_task);
-
         match self
-            .config
-            .clone()
-            .build::<1>(cli_config, [Box::new(event_generator)], private_key)
+            .build(peer_id.clone(), [Box::new(event_generator)], private_key)
             .await
         {
             Ok(node) => match node.run().await {

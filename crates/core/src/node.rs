@@ -24,6 +24,7 @@ use freenet_stdlib::{
     prelude::ContractKey,
 };
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId as Libp2pPeerId};
+
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 

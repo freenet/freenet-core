@@ -1649,6 +1649,7 @@ dependencies = [
  "pav_regression",
  "pico-args",
  "rand",
+ "reqwest",
  "rocksdb",
  "serde",
  "serde_json",

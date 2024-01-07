@@ -402,7 +402,6 @@ async fn child(
         .expect("data_dir should be set for child process");
     // write logs to stderr so stdout and stdin are free of unexpected data
     std::env::set_var("FREENET_LOG_TO_STDERR", "1");
-    std::env::set_var("FREENET_DATA_DIR", data_dir);
 
     let (user_ev_controller, mut receiver_ch) = tokio::sync::watch::channel((0, PeerId::random()));
     receiver_ch.borrow_and_update();

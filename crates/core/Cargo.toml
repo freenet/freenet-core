@@ -3,7 +3,7 @@ name = "freenet"
 version = "0.0.7"
 edition = "2021"
 rust-version = "1.71.1"
-publish =  true
+publish = true
 description = "Freenet core software"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/freenet/freenet-core"
@@ -62,6 +62,7 @@ ulid = { features = ["serde"], version = "1.1" }
 unsigned-varint = "0.7"
 wasmer = { features = ["sys"], workspace = true }
 xz2 = { version = "0.1" }
+reqwest = { version = "0.11.23", features = ["json"] }
 # enum-iterator = "1.4.1"
 
 # Tracing deps
