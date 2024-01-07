@@ -77,10 +77,17 @@ impl HttpGateway {
     }
 }
 
+/// return home folder
 async fn home() -> axum::response::Response {
     axum::response::Response::default()
 }
 
+/// return home folder from network
+///
+/// Ask to /contract/web/ freenet address. Sends a request and return the full home address.
+/// 
+/// 
+/// returns 
 async fn web_home(
     Path(key): Path<String>,
     Extension(rs): Extension<HttpGatewayRequest>,
