@@ -16,19 +16,19 @@
 //! * 3: Disconnect message - encrypted with symmetric key
 
 use super::*;
+use crate::transport::crypto::{TransportKeypair, TransportPublicKey};
 use crate::transport::udp::udp_connection::UdpConnection;
+use aes::cipher::KeyInit;
+use aes::Aes128;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use rand::{random, Rng};
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 use tokio::task;
 
 pub(crate) struct UdpTransport {
     connections: DashMap<SocketAddr, UdpConnection>,
-    channel: (
-        mpsc::Sender<InternalMessage>,
-        mpsc::Receiver<InternalMessage>,
-    ),
-    keypair: Keypair,
+    keypair: TransportKeypair,
     listen_port: u16,
     is_gateway: bool,
     max_upstream_rate: BytesPerSecond,
@@ -36,7 +36,7 @@ pub(crate) struct UdpTransport {
 
 impl Transport<UdpConnection> for UdpTransport {
     async fn new(
-        keypair: Keypair,
+        keypair: TransportKeypair,
         listen_port: u16,
         is_gateway: bool,
         max_upstream_rate: BytesPerSecond,
@@ -49,14 +49,8 @@ impl Transport<UdpConnection> for UdpTransport {
             .await
             .map_err(|e| TransportError::NetworkError(e))?;
 
-        let (tx, rx) = mpsc::channel(100); // Adjust the channel size as needed
-
-        // Clone the socket handle for the async task
-        let socket_clone = socket.clone();
-
         let new_transport = UdpTransport {
             connections: DashMap::new(),
-            channel: (tx, rx),
             keypair,
             listen_port,
             is_gateway,
@@ -70,7 +64,7 @@ impl Transport<UdpConnection> for UdpTransport {
                 // Ensure the buffer has space
                 buf.reserve(1024 - buf.len());
 
-                match socket_clone.recv_from(&mut buf.chunk_mut()).await {
+                match socket.recv_from(buf.chunk_mut()).await {
                     Ok((size, addr)) => {
                         unsafe {
                             buf.advance(size);
@@ -82,7 +76,7 @@ impl Transport<UdpConnection> for UdpTransport {
                             data: buf.split().freeze(),
                         };
 
-                        match new_transport.connections[&addr] {
+                        match new_transport.connections.get(&addr) {
                             Some(connection) => {
                                 // Send the message to the connection
                                 if let Err(e) = connection.channel.0.send(message).await {
@@ -90,12 +84,12 @@ impl Transport<UdpConnection> for UdpTransport {
                                 }
                             }
                             None => {
-                                // Send the message to the transport
-                                if let Err(e) = new_transport.channel.0.send(message).await {
-                                    tracing::warn!("Failed to send message: {:?}", e);
-                                }
+                                new_transport.handle_unrecognized_message(message);
                             }
                         }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to receive UDP packet: {:?}", e);
                     }
                 }
 
@@ -109,12 +103,23 @@ impl Transport<UdpConnection> for UdpTransport {
 
     async fn connect(
         &self,
-        remote_public_key: PublicKey,
+        remote_public_key: TransportPublicKey,
         remote_ip_address: IpAddr,
         remote_port: u16,
         remote_is_gateway: bool,
-        timeout: Duration,
+        timeout: std::time::Duration,
     ) -> Result<UdpConnection, TransportError> {
+        let key = random::<[u8; 16]>();
+        let outbound_sym_key: Aes128;
+        unsafe {
+            outbound_sym_key = Aes128::new_from_slice(&key)
+                .map_err(|e| TransportError::CryptoError(e.to_string()))?;
+        }
+
+        let intro_packet = remote_public_key
+            .encrypt(&key)
+            .map_err(|e| TransportError::CryptoError(e.to_string()))?;
+
         todo!()
     }
 
@@ -127,6 +132,33 @@ impl Transport<UdpConnection> for UdpTransport {
     }
 }
 
+impl UdpTransport {
+    fn handle_unrecognized_message(&self, message: InternalMessage) {
+        if !self.is_gateway {
+            tracing::warn!(
+                message,
+                "Received unrecognized message, ignoring because not a gateway"
+            );
+        } else {
+            match message {
+                InternalMessage::UdpPacketReceived { source, data } => {
+                    tracing::debug!(
+                        message,
+                        "Received unrecognized message, attempting to parse"
+                    );
+
+                    // use self.keypair to decrypt the message, which should contain a symmetric key
+                    todo!()
+                }
+                _ => {
+                    tracing::warn!(message, "Received unrecognized message, ignoring");
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 enum InternalMessage {
     UdpPacketReceived { source: SocketAddr, data: Bytes },
 }

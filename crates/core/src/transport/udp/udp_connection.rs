@@ -1,28 +1,22 @@
 use crate::transport::errors::ConnectionError;
 use crate::transport::{Connection, ConnectionEvent, SenderStream};
+use aes::Aes128;
 use libp2p_identity::PublicKey;
 use std::net::IpAddr;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub(super) struct UdpConnection {
-    channel: (
+    pub(super) channel: (
         mpsc::Sender<InternalMessage>,
         mpsc::Receiver<InternalMessage>,
     ),
+    outbound_symmetric_key: Option<Aes128>,
+    inbound_symmetric_key: Option<Aes128>,
+    remote_is_gateway: bool,
 }
 
-impl UdpConnection {
-    pub(super) fn new(
-        remote_public_key: PublicKey,
-        remote_ip_address: IpAddr,
-        remote_port: u16,
-        remote_is_gateway: bool,
-        timeout: Duration,
-    ) -> Result<Self, ConnectionError> {
-        todo!()
-    }
-}
+impl UdpConnection {}
 
 impl Connection for UdpConnection {
     fn remote_ip_address(&self) -> IpAddr {

@@ -33,18 +33,30 @@
 //! peer it is connecting to. The encrypted key is then sent to the peer in the first message
 //! of the connection, repeated until a correctly encrypted response is received. The peer
 //! receiving the message will decrypt the key and use it to encrypt future messages.
+//!
+//! ## Opening a Connection
+//!
+//! ### Neither peer is a gateway
+//!
+//! 1. Peer A sends a `ConnectionStart` message to Peer B with its chosen symmetric key
+//!    encrypted with Peer B's public key, resending every 200ms until...
+//! 2. Peer B receives the message and decrypts the symmetric key, it then sends a `ConnectionAck`
+//!    message to Peer A encrypted with the symmetric key.
+//! 3. Peer B stores the `ConnectionStart` and `ConnectionAck` messages in [UdpConnection] and
+//!    if its sees that message again it resends the `ConnectionAck` message.
 
 pub(crate) mod errors;
 mod udp;
 
+use crypto::*;
 use errors::*;
 use libp2p_identity::{Keypair, PublicKey};
 use std::net::IpAddr;
 use std::time::Duration;
 
 trait Transport<C: Connection> {
-    fn new(
-        keypair: Keypair,
+    async fn new(
+        keypair: TransportKeypair,
         listen_port: u16,
         is_gateway: bool,
         max_upstream_rate: BytesPerSecond,
@@ -57,22 +69,16 @@ trait Transport<C: Connection> {
 
     async fn connect(
         &self,
-        remote_public_key: PublicKey,
+        remote_public_key: TransportPublicKey,
         remote_ip_address: IpAddr,
         remote_port: u16,
         remote_is_gateway: bool,
         timeout: Duration,
-    ) -> Result<C, TransportError> {
-        todo!()
-    }
+    ) -> Result<C, TransportError>;
 
-    fn update_max_upstream_rate(&self, max_upstream_rate: BytesPerSecond) {
-        todo!()
-    }
+    fn update_max_upstream_rate(&self, max_upstream_rate: BytesPerSecond);
 
-    async fn listen_for_connection(&self) -> Result<C, TransportError> {
-        todo!()
-    }
+    async fn listen_for_connection(&self) -> Result<C, TransportError>;
 }
 
 pub trait Connection {
@@ -126,6 +132,8 @@ impl SenderStream {
         todo!()
     }
 }
+
+mod crypto;
 
 pub(crate) struct BytesPerSecond(f64);
 

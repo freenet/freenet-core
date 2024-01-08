@@ -1,3 +1,4 @@
+use serde_with::SerializeDisplay;
 use thiserror::Error;
 
 // Define a custom error type for the transport layer
@@ -11,6 +12,9 @@ pub enum TransportError {
 
     #[error("initialization error: {0}")]
     InitializationError(String),
+
+    #[error("crypto error: {0}")]
+    CryptoError(String),
 }
 
 // Define a custom error type for the connection
@@ -31,12 +35,16 @@ pub enum ConnectionError {
 
 #[derive(Debug, Error)]
 enum SendMessageError {
-    MessageTooBig { max_size: usize },
+    #[error("message too big, size: {size}, max size: {max_size}")]
+    MessageTooBig { size: usize, max_size: usize },
+    #[error("stream closed unexpectedly")]
     Closed,
 }
 
 #[derive(Debug, Error)]
 pub(crate) enum SenderStreamError {
+    #[error("stream closed unexpectedly")]
     Closed,
+    #[error("message too big, size: {size}, max size: {max_size}")]
     MessageExceedsLength { size: usize, max_size: usize },
 }
