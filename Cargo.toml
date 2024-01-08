@@ -10,7 +10,7 @@ bs58 = "0.5"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = true }
 clap = "4"
-crossbeam = "0.8.2"
+crossbeam = "0.8.4"
 ctrlc = { version = "3.4" }
 dashmap = "^5.5"
 either = "1.8"
