@@ -209,6 +209,9 @@ impl Operation for UpdateOp {
                             .within_subscribing_distance(&Location::from(key))
                     {
                         tracing::debug!(tx = %id, "Attempting contract value update");
+
+                        tracing::debug!(state = %value, "Data of new state to be updated");
+
                         update_contract(
                             op_manager,
                             key.clone(),
@@ -244,12 +247,11 @@ impl Operation for UpdateOp {
                             // if is not subscribed it means it doesnt exists here and there's
                             // nothing to update then and it should be a put request
 
-                            // put_contract(
+                            // update_contract(
                             //     op_manager,
                             //     key.clone(),
-                            //     new_state.clone(),
+                            //     value.clone(),
                             //     RelatedContracts::default(),
-                            //     contract,
                             // )
                             // .await?;
                         }
@@ -267,6 +269,13 @@ impl Operation for UpdateOp {
                     };
 
                     let broadcast_to = op_manager.get_broadcast_targets(&key, &sender.peer);
+
+                    if let Some(UpdateState::AwaitingResponse { .. }) | None = self.state {
+                        tracing::debug!("\njust before try to broadcast. Is going to fail. state is AwaitingResponse or None");
+                        tracing::debug!(state = ?self.state);
+                        tracing::debug!(?broadcast_to, "broadcast_to list");
+                    };
+
                     match try_to_broadcast(
                         *id,
                         last_hop,
@@ -310,6 +319,11 @@ impl Operation for UpdateOp {
                         target.location
                     );
 
+                    if let Some(UpdateState::AwaitingResponse { .. }) | None = self.state {
+                        tracing::debug!("\njust before try to broadcast. Is going to fail. state is AwaitingResponse or None");
+                        tracing::debug!(state = ?self.state);
+                        tracing::debug!(?broadcast_to, "broadcast_to list");
+                    };
                     match try_to_broadcast(
                         *id,
                         false,
@@ -496,6 +510,13 @@ impl Operation for UpdateOp {
                     };
 
                     let broadcast_to = op_manager.get_broadcast_targets(&key, &sender.peer);
+
+                    if let Some(UpdateState::AwaitingResponse { .. }) | None = self.state {
+                        tracing::debug!("\njust before try to broadcast. Is going to fail. state is AwaitingResponse or None");
+                        tracing::debug!(state = ?self.state);
+                        tracing::debug!(?broadcast_to, "broadcast_to list");
+                    };
+
                     match try_to_broadcast(
                         *id,
                         last_hop,

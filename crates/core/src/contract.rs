@@ -121,25 +121,32 @@ where
                     .executor()
                     .fetch_contract(key.clone(), true)
                     .await
-                    .unwrap(); //FIXME I should see how to handle this error
+                    .expect("is not getting the contract from executor"); //FIXME I should see how to handle this error
+
+                tracing::debug!("in Update Query just before upsert_contract_state");
 
                 let update_result = contract_handler
                     .executor()
                     .upsert_contract_state(
                         key.clone(),
-                        Either::Left(state),
+                        Either::Left(state.clone()),
                         related_contracts,
                         contract,
                     )
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await;
+
+                let a = update_result.unwrap();
+
+                tracing::debug!("after upsert_contract_state");
+
                 contract_handler
                     .channel()
                     .send_to_sender(
                         id,
-                        ContractHandlerEvent::UpdateResponse {
-                            new_value: update_result.map_err(Into::into),
-                        },
+                        ContractHandlerEvent::UpdateResponse { new_value: Ok(a) }, // ContractHandlerEvent::UpdateResponse {
+                                                                                   //     new_value: update_result.map_err(Into::into),
+                                                                                   // },
                     )
                     .await
                     .map_err(|error| {
