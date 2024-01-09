@@ -18,13 +18,17 @@
 use super::*;
 use crate::transport::crypto::{TransportKeypair, TransportPublicKey};
 use crate::transport::udp::udp_connection::UdpConnection;
+use crate::transport::udp::udp_transport::InternalMessage::UdpPacketReceived;
 use aes::cipher::KeyInit;
 use aes::Aes128;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use rand::{random, Rng};
+use bytes::{Buf, Bytes, BytesMut};
+use rand::random;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::UdpSocket;
+use tokio::sync::RwLock;
 use tokio::task;
+use tracing::Value;
 
 pub(crate) struct UdpTransport {
     connections: DashMap<SocketAddr, UdpConnection>,
@@ -40,7 +44,7 @@ impl Transport<UdpConnection> for UdpTransport {
         listen_port: u16,
         is_gateway: bool,
         max_upstream_rate: BytesPerSecond,
-    ) -> Result<Self, TransportError>
+    ) -> Result<Arc<RwLock<Self>>, TransportError>
     where
         Self: Sized,
     {
@@ -49,34 +53,33 @@ impl Transport<UdpConnection> for UdpTransport {
             .await
             .map_err(|e| TransportError::NetworkError(e))?;
 
-        let new_transport = UdpTransport {
+        let new_transport = Arc::new(RwLock::new(UdpTransport {
             connections: DashMap::new(),
             keypair,
             listen_port,
             is_gateway,
             max_upstream_rate,
-        };
+        }));
+
+        let transport_clone = new_transport.clone();
 
         // Spawn a task for listening to incoming UDP packets
         task::spawn(async move {
-            let mut buf = BytesMut::with_capacity(1024); // Initial capacity
+            let mut buf = BytesMut::with_capacity(2048);
             loop {
                 // Ensure the buffer has space
                 buf.reserve(1024 - buf.len());
 
-                match socket.recv_from(buf.chunk_mut()).await {
+                match socket.recv_from(buf.as_mut()).await {
                     Ok((size, addr)) => {
-                        unsafe {
-                            buf.advance(size);
-                        }
+                        buf.advance(size);
 
                         // Create an InternalMessage
-                        let message = InternalMessage::UdpPacketReceived {
+                        let message = UdpPacketReceived {
                             source: addr,
                             data: buf.split().freeze(),
                         };
-
-                        match new_transport.connections.get(&addr) {
+                        match transport_clone.read().await.connections.get(&addr) {
                             Some(connection) => {
                                 // Send the message to the connection
                                 if let Err(e) = connection.channel.0.send(message).await {
@@ -84,7 +87,10 @@ impl Transport<UdpConnection> for UdpTransport {
                                 }
                             }
                             None => {
-                                new_transport.handle_unrecognized_message(message);
+                                transport_clone
+                                    .read()
+                                    .await
+                                    .handle_unrecognized_message(message);
                             }
                         }
                     }
@@ -136,22 +142,22 @@ impl UdpTransport {
     fn handle_unrecognized_message(&self, message: InternalMessage) {
         if !self.is_gateway {
             tracing::warn!(
-                message,
-                "Received unrecognized message, ignoring because not a gateway"
+                "Received unrecognized message, ignoring because not a gateway {:?}",
+                message
             );
         } else {
-            match message {
-                InternalMessage::UdpPacketReceived { source, data } => {
+            match &message {
+                UdpPacketReceived { source, data } => {
                     tracing::debug!(
-                        message,
-                        "Received unrecognized message, attempting to parse"
+                        "Received unrecognized message, attempting to parse {:?}",
+                        message
                     );
 
                     // use self.keypair to decrypt the message, which should contain a symmetric key
                     todo!()
                 }
                 _ => {
-                    tracing::warn!(message, "Received unrecognized message, ignoring");
+                    tracing::warn!("Received unrecognized message, ignoring {:?}", message);
                 }
             }
         }
@@ -159,6 +165,6 @@ impl UdpTransport {
 }
 
 #[derive(Debug)]
-enum InternalMessage {
+pub(crate) enum InternalMessage {
     UdpPacketReceived { source: SocketAddr, data: Bytes },
 }

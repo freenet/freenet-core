@@ -1,15 +1,18 @@
 use crate::transport::errors::ConnectionError;
+use crate::transport::udp::udp_transport;
+use crate::transport::udp::udp_transport::UdpTransport;
 use crate::transport::{Connection, ConnectionEvent, SenderStream};
 use aes::Aes128;
 use libp2p_identity::PublicKey;
 use std::net::IpAddr;
-use std::time::Duration;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
 
 pub(super) struct UdpConnection {
+    transport: Arc<RwLock<UdpTransport>>,
     pub(super) channel: (
-        mpsc::Sender<InternalMessage>,
-        mpsc::Receiver<InternalMessage>,
+        mpsc::Sender<udp_transport::InternalMessage>,
+        mpsc::Receiver<udp_transport::InternalMessage>,
     ),
     outbound_symmetric_key: Option<Aes128>,
     inbound_symmetric_key: Option<Aes128>,

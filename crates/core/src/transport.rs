@@ -52,7 +52,9 @@ use crypto::*;
 use errors::*;
 use libp2p_identity::{Keypair, PublicKey};
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 
 trait Transport<C: Connection> {
     async fn new(
@@ -60,7 +62,7 @@ trait Transport<C: Connection> {
         listen_port: u16,
         is_gateway: bool,
         max_upstream_rate: BytesPerSecond,
-    ) -> Result<Self, TransportError>
+    ) -> Result<Arc<RwLock<Self>>, TransportError>
     where
         Self: Sized,
     {
