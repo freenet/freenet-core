@@ -45,10 +45,10 @@
 //! 3. Peer B stores the `ConnectionStart` and `ConnectionAck` messages in [UdpConnection] and
 //!    if its sees that message again it resends the `ConnectionAck` message.
 
-pub(crate) mod errors;
-mod udp_transport;
-mod udp_connection;
 mod crypto;
+pub(crate) mod errors;
+mod udp_connection;
+mod udp_transport;
 
 use errors::*;
 
