@@ -227,8 +227,6 @@ impl Operation for UpdateOp {
                         );
                     }
 
-                    let skip_list = vec![]; // FIXME: placeholder
-
                     let last_hop = if let Some(new_htl) = htl.checked_sub(1) {
                         // forward changes in the contract to nodes closer to the contract location, if possible
                         let put_here = forward_update(
@@ -238,7 +236,7 @@ impl Operation for UpdateOp {
                             value.clone(),
                             *id,
                             new_htl,
-                            skip_list,
+                            vec![sender.peer],
                         )
                         .await;
                         if put_here && !is_subscribed_contract {
@@ -385,7 +383,7 @@ impl Operation for UpdateOp {
                             peer.peer,
                             err
                         );
-                        // todo: review this, maybe we should just dropping this subscription
+                        // TODO: review this, maybe we should just dropping this subscription
                         conn_manager.drop_connection(&peer.peer).await?;
                         incorrect_results += 1;
                     }
@@ -439,7 +437,11 @@ impl Operation for UpdateOp {
                                 return_msg = None;
                             }
                         }
-                        _ => return Err(OpError::invalid_transition(self.id)),
+                        _ => {
+                            tracing::debug!("in UpdateMsg::SuccessfulUpdate -> match self.state");
+
+                            return Err(OpError::invalid_transition(self.id));
+                        }
                     };
                 }
                 UpdateMsg::UpdateForward {
@@ -448,6 +450,7 @@ impl Operation for UpdateOp {
                     new_value,
                     htl,
                     sender,
+                    skip_list,
                 } => {
                     let peer_loc = op_manager.ring.own_location();
 
@@ -472,9 +475,10 @@ impl Operation for UpdateOp {
                         .await?;
                     }
 
-                    let skip_list = vec![]; // FIXME: placeholder
-                                            // if successful, forward to the next closest peers (if any)
+                    // if successful, forward to the next closest peers (if any)
                     let last_hop = if let Some(new_htl) = htl.checked_sub(1) {
+                        let mut new_skip_list = skip_list.clone();
+                        new_skip_list.push(sender.peer);
                         // only hop forward if there are closer peers
                         let put_here = forward_update(
                             op_manager,
@@ -483,7 +487,7 @@ impl Operation for UpdateOp {
                             new_value.clone(),
                             *id,
                             new_htl,
-                            skip_list,
+                            new_skip_list,
                         )
                         .await;
                         if put_here && !is_subscribed_contract {
@@ -648,6 +652,7 @@ async fn forward_update<NB: NetworkBridge>(
                         sender: own_pkloc,
                         new_value: new_value.clone(),
                         htl,
+                        skip_list,
                     })
                     .into(),
                 )
@@ -792,6 +797,7 @@ mod messages {
 
     use crate::{
         message::{InnerMessage, Transaction},
+        node::PeerId,
         ring::{Location, PeerKeyLocation},
     };
 
@@ -814,6 +820,7 @@ mod messages {
             new_value: WrappedState,
             /// current htl, reduced by one at each hop
             htl: usize,
+            skip_list: Vec<PeerId>,
         },
         /// Value successfully inserted/updated.
         SuccessfulUpdate {
