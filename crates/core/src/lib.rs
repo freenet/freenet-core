@@ -1,3 +1,5 @@
+#![feature(async_fn_in_trait)]
+
 /// Clients events related logic and type definitions.
 pub(crate) mod client_events;
 /// Peer node configuration.

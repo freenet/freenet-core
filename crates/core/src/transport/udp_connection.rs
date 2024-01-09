@@ -1,18 +1,17 @@
 use crate::transport::errors::ConnectionError;
-use crate::transport::udp::udp_transport;
-use crate::transport::udp::udp_transport::UdpTransport;
-use crate::transport::{Connection, ConnectionEvent, SenderStream};
+use crate::transport::udp_transport::UdpTransport;
+use crate::transport::{ConnectionEvent, SenderStream};
 use aes::Aes128;
 use libp2p_identity::PublicKey;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
-pub(super) struct UdpConnection {
+pub struct UdpConnection {
     transport: Arc<RwLock<UdpTransport>>,
-    pub(super) receive_queue: (
-        mpsc::Sender<(IpAddr, Vec<u8>)>,
-        mpsc::Receiver<(IpAddr, Vec<u8>)>,
+    pub(in crate::transport) receive_queue: (
+        mpsc::Sender<(SocketAddr, Vec<u8>)>,
+        mpsc::Receiver<(SocketAddr, Vec<u8>)>,
     ),
     outbound_symmetric_key: Option<Aes128>,
     inbound_symmetric_key: Option<Aes128>,
@@ -21,7 +20,7 @@ pub(super) struct UdpConnection {
 
 impl UdpConnection {}
 
-impl Connection for UdpConnection {
+impl UdpConnection {
     fn remote_ip_address(&self) -> IpAddr {
         todo!()
     }

@@ -46,63 +46,11 @@
 //!    if its sees that message again it resends the `ConnectionAck` message.
 
 pub(crate) mod errors;
-mod udp;
+mod udp_transport;
+mod udp_connection;
+mod crypto;
 
-use crypto::*;
 use errors::*;
-use libp2p_identity::{Keypair, PublicKey};
-use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::RwLock;
-
-trait Transport<C: Connection> {
-    async fn new(
-        keypair: TransportKeypair,
-        listen_port: u16,
-        is_gateway: bool,
-        max_upstream_rate: BytesPerSecond,
-    ) -> Result<Arc<RwLock<Self>>, TransportError>
-    where
-        Self: Sized,
-    {
-        todo!()
-    }
-
-    async fn connect(
-        &self,
-        remote_public_key: TransportPublicKey,
-        remote_ip_address: IpAddr,
-        remote_port: u16,
-        remote_is_gateway: bool,
-        timeout: Duration,
-    ) -> Result<C, TransportError>;
-
-    fn update_max_upstream_rate(&self, max_upstream_rate: BytesPerSecond);
-
-    async fn listen_for_connection(&self) -> Result<C, TransportError>;
-}
-
-pub trait Connection {
-    fn remote_ip_address(&self) -> IpAddr;
-
-    fn remote_public_key(&self) -> PublicKey;
-
-    fn remote_port(&self) -> u16;
-
-    fn outbound_symmetric_key(&self) -> Vec<u8>;
-
-    fn inbound_symmetric_key(&self) -> Vec<u8>;
-
-    async fn read_event(&self) -> Result<ConnectionEvent, ConnectionError>;
-
-    async fn send_short_message(&self, message: Vec<u8>) -> Result<(), ConnectionError>;
-
-    async fn send_streamed_message(
-        &self,
-        message_length: usize,
-    ) -> Result<SenderStream, ConnectionError>;
-}
 
 enum ConnectionEvent {
     /// A short message that can fit in a single UDP packet.
@@ -134,8 +82,6 @@ impl SenderStream {
         todo!()
     }
 }
-
-mod crypto;
 
 pub(crate) struct BytesPerSecond(f64);
 

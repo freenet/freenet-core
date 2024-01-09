@@ -15,18 +15,18 @@
 //! * 2: Message - encrypted with symmetric key
 //! * 3: Disconnect message - encrypted with symmetric key
 
+use std::net::SocketAddr;
 use super::*;
 use crate::transport::crypto::{TransportKeypair, TransportPublicKey};
-use crate::transport::udp::udp_connection::UdpConnection;
-use crate::transport::udp::udp_transport::InternalMessage::UdpPacketReceived;
+use crate::transport::udp_connection::UdpConnection;
 use aes::cipher::KeyInit;
 use aes::Aes128;
-use bytes::{Buf, Bytes, BytesMut};
 use rand::random;
-use std::net::SocketAddr;
 use std::sync::Arc;
+use std::vec::Vec;
+use dashmap::DashMap;
 use tokio::net::UdpSocket;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio::task;
 use tracing::Value;
 
@@ -43,26 +43,25 @@ pub(crate) struct UdpTransport {
     listen_port: u16,
     is_gateway: bool,
     max_upstream_rate: BytesPerSecond,
-    send_queue: (
-        mpsc::Sender<(IpAddr, Vec<u8>)>,
-        mpsc::Receiver<(IpAddr, Vec<u8>)>,
-    ),
+    send_queue: mpsc::Sender<(SocketAddr, Vec<u8>)>,
 }
 
-impl Transport<UdpConnection> for UdpTransport {
+impl UdpTransport {
     async fn new(
         keypair: TransportKeypair,
         listen_port: u16,
         is_gateway: bool,
         max_upstream_rate: BytesPerSecond,
     ) -> Result<Arc<RwLock<Self>>, TransportError>
-    where
-        Self: Sized,
+        where
+            Self: Sized,
     {
         // Bind the UDP socket to the specified port
         let socket = UdpSocket::bind(("0.0.0.0", listen_port))
             .await
             .map_err(|e| TransportError::NetworkError(e))?;
+
+        let (send_queue, mut send_queue_receiver) = mpsc::channel(SEND_QUEUE_SIZE);
 
         let new_transport = Arc::new(RwLock::new(UdpTransport {
             connections: DashMap::new(),
@@ -70,33 +69,31 @@ impl Transport<UdpConnection> for UdpTransport {
             listen_port,
             is_gateway,
             max_upstream_rate,
-            send_queue: mpsc::channel(SEND_QUEUE_SIZE),
+            send_queue,
         }));
 
-        let transport_clone = new_transport.clone();
-
         // Spawn a task for listening to incoming UDP packets
+        let new_transport_clone = Arc::clone(&new_transport);
         task::spawn(async move {
+
             loop {
-                // TODO: Potentially inefficient to allocate a new buffer for every
-                //       received packet, consider some kind of buffer pool.
                 let mut buf = vec![0u8; MAX_PACKET_SIZE];
-
-                match socket.recv_from(&mut buf).await {
+                tokio::select! {
+            recv_result = socket.recv_from(&mut buf) => {
+                match &recv_result {
                     Ok((size, addr)) => {
-                        buf.truncate(size);
+                        buf.truncate(*size);
 
-                        let message = (addr.ip(), buf);
+                        let message: (SocketAddr, Vec<u8>) = (*addr, buf);
 
-                        // Handle the message (existing logic)
-                        match transport_clone.read().await.connections.get(&addr) {
+                        match new_transport_clone.read().await.connections.get(&addr) {
                             Some(connection) => {
                                 if let Err(e) = connection.receive_queue.0.send(message).await {
                                     tracing::warn!("Failed to send message: {:?}", e);
                                 }
                             }
                             None => {
-                                transport_clone
+                                new_transport_clone
                                     .read()
                                     .await
                                     .handle_unrecognized_message(message);
@@ -107,6 +104,16 @@ impl Transport<UdpConnection> for UdpTransport {
                         tracing::warn!("Failed to receive UDP packet: {:?}", e);
                     }
                 }
+            },
+
+            send_message = send_queue_receiver.recv() => {
+                if let Some((ip_addr, data)) = &send_message {
+                    if let Err(e) = socket.send_to(&data, ip_addr).await {
+                        tracing::warn!("Failed to send UDP packet: {:?}", e);
+                    }
+                }
+            },
+        }
             }
         });
 
@@ -116,17 +123,13 @@ impl Transport<UdpConnection> for UdpTransport {
     async fn connect(
         &self,
         remote_public_key: TransportPublicKey,
-        remote_ip_address: IpAddr,
-        remote_port: u16,
+        socket_addr: SocketAddr,
         remote_is_gateway: bool,
         timeout: std::time::Duration,
     ) -> Result<UdpConnection, TransportError> {
         let key = random::<[u8; 16]>();
-        let outbound_sym_key: Aes128;
-        unsafe {
-            outbound_sym_key = Aes128::new_from_slice(&key)
+        let outbound_sym_key: Aes128 = Aes128::new_from_slice(&key)
                 .map_err(|e| TransportError::CryptoError(e.to_string()))?;
-        }
 
         let intro_packet = remote_public_key
             .encrypt(&key)
@@ -142,10 +145,8 @@ impl Transport<UdpConnection> for UdpTransport {
     async fn listen_for_connection(&self) -> Result<UdpConnection, TransportError> {
         todo!()
     }
-}
 
-impl UdpTransport {
-    fn handle_unrecognized_message(&self, message: (IpAddr, Vec<u8>)) {
+    fn handle_unrecognized_message(&self, message: (SocketAddr, Vec<u8>)) {
         if !self.is_gateway {
             tracing::warn!(
                 "Received unrecognized message, ignoring because not a gateway {:?}",
@@ -154,11 +155,6 @@ impl UdpTransport {
         } else {
             match &message {
                 (source, data) => {
-                    tracing::debug!(
-                        "Received unrecognized message, attempting to parse {:?}",
-                        message
-                    );
-
                     // use self.keypair to decrypt the message, which should contain a symmetric key
                     todo!()
                 }
