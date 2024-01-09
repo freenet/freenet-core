@@ -30,12 +30,23 @@ use tokio::sync::RwLock;
 use tokio::task;
 use tracing::Value;
 
+/// The maximum size of a received UDP packet, MTU is 1500
+/// so this should be more than enough.
+const MAX_PACKET_SIZE: usize = 2048;
+
+const RECEIVE_QUEUE_SIZE: usize = 100;
+const SEND_QUEUE_SIZE: usize = 100;
+
 pub(crate) struct UdpTransport {
     connections: DashMap<SocketAddr, UdpConnection>,
     keypair: TransportKeypair,
     listen_port: u16,
     is_gateway: bool,
     max_upstream_rate: BytesPerSecond,
+    send_queue: (
+        mpsc::Sender<(IpAddr, Vec<u8>)>,
+        mpsc::Receiver<(IpAddr, Vec<u8>)>,
+    ),
 }
 
 impl Transport<UdpConnection> for UdpTransport {
@@ -59,30 +70,28 @@ impl Transport<UdpConnection> for UdpTransport {
             listen_port,
             is_gateway,
             max_upstream_rate,
+            send_queue: mpsc::channel(SEND_QUEUE_SIZE),
         }));
 
         let transport_clone = new_transport.clone();
 
         // Spawn a task for listening to incoming UDP packets
         task::spawn(async move {
-            let mut buf = BytesMut::with_capacity(2048);
             loop {
-                // Ensure the buffer has space
-                buf.reserve(1024 - buf.len());
+                // TODO: Potentially inefficient to allocate a new buffer for every
+                //       received packet, consider some kind of buffer pool.
+                let mut buf = vec![0u8; MAX_PACKET_SIZE];
 
-                match socket.recv_from(buf.as_mut()).await {
+                match socket.recv_from(&mut buf).await {
                     Ok((size, addr)) => {
-                        buf.advance(size);
+                        buf.truncate(size);
 
-                        // Create an InternalMessage
-                        let message = UdpPacketReceived {
-                            source: addr,
-                            data: buf.split().freeze(),
-                        };
+                        let message = (addr.ip(), buf);
+
+                        // Handle the message (existing logic)
                         match transport_clone.read().await.connections.get(&addr) {
                             Some(connection) => {
-                                // Send the message to the connection
-                                if let Err(e) = connection.channel.0.send(message).await {
+                                if let Err(e) = connection.receive_queue.0.send(message).await {
                                     tracing::warn!("Failed to send message: {:?}", e);
                                 }
                             }
@@ -98,9 +107,6 @@ impl Transport<UdpConnection> for UdpTransport {
                         tracing::warn!("Failed to receive UDP packet: {:?}", e);
                     }
                 }
-
-                // Clear the buffer for the next packet
-                buf.clear();
             }
         });
 
@@ -139,7 +145,7 @@ impl Transport<UdpConnection> for UdpTransport {
 }
 
 impl UdpTransport {
-    fn handle_unrecognized_message(&self, message: InternalMessage) {
+    fn handle_unrecognized_message(&self, message: (IpAddr, Vec<u8>)) {
         if !self.is_gateway {
             tracing::warn!(
                 "Received unrecognized message, ignoring because not a gateway {:?}",
@@ -147,7 +153,7 @@ impl UdpTransport {
             );
         } else {
             match &message {
-                UdpPacketReceived { source, data } => {
+                (source, data) => {
                     tracing::debug!(
                         "Received unrecognized message, attempting to parse {:?}",
                         message
@@ -166,5 +172,5 @@ impl UdpTransport {
 
 #[derive(Debug)]
 pub(crate) enum InternalMessage {
-    UdpPacketReceived { source: SocketAddr, data: Bytes },
+    UdpPacketReceived { source: SocketAddr, data: Vec<u8> },
 }

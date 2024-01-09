@@ -10,9 +10,9 @@ use tokio::sync::{mpsc, RwLock};
 
 pub(super) struct UdpConnection {
     transport: Arc<RwLock<UdpTransport>>,
-    pub(super) channel: (
-        mpsc::Sender<udp_transport::InternalMessage>,
-        mpsc::Receiver<udp_transport::InternalMessage>,
+    pub(super) receive_queue: (
+        mpsc::Sender<(IpAddr, Vec<u8>)>,
+        mpsc::Receiver<(IpAddr, Vec<u8>)>,
     ),
     outbound_symmetric_key: Option<Aes128>,
     inbound_symmetric_key: Option<Aes128>,
