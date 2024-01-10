@@ -1636,7 +1636,7 @@ dependencies = [
 name = "freenet"
 version = "0.0.7"
 dependencies = [
- "aes",
+ "aes-gcm",
  "anyhow",
  "arbitrary",
  "async-trait",

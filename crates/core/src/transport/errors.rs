@@ -12,22 +12,6 @@ impl Display for TransportError {
     }
 }
 
-// Define a custom error type for the connection
-#[derive(Debug, Error)]
-pub enum ConnectionError {
-    #[error("timeout occurred")]
-    Timeout,
-
-    #[error("message too big, size: {size}, max size: {max_size}")]
-    MessageTooBig { size: usize, max_size: usize },
-
-    #[error("stream closed unexpectedly")]
-    Closed,
-
-    #[error("protocol error: {0}")]
-    ProtocolError(String),
-}
-
 #[derive(Debug, Error)]
 enum SendMessageError {
     #[error("message too big, size: {size}, max size: {max_size}")]
