@@ -623,7 +623,9 @@ mod contract {
             ))
         }
 
+        // FIXME: This test fails in GitHub CI. The failure is due to issues compiling the test-app-1 application with webpack.
         #[test]
+        #[ignore]
         fn package_webapp_state() -> Result<(), anyhow::Error> {
             let (config, cwd) = setup_webapp_contract()?;
             // env::set_current_dir(&cwd)?;
