@@ -255,21 +255,23 @@ impl Operation for UpdateOp {
                         }
                         put_here
                     } else {
-                        // should put in this location, no hops left
-                        update_contract(
-                            op_manager,
-                            key.clone(),
-                            value.clone(),
-                            RelatedContracts::default(),
-                        )
-                        .await?;
+                        // if is not subscribed then it didnt find it. Nothing to update.
+                        //
+                        //
+                        // update_contract(
+                        //     op_manager,
+                        //     key.clone(),
+                        //     value.clone(),
+                        //     RelatedContracts::default(),
+                        // )
+                        // .await?;
                         true
                     };
 
                     let broadcast_to = op_manager.get_broadcast_targets(&key, &sender.peer);
 
                     if let Some(UpdateState::AwaitingResponse { .. }) | None = self.state {
-                        tracing::debug!("\njust before try to broadcast. Is going to fail. state is AwaitingResponse or None");
+                        tracing::debug!("\njust before try to broadcast_1. Is going to fail. state is AwaitingResponse or None");
                         tracing::debug!(state = ?self.state);
                         tracing::debug!(?broadcast_to, "broadcast_to list");
                     };
@@ -318,7 +320,7 @@ impl Operation for UpdateOp {
                     );
 
                     if let Some(UpdateState::AwaitingResponse { .. }) | None = self.state {
-                        tracing::debug!("\njust before try to broadcast. Is going to fail. state is AwaitingResponse or None");
+                        tracing::debug!("\njust before try to broadcast_2. Is going to fail. state is AwaitingResponse or None");
                         tracing::debug!(state = ?self.state);
                         tracing::debug!(?broadcast_to, "broadcast_to list");
                     };
@@ -393,14 +395,20 @@ impl Operation for UpdateOp {
                         "Successfully broadcasted update contract {key} to {broadcasted_to} peers"
                     );
 
+                    let raw_state = State::from(new_value.clone());
+
+                    let summary = StateSummary::from(raw_state.into_bytes());
+
                     // Subscriber nodes have been notified of the change, the operation is completed
                     return_msg = Some(UpdateMsg::SuccessfulUpdate {
                         id: *id,
                         target: *upstream,
+                        summary,
                     });
+
                     new_state = None;
                 }
-                UpdateMsg::SuccessfulUpdate { id, .. } => {
+                UpdateMsg::SuccessfulUpdate { id, summary, .. } => {
                     match self.state {
                         Some(UpdateState::AwaitingResponse { key, upstream }) => {
                             let is_subscribed_contract =
@@ -421,17 +429,15 @@ impl Operation for UpdateOp {
                                 "Peer completed contract value update",
                             );
 
-                            // TODO: fix this
-                            let fake_summary = StateSummary::from(vec![]);
-
                             new_state = Some(UpdateState::Finished {
                                 key,
-                                summary: fake_summary,
+                                summary: summary.clone(),
                             });
                             if let Some(upstream) = upstream {
                                 return_msg = Some(UpdateMsg::SuccessfulUpdate {
                                     id: *id,
                                     target: upstream,
+                                    summary: summary.clone(),
                                 });
                             } else {
                                 return_msg = None;
@@ -516,7 +522,7 @@ impl Operation for UpdateOp {
                     let broadcast_to = op_manager.get_broadcast_targets(&key, &sender.peer);
 
                     if let Some(UpdateState::AwaitingResponse { .. }) | None = self.state {
-                        tracing::debug!("\njust before try to broadcast. Is going to fail. state is AwaitingResponse or None");
+                        tracing::debug!("\njust before try to broadcast_3. Is going to fail. state is AwaitingResponse or None");
                         tracing::debug!(state = ?self.state);
                         tracing::debug!(?broadcast_to, "broadcast_to list");
                     };
@@ -595,10 +601,14 @@ async fn try_to_broadcast(
                     .await?;
                 return Err(OpError::StatePushed);
             } else {
+                let raw_state = State::from(new_value.clone());
+
+                let summary = StateSummary::from(raw_state.into_bytes());
                 new_state = None;
                 return_msg = Some(UpdateMsg::SuccessfulUpdate {
                     id,
                     target: upstream,
+                    summary,
                 });
             }
         }
@@ -792,7 +802,9 @@ pub(crate) async fn request_update(
 mod messages {
     use std::fmt::Display;
 
-    use freenet_stdlib::prelude::{ContractContainer, ContractKey, RelatedContracts, WrappedState};
+    use freenet_stdlib::prelude::{
+        ContractContainer, ContractKey, RelatedContracts, StateSummary, WrappedState,
+    };
     use serde::{Deserialize, Serialize};
 
     use crate::{
@@ -826,6 +838,8 @@ mod messages {
         SuccessfulUpdate {
             id: Transaction,
             target: PeerKeyLocation,
+            #[serde(deserialize_with = "StateSummary::deser_state_summary")]
+            summary: StateSummary<'static>,
         },
         AwaitUpdate {
             id: Transaction,

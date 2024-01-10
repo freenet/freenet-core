@@ -136,17 +136,15 @@ where
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await;
 
-                let a = update_result.unwrap();
-
                 tracing::debug!("after upsert_contract_state");
 
                 contract_handler
                     .channel()
                     .send_to_sender(
                         id,
-                        ContractHandlerEvent::UpdateResponse { new_value: Ok(a) }, // ContractHandlerEvent::UpdateResponse {
-                                                                                   //     new_value: update_result.map_err(Into::into),
-                                                                                   // },
+                        ContractHandlerEvent::UpdateResponse {
+                            new_value: update_result.map_err(Into::into),
+                        },
                     )
                     .await
                     .map_err(|error| {
