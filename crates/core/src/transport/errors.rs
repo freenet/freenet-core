@@ -1,20 +1,15 @@
-use serde_with::SerializeDisplay;
+use std::fmt::Display;
 use thiserror::Error;
 
 // Define a custom error type for the transport layer
 #[derive(Debug, Error)]
-pub enum TransportError {
-    #[error("network error: {0}")]
-    NetworkError(#[from] std::io::Error),
+pub struct TransportError(pub String);
 
-    #[error("connection error: {0}")]
-    ConnectionError(#[from] ConnectionError),
-
-    #[error("initialization error: {0}")]
-    InitializationError(String),
-
-    #[error("crypto error: {0}")]
-    CryptoError(String),
+impl Display for TransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)?;
+        Ok(())
+    }
 }
 
 // Define a custom error type for the connection

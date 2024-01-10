@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, RwLock};
 
 pub struct UdpConnection {
     transport: Arc<RwLock<UdpTransport>>,
-    pub(in crate::transport) receive_queue: (
+    pub(in crate::transport) raw_packets: (
         mpsc::Sender<(SocketAddr, Vec<u8>)>,
         mpsc::Receiver<(SocketAddr, Vec<u8>)>,
     ),

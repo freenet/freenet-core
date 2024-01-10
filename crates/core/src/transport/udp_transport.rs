@@ -59,7 +59,7 @@ impl UdpTransport {
         // Bind the UDP socket to the specified port
         let socket = UdpSocket::bind(("0.0.0.0", listen_port))
             .await
-            .map_err(|e| TransportError::NetworkError(e))?;
+            .map_err(|e| TransportError(e.to_string()))?;
 
         let (send_queue, mut send_queue_receiver) = mpsc::channel(SEND_QUEUE_SIZE);
 
@@ -87,7 +87,7 @@ impl UdpTransport {
 
                                 match new_transport_clone.read().await.connections.get(&addr) {
                                     Some(connection) => {
-                                        if let Err(e) = connection.receive_queue.0.send(message).await {
+                                        if let Err(e) = connection.raw_packets.0.send(message).await {
                                             tracing::warn!("Failed to send message: {:?}", e);
                                         }
                                     }
@@ -128,13 +128,23 @@ impl UdpTransport {
     ) -> Result<UdpConnection, TransportError> {
         let key = random::<[u8; 16]>();
         let outbound_sym_key: Aes128 =
-            Aes128::new_from_slice(&key).map_err(|e| TransportError::CryptoError(e.to_string()))?;
+            Aes128::new_from_slice(&key).map_err(|e| TransportError(e.to_string()))?;
 
         let intro_packet = remote_public_key
             .encrypt(&key)
-            .map_err(|e| TransportError::CryptoError(e.to_string()))?;
+            .map_err(|e| TransportError(e.to_string()))?;
+    }
 
-        todo!()
+    pub async fn send_raw_message(
+        &self,
+        socket_addr: SocketAddr,
+        data: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        self.send_queue
+            .send((socket_addr, data))
+            .await
+            .map_err(|e| TransportError(e.to_string()))?;
+        Ok(())
     }
 
     fn update_max_upstream_rate(&mut self, max_upstream_rate: BytesPerSecond) {
