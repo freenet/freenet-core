@@ -412,7 +412,7 @@ impl ComposeNetworkMessage<operations::update::UpdateOp> for UpdateContract {
         op: operations::update::UpdateOp,
         op_manager: &OpManager,
     ) -> Result<(), OpError> {
-        operations::update::request_update(op_manager, op, None).await
+        operations::update::request_update(op_manager, op).await
     }
 }
 

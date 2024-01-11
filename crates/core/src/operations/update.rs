@@ -120,6 +120,7 @@ impl Operation for UpdateOp {
                 }
                 Ok(None) => {
                     // new request to get a value for a contract, initialize the machine
+                    tracing::debug!("state op set to ReceivedRequest");
                     Ok(OpInitialization {
                         op: Self {
                             state: Some(UpdateState::ReceivedRequest),
@@ -208,9 +209,7 @@ impl Operation for UpdateOp {
                             .ring
                             .within_subscribing_distance(&Location::from(key))
                     {
-                        tracing::debug!(tx = %id, "Attempting contract value update");
-
-                        tracing::debug!(state = %value, "Data of new state to be updated");
+                        tracing::debug!(tx = %id, "Attempting contract value update - update");
 
                         update_contract(
                             op_manager,
@@ -221,7 +220,7 @@ impl Operation for UpdateOp {
                         .await?;
                         tracing::debug!(
                             tx = %id,
-                            "Successfully updated a value for contract {} @ {:?}",
+                            "Successfully updated a value for contract {} @ {:?} - update",
                             key,
                             target.location
                         );
@@ -270,11 +269,9 @@ impl Operation for UpdateOp {
 
                     let broadcast_to = op_manager.get_broadcast_targets(&key, &sender.peer);
 
-                    if let Some(UpdateState::AwaitingResponse { .. }) | None = self.state {
-                        tracing::debug!("\njust before try to broadcast_1. Is going to fail. state is AwaitingResponse or None");
-                        tracing::debug!(state = ?self.state);
-                        tracing::debug!(?broadcast_to, "broadcast_to list");
-                    };
+                    tracing::debug!("\njust before try to broadcast_1");
+                    tracing::debug!(state = ?self.state);
+                    tracing::debug!(broadcast_list = ?broadcast_to);
 
                     match try_to_broadcast(
                         *id,
@@ -302,7 +299,7 @@ impl Operation for UpdateOp {
                 } => {
                     let target = op_manager.ring.own_location();
 
-                    tracing::debug!("Attempting contract value update");
+                    tracing::debug!("Attempting contract value update - BroadcastTo - update");
                     let new_value = update_contract(
                         op_manager,
                         key.clone(),
@@ -310,19 +307,19 @@ impl Operation for UpdateOp {
                         RelatedContracts::default(),
                     )
                     .await?;
-                    tracing::debug!("Contract successfully updated");
+                    tracing::debug!("Contract successfully updated - BroadcastTo - update");
 
                     let broadcast_to = op_manager.get_broadcast_targets(key, &sender.peer);
                     tracing::debug!(
-                        "Successfully updated a value for contract {} @ {:?}",
+                        "Successfully updated a value for contract {} @ {:?} - BroadcastTo - update",
                         key,
                         target.location
                     );
 
                     if let Some(UpdateState::AwaitingResponse { .. }) | None = self.state {
-                        tracing::debug!("\njust before try to broadcast_2. Is going to fail. state is AwaitingResponse or None");
-                        tracing::debug!(state = ?self.state);
-                        tracing::debug!(?broadcast_to, "broadcast_to list");
+                        tracing::debug!("\njust before try to broadcast_2. Is going to fail. state is AwaitingResponse or None - BroadcastTo - update");
+                        tracing::debug!(state = ?self.state, " - BroadcastTo");
+                        tracing::debug!(broadcast_list = ?broadcast_to, " - BroadcastTo");
                     };
                     match try_to_broadcast(
                         *id,
@@ -392,7 +389,7 @@ impl Operation for UpdateOp {
 
                     broadcasted_to += broadcast_to.len() - incorrect_results;
                     tracing::debug!(
-                        "Successfully broadcasted update contract {key} to {broadcasted_to} peers"
+                        "Successfully broadcasted update contract {key} to {broadcasted_to} peers - update"
                     );
 
                     let raw_state = State::from(new_value.clone());
@@ -426,7 +423,7 @@ impl Operation for UpdateOp {
                                 tx = %id,
                                 %key,
                                 this_peer = %op_manager.ring.peer_key,
-                                "Peer completed contract value update",
+                                "Peer completed contract value update - update",
                             );
 
                             new_state = Some(UpdateState::Finished {
@@ -463,7 +460,7 @@ impl Operation for UpdateOp {
                     tracing::debug!(
                         %key,
                         this_peer = % peer_loc.peer,
-                        "Forwarding changes, trying to update the contract"
+                        "Forwarding changes, trying to update the contract - update"
                     );
 
                     let is_subscribed_contract = op_manager.ring.is_subscribed_to_contract(&key);
@@ -521,11 +518,9 @@ impl Operation for UpdateOp {
 
                     let broadcast_to = op_manager.get_broadcast_targets(&key, &sender.peer);
 
-                    if let Some(UpdateState::AwaitingResponse { .. }) | None = self.state {
-                        tracing::debug!("\njust before try to broadcast_3. Is going to fail. state is AwaitingResponse or None");
-                        tracing::debug!(state = ?self.state);
-                        tracing::debug!(?broadcast_to, "broadcast_to list");
-                    };
+                    tracing::debug!("\njust before try to broadcast_3");
+                    tracing::debug!(state = ?self.state);
+                    tracing::debug!(broadcast_list = ?broadcast_to);
 
                     match try_to_broadcast(
                         *id,
@@ -570,7 +565,7 @@ async fn try_to_broadcast(
             if broadcast_to.is_empty() && !last_hop {
                 // broadcast complete
                 tracing::debug!(
-                    "Empty broadcast list while updating value for contract {}",
+                    "Empty broadcast list while updating value for contract {} - update",
                     key
                 );
                 // means the whole tx finished so can return early
@@ -579,9 +574,12 @@ async fn try_to_broadcast(
                     upstream: Some(upstream),
                 });
                 return_msg = None;
+
+                tracing::debug!("state op set to AwaitingResponse");
             } else if !broadcast_to.is_empty() {
-                tracing::debug!("Callback to start broadcasting to other nodes");
+                tracing::debug!("Callback to start broadcasting to other nodes - update");
                 new_state = Some(UpdateState::BroadcastOngoing);
+                tracing::debug!("state op set to BroadcastOngoing");
                 return_msg = Some(UpdateMsg::Broadcasting {
                     id,
                     new_value,
@@ -738,7 +736,6 @@ pub(crate) fn start_op(
 pub(crate) async fn request_update(
     op_manager: &OpManager,
     mut update_op: UpdateOp,
-    client_id: Option<ClientId>,
 ) -> Result<(), OpError> {
     let key = if let Some(UpdateState::PrepareRequest { key, .. }) = &update_op.state {
         key
@@ -770,6 +767,7 @@ pub(crate) async fn request_update(
             htl,
             related_contracts,
         }) => {
+            tracing::debug!("state op set to AwaitingResponse");
             let new_state = Some(UpdateState::AwaitingResponse {
                 key: key.clone(),
                 upstream: None,

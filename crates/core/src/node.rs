@@ -397,17 +397,8 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                         this_peer = %op_manager.ring.peer_key,
                         "Received update from user event",
                     );
-                    // calculate new state from delta
-                    // let a = match data {
-                    //     freenet_stdlib::prelude::UpdateData::State(s) => true,
-                    //     _ => false,
-                    // };
-
                     let state = match data {
                         freenet_stdlib::prelude::UpdateData::State(s) => s,
-                        freenet_stdlib::prelude::UpdateData::Delta(sd) => {
-                            unreachable!();
-                        }
                         _ => {
                             unreachable!();
                         }
@@ -419,12 +410,24 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
 
                     tracing::debug!("just before update start op");
 
-                    let op = update::start_op(key, wrapped_state, related_contracts, 10_usize);
+                    let op = update::start_op(
+                        key,
+                        wrapped_state,
+                        related_contracts,
+                        op_manager.ring.max_hops_to_live,
+                    );
+
+                    tracing::debug!("before waiting_for_transaction_result");
+
+                    let _ = op_manager
+                        .ch_outbound
+                        .waiting_for_transaction_result(op.id, client_id)
+                        .await;
+                    tracing::debug!("after waiting_for_transaction_result");
 
                     tracing::debug!("just before request update");
 
-                    if let Err(err) = update::request_update(&op_manager, op, Some(client_id)).await
-                    {
+                    if let Err(err) = update::request_update(&op_manager, op).await {
                         tracing::error!("request update error {}", err)
                     }
                 }

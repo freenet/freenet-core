@@ -131,7 +131,7 @@ where
                         key.clone(),
                         Either::Left(state.clone()),
                         related_contracts,
-                        contract,
+                        None,
                     )
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await;
