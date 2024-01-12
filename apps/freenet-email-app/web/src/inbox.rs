@@ -10,8 +10,6 @@ use chacha20poly1305::{
     XChaCha20Poly1305,
 };
 use chrono::{DateTime, Utc};
-use futures::future::LocalBoxFuture;
-use futures::FutureExt;
 use freenet_aft_interface::{Tier, TokenAssignment, TokenAssignmentHash};
 use freenet_stdlib::prelude::StateSummary;
 use freenet_stdlib::{
@@ -21,6 +19,8 @@ use freenet_stdlib::{
         ContractKey, State, UpdateData,
     },
 };
+use futures::future::LocalBoxFuture;
+use futures::FutureExt;
 use rsa::{
     pkcs1v15::SigningKey, sha2::Sha256, signature::Signer, Pkcs1v15Encrypt, RsaPrivateKey,
     RsaPublicKey,
@@ -181,8 +181,7 @@ impl DecryptedMessage {
         }
         .try_into()
         .map_err(|e| format!("{e}"))?;
-        let inbox_key =
-            ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
+        let inbox_key = !::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
         AftRecords::pending_assignment(delegate_key, inbox_key.clone());
 
         PENDING_INBOXES_UPDATE.with(|map| {
@@ -557,7 +556,10 @@ mod tests {
                     minimum_tier: Tier::Hour1,
                     private_key,
                 },
-                key: ContractKey::from_params_and_code(&params.try_into()?, ContractCode::from([].as_slice())),
+                key: ContractKey::from_params_and_code(
+                    &params.try_into()?,
+                    ContractCode::from([].as_slice()),
+                ),
             })
         }
     }
