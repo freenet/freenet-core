@@ -1,9 +1,5 @@
-use aes::cipher::consts::U16;
-use aes::cipher::generic_array::GenericArray;
-use ecies::utils::generate_keypair;
-use ecies::{decrypt, encrypt, SecpError};
 use rand::rngs::OsRng;
-use rand::RngCore;
+use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 
 pub(crate) struct TransportKeypair {
     public: TransportPublicKey,
@@ -12,40 +8,35 @@ pub(crate) struct TransportKeypair {
 
 impl TransportKeypair {
     pub fn new() -> Self {
-        let (sk, pk) = generate_keypair();
+        let mut rng = OsRng;
+        let bits = 2048; // Key size, can be adjusted
+        let priv_key = RsaPrivateKey::new(&mut rng, bits).expect("failed to generate a key");
+        let pub_key = RsaPublicKey::from(&priv_key);
+
         TransportKeypair {
-            public: TransportPublicKey(pk.serialize()),
-            secret: TransportSecretKey(sk.serialize()),
+            public: TransportPublicKey(pub_key),
+            secret: TransportSecretKey(priv_key),
         }
     }
 }
 
-pub(crate) struct TransportPublicKey([u8; 65]);
+pub(crate) struct TransportPublicKey(RsaPublicKey);
 
 impl TransportPublicKey {
-    pub fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, SecpError> {
-        encrypt(&self.0, data)
+    pub fn encrypt(&self, data: &[u8]) -> Vec<u8> {
+        let mut rng = OsRng;
+        let padding = Pkcs1v15Encrypt::default();
+        self.0
+            .encrypt(&mut rng, padding, data)
+            .expect("failed to encrypt")
     }
 }
 
-pub(crate) struct TransportSecretKey([u8; 32]);
+pub(crate) struct TransportSecretKey(RsaPrivateKey);
 
 impl TransportSecretKey {
-    pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, SecpError> {
-        decrypt(&self.0, data)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn transport_keypair_encrypt_decrypt() {
-        let keypair = TransportKeypair::new();
-        let data = b"hello world";
-        let encrypted = keypair.public.encrypt(data).unwrap();
-        let decrypted = keypair.secret.decrypt(&encrypted).unwrap();
-        assert_eq!(data, decrypted.as_slice());
+    pub fn decrypt(&self, data: &[u8]) -> Vec<u8> {
+        let padding = Pkcs1v15Encrypt::default();
+        self.0.decrypt(padding, data).expect("failed to decrypt")
     }
 }

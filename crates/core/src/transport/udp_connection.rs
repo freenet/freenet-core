@@ -1,5 +1,4 @@
 use crate::transport::udp_transport::UdpTransport;
-use crate::transport::ConnectionEvent;
 use aes_gcm::{
     aead::{generic_array::GenericArray, Aead},
     Aes128Gcm,
