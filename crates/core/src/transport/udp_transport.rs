@@ -17,33 +17,31 @@
 
 use super::*;
 use crate::transport::crypto::{TransportKeypair, TransportPublicKey};
-use crate::transport::udp_connection::UdpConnection;
-use aes::cipher::KeyInit;
-use aes::Aes128;
+use crate::transport::udp_connection::UdpConnectionInfo;
 use dashmap::DashMap;
 use rand::random;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::vec::Vec;
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task;
-use tracing::Value;
 
 /// The maximum size of a received UDP packet, MTU is 1500
 /// so this should be more than enough.
 const MAX_PACKET_SIZE: usize = 2048;
 
 const RECEIVE_QUEUE_SIZE: usize = 100;
-const SEND_QUEUE_SIZE: usize = 100;
 
 pub(crate) struct UdpTransport {
-    pub(super) connections: DashMap<SocketAddr, UdpConnection>,
+    pub(super) connection_raw_packet_senders: DashMap<SocketAddr, Sender<(SocketAddr, Vec<u8>)>>,
+    pub(super) connection_info: DashMap<SocketAddr, UdpConnectionInfo>,
     keypair: TransportKeypair,
     listen_port: u16,
     is_gateway: bool,
     max_upstream_rate: BytesPerSecond,
-    send_queue: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    send_queue: Sender<(SocketAddr, Vec<u8>)>,
 }
 
 impl UdpTransport {
@@ -61,10 +59,13 @@ impl UdpTransport {
             .await
             .map_err(|e| TransportError(e.to_string()))?;
 
-        let (send_queue, mut send_queue_receiver) = mpsc::channel(SEND_QUEUE_SIZE);
+        // Channel buffer is zero so senders will block until the receiver is ready,
+        // important for bandwidth limiting
+        let (send_queue, mut send_queue_receiver) = mpsc::channel(0);
 
         let new_transport = Arc::new(RwLock::new(UdpTransport {
-            connections: DashMap::new(),
+            connection_raw_packet_senders: DashMap::new(),
+            connection_info: DashMap::new(),
             keypair,
             listen_port,
             is_gateway,
@@ -85,10 +86,10 @@ impl UdpTransport {
 
                                 let message: (SocketAddr, Vec<u8>) = (*addr, buf);
 
-                                match new_transport_clone.read().await.connections.get(&addr) {
-                                    Some(connection) => {
-                                        if let Err(e) = connection.raw_packets.0.send(message).await {
-                                            tracing::warn!("Failed to send message: {:?}", e);
+                                match new_transport_clone.read().await.connection_raw_packet_senders.get(&addr) {
+                                    Some(e) => {
+                                        if let Err(e) = e.value().send(message).await {
+                                            tracing::warn!("Failed to send raw packet to connection sender: {:?}", e);
                                         }
                                     }
                                     None => {
@@ -125,7 +126,7 @@ impl UdpTransport {
         socket_addr: SocketAddr,
         remote_is_gateway: bool,
         timeout: std::time::Duration,
-    ) -> Result<UdpConnection, TransportError> {
+    ) -> Result<UdpConnectionInfo, TransportError> {
         let key = random::<[u8; 16]>();
         let outbound_sym_key: Aes128 =
             Aes128::new_from_slice(&key).map_err(|e| TransportError(e.to_string()))?;
@@ -151,7 +152,7 @@ impl UdpTransport {
         self.max_upstream_rate = max_upstream_rate;
     }
 
-    async fn listen_for_connection(&self) -> Result<UdpConnection, TransportError> {
+    async fn listen_for_connection(&self) -> Result<UdpConnectionInfo, TransportError> {
         todo!()
     }
 

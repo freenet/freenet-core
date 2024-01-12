@@ -21,10 +21,7 @@ use tokio::task;
 
 */
 
-pub struct UdpConnection {
-    transport: Arc<RwLock<UdpTransport>>,
-    pub(in crate::transport) raw_packets: PacketQueue<RawPacket>,
-    pub(in crate::transport) decrypted_packets: PacketQueue<Vec<u8>>,
+pub struct UdpConnectionInfo {
     outbound_symmetric_key: Option<Aes128Gcm>,
     inbound_symmetric_key: Option<Aes128Gcm>,
     inbound_intro_packet: Option<Vec<u8>>,
@@ -33,7 +30,7 @@ pub struct UdpConnection {
     remote_is_gateway: bool,
 }
 
-impl UdpConnection {
+impl UdpConnectionInfo {
     pub(in crate::transport) async fn new(
         transport: Arc<RwLock<UdpTransport>>,
         remote_addr: SocketAddr,
