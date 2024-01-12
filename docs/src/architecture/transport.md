@@ -105,7 +105,7 @@ if so it discards the message but sends a `NoOperation` message back to the send
 to re-confirm its receipt.
 
 If a peer sends a message and doesn't receive an acknowledgement within 2 seconds (`MESSAGE_CONFIRMATION_TIMEOUT`) 
-it will resend the message.
+it will resend the message. Because of this peers need to retain the messages they send until they are acknowledged.
 
 ### Confirmation batching
 
