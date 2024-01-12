@@ -235,7 +235,7 @@ impl Operation for PutOp {
                     sender,
                 } => {
                     let key = contract.key();
-                    let is_subscribed_contract = op_manager.ring.is_subscribed_to_contract(&key);
+                    let is_subscribed_contract = op_manager.ring.is_seeding_contract(&key);
 
                     tracing::debug!(
                         tx = %id,
@@ -244,11 +244,7 @@ impl Operation for PutOp {
                         "Puttting contract at target peer",
                     );
 
-                    if is_subscribed_contract
-                        || op_manager
-                            .ring
-                            .within_subscribing_distance(&Location::from(&key))
-                    {
+                    if is_subscribed_contract || op_manager.ring.should_seed(&key) {
                         tracing::debug!(tx = %id, "Attempting contract value update");
                         put_contract(
                             op_manager,
@@ -432,13 +428,8 @@ impl Operation for PutOp {
                 PutMsg::SuccessfulPut { id, .. } => {
                     match self.state {
                         Some(PutState::AwaitingResponse { key, upstream }) => {
-                            let is_subscribed_contract =
-                                op_manager.ring.is_subscribed_to_contract(&key);
-                            if !is_subscribed_contract
-                                && op_manager
-                                    .ring
-                                    .within_subscribing_distance(&Location::from(&key))
-                            {
+                            let is_subscribed_contract = op_manager.ring.is_seeding_contract(&key);
+                            if !is_subscribed_contract && op_manager.ring.should_seed(&key) {
                                 tracing::debug!(tx = %id, %key, peer = %op_manager.ring.peer_key, "Contract not cached @ peer, caching");
                                 super::start_subscription_request(op_manager, key.clone(), true)
                                     .await;
@@ -479,11 +470,8 @@ impl Operation for PutOp {
                         "Forwarding changes, trying put the contract"
                     );
 
-                    let is_subscribed_contract = op_manager.ring.is_subscribed_to_contract(&key);
-                    let within_caching_dist = op_manager
-                        .ring
-                        .within_subscribing_distance(&Location::from(&key));
-                    if is_subscribed_contract || within_caching_dist {
+                    let should_seed = op_manager.ring.should_seed(&key);
+                    if should_seed {
                         // after the contract has been cached, push the update query
                         put_contract(
                             op_manager,
@@ -510,7 +498,8 @@ impl Operation for PutOp {
                             new_skip_list,
                         )
                         .await;
-                        if put_here && !is_subscribed_contract {
+                        let is_seeding_contract = op_manager.ring.is_seeding_contract(&key);
+                        if put_here && !is_seeding_contract && should_seed {
                             // if already subscribed the value was already put and merging succeeded
                             put_contract(
                                 op_manager,
@@ -520,6 +509,22 @@ impl Operation for PutOp {
                                 contract,
                             )
                             .await?;
+                            let (dropped_contract, old_subscribers) =
+                                op_manager.ring.seed_contract(key.clone());
+                            if let Some(key) = dropped_contract {
+                                for subscriber in old_subscribers {
+                                    conn_manager
+                                        .send(
+                                            &subscriber.peer,
+                                            NetMessage::Unsubscribed {
+                                                transaction: Transaction::new::<PutMsg>(),
+                                                key: key.clone(),
+                                                from: op_manager.ring.peer_key,
+                                            },
+                                        )
+                                        .await?;
+                                }
+                            }
                         }
                         put_here
                     } else {
@@ -564,7 +569,7 @@ impl Operation for PutOp {
 
 impl OpManager {
     fn get_broadcast_targets(&self, key: &ContractKey, sender: &PeerId) -> Vec<PeerKeyLocation> {
-        let mut subscribers = self
+        let subscribers = self
             .ring
             .subscribers_of(key)
             .map(|subs| {
@@ -575,9 +580,6 @@ impl OpManager {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        if let Some(peer) = self.ring.subscribed_to_contract(key) {
-            subscribers.push(peer);
-        }
         subscribers
     }
 }
@@ -1022,7 +1024,6 @@ mod test {
         )
         .await;
         let mut locations = sim_nw.get_locations_by_node();
-        let gw0_loc = locations.remove(&"gateway-0".into()).unwrap();
         let node0_loc = locations.remove(&"node-1".into()).unwrap();
         let node1_loc = locations.remove(&"node-2".into()).unwrap();
 
@@ -1031,7 +1032,7 @@ mod test {
             owned_contracts: vec![(
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone())),
                 contract_val.clone(),
-                Some(gw0_loc),
+                false,
             )],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::new(),
@@ -1041,7 +1042,7 @@ mod test {
             owned_contracts: vec![(
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone())),
                 contract_val.clone(),
-                Some(gw0_loc),
+                false,
             )],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::new(),
@@ -1058,7 +1059,7 @@ mod test {
             owned_contracts: vec![(
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract.clone())),
                 contract_val,
-                None,
+                false,
             )],
             events_to_generate: HashMap::from_iter([(1, put_event)]),
             contract_subscribers: HashMap::from_iter([(key.clone(), vec![node0_loc, node1_loc])]),
