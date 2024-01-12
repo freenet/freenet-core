@@ -38,7 +38,7 @@ const RECEIVE_QUEUE_SIZE: usize = 100;
 const SEND_QUEUE_SIZE: usize = 100;
 
 pub(crate) struct UdpTransport {
-    connections: DashMap<SocketAddr, UdpConnection>,
+    pub(super) connections: DashMap<SocketAddr, UdpConnection>,
     keypair: TransportKeypair,
     listen_port: u16,
     is_gateway: bool,

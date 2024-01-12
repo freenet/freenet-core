@@ -1,4 +1,3 @@
-use crate::transport::errors::ConnectionError;
 use crate::transport::udp_transport::UdpTransport;
 use crate::transport::ConnectionEvent;
 use aes_gcm::{
@@ -8,24 +7,29 @@ use aes_gcm::{
 use libp2p_identity::PublicKey;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task;
+
+/*
+ NOTES:
+    The receiver thread should be set up when the channel is created, it shouldn't be stored
+    in the struct because only the receiver thread loop should be able to access it.
+
+
+*/
 
 pub struct UdpConnection {
     transport: Arc<RwLock<UdpTransport>>,
-    pub(in crate::transport) raw_packets: (
-        mpsc::Sender<(SocketAddr, RawPacket)>,
-        mpsc::Receiver<(SocketAddr, RawPacket)>,
-    ),
-    pub(in crate::transport) decrypted_packets: (
-        mpsc::Sender<(SocketAddr, Vec<u8>)>,
-        mpsc::Receiver<(SocketAddr, Vec<u8>)>,
-    ),
+    pub(in crate::transport) raw_packets: PacketQueue<RawPacket>,
+    pub(in crate::transport) decrypted_packets: PacketQueue<Vec<u8>>,
     outbound_symmetric_key: Option<Aes128Gcm>,
     inbound_symmetric_key: Option<Aes128Gcm>,
+    inbound_intro_packet: Option<Vec<u8>>,
+    outbound_intro_packet: Option<Vec<u8>>,
+    remote_public_key: Option<PublicKey>,
     remote_is_gateway: bool,
 }
 
@@ -36,51 +40,37 @@ impl UdpConnection {
         remote_public_key: PublicKey,
         remote_is_gateway: bool,
     ) -> Result<Self, ConnectionError> {
-        todo!()
-    }
+        let mut connection = Self {
+            transport,
+            raw_packets: PacketQueue::new(),
+            decrypted_packets: PacketQueue::new(),
+            outbound_symmetric_key: None,
+            inbound_symmetric_key: None,
+            inbound_intro_packet: None,
+            outbound_intro_packet: None,
+            remote_public_key: Some(remote_public_key),
+            remote_is_gateway,
+        };
 
-    fn spawn_message_handler(&mut self) {
         task::spawn(async move {
             loop {
                 tokio::select! {
-                        Some((addr, message)) = self.raw_packets.1.recv() => {
-                            // Handle the raw packet
-                            self.handle_raw_packet(&addr, &message).await;
-                        }
-                        Some((addr, message)) = self.decrypted_packets.1.recv() => {
-                            // Handle the decrypted packet
-                            self.handle_decrypted_packet(&addr, &message).await;
-                        }
+                    Some((addr, message)) = raw_packets_receiver_clone.recv() => {
+                        // Handle the raw packet
+                        Self::handle_raw_packet(&addr, &message).await;
+                    },
+                    Some((addr, message)) = decrypted_packets_receiver_clone.recv() => {
+                        // Handle the decrypted packet
+                        Self::handle_decrypted_packet(&addr, &message).await;
+                    },
                 }
             }
         });
+
+        Ok(connection)
     }
 
-    fn remote_ip_address(&self) -> IpAddr {
-        todo!()
-    }
-
-    fn remote_public_key(&self) -> PublicKey {
-        todo!()
-    }
-
-    fn remote_port(&self) -> u16 {
-        todo!()
-    }
-
-    fn outbound_symmetric_key(&self) -> Vec<u8> {
-        todo!()
-    }
-
-    fn inbound_symmetric_key(&self) -> Vec<u8> {
-        todo!()
-    }
-
-    async fn read_event(&self) -> Result<ConnectionEvent, ConnectionError> {
-        todo!()
-    }
-
-    async fn handle_raw_packet(&mut self, addr: &SocketAddr, message: &RawPacket) {
+    async fn handle_raw_packet(addr: &SocketAddr, message: &RawPacket) {
         match message {
             RawPacket::Message(data) => {
                 // Decrypt the message
@@ -102,11 +92,7 @@ impl UdpConnection {
         }
     }
 
-    async fn handle_decrypted_packet(
-        &mut self,
-        addr: &SocketAddr,
-        message: &Vec<u8>,
-    ) -> Result<(), ConnectionError> {
+    async fn handle_decrypted_packet(addr: &SocketAddr, message: &Vec<u8>) {
         todo!()
     }
 
@@ -157,6 +143,29 @@ impl UdpConnection {
 enum RawPacket {
     Message(Vec<u8>),
     Terminate,
+}
+
+pub struct PacketQueue<T> {
+    pub sender: Arc<RwLock<mpsc::Sender<(SocketAddr, T)>>>,
+    pub receiver: Arc<RwLock<mpsc::Receiver<(SocketAddr, T)>>>,
+}
+
+impl<T> PacketQueue<T> {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel(100);
+        Self {
+            sender: Arc::new(RwLock::new(sender)),
+            receiver: Arc::new(RwLock::new(receiver)),
+        }
+    }
+
+    fn sender_clone(&self) -> Arc<RwLock<mpsc::Sender<(SocketAddr, T)>>> {
+        self.sender.clone()
+    }
+
+    fn receiver_clone(&self) -> Arc<RwLock<mpsc::Receiver<(SocketAddr, T)>>> {
+        self.receiver.clone()
+    }
 }
 
 #[derive(Debug, Error)]
