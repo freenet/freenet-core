@@ -125,6 +125,8 @@ pub enum SymmetricMessagePayload {
 
 * Try to avoid unnecessary copies of data, especially for large messages.
 * Ensure serialization format is robust against untrusted data.
+* Note that there will be nested layers of serialization, both internal to FrTP and
+  by the FrTP user.
 
 Consider:
 * [FlatBuffers](https://crates.io/crates/flatbuffers/)
