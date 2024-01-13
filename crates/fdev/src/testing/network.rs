@@ -11,8 +11,8 @@ use axum::{
     Router,
 };
 use freenet::dev_tool::{
-    EventChain, Executor, MemoryEventsGen, NetworkEventGenerator, NetworkPeer, NodeConfig,
-    NodeLabel, OperationMode, PeerCliConfig, PeerId, PeerMessage, PeerStatus, Runtime, SimNetwork,
+    EventChain, MemoryEventsGen, NetworkEventGenerator, NetworkPeer, NodeConfig, NodeLabel, PeerId,
+    PeerMessage, PeerStatus, SimNetwork,
 };
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
@@ -34,11 +34,9 @@ use thiserror::Error;
 use tokio::sync::watch::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio::{
-    net::TcpStream,
     process::Command,
     sync::{oneshot, Mutex},
 };
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 #[derive(Debug, Error)]
 pub enum NetworkSimulationError {
@@ -152,33 +150,37 @@ impl SubProcess {
     }
 }
 
+async fn start_supervisor(config: &TestConfig) -> anyhow::Result<(), Error> {
+    let mut network = super::config_sim_network(config).await.map_err(|e| {
+        NetworkSimulationError::NetworkError(format!(
+            "Failed to configure simulation network: {}",
+            e
+        ))
+    })?;
+
+    let supervisor = Arc::new(Supervisor::new(&mut network).await);
+    start_server(supervisor.clone()).await?;
+    run_network(supervisor, config, network).await?;
+    Ok(())
+}
+
+async fn start_peer(config: &TestConfig, cmd_config: &NetworkProcessConfig) -> Result<(), Error> {
+    std::env::set_var("FREENET_PEER_ID", cmd_config.clone().id.unwrap());
+    freenet::config::set_logger();
+    if let Some(peer_id) = &cmd_config.id {
+        let mut peer = NetworkPeer::new(peer_id.clone()).await?;
+        peer.run(config, peer_id.clone()).await?;
+    }
+    Ok(())
+}
+
 pub(super) async fn run(
     config: &TestConfig,
     cmd_config: &NetworkProcessConfig,
 ) -> Result<(), Error> {
     match &cmd_config.mode {
-        Process::Supervisor => {
-            let mut network = super::config_sim_network(config).await.map_err(|e| {
-                NetworkSimulationError::NetworkError(format!(
-                    "Failed to configure simulation network: {}",
-                    e
-                ))
-            })?;
-
-            let supervisor = Arc::new(Supervisor::new(&mut network).await);
-            start_server(supervisor.clone()).await?;
-            run_network(supervisor, config, network).await?;
-            Ok(())
-        }
-        Process::Peer => {
-            std::env::set_var("FREENET_PEER_ID", cmd_config.clone().id.unwrap());
-            freenet::config::set_logger();
-            if let Some(peer_id) = &cmd_config.id {
-                let mut peer = NetworkPeer::new(peer_id.clone()).await?;
-                peer.run(config, peer_id.clone()).await?;
-            }
-            Ok(())
-        }
+        Process::Supervisor => start_supervisor(config).await,
+        Process::Peer => start_peer(config, cmd_config).await,
     }
 }
 
@@ -231,11 +233,7 @@ pub async fn run_network(
     tracing::info!("Starting network");
 
     let cmd_args = SubProcess::build_command(&test_config, test_config.seed());
-    start_processes(supervisor.clone(), &cmd_args, test_config).await?;
-
-    tracing::info!("Waiting for all peers to start");
-    wait_for_peers(supervisor.clone()).await;
-    tracing::info!("All peers started");
+    start_peers(supervisor.clone(), &cmd_args).await?;
 
     let peers: Vec<(NodeLabel, PeerId)> = supervisor
         .peers_config
@@ -302,23 +300,59 @@ pub async fn run_network(
     Ok(())
 }
 
-async fn start_processes(
+async fn start_process(
     supervisor: Arc<Supervisor>,
     cmd_args: &[String],
-    test_config: &TestConfig,
+    label: &NodeLabel,
+    config: &NodeConfig,
 ) -> Result<(), Error> {
-    for (label, config) in supervisor.peers_config.lock().await.iter() {
-        let process = SubProcess::start(&cmd_args, &label, config.peer_id)
-            .await
-            .unwrap();
-        supervisor
-            .processes
-            .lock()
-            .await
-            .insert(config.peer_id, process);
+    if config.is_gateway() {
+        supervisor.enqueue_gateway(label.number()).await;
+    } else {
         supervisor.enqueue_peer(label.number()).await;
     }
+    let process = SubProcess::start(cmd_args, label, config.peer_id).await?;
+    supervisor
+        .processes
+        .lock()
+        .await
+        .insert(config.peer_id, process);
     Ok(())
+}
+
+async fn start_peers(supervisor: Arc<Supervisor>, cmd_args: &[String]) -> Result<(), Error> {
+    let mut gateways = Vec::new();
+    let mut nodes = Vec::new();
+    let peers_map = supervisor.peers_config.lock().await;
+    for (label, config) in peers_map.iter() {
+        if config.is_gateway() {
+            gateways.push((label, config));
+        } else {
+            nodes.push((label, config));
+        }
+    }
+
+    for (label, config) in gateways {
+        start_process(supervisor.clone(), cmd_args, label, config).await?;
+    }
+    tracing::info!("Waiting for all gateways to start");
+    wait_for_gateways(supervisor.clone()).await;
+    tracing::info!("All gateways started");
+
+    for (label, config) in nodes {
+        start_process(supervisor.clone(), cmd_args, label, config).await?;
+    }
+    tracing::info!("Waiting for all peers to start");
+    wait_for_peers(supervisor.clone()).await;
+    tracing::info!("All peers started");
+
+    Ok(())
+}
+
+async fn wait_for_gateways(supervisor: Arc<Supervisor>) {
+    while !supervisor.waiting_gateways.lock().await.is_empty() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn wait_for_peers(supervisor: Arc<Supervisor>) {
@@ -331,6 +365,7 @@ async fn config_handler(
     peers_config: Arc<Mutex<HashMap<NodeLabel, NodeConfig>>>,
     Path(peer_id): Path<String>,
 ) -> axum::response::Response {
+    tracing::info!("Received config request for peer_id: {}", peer_id);
     let config = peers_config.lock().await;
     let id = NodeLabel::from(peer_id.as_str());
     tracing::info!("Received config request for peer_id: {}", peer_id);
@@ -476,8 +511,14 @@ async fn handle_peer_message(
         PeerMessage::Status(status) => {
             tracing::info!("Received status: {:?}", status);
             match status {
-                PeerStatus::Finished(id) => {
+                PeerStatus::PeerStarted(id) => {
+                    tracing::info!("Received peer started message for id {}", id);
                     supervisor.dequeue_peer(id).await;
+                    Ok(())
+                }
+                PeerStatus::GatewayStarted(id) => {
+                    tracing::info!("Received gateway started message for id {}", id);
+                    supervisor.dequeue_gateway(id).await;
                     Ok(())
                 }
                 PeerStatus::Error(error_msg) => {
@@ -497,6 +538,7 @@ pub struct Supervisor {
     peers_config: Arc<Mutex<HashMap<NodeLabel, NodeConfig>>>,
     processes: Mutex<HashMap<PeerId, SubProcess>>,
     waiting_peers: Arc<Mutex<VecDeque<usize>>>,
+    waiting_gateways: Arc<Mutex<VecDeque<usize>>>,
     user_ev_controller: Arc<Mutex<tokio::sync::mpsc::Sender<(u32, PeerId)>>>,
     event_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<(u32, PeerId)>>>,
 }
@@ -511,6 +553,7 @@ impl Supervisor {
             peers_config,
             processes: Mutex::new(HashMap::new()),
             waiting_peers: Arc::new(Mutex::new(VecDeque::new())),
+            waiting_gateways: Arc::new(Mutex::new(VecDeque::new())),
             user_ev_controller: Arc::new(Mutex::new(user_ev_controller)),
             event_rx: Arc::new(Mutex::new(event_rx)),
         }
@@ -525,6 +568,20 @@ impl Supervisor {
     pub async fn dequeue_peer(&self, id: usize) {
         tracing::info!("Dequeueing peer {}", id);
         let mut queue = self.waiting_peers.lock().await;
+        if let Some(position) = queue.iter().position(|x| x == &id) {
+            queue.remove(position);
+        }
+    }
+
+    pub async fn enqueue_gateway(&self, id: usize) {
+        tracing::info!("Enqueueing gateway {}", id);
+        let mut queue = self.waiting_gateways.lock().await;
+        queue.push_back(id);
+    }
+
+    pub async fn dequeue_gateway(&self, id: usize) {
+        tracing::info!("Dequeueing gateway {}", id);
+        let mut queue = self.waiting_gateways.lock().await;
         if let Some(position) = queue.iter().position(|x| x == &id) {
             queue.remove(position);
         }
@@ -579,6 +636,11 @@ impl Runnable for NetworkPeer {
             Ok(node) => match node.run().await {
                 Ok(_) => {
                     tracing::info!("Node {} finished", peer_id);
+                    let msg = match self.config.is_gateway() {
+                        true => PeerMessage::Status(PeerStatus::GatewayStarted(peer_id_num)),
+                        false => PeerMessage::Status(PeerStatus::PeerStarted(peer_id_num)),
+                    };
+                    self.send_peer_msg(msg).await;
                 }
                 Err(e) => {
                     tracing::error!("Node {} failed: {}", peer_id, e);
@@ -604,6 +666,7 @@ mod tests {
             peers_config: Arc::new(Mutex::new(HashMap::new())),
             processes: Mutex::new(HashMap::new()),
             waiting_peers: Arc::new(Mutex::new(VecDeque::new())),
+            waiting_gateways: Arc::new(Mutex::new(VecDeque::new())),
             user_ev_controller: Arc::new(Mutex::new(tokio::sync::mpsc::channel(1).0)),
             event_rx: Arc::new(Mutex::new(tokio::sync::mpsc::channel(1).1)),
         }
