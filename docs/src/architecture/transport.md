@@ -1,10 +1,22 @@
-# Freenet Transport Protocol (FTP)
+# Freenet Transport Protocol (FrTP)
 
 ## Introduction
 
-The Freenet Transport Protocol (FTP) is a UDP-based system designed to ensure reliable and encrypted
+The Freenet Transport Protocol (FrTP) is a UDP-based system designed to ensure reliable and encrypted
 message transmission. This document outlines the key elements of FTP, including connection 
 establishment, message handling, and rate limiting.
+
+## Overview
+
+* **Firewall Traversal**: FrTP allows peers behind firewalls to establish direct connections.
+* **Security**: All messages are encrypted using AES128GCM, with RSA public key exchange for
+  connection establishment, should effectively thwart man-in-the-middle attacks.
+* **Streaming**: Large messages can be streamed, meaning that a peer can start forwarding data
+  before the entire message is received.
+* **Covert**: FrTP can run on any UDP port and FrTP packets look like random data, although more
+   sophisticated analysis of packet timing and size could be used to identify FrTP traffic.
+* **Efficient**: FrTP is designed to minimize bandwidth usage, with rate limiting and message
+  batching.
 
 ## Connection Establishment
 
@@ -60,10 +72,12 @@ pub struct SymmetricMessage {
 }
 
 pub enum SymmetricMessagePayload {
-    AcknowledgeHello,
+    AcknowledgeHello { encrypted_symmetric_key: Vec<u8> },
     NoOperation,
-    // Acknowledgement or resend request
-    KeepAlive,
+    KeepAlive {
+        /// Arbitrary data peers can share with their neighbors
+        metadata: HashMap<String, String> 
+    },
     Disconnect,
     ShortMessage { payload: Vec<u8> },
     LongMessageFragment {
