@@ -541,12 +541,6 @@ impl Runnable for NetworkPeer {
         let mut receiver_ch = self.receiver_ch.deref().clone();
         receiver_ch.borrow_and_update();
 
-        let conf_str = serde_json::to_string(&self.config).unwrap();
-        Self::send_peer_msg(
-            self,
-            PeerMessage::Info(format!("Node {} with config: {}", peer_id, conf_str)),
-        )
-        .await;
         let mut memory_event_generator = MemoryEventsGen::<fastrand::Rng>::new_with_seed(
             receiver_ch,
             self.config.peer_id,
@@ -560,10 +554,18 @@ impl Runnable for NetworkPeer {
             config.max_contract_number.unwrap_or(config.nodes * 10),
             config.events as usize,
         );
+
+        let ws_client = match self.ws_client.clone() {
+            Some(ws_client) => ws_client,
+            None => {
+                return Err(anyhow!("Websocket client not initialized"));
+            }
+        };
+
         let event_generator = NetworkEventGenerator::new(
             self.config.peer_id,
             memory_event_generator,
-            self.ws_client.clone(),
+            ws_client,
             config.seed(),
         );
 
@@ -577,16 +579,12 @@ impl Runnable for NetworkPeer {
             Ok(node) => match node.run().await {
                 Ok(_) => {
                     tracing::info!("Node {} finished", peer_id);
-                    self.send_peer_msg(PeerMessage::Status(PeerStatus::Finished(peer_id_num)))
-                        .await;
                 }
                 Err(e) => {
                     tracing::error!("Node {} failed: {}", peer_id, e);
-                    Self::send_error_msg(self, format!("Node {} failed: {}", peer_id, e)).await;
                 }
             },
             Err(e) => {
-                Self::send_error_msg(self, format!("Failed to build node: {}", e)).await;
                 tracing::error!("Failed to build node: {}", e);
             }
         }
@@ -610,98 +608,64 @@ mod tests {
             event_rx: Arc::new(Mutex::new(tokio::sync::mpsc::channel(1).1)),
         }
     }
+
     #[tokio::test]
-    async fn test_peer() {
-        let mut supervisor = build_supervisor();
+    async fn test_network() {
+        // Generate keys for the nodes
+        let peer1_key = Keypair::generate_ed25519();
+        let peer2_key = Keypair::generate_ed25519();
 
-        let network_config = NetworkProcessConfig {
-            mode: Process::Peer,
-            id: Some("node-1".to_string()),
-        };
-
-        let config = super::super::TestConfig {
-            name: Some("TestName".to_string()),
-            seed: Some(12345),
-            gateways: 0,
-            nodes: 1,
-            ring_max_htl: 20,
-            rnd_if_htl_above: 10,
-            max_connections: 20,
-            min_connections: 0,
-            max_contract_number: Some(100),
-            events: 2,
-            event_wait_ms: Some(1000),
-            connection_wait_ms: Some(2000),
-            peer_start_backoff_ms: Some(2000),
-            execution_data: None,
-            disable_metrics: false,
-            command: super::super::TestMode::Network(NetworkProcessConfig {
-                mode: Process::Peer,
-                id: Some("node-1".to_string()),
-            }),
-        };
-
-        let server_task = start_server(Arc::new(supervisor));
-        tokio::task::spawn(server_task);
-
-        let (ws_client, _) = tokio_tungstenite::connect_async("ws://localhost:3000/ws")
-            .await
-            .expect("Failed to connect to supervisor");
-
-        let (user_ev_controller, mut receiver_ch) =
-            tokio::sync::watch::channel((0, PeerId::random()));
-        receiver_ch.borrow_and_update();
-
-        let mut node_config = NodeConfig::new();
-        node_config
+        // Create configurations for the peers
+        let mut peer_config1 = NodeConfig::new();
+        peer_config1
             .with_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
             .with_port(3001);
+        let mut peer_config2 = NodeConfig::new();
+        peer_config2
+            .with_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .with_port(3002);
 
-        let mut memory_event_generator = MemoryEventsGen::<fastrand::Rng>::new_with_seed(
-            receiver_ch,
-            node_config.peer_id,
-            config.seed.expect("seed should be set for child process"),
-        );
-        let peer_id_num = NodeLabel::from("node-1").number();
-
-        memory_event_generator.rng_params(
-            peer_id_num,
-            config.gateways + config.nodes,
-            config.max_contract_number.unwrap_or(config.nodes * 10),
-            config.events as usize,
-        );
-        let event_generator = NetworkEventGenerator::new(
-            node_config.peer_id,
-            memory_event_generator,
-            Arc::new(Mutex::new(ws_client)),
-            config.seed(),
+        // Create event generators for the peer 1
+        let (user_ev_controller1, receiver_ch1): (Sender<(u32, PeerId)>, Receiver<(u32, PeerId)>) =
+            tokio::sync::watch::channel((0, peer_config1.peer_id));
+        let mut event_generator1 = MemoryEventsGen::<fastrand::Rng>::new_with_seed(
+            receiver_ch1.clone(),
+            peer_config1.peer_id,
+            1994,
         );
 
-        // Obtain an identity::Keypair instance for the private_key
-        let private_key = Keypair::generate_ed25519();
+        // Create event generators for the peer 2
+        let (user_ev_controller2, receiver_ch2): (Sender<(u32, PeerId)>, Receiver<(u32, PeerId)>) =
+            tokio::sync::watch::channel((0, peer_config2.peer_id));
+        let mut event_generator2 = MemoryEventsGen::<fastrand::Rng>::new_with_seed(
+            receiver_ch2.clone(),
+            peer_config2.peer_id,
+            1994,
+        );
 
-        let data_dir = Executor::<Runtime>::test_data_dir("node-1");
+        let peer1 = NetworkPeer {
+            id: "peer1".to_string(),
+            config: peer_config1.clone(),
+            ws_client: None,
+            user_ev_controller: Arc::new(user_ev_controller1),
+            receiver_ch: Arc::new(receiver_ch1),
+        }
+        .build("peer1".to_string(), [Box::new(event_generator1)], peer1_key)
+        .await
+        .unwrap();
 
-        let cli_config = PeerCliConfig {
-            mode: OperationMode::Network,
-            node_data_dir: Some(data_dir),
-            address: node_config.local_ip.unwrap(),
-            port: node_config.local_port.unwrap(),
-        };
+        let peer2 = NetworkPeer {
+            id: "peer2".to_string(),
+            config: peer_config2.clone(),
+            ws_client: None,
+            user_ev_controller: Arc::new(user_ev_controller2),
+            receiver_ch: Arc::new(receiver_ch2),
+        }
+        .build("peer2".to_string(), [Box::new(event_generator2)], peer2_key)
+        .await
+        .unwrap();
 
-        let node = node_config
-            .clone()
-            .build::<1>(cli_config, [Box::new(event_generator)], private_key)
-            .await
-            .unwrap();
-
-        match node.run().await {
-            Ok(_) => {
-                tracing::info!("Node {} finished", "1");
-            }
-            Err(e) => {
-                tracing::error!("Node {} failed: {}", "1", e);
-            }
-        };
+        // Run the nodes
+        todo!();
     }
 }

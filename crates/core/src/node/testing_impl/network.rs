@@ -4,7 +4,6 @@ use crate::node::p2p_impl::NodeP2P;
 use crate::node::Node;
 use crate::tracing::EventRegister;
 use anyhow::Error;
-use futures::SinkExt;
 use libp2p_identity::Keypair;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -14,10 +13,10 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 pub struct NetworkPeer {
-    id: String,
+    pub id: String,
     pub config: crate::node::NodeConfig,
-    pub ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
-    user_ev_controller: Arc<Sender<(u32, crate::node::PeerId)>>,
+    pub ws_client: Option<Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
+    pub user_ev_controller: Arc<Sender<(u32, crate::node::PeerId)>>,
     pub receiver_ch: Arc<Receiver<(u32, crate::node::PeerId)>>,
 }
 
@@ -42,7 +41,6 @@ impl NetworkPeer {
 
         let config_url = format!("http://localhost:3000/config/{}", peer_id);
         let response = reqwest::get(&config_url).await?;
-        tracing::info!("Response config from server: {:?}", response);
         let peer_config = response.json::<crate::node::NodeConfig>().await?;
 
         let (user_ev_controller, receiver_ch): (
@@ -53,7 +51,7 @@ impl NetworkPeer {
         Ok(NetworkPeer {
             id: peer_id,
             config: peer_config,
-            ws_client: Arc::new(Mutex::new(ws_stream)),
+            ws_client: Some(Arc::new(Mutex::new(ws_stream))),
             user_ev_controller: Arc::new(user_ev_controller),
             receiver_ch: Arc::new(receiver_ch),
         })
@@ -91,26 +89,5 @@ impl NetworkPeer {
         )
         .await?;
         Ok(Node(node))
-    }
-
-    pub async fn send_peer_msg(&self, msg: PeerMessage) {
-        let serialized_msg: Vec<u8> = bincode::serialize(&msg).unwrap();
-        self.ws_client
-            .lock()
-            .await
-            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
-                serialized_msg,
-            ))
-            .await
-            .unwrap();
-    }
-
-    pub async fn send_error_msg(&self, msg: String) {
-        self.ws_client
-            .lock()
-            .await
-            .send(tokio_tungstenite::tungstenite::protocol::Message::Text(msg))
-            .await
-            .unwrap();
     }
 }
