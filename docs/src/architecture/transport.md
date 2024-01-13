@@ -10,9 +10,9 @@ establishment, message handling, and rate limiting.
 
 ### Scenario 1: Both Peers Behind NAT
 
-From Peer A's perspective (applicable to Peer B due to protocol symmetry):
+From Peer A's perspective (also applicable to Peer B as protocol is symmetric):
 
-1. **Initial Knowledge**: Each peer must know the other's IP, port, and public key.
+1. **Initial Knowledge**: Each peer must know the other's IP, port, and RSA public key.
 2. **Key Generation**: Peer A generates a random AES128GCM symmetric key,
    termed `outbound_symmetric_key`.
 3. **Outbound Hello Message**: Peer A encrypts `outbound_symmetric_key` and a u16 protocol version
@@ -79,10 +79,9 @@ pub enum SymmetricMessagePayload {
 ### Dropped and Out-of-Order Messages
 
 - **Duplicate Detection**: Messages are checked for duplicate `message_id` and hash. Duplicates
-  trigger a `NoOperation`
-  message with a reconfirmation in `confirm_receipt`.
-- **Acknowledgement Timeout**: Messages are resent if not acknowledged within 2
-  seconds (`MESSAGE_CONFIRMATION_TIMEOUT`).
+  trigger an immediate `NoOperation` message with a reconfirmation in `confirm_receipt`.
+- **Acknowledgement Timeout**: Messages are resent if not acknowledged within 2 seconds 
+  (`MESSAGE_CONFIRMATION_TIMEOUT`).
 
 ### Confirmation Batching
 
