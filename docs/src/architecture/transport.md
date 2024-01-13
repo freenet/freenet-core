@@ -123,10 +123,13 @@ pub enum SymmetricMessagePayload {
 
 ### Serialization
 
-Consider [Serde Bytes](https://docs.rs/serde_bytes/latest/serde_bytes/) for serialization, due to
-its efficiency and avoiding unnecessary copies - but consider any risks from deserializing
-untrusted data.
+* Try to avoid unnecessary copies of data, especially for large messages.
+* Ensure serialization format is robust against untrusted data.
 
+Consider:
+* [FlatBuffers](https://crates.io/crates/flatbuffers/)
+* [Serde Bytes](https://docs.rs/serde_bytes/latest/serde_bytes/)
+* [BinCode](https://github.com/bincode-org/bincode)
 
 ## Conclusion
 
