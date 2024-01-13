@@ -37,9 +37,6 @@ impl UdpConnectionInfo {
         remote_is_gateway: bool,
     ) -> Result<Self, ConnectionError> {
         let mut connection = Self {
-            transport,
-            raw_packets: PacketQueue::new(),
-            decrypted_packets: PacketQueue::new(),
             outbound_symmetric_key: None,
             inbound_symmetric_key: None,
             inbound_intro_packet: None,
@@ -47,21 +44,6 @@ impl UdpConnectionInfo {
             remote_public_key: Some(remote_public_key),
             remote_is_gateway,
         };
-
-        task::spawn(async move {
-            loop {
-                tokio::select! {
-                    Some((addr, message)) = raw_packets_receiver_clone.recv() => {
-                        // Handle the raw packet
-                        Self::handle_raw_packet(&addr, &message).await;
-                    },
-                    Some((addr, message)) = decrypted_packets_receiver_clone.recv() => {
-                        // Handle the decrypted packet
-                        Self::handle_decrypted_packet(&addr, &message).await;
-                    },
-                }
-            }
-        });
 
         Ok(connection)
     }

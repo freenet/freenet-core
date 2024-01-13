@@ -119,6 +119,15 @@ pub enum SymmetricMessagePayload {
   Exceeding limits
   triggers a 10ms sleep (`BANDWIDTH_CONTROL_SLEEP_DURATION`), with periodic reassessment.
 
+## Implementation Notes
+
+### Serialization
+
+Consider [Serde Bytes](https://docs.rs/serde_bytes/latest/serde_bytes/) for serialization, due to
+its efficiency and avoiding unnecessary copies - but consider any risks from deserializing
+untrusted data.
+
+
 ## Conclusion
 
 The Freenet Transport Protocol provides a robust framework for secure and efficient data
