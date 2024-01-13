@@ -76,7 +76,7 @@ pub enum SymmetricMessagePayload {
     NoOperation,
     KeepAlive {
         /// Arbitrary data peers can share with their neighbors
-        metadata: HashMap<String, String> 
+        metadata: HashMap<String, Vec<u8>> 
     },
     Disconnect,
     ShortMessage { payload: Vec<u8> },

@@ -73,7 +73,6 @@ impl UdpTransport {
             send_queue,
         }));
 
-        // Spawn a task for listening to incoming UDP packets
         let new_transport_clone = Arc::clone(&new_transport);
         task::spawn(async move {
             loop {
@@ -106,6 +105,7 @@ impl UdpTransport {
                         }
                     },
 
+                    // Handling of outbound packets
                     send_message = send_queue_receiver.recv() => {
                         if let Some((ip_addr, data)) = &send_message {
                             if let Err(e) = socket.send_to(&data, ip_addr).await {
