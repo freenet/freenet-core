@@ -1,152 +1,113 @@
-# Freenet Transport Protocol
+# Freenet Transport Protocol (FTP)
 
-Freenet's Transport Protocol (FTS) is designed to provide a reliable, encrypted message-based transport system over
-UDP.
+## Introduction
 
-## Establishing a connection between two peers
+The Freenet Transport Protocol (FTP) is a UDP-based system designed to ensure reliable and encrypted
+message transmission. This document outlines the key elements of FTP, including connection 
+establishment, message handling, and rate limiting.
 
-### Both peers behind NAT
+## Connection Establishment
 
-This is from the perspective of Peer A, but the same steps are taken by Peer B as the protocol is symmetrical.
+### Scenario 1: Both Peers Behind NAT
 
-1. To establish a direct connection both peers must know the other peer's IP address, port, and public key.
-2. Peer A randomly generates an [Aes128Gcm](https://docs.rs/aes-gcm/0.10.3/aes_gcm/type.Aes128Gcm.html) symmetric 
-   key, the `outbound_symmetric_key`.
-3. Peer A encrypts the `outbound_symmetric_key` with Peer B's public key, the `encrypted_symmetric_key` and
-   send it to Peer B, this is the `outbound_hello_message`.
-   1. Note that the `outbound_hello_message` is unique in that it is the only message type that isn't encrypted
-      with the `outbound_symmetric_key`. 
-4. At the same time Peer A listens for a `inbound_hello_message` from Peer B. When it receives this it 
-   decrypts the `inbound_symmetric_key` using its private key and stores it in `UdpConnectionInfo`.
-5. Peer A resends the `outbound_hello_message` every 200ms until it receives a `hello_ack` message from Peer B,
-   until it reaches a timeout of 5 seconds, at which point the connection attempt has failed.
-6. Peer A sends a `hello_ack` message to Peer B encrypted with the `outbound_symmetric_key`.
-   1. Peer A checks future messages from peer B to see if they are identical to the `inbound_hello_message`, if
-      it receives another one (perhaps because the `hello_ack` was lost) it sends another `hello_ack` message
-      and otherwise disregards the message. 
-7. When both peers have received a `hello_ack` message from the other peer they have established a connection.
+From Peer A's perspective (applicable to Peer B due to protocol symmetry):
 
-### Peer A behind NAT, Peer B is a gateway
+1. **Initial Knowledge**: Each peer must know the other's IP, port, and public key.
+2. **Key Generation**: Peer A generates a random AES128GCM symmetric key,
+   termed `outbound_symmetric_key`.
+3. **Outbound Hello Message**: Peer A encrypts `outbound_symmetric_key` and a u16 protocol version
+   number with Peer B's
+   public key, sending this as the `outbound_hello_message`.
+    - **Note**: This is the sole message type not encrypted with `outbound_symmetric_key`.
+4. **Inbound Hello Message**: Peer A awaits Peer B’s `inbound_hello_message`, decrypts it using its
+   private key, and
+   stores the `inbound_symmetric_key` in `UdpConnectionInfo`.
+5. **Acknowledgement Protocol**: Peer A repeatedly sends `outbound_hello_message` every 200ms until
+   a `hello_ack` from Peer B is received or a 5-second timeout occurs, indicating connection 
+   failure.
+6. **Hello Acknowledgement**: Upon receiving `inbound_hello_message`, Peer A sends back `hello_ack`,
+   using `outbound_symmetric_key`.
+    - **Repeated Hello Handling**: If a repeated `inbound_hello_message` is detected, Peer A
+      retransmits `hello_ack` and disregards the duplicate message.
+7. **Connection Establishment**: Connection is established once both peers have exchanged and
+   acknowledged `hello_ack` messages.
 
-In this scenario only Peer A is attempting to initiate the connection, Peer B is a gateway and will listen for
-any connections coming from any other peer. Peer A must know Peer B's IP address, port, and public key - but
-Peer B is initially unaware of Peer A. Peer A knows that it's trying to connect to a gateway.
+### Scenario 2: Peer A Behind NAT, Peer B as Gateway
 
-The key difference between this scenario and the previous one is that the same symmetric key is used both
-for outbound and inbound, this key is chosen by Peer A.
+Here, Peer A initiates the connection, while Peer B operates as a gateway.
 
-1. Peer A randomly generates an AES128 symmetric key, which will serve as both the `outbound_symmetric_key`
-   and `inbound_symmetric_key`.
-2. Peer A creates and sends the `outbound_hello_message` to Peer B, which is the symmetric key encrypted with 
-   Peer B's public key, this is resent every 200ms as in the previous scenario.
-4. Peer B receives the `outbound_hello_message` and decrypts it with its private key, storing the symmetric key
-   in `UdpConnectionInfo`, and transmits a `hello_ack` message to Peer A encrypted with the symmetric key.
+1. **Symmetric Key Selection**: Peer A generates an AES128 symmetric key, serving as
+   both `outbound_symmetric_key` and `inbound_symmetric_key`.
+2. **Outbound Hello Message**: Similar to Scenario 1, Peer A sends an encrypted symmetric key to
+   Peer B.
+3. **Acknowledgement and Connection**: Peer B decrypts the message, acknowledges it, and establishes
+   the connection using the symmetric key.
 
-## Keep-alive messages
+## Keep-Alive Protocol
 
-Once a connection has been established, both peers send a `keep_alive` message every 30 seconds to the other
-peer to ensure that the connection remains open. If a peer does not receive a `keep_alive` or other message from the
-other peer within 120 seconds it will close the connection.
+To maintain an open connection, `keep_alive` messages are exchanged every 30 seconds. A connection 
+is terminated if a peer fails to receive any message within 120 seconds.
 
-## Symmetric message schema
+## Symmetric Message Schema
 
 ```rust
 pub struct SymmetricMessage {
-    /// A unique number generated by the sender of this message, used to detect and discard duplicate messages
-    /// and to identify dropped messages. These should start at `0` and increment by `1` for each message sent,
-    /// they should wrap around to `0` after reaching `u16::MAX`.
     pub message_id: u16,
-    
-    /// This is used to confirm receipt of messages, the sender will resend messages if not confirmed within 
-    /// 2 seconds (`MESSAGE_CONFIRMATION_TIMEOUT`), or if a message id is confirmed that came after a message 
-    /// that hasn't yet been confirmed (i.e. a message was dropped). Note: this could cause unnecessary
-    /// retransmission of messages if received out-of-order, I'm assuming that this is rare enough that
-    /// it's not worth the extra complexity to avoid it.
+    // Unique number for message tracking and duplicate detection
     pub confirm_receipt: Vec<u16>,
-    
+    // Confirmation mechanism to identify dropped messages
     pub payload: SymmetricMessagePayload,
 }
 
 pub enum SymmetricMessagePayload {
     AcknowledgeHello,
-    
-    /// This can be used to acknowledge the receipt of a message, or to request a resend of a message
-    /// even if the peer doesn't otherwise have any messages to send
     NoOperation,
-    
+    // Acknowledgement or resend request
     KeepAlive,
-    
     Disconnect,
-    
-    /// A message sent by the sender of this message
-    ShortMessage { payload: Vec<u8>},
-    
+    ShortMessage { payload: Vec<u8> },
     LongMessageFragment {
-        /// The total length of this message in bytes
         total_length: u64,
-        
-        /// The start byte of this fragment in the message
         start_index: u64,
-        
-        /// The payload of this fragment
         payload: Vec<u8>,
     },
 }
 ``` 
 
-## Handling dropped and out-of-order `SymmetricMessage`s
+## Message Handling
 
-Every symmetric message has a `message_id` field, which is a unique number generated by the sender of the message.
-In practice these will be generated sequentially starting at `0` and wrapping around to `u16::MAX`, this minimizes
-the likelihood of duplicate message ids being used within a short timeframe.
+### Dropped and Out-of-Order Messages
 
-When a peer receives a `SymmetricMessage` it checks if it has already received a message with the same `message_id`,
-if so it discards the message but sends a `NoOperation` message back to the sender including it in confirm_receipt 
-to re-confirm its receipt.
+- **Duplicate Detection**: Messages are checked for duplicate `message_id` and hash. Duplicates
+  trigger a `NoOperation`
+  message with a reconfirmation in `confirm_receipt`.
+- **Acknowledgement Timeout**: Messages are resent if not acknowledged within 2
+  seconds (`MESSAGE_CONFIRMATION_TIMEOUT`).
 
-If a peer sends a message and doesn't receive an acknowledgement within 2 seconds (`MESSAGE_CONFIRMATION_TIMEOUT`) 
-it will resend the message. Because of this peers need to retain the messages they send until they are acknowledged.
+### Confirmation Batching
 
-### Confirmation batching
+- **Batching Strategy**: Receipts can be delayed up to 500ms (`MAX_CONFIRMATION_DELAY`) to enable
+  batch confirmation.
+- **Queue Management**: Receipt queues exceeding 20 messages prompt immediate confirmation to
+  prevent overflow.
 
-To avoid having to send a receipt message for every message received, a peer can wait up to 500ms 
-(`MAX_CONFIRMATION_DELAY`) before sending a receipt message. The hope is that this will allow multiple messages 
-to be received and acknowledged with a single receipt message, potentially piggy-backing on a message that would 
-have been sent anyway.
+## Message Types
 
-This can be achieved by maintaining a `receipt_queue`, perhaps a `VecDeque<(Instant, u16)>`, which stores the 
-`message_id` that haven't yet been confirmed along with the time they were stored. If the receipt queue exceeds 
-20 messages (`MAX_RECEIPT_QUEUE_SIZE`), then a receipt message will be sent immediately, this is to avoid the 
-queue growing too large to fit in a single UDP packet.
+- **Short Messages**: Contained within a single UDP packet (up to 1kb).
+- **Long Messages**: Split into fragments for larger payloads, enabling efficient data forwarding.
 
-It's obviously important that `MAX_CONFIRMATION_DELAY` is significantly less than `MESSAGE_CONFIRMATION_TIMEOUT`.
+## Rate Limiting
 
-## Short and long message types
+- **Initial Setup**: Upstream bandwidth set 50% above desired usage to allow for traffic bursts.
+- **Dynamic Adjustment**: Future adaptations may use isotonic regression for optimizing bandwidth
+  and packet loss
+  balance.
+- **Implementation**: Bandwidth monitoring over 10-second windows (`BANDWIDTH_MEASUREMENT_WINDOW`).
+  Exceeding limits
+  triggers a 10ms sleep (`BANDWIDTH_CONTROL_SLEEP_DURATION`), with periodic reassessment.
 
-Short messages are messages that fit within a single UDP packet - maximum length 1kb, while long messages can have
-unlimited length and are split into fragments.
+## Conclusion
 
-One of the key goals of long messages is to allow a peer to start forwarding a long message to another peer before
-it has received the entire message. This is essential for the efficient inserting and retrieving of large contract
-states.
-
-By convention the first fragment of a long message should explain what the message is, for example a response to
-a request for a contract state, so the peer can decide how it will handle the remainder of the long message (eg. 
-whether it will forward it to another peer).
-
-## Rate limiting
-
-FTS uses a simple rate limiting scheme to control bandwidth usage. We specify a maximum
-upstream bandwidth in bytes per second - in practice this should be set higher than the peer's desired upstream
-bandwidth usage as governed by the `topology` module, to allow for bursts of traffic - perhaps 50% higher.
-
-While this should be hardwired initially, in future we can adjust it dynamically using an 
-[isotonic regression](https://github.com/sanity/pav.rs) to determine the relationship between bandwidth usage and 
-packet loss, and choosing the bandwidth limit accordingly.
-
-The rate limiting is implemented by monitoring the number of bytes sent in the last 10 seconds 
-(`BANDWIDTH_MESAUREMENT_WINDOW`), and if it exceeds the maximum bandwidth the peer will sleep for 10ms 
-(`BANDWIDTH_CONTROL_SLEEP_DURATION`) and then check again, repeating until the bandwidth usage is below the limit.
-
-In future we should consider a more sophisticated approach to determining the sleep time, however we should bear
-in mind that sleeping for very short periods of time (eg. 1ms) is not very accurate on most operating systems.
+The Freenet Transport Protocol provides a robust framework for secure and efficient data
+transmission. Its design considers NAT challenges, message integrity, and bandwidth management, 
+ensuring reliable communication in various network conditions.
