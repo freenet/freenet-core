@@ -15,8 +15,8 @@ establishment, message handling, and rate limiting.
   before the entire message is received.
 * **Covert**: FrTP can run on any UDP port and FrTP packets look like random data, although more
    sophisticated analysis of packet timing and size could be used to identify FrTP traffic.
-* **Efficient**: FrTP is designed to minimize bandwidth usage, with rate limiting and message
-  batching.
+* **Efficient**: FrTP is designed to minimize bandwidth usage, with rate limiting and confirmation
+   message batching.
 
 ## Connection Establishment
 
