@@ -3,7 +3,7 @@
 ## Introduction
 
 The Freenet Transport Protocol (FrTP) is a UDP-based system designed to ensure reliable and encrypted
-message transmission. This document outlines the key elements of FTP, including connection 
+message transmission. This document outlines the key elements of FrTP, including connection 
 establishment, message handling, and rate limiting.
 
 ## Overview
