@@ -9,32 +9,20 @@ use std::net::SocketAddr;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use super::PacketData;
+use super::{connection_handler::ConnectionHandlerMessage, PacketData};
 
-/*
- NOTES:
-    The receiver thread should be set up when the channel is created, it shouldn't be stored
-    in the struct because only the receiver thread loop should be able to access it.
-*/
-
-type ConnectionHandlerMessage = (SocketAddr, Vec<u8>);
-
-// todo: maybe makes more sense to switch naming here? this should be FreenetProtocol
-// or FreenetConnection since it's our own custom transport protocol over UDP
-// and what we are calling UdpTransport
-// should be called FreenetConnectionHandler since it's what is doing
-pub(super) struct UdpConnection {
+pub(super) struct Connection {
     outbound_symmetric_key: Option<Aes128Gcm>,
     inbound_symmetric_key: Option<Aes128Gcm>,
     inbound_intro_packet: Option<Vec<u8>>,
     outbound_intro_packet: Option<Vec<u8>>,
     remote_public_key: Option<PublicKey>,
     remote_is_gateway: bool,
-    remote_addr: SocketAddr,
+    pub remote_addr: SocketAddr,
     connection_handler_sender: mpsc::Sender<ConnectionHandlerMessage>,
 }
 
-impl UdpConnection {
+impl Connection {
     pub(super) async fn new(
         remote_addr: SocketAddr,
         remote_public_key: PublicKey,
@@ -119,7 +107,7 @@ impl UdpConnection {
 }
 
 #[derive(Debug, Error)]
-pub enum ConnectionError {
+pub(super) enum ConnectionError {
     #[error("timeout occurred")]
     Timeout,
 

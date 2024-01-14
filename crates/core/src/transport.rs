@@ -1,5 +1,21 @@
 #![allow(dead_code)] // TODO: Remove before integration
-
+//! Freenet Transport protocol implementation.
+//!
+//! # Protocol
+//!
+//! ## Connection Establishment
+//!
+//! ### Neither peer is a gateway
+//!
+//!
+//!
+//! # Transport message types (u8)
+//!
+//! * 0: Symmetric key encrypted with our public key
+//! * 1: Acknowledgement of symmetric key - encrypted with symmetric key
+//! * 2: Message - encrypted with symmetric key
+//! * 3: Disconnect message - encrypted with symmetric key
+//!
 //! # Transport
 //!
 //! The transport layer is responsible for reliably sending and receiving messages
@@ -45,16 +61,13 @@
 //! 3. Peer B stores the `ConnectionStart` and `ConnectionAck` messages in [UdpConnection] and
 //!    if its sees that message again it resends the `ConnectionAck` message.
 
+mod connection;
+mod connection_handler;
 mod crypto;
-pub(crate) mod errors;
-mod udp_connection;
-mod udp_transport;
 
 use std::ops::Deref;
 
-use errors::*;
-
-use self::udp_transport::MAX_PACKET_SIZE;
+use self::{connection::ConnectionError, connection_handler::MAX_PACKET_SIZE};
 
 struct ReceiverStream {}
 
@@ -114,4 +127,12 @@ impl BytesPerSecond {
     pub fn as_f64(&self) -> f64 {
         self.0
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum SenderStreamError {
+    #[error("stream closed unexpectedly")]
+    Closed,
+    #[error("message too big, size: {size}, max size: {max_size}")]
+    MessageExceedsLength { size: usize, max_size: usize },
 }
