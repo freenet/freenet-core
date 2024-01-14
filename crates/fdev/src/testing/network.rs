@@ -233,13 +233,13 @@ pub async fn run_network(
     tracing::info!("Starting network");
 
     let cmd_args = SubProcess::build_command(&test_config, test_config.seed());
-    start_peers(supervisor.clone(), &cmd_args).await?;
+    supervisor.start_peer_gateways(&cmd_args).await?;
+    supervisor.start_peer_nodes(&cmd_args).await?;
 
     let peers: Vec<(NodeLabel, PeerId)> = supervisor
-        .peers_config
-        .lock()
+        .get_peer_nodes()
         .await
-        .iter()
+        .into_iter()
         .map(|(label, config)| (label.clone(), config.peer_id))
         .collect();
 
@@ -300,67 +300,6 @@ pub async fn run_network(
     Ok(())
 }
 
-async fn start_process(
-    supervisor: Arc<Supervisor>,
-    cmd_args: &[String],
-    label: &NodeLabel,
-    config: &NodeConfig,
-) -> Result<(), Error> {
-    if config.is_gateway() {
-        supervisor.enqueue_gateway(label.number()).await;
-    } else {
-        supervisor.enqueue_peer(label.number()).await;
-    }
-    let process = SubProcess::start(cmd_args, label, config.peer_id).await?;
-    supervisor
-        .processes
-        .lock()
-        .await
-        .insert(config.peer_id, process);
-    Ok(())
-}
-
-async fn start_peers(supervisor: Arc<Supervisor>, cmd_args: &[String]) -> Result<(), Error> {
-    let mut gateways = Vec::new();
-    let mut nodes = Vec::new();
-    let peers_map = supervisor.peers_config.lock().await;
-    for (label, config) in peers_map.iter() {
-        if config.is_gateway() {
-            gateways.push((label, config));
-        } else {
-            nodes.push((label, config));
-        }
-    }
-
-    for (label, config) in gateways {
-        start_process(supervisor.clone(), cmd_args, label, config).await?;
-    }
-    tracing::info!("Waiting for all gateways to start");
-    wait_for_gateways(supervisor.clone()).await;
-    tracing::info!("All gateways started");
-
-    for (label, config) in nodes {
-        start_process(supervisor.clone(), cmd_args, label, config).await?;
-    }
-    tracing::info!("Waiting for all peers to start");
-    wait_for_peers(supervisor.clone()).await;
-    tracing::info!("All peers started");
-
-    Ok(())
-}
-
-async fn wait_for_gateways(supervisor: Arc<Supervisor>) {
-    while !supervisor.waiting_gateways.lock().await.is_empty() {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-async fn wait_for_peers(supervisor: Arc<Supervisor>) {
-    while !supervisor.waiting_peers.lock().await.is_empty() {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
 async fn config_handler(
     peers_config: Arc<Mutex<HashMap<NodeLabel, NodeConfig>>>,
     Path(peer_id): Path<String>,
@@ -368,7 +307,6 @@ async fn config_handler(
     tracing::info!("Received config request for peer_id: {}", peer_id);
     let config = peers_config.lock().await;
     let id = NodeLabel::from(peer_id.as_str());
-    tracing::info!("Received config request for peer_id: {}", peer_id);
     match config.get(&id) {
         Some(node_config) => {
             tracing::info!("Found config for peer_id: {}", peer_id);
@@ -558,15 +496,73 @@ impl Supervisor {
             event_rx: Arc::new(Mutex::new(event_rx)),
         }
     }
+    async fn start_process(
+        &self,
+        cmd_args: &[String],
+        label: &NodeLabel,
+        config: &NodeConfig,
+    ) -> Result<(), Error> {
+        let process = SubProcess::start(cmd_args, label, config.peer_id).await?;
+        self.processes.lock().await.insert(config.peer_id, process);
+        Ok(())
+    }
 
-    pub async fn enqueue_peer(&self, id: usize) {
-        tracing::info!("Enqueueing peer {}", id);
+    pub async fn get_peer_nodes(&self) -> Vec<(NodeLabel, NodeConfig)> {
+        self.peers_config
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, config)| !config.is_gateway())
+            .map(|(label, config)| (label.clone(), config.clone()))
+            .collect()
+    }
+
+    pub async fn gent_peer_gateways(&self) -> Vec<(NodeLabel, NodeConfig)> {
+        self.peers_config
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, config)| config.is_gateway())
+            .map(|(label, config)| (label.clone(), config.clone()))
+            .collect()
+    }
+
+    pub async fn start_peer_nodes(&self, cmd_args: &[String]) -> Result<(), Error> {
+        let nodes: Vec<(NodeLabel, NodeConfig)> = self.get_peer_nodes().await;
+        for (label, config) in nodes {
+            self.enqueue_node(label.number()).await;
+            self.start_process(cmd_args, &label, &config).await?;
+        }
+        tracing::info!("Waiting for all gateways to start");
+        while !self.waiting_gateways.lock().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tracing::info!("All gateways started");
+        Ok(())
+    }
+
+    pub async fn start_peer_gateways(&self, cmd_args: &[String]) -> Result<(), Error> {
+        let nodes: Vec<(NodeLabel, NodeConfig)> = self.gent_peer_gateways().await;
+        for (label, config) in nodes {
+            self.enqueue_gateway(label.number()).await;
+            self.start_process(cmd_args, &label, &config).await?;
+        }
+        tracing::info!("Waiting for all gateways to start");
+        while !self.waiting_gateways.lock().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tracing::info!("All gateways started");
+        Ok(())
+    }
+
+    pub async fn enqueue_node(&self, id: usize) {
+        tracing::info!("Enqueueing node {}", id);
         let mut queue = self.waiting_peers.lock().await;
         queue.push_back(id);
     }
 
     pub async fn dequeue_peer(&self, id: usize) {
-        tracing::info!("Dequeueing peer {}", id);
+        tracing::info!("Dequeueing node {}", id);
         let mut queue = self.waiting_peers.lock().await;
         if let Some(position) = queue.iter().position(|x| x == &id) {
             queue.remove(position);
