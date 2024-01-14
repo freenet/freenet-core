@@ -46,6 +46,7 @@
 //! 3. Peer B stores the `ConnectionStart` and `ConnectionAck` messages in [UdpConnection] and
 //!    if its sees that message again it resends the `ConnectionAck` message.
 
+mod bw;
 mod connection_handler;
 mod connection_info;
 mod crypto;
