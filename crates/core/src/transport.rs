@@ -1,21 +1,6 @@
 #![allow(dead_code)] // TODO: Remove before integration
 //! Freenet Transport protocol implementation.
 //!
-//! # Protocol
-//!
-//! ## Connection Establishment
-//!
-//! ### Neither peer is a gateway
-//!
-//!
-//!
-//! # Transport message types (u8)
-//!
-//! * 0: Symmetric key encrypted with our public key
-//! * 1: Acknowledgement of symmetric key - encrypted with symmetric key
-//! * 2: Message - encrypted with symmetric key
-//! * 3: Disconnect message - encrypted with symmetric key
-//!
 //! # Transport
 //!
 //! The transport layer is responsible for reliably sending and receiving messages
@@ -51,6 +36,13 @@
 //! receiving the message will decrypt the key and use it to encrypt future messages.
 //!
 //! ## Opening a Connection
+//!
+//! ## Transport message types (u8)
+//!
+//! * 0: Symmetric key encrypted with our public key
+//! * 1: Acknowledgement of symmetric key - encrypted with symmetric key
+//! * 2: Message - encrypted with symmetric key
+//! * 3: Disconnect message - encrypted with symmetric key
 //!
 //! ### Neither peer is a gateway
 //!
