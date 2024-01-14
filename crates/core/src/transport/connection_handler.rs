@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tokio::task;
 
 use super::{
-    connection::Connection,
+    connection_info::ConnectionInfo,
     crypto::{TransportKeypair, TransportPublicKey},
 };
 
@@ -19,7 +19,7 @@ pub(super) const MAX_PACKET_SIZE: usize = 2048;
 pub(super) type ConnectionHandlerMessage = (SocketAddr, Vec<u8>);
 
 pub(crate) struct ConnectionHandler {
-    connection_info: HashMap<PeerId, Connection>,
+    connection_info: HashMap<PeerId, ConnectionInfo>,
     keypair: TransportKeypair,
     listen_port: u16,
     is_gateway: bool,

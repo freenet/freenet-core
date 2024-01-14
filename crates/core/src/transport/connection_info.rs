@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 use super::{connection_handler::ConnectionHandlerMessage, PacketData};
 
-pub(super) struct Connection {
+pub(super) struct ConnectionInfo {
     outbound_symmetric_key: Option<Aes128Gcm>,
     inbound_symmetric_key: Option<Aes128Gcm>,
     inbound_intro_packet: Option<Vec<u8>>,
@@ -22,7 +22,7 @@ pub(super) struct Connection {
     connection_handler_sender: mpsc::Sender<ConnectionHandlerMessage>,
 }
 
-impl Connection {
+impl ConnectionInfo {
     pub(super) async fn new(
         remote_addr: SocketAddr,
         remote_public_key: PublicKey,

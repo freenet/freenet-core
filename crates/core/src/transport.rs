@@ -61,13 +61,13 @@
 //! 3. Peer B stores the `ConnectionStart` and `ConnectionAck` messages in [UdpConnection] and
 //!    if its sees that message again it resends the `ConnectionAck` message.
 
-mod connection;
 mod connection_handler;
+mod connection_info;
 mod crypto;
 
 use std::ops::Deref;
 
-use self::{connection::ConnectionError, connection_handler::MAX_PACKET_SIZE};
+use self::{connection_handler::MAX_PACKET_SIZE, connection_info::ConnectionError};
 
 struct ReceiverStream {}
 
