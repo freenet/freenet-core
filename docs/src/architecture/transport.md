@@ -3,7 +3,7 @@
 ## Introduction
 
 The Freenet Transport Protocol (FrTP) is a UDP-based system designed to ensure reliable and encrypted
-message transmission. This document outlines the key elements of FTP, including connection 
+message transmission. This document outlines the key elements of FrTP, including connection 
 establishment, message handling, and rate limiting.
 
 ## Overview
@@ -15,8 +15,8 @@ establishment, message handling, and rate limiting.
   before the entire message is received.
 * **Covert**: FrTP can run on any UDP port and FrTP packets look like random data, although more
    sophisticated analysis of packet timing and size could be used to identify FrTP traffic.
-* **Efficient**: FrTP is designed to minimize bandwidth usage, with rate limiting and message
-  batching.
+* **Efficient**: FrTP is designed to minimize bandwidth usage, with rate limiting and confirmation
+   message batching.
 
 ## Connection Establishment
 
@@ -92,8 +92,9 @@ pub enum SymmetricMessagePayload {
 
 ### Dropped and Out-of-Order Messages
 
-- **Duplicate Detection**: Messages are checked for duplicate `message_id` and hash. Duplicates
-  trigger an immediate `NoOperation` message with a reconfirmation in `confirm_receipt`.
+- **Duplicate Detection**: Messages are checked for duplicate `message_id` and a cheap
+  (non-cryptographic) hash. Duplicates trigger an immediate `NoOperation` message with 
+  a reconfirmation in `confirm_receipt`.
 - **Acknowledgement Timeout**: Messages are resent if not acknowledged within 2 seconds 
   (`MESSAGE_CONFIRMATION_TIMEOUT`).
 
