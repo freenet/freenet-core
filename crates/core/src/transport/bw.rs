@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+/// A tracker for UDP packets that keeps track of the bandwidth used in the last window_size.
 struct UdpPacketTracker {
     packets: VecDeque<(usize, Instant)>,
     window_size: Duration,
@@ -8,7 +9,7 @@ struct UdpPacketTracker {
 }
 
 impl UdpPacketTracker {
-    fn new(window_size: Duration, bandwidth_limit: usize) -> Self {
+    fn new(window_size: Duration) -> Self {
         UdpPacketTracker {
             packets: VecDeque::new(),
             window_size,
@@ -16,6 +17,7 @@ impl UdpPacketTracker {
         }
     }
 
+    /// Report that a packet was sent
     fn add_packet(&mut self, packet_size: usize) {
         let now = Instant::now();
         self.packets.push_back((packet_size, now));
@@ -38,8 +40,9 @@ impl UdpPacketTracker {
         }
     }
 
-    /// Returns Ok(()) if the packet can be sent immediately, otherwise returns Err(wait_time)
-    /// where wait_time is the time that needs to pass before the packet can be sent.
+    /// Returns Ok(()) if the packet can be sent immediately without the bandwidth limit being
+    /// exceeded in the `window_size`. Otherwise returns Err(wait_time) where wait_time is the
+    /// amount of time that should be waited before sending the packet.
     fn can_send_packet(
         &mut self,
         bandwidth_limit: usize,
