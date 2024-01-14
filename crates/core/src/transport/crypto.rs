@@ -2,15 +2,16 @@ use rand::rngs::OsRng;
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 
 pub(super) struct TransportKeypair {
-    public: TransportPublicKey,
-    secret: TransportSecretKey,
+    pub public: TransportPublicKey,
+    pub secret: TransportSecretKey,
 }
 
 impl TransportKeypair {
     pub fn new() -> Self {
         let mut rng = OsRng;
-        let bits = 2048; // Key size, can be adjusted
-        let priv_key = RsaPrivateKey::new(&mut rng, bits).expect("failed to generate a key");
+        // Key size, can be adjusted
+        const BITS: usize = 2048;
+        let priv_key = RsaPrivateKey::new(&mut rng, BITS).expect("failed to generate a key");
         let pub_key = RsaPublicKey::from(&priv_key);
 
         TransportKeypair {

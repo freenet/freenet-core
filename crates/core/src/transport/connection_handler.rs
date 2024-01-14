@@ -1,5 +1,7 @@
 use super::*;
 use crate::node::PeerId;
+use aes_gcm::{aes::Aes128, KeyInit};
+use futures::stream::FuturesUnordered;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::vec::Vec;
@@ -14,6 +16,7 @@ use super::{
 
 /// The maximum size of a received UDP packet, MTU tipically is 1500
 /// so this should be more than enough.
+// todo: probably reduce this to 1500? since we are using this for breaking up messages etc.
 pub(super) const MAX_PACKET_SIZE: usize = 2048;
 
 pub(super) type ConnectionHandlerMessage = (SocketAddr, Vec<u8>);
@@ -27,7 +30,7 @@ pub(crate) struct ConnectionHandler {
     // todo: don't think we need to set in a second task and we can manage all this
     // with FuturesUnordered and concurrently handling all the connections,
     // but revisit this when the code is a bit more mature and see if it's the case
-    send_queue: mpsc::Sender<(SocketAddr, PacketData)>,
+    send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>,
 }
 
 impl ConnectionHandler {
@@ -66,7 +69,7 @@ impl ConnectionHandler {
         &mut self,
         peer_id: PeerId,
         remote_public_key: TransportPublicKey,
-        socket_addr: SocketAddr,
+        remote_socket_addr: SocketAddr,
         remote_is_gateway: bool,
         timeout: std::time::Duration,
     ) -> Result<(), TransportError> {
@@ -77,14 +80,42 @@ impl ConnectionHandler {
         * 2: Message - encrypted with symmetric key
         * 3: Disconnect message - encrypted with symmetric key
         */
-        // let key = random::<[u8; 16]>();
-        // let outbound_sym_key: Aes128 =
-        //     Aes128::new_from_slice(&key).map_err(|e| TransportError(e.to_string()))?;
+        let key = rand::random::<[u8; 16]>();
+        let outbound_sym_key: Aes128 = Aes128::new_from_slice(&key).expect("valid length");
+        // todo: how large is this `intro_packet`, 16 bytes too? if it fits in a single UDP packet
+        let encrypted_key: Vec<u8> = remote_public_key.encrypt(&key);
+        let intro_packet = {
+            // fixme, this assetion would fail now
+            // ideally we want protoc version + encrypted key to fit into a packet
+            debug_assert!(encrypted_key.len() <= MAX_PACKET_SIZE - std::mem::size_of::<u16>());
+            let mut data = [0; MAX_PACKET_SIZE];
+            data.copy_from_slice(&encrypted_key[..]);
+            PacketData::from_bytes(data, encrypted_key.len())
+        };
 
-        // let intro_packet = remote_public_key
-        //     .encrypt(&key)
-        //     .map_err(|e| TransportError(e.to_string()))?;
-        todo!("attempt establishing connection; build a `Connection` instance and save it")
+        if !remote_is_gateway {
+            self.nat_traversal(remote_socket_addr, intro_packet).await?;
+        } else {
+            todo!()
+        }
+
+        todo!("attempt establishing connection; build a `ConnectionInfo` instance and save it")
+    }
+
+    pub(super) const PROTOC_VERSION: u16 = 0;
+
+    async fn nat_traversal(
+        &self,
+        remote_socket: SocketAddr,
+        intro_packet: PacketData,
+    ) -> Result<(), TransportError> {
+        self.send_queue
+            .send((
+                remote_socket,
+                ConnectionEvent::ConnectionStart { intro_packet },
+            ))
+            .await?;
+        Ok(())
     }
 
     /// Method used by users of connection handler to send a message.
@@ -114,7 +145,9 @@ impl ConnectionHandler {
             .connection_info
             .get(peer_id)
             .ok_or_else(|| TransportError::MissingPeer(*peer_id))?;
-        self.send_queue.send((connection.remote_addr, data)).await?;
+        self.send_queue
+            .send((connection.remote_addr, ConnectionEvent::SendRawPacket(data)))
+            .await?;
         Ok(())
     }
 
@@ -139,7 +172,7 @@ impl ConnectionHandler {
 struct UdpPacketsListener {
     socket: UdpSocket,
     connection_raw_packet_senders: HashMap<SocketAddr, mpsc::Sender<(SocketAddr, PacketData)>>,
-    send_queue: mpsc::Receiver<(SocketAddr, PacketData)>,
+    send_queue: mpsc::Receiver<(SocketAddr, ConnectionEvent)>,
 }
 
 impl UdpPacketsListener {
@@ -172,10 +205,20 @@ impl UdpPacketsListener {
                 },
                 // Handling of outbound packets
                 send_message = self.send_queue.recv() => {
-                    if let Some((ip_addr, data)) = &send_message {
-                        // if let Err(e) = self.socket.send_to(&data, ip_addr).await {
-                        //     tracing::warn!("Failed to send UDP packet: {:?}", e);
-                        // }
+                    if let Some((socket, event)) = send_message {
+                        match event {
+                            ConnectionEvent::SendRawPacket(data) => {
+                                if let Err(e) = self.socket.send_to(&data, socket).await {
+                                    tracing::warn!("Failed to send UDP packet: {:?}", e);
+                                }
+                            }
+                            ConnectionEvent::ConnectionStart { intro_packet } => {
+                                // todo: repeat each 200ms and control for an Ack packet comming back
+                                if let Err(e) = self.socket.send_to(&intro_packet, socket).await {
+                                    tracing::warn!("Failed to send UDP packet: {:?}", e);
+                                }
+                            }
+                        }
                     }
                 },
             }
@@ -187,9 +230,10 @@ impl UdpPacketsListener {
     }
 }
 
-#[derive(Debug)]
-enum InternalMessage {
-    UdpPacketReceived { source: SocketAddr, data: Vec<u8> },
+enum ConnectionEvent {
+    SendRawPacket(PacketData),
+    ConnectionStart { intro_packet: PacketData },
+    // UdpPacketReceived { source: SocketAddr, data: Vec<u8> },
 }
 
 // Define a custom error type for the transport layer
@@ -200,5 +244,12 @@ pub(super) enum TransportError {
     #[error(transparent)]
     IO(#[from] std::io::Error),
     #[error("transport handler channel closed")]
-    ChannelClosed(#[from] mpsc::error::SendError<(SocketAddr, PacketData)>),
+    ChannelClosed(#[from] mpsc::error::SendError<(SocketAddr, ConnectionEvent)>),
+}
+
+#[test]
+fn check_size() {
+    let pair = super::crypto::TransportKeypair::new();
+    let encrypted = pair.public.encrypt(&[0; 16]);
+    eprintln!("encrypted: {:?}", encrypted.len());
 }
