@@ -25,6 +25,10 @@ impl UdpPacketTracker {
         self.cleanup();
     }
 
+    fn set_bandwidth_limit(&mut self, bandwidth_limit: usize) {
+        self.bandwidth_limit = bandwidth_limit;
+    }
+
     /// Removes packets that are older than the window size.
     fn cleanup(&mut self) {
         let now = Instant::now();
