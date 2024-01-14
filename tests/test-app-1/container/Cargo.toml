@@ -1,5 +1,5 @@
 [package]
-name = "freenet-microblogging-web"
+name = "test-web-contract"
 version = "0.0.0"
 edition = "2021"
 rust-version = "1.71.1"

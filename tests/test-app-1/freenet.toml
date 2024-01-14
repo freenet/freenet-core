@@ -1,0 +1,15 @@
+[contract]
+type = "webapp"
+lang = "rust"
+
+[webapp]
+lang = "typescript"
+
+[webapp.typescript]
+webpack = true
+
+[webapp.state-sources]
+source_dirs = ["dist"]
+
+[webapp.dependencies]
+posts = { path = "deps" }

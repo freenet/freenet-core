@@ -127,7 +127,7 @@ impl<'a> From<&'a str> for NodeLabel {
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct NodeSpecification {
-    pub owned_contracts: Vec<(ContractContainer, WrappedState, Option<PeerKeyLocation>)>,
+    pub owned_contracts: Vec<(ContractContainer, WrappedState, bool)>,
     pub events_to_generate: HashMap<EventId, freenet_stdlib::client_api::ClientRequest<'static>>,
     pub contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
 }
@@ -283,7 +283,7 @@ pub(super) struct Builder<ER> {
     contract_handler_name: String,
     add_noise: bool,
     event_register: ER,
-    contracts: Vec<(ContractContainer, WrappedState, Option<PeerKeyLocation>)>,
+    contracts: Vec<(ContractContainer, WrappedState, bool)>,
     contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
 }
 
