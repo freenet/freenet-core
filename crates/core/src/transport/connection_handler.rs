@@ -70,6 +70,13 @@ impl ConnectionHandler {
         remote_is_gateway: bool,
         timeout: std::time::Duration,
     ) -> Result<(), TransportError> {
+        /*
+        Transport message types when establishing connection
+        * 0: Symmetric key encrypted with our public key
+        * 1: Acknowledgement of symmetric key - encrypted with symmetric key
+        * 2: Message - encrypted with symmetric key
+        * 3: Disconnect message - encrypted with symmetric key
+        */
         // let key = random::<[u8; 16]>();
         // let outbound_sym_key: Aes128 =
         //     Aes128::new_from_slice(&key).map_err(|e| TransportError(e.to_string()))?;

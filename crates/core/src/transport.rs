@@ -37,13 +37,6 @@
 //!
 //! ## Opening a Connection
 //!
-//! ## Transport message types (u8)
-//!
-//! * 0: Symmetric key encrypted with our public key
-//! * 1: Acknowledgement of symmetric key - encrypted with symmetric key
-//! * 2: Message - encrypted with symmetric key
-//! * 3: Disconnect message - encrypted with symmetric key
-//!
 //! ### Neither peer is a gateway
 //!
 //! 1. Peer A sends a `ConnectionStart` message to Peer B with its chosen symmetric key
