@@ -92,8 +92,9 @@ pub enum SymmetricMessagePayload {
 
 ### Dropped and Out-of-Order Messages
 
-- **Duplicate Detection**: Messages are checked for duplicate `message_id` and hash. Duplicates
-  trigger an immediate `NoOperation` message with a reconfirmation in `confirm_receipt`.
+- **Duplicate Detection**: Messages are checked for duplicate `message_id` and a cheap
+  (non-cryptographic) hash. Duplicates trigger an immediate `NoOperation` message with 
+  a reconfirmation in `confirm_receipt`.
 - **Acknowledgement Timeout**: Messages are resent if not acknowledged within 2 seconds 
   (`MESSAGE_CONFIRMATION_TIMEOUT`).
 
