@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 struct UdpPacketTracker {
     packets: VecDeque<(usize, Instant)>,
     window_size: Duration,
-    bandwidth_limit: usize,
     current_bandwidth: usize,
 }
 
@@ -13,7 +12,6 @@ impl UdpPacketTracker {
         UdpPacketTracker {
             packets: VecDeque::new(),
             window_size,
-            bandwidth_limit,
             current_bandwidth: 0,
         }
     }
@@ -23,10 +21,6 @@ impl UdpPacketTracker {
         self.packets.push_back((packet_size, now));
         self.current_bandwidth += packet_size;
         self.cleanup();
-    }
-
-    fn set_bandwidth_limit(&mut self, bandwidth_limit: usize) {
-        self.bandwidth_limit = bandwidth_limit;
     }
 
     /// Removes packets that are older than the window size.
@@ -46,10 +40,14 @@ impl UdpPacketTracker {
 
     /// Returns Ok(()) if the packet can be sent immediately, otherwise returns Err(wait_time)
     /// where wait_time is the time that needs to pass before the packet can be sent.
-    fn can_send_packet(&mut self, packet_size: usize) -> Result<(), Duration> {
+    fn can_send_packet(
+        &mut self,
+        bandwidth_limit: usize,
+        packet_size: usize,
+    ) -> Result<(), Duration> {
         self.cleanup();
 
-        if self.current_bandwidth + packet_size <= self.bandwidth_limit {
+        if self.current_bandwidth + packet_size <= bandwidth_limit {
             return Ok(());
         }
 
@@ -58,7 +56,7 @@ impl UdpPacketTracker {
 
         for &(size, time) in self.packets.iter() {
             temp_bandwidth -= size;
-            if temp_bandwidth + packet_size <= self.bandwidth_limit {
+            if temp_bandwidth + packet_size <= bandwidth_limit {
                 wait_time = Some(self.window_size - (Instant::now() - time));
                 break;
             }
