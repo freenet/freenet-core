@@ -50,40 +50,60 @@ pub(crate) mod errors;
 mod udp_connection;
 mod udp_transport;
 
+use std::ops::Deref;
+
 use errors::*;
 
-enum ConnectionEvent {
-    /// A short message that can fit in a single UDP packet.
-    Message(Vec<u8>),
-    /// A message that is streamed over multiple UDP packets.
-    StreamedMessage(ReceiverStream),
-    Disconnected,
-}
+use self::udp_transport::MAX_PACKET_SIZE;
 
 struct ReceiverStream {}
 
 impl ReceiverStream {
+    /// Will await until a full message is received, does error handling, reassembling the message from parts, decryption, etc.
+    async fn receive_message(&self) -> Result<Vec<u8>, ConnectionError> {
+        todo!()
+    }
+
     async fn read_part(&self) -> Result<StreamedMessagePart, ConnectionError> {
         todo!()
     }
 }
 
-pub(crate) struct StreamedMessagePart {
-    data: Vec<u8>,
+struct StreamedMessagePart {
+    data: PacketData,
     part_start_position: usize,
     message_size: usize,
 }
 
-pub(crate) struct SenderStream {}
+struct PacketData {
+    data: [u8; MAX_PACKET_SIZE],
+    size: usize,
+}
 
-impl SenderStream {
-    /// Will block until the message is sent, data must fit in a single UDP packet.
-    async fn send_part(&self, data: Vec<u8>) -> Result<(), SenderStreamError> {
+impl Deref for PacketData {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
         todo!()
     }
 }
 
-pub(crate) struct BytesPerSecond(f64);
+impl PacketData {
+    fn from_bytes(data: [u8; MAX_PACKET_SIZE], size: usize) -> Self {
+        Self { data, size }
+    }
+}
+
+struct SenderStream {}
+
+impl SenderStream {
+    /// Will await until the message is sent, handles breaking the message into parts, encryption, etc.
+    async fn send_message(&self, _data: &[u8]) -> Result<(), SenderStreamError> {
+        todo!()
+    }
+}
+
+struct BytesPerSecond(f64);
 
 impl BytesPerSecond {
     pub fn new(bytes_per_second: f64) -> Self {

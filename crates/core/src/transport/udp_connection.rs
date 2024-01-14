@@ -1,4 +1,3 @@
-use crate::transport::udp_transport::UdpTransport;
 use aes_gcm::{
     aead::{generic_array::GenericArray, Aead},
     Aes128Gcm,
@@ -7,70 +6,69 @@ use libp2p_identity::PublicKey;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::{mpsc, Mutex, RwLock};
-use tokio::task;
+use tokio::sync::mpsc;
+
+use super::PacketData;
 
 /*
  NOTES:
     The receiver thread should be set up when the channel is created, it shouldn't be stored
     in the struct because only the receiver thread loop should be able to access it.
-
-
 */
 
-pub struct UdpConnectionInfo {
+type ConnectionHandlerMessage = (SocketAddr, Vec<u8>);
+
+// todo: maybe makes more sense to switch naming here? this should be FreenetProtocol
+// or FreenetConnection since it's our own custom transport protocol over UDP
+// and what we are calling UdpTransport
+// should be called FreenetConnectionHandler since it's what is doing
+pub(super) struct UdpConnection {
     outbound_symmetric_key: Option<Aes128Gcm>,
     inbound_symmetric_key: Option<Aes128Gcm>,
     inbound_intro_packet: Option<Vec<u8>>,
     outbound_intro_packet: Option<Vec<u8>>,
     remote_public_key: Option<PublicKey>,
     remote_is_gateway: bool,
+    remote_addr: SocketAddr,
+    connection_handler_sender: mpsc::Sender<ConnectionHandlerMessage>,
 }
 
-impl UdpConnectionInfo {
-    pub(in crate::transport) async fn new(
-        transport: Arc<RwLock<UdpTransport>>,
+impl UdpConnection {
+    pub(super) async fn new(
         remote_addr: SocketAddr,
         remote_public_key: PublicKey,
         remote_is_gateway: bool,
+        connection_handler_sender: mpsc::Sender<ConnectionHandlerMessage>,
     ) -> Result<Self, ConnectionError> {
-        let mut connection = Self {
+        let connection = Self {
             outbound_symmetric_key: None,
             inbound_symmetric_key: None,
             inbound_intro_packet: None,
             outbound_intro_packet: None,
             remote_public_key: Some(remote_public_key),
             remote_is_gateway,
+            remote_addr,
+            connection_handler_sender,
         };
-
         Ok(connection)
     }
 
-    async fn handle_raw_packet(addr: &SocketAddr, message: &RawPacket) {
-        match message {
-            RawPacket::Message(data) => {
-                // Decrypt the message
-                let decrypted_message = self.decrypt_message(data).unwrap();
+    async fn handle_raw_packet(&self, data: PacketData) {
+        // Decrypt the message
+        let decrypted_message = self.decrypt_message(data).unwrap();
 
-                // Send the decrypted message to the decrypted packets channel
-                if let Err(e) = self
-                    .decrypted_packets
-                    .0
-                    .send((addr.clone(), decrypted_message))
-                    .await
-                {
-                    tracing::warn!("Failed to send decrypted message: {:?}", e);
-                }
-            }
-            RawPacket::Terminate => {
-                todo!()
-            }
+        // Send the decrypted message to the decrypted packets channel
+        if let Err(e) = self
+            .connection_handler_sender
+            .send((self.remote_addr, decrypted_message))
+            .await
+        {
+            tracing::warn!("Failed to send decrypted message: {:?}", e);
         }
     }
 
-    async fn handle_decrypted_packet(addr: &SocketAddr, message: &Vec<u8>) {
+    async fn terminate(&self) {
         todo!()
     }
 
@@ -81,12 +79,13 @@ impl UdpConnectionInfo {
 
         let cipher = self
             .outbound_symmetric_key
+            .as_ref()
             .ok_or(ConnectionError::ProtocolError(
                 "Don't have outbound symmetric key".to_string(),
             ))?;
         let encrypted_data = cipher
             .encrypt(GenericArray::from_slice(&nonce), data)
-            .map_err(|e| ConnectionError::AesGcmError(e))?;
+            .map_err(ConnectionError::AesGcmError)?;
 
         // Prepend the nonce to the ciphertext
         let mut result = Vec::with_capacity(nonce.len() + encrypted_data.len());
@@ -97,7 +96,7 @@ impl UdpConnectionInfo {
     }
 
     // Decrypts the data, assuming the nonce is prepended to the ciphertext
-    fn decrypt_message(&self, data: &[u8]) -> Result<Vec<u8>, ConnectionError> {
+    fn decrypt_message(&self, data: PacketData) -> Result<Vec<u8>, ConnectionError> {
         // Extract the nonce from the beginning of the data
         if data.len() < 12 {
             return Err(ConnectionError::ProtocolError(
@@ -109,40 +108,13 @@ impl UdpConnectionInfo {
 
         let cipher = self
             .inbound_symmetric_key
+            .as_ref()
             .ok_or(ConnectionError::ProtocolError(
                 "Don't have inbound symmetric key".to_string(),
             ))?;
         cipher
             .decrypt(GenericArray::from_slice(nonce), ciphertext)
-            .map_err(|e| ConnectionError::AesGcmError(e))
-    }
-}
-
-enum RawPacket {
-    Message(Vec<u8>),
-    Terminate,
-}
-
-pub struct PacketQueue<T> {
-    pub sender: Arc<RwLock<mpsc::Sender<(SocketAddr, T)>>>,
-    pub receiver: Arc<RwLock<mpsc::Receiver<(SocketAddr, T)>>>,
-}
-
-impl<T> PacketQueue<T> {
-    fn new() -> Self {
-        let (sender, receiver) = mpsc::channel(100);
-        Self {
-            sender: Arc::new(RwLock::new(sender)),
-            receiver: Arc::new(RwLock::new(receiver)),
-        }
-    }
-
-    fn sender_clone(&self) -> Arc<RwLock<mpsc::Sender<(SocketAddr, T)>>> {
-        self.sender.clone()
-    }
-
-    fn receiver_clone(&self) -> Arc<RwLock<mpsc::Receiver<(SocketAddr, T)>>> {
-        self.receiver.clone()
+            .map_err(ConnectionError::AesGcmError)
     }
 }
 

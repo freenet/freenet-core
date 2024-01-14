@@ -1,7 +1,7 @@
 use rand::rngs::OsRng;
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 
-pub(crate) struct TransportKeypair {
+pub(super) struct TransportKeypair {
     public: TransportPublicKey,
     secret: TransportSecretKey,
 }
@@ -20,23 +20,23 @@ impl TransportKeypair {
     }
 }
 
-pub(crate) struct TransportPublicKey(RsaPublicKey);
+pub(super) struct TransportPublicKey(RsaPublicKey);
 
 impl TransportPublicKey {
     pub fn encrypt(&self, data: &[u8]) -> Vec<u8> {
         let mut rng = OsRng;
-        let padding = Pkcs1v15Encrypt::default();
+        let padding = Pkcs1v15Encrypt;
         self.0
             .encrypt(&mut rng, padding, data)
             .expect("failed to encrypt")
     }
 }
 
-pub(crate) struct TransportSecretKey(RsaPrivateKey);
+pub(super) struct TransportSecretKey(RsaPrivateKey);
 
 impl TransportSecretKey {
     pub fn decrypt(&self, data: &[u8]) -> Vec<u8> {
-        let padding = Pkcs1v15Encrypt::default();
+        let padding = Pkcs1v15Encrypt;
         self.0.decrypt(padding, data).expect("failed to decrypt")
     }
 }
