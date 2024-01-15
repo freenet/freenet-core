@@ -40,9 +40,13 @@ impl UdpPacketTracker {
         }
     }
 
-    /// Returns Ok(()) if the packet can be sent immediately without the bandwidth limit being
-    /// exceeded in the `window_size`. Otherwise returns Err(wait_time) where wait_time is the
+    /// Returns Ok(()) if the packet can be sent immediately without `bandwidth_limit` being
+    /// exceeded within the `window_size`. Otherwise returns Err(wait_time) where wait_time is the
     /// amount of time that should be waited before sending the packet.
+    ///
+    /// `bandwidth_limit` should be set to 50% higher than the target upstream bandwidth the
+    /// [topology manager](crate::topology::TopologyManager) is aiming for, as it serves
+    /// as a hard limit which we'd prefer not to hit.
     fn can_send_packet(
         &mut self,
         bandwidth_limit: usize,
@@ -99,7 +103,7 @@ mod tests {
 
     #[test]
     fn test_adding_packets() {
-        let mut tracker = UdpPacketTracker::new(Duration::from_secs(1), 10000);
+        let mut tracker = UdpPacketTracker::new(Duration::from_secs(1));
         verify_bandwidth_match(&tracker);
         tracker.add_packet(1500);
         verify_bandwidth_match(&tracker);
@@ -108,7 +112,7 @@ mod tests {
 
     #[test]
     fn test_bandwidth_calculation() {
-        let mut tracker = UdpPacketTracker::new(Duration::from_secs(1), 10000);
+        let mut tracker = UdpPacketTracker::new(Duration::from_secs(1));
         tracker.add_packet(1500);
         tracker.add_packet(2500);
         verify_bandwidth_match(&tracker);
@@ -120,7 +124,7 @@ mod tests {
 
     #[test]
     fn test_packet_expiry() {
-        let mut tracker = UdpPacketTracker::new(Duration::from_millis(200), 10000);
+        let mut tracker = UdpPacketTracker::new(Duration::from_millis(200));
         tracker.add_packet(1500);
         verify_bandwidth_match(&tracker);
         sleep(Duration::from_millis(300));
@@ -131,13 +135,13 @@ mod tests {
 
     #[test]
     fn test_wait_time_calculation() {
-        let mut tracker = UdpPacketTracker::new(Duration::from_secs(1), 10000);
+        let mut tracker = UdpPacketTracker::new(Duration::from_secs(1));
         tracker.add_packet(5000);
         verify_bandwidth_match(&tracker);
         sleep(Duration::from_millis(500));
         tracker.add_packet(4000);
         verify_bandwidth_match(&tracker);
-        match tracker.can_send_packet(2000) {
+        match tracker.can_send_packet(10000, 2000) {
             Ok(_) => panic!("Should require waiting"),
             Err(wait_time) => assert!(wait_time > Duration::from_secs(0)),
         }
@@ -145,8 +149,8 @@ mod tests {
 
     #[test]
     fn test_immediate_send() {
-        let mut tracker = UdpPacketTracker::new(Duration::from_secs(10), 10000);
+        let mut tracker = UdpPacketTracker::new(Duration::from_secs(10));
         tracker.add_packet(3000);
-        assert_eq!(tracker.can_send_packet(2000), Ok(()));
+        assert_eq!(tracker.can_send_packet(10000, 2000), Ok(()));
     }
 }
