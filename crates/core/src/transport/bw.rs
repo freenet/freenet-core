@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 /// Keeps track of the bandwidth used in the last window_size. Recommend a `window_size` of
 /// 10 seconds.
-struct PacketBWTracker<T: TimeSource> {
+pub(super) struct PacketBWTracker<T: TimeSource> {
     packets: VecDeque<(usize, Instant)>,
     window_size: Duration,
     current_bandwidth: usize,
@@ -11,7 +11,7 @@ struct PacketBWTracker<T: TimeSource> {
 }
 
 impl PacketBWTracker<SystemTime> {
-    pub fn new(window_size: Duration) -> Self {
+    pub(super) fn new(window_size: Duration) -> Self {
         PacketBWTracker {
             packets: VecDeque::new(),
             window_size,
@@ -23,7 +23,7 @@ impl PacketBWTracker<SystemTime> {
 
 impl<T: TimeSource> PacketBWTracker<T> {
     /// Report that a packet was sent
-    pub fn add_packet(&mut self, packet_size: usize) {
+    pub(super) fn add_packet(&mut self, packet_size: usize) {
         let now = self.time_source.now();
         self.packets.push_back((packet_size, now));
         self.current_bandwidth += packet_size;
@@ -52,7 +52,7 @@ impl<T: TimeSource> PacketBWTracker<T> {
     /// `bandwidth_limit` should be set to 50% higher than the target upstream bandwidth the
     /// [topology manager](crate::topology::TopologyManager) is aiming for, as it serves
     /// as a hard limit which we'd prefer not to hit.
-    pub fn can_send_packet(
+    pub(super) fn can_send_packet(
         &mut self,
         bandwidth_limit: usize,
         packet_size: usize,
@@ -81,7 +81,7 @@ impl<T: TimeSource> PacketBWTracker<T> {
     }
 }
 
-trait TimeSource {
+pub(super) trait TimeSource {
     fn now(&self) -> Instant;
 }
 
