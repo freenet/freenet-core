@@ -1,25 +1,30 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// A tracker for UDP packets that keeps track of the bandwidth used in the last window_size.
-struct UdpPacketTracker {
+/// Keeps track of the bandwidth used in the last window_size. Recommend a `window_size` of
+/// 10 seconds.
+struct PacketBWTracker<T: TimeSource> {
     packets: VecDeque<(usize, Instant)>,
     window_size: Duration,
     current_bandwidth: usize,
+    time_source: T,
 }
 
-impl UdpPacketTracker {
-    fn new(window_size: Duration) -> Self {
-        UdpPacketTracker {
+impl PacketBWTracker<SystemTime> {
+    pub fn new(window_size: Duration) -> Self {
+        PacketBWTracker {
             packets: VecDeque::new(),
             window_size,
             current_bandwidth: 0,
+            time_source: SystemTime,
         }
     }
+}
 
+impl<T: TimeSource> PacketBWTracker<T> {
     /// Report that a packet was sent
-    fn add_packet(&mut self, packet_size: usize) {
-        let now = Instant::now();
+    pub fn add_packet(&mut self, packet_size: usize) {
+        let now = self.time_source.now();
         self.packets.push_back((packet_size, now));
         self.current_bandwidth += packet_size;
         self.cleanup();
@@ -27,7 +32,7 @@ impl UdpPacketTracker {
 
     /// Removes packets that are older than the window size.
     fn cleanup(&mut self) {
-        let now = Instant::now();
+        let now = self.time_source.now();
         while self
             .packets
             .front()
@@ -47,7 +52,7 @@ impl UdpPacketTracker {
     /// `bandwidth_limit` should be set to 50% higher than the target upstream bandwidth the
     /// [topology manager](crate::topology::TopologyManager) is aiming for, as it serves
     /// as a hard limit which we'd prefer not to hit.
-    fn can_send_packet(
+    pub fn can_send_packet(
         &mut self,
         bandwidth_limit: usize,
         packet_size: usize,
@@ -64,7 +69,7 @@ impl UdpPacketTracker {
         for &(size, time) in self.packets.iter() {
             temp_bandwidth -= size;
             if temp_bandwidth + packet_size <= bandwidth_limit {
-                wait_time = Some(self.window_size - (Instant::now() - time));
+                wait_time = Some(self.window_size - (self.time_source.now() - time));
                 break;
             }
         }
@@ -91,9 +96,46 @@ impl TimeSource for SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread::sleep;
+    use std::rc::Rc;
+    use std::sync::RwLock;
 
-    fn verify_bandwidth_match(tracker: &UdpPacketTracker) {
+    #[derive(Clone)]
+    struct MockTimeSource {
+        current_instant: Rc<RwLock<Instant>>,
+    }
+
+    impl MockTimeSource {
+        fn new(start_instant: Instant) -> Self {
+            MockTimeSource {
+                current_instant: Rc::new(RwLock::new(start_instant)),
+            }
+        }
+
+        fn advance_time(&self, duration: Duration) {
+            let mut write_guard = self.current_instant.write().unwrap();
+            *write_guard += duration;
+        }
+    }
+
+    impl TimeSource for MockTimeSource {
+        fn now(&self) -> Instant {
+            let read_guard = self.current_instant.read().unwrap();
+            *read_guard
+        }
+    }
+
+    fn mock_tracker(window_size: Duration) -> (PacketBWTracker<MockTimeSource>, MockTimeSource) {
+        let time_source = MockTimeSource::new(Instant::now());
+        let tracker = PacketBWTracker {
+            packets: VecDeque::new(),
+            window_size,
+            current_bandwidth: 0,
+            time_source: time_source.clone(),
+        };
+        (tracker, time_source)
+    }
+
+    fn verify_bandwidth_match<T: TimeSource>(tracker: &PacketBWTracker<T>) {
         let mut total_bandwidth = 0;
         for &(size, _) in tracker.packets.iter() {
             total_bandwidth += size;
@@ -103,7 +145,7 @@ mod tests {
 
     #[test]
     fn test_adding_packets() {
-        let mut tracker = UdpPacketTracker::new(Duration::from_secs(1));
+        let mut tracker = PacketBWTracker::new(Duration::from_secs(1));
         verify_bandwidth_match(&tracker);
         tracker.add_packet(1500);
         verify_bandwidth_match(&tracker);
@@ -112,7 +154,7 @@ mod tests {
 
     #[test]
     fn test_bandwidth_calculation() {
-        let mut tracker = UdpPacketTracker::new(Duration::from_secs(1));
+        let mut tracker = PacketBWTracker::new(Duration::from_secs(1));
         tracker.add_packet(1500);
         tracker.add_packet(2500);
         verify_bandwidth_match(&tracker);
@@ -124,10 +166,10 @@ mod tests {
 
     #[test]
     fn test_packet_expiry() {
-        let mut tracker = UdpPacketTracker::new(Duration::from_millis(200));
+        let (mut tracker, ts) = mock_tracker(Duration::from_millis(200));
         tracker.add_packet(1500);
         verify_bandwidth_match(&tracker);
-        sleep(Duration::from_millis(300));
+        ts.advance_time(Duration::from_millis(300));
         tracker.cleanup();
         verify_bandwidth_match(&tracker);
         assert!(tracker.packets.is_empty());
@@ -135,10 +177,10 @@ mod tests {
 
     #[test]
     fn test_wait_time_calculation() {
-        let mut tracker = UdpPacketTracker::new(Duration::from_secs(1));
+        let (mut tracker, ts) = mock_tracker(Duration::from_secs(1));
         tracker.add_packet(5000);
         verify_bandwidth_match(&tracker);
-        sleep(Duration::from_millis(500));
+        ts.advance_time(Duration::from_millis(500));
         tracker.add_packet(4000);
         verify_bandwidth_match(&tracker);
         match tracker.can_send_packet(10000, 2000) {
@@ -149,7 +191,7 @@ mod tests {
 
     #[test]
     fn test_immediate_send() {
-        let mut tracker = UdpPacketTracker::new(Duration::from_secs(10));
+        let mut tracker = PacketBWTracker::new(Duration::from_secs(10));
         tracker.add_packet(3000);
         assert_eq!(tracker.can_send_packet(10000, 2000), Ok(()));
     }
