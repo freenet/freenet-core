@@ -102,14 +102,25 @@ impl ContractExecutor for Executor<MockRuntime> {
                     .map_err(ExecutorError::other)?;
                 return Ok(incoming_state);
             }
-            // (Either::Left(_), None) => {
-            //     return Err(ExecutorError::request(RequestError::from(
-            //         StdContractError::Get {
-            //             key: key.clone(),
-            //             cause: "Missing contract or parameters".into(),
-            //         },
-            //     )));
-            // }
+            (Either::Left(incoming_state), None) => {
+                let params = self
+                    .state_store
+                    .get_params(&key)
+                    .await
+                    .map_err(ExecutorError::other)?
+                    .ok_or_else(|| {
+                        ExecutorError::request(StdContractError::Put {
+                            key: key.clone(),
+                            cause: "missing contract parameters".into(),
+                        })
+                    })?;
+
+                self.state_store
+                    .store(key, incoming_state.clone(), params.into_owned())
+                    .await
+                    .map_err(ExecutorError::other)?;
+                return Ok(incoming_state);
+            }
             (update, contract) => unreachable!("{update:?}, {contract:?}"),
         }
     }

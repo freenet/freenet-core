@@ -116,15 +116,6 @@ where
                 state,
                 related_contracts,
             } => {
-                // if contract needed
-                let (_, contract) = contract_handler
-                    .executor()
-                    .fetch_contract(key.clone(), true)
-                    .await
-                    .expect("is not getting the contract from executor"); //FIXME I should see how to handle this error
-
-                tracing::debug!("in Update Query just before upsert_contract_state");
-
                 let update_result = contract_handler
                     .executor()
                     .upsert_contract_state(
@@ -135,8 +126,6 @@ where
                     )
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await;
-
-                tracing::debug!("after upsert_contract_state");
 
                 contract_handler
                     .channel()

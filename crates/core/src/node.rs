@@ -408,8 +408,6 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
 
                     let related_contracts = RelatedContracts::default();
 
-                    tracing::debug!("just before update start op");
-
                     let op = update::start_op(
                         key,
                         wrapped_state,
@@ -417,15 +415,10 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                         op_manager.ring.max_hops_to_live,
                     );
 
-                    tracing::debug!("before waiting_for_transaction_result");
-
                     let _ = op_manager
                         .ch_outbound
                         .waiting_for_transaction_result(op.id, client_id)
                         .await;
-                    tracing::debug!("after waiting_for_transaction_result");
-
-                    tracing::debug!("just before request update");
 
                     if let Err(err) = update::request_update(&op_manager, op).await {
                         tracing::error!("request update error {}", err)

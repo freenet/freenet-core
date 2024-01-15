@@ -120,7 +120,7 @@ impl Operation for UpdateOp {
                 }
                 Ok(None) => {
                     // new request to get a value for a contract, initialize the machine
-                    tracing::debug!("state op set to ReceivedRequest");
+                    tracing::debug!("6 - state op set to ReceivedRequest");
                     Ok(OpInitialization {
                         op: Self {
                             state: Some(UpdateState::ReceivedRequest),
@@ -185,6 +185,7 @@ impl Operation for UpdateOp {
 
                     // no changes to state yet, still in AwaitResponse state
                     new_state = self.state;
+                    tracing::debug!(op_id = %id, "3 - (in process message) state op changed to {:?}", new_state);
                 }
                 UpdateMsg::SeekNode {
                     id,
@@ -209,8 +210,6 @@ impl Operation for UpdateOp {
                             .ring
                             .within_subscribing_distance(&Location::from(key))
                     {
-                        tracing::debug!(tx = %id, "Attempting contract value update - update");
-
                         update_contract(
                             op_manager,
                             key.clone(),
@@ -271,7 +270,7 @@ impl Operation for UpdateOp {
 
                     tracing::debug!("\njust before try to broadcast_1");
                     tracing::debug!(state = ?self.state);
-                    tracing::debug!(broadcast_list = ?broadcast_to);
+                    // tracing::debug!(broadcast_list = ?broadcast_to);
 
                     match try_to_broadcast(
                         *id,
@@ -285,6 +284,7 @@ impl Operation for UpdateOp {
                     .await
                     {
                         Ok((state, msg)) => {
+                            tracing::debug!(op_id = %self.id, "4 - (in process message) state op changed to {:?}", state);
                             new_state = state;
                             return_msg = msg;
                         }
@@ -316,11 +316,14 @@ impl Operation for UpdateOp {
                         target.location
                     );
 
-                    if let Some(UpdateState::AwaitingResponse { .. }) | None = self.state {
-                        tracing::debug!("\njust before try to broadcast_2. Is going to fail. state is AwaitingResponse or None - BroadcastTo - update");
-                        tracing::debug!(state = ?self.state, " - BroadcastTo");
-                        tracing::debug!(broadcast_list = ?broadcast_to, " - BroadcastTo");
-                    };
+                    if self.state.is_none() {
+                        tracing::debug!(op_id = %self.id, "try_to_broadcast_2 - self state is None - UpdateMsg::BroadcastTo");
+                    }
+
+                    if let Some(UpdateState::AwaitingResponse { .. }) = self.state {
+                        tracing::debug!(state = ?self.state, op_id = %self.id, "try_to_broadcast_2 awaitingresponse - UpdateMsg::BroadcastTo ");
+                    }
+
                     match try_to_broadcast(
                         *id,
                         false,
@@ -333,6 +336,7 @@ impl Operation for UpdateOp {
                     .await
                     {
                         Ok((state, msg)) => {
+                            tracing::debug!(op_id = %self.id, "5 - (in process mesasge) state op changed to {:?}", state);
                             new_state = state;
                             return_msg = msg;
                         }
@@ -403,6 +407,7 @@ impl Operation for UpdateOp {
                         summary,
                     });
 
+                    tracing::debug!(op_id = %self.id, "10 - (in process message) state op changed to None");
                     new_state = None;
                 }
                 UpdateMsg::SuccessfulUpdate { id, summary, .. } => {
@@ -426,6 +431,7 @@ impl Operation for UpdateOp {
                                 "Peer completed contract value update - update",
                             );
 
+                            tracing::debug!(op_id = %self.id, "7 - (in process message) state changed to UpdateState::Finished");
                             new_state = Some(UpdateState::Finished {
                                 key,
                                 summary: summary.clone(),
@@ -441,7 +447,10 @@ impl Operation for UpdateOp {
                             }
                         }
                         _ => {
-                            tracing::debug!("in UpdateMsg::SuccessfulUpdate -> match self.state");
+                            tracing::debug!(
+                                state = ?self.state,
+                                "in UpdateMsg::SuccessfulUpdate -> match self.state"
+                            );
 
                             return Err(OpError::invalid_transition(self.id));
                         }
@@ -506,21 +515,21 @@ impl Operation for UpdateOp {
                         put_here
                     } else {
                         // should put in this location, no hops left
-                        update_contract(
-                            op_manager,
-                            key.clone(),
-                            new_value.clone(),
-                            RelatedContracts::default(),
-                        )
-                        .await?;
+                        // update_contract(
+                        //     op_manager,
+                        //     key.clone(),
+                        //     new_value.clone(),
+                        //     RelatedContracts::default(),
+                        // )
+                        // .await?;
                         true
                     };
 
                     let broadcast_to = op_manager.get_broadcast_targets(&key, &sender.peer);
 
                     tracing::debug!("\njust before try to broadcast_3");
-                    tracing::debug!(state = ?self.state);
-                    tracing::debug!(broadcast_list = ?broadcast_to);
+                    tracing::debug!(state = ?self.state, op_id = %self.id);
+                    // tracing::debug!(broadcast_list = ?broadcast_to);
 
                     match try_to_broadcast(
                         *id,
@@ -534,6 +543,7 @@ impl Operation for UpdateOp {
                     .await
                     {
                         Ok((state, msg)) => {
+                            tracing::debug!(op_id = %self.id, "8 - (in process message) state op changed to {:?}", state);
                             new_state = state;
                             return_msg = msg;
                         }
@@ -574,12 +584,21 @@ async fn try_to_broadcast(
                     upstream: Some(upstream),
                 });
                 return_msg = None;
-
-                tracing::debug!("state op set to AwaitingResponse");
+                // tracing::debug!(op_id = %id,
+                //     "state op changed to UpdateState::AwaitingResponse");
             } else if !broadcast_to.is_empty() {
                 tracing::debug!("Callback to start broadcasting to other nodes - update");
                 new_state = Some(UpdateState::BroadcastOngoing);
-                tracing::debug!("state op set to BroadcastOngoing");
+
+                tracing::debug!(
+                    "broadcast_to list size {} before broadcasting",
+                    broadcast_to.len()
+                );
+                for peer in broadcast_to.iter() {
+                    tracing::warn!("{}", peer.peer);
+                }
+                tracing::debug!("end broadcast_to list before broadcasting");
+
                 return_msg = Some(UpdateMsg::Broadcasting {
                     id,
                     new_value,
@@ -602,6 +621,9 @@ async fn try_to_broadcast(
                 let raw_state = State::from(new_value.clone());
 
                 let summary = StateSummary::from(raw_state.into_bytes());
+
+                // tracing::debug!(op_id = %id, "state op changed to None");
+
                 new_state = None;
                 return_msg = Some(UpdateMsg::SuccessfulUpdate {
                     id,
@@ -711,6 +733,9 @@ pub(crate) fn start_op(
     tracing::debug!(%contract_location, %key, "Requesting update");
     let id = Transaction::new::<UpdateMsg>();
     // let payload_size = contract.data().len();
+
+    tracing::debug!(op_id = %id, "1 - state op changed to PrepareRequest");
+
     let state = Some(UpdateState::PrepareRequest {
         key,
         related_contracts,
@@ -767,7 +792,7 @@ pub(crate) async fn request_update(
             htl,
             related_contracts,
         }) => {
-            tracing::debug!("state op set to AwaitingResponse");
+            tracing::debug!(op_id = %id, "2 - state op set to AwaitingResponse");
             let new_state = Some(UpdateState::AwaitingResponse {
                 key: key.clone(),
                 upstream: None,

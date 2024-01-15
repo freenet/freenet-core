@@ -580,7 +580,13 @@ impl OpManager {
             })
             .unwrap_or_default();
         if let Some(peer) = self.ring.subscribed_to_contract(key) {
-            subscribers.push(peer);
+            if &peer.peer == sender {
+                tracing::warn!("1 - about to add sender peer to broadcast targets");
+            } else if subscribers.contains(&peer) {
+                tracing::warn!("2 - about to add already added peer to broadcast targets");
+            } else {
+                subscribers.push(peer);
+            }
         }
         subscribers
     }
