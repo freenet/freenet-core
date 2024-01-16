@@ -237,7 +237,7 @@ pub async fn run_network(
     supervisor.start_peer_nodes(&cmd_args).await?;
 
     let peers: Vec<(NodeLabel, PeerId)> = supervisor
-        .get_peer_nodes()
+        .get_all_peers()
         .await
         .into_iter()
         .map(|(label, config)| (label.clone(), config.peer_id))
@@ -507,6 +507,14 @@ impl Supervisor {
         Ok(())
     }
 
+    pub async fn get_all_peers(&self) -> Vec<(NodeLabel, NodeConfig)> {
+        let mut peers: Vec<(NodeLabel, NodeConfig)> = self.get_peer_gateways().await;
+        peers.extend(self.get_peer_nodes().await);
+
+        peers.sort_by(|a, b| a.0.cmp(&b.0));
+
+        peers
+    }
     pub async fn get_peer_nodes(&self) -> Vec<(NodeLabel, NodeConfig)> {
         self.peers_config
             .lock()
@@ -517,7 +525,7 @@ impl Supervisor {
             .collect()
     }
 
-    pub async fn gent_peer_gateways(&self) -> Vec<(NodeLabel, NodeConfig)> {
+    pub async fn get_peer_gateways(&self) -> Vec<(NodeLabel, NodeConfig)> {
         self.peers_config
             .lock()
             .await
@@ -541,15 +549,20 @@ impl Supervisor {
         Ok(())
     }
 
+    async fn wait_while_gateway_start(&self, id: &usize) {
+        tracing::info!("Waiting for gateway {} to start", id);
+        while !self.waiting_gateways.lock().await.contains(id) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tracing::info!("Gateway {} started", id);
+    }
+
     pub async fn start_peer_gateways(&self, cmd_args: &[String]) -> Result<(), Error> {
-        let nodes: Vec<(NodeLabel, NodeConfig)> = self.gent_peer_gateways().await;
+        let nodes: Vec<(NodeLabel, NodeConfig)> = self.get_peer_gateways().await;
         for (label, config) in nodes {
             self.enqueue_gateway(label.number()).await;
             self.start_process(cmd_args, &label, &config).await?;
-        }
-        tracing::info!("Waiting for all gateways to start");
-        while !self.waiting_gateways.lock().await.is_empty() {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            self.wait_while_gateway_start(&label.number()).await;
         }
         tracing::info!("All gateways started");
         Ok(())
