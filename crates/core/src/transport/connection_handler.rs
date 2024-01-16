@@ -14,9 +14,7 @@ use super::{
 };
 
 /// The maximum size of a received UDP packet, MTU typically is 1500
-/// so this should be more than enough.
-// todo: probably reduce this to 1500? since we are using this for breaking up messages etc.
-pub(super) const MAX_PACKET_SIZE: usize = 2048;
+pub(super) const MAX_PACKET_SIZE: usize = 1500;
 
 pub(super) type ConnectionHandlerMessage = (SocketAddr, Vec<u8>);
 
