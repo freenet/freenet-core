@@ -51,9 +51,18 @@ mod connection_handler;
 mod connection_info;
 mod crypto;
 
-use std::ops::Deref;
+use aes_gcm::{
+    aead::generic_array::GenericArray,
+    aes::{
+        cipher::{BlockDecrypt, BlockEncrypt},
+        Aes128,
+    },
+};
 
-use self::{connection_handler::MAX_PACKET_SIZE, connection_info::ConnectionError};
+use self::{
+    connection_handler::MAX_PACKET_SIZE, connection_info::ConnectionError,
+    crypto::TransportPublicKey,
+};
 
 struct ReceiverStream {}
 
@@ -74,22 +83,49 @@ struct StreamedMessagePart {
     message_size: usize,
 }
 
+// todo: split this into type for handling inbound (encrypted)/outbound (decrypted) packets for clarity
 struct PacketData {
     data: [u8; MAX_PACKET_SIZE],
     size: usize,
 }
 
-impl Deref for PacketData {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        todo!()
-    }
-}
-
 impl PacketData {
-    fn from_bytes(data: [u8; MAX_PACKET_SIZE], size: usize) -> Self {
+    fn encrypted_with_cipher(
+        mut data: [u8; MAX_PACKET_SIZE],
+        size: usize,
+        cipher: &Aes128,
+    ) -> Self {
+        cipher.encrypt_block(GenericArray::from_mut_slice(&mut data[..size]));
         Self { data, size }
+    }
+
+    fn encrypted_with_remote(data: &[u8], remote_key: &TransportPublicKey) -> Self {
+        let encrypted_data: Vec<u8> = remote_key.encrypt(data);
+        debug_assert!(encrypted_data.len() <= MAX_PACKET_SIZE);
+        let mut data = [0; MAX_PACKET_SIZE];
+        data.copy_from_slice(&encrypted_data[..]);
+        Self {
+            data,
+            size: encrypted_data.len(),
+        }
+    }
+
+    fn send_data(&self) -> &[u8] {
+        &self.data[..self.size]
+    }
+
+    fn from_encrypted(
+        mut data: [u8; MAX_PACKET_SIZE],
+        size: usize,
+        inbound_sym_key: &Aes128,
+    ) -> Self {
+        Self::decrypt(&mut data[..size], inbound_sym_key);
+        Self { data, size }
+    }
+
+    fn decrypt(encrypted_data: &mut [u8], inbound_sym_key: &Aes128) {
+        debug_assert!(encrypted_data.len() <= MAX_PACKET_SIZE);
+        inbound_sym_key.decrypt_block(GenericArray::from_mut_slice(encrypted_data));
     }
 }
 

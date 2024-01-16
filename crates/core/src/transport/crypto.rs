@@ -36,8 +36,8 @@ impl TransportPublicKey {
 pub(super) struct TransportSecretKey(RsaPrivateKey);
 
 impl TransportSecretKey {
-    pub fn decrypt(&self, data: &[u8]) -> Vec<u8> {
+    pub fn decrypt(&self, data: &[u8]) -> rsa::Result<Vec<u8>> {
         let padding = Pkcs1v15Encrypt;
-        self.0.decrypt(padding, data).expect("failed to decrypt")
+        self.0.decrypt(padding, data)
     }
 }

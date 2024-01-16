@@ -4,6 +4,7 @@ use aes_gcm::{aes::Aes128, KeyInit};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::vec::Vec;
+use std::{borrow::Cow, time::Duration};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task;
@@ -18,15 +19,25 @@ pub(super) const MAX_PACKET_SIZE: usize = 1500;
 
 pub(super) type ConnectionHandlerMessage = (SocketAddr, Vec<u8>);
 
+const PROTOC_VERSION: [u8; 2] = 1u16.to_le_bytes();
+
+pub struct PeerConnection(mpsc::Receiver<PacketData>);
+
+impl PeerConnection {
+    pub async fn recv(&self) -> Result<Vec<u8>, ConnectionError> {
+        todo!()
+    }
+
+    pub async fn send(&self, _message: Vec<u8>) -> Result<(), ConnectionError> {
+        todo!()
+    }
+}
+
 pub(crate) struct ConnectionHandler {
     connection_info: HashMap<PeerId, ConnectionInfo>,
-    keypair: TransportKeypair,
     listen_port: u16,
     is_gateway: bool,
     max_upstream_rate: BytesPerSecond,
-    // todo: don't think we need to set in a second task and we can manage all this
-    // with FuturesUnordered and concurrently handling all the connections,
-    // but revisit this when the code is a bit more mature and see if it's the case
     send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>,
 }
 
@@ -47,10 +58,10 @@ impl ConnectionHandler {
             connection_raw_packet_senders: HashMap::new(),
             socket,
             send_queue: send_queue_receiver,
+            this_peer_keypair: keypair,
         };
         let connection_handler = ConnectionHandler {
             connection_info: HashMap::new(),
-            keypair,
             listen_port,
             is_gateway,
             max_upstream_rate,
@@ -64,98 +75,31 @@ impl ConnectionHandler {
 
     pub async fn connect(
         &mut self,
-        peer_id: PeerId,
         remote_public_key: TransportPublicKey,
-        remote_socket_addr: SocketAddr,
+        remote_addr: SocketAddr,
         remote_is_gateway: bool,
-        timeout: std::time::Duration,
-    ) -> Result<(), TransportError> {
-        /*
-        Transport message types when establishing connection
-        * 0: Symmetric key encrypted with our public key
-        * 1: Acknowledgement of symmetric key - encrypted with symmetric key
-        * 2: Message - encrypted with symmetric key
-        * 3: Disconnect message - encrypted with symmetric key
-        */
-        let key = rand::random::<[u8; 16]>();
-        let outbound_sym_key: Aes128 = Aes128::new_from_slice(&key).expect("valid length");
-        // todo: how large is this `intro_packet`, 16 bytes too? if it fits in a single UDP packet
-        let encrypted_key: Vec<u8> = remote_public_key.encrypt(&key);
-        let intro_packet = {
-            // fixme, this assetion would fail now
-            // ideally we want protoc version + encrypted key to fit into a packet
-            debug_assert!(encrypted_key.len() <= MAX_PACKET_SIZE - std::mem::size_of::<u16>());
-            let mut data = [0; MAX_PACKET_SIZE];
-            data.copy_from_slice(&encrypted_key[..]);
-            PacketData::from_bytes(data, encrypted_key.len())
-        };
-
+    ) -> Result<PeerConnection, TransportError> {
         if !remote_is_gateway {
-            self.nat_traversal(remote_socket_addr, intro_packet).await?;
+            self.send_queue
+                .send((
+                    remote_addr,
+                    ConnectionEvent::ConnectionStart { remote_public_key },
+                ))
+                .await?;
+            todo!("wait for response from the udp listener and return a `PeerConnection` instance")
         } else {
-            todo!()
+            todo!("establish connection with a gateway")
         }
-
-        todo!("attempt establishing connection; build a `ConnectionInfo` instance and save it")
-    }
-
-    pub(super) const PROTOC_VERSION: u16 = 0;
-
-    async fn nat_traversal(
-        &self,
-        remote_socket: SocketAddr,
-        intro_packet: PacketData,
-    ) -> Result<(), TransportError> {
-        self.send_queue
-            .send((
-                remote_socket,
-                ConnectionEvent::ConnectionStart { intro_packet },
-            ))
-            .await?;
-        Ok(())
-    }
-
-    /// Method used by users of connection handler to send a message.
-    /// Message partitioning, encryption, etc. is handled internally.
-    pub async fn send_message(
-        &self,
-        peer_id: &PeerId,
-        message: Vec<u8>,
-    ) -> Result<(), TransportError> {
-        todo!()
-    }
-
-    /// Method used by users of connection handler to receive any incoming messages.
-    pub async fn receive_message(
-        &mut self,
-        peer_id: &PeerId,
-    ) -> Result<(PeerId, Vec<u8>), TransportError> {
-        todo!()
-    }
-
-    async fn send_raw_packet(
-        &self,
-        peer_id: &PeerId,
-        data: PacketData,
-    ) -> Result<(), TransportError> {
-        let connection = self
-            .connection_info
-            .get(peer_id)
-            .ok_or_else(|| TransportError::MissingPeer(*peer_id))?;
-        self.send_queue
-            .send((connection.remote_addr, ConnectionEvent::SendRawPacket(data)))
-            .await?;
-        Ok(())
     }
 
     fn update_max_upstream_rate(&mut self, max_upstream_rate: BytesPerSecond) {
         self.max_upstream_rate = max_upstream_rate;
     }
 
-    fn handle_unrecognized_message(&self, (_socket, data): (SocketAddr, PacketData)) {
+    fn handle_unrecognized_message(&self, (_socket, packet): (SocketAddr, PacketData)) {
         if !self.is_gateway {
             tracing::warn!(
-                packet = ?&*data,
+                packet = ?packet.send_data(),
                 "Received unrecognized message, ignoring because not a gateway",
             );
             return;
@@ -168,8 +112,9 @@ impl ConnectionHandler {
 /// Handles UDP transport internally.
 struct UdpPacketsListener {
     socket: UdpSocket,
-    connection_raw_packet_senders: HashMap<SocketAddr, mpsc::Sender<(SocketAddr, PacketData)>>,
+    connection_raw_packet_senders: HashMap<SocketAddr, (ConnectionInfo, mpsc::Sender<PacketData>)>,
     send_queue: mpsc::Receiver<(SocketAddr, ConnectionEvent)>,
+    this_peer_keypair: TransportKeypair,
 }
 
 impl UdpPacketsListener {
@@ -181,17 +126,16 @@ impl UdpPacketsListener {
                 recv_result = self.socket.recv_from(&mut buf) => {
                     match recv_result {
                         Ok((size, addr)) => {
-                            let packet_data = PacketData::from_bytes(std::mem::replace(&mut buf, [0; MAX_PACKET_SIZE]), size);
-                            let message: (SocketAddr, PacketData) = (addr, packet_data);
                             match self.connection_raw_packet_senders.get(&addr) {
-                                Some(sender) => {
-                                    if let Err(e) = sender.send(message).await {
+                                Some((conn_info, sender)) => {
+                                    let packet_data = PacketData::from_encrypted(std::mem::replace(&mut buf, [0; MAX_PACKET_SIZE]), size, &conn_info.outbound_symmetric_key);
+                                    if let Err(e) = sender.send(packet_data).await {
                                         tracing::warn!("Failed to send raw packet to connection sender: {:?}", e);
                                     }
                                 }
                                 None => {
                                     self
-                                        .handle_unrecognized_message(message);
+                                        .handle_unrecognized_remote(addr);
                                 }
                             }
                         }
@@ -202,17 +146,23 @@ impl UdpPacketsListener {
                 },
                 // Handling of outbound packets
                 send_message = self.send_queue.recv() => {
-                    if let Some((socket, event)) = send_message {
+                    if let Some((remote_addr, event)) = send_message {
                         match event {
                             ConnectionEvent::SendRawPacket(data) => {
-                                if let Err(e) = self.socket.send_to(&data, socket).await {
+                                if let Err(e) = self.socket.send_to(data.send_data(), remote_addr).await {
                                     tracing::warn!("Failed to send UDP packet: {:?}", e);
                                 }
                             }
-                            ConnectionEvent::ConnectionStart { intro_packet } => {
-                                // todo: repeat each 200ms and control for an Ack packet comming back
-                                if let Err(e) = self.socket.send_to(&intro_packet, socket).await {
-                                    tracing::warn!("Failed to send UDP packet: {:?}", e);
+                            ConnectionEvent::ConnectionStart { remote_public_key  }  => {
+                                match self.traverse_nat(remote_addr, remote_public_key).await {
+                                    Err(error) => {
+                                        tracing::error!(%error, ?remote_addr, "Failed to establish connection");
+                                    }
+                                    Ok(connection_info) => {
+                                        let (peer_message_sender, peer_message_receiver) = mpsc::channel(1);
+                                        self.connection_raw_packet_senders.insert(remote_addr, (connection_info, peer_message_sender));
+                                        todo!()
+                                    }
                                 }
                             }
                         }
@@ -222,15 +172,171 @@ impl UdpPacketsListener {
         }
     }
 
-    fn handle_unrecognized_message(&mut self, message: (SocketAddr, PacketData)) {
-        tracing::warn!("Received unrecognized message, ignoring");
+    async fn traverse_nat(
+        &mut self,
+        remote_addr: SocketAddr,
+        remote_public_key: TransportPublicKey,
+    ) -> Result<ConnectionInfo, TransportError> {
+        enum ConnectionState {
+            Start,
+            SendIntroPacket,
+            AckProtoc,
+        }
+        // todo: probably should use exponential backoff with an upper limit: `timeout`
+        let timeout = Duration::from_secs(5);
+
+        // todo: probably instead of a fixed interval we should monotonically increase the interval
+        // until we reach a maximum, and then just keep trying at that maximum interval
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
+        const MAX_FAILURES: usize = 20;
+        let mut failures = 0;
+        let mut packet = [0u8; MAX_PACKET_SIZE];
+        let mut state = ConnectionState::Start;
+
+        let outbound_sym_key_bytes = rand::random::<[u8; 16]>();
+        let outbound_sym_key: Aes128 =
+            Aes128::new_from_slice(&outbound_sym_key_bytes).expect("valid length");
+        let mut inbound_sym_key: Option<Aes128> = None;
+
+        let outbound_intro_packet =
+            PacketData::encrypted_with_remote(&outbound_sym_key_bytes, &remote_public_key);
+
+        const HELLO: &[u8; 5] = b"hello";
+        let hello_packet = {
+            let mut packet = [0; MAX_PACKET_SIZE];
+            packet[..HELLO.len()].copy_from_slice(HELLO);
+            PacketData::encrypted_with_cipher(packet, HELLO.len(), &outbound_sym_key)
+        };
+
+        while failures < MAX_FAILURES {
+            match state {
+                ConnectionState::Start => {
+                    tracing::debug!("Sending protocol version to remote");
+                    if let Err(error) = self.socket.send_to(&PROTOC_VERSION, remote_addr).await {
+                        failures += 1;
+                        if failures == MAX_FAILURES {
+                            return Err(error.into());
+                        }
+                        tick.tick().await;
+                        continue;
+                    }
+                }
+                ConnectionState::SendIntroPacket => {
+                    tracing::debug!("Sending intro packet to remote");
+                    if let Err(error) = self
+                        .socket
+                        .send_to(outbound_intro_packet.send_data(), remote_addr)
+                        .await
+                    {
+                        failures += 1;
+                        if failures == MAX_FAILURES {
+                            return Err(error.into());
+                        }
+                        tick.tick().await;
+                        continue;
+                    }
+                }
+                ConnectionState::AckProtoc => {
+                    self.socket
+                        .send_to(hello_packet.send_data(), remote_addr)
+                        .await?;
+                }
+            }
+            match tokio::time::timeout(timeout, self.socket.recv_from(&mut packet)).await {
+                Ok(Ok((size, response_remote))) => {
+                    if response_remote != remote_addr {
+                        todo!("is a different remote, handle this message");
+                    }
+                    match state {
+                        ConnectionState::Start if size == PROTOC_VERSION.len() => {
+                            // is a response with the protocol version from the remote,
+                            // connection established, next wait for the encrypted private key
+                            match &packet[..size] {
+                                version if version == PROTOC_VERSION.as_slice() => {}
+                                other_version => {
+                                    // todo: handle this case in the future when we have more than one protocol version
+                                    return Err(TransportError::ConnectionEstablishmentFailure {
+                                        cause: format!(
+                                            "remote is using a different protocol version: {:?}",
+                                            String::from_utf8_lossy(other_version)
+                                        )
+                                        .into(),
+                                    });
+                                }
+                            }
+                            state = ConnectionState::SendIntroPacket;
+                            continue;
+                        }
+                        ConnectionState::Start => {
+                            failures += 1;
+                            tracing::debug!("Received unexpect response from remote");
+                        }
+                        ConnectionState::SendIntroPacket if inbound_sym_key.is_none() => {
+                            // try to decrypt the message with the symmetric key
+                            let key_bytes =
+                                self.this_peer_keypair.secret.decrypt(&packet[..size])?;
+                            let key: Aes128 = Aes128::new_from_slice(&key_bytes).map_err(|_| {
+                                TransportError::ConnectionEstablishmentFailure {
+                                    cause: "invalid symmetric key".into(),
+                                }
+                            })?;
+                            inbound_sym_key = Some(key);
+                            state = ConnectionState::AckProtoc;
+                        }
+                        ConnectionState::AckProtoc => {
+                            PacketData::decrypt(
+                                &mut packet[..size],
+                                inbound_sym_key
+                                    .as_ref()
+                                    .expect("should be set at this stage"),
+                            );
+                            if &packet[..size] == HELLO.as_slice() {
+                                return Ok(ConnectionInfo {
+                                    outbound_symmetric_key: outbound_sym_key,
+                                    inbound_symmetric_key: inbound_sym_key
+                                        .expect("should be set at this stage"),
+                                    remote_public_key,
+                                    remote_is_gateway: false,
+                                    remote_addr,
+                                });
+                            } else {
+                                tracing::debug!("Received unrecognized message from remote");
+                                return Err(TransportError::ConnectionEstablishmentFailure {
+                                    cause: "received unrecognized message from remote".into(),
+                                });
+                            }
+                        }
+                        _ => {
+                            unreachable!()
+                        }
+                    }
+                }
+                Ok(Err(io_error)) => {
+                    failures += 1;
+                    tracing::debug!(%io_error, "Failed to receive UDP response");
+                }
+                Err(_) => {
+                    failures += 1;
+                    tracing::debug!("Failed to receive UDP response, time out");
+                }
+            }
+            tick.tick().await;
+        }
+        Err(TransportError::ConnectionEstablishmentFailure {
+            cause: "max connection attemps reached".into(),
+        })
+    }
+
+    fn handle_unrecognized_remote(&mut self, _remote: SocketAddr) {
+        tracing::warn!("Received unrecognized remote, ignoring");
     }
 }
 
-enum ConnectionEvent {
+pub(super) enum ConnectionEvent {
     SendRawPacket(PacketData),
-    ConnectionStart { intro_packet: PacketData },
-    // UdpPacketReceived { source: SocketAddr, data: Vec<u8> },
+    ConnectionStart {
+        remote_public_key: TransportPublicKey,
+    },
 }
 
 // Define a custom error type for the transport layer
@@ -242,11 +348,8 @@ pub(super) enum TransportError {
     IO(#[from] std::io::Error),
     #[error("transport handler channel closed")]
     ChannelClosed(#[from] mpsc::error::SendError<(SocketAddr, ConnectionEvent)>),
-}
-
-#[test]
-fn check_size() {
-    let pair = super::crypto::TransportKeypair::new();
-    let encrypted = pair.public.encrypt(&[0; 16]);
-    eprintln!("encrypted: {:?}", encrypted.len());
+    #[error("failed while establishing connection, reason: {cause}")]
+    ConnectionEstablishmentFailure { cause: Cow<'static, str> },
+    #[error(transparent)]
+    DescryptionError(#[from] rsa::errors::Error),
 }
