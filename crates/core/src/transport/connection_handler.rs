@@ -1,7 +1,6 @@
 use super::*;
 use crate::node::PeerId;
 use aes_gcm::{aes::Aes128, KeyInit};
-use futures::stream::FuturesUnordered;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::vec::Vec;
@@ -14,7 +13,7 @@ use super::{
     crypto::{TransportKeypair, TransportPublicKey},
 };
 
-/// The maximum size of a received UDP packet, MTU tipically is 1500
+/// The maximum size of a received UDP packet, MTU typically is 1500
 /// so this should be more than enough.
 // todo: probably reduce this to 1500? since we are using this for breaking up messages etc.
 pub(super) const MAX_PACKET_SIZE: usize = 2048;
