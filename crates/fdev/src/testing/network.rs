@@ -304,14 +304,10 @@ async fn config_handler(
     peers_config: Arc<Mutex<HashMap<NodeLabel, NodeConfig>>>,
     Path(peer_id): Path<String>,
 ) -> axum::response::Response {
-    tracing::info!("Received config request for peer_id: {}", peer_id);
     let config = peers_config.lock().await;
     let id = NodeLabel::from(peer_id.as_str());
     match config.get(&id) {
-        Some(node_config) => {
-            tracing::info!("Found config for peer_id: {}", peer_id);
-            axum::response::Json(node_config.clone()).into_response()
-        }
+        Some(node_config) => axum::response::Json(node_config.clone()).into_response(),
         None => {
             let body = format!("No config found for peer_id: {}", peer_id);
             let response = Response::builder()
@@ -535,17 +531,22 @@ impl Supervisor {
             .collect()
     }
 
+    async fn wait_while_node_start(&self, id: &usize) {
+        tracing::info!("Waiting for node {} to start", id);
+        while !self.waiting_peers.lock().await.contains(id) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tracing::info!("Node {} started", id);
+    }
+
     pub async fn start_peer_nodes(&self, cmd_args: &[String]) -> Result<(), Error> {
         let nodes: Vec<(NodeLabel, NodeConfig)> = self.get_peer_nodes().await;
         for (label, config) in nodes {
             self.enqueue_node(label.number()).await;
             self.start_process(cmd_args, &label, &config).await?;
+            self.wait_while_node_start(&label.number()).await;
         }
-        tracing::info!("Waiting for all gateways to start");
-        while !self.waiting_gateways.lock().await.is_empty() {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        tracing::info!("All gateways started");
+        tracing::info!("All nodes started");
         Ok(())
     }
 
@@ -603,7 +604,11 @@ pub trait Runnable {
 
 impl Runnable for NetworkPeer {
     async fn run(&self, config: &TestConfig, peer_id: String) -> anyhow::Result<()> {
-        tracing::info!("Starting node {}", peer_id);
+        if self.config.is_gateway() {
+            tracing::info!("Starting gateway {}", peer_id);
+        } else {
+            tracing::info!("Starting node {}", peer_id);
+        }
         let mut receiver_ch = self.receiver_ch.deref().clone();
         receiver_ch.borrow_and_update();
 
@@ -644,7 +649,11 @@ impl Runnable for NetworkPeer {
         {
             Ok(node) => match node.run().await {
                 Ok(_) => {
-                    tracing::info!("Node {} finished", peer_id);
+                    if self.config.is_gateway() {
+                        tracing::info!("Gateway {} finished", peer_id);
+                    } else {
+                        tracing::info!("Node {} finished", peer_id);
+                    }
                     let msg = match self.config.is_gateway() {
                         true => PeerMessage::Status(PeerStatus::GatewayStarted(peer_id_num)),
                         false => PeerMessage::Status(PeerStatus::PeerStarted(peer_id_num)),
