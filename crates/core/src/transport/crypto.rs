@@ -41,3 +41,19 @@ impl TransportSecretKey {
         self.0.decrypt(padding, data)
     }
 }
+
+#[cfg(test)]
+#[test]
+fn key_sizes_and_decryption() {
+    let pair = TransportKeypair::new();
+    let sym_key_bytes = rand::random::<[u8; 16]>();
+    // use aes_gcm::KeyInit;
+    // let _sym_key = aes_gcm::aes::Aes128::new(&sym_key_bytes.into());
+    let encrypted: Vec<u8> = pair.public.encrypt(&sym_key_bytes);
+    assert!(
+        encrypted.len() <= super::connection_handler::MAX_PACKET_SIZE,
+        "packet size is too big"
+    );
+    let bytes = pair.secret.decrypt(&encrypted).unwrap();
+    assert_eq!(bytes, sym_key_bytes.as_slice());
+}

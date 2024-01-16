@@ -8,6 +8,7 @@ use std::{borrow::Cow, time::Duration};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task;
+use tokio_tungstenite::tungstenite::protocol;
 
 use super::{
     connection_info::ConnectionInfo,
@@ -21,7 +22,10 @@ pub(super) type ConnectionHandlerMessage = (SocketAddr, Vec<u8>);
 
 const PROTOC_VERSION: [u8; 2] = 1u16.to_le_bytes();
 
-pub struct PeerConnection(mpsc::Receiver<PacketData>);
+pub struct PeerConnection {
+    recv_inbound: mpsc::Receiver<PacketData>,
+    send_outbound: mpsc::Sender<PacketData>,
+}
 
 impl PeerConnection {
     pub async fn recv(&self) -> Result<Vec<u8>, ConnectionError> {
@@ -179,8 +183,7 @@ impl UdpPacketsListener {
     ) -> Result<ConnectionInfo, TransportError> {
         enum ConnectionState {
             Start,
-            SendIntroPacket,
-            AckProtoc,
+            AckConnection,
         }
         // todo: probably should use exponential backoff with an upper limit: `timeout`
         let timeout = Duration::from_secs(5);
@@ -194,13 +197,17 @@ impl UdpPacketsListener {
         let mut state = ConnectionState::Start;
 
         let outbound_sym_key_bytes = rand::random::<[u8; 16]>();
-        let outbound_sym_key: Aes128 =
-            Aes128::new_from_slice(&outbound_sym_key_bytes).expect("valid length");
+        let outbound_sym_key: Aes128 = Aes128::new(&outbound_sym_key_bytes.into());
         let mut inbound_sym_key: Option<Aes128> = None;
 
-        let outbound_intro_packet =
-            PacketData::encrypted_with_remote(&outbound_sym_key_bytes, &remote_public_key);
+        let outbound_intro_packet = {
+            let mut data = [0u8; { 16 + PROTOC_VERSION.len() }];
+            data[..PROTOC_VERSION.len()].copy_from_slice(&PROTOC_VERSION);
+            data[PROTOC_VERSION.len()..].copy_from_slice(&outbound_sym_key_bytes);
+            PacketData::encrypted_with_remote(&data, &remote_public_key)
+        };
 
+        // fixme: use typed messages instead of raw bytes
         const HELLO: &[u8; 5] = b"hello";
         let hello_packet = {
             let mut packet = [0; MAX_PACKET_SIZE];
@@ -212,17 +219,6 @@ impl UdpPacketsListener {
             match state {
                 ConnectionState::Start => {
                     tracing::debug!("Sending protocol version to remote");
-                    if let Err(error) = self.socket.send_to(&PROTOC_VERSION, remote_addr).await {
-                        failures += 1;
-                        if failures == MAX_FAILURES {
-                            return Err(error.into());
-                        }
-                        tick.tick().await;
-                        continue;
-                    }
-                }
-                ConnectionState::SendIntroPacket => {
-                    tracing::debug!("Sending intro packet to remote");
                     if let Err(error) = self
                         .socket
                         .send_to(outbound_intro_packet.send_data(), remote_addr)
@@ -236,7 +232,7 @@ impl UdpPacketsListener {
                         continue;
                     }
                 }
-                ConnectionState::AckProtoc => {
+                ConnectionState::AckConnection => {
                     self.socket
                         .send_to(hello_packet.send_data(), remote_addr)
                         .await?;
@@ -248,42 +244,34 @@ impl UdpPacketsListener {
                         todo!("is a different remote, handle this message");
                     }
                     match state {
-                        ConnectionState::Start if size == PROTOC_VERSION.len() => {
-                            // is a response with the protocol version from the remote,
-                            // connection established, next wait for the encrypted private key
-                            match &packet[..size] {
-                                version if version == PROTOC_VERSION.as_slice() => {}
-                                other_version => {
-                                    // todo: handle this case in the future when we have more than one protocol version
-                                    return Err(TransportError::ConnectionEstablishmentFailure {
-                                        cause: format!(
-                                            "remote is using a different protocol version: {:?}",
-                                            String::from_utf8_lossy(other_version)
-                                        )
-                                        .into(),
-                                    });
-                                }
+                        ConnectionState::Start
+                            if size == outbound_intro_packet.send_data().len() =>
+                        {
+                            // try to decrypt the message with the symmetric key
+                            let data = self.this_peer_keypair.secret.decrypt(&packet[..size])?;
+                            let protocol_version = &data[..PROTOC_VERSION.len()];
+                            if protocol_version != PROTOC_VERSION {
+                                return Err(TransportError::ConnectionEstablishmentFailure {
+                                    cause: format!(
+                                        "remote is using a different protocol version: {:?}",
+                                        String::from_utf8_lossy(protocol_version)
+                                    )
+                                    .into(),
+                                });
                             }
-                            state = ConnectionState::SendIntroPacket;
+                            let key: Aes128 = Aes128::new_from_slice(&data[PROTOC_VERSION.len()..])
+                                .map_err(|_| TransportError::ConnectionEstablishmentFailure {
+                                    cause: "invalid symmetric key".into(),
+                                })?;
+                            inbound_sym_key = Some(key);
+                            state = ConnectionState::AckConnection;
                             continue;
                         }
                         ConnectionState::Start => {
                             failures += 1;
                             tracing::debug!("Received unexpect response from remote");
                         }
-                        ConnectionState::SendIntroPacket if inbound_sym_key.is_none() => {
-                            // try to decrypt the message with the symmetric key
-                            let key_bytes =
-                                self.this_peer_keypair.secret.decrypt(&packet[..size])?;
-                            let key: Aes128 = Aes128::new_from_slice(&key_bytes).map_err(|_| {
-                                TransportError::ConnectionEstablishmentFailure {
-                                    cause: "invalid symmetric key".into(),
-                                }
-                            })?;
-                            inbound_sym_key = Some(key);
-                            state = ConnectionState::AckProtoc;
-                        }
-                        ConnectionState::AckProtoc => {
+                        ConnectionState::AckConnection => {
                             PacketData::decrypt(
                                 &mut packet[..size],
                                 inbound_sym_key
