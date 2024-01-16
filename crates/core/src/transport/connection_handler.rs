@@ -1,6 +1,7 @@
 use super::*;
 use crate::node::PeerId;
 use aes_gcm::{aes::Aes128, KeyInit};
+use futures::channel::oneshot;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::vec::Vec;
@@ -8,7 +9,6 @@ use std::{borrow::Cow, time::Duration};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task;
-use tokio_tungstenite::tungstenite::protocol;
 
 use super::{
     connection_info::ConnectionInfo,
@@ -84,13 +84,22 @@ impl ConnectionHandler {
         remote_is_gateway: bool,
     ) -> Result<PeerConnection, TransportError> {
         if !remote_is_gateway {
+            let (open_connection, recv_connection) = oneshot::channel();
             self.send_queue
                 .send((
                     remote_addr,
-                    ConnectionEvent::ConnectionStart { remote_public_key },
+                    ConnectionEvent::ConnectionStart {
+                        remote_public_key,
+                        open_connection,
+                    },
                 ))
                 .await?;
-            todo!("wait for response from the udp listener and return a `PeerConnection` instance")
+            let (send_outbound, recv_inbound) =
+                recv_connection.await.map_err(|e| anyhow::anyhow!(e))??;
+            Ok(PeerConnection {
+                recv_inbound,
+                send_outbound,
+            })
         } else {
             todo!("establish connection with a gateway")
         }
@@ -157,15 +166,16 @@ impl UdpPacketsListener {
                                     tracing::warn!("Failed to send UDP packet: {:?}", e);
                                 }
                             }
-                            ConnectionEvent::ConnectionStart { remote_public_key  }  => {
+                            ConnectionEvent::ConnectionStart { remote_public_key, open_connection  }  => {
                                 match self.traverse_nat(remote_addr, remote_public_key).await {
                                     Err(error) => {
                                         tracing::error!(%error, ?remote_addr, "Failed to establish connection");
                                     }
                                     Ok(connection_info) => {
-                                        let (peer_message_sender, peer_message_receiver) = mpsc::channel(1);
-                                        self.connection_raw_packet_senders.insert(remote_addr, (connection_info, peer_message_sender));
-                                        todo!()
+                                        let (outbound_sender, outbound_receiver) = mpsc::channel(1);
+                                        let (inbound_sender, inbound_receiver) = mpsc::channel(1);
+                                        self.connection_raw_packet_senders.insert(remote_addr, (connection_info, outbound_sender));
+                                        let _ = open_connection.send(Ok((inbound_sender, outbound_receiver)));
                                     }
                                 }
                             }
@@ -320,11 +330,14 @@ impl UdpPacketsListener {
     }
 }
 
+type PeerChannel = (mpsc::Sender<PacketData>, mpsc::Receiver<PacketData>);
+
 pub(super) enum ConnectionEvent {
-    SendRawPacket(PacketData),
     ConnectionStart {
         remote_public_key: TransportPublicKey,
+        open_connection: oneshot::Sender<Result<PeerChannel, TransportError>>,
     },
+    SendRawPacket(PacketData),
 }
 
 // Define a custom error type for the transport layer
@@ -340,4 +353,6 @@ pub(super) enum TransportError {
     ConnectionEstablishmentFailure { cause: Cow<'static, str> },
     #[error(transparent)]
     DescryptionError(#[from] rsa::errors::Error),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
