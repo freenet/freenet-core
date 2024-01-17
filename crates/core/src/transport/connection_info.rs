@@ -13,4 +13,7 @@ pub(super) struct ConnectionInfo {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum ConnectionError {}
+pub(crate) enum ConnectionError {
+    #[error("Connection closed")]
+    ChannelClosed,
+}

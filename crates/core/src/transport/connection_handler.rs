@@ -1,7 +1,6 @@
-use super::*;
-use crate::node::PeerId;
 use aes_gcm::{aes::Aes128, KeyInit};
 use futures::channel::oneshot;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::vec::Vec;
@@ -10,9 +9,11 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task;
 
+use super::BytesPerSecond;
 use super::{
-    connection_info::ConnectionInfo,
+    connection_info::{ConnectionError, ConnectionInfo},
     crypto::{TransportKeypair, TransportPublicKey},
+    PacketData,
 };
 
 /// The maximum size of a received UDP packet, MTU typically is 1500
@@ -22,23 +23,31 @@ pub(super) type ConnectionHandlerMessage = (SocketAddr, Vec<u8>);
 
 const PROTOC_VERSION: [u8; 2] = 1u16.to_le_bytes();
 
+type SerializedMessage = Vec<u8>;
+
 pub struct PeerConnection {
-    recv_inbound: mpsc::Receiver<PacketData>,
-    send_outbound: mpsc::Sender<PacketData>,
+    inbound_recv: mpsc::Receiver<PacketData>,
+    outbound_sender: mpsc::Sender<SerializedMessage>,
 }
 
 impl PeerConnection {
-    pub async fn recv(&self) -> Result<Vec<u8>, ConnectionError> {
+    pub async fn recv(&mut self) -> Result<Vec<u8>, ConnectionError> {
+        let packet_data = self
+            .inbound_recv
+            .recv()
+            .await
+            .ok_or(ConnectionError::ChannelClosed);
         todo!()
     }
 
-    pub async fn send(&self, _message: Vec<u8>) -> Result<(), ConnectionError> {
+    pub async fn send<T: Serialize>(&mut self, data: &T) -> Result<(), ConnectionError> {
+        let _serialized_data = bincode::serialize(data).unwrap();
+        // todo: send this to the udp listener and send in one packet or stream the message
         todo!()
     }
 }
 
 pub(crate) struct ConnectionHandler {
-    connection_info: HashMap<PeerId, ConnectionInfo>,
     listen_port: u16,
     is_gateway: bool,
     max_upstream_rate: BytesPerSecond,
@@ -65,7 +74,6 @@ impl ConnectionHandler {
             this_peer_keypair: keypair,
         };
         let connection_handler = ConnectionHandler {
-            connection_info: HashMap::new(),
             listen_port,
             is_gateway,
             max_upstream_rate,
@@ -94,11 +102,11 @@ impl ConnectionHandler {
                     },
                 ))
                 .await?;
-            let (send_outbound, recv_inbound) =
+            let (outbound_sender, inbound_recv) =
                 recv_connection.await.map_err(|e| anyhow::anyhow!(e))??;
             Ok(PeerConnection {
-                recv_inbound,
-                send_outbound,
+                inbound_recv,
+                outbound_sender,
             })
         } else {
             todo!("establish connection with a gateway")
@@ -173,9 +181,9 @@ impl UdpPacketsListener {
                                     }
                                     Ok(connection_info) => {
                                         let (outbound_sender, outbound_receiver) = mpsc::channel(1);
-                                        let (inbound_sender, inbound_receiver) = mpsc::channel(1);
-                                        self.connection_raw_packet_senders.insert(remote_addr, (connection_info, outbound_sender));
-                                        let _ = open_connection.send(Ok((inbound_sender, outbound_receiver)));
+                                        let (inbound_sender, inbound_recv) = mpsc::channel(1);
+                                        self.connection_raw_packet_senders.insert(remote_addr, (connection_info, inbound_sender));
+                                        let _ = open_connection.send(Ok((outbound_sender, inbound_recv)));
                                     }
                                 }
                             }
@@ -330,7 +338,7 @@ impl UdpPacketsListener {
     }
 }
 
-type PeerChannel = (mpsc::Sender<PacketData>, mpsc::Receiver<PacketData>);
+type PeerChannel = (mpsc::Sender<SerializedMessage>, mpsc::Receiver<PacketData>);
 
 pub(super) enum ConnectionEvent {
     ConnectionStart {
@@ -343,8 +351,6 @@ pub(super) enum ConnectionEvent {
 // Define a custom error type for the transport layer
 #[derive(Debug, thiserror::Error)]
 pub(super) enum TransportError {
-    #[error("missing peer: {0}")]
-    MissingPeer(PeerId),
     #[error(transparent)]
     IO(#[from] std::io::Error),
     #[error("transport handler channel closed")]
