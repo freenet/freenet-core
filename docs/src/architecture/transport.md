@@ -68,7 +68,7 @@ to Alice. The process is symmetric in the other direction.
 #### Actors
 
 * Alice is a peer behind a firewall, Gateway isn't behind a firewall and is configured to act as a
-  gateway for Alice.
+  gateway peer for new peers to assimiate into the network.
 
 #### Terminology
 
