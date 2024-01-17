@@ -14,7 +14,8 @@ establishment, message handling, and rate limiting.
 * **Streaming**: Large messages can be streamed, meaning that a peer can start forwarding data
   before the entire message is received.
 * **Covert**: FrTP can run on any UDP port and FrTP packets look like random data, although more
-   sophisticated analysis of packet timing and size could be used to identify FrTP traffic.
+   sophisticated analysis of packet timing and size could be used to identify FrTP traffic. FrTP
+   can't be port-scanned as it won't respond to packets unless encrypted with the peer's public key.
 * **Efficient**: FrTP is designed to minimize bandwidth usage, with rate limiting and confirmation
    message batching.
 
