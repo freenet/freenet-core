@@ -381,7 +381,7 @@ impl Operation for SubscribeOp {
                             provider = %sender.peer,
                             "Subscribed to contract"
                         );
-                        op_manager.ring.add_subscription(key.clone(), *sender);
+                        op_manager.ring.register_subscription(key, *sender);
 
                         new_state = Some(SubscribeState::Completed {});
                         if let Some(upstream_subscriber) = upstream_subscriber {
@@ -542,7 +542,7 @@ mod test {
             owned_contracts: vec![(
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
                 contract_val,
-                None,
+                true,
             )],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::new(),

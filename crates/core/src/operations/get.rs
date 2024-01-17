@@ -593,9 +593,7 @@ impl Operation for GetOp {
                             ..
                         })
                     );
-                    let should_subscribe = op_manager
-                        .ring
-                        .within_subscribing_distance(&Location::from(&key));
+                    let should_subscribe = op_manager.ring.should_seed(&key);
                     let should_put = is_original_requester || should_subscribe;
 
                     if should_put {
@@ -610,7 +608,7 @@ impl Operation for GetOp {
                         match res {
                             ContractHandlerEvent::PutResponse { new_value: Ok(_) } => {
                                 let is_subscribed_contract =
-                                    op_manager.ring.is_subscribed_to_contract(&key);
+                                    op_manager.ring.is_seeding_contract(&key);
                                 if !is_subscribed_contract && should_subscribe {
                                     tracing::debug!(tx = %id, %key, peer = %op_manager.ring.peer_key, "Contract not cached @ peer, caching");
                                     super::start_subscription_request(
@@ -953,7 +951,7 @@ mod test {
             owned_contracts: vec![(
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
                 contract_val,
-                None,
+                false,
             )],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::new(),
@@ -1048,7 +1046,7 @@ mod test {
             owned_contracts: vec![(
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
                 contract_val,
-                None,
+                false,
             )],
             events_to_generate: HashMap::new(),
             contract_subscribers: HashMap::new(),

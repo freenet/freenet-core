@@ -85,7 +85,7 @@ pub mod local_node {
 
         serve(socket, ws_router.layer(TraceLayer::new_for_http()));
 
-        // FIXME: use combinator instead
+        // TODO: use combinator instead
         // let mut all_clients =
         //    ClientEventsCombinator::new([Box::new(ws_handle), Box::new(http_handle)]);
         enum Receiver {

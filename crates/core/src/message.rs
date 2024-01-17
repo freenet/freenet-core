@@ -6,6 +6,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use freenet_stdlib::prelude::ContractKey;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -228,6 +229,11 @@ pub(crate) enum NetMessage {
     Put(PutMsg),
     Get(GetMsg),
     Subscribe(SubscribeMsg),
+    Unsubscribed {
+        transaction: Transaction,
+        key: ContractKey,
+        from: PeerId,
+    },
     Update(UpdateMsg),
     /// Failed a transaction, informing of abortion.
     Aborted(Transaction),
@@ -294,6 +300,7 @@ impl NetMessage {
             Subscribe(op) => op.id(),
             Update(op) => op.id(),
             Aborted(tx) => tx,
+            Unsubscribed { transaction, .. } => transaction,
         }
     }
 
@@ -306,6 +313,7 @@ impl NetMessage {
             Subscribe(op) => op.target(),
             Update(op) => op.target(),
             Aborted(_) => None,
+            Unsubscribed { .. } => None,
         }
     }
 
@@ -319,6 +327,7 @@ impl NetMessage {
             Subscribe(op) => op.terminal(),
             Update(op) => op.terminal(),
             Aborted(_) => true,
+            Unsubscribed { .. } => true,
         }
     }
 
@@ -331,6 +340,7 @@ impl NetMessage {
             Subscribe(op) => op.requested_location(),
             Update(op) => op.requested_location(),
             Aborted(_) => None,
+            Unsubscribed { .. } => None,
         }
     }
 
@@ -351,6 +361,9 @@ impl Display for NetMessage {
             Subscribe(msg) => msg.fmt(f)?,
             Update(msg) => msg.fmt(f)?,
             Aborted(msg) => msg.fmt(f)?,
+            Unsubscribed { key, from, .. } => {
+                write!(f, "Unsubscribed {{  key: {}, from: {} }}", key, from)?;
+            }
         };
         write!(f, "}}")
     }
