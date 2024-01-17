@@ -1,6 +1,8 @@
 # Getting Started
 
-This tutorial will show you how to build decentralized software on Freenet. For a similar working and up to date example check the `freenet-email` app (located in under the `apps/freenet-email-app` directory in the `freenet-core` repository).
+This tutorial will show you how to build decentralized software on Freenet. For a similar working
+and up to date example check the `freenet-email` app (located in under the `apps/freenet-email-app`
+directory in the `freenet-core` repository).
 
 <!-- toc -->
 
@@ -16,6 +18,7 @@ curl https://sh.rustup.rs -sSf | sh
 ```
 
 #### Note for MacOS install
+
 Do not have the `brew` version of rust installed as it will cause compications with `fdev`.
 
 ### Freenet development tool (fdev)
@@ -31,6 +34,7 @@ This command will install `fdev` (Freenet development tool) and a working Freene
 be used for local development.
 
 ### Add WebAssembly target
+
 ```bash
 rustup target add wasm32-unknown-unknown
 ```
@@ -72,14 +76,14 @@ contracts](glossary.md#container-contract). Currently, the following
 technological stacks are supported (more to be added in the future):
 
 - Regular contracts:
-  - Rust (_default_)
-- Web applications:
-  - Container development:
     - Rust (_default_)
-  - Web/state development:
-    - Typescript. (_default: using npm and webpack_)
-    - JavaScript.
-    - Rust (**WIP**).
+- Web applications:
+    - Container development:
+        - Rust (_default_)
+    - Web/state development:
+        - Typescript. (_default: using npm and webpack_)
+        - JavaScript.
+        - Rust (**WIP**).
 
 We will need to create a directory that will hold our web app and initialize it:
 
