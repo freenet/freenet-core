@@ -181,7 +181,7 @@ impl DecryptedMessage {
         }
         .try_into()
         .map_err(|e| format!("{e}"))?;
-        let inbox_key = !::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
+        let inbox_key = ContractKey::from_params(INBOX_CODE_HASH, params).map_err(|e| format!("{e}"))?;
         AftRecords::pending_assignment(delegate_key, inbox_key.clone());
 
         PENDING_INBOXES_UPDATE.with(|map| {
