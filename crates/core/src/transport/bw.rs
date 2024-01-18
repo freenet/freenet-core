@@ -185,7 +185,7 @@ mod tests {
         verify_bandwidth_match(&tracker);
         match tracker.can_send_packet(10000, 2000) {
             Ok(_) => panic!("Should require waiting"),
-            Err(wait_time) => assert!(wait_time > Duration::from_secs(0)),
+            Err(wait_time) => assert_eq!(wait_time, Duration::from_millis(500)),
         }
     }
 
