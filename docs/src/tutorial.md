@@ -30,7 +30,7 @@ tools:
 cargo install freenet fdev
 ```
 
-This command will install `fdev` (Freenet development tool) and a working Freenet kernel that can
+This command will install `fdev` (Freenet development tool) and a working Freenet peer that can
 be used for local development.
 
 ### Add WebAssembly target
@@ -42,14 +42,14 @@ rustup target add wasm32-unknown-unknown
 ### Node.js and TypeScript
 
 To build user interfaces in JavaScript or TypeScript, you need to have Node.js
-and npm installed. On Linux or Mac:
+and npm installed. For example on Ubuntu Linux:
 
 ```bash
 sudo apt update
 sudo apt install nodejs npm
 ```
 
-For Windows, you can download Node.js and npm from [here](https://nodejs.org/en/download/).
+For Mac or Windows, you can download Node.js and npm from [here](https://nodejs.org/en/download/).
 
 Once Node.js and npm are installed, you can install TypeScript globally on your
 system, which includes the `tsc` command:
