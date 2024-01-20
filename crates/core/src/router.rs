@@ -107,7 +107,7 @@ impl Router {
                 EstimatorType::Negative,
             ),
             mean_transfer_size,
-            consider_n_closest_peers: 20,
+            consider_n_closest_peers: 2,
         }
     }
 
