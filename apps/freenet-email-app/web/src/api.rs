@@ -675,7 +675,7 @@ pub(crate) async fn node_comms(
                                 crate::log::error(format!("FIXME: {err}"), None)
                             }
                             RequestError::DelegateError(DelegateError::Missing(key))
-                                if &key == IDENTITIES_KEY.get().unwrap() =>
+                                if &key == &IDENTITIES_KEY.get().unwrap() =>
                             {
                                 if let Err(e) =
                                     identity_management::create_delegate(&mut client).await
