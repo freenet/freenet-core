@@ -89,7 +89,7 @@ struct PacketData<const N: usize = MAX_PACKET_SIZE> {
 }
 
 // FIXME: this **MUST** be different for every packet, but it doesn't need to be randomly generated
-//        for every packet, for example it's fine to increment it by 1 for every packet. In future
+//        for every packet. For example it's fine to increment it by 1 for every packet. In future
 //        we can take advantage of this to avoid sending the entire 12 bytes of the nonce in every
 //        packet, but any such mechanism **must** be resistant to packet loss.
 static NONCE: [u8; 12] = [0; 12];
