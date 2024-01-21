@@ -5,7 +5,12 @@ use crate::ring::{Location, PeerKeyLocation};
 use isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use stretto::TransparentKey;
 use util::{Mean, TransferSpeed};
+
+const DEFAULT_N_CLOSEST_LIMIT: usize = 2;
+const INITIAL_MEAN_TRANSFER_SIZE_ESTIMATE: f64 = 100.0;
+const INITIAL_MEAN_TRANSFER_SIZE_WEIGHT: usize = 10;
 
 /// # Usage
 /// Important when using this type:
@@ -80,7 +85,10 @@ impl Router {
         let mut mean_transfer_size = Mean::new();
 
         // Add some initial data so this produces sensible results with low or no historical data
-        mean_transfer_size.add_with_count(1000.0, 10);
+        mean_transfer_size.add_with_count(
+            INITIAL_MEAN_TRANSFER_SIZE_ESTIMATE * INITIAL_MEAN_TRANSFER_SIZE_WEIGHT,
+            INITIAL_MEAN_TRANSFER_SIZE_WEIGHT,
+        );
 
         for event in history {
             if let RouteOutcome::Success {
@@ -107,7 +115,7 @@ impl Router {
                 EstimatorType::Negative,
             ),
             mean_transfer_size,
-            consider_n_closest_peers: 2,
+            consider_n_closest_peers: DEFAULT_N_CLOSEST_LIMIT,
         }
     }
 

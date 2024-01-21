@@ -3,7 +3,7 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, Serialize)]
 pub(super) struct Mean {
     sum: f64,
-    count: u64,
+    count: usize,
 }
 
 impl Mean {
@@ -16,7 +16,7 @@ impl Mean {
         self.count += 1;
     }
 
-    pub fn add_with_count(&mut self, sum: f64, count: u64) {
+    pub fn add_with_count(&mut self, sum: f64, count: usize) {
         self.sum += sum;
         self.count += count;
     }
