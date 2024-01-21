@@ -99,6 +99,8 @@ thread_local! {
     );
 }
 
+// These are the same as the AES-GCM 128 constants, but extracting them from Aes128Gcm
+// as consts was awkward.
 const NONCE_SIZE: usize = 12;
 const TAG_SIZE: usize = 16;
 
