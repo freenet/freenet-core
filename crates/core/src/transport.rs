@@ -52,11 +52,15 @@ mod connection_info;
 mod crypto;
 mod symmetric_message;
 
+use aes_gcm::aead::rand_core::SeedableRng;
 use aes_gcm::{
     aead::{generic_array::GenericArray, AeadMut},
     aes::cipher::Unsigned,
     AeadCore, AeadInPlace, Aes128Gcm,
 };
+use rand::rngs::SmallRng;
+use rand::{thread_rng, Rng};
+use std::cell::RefCell;
 
 use self::{
     connection_handler::MAX_PACKET_SIZE, connection_info::ConnectionError,
@@ -88,27 +92,41 @@ struct PacketData<const N: usize = MAX_PACKET_SIZE> {
     size: usize,
 }
 
-// FIXME: this **MUST** be different for every packet, but it doesn't need to be randomly generated
-//        for every packet. For example it's fine to increment it by 1 for every packet. In future
-//        we can take advantage of this to avoid sending the entire 12 bytes of the nonce in every
-//        packet, but any such mechanism **must** be resistant to packet loss.
-static NONCE: [u8; 12] = [0; 12];
+// This must be very fast, but doesn't need to be cryptographically secure.
+thread_local! {
+    static RNG: RefCell<SmallRng> = RefCell::new(
+        SmallRng::from_rng(thread_rng()).expect("failed to create RNG")
+    );
+}
+
+const NONCE_SIZE: usize = 12;
+const TAG_SIZE: usize = 16;
 
 impl<const N: usize> PacketData<N> {
     fn encrypted_with_cipher(data: &[u8], cipher: &mut Aes128Gcm) -> Self {
-        debug_assert!(data.len() <= MAX_PACKET_SIZE - <Aes128Gcm as AeadCore>::TagSize::to_usize());
+        debug_assert!(data.len() <= MAX_PACKET_SIZE - NONCE_SIZE - TAG_SIZE);
+
+        // Randomly generate nonce using a *fast* RNG (not cryptographically secure)
+        // this **MUST** be different for every packet, but it can be predictable, so
+        // for example it's fine to increment it by 1 for every packet. In future we can
+        // take advantage of this to avoid sending the entire 12 bytes of the nonce in
+        // every packet, but any such mechanism **must** be resistant to packet loss.
+        let nonce: [u8; NONCE_SIZE] = RNG.with(|rng| rng.borrow_mut().gen());
+
+        // Prepare buffer with enough space for nonce, encrypted data, and tag
         let mut buffer = [0u8; N];
-        let payload: aes_gcm::aead::Payload = data.into();
-        let encrypted = cipher.encrypt(&NONCE.into(), data).unwrap();
-        let tag = cipher
-            .encrypt_in_place_detached(&NONCE.into(), payload.aad, &mut buffer[..data.len()])
-            .unwrap();
-        let tag_size = <Aes128Gcm as AeadCore>::TagSize::to_usize();
-        buffer[..tag_size].copy_from_slice(tag.as_slice());
-        buffer[tag_size..tag_size + encrypted.len()].copy_from_slice(&encrypted[..]);
+        // Copy nonce to the beginning of the buffer
+        buffer[..NONCE_SIZE].copy_from_slice(&nonce);
+
+        // Encrypt the data
+        let encrypted_with_tag = cipher.encrypt(&nonce.into(), data).unwrap();
+        // Copy encrypted data with tag into the buffer after the nonce
+        buffer[NONCE_SIZE..NONCE_SIZE + encrypted_with_tag.len()]
+            .copy_from_slice(&encrypted_with_tag);
+
         Self {
             data: buffer,
-            size: encrypted.len(),
+            size: NONCE_SIZE + encrypted_with_tag.len(),
         }
     }
 
@@ -129,21 +147,23 @@ impl<const N: usize> PacketData<N> {
 
     fn decrypt(&self, inbound_sym_key: &mut Aes128Gcm) -> Result<Self, aes_gcm::Error> {
         let tag_size = <Aes128Gcm as AeadCore>::TagSize::to_usize();
-        debug_assert!(self.data.len() <= MAX_PACKET_SIZE + tag_size);
+
+        debug_assert!(self.data.len() >= NONCE_SIZE + tag_size);
+        debug_assert!(self.data.len() <= MAX_PACKET_SIZE + NONCE_SIZE + tag_size);
+
+        let nonce = GenericArray::from_slice(&self.data[..NONCE_SIZE]);
+        // Adjusted to extract the tag from the end of the encrypted data
+        let tag = GenericArray::from_slice(&self.data[self.size - TAG_SIZE..self.size]);
+        let encrypted_data = &self.data[NONCE_SIZE..self.size - TAG_SIZE];
         let mut buffer = [0u8; N];
-        // inbound_sym_key.decrypt_in_place(&NONCE.into(), encrypted_data, &mut buffer[..])?;
-        let payload: aes_gcm::aead::Payload = self.data.as_slice().into();
-        // let _d = inbound_sym_key.decrypt(&NONCE.into(), &self.data[..]);
-        let tag = GenericArray::from_slice(&self.data[..tag_size]);
-        inbound_sym_key.decrypt_in_place_detached(
-            &NONCE.into(),
-            payload.aad,
-            &mut buffer[..self.data[tag_size..].len()],
-            tag,
-        )?;
+        let buffer_len = encrypted_data.len();
+        buffer[..buffer_len].copy_from_slice(encrypted_data);
+
+        inbound_sym_key.decrypt_in_place_detached(nonce, &[], &mut buffer[..buffer_len], tag)?;
+
         Ok(Self {
-            data: self.data,
-            size: self.data.len(),
+            data: buffer,
+            size: buffer_len,
         })
     }
 }
@@ -176,4 +196,43 @@ pub(super) enum SenderStreamError {
     Closed,
     #[error("message too big, size: {size}, max size: {max_size}")]
     MessageExceedsLength { size: usize, max_size: usize },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aes_gcm::aead::rand_core::RngCore;
+    use aes_gcm::{Aes128Gcm, KeyInit};
+    use rand::rngs::OsRng;
+
+    #[test]
+    fn test_encryption_decryption() {
+        // Generate a random 128-bit (16 bytes) key
+        let mut key = [0u8; 16];
+        OsRng.fill_bytes(&mut key);
+
+        // Create a key object for AES-GCM
+        let key = GenericArray::from_slice(&key);
+
+        // Create a new AES-128-GCM instance
+        let mut cipher = Aes128Gcm::new(key);
+        let original_data = b"Hello, world!";
+        let packet_data: PacketData<MAX_PACKET_SIZE> =
+            PacketData::encrypted_with_cipher(original_data, &mut cipher);
+
+        // Ensure data is not plainly visible
+        assert_ne!(packet_data.data[..packet_data.size], *original_data);
+
+        // Test decryption
+        match packet_data.decrypt(&mut cipher) {
+            Ok(decrypted_data) => {
+                // Ensure decrypted data matches original
+                assert_eq!(&decrypted_data.data[..decrypted_data.size], original_data);
+            }
+            Err(e) => panic!("Decryption failed with error: {:?}", e),
+        }
+    }
+
+    // Additional tests can be added here, such as testing with different data sizes,
+    // ensuring that encryption/decryption fails with incorrect keys, etc.
 }
