@@ -51,7 +51,7 @@ impl Display for ClientId {
 
 type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AuthToken(#[serde(deserialize_with = "AuthToken::deser_auth_token")] Arc<str>);
 
 impl AuthToken {
@@ -162,9 +162,12 @@ pub(crate) mod test {
         client_api::{ContractRequest, ErrorKind},
         prelude::*,
     };
-    use futures::FutureExt;
+    use futures::{FutureExt, SinkExt};
     use rand::{seq::SliceRandom, SeedableRng};
+    use tokio::net::TcpStream;
     use tokio::sync::watch::Receiver;
+    use tokio::sync::Mutex;
+    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
     use crate::node::{testing_impl::EventId, PeerId};
 
@@ -307,6 +310,60 @@ pub(crate) mod test {
             })) = response
             {
                 self.internal_state
+                    .as_mut()
+                    .expect("state should be set")
+                    .owns_contracts
+                    .insert(key);
+            }
+            async { Ok(()) }.boxed()
+        }
+    }
+
+    pub struct NetworkEventGenerator {
+        memory_event_generator: MemoryEventsGen<fastrand::Rng>,
+        ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+    }
+
+    impl NetworkEventGenerator {
+        pub fn new(
+            memory_event_generator: MemoryEventsGen<fastrand::Rng>,
+            ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+        ) -> Self {
+            Self {
+                memory_event_generator,
+                ws_client,
+            }
+        }
+    }
+
+    impl ClientEventsProxy for NetworkEventGenerator {
+        fn recv(&mut self) -> BoxFuture<'_, HostIncomingMsg> {
+            async {
+                loop {
+                    tokio::select! {
+                        event = self.memory_event_generator.recv() => {
+                            let serialized_message = bincode::serialize(&event?.request).unwrap();
+                             self.ws_client.lock().await.send(
+                                tokio_tungstenite::tungstenite::protocol::Message::Binary(serialized_message)
+                            ).await.unwrap();
+                        }
+                    }
+                }
+            }
+            .boxed()
+        }
+
+        fn send(
+            &mut self,
+            _id: ClientId,
+            response: Result<HostResponse, ClientError>,
+        ) -> BoxFuture<'_, Result<(), ClientError>> {
+            if let Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key, ..
+            })) = response
+            {
+                self.memory_event_generator
+                    .internal_state
                     .as_mut()
                     .expect("state should be set")
                     .owns_contracts

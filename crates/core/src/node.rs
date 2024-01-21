@@ -95,15 +95,15 @@ impl Node {
 ///
 /// If both are provided but also additional peers are added via the [`Self::add_gateway()`] method, this node will
 /// be listening but also try to connect to an existing peer.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct NodeConfig {
     /// public identifier for the peer
     pub peer_id: PeerId,
     // optional local info, in case this is an initial bootstrap node
     /// IP to bind to the listener
-    pub(crate) local_ip: Option<IpAddr>,
+    pub local_ip: Option<IpAddr>,
     /// socket port to bind to the listener
-    pub(crate) local_port: Option<u16>,
+    pub local_port: Option<u16>,
     /// IP dialers should connect to
     pub(crate) public_ip: Option<IpAddr>,
     /// socket port dialers should connect to
