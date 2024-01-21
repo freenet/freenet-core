@@ -7,9 +7,18 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use util::{Mean, TransferSpeed};
 
+/// Only consider the N closest peers to the contract location, lower values should
+/// encourage a small world network topology, higher values (or no limit) will prioritize speed.
 const DEFAULT_N_CLOSEST_LIMIT: usize = 2;
-const INITIAL_MEAN_TRANSFER_SIZE_ESTIMATE: f64 = 100.0;
+
+/// In the absence of sufficient data assume a mean transfer size of 2000 bytes. This should
+/// be adjusted once we have real-world data on contract sizes.
+const INITIAL_MEAN_TRANSFER_SIZE_ESTIMATE: f64 = 2000.0;
 const INITIAL_MEAN_TRANSFER_SIZE_WEIGHT: usize = 10;
+
+/// This is a fairly naive approach, assuming that the cost of a failure is a multiple
+/// of the cost of success.
+const FAILURE_COST_MULTIPLIER: f64 = 3.0;
 
 /// # Usage
 /// Important when using this type:
@@ -254,13 +263,9 @@ impl Router {
                 source,
             })?;
 
-        // This is a fairly naive approach, assuming that the cost of a failure is a multiple
-        // of the cost of success.
-        let failure_cost_multiplier = 3.0;
-
         let expected_total_time = time_to_response_start_estimate
             + (self.mean_transfer_size.compute() / transfer_rate_estimate)
-            + (time_to_response_start_estimate * failure_estimate * failure_cost_multiplier);
+            + (time_to_response_start_estimate * failure_estimate * FAILURE_COST_MULTIPLIER);
 
         Ok(RoutingPrediction {
             failure_probability: failure_estimate,
