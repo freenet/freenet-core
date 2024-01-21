@@ -147,6 +147,32 @@ mod tests {
         test_decryption(packet_data, &mut cipher, &original_data);
     }
 
+    // Test detection of packet corruption
+    #[test]
+    fn test_encryption_decryption_corrupted() {
+        // Generate a random 128-bit (16 bytes) key
+        let mut key = [0u8; 16];
+        OsRng.fill_bytes(&mut key);
+
+        // Create a key object for AES-GCM
+        let key = GenericArray::from_slice(&key);
+
+        // Create a new AES-128-GCM instance
+        let mut cipher = Aes128Gcm::new(key);
+        let original_data = b"Hello, world!";
+        let mut packet_data: PacketData<MAX_PACKET_SIZE> =
+            PacketData::encrypted_with_cipher(original_data, &mut cipher);
+
+        // Corrupt the packet data
+        packet_data.data[packet_data.size / 2] = 0;
+
+        // Ensure decryption fails
+        match packet_data.decrypt(&mut cipher) {
+            Ok(_) => panic!("Decryption succeeded when it should have failed"),
+            Err(e) => assert_eq!(e, aes_gcm::Error),
+        }
+    }
+
     fn test_decryption<T: AsRef<[u8]>>(
         packet_data: PacketData<MAX_PACKET_SIZE>,
         cipher: &mut Aes128Gcm,
