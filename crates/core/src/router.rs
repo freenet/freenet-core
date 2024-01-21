@@ -5,7 +5,6 @@ use crate::ring::{Location, PeerKeyLocation};
 use isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use stretto::TransparentKey;
 use util::{Mean, TransferSpeed};
 
 const DEFAULT_N_CLOSEST_LIMIT: usize = 2;
@@ -26,90 +25,17 @@ pub(crate) struct Router {
 
 impl Router {
     pub fn new(history: &[RouteEvent]) -> Self {
-        let failure_outcomes: Vec<IsotonicEvent> = history
-            .iter()
-            .map(|re| IsotonicEvent {
-                peer: re.peer,
-                contract_location: re.contract_location,
-                result: match re.outcome {
-                    RouteOutcome::Success {
-                        time_to_response_start: _,
-                        payload_size: _,
-                        payload_transfer_time: _,
-                    } => 0.0,
-                    RouteOutcome::Failure => 1.0,
-                },
-            })
-            .collect();
-
-        let success_durations: Vec<IsotonicEvent> = history
-            .iter()
-            .filter_map(|re| {
-                if let RouteOutcome::Success {
-                    time_to_response_start,
-                    payload_size: _,
-                    payload_transfer_time: _,
-                } = re.outcome
-                {
-                    Some(IsotonicEvent {
-                        peer: re.peer,
-                        contract_location: re.contract_location,
-                        result: time_to_response_start.as_secs_f64(),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let transfer_rates: Vec<IsotonicEvent> = history
-            .iter()
-            .filter_map(|re| {
-                if let RouteOutcome::Success {
-                    time_to_response_start: _,
-                    payload_size,
-                    payload_transfer_time,
-                } = re.outcome
-                {
-                    Some(IsotonicEvent {
-                        peer: re.peer,
-                        contract_location: re.contract_location,
-                        result: payload_size as f64 / payload_transfer_time.as_secs_f64(),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let mut mean_transfer_size = Mean::new();
-
-        // Add some initial data so this produces sensible results with low or no historical data
-        mean_transfer_size.add_with_count(
-            INITIAL_MEAN_TRANSFER_SIZE_ESTIMATE * INITIAL_MEAN_TRANSFER_SIZE_WEIGHT,
-            INITIAL_MEAN_TRANSFER_SIZE_WEIGHT,
-        );
-
-        for event in history {
-            if let RouteOutcome::Success {
-                time_to_response_start: _,
-                payload_size,
-                payload_transfer_time: _,
-            } = event.outcome
-            {
-                mean_transfer_size.add(payload_size as f64);
-            }
-        }
+        let failure_outcomes = Self::process_failure_outcomes(history);
+        let success_durations = Self::process_success_durations(history);
+        let transfer_rates = Self::process_transfer_rates(history);
+        let mean_transfer_size = Self::calculate_mean_transfer_size(history);
 
         Router {
-            // Positive because we expect time to increase as distance increases
             response_start_time_estimator: IsotonicEstimator::new(
                 success_durations,
                 EstimatorType::Positive,
             ),
-            // Positive because we expect failure probability to increase as distance increase
             failure_estimator: IsotonicEstimator::new(failure_outcomes, EstimatorType::Positive),
-            // Negative because we expect transfer rate to decrease as distance increases
             transfer_rate_estimator: IsotonicEstimator::new(
                 transfer_rates,
                 EstimatorType::Negative,
@@ -159,6 +85,79 @@ impl Router {
                 });
             }
         }
+    }
+
+    fn process_failure_outcomes(history: &[RouteEvent]) -> Vec<IsotonicEvent> {
+        history
+            .iter()
+            .map(|re| IsotonicEvent {
+                peer: re.peer,
+                contract_location: re.contract_location,
+                result: if matches!(re.outcome, RouteOutcome::Failure) {
+                    1.0
+                } else {
+                    0.0
+                },
+            })
+            .collect()
+    }
+
+    fn process_success_durations(history: &[RouteEvent]) -> Vec<IsotonicEvent> {
+        history
+            .iter()
+            .filter_map(|re| {
+                if let RouteOutcome::Success {
+                    time_to_response_start,
+                    ..
+                } = re.outcome
+                {
+                    Some(IsotonicEvent {
+                        peer: re.peer,
+                        contract_location: re.contract_location,
+                        result: time_to_response_start.as_secs_f64(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn process_transfer_rates(history: &[RouteEvent]) -> Vec<IsotonicEvent> {
+        history
+            .iter()
+            .filter_map(|re| {
+                if let RouteOutcome::Success {
+                    payload_size,
+                    payload_transfer_time,
+                    ..
+                } = re.outcome
+                {
+                    Some(IsotonicEvent {
+                        peer: re.peer,
+                        contract_location: re.contract_location,
+                        result: payload_size as f64 / payload_transfer_time.as_secs_f64(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn calculate_mean_transfer_size(history: &[RouteEvent]) -> Mean {
+        let mut mean_transfer_size = Mean::new();
+        mean_transfer_size.add_with_count(
+            INITIAL_MEAN_TRANSFER_SIZE_ESTIMATE * (INITIAL_MEAN_TRANSFER_SIZE_WEIGHT as f64),
+            INITIAL_MEAN_TRANSFER_SIZE_WEIGHT,
+        );
+
+        for event in history {
+            if let RouteOutcome::Success { payload_size, .. } = event.outcome {
+                mean_transfer_size.add(payload_size as f64);
+            }
+        }
+        mean_transfer_size
     }
 
     fn select_closest_peers<'a>(
