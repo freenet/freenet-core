@@ -170,6 +170,10 @@ impl<const N: usize> PacketData<N> {
             size: buffer_len,
         })
     }
+
+    const fn max_data_size() -> usize {
+        MAX_PACKET_SIZE - NONCE_SIZE - TAG_SIZE
+    }
 }
 
 struct SenderStream {}
@@ -237,6 +241,32 @@ mod tests {
         }
     }
 
-    // Additional tests can be added here, such as testing with different data sizes,
-    // ensuring that encryption/decryption fails with incorrect keys, etc.
+    // Test encryption/decryption where message size is the maximum allowed
+    #[test]
+    fn test_encryption_decryption_max_size() {
+        // Generate a random 128-bit (16 bytes) key
+        let mut key = [0u8; 16];
+        OsRng.fill_bytes(&mut key);
+
+        // Create a key object for AES-GCM
+        let key = GenericArray::from_slice(&key);
+
+        // Create a new AES-128-GCM instance
+        let mut cipher = Aes128Gcm::new(key);
+        let original_data = [0u8; MAX_PACKET_SIZE - NONCE_SIZE - TAG_SIZE];
+        let packet_data: PacketData<MAX_PACKET_SIZE> =
+            PacketData::encrypted_with_cipher(&original_data, &mut cipher);
+
+        // Ensure data is not plainly visible
+        assert_ne!(packet_data.data[..packet_data.size], original_data);
+
+        // Test decryption
+        match packet_data.decrypt(&mut cipher) {
+            Ok(decrypted_data) => {
+                // Ensure decrypted data matches original
+                assert_eq!(&decrypted_data.data[..decrypted_data.size], original_data);
+            }
+            Err(e) => panic!("Decryption failed with error: {:?}", e),
+        }
+    }
 }
