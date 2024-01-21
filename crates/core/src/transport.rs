@@ -66,8 +66,6 @@ use self::{
 use rand::rngs::SmallRng;
 use rand::{thread_rng, Rng, SeedableRng};
 
-const NONCE_SIZE: usize = 12;
-
 struct ReceiverStream {}
 
 impl ReceiverStream {
@@ -102,32 +100,28 @@ thread_local! {
 
 impl<const N: usize> PacketData<N> {
     fn encrypted_with_cipher(data: &[u8], cipher: &mut Aes128Gcm) -> Self {
-        let tag_size = <Aes128Gcm as AeadCore>::TagSize::to_usize();
-        debug_assert!(data.len() + NONCE_SIZE <= N - tag_size);
-
+        debug_assert!(data.len() <= MAX_PACKET_SIZE - <Aes128Gcm as AeadCore>::TagSize::to_usize());
         let mut buffer = [0u8; N];
         let payload: aes_gcm::aead::Payload = data.into();
 
-        // Generate nonce
-        let nonce: [u8; NONCE_SIZE] = RNG.with(|rng| rng.borrow_mut().gen());
-        buffer[..NONCE_SIZE].copy_from_slice(&nonce);
+        // Randomly generate nonce using a *fast* RNG (not cryptographically secure)
+        // this **MUST** be different for every packet, but it can be predictable, so
+        // for example it's fine to increment it by 1 for every packet. In future we can
+        // take advantage of this to avoid sending the entire 12 bytes of the nonce in
+        // every packet, but any such mechanism **must** be resistant to packet loss.
+        let nonce: [u8; 12] = RNG.with(|rng| rng.borrow_mut().gen());
 
         let encrypted = cipher.encrypt(&nonce.into(), data).unwrap();
-        buffer[NONCE_SIZE..NONCE_SIZE + encrypted.len()].copy_from_slice(&encrypted[..]);
-
         let tag = cipher
-            .encrypt_in_place_detached(
-                &nonce.into(),
-                payload.aad,
-                &mut buffer[NONCE_SIZE..NONCE_SIZE + data.len()],
-            )
+            .encrypt_in_place_detached(&nonce.into(), payload.aad, &mut buffer[..data.len()])
             .unwrap();
-        buffer[NONCE_SIZE + encrypted.len()..NONCE_SIZE + encrypted.len() + tag_size]
-            .copy_from_slice(tag.as_slice());
 
+        let tag_size = <Aes128Gcm as AeadCore>::TagSize::to_usize();
+        buffer[..tag_size].copy_from_slice(tag.as_slice());
+        buffer[tag_size..tag_size + encrypted.len()].copy_from_slice(&encrypted[..]);
         Self {
             data: buffer,
-            size: NONCE_SIZE + encrypted.len() + tag_size,
+            size: encrypted.len(),
         }
     }
 
@@ -148,24 +142,21 @@ impl<const N: usize> PacketData<N> {
 
     fn decrypt(&self, inbound_sym_key: &mut Aes128Gcm) -> Result<Self, aes_gcm::Error> {
         let tag_size = <Aes128Gcm as AeadCore>::TagSize::to_usize();
-        let encrypted_size = self.size - NONCE_SIZE - tag_size;
-        debug_assert!(encrypted_size >= 0);
-
-        let nonce = GenericArray::from_slice(&self.data[..NONCE_SIZE]);
-        let tag = GenericArray::from_slice(
-            &self.data[NONCE_SIZE + encrypted_size..NONCE_SIZE + encrypted_size + tag_size],
-        );
+        debug_assert!(self.data.len() <= MAX_PACKET_SIZE + tag_size);
         let mut buffer = [0u8; N];
+        // inbound_sym_key.decrypt_in_place(&NONCE.into(), encrypted_data, &mut buffer[..])?;
+        let payload: aes_gcm::aead::Payload = self.data.as_slice().into();
+        // let _d = inbound_sym_key.decrypt(&NONCE.into(), &self.data[..]);
+        let tag = GenericArray::from_slice(&self.data[..tag_size]);
         inbound_sym_key.decrypt_in_place_detached(
-            nonce,
-            &[],
-            &mut buffer[..encrypted_size],
+            &NONCE.into(),
+            payload.aad,
+            &mut buffer[..self.data[tag_size..].len()],
             tag,
         )?;
-
         Ok(Self {
-            data: buffer,
-            size: encrypted_size,
+            data: self.data,
+            size: self.data.len(),
         })
     }
 }
