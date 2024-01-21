@@ -396,7 +396,7 @@ async fn child(
     child_config: &MultiProcessConfig,
 ) -> anyhow::Result<()> {
     let id = child_config.id.expect("id should be set for child process");
-    let data_dir = child_config
+    let _data_dir = child_config
         .data_dir
         .as_ref()
         .expect("data_dir should be set for child process");

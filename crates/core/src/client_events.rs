@@ -153,7 +153,6 @@ pub trait ClientEventsProxy {
 }
 
 pub(crate) mod test {
-    use fastrand::Rng;
     use std::{
         collections::{HashMap, HashSet},
         time::Duration,
@@ -163,7 +162,7 @@ pub(crate) mod test {
         client_api::{ContractRequest, ErrorKind},
         prelude::*,
     };
-    use futures::{FutureExt, SinkExt, StreamExt};
+    use futures::{FutureExt, StreamExt};
     use rand::{seq::SliceRandom, SeedableRng};
     use tokio::net::TcpStream;
     use tokio::sync::watch::Receiver;
@@ -326,8 +325,6 @@ pub(crate) mod test {
         memory_event_generator: MemoryEventsGen<R>,
         ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
         rng: Option<R>,
-        internal_state: Option<InternalGeneratorState>,
-        events_to_gen: HashMap<EventId, ClientRequest<'static>>,
     }
 
     impl<R> NetworkEventGenerator<R>
@@ -345,8 +342,6 @@ pub(crate) mod test {
                 memory_event_generator,
                 ws_client,
                 rng: Some(R::seed_from_u64(seed)),
-                internal_state: None,
-                events_to_gen: HashMap::new(),
             }
         }
     }

@@ -35,6 +35,9 @@ pub enum PeerMessage {
     Info(String),
 }
 
+type PeerEventSender = Sender<(u32, crate::node::PeerId)>;
+type PeerEventReceiver = Receiver<(u32, crate::node::PeerId)>;
+
 impl NetworkPeer {
     pub async fn new(peer_id: String) -> Result<Self, Error> {
         let (ws_stream, _) = tokio_tungstenite::connect_async("ws://localhost:3000/ws")
@@ -47,10 +50,8 @@ impl NetworkPeer {
 
         tracing::debug!(peer_config = ?peer_config, "Received peer config");
 
-        let (user_ev_controller, receiver_ch): (
-            Sender<(u32, crate::node::PeerId)>,
-            Receiver<(u32, crate::node::PeerId)>,
-        ) = tokio::sync::watch::channel((0, peer_config.peer_id));
+        let (user_ev_controller, receiver_ch): (PeerEventSender, PeerEventReceiver) =
+            tokio::sync::watch::channel((0, peer_config.peer_id));
 
         Ok(NetworkPeer {
             id: peer_id,

@@ -18,8 +18,6 @@ use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use http::{Response, StatusCode};
 use libp2p_identity::Keypair;
-use reqwest;
-use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 use std::{
     collections::{HashMap, VecDeque},
@@ -31,7 +29,6 @@ use std::{
 };
 
 use thiserror::Error;
-use tokio::sync::watch::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio::{
     process::Command,
@@ -41,11 +38,11 @@ use tokio::{
 #[derive(Debug, Error)]
 pub enum NetworkSimulationError {
     #[error("Server start failed: {0}")]
-    ServerStartError(String),
+    ServerStartFailure(String),
     #[error("Network error: {0}")]
     NetworkError(String),
     #[error("Subprocess start failed: {0}")]
-    SubProcessStartError(String),
+    SubProcessStartFailure(String),
 }
 
 #[derive(Default, Clone, clap::ValueEnum)]
@@ -74,7 +71,6 @@ pub struct NetworkProcessConfig {
 
 struct SubProcess {
     child: tokio::process::Child,
-    id: PeerId,
 }
 
 impl SubProcess {
@@ -121,11 +117,7 @@ impl SubProcess {
         args
     }
 
-    async fn start(
-        cmd_args: &[String],
-        label: &NodeLabel,
-        id: PeerId,
-    ) -> anyhow::Result<Self, Error> {
+    async fn start(cmd_args: &[String], label: &NodeLabel) -> anyhow::Result<Self, Error> {
         let child = Command::new("fdev")
             .kill_on_drop(true)
             .args(cmd_args)
@@ -136,13 +128,13 @@ impl SubProcess {
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| {
-                NetworkSimulationError::SubProcessStartError(format!(
+                NetworkSimulationError::SubProcessStartFailure(format!(
                     "Failed to start subprocess: {}",
                     e
                 ))
             })?;
 
-        Ok(Self { child, id })
+        Ok(Self { child })
     }
 
     async fn close(mut self) {
@@ -168,7 +160,7 @@ async fn start_peer(config: &TestConfig, cmd_config: &NetworkProcessConfig) -> R
     std::env::set_var("FREENET_PEER_ID", cmd_config.clone().id.unwrap());
     freenet::config::set_logger();
     if let Some(peer_id) = &cmd_config.id {
-        let mut peer = NetworkPeer::new(peer_id.clone()).await?;
+        let peer = NetworkPeer::new(peer_id.clone()).await?;
         peer.run(config, peer_id.clone()).await?;
     }
     Ok(())
@@ -202,24 +194,24 @@ pub async fn start_server(supervisor: Arc<Supervisor>) -> Result<(), NetworkSimu
     tokio::spawn(async move {
         tracing::info!("Supervisor running on {}", socket);
         let listener = tokio::net::TcpListener::bind(socket).await.map_err(|_| {
-            NetworkSimulationError::ServerStartError("Failed to bind TCP listener".into())
+            NetworkSimulationError::ServerStartFailure("Failed to bind TCP listener".into())
         })?;
 
         if startup_sender.send(()).is_err() {
             tracing::error!("Failed to send startup signal");
-            return Err(NetworkSimulationError::ServerStartError(
+            return Err(NetworkSimulationError::ServerStartFailure(
                 "Failed to send startup signal".into(),
             ));
         }
 
         axum::serve(listener, router)
             .await
-            .map_err(|e| NetworkSimulationError::ServerStartError(format!("Server error: {}", e)))
+            .map_err(|e| NetworkSimulationError::ServerStartFailure(format!("Server error: {}", e)))
     });
 
     startup_receiver
         .await
-        .map_err(|_| NetworkSimulationError::ServerStartError("Server startup failed".into()))?;
+        .map_err(|_| NetworkSimulationError::ServerStartFailure("Server startup failed".into()))?;
 
     tracing::info!("Server started successfully");
     Ok(())
@@ -232,7 +224,7 @@ pub async fn run_network(
 ) -> Result<(), Error> {
     tracing::info!("Starting network");
 
-    let cmd_args = SubProcess::build_command(&test_config, test_config.seed());
+    let cmd_args = SubProcess::build_command(test_config, test_config.seed());
     supervisor.start_peer_gateways(&cmd_args).await?;
     supervisor.start_peer_nodes(&cmd_args).await?;
 
@@ -330,7 +322,7 @@ async fn ws_handler(ws: WebSocketUpgrade, supervisor: Arc<Supervisor>) -> axum::
     ws.on_upgrade(on_upgrade)
 }
 
-async fn handle_socket(mut socket: WebSocket, supervisor: Arc<Supervisor>) -> anyhow::Result<()> {
+async fn handle_socket(socket: WebSocket, supervisor: Arc<Supervisor>) -> anyhow::Result<()> {
     // Clone supervisor to allow safe concurrent access in async tasks.
     let cloned_supervisor = supervisor.clone();
     let (mut sender, mut receiver): (SplitSink<WebSocket, Message>, SplitStream<WebSocket>) =
@@ -498,7 +490,7 @@ impl Supervisor {
         label: &NodeLabel,
         config: &NodeConfig,
     ) -> Result<(), Error> {
-        let process = SubProcess::start(cmd_args, label, config.peer_id).await?;
+        let process = SubProcess::start(cmd_args, label).await?;
         self.processes.lock().await.insert(config.peer_id, process);
         Ok(())
     }
