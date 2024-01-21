@@ -108,27 +108,29 @@ impl<const N: usize> PacketData<N> {
     fn encrypted_with_cipher(data: &[u8], cipher: &mut Aes128Gcm) -> Self {
         debug_assert!(data.len() <= MAX_PACKET_SIZE - NONCE_SIZE - TAG_SIZE);
 
-        // Randomly generate nonce using a *fast* RNG (not cryptographically secure)
-        // this **MUST** be different for every packet, but it can be predictable, so
-        // for example it's fine to increment it by 1 for every packet. In future we can
-        // take advantage of this to avoid sending the entire 12 bytes of the nonce in
-        // every packet, but any such mechanism **must** be resistant to packet loss.
         let nonce: [u8; NONCE_SIZE] = RNG.with(|rng| rng.borrow_mut().gen());
 
-        // Prepare buffer with enough space for nonce, encrypted data, and tag
         let mut buffer = [0u8; N];
-        // Copy nonce to the beginning of the buffer
         buffer[..NONCE_SIZE].copy_from_slice(&nonce);
 
-        // Encrypt the data
-        let encrypted_with_tag = cipher.encrypt(&nonce.into(), data).unwrap();
-        // Copy encrypted data with tag into the buffer after the nonce
-        buffer[NONCE_SIZE..NONCE_SIZE + encrypted_with_tag.len()]
-            .copy_from_slice(&encrypted_with_tag);
+        // Encrypt the data in place
+        let payload_length = data.len();
+        buffer[NONCE_SIZE..NONCE_SIZE + payload_length].copy_from_slice(data);
+        let tag = cipher
+            .encrypt_in_place_detached(
+                &nonce.into(),
+                &[],
+                &mut buffer[NONCE_SIZE..NONCE_SIZE + payload_length],
+            )
+            .unwrap();
+
+        // Append the tag to the buffer
+        buffer[NONCE_SIZE + payload_length..NONCE_SIZE + payload_length + TAG_SIZE]
+            .copy_from_slice(tag.as_slice());
 
         Self {
             data: buffer,
-            size: NONCE_SIZE + encrypted_with_tag.len(),
+            size: NONCE_SIZE + payload_length + TAG_SIZE,
         }
     }
 
