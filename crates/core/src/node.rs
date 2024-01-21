@@ -96,7 +96,7 @@ impl Node {
 ///
 /// If both are provided but also additional peers are added via the [`Self::add_gateway()`] method, this node will
 /// be listening but also try to connect to an existing peer.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NodeConfig {
     /// public identifier for the peer
     pub peer_id: PeerId,
@@ -264,7 +264,7 @@ impl Default for NodeConfig {
 }
 
 /// Gateway node to bootstrap the network.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct InitPeerNode {
     addr: Option<Multiaddr>,
     identifier: PeerId,

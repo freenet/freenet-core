@@ -45,6 +45,8 @@ impl NetworkPeer {
         let response = reqwest::get(&config_url).await?;
         let peer_config = response.json::<crate::node::NodeConfig>().await?;
 
+        tracing::debug!(peer_config = ?peer_config, "Received peer config");
+
         let (user_ev_controller, receiver_ch): (
             Sender<(u32, crate::node::PeerId)>,
             Receiver<(u32, crate::node::PeerId)>,
