@@ -50,14 +50,11 @@ mod bw;
 mod connection_handler;
 mod connection_info;
 mod crypto;
+mod symmetric_message;
 
-use aes_gcm::{
-    aead::generic_array::GenericArray,
-    aes::{
-        cipher::{BlockDecrypt, BlockEncrypt},
-        Aes128,
-    },
-};
+use std::vec;
+
+use aes_gcm::{AeadInPlace, Aes128Gcm};
 
 use self::{
     connection_handler::MAX_PACKET_SIZE, connection_info::ConnectionError,
@@ -89,14 +86,16 @@ struct PacketData {
     size: usize,
 }
 
+// todo: this is temporal, we need to generate those
+static NONCE: [u8; 12] = [0; 12];
+
 impl PacketData {
-    fn encrypted_with_cipher(
-        mut data: [u8; MAX_PACKET_SIZE],
-        size: usize,
-        cipher: &Aes128,
-    ) -> Self {
-        cipher.encrypt_block(GenericArray::from_mut_slice(&mut data[..size]));
-        Self { data, size }
+    fn encrypted_with_cipher(data: [u8; MAX_PACKET_SIZE], size: usize, cipher: &Aes128Gcm) -> Self {
+        let mut buffer = [0u8; MAX_PACKET_SIZE];
+        let _tag = cipher
+            .encrypt_in_place_detached(&NONCE.into(), &data, buffer.as_mut_slice())
+            .unwrap();
+        Self { data: buffer, size }
     }
 
     fn encrypted_with_remote(data: &[u8], remote_key: &TransportPublicKey) -> Self {
@@ -115,17 +114,23 @@ impl PacketData {
     }
 
     fn from_encrypted(
-        mut data: [u8; MAX_PACKET_SIZE],
+        data: [u8; MAX_PACKET_SIZE],
         size: usize,
-        inbound_sym_key: &Aes128,
-    ) -> Self {
-        Self::decrypt(&mut data[..size], inbound_sym_key);
-        Self { data, size }
+        inbound_sym_key: &Aes128Gcm,
+    ) -> Result<Self, aes_gcm::Error> {
+        Self::decrypt(&data[..size], inbound_sym_key)?;
+        Ok(Self { data, size })
     }
 
-    fn decrypt(encrypted_data: &mut [u8], inbound_sym_key: &Aes128) {
+    fn decrypt(
+        encrypted_data: &[u8],
+        inbound_sym_key: &Aes128Gcm,
+    ) -> Result<[u8; MAX_PACKET_SIZE], aes_gcm::Error> {
         debug_assert!(encrypted_data.len() <= MAX_PACKET_SIZE);
-        inbound_sym_key.decrypt_block(GenericArray::from_mut_slice(encrypted_data));
+        let mut buffer = vec![0u8; MAX_PACKET_SIZE];
+        inbound_sym_key.decrypt_in_place(&NONCE.into(), encrypted_data, &mut buffer)?;
+        let data = buffer[..1500].try_into().unwrap();
+        Ok(data)
     }
 }
 

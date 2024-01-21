@@ -96,31 +96,27 @@ impl TimeSource for SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::rc::Rc;
-    use std::sync::RwLock;
 
     #[derive(Clone)]
     struct MockTimeSource {
-        current_instant: Rc<RwLock<Instant>>,
+        current_instant: Instant,
     }
 
     impl MockTimeSource {
         fn new(start_instant: Instant) -> Self {
             MockTimeSource {
-                current_instant: Rc::new(RwLock::new(start_instant)),
+                current_instant: start_instant,
             }
         }
 
-        fn advance_time(&self, duration: Duration) {
-            let mut write_guard = self.current_instant.write().unwrap();
-            *write_guard += duration;
+        fn advance_time(&mut self, duration: Duration) {
+            self.current_instant += duration;
         }
     }
 
     impl TimeSource for MockTimeSource {
         fn now(&self) -> Instant {
-            let read_guard = self.current_instant.read().unwrap();
-            *read_guard
+            self.current_instant
         }
     }
 
@@ -166,7 +162,7 @@ mod tests {
 
     #[test]
     fn test_packet_expiry() {
-        let (mut tracker, ts) = mock_tracker(Duration::from_millis(200));
+        let (mut tracker, mut ts) = mock_tracker(Duration::from_millis(200));
         tracker.add_packet(1500);
         verify_bandwidth_match(&tracker);
         ts.advance_time(Duration::from_millis(300));
@@ -177,7 +173,7 @@ mod tests {
 
     #[test]
     fn test_wait_time_calculation() {
-        let (mut tracker, ts) = mock_tracker(Duration::from_secs(1));
+        let (mut tracker, mut ts) = mock_tracker(Duration::from_secs(1));
         tracker.add_packet(5000);
         verify_bandwidth_match(&tracker);
         ts.advance_time(Duration::from_millis(500));

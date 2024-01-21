@@ -1,3 +1,4 @@
+use aes_gcm::Aes128Gcm;
 use aes_gcm::{aes::Aes128, KeyInit};
 use futures::channel::oneshot;
 use serde::Serialize;
@@ -8,6 +9,8 @@ use std::{borrow::Cow, time::Duration};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task;
+
+use crate::transport::symmetric_message::{SymmetricMessage, SymmetricMessagePayload};
 
 use super::BytesPerSecond;
 use super::{
@@ -149,7 +152,7 @@ impl UdpPacketsListener {
                         Ok((size, addr)) => {
                             match self.connection_raw_packet_senders.get(&addr) {
                                 Some((conn_info, sender)) => {
-                                    let packet_data = PacketData::from_encrypted(std::mem::replace(&mut buf, [0; MAX_PACKET_SIZE]), size, &conn_info.outbound_symmetric_key);
+                                    let packet_data = PacketData::from_encrypted(std::mem::replace(&mut buf, [0; MAX_PACKET_SIZE]), size, &conn_info.outbound_symmetric_key).unwrap();
                                     if let Err(e) = sender.send(packet_data).await {
                                         tracing::warn!("Failed to send raw packet to connection sender: {:?}", e);
                                     }
@@ -214,14 +217,14 @@ impl UdpPacketsListener {
         let mut packet = [0u8; MAX_PACKET_SIZE];
         let mut state = ConnectionState::Start;
 
-        let outbound_sym_key_bytes = rand::random::<[u8; 16]>();
-        let outbound_sym_key: Aes128 = Aes128::new(&outbound_sym_key_bytes.into());
-        let mut inbound_sym_key: Option<Aes128> = None;
+        let inbound_sym_key_bytes = rand::random::<[u8; 16]>();
+        let inbound_sym_key = Aes128Gcm::new(&inbound_sym_key_bytes.into());
+        let mut outbound_sym_key: Option<Aes128Gcm> = None;
 
         let outbound_intro_packet = {
             let mut data = [0u8; { 16 + PROTOC_VERSION.len() }];
             data[..PROTOC_VERSION.len()].copy_from_slice(&PROTOC_VERSION);
-            data[PROTOC_VERSION.len()..].copy_from_slice(&outbound_sym_key_bytes);
+            data[PROTOC_VERSION.len()..].copy_from_slice(&inbound_sym_key_bytes);
             PacketData::encrypted_with_remote(&data, &remote_public_key)
         };
 
@@ -230,7 +233,7 @@ impl UdpPacketsListener {
         let hello_packet = {
             let mut packet = [0; MAX_PACKET_SIZE];
             packet[..HELLO.len()].copy_from_slice(HELLO);
-            PacketData::encrypted_with_cipher(packet, HELLO.len(), &outbound_sym_key)
+            PacketData::encrypted_with_cipher(packet, HELLO.len(), &inbound_sym_key)
         };
 
         while failures < MAX_FAILURES {
@@ -263,12 +266,34 @@ impl UdpPacketsListener {
                     }
                     match state {
                         ConnectionState::Start
+                        // this is the other peer intro packer theoretically
                             if size == outbound_intro_packet.send_data().len() =>
                         {
                             // try to decrypt the message with the symmetric key
-                            let data = self.this_peer_keypair.secret.decrypt(&packet[..size])?;
+                            let Ok(data) = self.this_peer_keypair.secret.decrypt(&packet[..size]) else {
+                                failures += 1;
+                                tracing::debug!("Received unexpect packet from remote");
+                                continue;
+                            };
+                            let key = Aes128Gcm::new_from_slice(&data[PROTOC_VERSION.len()..])
+                                .map_err(|_| TransportError::ConnectionEstablishmentFailure {
+                                    cause: "invalid symmetric key".into(),
+                                })?;
                             let protocol_version = &data[..PROTOC_VERSION.len()];
                             if protocol_version != PROTOC_VERSION {
+                                let packet = {
+                                    let msg = SymmetricMessage {
+                                        message_id: 0,
+                                        confirm_receipt: None,
+                                        payload: SymmetricMessagePayload::AckConnection {
+                                            result: Err("remote is using a different protocol version".into()),
+                                        },
+                                    };
+                                    let mut packet = [0u8; MAX_PACKET_SIZE];
+                                    bincode::serialize_into( packet.as_mut_slice(), &msg)?;
+                                    PacketData::encrypted_with_cipher(packet, packet.len(), &key)
+                                };
+                                let _ = self.socket.send_to(packet.send_data(), remote_addr).await; 
                                 return Err(TransportError::ConnectionEstablishmentFailure {
                                     cause: format!(
                                         "remote is using a different protocol version: {:?}",
@@ -277,11 +302,8 @@ impl UdpPacketsListener {
                                     .into(),
                                 });
                             }
-                            let key: Aes128 = Aes128::new_from_slice(&data[PROTOC_VERSION.len()..])
-                                .map_err(|_| TransportError::ConnectionEstablishmentFailure {
-                                    cause: "invalid symmetric key".into(),
-                                })?;
-                            inbound_sym_key = Some(key);
+                            
+                            outbound_sym_key = Some(key);
                             state = ConnectionState::AckConnection;
                             continue;
                         }
@@ -290,16 +312,16 @@ impl UdpPacketsListener {
                             tracing::debug!("Received unexpect response from remote");
                         }
                         ConnectionState::AckConnection => {
-                            PacketData::decrypt(
-                                &mut packet[..size],
-                                inbound_sym_key
+                            let decrypted = PacketData::decrypt(
+                                & packet[..size],
+                                outbound_sym_key
                                     .as_ref()
                                     .expect("should be set at this stage"),
                             );
                             if &packet[..size] == HELLO.as_slice() {
                                 return Ok(ConnectionInfo {
-                                    outbound_symmetric_key: outbound_sym_key,
-                                    inbound_symmetric_key: inbound_sym_key
+                                    outbound_symmetric_key: inbound_sym_key,
+                                    inbound_symmetric_key: outbound_sym_key
                                         .expect("should be set at this stage"),
                                     remote_public_key,
                                     remote_is_gateway: false,
@@ -361,4 +383,6 @@ pub(super) enum TransportError {
     DescryptionError(#[from] rsa::errors::Error),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+    #[error(transparent)]
+    Serialization(#[from] bincode::Error),
 }
