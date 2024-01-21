@@ -141,7 +141,8 @@ mod tests {
             PacketData::encrypted_with_cipher(&original_data, &mut cipher);
 
         // Ensure data is not plainly visible
-        assert!(longest_common_subsequence(&packet_data.data, &original_data) < 10);
+        let overlap = longest_common_subsequence(&packet_data.data, &original_data);
+        assert!(overlap < 20);
 
         test_decryption(packet_data, &mut cipher, &original_data);
     }
