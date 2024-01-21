@@ -17,7 +17,7 @@ anyhow = "1"
 asynchronous-codec = "0.6"
 async-trait = "0.1"
 axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws"], workspace = true }
-bincode = "1"
+bincode = "1.3.3"
 blake3 = { workspace = true }
 bs58 = "0.5"
 byteorder = "1"

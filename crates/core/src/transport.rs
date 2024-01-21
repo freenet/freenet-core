@@ -52,9 +52,11 @@ mod connection_info;
 mod crypto;
 mod symmetric_message;
 
-use std::vec;
-
-use aes_gcm::{AeadInPlace, Aes128Gcm};
+use aes_gcm::{
+    aead::{generic_array::GenericArray, AeadMut},
+    aes::cipher::Unsigned,
+    AeadCore, AeadInPlace, Aes128Gcm,
+};
 
 use self::{
     connection_handler::MAX_PACKET_SIZE, connection_info::ConnectionError,
@@ -81,27 +83,36 @@ struct StreamedMessagePart {
 }
 
 // todo: split this into type for handling inbound (encrypted)/outbound (decrypted) packets for clarity
-struct PacketData {
-    data: [u8; MAX_PACKET_SIZE],
+struct PacketData<const N: usize = MAX_PACKET_SIZE> {
+    data: [u8; N],
     size: usize,
 }
 
 // todo: this is temporal, we need to generate those
 static NONCE: [u8; 12] = [0; 12];
 
-impl PacketData {
-    fn encrypted_with_cipher(data: [u8; MAX_PACKET_SIZE], size: usize, cipher: &Aes128Gcm) -> Self {
-        let mut buffer = [0u8; MAX_PACKET_SIZE];
-        let _tag = cipher
-            .encrypt_in_place_detached(&NONCE.into(), &data, buffer.as_mut_slice())
+impl<const N: usize> PacketData<N> {
+    fn encrypted_with_cipher(data: &[u8], cipher: &mut Aes128Gcm) -> Self {
+        debug_assert!(data.len() <= MAX_PACKET_SIZE - <Aes128Gcm as AeadCore>::TagSize::to_usize());
+        let mut buffer = [0u8; N];
+        let payload: aes_gcm::aead::Payload = data.into();
+        let encrypted = cipher.encrypt(&NONCE.into(), data).unwrap();
+        let tag = cipher
+            .encrypt_in_place_detached(&NONCE.into(), payload.aad, &mut buffer[..data.len()])
             .unwrap();
-        Self { data: buffer, size }
+        let tag_size = <Aes128Gcm as AeadCore>::TagSize::to_usize();
+        buffer[..tag_size].copy_from_slice(tag.as_slice());
+        buffer[tag_size..tag_size + encrypted.len()].copy_from_slice(&encrypted[..]);
+        Self {
+            data: buffer,
+            size: encrypted.len(),
+        }
     }
 
     fn encrypted_with_remote(data: &[u8], remote_key: &TransportPublicKey) -> Self {
         let encrypted_data: Vec<u8> = remote_key.encrypt(data);
         debug_assert!(encrypted_data.len() <= MAX_PACKET_SIZE);
-        let mut data = [0; MAX_PACKET_SIZE];
+        let mut data = [0; N];
         data.copy_from_slice(&encrypted_data[..]);
         Self {
             data,
@@ -113,24 +124,24 @@ impl PacketData {
         &self.data[..self.size]
     }
 
-    fn from_encrypted(
-        data: [u8; MAX_PACKET_SIZE],
-        size: usize,
-        inbound_sym_key: &Aes128Gcm,
-    ) -> Result<Self, aes_gcm::Error> {
-        Self::decrypt(&data[..size], inbound_sym_key)?;
-        Ok(Self { data, size })
-    }
-
-    fn decrypt(
-        encrypted_data: &[u8],
-        inbound_sym_key: &Aes128Gcm,
-    ) -> Result<[u8; MAX_PACKET_SIZE], aes_gcm::Error> {
-        debug_assert!(encrypted_data.len() <= MAX_PACKET_SIZE);
-        let mut buffer = vec![0u8; MAX_PACKET_SIZE];
-        inbound_sym_key.decrypt_in_place(&NONCE.into(), encrypted_data, &mut buffer)?;
-        let data = buffer[..1500].try_into().unwrap();
-        Ok(data)
+    fn decrypt(&self, inbound_sym_key: &mut Aes128Gcm) -> Result<Self, aes_gcm::Error> {
+        let tag_size = <Aes128Gcm as AeadCore>::TagSize::to_usize();
+        debug_assert!(self.data.len() <= MAX_PACKET_SIZE + tag_size);
+        let mut buffer = [0u8; N];
+        // inbound_sym_key.decrypt_in_place(&NONCE.into(), encrypted_data, &mut buffer[..])?;
+        let payload: aes_gcm::aead::Payload = self.data.as_slice().into();
+        // let _d = inbound_sym_key.decrypt(&NONCE.into(), &self.data[..]);
+        let tag = GenericArray::from_slice(&self.data[..tag_size]);
+        inbound_sym_key.decrypt_in_place_detached(
+            &NONCE.into(),
+            payload.aad,
+            &mut buffer[..self.data[tag_size..].len()],
+            tag,
+        )?;
+        Ok(Self {
+            data: self.data,
+            size: self.data.len(),
+        })
     }
 }
 

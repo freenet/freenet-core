@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::OnceLock};
 
 use aes_gcm::Aes128Gcm;
 use serde::{Deserialize, Serialize};
@@ -21,22 +21,26 @@ impl SymmetricMessage {
         bincode::deserialize(bytes)
     }
 
-    pub fn ack_error(outbound_sym_key: &Aes128Gcm) -> Result<PacketData, bincode::Error> {
-        let msg = SymmetricMessage {
-            message_id: 0,
-            confirm_receipt: None,
-            payload: SymmetricMessagePayload::AckConnection {
-                result: Err("remote is using a different protocol version".into()),
-            },
-        };
-        let mut packet = [0u8; MAX_PACKET_SIZE];
-        bincode::serialize_into(packet.as_mut_slice(), &msg)?;
-        Ok(PacketData::encrypted_with_cipher(
-            packet,
-            packet.len(),
-            outbound_sym_key,
-        ))
+    pub fn ack_error(outbound_sym_key: &mut Aes128Gcm) -> Result<PacketData, bincode::Error> {
+        static SERIALIZED: OnceLock<Box<[u8]>> = OnceLock::new();
+        let bytes = SERIALIZED.get_or_init(|| {
+            let mut packet = [0u8; MAX_PACKET_SIZE];
+            let size = bincode::serialized_size(&Self::ACK_ERROR).unwrap();
+            bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_ERROR).unwrap();
+            (&packet[..size as usize]).into()
+        });
+        Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
     }
+
+    const ACK_ERROR: SymmetricMessage = SymmetricMessage {
+        message_id: 0,
+        confirm_receipt: None,
+        payload: SymmetricMessagePayload::AckConnection {
+            result: Err(Cow::Borrowed(
+                "remote is using a different protocol version",
+            )),
+        },
+    };
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,10 +56,10 @@ pub(super) enum SymmetricMessagePayload {
 #[test]
 fn ack_error_msg() -> Result<(), Box<dyn std::error::Error>> {
     use aes_gcm::KeyInit;
-    let key = Aes128Gcm::new(&[0; 16].into());
-    let packet = SymmetricMessage::ack_error(&key)?;
-    let data = PacketData::decrypt(packet.send_data(), &key).unwrap();
-    let deser = SymmetricMessage::deser(&data)?;
+    let mut key = Aes128Gcm::new(&[0; 16].into());
+    let packet = SymmetricMessage::ack_error(&mut key)?;
+    let data = packet.decrypt(&mut key).unwrap();
+    let deser = SymmetricMessage::deser(data.send_data())?;
     assert!(matches!(
         deser.payload,
         SymmetricMessagePayload::AckConnection { result: Err(_) }

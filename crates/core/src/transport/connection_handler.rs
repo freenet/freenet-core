@@ -1,11 +1,11 @@
-use aes_gcm::Aes128Gcm;
-use aes_gcm::{aes::Aes128, KeyInit};
-use futures::channel::oneshot;
-use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::vec::Vec;
 use std::{borrow::Cow, time::Duration};
+
+use aes_gcm::{Aes128Gcm, KeyInit};
+use futures::channel::oneshot;
+use serde::Serialize;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task;
@@ -150,12 +150,12 @@ impl UdpPacketsListener {
                 recv_result = self.socket.recv_from(&mut buf) => {
                     match recv_result {
                         Ok((size, addr)) => {
-                            match self.connection_raw_packet_senders.get(&addr) {
+                            match self.connection_raw_packet_senders.get_mut(&addr) {
                                 Some((conn_info, sender)) => {
-                                    let packet_data = PacketData::from_encrypted(std::mem::replace(&mut buf, [0; MAX_PACKET_SIZE]), size, &conn_info.outbound_symmetric_key).unwrap();
-                                    if let Err(e) = sender.send(packet_data).await {
-                                        tracing::warn!("Failed to send raw packet to connection sender: {:?}", e);
-                                    }
+                                    // let packet_data = PacketData::decrypt(std::mem::replace(&mut buf, [0; MAX_PACKET_SIZE]),  &mut conn_info.outbound_symmetric_key).unwrap();
+                                    // if let Err(e) = sender.send(packet_data).await {
+                                    //     tracing::warn!("Failed to send raw packet to connection sender: {:?}", e);
+                                    // }
                                 }
                                 None => {
                                     self
@@ -218,22 +218,20 @@ impl UdpPacketsListener {
         let mut state = ConnectionState::Start;
 
         let inbound_sym_key_bytes = rand::random::<[u8; 16]>();
-        let inbound_sym_key = Aes128Gcm::new(&inbound_sym_key_bytes.into());
+        let mut inbound_sym_key = Aes128Gcm::new(&inbound_sym_key_bytes.into());
         let mut outbound_sym_key: Option<Aes128Gcm> = None;
 
         let outbound_intro_packet = {
             let mut data = [0u8; { 16 + PROTOC_VERSION.len() }];
             data[..PROTOC_VERSION.len()].copy_from_slice(&PROTOC_VERSION);
             data[PROTOC_VERSION.len()..].copy_from_slice(&inbound_sym_key_bytes);
-            PacketData::encrypted_with_remote(&data, &remote_public_key)
+            PacketData::<MAX_PACKET_SIZE>::encrypted_with_remote(&data, &remote_public_key)
         };
 
         // fixme: use typed messages instead of raw bytes
-        const HELLO: &[u8; 5] = b"hello";
         let hello_packet = {
-            let mut packet = [0; MAX_PACKET_SIZE];
-            packet[..HELLO.len()].copy_from_slice(HELLO);
-            PacketData::encrypted_with_cipher(packet, HELLO.len(), &inbound_sym_key)
+            const HELLO: &[u8; 5] = b"hello";
+            PacketData::<MAX_PACKET_SIZE>::encrypted_with_cipher(HELLO, &mut inbound_sym_key)
         };
 
         while failures < MAX_FAILURES {
@@ -275,7 +273,7 @@ impl UdpPacketsListener {
                                 tracing::debug!("Received unexpect packet from remote");
                                 continue;
                             };
-                            let key = Aes128Gcm::new_from_slice(&data[PROTOC_VERSION.len()..])
+                            let mut key = Aes128Gcm::new_from_slice(&data[PROTOC_VERSION.len()..])
                                 .map_err(|_| TransportError::ConnectionEstablishmentFailure {
                                     cause: "invalid symmetric key".into(),
                                 })?;
@@ -290,10 +288,10 @@ impl UdpPacketsListener {
                                         },
                                     };
                                     let mut packet = [0u8; MAX_PACKET_SIZE];
-                                    bincode::serialize_into( packet.as_mut_slice(), &msg)?;
-                                    PacketData::encrypted_with_cipher(packet, packet.len(), &key)
+                                    bincode::serialize_into(packet.as_mut_slice(), &msg)?;
+                                    PacketData::<MAX_PACKET_SIZE>::encrypted_with_cipher(&packet[..], &mut key)
                                 };
-                                let _ = self.socket.send_to(packet.send_data(), remote_addr).await; 
+                                let _ = self.socket.send_to(packet.send_data(), remote_addr).await;
                                 return Err(TransportError::ConnectionEstablishmentFailure {
                                     cause: format!(
                                         "remote is using a different protocol version: {:?}",
@@ -302,7 +300,6 @@ impl UdpPacketsListener {
                                     .into(),
                                 });
                             }
-                            
                             outbound_sym_key = Some(key);
                             state = ConnectionState::AckConnection;
                             continue;
@@ -312,27 +309,28 @@ impl UdpPacketsListener {
                             tracing::debug!("Received unexpect response from remote");
                         }
                         ConnectionState::AckConnection => {
-                            let decrypted = PacketData::decrypt(
-                                & packet[..size],
-                                outbound_sym_key
-                                    .as_ref()
-                                    .expect("should be set at this stage"),
-                            );
-                            if &packet[..size] == HELLO.as_slice() {
-                                return Ok(ConnectionInfo {
-                                    outbound_symmetric_key: inbound_sym_key,
-                                    inbound_symmetric_key: outbound_sym_key
-                                        .expect("should be set at this stage"),
-                                    remote_public_key,
-                                    remote_is_gateway: false,
-                                    remote_addr,
-                                });
-                            } else {
-                                tracing::debug!("Received unrecognized message from remote");
-                                return Err(TransportError::ConnectionEstablishmentFailure {
-                                    cause: "received unrecognized message from remote".into(),
-                                });
-                            }
+                            let packet = std::mem::replace(&mut packet, [0; MAX_PACKET_SIZE]);
+                            // let decrypted = PacketData::<MAX_PACKET_SIZE>::decrypt(
+                            //     outbound_sym_key
+                            //         .as_mut()
+                            //         .expect("should be set at this stage"),
+                            // );
+                            // if &packet[..size] == HELLO.as_slice() {
+                            //     return Ok(ConnectionInfo {
+                            //         outbound_symmetric_key: inbound_sym_key,
+                            //         inbound_symmetric_key: outbound_sym_key
+                            //             .expect("should be set at this stage"),
+                            //         remote_public_key,
+                            //         remote_is_gateway: false,
+                            //         remote_addr,
+                            //     });
+                            // } else {
+                            //     tracing::debug!("Received unrecognized message from remote");
+                            //     return Err(TransportError::ConnectionEstablishmentFailure {
+                            //         cause: "received unrecognized message from remote".into(),
+                            //     });
+                            // }
+                            todo!()
                         }
                         _ => {
                             unreachable!()
