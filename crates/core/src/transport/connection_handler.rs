@@ -10,17 +10,14 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task;
 
+use crate::transport::packet_data::MAX_PACKET_SIZE;
 use crate::transport::symmetric_message::{SymmetricMessage, SymmetricMessagePayload};
 
-use super::BytesPerSecond;
 use super::{
     connection_info::{ConnectionError, ConnectionInfo},
     crypto::{TransportKeypair, TransportPublicKey},
-    PacketData,
+    BytesPerSecond, PacketData,
 };
-
-/// The maximum size of a received UDP packet, MTU typically is 1500
-pub(super) const MAX_PACKET_SIZE: usize = 1500;
 
 pub(super) type ConnectionHandlerMessage = (SocketAddr, Vec<u8>);
 

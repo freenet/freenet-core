@@ -53,8 +53,6 @@ mod crypto;
 mod packet_data;
 mod symmetric_message;
 
-use aes_gcm::{AeadCore, AeadInPlace};
-
 use crate::transport::packet_data::PacketData;
 
 use self::connection_info::ConnectionError;

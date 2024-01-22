@@ -51,7 +51,7 @@ fn key_sizes_and_decryption() {
     // let _sym_key = aes_gcm::aes::Aes128::new(&sym_key_bytes.into());
     let encrypted: Vec<u8> = pair.public.encrypt(&sym_key_bytes);
     assert!(
-        encrypted.len() <= super::connection_handler::MAX_PACKET_SIZE,
+        encrypted.len() <= super::packet_data::MAX_PACKET_SIZE,
         "packet size is too big"
     );
     let bytes = pair.secret.decrypt(&encrypted).unwrap();

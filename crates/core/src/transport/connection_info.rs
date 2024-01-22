@@ -1,5 +1,6 @@
-use aes_gcm::Aes128Gcm;
 use std::net::SocketAddr;
+
+use aes_gcm::Aes128Gcm;
 use thiserror::Error;
 
 use super::crypto::TransportPublicKey;

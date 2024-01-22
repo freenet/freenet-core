@@ -4,7 +4,7 @@ use aes_gcm::Aes128Gcm;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use super::{connection_handler::MAX_PACKET_SIZE, PacketData};
+use super::{packet_data::MAX_PACKET_SIZE, PacketData};
 
 #[serde_as]
 #[derive(Serialize, Deserialize)]
@@ -58,6 +58,9 @@ fn ack_error_msg() -> Result<(), Box<dyn std::error::Error>> {
     use aes_gcm::KeyInit;
     let mut key = Aes128Gcm::new(&[0; 16].into());
     let packet = SymmetricMessage::ack_error(&mut key)?;
+
+    let _packet = PacketData::<{ 1501 }>::encrypted_with_cipher(packet.send_data(), &mut key);
+
     let data = packet.decrypt(&mut key).unwrap();
     let deser = SymmetricMessage::deser(data.send_data())?;
     assert!(matches!(

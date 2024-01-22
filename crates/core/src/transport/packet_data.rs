@@ -1,34 +1,55 @@
-use crate::transport::connection_handler::MAX_PACKET_SIZE;
-use crate::transport::crypto::TransportPublicKey;
-use aes_gcm::aead::generic_array::GenericArray;
-use aes_gcm::aead::rand_core::SeedableRng;
-use aes_gcm::aead::{Aead, AeadMutInPlace};
-use aes_gcm::{AeadCore, Aes128Gcm};
-use rand::prelude::SmallRng;
-use rand::{thread_rng, Rng};
 use std::cell::RefCell;
 
-// todo: split this into type for handling inbound (encrypted)/outbound (decrypted) packets for clarity
-pub(super) struct PacketData<const N: usize = MAX_PACKET_SIZE> {
-    data: [u8; N],
-    size: usize,
-}
+use aes_gcm::{
+    aead::{generic_array::GenericArray, rand_core::SeedableRng, AeadMutInPlace},
+    Aes128Gcm,
+};
+use rand::{prelude::SmallRng, thread_rng, Rng};
 
-// This must be very fast, but doesn't need to be cryptographically secure.
-thread_local! {
-static RNG: RefCell<SmallRng> = RefCell::new(
-    SmallRng::from_rng(thread_rng()).expect("failed to create RNG")
-);
-}
+use crate::transport::crypto::TransportPublicKey;
+
+/// The maximum size of a received UDP packet, MTU typically is 1500
+pub(super) const MAX_PACKET_SIZE: usize = 1500;
 
 // These are the same as the AES-GCM 128 constants, but extracting them from Aes128Gcm
 // as consts was awkward.
 const NONCE_SIZE: usize = 12;
 const TAG_SIZE: usize = 16;
 
+const MAX_DATA_SIZE: usize = MAX_PACKET_SIZE - NONCE_SIZE - TAG_SIZE;
+
+thread_local! {
+    // This must be very fast, but doesn't need to be cryptographically secure.
+    static RNG: RefCell<SmallRng> = RefCell::new(
+        SmallRng::from_rng(thread_rng()).expect("failed to create RNG")
+    );
+}
+
+struct AssertSize<const N: usize>;
+
+impl<const N: usize> AssertSize<N> {
+    const OK: () = assert!(N < MAX_PACKET_SIZE);
+}
+
+// trying to bypass limitations with const generic checks on where clauses
+fn _check_valid_size<const N: usize>() {
+    let () = AssertSize::<N>::OK;
+}
+
+// todo: maybe split this into type for handling inbound (encrypted)/outbound (decrypted) packets for clarity
+pub(super) struct PacketData<const N: usize = MAX_PACKET_SIZE> {
+    data: [u8; N],
+    size: usize,
+}
+
+pub(super) const fn packet_size<const DATA_SIZE: usize>() -> usize {
+    DATA_SIZE + NONCE_SIZE + TAG_SIZE
+}
+
 impl<const N: usize> PacketData<N> {
     pub(super) fn encrypted_with_cipher(data: &[u8], cipher: &mut Aes128Gcm) -> Self {
-        debug_assert!(data.len() <= MAX_PACKET_SIZE - NONCE_SIZE - TAG_SIZE);
+        _check_valid_size::<N>();
+        debug_assert!(data.len() <= MAX_DATA_SIZE);
 
         let nonce: [u8; NONCE_SIZE] = RNG.with(|rng| rng.borrow_mut().gen());
 
@@ -57,6 +78,7 @@ impl<const N: usize> PacketData<N> {
     }
 
     pub(super) fn encrypted_with_remote(data: &[u8], remote_key: &TransportPublicKey) -> Self {
+        _check_valid_size::<N>();
         let encrypted_data: Vec<u8> = remote_key.encrypt(data);
         debug_assert!(encrypted_data.len() <= MAX_PACKET_SIZE);
         let mut data = [0; N];
@@ -73,7 +95,6 @@ impl<const N: usize> PacketData<N> {
 
     pub(super) fn decrypt(&self, inbound_sym_key: &mut Aes128Gcm) -> Result<Self, aes_gcm::Error> {
         debug_assert!(self.data.len() >= NONCE_SIZE + TAG_SIZE);
-        debug_assert!(self.data.len() <= MAX_PACKET_SIZE + NONCE_SIZE + TAG_SIZE);
 
         let nonce = GenericArray::from_slice(&self.data[..NONCE_SIZE]);
         // Adjusted to extract the tag from the end of the encrypted data
@@ -89,10 +110,6 @@ impl<const N: usize> PacketData<N> {
             data: buffer,
             size: buffer_len,
         })
-    }
-
-    const fn max_data_size() -> usize {
-        MAX_PACKET_SIZE - NONCE_SIZE - TAG_SIZE
     }
 }
 
@@ -114,14 +131,14 @@ mod tests {
 
         // Create a new AES-128-GCM instance
         let mut cipher = Aes128Gcm::new(key);
-        let original_data = b"Hello, world!";
-        let packet_data: PacketData<MAX_PACKET_SIZE> =
-            PacketData::encrypted_with_cipher(original_data, &mut cipher);
+        const ORIGINAL_DATA: &[u8] = b"Hello, world!";
+        let packet_data: PacketData<{ packet_size::<{ ORIGINAL_DATA.len() }>() }> =
+            PacketData::encrypted_with_cipher(ORIGINAL_DATA, &mut cipher);
 
         // Ensure data is not plainly visible
-        assert_ne!(packet_data.data[..packet_data.size], *original_data);
+        assert_ne!(packet_data.data[..packet_data.size], *ORIGINAL_DATA);
 
-        test_decryption(packet_data, &mut cipher, original_data);
+        test_decryption(packet_data, &mut cipher, ORIGINAL_DATA);
     }
 
     // Test encryption/decryption where message size is the maximum allowed
@@ -136,15 +153,15 @@ mod tests {
 
         // Create a new AES-128-GCM instance
         let mut cipher = Aes128Gcm::new(key);
-        let original_data = [0u8; MAX_PACKET_SIZE - NONCE_SIZE - TAG_SIZE];
-        let packet_data: PacketData<MAX_PACKET_SIZE> =
-            PacketData::encrypted_with_cipher(&original_data, &mut cipher);
+        const ORIGINAL_DATA: &[u8] = b"Hello, world!";
+        let packet_data: PacketData<{ packet_size::<{ ORIGINAL_DATA.len() }>() }> =
+            PacketData::encrypted_with_cipher(ORIGINAL_DATA, &mut cipher);
 
         // Ensure data is not plainly visible
-        let overlap = longest_common_subsequence(&packet_data.data, &original_data);
+        let overlap = longest_common_subsequence(&packet_data.data, ORIGINAL_DATA);
         assert!(overlap < 20);
 
-        test_decryption(packet_data, &mut cipher, &original_data);
+        test_decryption(packet_data, &mut cipher, ORIGINAL_DATA);
     }
 
     // Test detection of packet corruption
@@ -159,9 +176,9 @@ mod tests {
 
         // Create a new AES-128-GCM instance
         let mut cipher = Aes128Gcm::new(key);
-        let original_data = b"Hello, world!";
-        let mut packet_data: PacketData<MAX_PACKET_SIZE> =
-            PacketData::encrypted_with_cipher(original_data, &mut cipher);
+        const ORIGINAL_DATA: &[u8] = b"Hello, world!";
+        let mut packet_data: PacketData<{ packet_size::<{ ORIGINAL_DATA.len() }>() }> =
+            PacketData::encrypted_with_cipher(ORIGINAL_DATA, &mut cipher);
 
         // Corrupt the packet data
         packet_data.data[packet_data.size / 2] = 0;
@@ -173,8 +190,8 @@ mod tests {
         }
     }
 
-    fn test_decryption<T: AsRef<[u8]>>(
-        packet_data: PacketData<MAX_PACKET_SIZE>,
+    fn test_decryption<const N: usize, T: AsRef<[u8]>>(
+        packet_data: PacketData<N>,
         cipher: &mut Aes128Gcm,
         original_data: T,
     ) {
@@ -198,8 +215,8 @@ mod tests {
         let mut dp = vec![vec![0; n + 1]; m + 1];
 
         // Iterate over each character in both sequences
-        for i in 0..m {
-            for j in 0..n {
+        for (i, _) in a.iter().enumerate() {
+            for (j, _) in b.iter().enumerate() {
                 if a[i] == b[j] {
                     // If characters match, increment the count from the previous subsequence
                     dp[i + 1][j + 1] = dp[i][j] + 1;
