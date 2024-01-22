@@ -16,9 +16,9 @@ pub(super) struct PacketData<const N: usize = MAX_PACKET_SIZE> {
 
 // This must be very fast, but doesn't need to be cryptographically secure.
 thread_local! {
-static RNG: RefCell<SmallRng> = RefCell::new(
-    SmallRng::from_rng(thread_rng()).expect("failed to create RNG")
-);
+    static RNG: RefCell<SmallRng> = RefCell::new(
+        SmallRng::from_rng(thread_rng()).expect("failed to create RNG")
+    );
 }
 
 // These are the same as the AES-GCM 128 constants, but extracting them from Aes128Gcm
