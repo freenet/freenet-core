@@ -32,6 +32,17 @@ impl SymmetricMessage {
         Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
     }
 
+    pub fn ack_ok(outbound_sym_key: &mut Aes128Gcm) -> Result<PacketData, bincode::Error> {
+        static SERIALIZED: OnceLock<Box<[u8]>> = OnceLock::new();
+        let bytes = SERIALIZED.get_or_init(|| {
+            let mut packet = [0u8; MAX_PACKET_SIZE];
+            let size = bincode::serialized_size(&Self::ACK_OK).unwrap();
+            bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_ERROR).unwrap();
+            (&packet[..size as usize]).into()
+        });
+        Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
+    }
+
     const ACK_ERROR: SymmetricMessage = SymmetricMessage {
         message_id: 0,
         confirm_receipt: None,
@@ -41,12 +52,18 @@ impl SymmetricMessage {
             )),
         },
     };
+
+    const ACK_OK: SymmetricMessage = SymmetricMessage {
+        message_id: 0,
+        confirm_receipt: None,
+        payload: SymmetricMessagePayload::AckConnection { result: Ok(()) },
+    };
 }
 
 #[derive(Serialize, Deserialize)]
 pub(super) enum SymmetricMessagePayload {
     AckConnection {
-        result: Result<[u8; 16], Cow<'static, str>>,
+        result: Result<(), Cow<'static, str>>,
     },
     ShortMessage {
         payload: Vec<u8>,

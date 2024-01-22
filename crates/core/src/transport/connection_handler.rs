@@ -225,12 +225,6 @@ impl UdpPacketsListener {
             PacketData::<MAX_PACKET_SIZE>::encrypted_with_remote(&data, &remote_public_key)
         };
 
-        // fixme: use typed messages instead of raw bytes
-        let hello_packet = {
-            const HELLO: &[u8; 5] = b"hello";
-            PacketData::<MAX_PACKET_SIZE>::encrypted_with_cipher(HELLO, &mut inbound_sym_key)
-        };
-
         while failures < MAX_FAILURES {
             match state {
                 ConnectionState::Start => {
@@ -250,7 +244,11 @@ impl UdpPacketsListener {
                 }
                 ConnectionState::AckConnection => {
                     self.socket
-                        .send_to(hello_packet.send_data(), remote_addr)
+                        .send_to(
+                            SymmetricMessage::ack_ok(outbound_sym_key.as_mut().unwrap())?
+                                .send_data(),
+                            remote_addr,
+                        )
                         .await?;
                 }
             }
@@ -308,17 +306,14 @@ impl UdpPacketsListener {
                         ConnectionState::AckConnection => {
                             let packet: PacketData<MAX_PACKET_SIZE> = (std::mem::replace(&mut packet, [0; MAX_PACKET_SIZE]), size).into();
                             let decrypted = packet.decrypt(
-                                outbound_sym_key
-                                    .as_mut()
-                                    .expect("should be set at this stage"),
+                                &mut inbound_sym_key
                             ).unwrap();
                             let packet = bincode::deserialize::<SymmetricMessage>(decrypted.send_data())?;
                             if let SymmetricMessagePayload::AckConnection { result: Ok(key_bytes) } = packet.payload {
-                                let  inbound_symmetric_key = Aes128Gcm::new(&key_bytes.into());
                                 return Ok(ConnectionInfo {
                                     outbound_symmetric_key: outbound_sym_key
                                         .expect("should be set at this stage"),
-                                    inbound_symmetric_key,
+                                    inbound_symmetric_key: inbound_sym_key,
                                     remote_public_key,
                                     remote_is_gateway: false,
                                     remote_addr,
