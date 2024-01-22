@@ -46,7 +46,7 @@ impl SymmetricMessage {
 #[derive(Serialize, Deserialize)]
 pub(super) enum SymmetricMessagePayload {
     AckConnection {
-        result: Result<(), Cow<'static, str>>,
+        result: Result<[u8; 16], Cow<'static, str>>,
     },
     ShortMessage {
         payload: Vec<u8>,

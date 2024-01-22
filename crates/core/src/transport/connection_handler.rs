@@ -306,28 +306,28 @@ impl UdpPacketsListener {
                             tracing::debug!("Received unexpect response from remote");
                         }
                         ConnectionState::AckConnection => {
-                            let packet = std::mem::replace(&mut packet, [0; MAX_PACKET_SIZE]);
-                            // let decrypted = PacketData::<MAX_PACKET_SIZE>::decrypt(
-                            //     outbound_sym_key
-                            //         .as_mut()
-                            //         .expect("should be set at this stage"),
-                            // );
-                            // if &packet[..size] == HELLO.as_slice() {
-                            //     return Ok(ConnectionInfo {
-                            //         outbound_symmetric_key: inbound_sym_key,
-                            //         inbound_symmetric_key: outbound_sym_key
-                            //             .expect("should be set at this stage"),
-                            //         remote_public_key,
-                            //         remote_is_gateway: false,
-                            //         remote_addr,
-                            //     });
-                            // } else {
-                            //     tracing::debug!("Received unrecognized message from remote");
-                            //     return Err(TransportError::ConnectionEstablishmentFailure {
-                            //         cause: "received unrecognized message from remote".into(),
-                            //     });
-                            // }
-                            todo!()
+                            let packet: PacketData<MAX_PACKET_SIZE> = (std::mem::replace(&mut packet, [0; MAX_PACKET_SIZE]), size).into();
+                            let decrypted = packet.decrypt(
+                                outbound_sym_key
+                                    .as_mut()
+                                    .expect("should be set at this stage"),
+                            ).unwrap();
+                            let packet = bincode::deserialize::<SymmetricMessage>(decrypted.send_data())?;
+                            if let SymmetricMessagePayload::AckConnection { result: Ok(key_bytes) } = packet.payload {
+                                let  inbound_symmetric_key = Aes128Gcm::new(&key_bytes.into());
+                                return Ok(ConnectionInfo {
+                                    outbound_symmetric_key: outbound_sym_key
+                                        .expect("should be set at this stage"),
+                                    inbound_symmetric_key,
+                                    remote_public_key,
+                                    remote_is_gateway: false,
+                                    remote_addr,
+                                });
+                            }
+                                tracing::debug!("Received unrecognized message from remote");
+                                return Err(TransportError::ConnectionEstablishmentFailure {
+                                    cause: "received unrecognized message from remote".into(),
+                                });
                         }
                         _ => {
                             unreachable!()

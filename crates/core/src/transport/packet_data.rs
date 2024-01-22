@@ -32,7 +32,7 @@ impl<const N: usize> AssertSize<N> {
 }
 
 // trying to bypass limitations with const generic checks on where clauses
-fn _check_valid_size<const N: usize>() {
+const fn _check_valid_size<const N: usize>() {
     let () = AssertSize::<N>::OK;
 }
 
@@ -93,7 +93,7 @@ impl<const N: usize> PacketData<N> {
         &self.data[..self.size]
     }
 
-    pub(super) fn decrypt(&self, inbound_sym_key: &mut Aes128Gcm) -> Result<Self, aes_gcm::Error> {
+    pub(super) fn decrypt(self, inbound_sym_key: &mut Aes128Gcm) -> Result<Self, aes_gcm::Error> {
         debug_assert!(self.data.len() >= NONCE_SIZE + TAG_SIZE);
 
         let nonce = GenericArray::from_slice(&self.data[..NONCE_SIZE]);
@@ -110,6 +110,13 @@ impl<const N: usize> PacketData<N> {
             data: buffer,
             size: buffer_len,
         })
+    }
+}
+
+impl<const N: usize> From<([u8; N], usize)> for PacketData<N> {
+    fn from((data, size): ([u8; N], usize)) -> Self {
+        _check_valid_size::<N>();
+        Self { data, size }
     }
 }
 
