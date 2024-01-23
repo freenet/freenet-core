@@ -6,12 +6,8 @@ use std::{
 };
 
 use anyhow::anyhow;
-use freenet::{
-    dev_tool::{
-        EventChain, InterProcessConnManager, MemoryEventsGen, NodeConfig, NodeLabel, PeerId,
-        Runtime, SimPeer,
-    },
-    local_node::Executor,
+use freenet::dev_tool::{
+    EventChain, InterProcessConnManager, MemoryEventsGen, NodeConfig, NodeLabel, PeerId, SimPeer,
 };
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use rand::Rng;
