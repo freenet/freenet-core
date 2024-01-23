@@ -324,7 +324,6 @@ pub(crate) mod test {
         id: PeerId,
         memory_event_generator: MemoryEventsGen<R>,
         ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
-        rng: R,
     }
 
     impl<R> NetworkEventGenerator<R>
@@ -335,13 +334,11 @@ pub(crate) mod test {
             id: PeerId,
             memory_event_generator: MemoryEventsGen<R>,
             ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
-            seed: u64,
         ) -> Self {
             Self {
                 id,
                 memory_event_generator,
                 ws_client,
-                rng: R::seed_from_u64(seed),
             }
         }
     }
@@ -362,9 +359,7 @@ pub(crate) mod test {
 
                     match message {
                         Some(Ok(Message::Binary(data))) => {
-                            if let Ok((ev_id, pk)) =
-                                bincode::deserialize::<(EventId, PeerId)>(&data)
-                            {
+                            if let Ok((_, pk)) = bincode::deserialize::<(EventId, PeerId)>(&data) {
                                 if pk == self.id {
                                     let res = OpenRequest {
                                         client_id: ClientId::FIRST,

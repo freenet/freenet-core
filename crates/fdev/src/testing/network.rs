@@ -625,12 +625,8 @@ impl Runnable for NetworkPeer {
             }
         };
 
-        let event_generator = NetworkEventGenerator::new(
-            self.config.peer_id,
-            memory_event_generator,
-            ws_client,
-            config.seed(),
-        );
+        let event_generator =
+            NetworkEventGenerator::new(self.config.peer_id, memory_event_generator, ws_client);
 
         // Obtain an identity::Keypair instance for the private_key
         let private_key = Keypair::generate_ed25519();
