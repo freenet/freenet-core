@@ -103,20 +103,21 @@ impl ContractExecutor for Executor<MockRuntime> {
                 return Ok(incoming_state);
             }
             (Either::Left(incoming_state), None) => {
-                let params = self
-                    .state_store
-                    .get_params(&key)
-                    .await
-                    .map_err(ExecutorError::other)?
-                    .ok_or_else(|| {
-                        ExecutorError::request(StdContractError::Put {
-                            key: key.clone(),
-                            cause: "missing contract parameters".into(),
-                        })
-                    })?;
+                // update case
+                // let params = self
+                //     .state_store
+                //     .get_params(&key)
+                //     .await
+                //     .map_err(ExecutorError::other)?
+                //     .ok_or_else(|| {
+                //         ExecutorError::request(StdContractError::Put {
+                //             key: key.clone(),
+                //             cause: "missing contract parameters".into(),
+                //         })
+                //     })?;
 
                 self.state_store
-                    .store(key, incoming_state.clone(), params.into_owned())
+                    .update(&key, incoming_state.clone())
                     .await
                     .map_err(ExecutorError::other)?;
                 return Ok(incoming_state);

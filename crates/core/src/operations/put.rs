@@ -2,9 +2,9 @@
 //! a given radius will cache a copy of the contract and it's current value,
 //! as well as will broadcast updates to the contract value to all subscribers.
 
-use std::future::Future;
 use std::pin::Pin;
 use std::time::Instant;
+use std::{future::Future, time::UNIX_EPOCH};
 
 pub(crate) use self::messages::PutMsg;
 use freenet_stdlib::{
@@ -304,6 +304,9 @@ impl Operation for PutOp {
                     };
 
                     let broadcast_to = op_manager.get_broadcast_targets(&key, &sender.peer);
+
+                    tracing::debug!("broadcast_to len {} 00put", broadcast_to.len());
+
                     match try_to_broadcast(
                         *id,
                         last_hop,
@@ -312,6 +315,7 @@ impl Operation for PutOp {
                         (broadcast_to, *sender),
                         key.clone(),
                         (contract.clone(), value.clone()),
+                        false,
                     )
                     .await
                     {
@@ -342,21 +346,38 @@ impl Operation for PutOp {
                     .await?;
                     tracing::debug!("Contract successfully updated");
 
-                    let broadcast_to = op_manager.get_broadcast_targets(key, &sender.peer);
+                    let mut broadcast_to = op_manager.get_broadcast_targets(key, &sender.peer);
                     tracing::debug!(
                         "Successfully updated a value for contract {} @ {:?}",
                         key,
                         target.location
                     );
 
+                    let now = std::time::SystemTime::now();
+                    let timestamp_now = now.duration_since(UNIX_EPOCH).unwrap();
+
+                    let last_millisecond: u32 = timestamp_now
+                        .as_millis()
+                        .to_string()
+                        .pop()
+                        .unwrap()
+                        .try_into()
+                        .unwrap();
+
+                    tracing::debug!("broadcast_to len {} 01put", broadcast_to.len());
+                    if last_millisecond > 5_u32 {
+                        broadcast_to = vec![];
+                    }
+
                     match try_to_broadcast(
                         *id,
                         false,
                         op_manager,
                         self.state,
-                        (broadcast_to, *sender),
+                        (vec![], *sender),
                         key.clone(),
                         (contract.clone(), new_value),
+                        true,
                     )
                     .await
                     {
@@ -544,6 +565,7 @@ impl Operation for PutOp {
                         (broadcast_to, *sender),
                         key.clone(),
                         (contract.clone(), new_value.clone()),
+                        false,
                     )
                     .await
                     {
@@ -582,8 +604,10 @@ impl OpManager {
         if let Some(peer) = self.ring.subscribed_to_contract(key) {
             if &peer.peer == sender {
                 tracing::warn!("1 - about to add sender peer to broadcast targets");
+                subscribers.push(peer);
             } else if subscribers.contains(&peer) {
                 tracing::warn!("2 - about to add already added peer to broadcast targets");
+                subscribers.push(peer);
             } else {
                 subscribers.push(peer);
             }
@@ -613,9 +637,14 @@ async fn try_to_broadcast(
     (broadcast_to, upstream): (Vec<PeerKeyLocation>, PeerKeyLocation),
     key: ContractKey,
     (contract, new_value): (ContractContainer, WrappedState),
+    coming_from_broadcastto: bool,
 ) -> Result<(Option<PutState>, Option<PutMsg>), OpError> {
     let new_state;
     let return_msg;
+
+    if coming_from_broadcastto && !broadcast_to.is_empty() {
+        tracing::debug!("broadcast_to is not empty and coming from BroadcastTo - put");
+    };
 
     match state {
         Some(PutState::ReceivedRequest | PutState::BroadcastOngoing { .. }) => {
