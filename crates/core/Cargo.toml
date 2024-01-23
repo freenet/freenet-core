@@ -31,7 +31,7 @@ cookie = "0.17"
 crossbeam = { workspace = true }
 ctrlc = { features = ["termination"], workspace = true }
 dashmap = { workspace = true }
-delegate = "0.10"
+delegate = "0.12"
 directories = "5"
 either = { features = ["serde"], workspace = true }
 fastrand = { workspace = true }
