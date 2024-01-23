@@ -258,12 +258,10 @@ impl UdpPacketsListener {
                         todo!("is a different remote, handle this message");
                     }
                     match state {
-                        ConnectionState::Start
-                        // this is the other peer intro packer theoretically
-                            if size == outbound_intro_packet.send_data().len() =>
-                        {
+                        ConnectionState::Start => {
                             // try to decrypt the message with the symmetric key
-                            let Ok(data) = self.this_peer_keypair.secret.decrypt(&packet[..size]) else {
+                            let Ok(data) = self.this_peer_keypair.secret.decrypt(&packet[..size])
+                            else {
                                 failures += 1;
                                 tracing::debug!("Received unexpect packet from remote");
                                 continue;
@@ -279,12 +277,18 @@ impl UdpPacketsListener {
                                         message_id: 0,
                                         confirm_receipt: None,
                                         payload: SymmetricMessagePayload::AckConnection {
-                                            result: Err("remote is using a different protocol version".into()),
+                                            result: Err(
+                                                "remote is using a different protocol version"
+                                                    .into(),
+                                            ),
                                         },
                                     };
                                     let mut packet = [0u8; MAX_PACKET_SIZE];
                                     bincode::serialize_into(packet.as_mut_slice(), &msg)?;
-                                    PacketData::<MAX_PACKET_SIZE>::encrypted_with_cipher(&packet[..], &mut key)
+                                    PacketData::<MAX_PACKET_SIZE>::encrypted_with_cipher(
+                                        &packet[..],
+                                        &mut key,
+                                    )
                                 };
                                 let _ = self.socket.send_to(packet.send_data(), remote_addr).await;
                                 return Err(TransportError::ConnectionEstablishmentFailure {
@@ -299,17 +303,16 @@ impl UdpPacketsListener {
                             state = ConnectionState::AckConnection;
                             continue;
                         }
-                        ConnectionState::Start => {
-                            failures += 1;
-                            tracing::debug!("Received unexpect response from remote");
-                        }
+
                         ConnectionState::AckConnection => {
-                            let packet: PacketData<MAX_PACKET_SIZE> = (std::mem::replace(&mut packet, [0; MAX_PACKET_SIZE]), size).into();
-                            let decrypted = packet.decrypt(
-                                &mut inbound_sym_key
-                            ).unwrap();
-                            let packet = bincode::deserialize::<SymmetricMessage>(decrypted.send_data())?;
-                            if let SymmetricMessagePayload::AckConnection { result: Ok(key_bytes) } = packet.payload {
+                            let packet: PacketData<MAX_PACKET_SIZE> =
+                                (std::mem::replace(&mut packet, [0; MAX_PACKET_SIZE]), size).into();
+                            let decrypted = packet.decrypt(&mut inbound_sym_key).unwrap();
+                            let packet =
+                                bincode::deserialize::<SymmetricMessage>(decrypted.send_data())?;
+                            if let SymmetricMessagePayload::AckConnection { result: Ok(_) } =
+                                packet.payload
+                            {
                                 return Ok(ConnectionInfo {
                                     outbound_symmetric_key: outbound_sym_key
                                         .expect("should be set at this stage"),
@@ -319,10 +322,10 @@ impl UdpPacketsListener {
                                     remote_addr,
                                 });
                             }
-                                tracing::debug!("Received unrecognized message from remote");
-                                return Err(TransportError::ConnectionEstablishmentFailure {
-                                    cause: "received unrecognized message from remote".into(),
-                                });
+                            tracing::debug!("Received unrecognized message from remote");
+                            return Err(TransportError::ConnectionEstablishmentFailure {
+                                cause: "received unrecognized message from remote".into(),
+                            });
                         }
                         _ => {
                             unreachable!()

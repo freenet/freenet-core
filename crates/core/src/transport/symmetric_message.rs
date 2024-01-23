@@ -21,7 +21,7 @@ impl SymmetricMessage {
         bincode::deserialize(bytes)
     }
 
-    pub fn ack_error(outbound_sym_key: &mut Aes128Gcm) -> Result<PacketData, bincode::Error> {
+    pub fn ack_error(inbound_sym_key: &mut Aes128Gcm) -> Result<PacketData, bincode::Error> {
         static SERIALIZED: OnceLock<Box<[u8]>> = OnceLock::new();
         let bytes = SERIALIZED.get_or_init(|| {
             let mut packet = [0u8; MAX_PACKET_SIZE];
@@ -29,10 +29,10 @@ impl SymmetricMessage {
             bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_ERROR).unwrap();
             (&packet[..size as usize]).into()
         });
-        Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
+        Ok(PacketData::encrypted_with_cipher(bytes, inbound_sym_key))
     }
 
-    pub fn ack_ok(outbound_sym_key: &mut Aes128Gcm) -> Result<PacketData, bincode::Error> {
+    pub fn ack_ok(inbound_sym_key: &mut Aes128Gcm) -> Result<PacketData, bincode::Error> {
         static SERIALIZED: OnceLock<Box<[u8]>> = OnceLock::new();
         let bytes = SERIALIZED.get_or_init(|| {
             let mut packet = [0u8; MAX_PACKET_SIZE];
@@ -40,7 +40,7 @@ impl SymmetricMessage {
             bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_ERROR).unwrap();
             (&packet[..size as usize]).into()
         });
-        Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
+        Ok(PacketData::encrypted_with_cipher(bytes, inbound_sym_key))
     }
 
     const ACK_ERROR: SymmetricMessage = SymmetricMessage {
@@ -76,7 +76,7 @@ fn ack_error_msg() -> Result<(), Box<dyn std::error::Error>> {
     let mut key = Aes128Gcm::new(&[0; 16].into());
     let packet = SymmetricMessage::ack_error(&mut key)?;
 
-    let _packet = PacketData::<{ 1501 }>::encrypted_with_cipher(packet.send_data(), &mut key);
+    let _packet = PacketData::<1501>::encrypted_with_cipher(packet.send_data(), &mut key);
 
     let data = packet.decrypt(&mut key).unwrap();
     let deser = SymmetricMessage::deser(data.send_data())?;
