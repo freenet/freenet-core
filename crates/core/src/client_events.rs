@@ -324,7 +324,7 @@ pub(crate) mod test {
         id: PeerId,
         memory_event_generator: MemoryEventsGen<R>,
         ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
-        rng: Option<R>,
+        rng: R,
     }
 
     impl<R> NetworkEventGenerator<R>
@@ -341,7 +341,7 @@ pub(crate) mod test {
                 id,
                 memory_event_generator,
                 ws_client,
-                rng: Some(R::seed_from_u64(seed)),
+                rng: R::seed_from_u64(seed),
             }
         }
     }
@@ -365,7 +365,7 @@ pub(crate) mod test {
                             if let Ok((ev_id, pk)) =
                                 bincode::deserialize::<(EventId, PeerId)>(&data)
                             {
-                                if self.rng.is_some() && pk == self.id {
+                                if pk == self.id {
                                     let res = OpenRequest {
                                         client_id: ClientId::FIRST,
                                         request: self
@@ -375,18 +375,6 @@ pub(crate) mod test {
                                             .ok_or_else(|| {
                                                 ClientError::from(ErrorKind::Disconnect)
                                             })?
-                                            .into(),
-                                        notification_channel: None,
-                                        token: None,
-                                    };
-                                    return Ok(res.into_owned());
-                                } else if pk == self.id {
-                                    let res = OpenRequest {
-                                        client_id: ClientId::FIRST,
-                                        request: self
-                                            .memory_event_generator
-                                            .generate_deterministic_event(&ev_id)
-                                            .expect("event not found")
                                             .into(),
                                         notification_channel: None,
                                         token: None,

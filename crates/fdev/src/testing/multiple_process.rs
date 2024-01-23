@@ -327,14 +327,11 @@ struct SubProcess {
 impl SubProcess {
     fn start(cmd_args: &[String], label: &NodeLabel, id: PeerId) -> anyhow::Result<Self, Error> {
         // the identifier used for multi-process tests is the peer id
-        let data_dir = Executor::<Runtime>::test_data_dir(&id.to_string());
         let child = Command::new("fdev")
             .kill_on_drop(true)
             .args(cmd_args)
             .arg("--id")
             .arg(label.number().to_string())
-            .arg("--data-dir")
-            .arg(data_dir.to_str().expect("valid path"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -396,10 +393,7 @@ async fn child(
     child_config: &MultiProcessConfig,
 ) -> anyhow::Result<()> {
     let id = child_config.id.expect("id should be set for child process");
-    let _data_dir = child_config
-        .data_dir
-        .as_ref()
-        .expect("data_dir should be set for child process");
+
     // write logs to stderr so stdout and stdin are free of unexpected data
     std::env::set_var("FREENET_LOG_TO_STDERR", "1");
 
