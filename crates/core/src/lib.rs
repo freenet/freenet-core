@@ -41,11 +41,16 @@ pub mod local_node {
 pub mod dev_tool {
     use super::*;
     pub use crate::config::Config;
-    pub use client_events::{test::MemoryEventsGen, ClientEventsProxy, ClientId, OpenRequest};
+    pub use client_events::{
+        test::MemoryEventsGen, test::NetworkEventGenerator, ClientEventsProxy, ClientId,
+        OpenRequest,
+    };
     pub use contract::{storages::Storage, Executor, OperationMode};
     pub use flatbuffers;
     pub use node::{
-        testing_impl::{EventChain, NodeLabel, SimNetwork, SimPeer},
+        testing_impl::{
+            EventChain, NetworkPeer, NodeLabel, PeerMessage, PeerStatus, SimNetwork, SimPeer,
+        },
         InitPeerNode, InterProcessConnManager, NodeConfig, PeerCliConfig, PeerId,
     };
     pub use ring::Location;

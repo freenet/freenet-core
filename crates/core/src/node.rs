@@ -24,6 +24,7 @@ use freenet_stdlib::{
     prelude::ContractKey,
 };
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId as Libp2pPeerId};
+
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
@@ -95,15 +96,15 @@ impl Node {
 ///
 /// If both are provided but also additional peers are added via the [`Self::add_gateway()`] method, this node will
 /// be listening but also try to connect to an existing peer.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NodeConfig {
     /// public identifier for the peer
     pub peer_id: PeerId,
     // optional local info, in case this is an initial bootstrap node
     /// IP to bind to the listener
-    pub(crate) local_ip: Option<IpAddr>,
+    pub local_ip: Option<IpAddr>,
     /// socket port to bind to the listener
-    pub(crate) local_port: Option<u16>,
+    pub local_port: Option<u16>,
     /// IP dialers should connect to
     pub(crate) public_ip: Option<IpAddr>,
     /// socket port dialers should connect to
@@ -263,7 +264,7 @@ impl Default for NodeConfig {
 }
 
 /// Gateway node to bootstrap the network.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct InitPeerNode {
     addr: Option<Multiaddr>,
     identifier: PeerId,

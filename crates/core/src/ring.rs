@@ -660,7 +660,12 @@ impl Ring {
             tracing::info!(%peer, "Removing connection");
         }
         self.live_tx_tracker.prune_transactions_from_peer(&peer);
-        let loc = self.location_for_peer.write().remove(&peer).unwrap();
+        // This case would be when a connection is being open, so peer location hasn't been recorded yet and we can ignore everything below
+        let Some(loc) = self.location_for_peer.write().remove(&peer) else {
+            self.open_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return;
+        };
         {
             let conns = &mut *self.connections_by_location.write();
             conns.remove(&loc);

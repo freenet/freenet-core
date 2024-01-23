@@ -34,8 +34,10 @@ use crate::{
 
 mod in_memory;
 mod inter_process;
+mod network;
 
 pub use self::inter_process::SimPeer;
+pub use self::network::{NetworkPeer, PeerMessage, PeerStatus};
 
 use super::{
     network_bridge::EventLoopNotificationsReceiver, ConnectionError, NetworkBridge, PeerId,
@@ -482,7 +484,9 @@ impl SimNetwork {
                 .max_hops_to_live(self.ring_max_htl)
                 .rnd_if_htl_above(self.rnd_if_htl_above)
                 .max_number_of_connections(self.max_connections)
-                .with_key(pair.public().into());
+                .with_key(pair.public().into())
+                .with_ip(Ipv6Addr::LOCALHOST)
+                .with_port(get_free_port().unwrap());
 
             let peer = PeerId::from(id);
             self.event_listener.add_node(label.clone(), peer);
