@@ -94,6 +94,7 @@ where
     match result {
         Err(OpError::StatePushed) => {
             // do nothing and continue, the operation will just continue later on
+            tracing::debug!("entered in state pushed to continue with op");
             return Ok(None);
         }
         Err(err) => {
