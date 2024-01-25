@@ -23,6 +23,16 @@ pub(super) type ConnectionHandlerMessage = (SocketAddr, Vec<u8>);
 
 const PROTOC_VERSION: [u8; 2] = 1u16.to_le_bytes();
 
+// Constants for exponential backoff
+const INITIAL_TIMEOUT: Duration = Duration::from_secs(5);
+const TIMEOUT_MULTIPLIER: u64 = 2;
+const MAX_TIMEOUT: Duration = Duration::from_secs(60); // Maximum timeout limit
+
+// Constants for interval increase
+const INITIAL_INTERVAL: Duration = Duration::from_millis(200);
+const INTERVAL_INCREASE_FACTOR: u64 = 2;
+const MAX_INTERVAL: Duration = Duration::from_millis(5000); // Maximum interval limit
+
 type SerializedMessage = Vec<u8>;
 
 pub struct PeerConnection {
@@ -203,12 +213,11 @@ impl UdpPacketsListener {
             Start,
             AckConnection,
         }
-        // todo: probably should use exponential backoff with an upper limit: `timeout`
-        let timeout = Duration::from_secs(5);
+        // Initialize timeout and interval
+        let mut timeout = INITIAL_TIMEOUT;
+        let mut interval_duration = INITIAL_INTERVAL;
+        let mut tick = tokio::time::interval(interval_duration);
 
-        // todo: probably instead of a fixed interval we should monotonically increase the interval
-        // until we reach a maximum, and then just keep trying at that maximum interval
-        let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
         const MAX_FAILURES: usize = 20;
         let mut failures = 0;
         let mut packet = [0u8; MAX_PACKET_SIZE];
@@ -341,6 +350,23 @@ impl UdpPacketsListener {
                     tracing::debug!("Failed to receive UDP response, time out");
                 }
             }
+            // Update timeout using exponential backoff, capped at MAX_TIMEOUT
+            timeout = std::cmp::min(
+                Duration::from_secs(timeout.as_secs() * TIMEOUT_MULTIPLIER),
+                MAX_TIMEOUT,
+            );
+
+            // Update interval, capped at MAX_INTERVAL
+            if interval_duration < MAX_INTERVAL {
+                interval_duration = std::cmp::min(
+                    Duration::from_millis(
+                        interval_duration.as_millis() as u64 * INTERVAL_INCREASE_FACTOR,
+                    ),
+                    MAX_INTERVAL,
+                );
+                tick = tokio::time::interval(interval_duration);
+            }
+
             tick.tick().await;
         }
         Err(TransportError::ConnectionEstablishmentFailure {
