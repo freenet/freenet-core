@@ -414,7 +414,7 @@ impl Executor<Runtime> {
         }
         let params = contract.params();
 
-        if self.get_local_contract(&key.id()).await.is_ok() {
+        if self.get_local_contract(key.id()).await.is_ok() {
             // already existing contract, just try to merge states
             return self
                 .perform_contract_update(key, UpdateData::State(state.into()))
