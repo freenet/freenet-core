@@ -28,7 +28,6 @@ pub const TSC_BUILD_COMMAND: &'static str = "tsc.cmd";
 #[cfg(windows)]
 pub const WEBPACK_BUILD_COMMAND: &'static str = "webpack.cmd";
 
-
 #[cfg(not(windows))]
 pub const NPM_BUILD_COMMAND: &'static str = "npm";
 #[cfg(not(windows))]
@@ -36,7 +35,7 @@ pub const TSC_BUILD_COMMAND: &'static str = "tsc";
 #[cfg(not(windows))]
 pub const WEBPACK_BUILD_COMMAND: &'static str = "webpack";
 
-pub fn build_package(cli_config: BuildToolCliConfig, cwd: &Path) -> Result<(), DynError> {
+pub fn build_package(cli_config: BuildToolConfig, cwd: &Path) -> Result<(), anyhow::Error> {
     match cli_config.package_type {
         PackageType::Contract => contract::package_contract(cli_config, cwd),
         PackageType::Delegate => delegate::package_delegate(cli_config, cwd),
@@ -296,12 +295,14 @@ mod contract {
                         .unwrap_or_default();
                     use std::io::IsTerminal;
                     if webpack {
-                        let cmd_args: &[&str] =
-                            if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() && cfg!(not(windows)) {
-                                &["--color"]
-                            } else {
-                                &[]
-                            };
+                        let cmd_args: &[&str] = if std::io::stdout().is_terminal()
+                            && std::io::stderr().is_terminal()
+                            && cfg!(not(windows))
+                        {
+                            &["--color"]
+                        } else {
+                            &[]
+                        };
                         let child = Command::new(WEBPACK_BUILD_COMMAND)
                             .args(cmd_args)
                             .current_dir(cwd)
@@ -335,8 +336,8 @@ mod contract {
                         println!("Compiled input using tsc");
                     }
                 }
+                None => {}
             }
-            None => {}
         }
 
         let build_state = |sources: &Sources| -> Result<(), anyhow::Error> {
