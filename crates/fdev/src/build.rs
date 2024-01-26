@@ -29,11 +29,11 @@ pub const TSC_BUILD_COMMAND: &'static str = "tsc.cmd";
 pub const WEBPACK_BUILD_COMMAND: &'static str = "webpack.cmd";
 
 #[cfg(not(windows))]
-pub const NPM_BUILD_COMMAND: &'static str = "npm";
+pub const NPM_BUILD_COMMAND: &str = "npm";
 #[cfg(not(windows))]
-pub const TSC_BUILD_COMMAND: &'static str = "tsc";
+pub const TSC_BUILD_COMMAND: &str = "tsc";
 #[cfg(not(windows))]
-pub const WEBPACK_BUILD_COMMAND: &'static str = "webpack";
+pub const WEBPACK_BUILD_COMMAND: &str = "webpack";
 
 pub fn build_package(cli_config: BuildToolConfig, cwd: &Path) -> Result<(), anyhow::Error> {
     match cli_config.package_type {
