@@ -370,7 +370,7 @@ impl UdpPacketsListener {
             tick.tick().await;
         }
         Err(TransportError::ConnectionEstablishmentFailure {
-            cause: "max connection attemps reached".into(),
+            cause: "max connection attempts reached".into(),
         })
     }
 
