@@ -1,6 +1,5 @@
-use std::time::Instant;
-
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
+use std::time::Instant;
 // TODO: complete update logic in the network
 use freenet_stdlib::prelude::*;
 use futures::future::BoxFuture;
@@ -199,8 +198,6 @@ impl Operation for UpdateOp {
                         htl: *htl,
                     });
 
-                    tracing::debug!(state = ?self.state);
-
                     // no changes to state yet, still in AwaitResponse state
                     new_state = self.state;
                 }
@@ -235,11 +232,7 @@ impl Operation for UpdateOp {
                         true
                     };
 
-                    if is_subscribed_contract
-                    // || op_manager
-                    //     .ring
-                    //     .within_subscribing_distance(&Location::from(key))
-                    {
+                    if is_subscribed_contract {
                         tracing::debug!("peer is subscribed to contract. About to update it");
                         update_contract(
                             op_manager,
@@ -263,8 +256,7 @@ impl Operation for UpdateOp {
                                 "last hop found. Cannot forward update. Should throw an error"
                             );
                         } else {
-                            let mut skip_list = vec![sender.peer];
-                            // broadcast_to.iter().for_each(|t| skip_list.push(t.peer));
+                            let skip_list = vec![sender.peer];
                             forward_update(
                                 op_manager,
                                 conn_manager,
@@ -273,18 +265,11 @@ impl Operation for UpdateOp {
                                 *id,
                                 new_htl,
                                 skip_list,
-                                broadcast_to.iter().map(|t| t.peer).collect(),
+                                vec![],
                             )
                             .await;
                         }
                     }
-
-                    let mut next_already_broadcasted_to = vec![];
-
-                    broadcast_to.iter().for_each(|t| {
-                        // fix error 54 - BroadcastTo -> state = AwaitingResponse
-                        // next_already_broadcasted_to.push(t.peer);
-                    });
 
                     match try_to_broadcast(
                         *id,
@@ -294,7 +279,7 @@ impl Operation for UpdateOp {
                         (broadcast_to, *sender),
                         key.clone(),
                         value.clone(),
-                        next_already_broadcasted_to,
+                        vec![],
                         false,
                     )
                     .await
@@ -314,7 +299,7 @@ impl Operation for UpdateOp {
                     already_broadcasted_to,
                 } => {
                     if let Some(UpdateState::AwaitingResponse { .. }) = self.state {
-                        tracing::debug!("error 54 - trying to broadcast to a peer that was the initiator of the op because it received the client request, or is in the middle of a seek node or forward process");
+                        tracing::debug!("trying to broadcast to a peer that was the initiator of the op because it received the client request, or is in the middle of a seek node or forward process");
                         return Err(OpError::StatePushed);
                     };
 
@@ -330,27 +315,7 @@ impl Operation for UpdateOp {
                     .await?;
                     tracing::debug!("Contract successfully updated - BroadcastTo - update");
 
-                    tracing::debug!(state = ?self.state);
-
                     let broadcast_to = op_manager.get_broadcast_targets_update(key, &sender.peer);
-
-                    let mut next_already_broadcasted_to = already_broadcasted_to.clone();
-                    let mut next_already_broadcasted_to = vec![];
-
-                    let mut broadcast_to_next = vec![];
-
-                    // this filter already sent broadcast peer by other peers
-                    broadcast_to.into_iter().for_each(|t| {
-                        if already_broadcasted_to.contains(&t.peer) {
-                            // tracing::warn!(
-                            //     %target.peer, "error 54 - about to add to targets an already broadcasted to peer"
-                            // );
-                        } else {
-                            broadcast_to_next.push(t);
-                            // fix error 54 - BroadcastTo -> state = AwaitingResponse
-                            //next_already_broadcasted_to.push(t.peer);
-                        }
-                    });
 
                     tracing::debug!(
                         "Successfully updated a value for contract {} @ {:?} - BroadcastTo - update",
@@ -366,15 +331,20 @@ impl Operation for UpdateOp {
                         tracing::debug!(state = ?self.state, op_id = %self.id, "try_to_broadcast_2 awaitingresponse - BroadcastTo - update");
                     }
 
+                    tracing::debug!(
+                        "broadcast_to len {} - 00update - BroadcastTo",
+                        broadcast_to.len()
+                    );
+
                     match try_to_broadcast(
                         *id,
                         false,
                         op_manager,
                         self.state,
-                        (broadcast_to_next, *sender),
+                        (broadcast_to, *sender),
                         key.clone(),
                         new_value,
-                        next_already_broadcasted_to.to_vec(),
+                        vec![],
                         true,
                     )
                     .await
@@ -400,31 +370,13 @@ impl Operation for UpdateOp {
 
                     let mut broadcasting = Vec::with_capacity(broadcast_to.len());
 
-                    let mut next_already_broadcasted_to = already_broadcasted_to.clone();
-                    let mut next_already_broadcasted_to = vec![];
-
-                    broadcast_to.iter().for_each(|t| {
-                        if already_broadcasted_to.contains(&t.peer) {
-                            // fix error 54 - BroadcastTo -> state = AwaitingResponse
-                            // next_already_broadcasted_to.push(t.peer);
-                        }
-                    });
-
                     for peer in broadcast_to.iter() {
-                        if already_broadcasted_to.contains(&peer.peer) {
-                            // tracing::error!(%peer.peer,
-                            //     "error 54 - about to broadcast update to an already broadcasted peer - Broadcasting"
-                            // );
-                            // fix error 54 - BroadcastTo -> state = AwaitingResponse
-                            // continue;
-                        }
-
                         let msg = UpdateMsg::BroadcastTo {
                             id: *id,
                             key: key.clone(),
                             new_value: new_value.clone(),
                             sender,
-                            already_broadcasted_to: next_already_broadcasted_to.to_vec(),
+                            already_broadcasted_to: vec![],
                         };
                         let f = conn_manager.send(&peer.peer, msg.into());
                         broadcasting.push(f);
@@ -465,7 +417,6 @@ impl Operation for UpdateOp {
                     let summary = StateSummary::from(raw_state.into_bytes());
 
                     // Subscriber nodes have been notified of the change, the operation is complete
-                    // tracing::debug!();
                     return_msg = Some(UpdateMsg::SuccessfulUpdate {
                         id: *id,
                         target: *upstream,
@@ -473,35 +424,20 @@ impl Operation for UpdateOp {
                     });
 
                     new_state = None;
-                    // new_state = Some(UpdateState::AwaitingResponse {
-                    //     key: key.clone(),
-                    //     upstream: Some(*upstream),
-                    // });
                 }
                 UpdateMsg::SuccessfulUpdate { id, summary, .. } => {
-                    tracing::debug!(tx = %id, state = ?self.state, "in SuccessfulUpdate");
-
                     match self.state {
                         Some(UpdateState::AwaitingResponse { key, upstream }) => {
-                            tracing::debug!("State == AwaitingResponse");
                             let is_subscribed_contract =
                                 op_manager.ring.is_subscribed_to_contract(&key);
-                            // if !is_subscribed_contract
-                            //     && op_manager
-                            //         .ring
-                            //         .within_subscribing_distance(&Location::from(&key))
-                            // {
-                            //     tracing::debug!(tx = %id, %key, peer = %op_manager.ring.peer_key, "Contract not cached @ peer, caching");
-                            //     super::start_subscription_request(op_manager, key.clone(), true)
-                            //         .await;
-                            // }
+
                             tracing::debug!(
                                 tx = %id,
                                 %key,
                                 this_peer = %op_manager.ring.peer_key,
                                 "Peer completed contract value update - SuccessfulUpdate",
                             );
-                            tracing::debug!(upstream = ?upstream, "set state to Finished so upstream can close its tx");
+
                             new_state = Some(UpdateState::Finished {
                                 key,
                                 summary: summary.clone(),
@@ -518,7 +454,7 @@ impl Operation for UpdateOp {
                             }
                         }
                         _ => {
-                            tracing::debug!(
+                            tracing::error!(
                                 state = ?self.state,
                                 "invalid transition in UpdateMsg::SuccessfulUpdate -> match self.state"
                             );
@@ -545,9 +481,6 @@ impl Operation for UpdateOp {
                     );
 
                     let is_subscribed_contract = op_manager.ring.is_subscribed_to_contract(&key);
-                    let within_caching_dist = op_manager
-                        .ring
-                        .within_subscribing_distance(&Location::from(key));
 
                     if is_subscribed_contract {
                         // after the contract has been cached, push the update query
@@ -564,31 +497,10 @@ impl Operation for UpdateOp {
 
                     let broadcast_to = op_manager.get_broadcast_targets_update(&key, &sender.peer);
 
-                    let mut next_already_broadcasted_to = already_broadcasted_to.clone();
-                    let mut next_already_broadcasted_to = vec![];
-
-                    let mut broadcast_to_next = vec![];
-
-                    // this filter already sent broadcast peer by other peers
-                    broadcast_to.into_iter().for_each(|t| {
-                        if already_broadcasted_to.contains(&t.peer) {
-                            // tracing::warn!(
-                            //     %peer_loc.peer, "error 54 - about to add to targets an already broadcasted to peer"
-                            // );
-                        } else {
-                            broadcast_to_next.push(t);
-                        }
-                        //next_already_broadcasted_to.push(t.peer);
-                    });
-
                     // if successful, forward to the next closest peers (if any)
                     let last_hop = if let Some(new_htl) = htl.checked_sub(1) {
                         let mut new_skip_list = skip_list.clone();
                         new_skip_list.push(sender.peer);
-                        next_already_broadcasted_to
-                            .clone()
-                            .into_iter()
-                            .for_each(|t| new_skip_list.push(t));
 
                         // only hop forward if there are closer peers
                         let put_here = forward_update(
@@ -599,46 +511,25 @@ impl Operation for UpdateOp {
                             *id,
                             new_htl,
                             new_skip_list,
-                            next_already_broadcasted_to.clone(),
+                            vec![],
                         )
                         .await;
-                        // if put_here && !is_subscribed_contract {
-                        //     // if already subscribed the value was already put and merging succeeded
-                        //     update_contract(
-                        //         op_manager,
-                        //         key.clone(),
-                        //         new_value.clone(),
-                        //         RelatedContracts::default(),
-                        //     )
-                        //     .await?;
-                        // }
+
                         put_here
                     } else {
-                        // should put in this location, no hops left
-                        // update_contract(
-                        //     op_manager,
-                        //     key.clone(),
-                        //     new_value.clone(),
-                        //     RelatedContracts::default(),
-                        // )
-                        // .await?;
                         tracing::error!("didnt find the contract to update and no hops left. This should throw an error");
                         true
                     };
-
-                    tracing::debug!("\njust before try_to_broadcast_3");
-                    tracing::debug!(state = ?self.state, op_id = %self.id);
-                    // tracing::debug!(broadcast_list = ?broadcast_to);
 
                     match try_to_broadcast(
                         *id,
                         last_hop,
                         op_manager,
                         self.state,
-                        (broadcast_to_next, *sender),
+                        (broadcast_to, *sender),
                         key.clone(),
                         new_value.clone(),
-                        next_already_broadcasted_to.to_vec(),
+                        vec![],
                         false,
                     )
                     .await
@@ -684,10 +575,6 @@ async fn try_to_broadcast(
                 return_msg = None;
 
                 if is_from_a_broadcasted_to_peer {
-                    // let raw_state = State::from(new_value);
-
-                    // let summary = StateSummary::from(raw_state.into_bytes());
-
                     new_state = None;
                     return Ok((new_state, return_msg));
                 }
@@ -698,17 +585,15 @@ async fn try_to_broadcast(
                     upstream: Some(upstream),
                 });
             } else if !broadcast_to.is_empty() {
-                tracing::debug!("Callback to start broadcasting to other nodes - try_to_broadcast");
-                new_state = Some(UpdateState::BroadcastOngoing);
-
                 tracing::debug!(
-                    "broadcast_to list size {} before broadcasting",
+                    "Callback to start broadcasting to other nodes. List size {}",
                     broadcast_to.len()
                 );
-                for peer in broadcast_to.iter() {
-                    tracing::warn!("to {}", peer.peer);
-                }
-                tracing::debug!("end broadcast_to list before broadcasting - try_to_broadcast");
+                new_state = Some(UpdateState::BroadcastOngoing);
+
+                // for peer in broadcast_to.iter() {
+                //     tracing::debug!("to {}", peer.peer);
+                // }
 
                 return_msg = Some(UpdateMsg::Broadcasting {
                     id,
@@ -734,16 +619,12 @@ async fn try_to_broadcast(
 
                 let summary = StateSummary::from(raw_state.into_bytes());
 
-                // tracing::debug!(op_id = %id, "state op changed to None");
-
                 new_state = None;
                 return_msg = Some(UpdateMsg::SuccessfulUpdate {
                     id,
                     target: upstream,
                     summary,
                 });
-
-                tracing::debug!("set tx msg to SuccessfulUpdate - try_to_broadcast");
             }
         }
         _ => return Err(OpError::invalid_transition(id)),
@@ -843,12 +724,6 @@ async fn forward_update<NB: NetworkBridge>(
         if other_distance < self_distance {
             // forward the contract towards this node since it is indeed closer to the contract location
             // and forget about it, no need to keep track of this op or wait for response
-            if already_broadcasted_to.contains(&peer.peer) {
-                // tracing::error!(%peer.peer,
-                //     "error 54 - about to forward update to an already broadcasted peer"
-                // );
-            }
-
             let _ = conn_manager
                 .send(
                     &peer.peer,
