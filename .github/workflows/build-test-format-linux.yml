@@ -1,4 +1,4 @@
-name: CI
+name: Building, Testing and Formatting on Linux
 
 on:
   push:
