@@ -15,6 +15,7 @@
 
 # Developer Guide
 
+- [Tutorial: Install freenet](install.md)
 - [Tutorial: Create an App](tutorial.md)
 - [Contract interfaces](contract-interface.md)
 - [freenet.toml format](manifest.md)
