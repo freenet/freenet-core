@@ -41,12 +41,14 @@ mod crypto;
 mod packet_data;
 mod symmetric_message;
 
+use std::net::SocketAddr;
+
 use futures::sink::Sink;
-use tokio::sync::mpsc;
+use tokio::{net::UdpSocket, sync::mpsc};
 
 use crate::transport::packet_data::PacketData;
 
-use self::connection_handler::TransportError;
+use self::connection_handler::{RemoteConnection, TransportError};
 
 type StreamBytes = Vec<u8>;
 
@@ -70,15 +72,17 @@ struct StreamedMessagePart {
 }
 
 /// Handles breaking a message into parts, encryption, etc.
-struct SenderStream {}
+struct SenderStream<'a> {
+    socket: &'a UdpSocket,
+}
 
-impl SenderStream {
-    fn new(sender: &mut mpsc::Sender<connection_handler::SerializedMessage>) -> Self {
+impl<'a> SenderStream<'a> {
+    fn new(socket: &'a UdpSocket, remote_conn: &mut RemoteConnection) -> Self {
         todo!()
     }
 }
 
-impl Sink<StreamBytes> for SenderStream {
+impl Sink<StreamBytes> for SenderStream<'_> {
     type Error = SenderStreamError;
 
     fn poll_ready(

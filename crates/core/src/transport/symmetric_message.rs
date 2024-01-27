@@ -49,6 +49,24 @@ impl SymmetricMessage {
         Ok(PacketData::encrypted_with_cipher(bytes, inbound_sym_key))
     }
 
+    pub fn short_message(
+        message_id: u16,
+        payload: Vec<u8>,
+        inbound_sym_key: &Aes128Gcm,
+    ) -> Result<PacketData, bincode::Error> {
+        let message = Self {
+            message_id,
+            confirm_receipt: None,
+            payload: SymmetricMessagePayload::ShortMessage { payload },
+        };
+        let mut packet = [0u8; MAX_PACKET_SIZE]; // todo: optimize this
+        let size = bincode::serialized_size(&message)?;
+        debug_assert!(size <= MAX_PACKET_SIZE as u64);
+        bincode::serialize_into(packet.as_mut_slice(), &message)?;
+        let bytes = &packet[..size as usize];
+        Ok(PacketData::encrypted_with_cipher(bytes, inbound_sym_key))
+    }
+
     const ACK_ERROR: SymmetricMessage = SymmetricMessage {
         message_id: FIRST_MESSAGE_ID,
         confirm_receipt: None,
