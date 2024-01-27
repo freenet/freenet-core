@@ -7,19 +7,18 @@ rustup default stable &&
 rustup target add wasm32-unknown-unknown &&
 (sh curl -L https://git.io/n-install | bash) ;
 
-
-ls -l /usr/local
-
 if [ "$EUID" -ne 0 ]
   then 
   ~/n/bin/n latest ;
   ~/n/bin/npm install -g typescript webpack
+  echo 'PATH="~/n/bin/:$PATH"' >> ~/.bashrc
 else
   /usr/local/n latest ;
   /usr/local/n/bin/npm install -g typescript webpack
 fi
 
-
+echo 'PATH="$(npm config get prefix)/bin/:$PATH"' >> ~/.bashrc
+source ~/.bashrc
 
 git submodule update --init --recursive &&
 export CARGO_TARGET_DIR="$(pwd)/target" &&
@@ -32,4 +31,4 @@ cd ./modules/identity-management/ && make build &&
 cd ../antiflood-tokens/ &&
 rm Cargo.lock ;
 make build &&
-cd ../../apps/freenet-email-app && make build
+cd ../../apps/freenet-microblogging && make build
