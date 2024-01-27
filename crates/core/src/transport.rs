@@ -37,7 +37,6 @@
 
 mod bw;
 mod connection_handler;
-mod connection_info;
 mod crypto;
 mod packet_data;
 mod symmetric_message;
@@ -47,7 +46,7 @@ use tokio::sync::mpsc;
 
 use crate::transport::packet_data::PacketData;
 
-use self::connection_handler::ConnectionError;
+use self::connection_handler::TransportError;
 
 type StreamBytes = Vec<u8>;
 
@@ -55,11 +54,11 @@ struct ReceiverStream {}
 
 impl ReceiverStream {
     /// Will await until a full message is received, does error handling, reassembling the message from parts, decryption, etc.
-    async fn receive_message(&self) -> Result<Vec<u8>, ConnectionError> {
+    async fn receive_message(&self) -> Result<Vec<u8>, TransportError> {
         todo!()
     }
 
-    async fn read_part(&self) -> Result<StreamedMessagePart, ConnectionError> {
+    async fn read_part(&self) -> Result<StreamedMessagePart, TransportError> {
         todo!()
     }
 }
