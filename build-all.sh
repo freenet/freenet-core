@@ -28,8 +28,7 @@ cd ../.. &&
 cargo install --path crates/core --force &&
 cargo install --path crates/fdev --force &&
 cd ./modules/identity-management/ && make build &&
-cd ../antiflood-tokens/ &&
-rm Cargo.lock ;
-make build &&
-cd ../../apps/freenet-microblogging && make build &&
-cd ../../apps/freenet-email-app && make build
+cd ../antiflood-tokens/ && rm Cargo.lock ; make build &&
+cd ../../ && 
+make -C ./apps/freenet-microblogging build &&
+make -C ./apps/freenet-email-app build
