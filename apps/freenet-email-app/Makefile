@@ -19,6 +19,10 @@ IDENTITY_DELEGATE := $(FREENET_ROOT)$(PATH_SEP)modules$(PATH_SEP)identity-manage
 WEB_DIR_SRC := $(ROOT)$(PATH_SEP)web$(PATH_SEP)src
 FILE := $(IDENTITY_DELEGATE)$(PATH_SEP)build$(PATH_SEP)identity-manager-key.private.pem
 
+IDENTITY_DELEGATE_PRIVATE_KEY := identity-manager-key.private.pem
+PATH_TO_IDENTITY_DELEGATE := $(IDENTITY_DELEGATE)/build/$(IDENTITY_DELEGATE_PRIVATE_KEY)
+
+
 ifeq ($(CARGO_TARGET_DIR),)
 	$(error CARGO_TARGET_DIR is not set)
 endif
