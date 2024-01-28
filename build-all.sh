@@ -31,4 +31,5 @@ cd ./modules/identity-management/ && make build &&
 cd ../antiflood-tokens/ &&
 rm Cargo.lock ;
 make build &&
-cd ../../apps/freenet-microblogging && make build
+cd ../../apps/freenet-microblogging && make build &&
+cd ../../apps/freenet-email-app && make build

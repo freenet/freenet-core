@@ -32,9 +32,10 @@ build-tool:
 
 generate-id-manager-key:
 	FILE="$(IDENTITY_DELEGATE)/build/identity-manager-key.private.pem"
-	@if [ ! -f $$FILE ]; then \
-		cd $(IDENTITY_DELEGATE) && cargo run -- --path "$(IDENTITY_DELEGATE)/build/" \
-	fi
+	echo $$FILE ;
+ifneq ("$(wildcard $(FILE))","")
+    cd $(IDENTITY_DELEGATE) && cargo run -- --path "$(IDENTITY_DELEGATE)/build/" ; 
+endif
 
 build-inbox:
 	cd $(INBOX_DIR)
