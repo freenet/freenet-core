@@ -10,6 +10,10 @@ AFT_GENERATOR := $(FREENET_DIR)/modules/antiflood-tokens/delegates/token-generat
 IDENTITY_DELEGATE := $(FREENET_DIR)/modules/identity-management
 WEB_DIR_SRC := $(FREENET_DIR)/apps/freenet-email-app/web/src
 
+IDENTITY_DELEGATE_PRIVATE_KEY := identity-manager-key.private.pem
+PATH_TO_IDENTITY_DELEGATE := $(IDENTITY_DELEGATE)/build/$(IDENTITY_DELEGATE_PRIVATE_KEY)
+
+
 ifeq ($(CARGO_TARGET_DIR),)
 $(error CARGO_TARGET_DIR is not set)
 endif
@@ -31,10 +35,10 @@ build-tool:
 	cargo install --force --path $(FREENET_DIR)/crates/fdev
 
 generate-id-manager-key:
-	FILE="$(IDENTITY_DELEGATE)/build/identity-manager-key.private.pem"
-	echo $$FILE ;
-ifneq ("$(wildcard $(FILE))","")
-    cd $(IDENTITY_DELEGATE) && cargo run -- --path "$(IDENTITY_DELEGATE)/build/" ; 
+ifeq ($(wildcard $(PATH_TO_IDENTITY_DELEGATE)), $(IDENTITY_DELEGATE_PRIVATE_KEY))
+	echo "file $(IDENTITY_DELEGATE_PRIVATE_KEY) already exists. Skipping." ;
+else
+	 cargo run -- --path "$(IDENTITY_DELEGATE)/build/" ;
 endif
 
 build-inbox:
