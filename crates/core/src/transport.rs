@@ -41,26 +41,26 @@ mod crypto;
 mod packet_data;
 mod symmetric_message;
 
-use std::net::SocketAddr;
-
 use futures::sink::Sink;
-use tokio::{net::UdpSocket, sync::mpsc};
+use tokio::net::UdpSocket;
 
-use crate::transport::packet_data::PacketData;
-
-use self::connection_handler::{RemoteConnection, TransportError};
+use self::{connection_handler::RemoteConnection, packet_data::PacketData};
 
 type StreamBytes = Vec<u8>;
 
 struct ReceiverStream {}
 
 impl ReceiverStream {
-    /// Will await until a full message is received, does error handling, reassembling the message from parts, decryption, etc.
-    async fn receive_message(&self) -> Result<Vec<u8>, TransportError> {
+    fn new(total_length: u64) -> Self {
         todo!()
     }
 
-    async fn read_part(&self) -> Result<StreamedMessagePart, TransportError> {
+    fn push_fragment(&mut self, index: u64, fragment: StreamBytes) {
+        todo!()
+    }
+
+    /// Returns some if the message has been completely streamed, none otherwise.
+    fn full_message(&mut self) -> Option<Vec<u8>> {
         todo!()
     }
 }

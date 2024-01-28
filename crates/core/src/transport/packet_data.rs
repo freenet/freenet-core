@@ -90,7 +90,7 @@ impl<const N: usize> PacketData<N> {
         }
     }
 
-    pub(super) fn send_data(&self) -> &[u8] {
+    pub(super) fn data(&self) -> &[u8] {
         &self.data[..self.size]
     }
 
@@ -114,10 +114,10 @@ impl<const N: usize> PacketData<N> {
     }
 }
 
-impl<const N: usize> From<([u8; N], usize)> for PacketData<N> {
-    fn from((data, size): ([u8; N], usize)) -> Self {
+impl<const N: usize> From<[u8; N]> for PacketData<N> {
+    fn from(data: [u8; N]) -> Self {
         _check_valid_size::<N>();
-        Self { data, size }
+        Self { data, size: N }
     }
 }
 

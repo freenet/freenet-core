@@ -4,6 +4,8 @@ use aes_gcm::Aes128Gcm;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
+use crate::transport::packet_data::MAX_DATA_SIZE;
+
 use super::{packet_data::MAX_PACKET_SIZE, PacketData};
 
 #[serde_as]
@@ -33,7 +35,7 @@ impl SymmetricMessage {
             bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_ERROR).unwrap();
             (&packet[..size as usize]).into()
         });
-        // todo: we need exact size of this packer so we can return an optimized PacketData
+        // todo: we need exact size of this packet so we can return an optimized PacketData
         Ok(PacketData::encrypted_with_cipher(bytes, inbound_sym_key))
     }
 
@@ -45,7 +47,7 @@ impl SymmetricMessage {
             bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_ERROR).unwrap();
             (&packet[..size as usize]).into()
         });
-        // todo: we need exact size of this packer so we can return an optimized PacketData
+        // todo: we need exact size of this packet so we can return an optimized PacketData
         Ok(PacketData::encrypted_with_cipher(bytes, inbound_sym_key))
     }
 
@@ -61,7 +63,7 @@ impl SymmetricMessage {
         };
         let mut packet = [0u8; MAX_PACKET_SIZE]; // todo: optimize this
         let size = bincode::serialized_size(&message)?;
-        debug_assert!(size <= MAX_PACKET_SIZE as u64);
+        debug_assert!(size <= MAX_DATA_SIZE as u64);
         bincode::serialize_into(packet.as_mut_slice(), &message)?;
         let bytes = &packet[..size as usize];
         Ok(PacketData::encrypted_with_cipher(bytes, inbound_sym_key))
@@ -93,6 +95,11 @@ pub(super) enum SymmetricMessagePayload {
     ShortMessage {
         payload: Vec<u8>,
     },
+    LongMessageFragment {
+        total_length: u64,
+        index: u64,
+        payload: Vec<u8>,
+    },
 }
 
 #[test]
@@ -101,10 +108,10 @@ fn ack_error_msg() -> Result<(), Box<dyn std::error::Error>> {
     let key = Aes128Gcm::new(&[0; 16].into());
     let packet = SymmetricMessage::ack_error(&key)?;
 
-    let _packet = PacketData::<1501>::encrypted_with_cipher(packet.send_data(), &key);
+    let _packet = PacketData::<1501>::encrypted_with_cipher(packet.data(), &key);
 
     let data = packet.decrypt(&key).unwrap();
-    let deser = SymmetricMessage::deser(data.send_data())?;
+    let deser = SymmetricMessage::deser(data.data())?;
     assert!(matches!(
         deser.payload,
         SymmetricMessagePayload::AckConnection { result: Err(_) }
