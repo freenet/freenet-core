@@ -39,78 +39,10 @@ mod bw;
 mod connection_handler;
 mod crypto;
 mod packet_data;
+mod peer_connection;
 mod symmetric_message;
 
-use futures::sink::Sink;
-use tokio::net::UdpSocket;
-
-use self::{connection_handler::RemoteConnection, packet_data::PacketData};
-
-type StreamBytes = Vec<u8>;
-
-struct ReceiverStream {}
-
-impl ReceiverStream {
-    fn new(total_length: u64) -> Self {
-        todo!()
-    }
-
-    fn push_fragment(&mut self, index: u64, fragment: StreamBytes) {
-        todo!()
-    }
-
-    /// Returns some if the message has been completely streamed, none otherwise.
-    fn full_message(&mut self) -> Option<Vec<u8>> {
-        todo!()
-    }
-}
-
-struct StreamedMessagePart {
-    data: PacketData,
-    part_start_position: usize,
-    message_size: usize,
-}
-
-/// Handles breaking a message into parts, encryption, etc.
-struct SenderStream<'a> {
-    socket: &'a UdpSocket,
-}
-
-impl<'a> SenderStream<'a> {
-    fn new(socket: &'a UdpSocket, remote_conn: &mut RemoteConnection) -> Self {
-        todo!()
-    }
-}
-
-impl Sink<StreamBytes> for SenderStream<'_> {
-    type Error = SenderStreamError;
-
-    fn poll_ready(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        todo!()
-    }
-
-    fn start_send(self: std::pin::Pin<&mut Self>, data: StreamBytes) -> Result<(), Self::Error> {
-        // we break the message into parts, encrypt them, and send them
-        todo!()
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        todo!()
-    }
-
-    fn poll_close(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        todo!()
-    }
-}
+use self::packet_data::PacketData;
 
 struct BytesPerSecond(f64);
 
@@ -123,12 +55,4 @@ impl BytesPerSecond {
     pub fn as_f64(&self) -> f64 {
         self.0
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(super) enum SenderStreamError {
-    #[error("stream closed unexpectedly")]
-    Closed,
-    #[error("message too big, size: {size}, max size: {max_size}")]
-    MessageExceedsLength { size: usize, max_size: usize },
 }

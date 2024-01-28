@@ -8,22 +8,18 @@ use aes_gcm::{Aes128Gcm, KeyInit};
 use futures::channel::oneshot;
 use futures::stream::FuturesUnordered;
 use futures::{SinkExt, StreamExt};
-use serde::Serialize;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task;
 
-use crate::transport::packet_data::MAX_DATA_SIZE;
-use crate::transport::{
-    packet_data::MAX_PACKET_SIZE,
-    symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
-};
-
+use super::peer_connection::SenderStreamError;
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
+    packet_data::{MAX_DATA_SIZE, MAX_PACKET_SIZE},
+    peer_connection::{PeerConnection, SenderStream},
+    symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
     BytesPerSecond, PacketData,
 };
-use super::{ReceiverStream, SenderStream, SenderStreamError};
 
 const PROTOC_VERSION: [u8; 2] = 1u16.to_le_bytes();
 
@@ -40,59 +36,6 @@ const MAX_INTERVAL: Duration = Duration::from_millis(5000); // Maximum interval 
 type ConnectionHandlerMessage = (SocketAddr, Vec<u8>);
 pub type SerializedMessage = Vec<u8>;
 type PeerChannel = (mpsc::Sender<SerializedMessage>, mpsc::Receiver<PacketData>);
-
-pub(crate) struct PeerConnection {
-    inbound_recv: mpsc::Receiver<PacketData>,
-    outbound_sender: mpsc::Sender<SerializedMessage>,
-    inbound_sym_key: Aes128Gcm,
-    ongoing_stream: Option<ReceiverStream>,
-}
-
-impl PeerConnection {
-    pub async fn recv(&mut self) -> Result<Vec<u8>, TransportError> {
-        use SymmetricMessagePayload::*;
-        let packet_data = self
-            .inbound_recv
-            .recv()
-            .await
-            .ok_or(TransportError::ConnectionClosed)?;
-        let decrypted = packet_data
-            .decrypt(&self.inbound_sym_key)
-            .map_err(TransportError::PrivateKeyDecryptionError)?;
-        let SymmetricMessage { payload, .. } = SymmetricMessage::deser(decrypted.data())?;
-        // todo: handle out of order messages, repeated messages, missing packets, etc.
-        match payload {
-            ShortMessage { payload } => Ok(payload),
-            AckConnection { .. } => Err(TransportError::UnexpectedMessage("AckConnection".into())),
-            LongMessageFragment {
-                total_length,
-                index: start_index,
-                payload,
-            } => {
-                // todo: IGNORE THIS FOR NOW, needs more work
-                let mut stream = self
-                    .ongoing_stream
-                    .take()
-                    .unwrap_or_else(|| ReceiverStream::new(total_length));
-                stream.push_fragment(start_index, payload);
-                self.ongoing_stream = Some(stream);
-                todo!("make ReceiverStream a real stream and probably PeerConnection a stream too so we can poll etc.")
-            }
-        }
-    }
-
-    pub async fn send<T: Serialize>(&mut self, data: &T) -> Result<(), TransportError> {
-        // todo: improve: careful with blocking while serializing here
-        let serialized_data = bincode::serialize(data).unwrap();
-        // todo: improve cancel safety just in case, although is unlikely to be an issue
-        // when calling this methods because the &mut ref
-        self.outbound_sender
-            .send(serialized_data)
-            .await
-            .map_err(|_| TransportError::ConnectionClosed)?;
-        Ok(())
-    }
-}
 
 struct OutboundMessage {
     remote_addr: SocketAddr,
