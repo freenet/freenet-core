@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    fs::{self, File},
+};
 
 use freenet_stdlib::prelude::Parameters;
 use identity_management::IdentityParams;
@@ -31,7 +34,10 @@ impl Args {
             None => std::env::current_dir()?,
         };
         let key = pargs.opt_value_from_str(["-k", "--key"])?;
-        if !path.is_dir() {
+        println!("path: {:?}", path);
+        if !path.exists() {
+            fs::create_dir_all(&path)?;
+        } else if !path.is_dir() {
             return Err("path must be a directory".into());
         }
         Ok(Args { path, key })
