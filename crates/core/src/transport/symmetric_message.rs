@@ -108,7 +108,7 @@ fn ack_error_msg() -> Result<(), Box<dyn std::error::Error>> {
     let key = Aes128Gcm::new(&[0; 16].into());
     let packet = SymmetricMessage::ack_error(&key)?;
 
-    let _packet = PacketData::<1501>::encrypted_with_cipher(packet.data(), &key);
+    let _packet = PacketData::<1500>::encrypted_with_cipher(packet.data(), &key);
 
     let data = packet.decrypt(&key).unwrap();
     let deser = SymmetricMessage::deser(data.data())?;
