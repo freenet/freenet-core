@@ -40,7 +40,7 @@ mod connection_handler;
 mod crypto;
 mod packet_data;
 mod peer_connection;
-mod receipt_tracker;
+mod received_packet_tracker;
 mod symmetric_message;
 
 use self::packet_data::PacketData;
