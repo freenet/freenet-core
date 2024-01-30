@@ -1,6 +1,6 @@
 use crate::util::{SystemTime, TimeSource};
 use std::collections::VecDeque;
-use time::{Duration, Instant};
+use std::time::{Duration, Instant};
 
 /// Keeps track of the bandwidth used in the last window_size. Recommend a `window_size` of
 /// 10 seconds.
@@ -108,7 +108,7 @@ mod tests {
 
     #[test]
     fn test_adding_packets() {
-        let mut tracker = PacketBWTracker::new(Duration::seconds(1));
+        let mut tracker = PacketBWTracker::new(Duration::from_secs(1));
         verify_bandwidth_match(&tracker);
         tracker.add_packet(1500);
         verify_bandwidth_match(&tracker);
@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn test_bandwidth_calculation() {
-        let mut tracker = PacketBWTracker::new(Duration::seconds(1));
+        let mut tracker = PacketBWTracker::new(Duration::from_secs(1));
         tracker.add_packet(1500);
         tracker.add_packet(2500);
         verify_bandwidth_match(&tracker);
@@ -129,10 +129,10 @@ mod tests {
 
     #[test]
     fn test_packet_expiry() {
-        let (mut tracker, mut ts) = mock_tracker(Duration::milliseconds(200));
+        let (mut tracker, mut ts) = mock_tracker(Duration::from_millis(200));
         tracker.add_packet(1500);
         verify_bandwidth_match(&tracker);
-        ts.advance_time(Duration::milliseconds(300));
+        ts.advance_time(Duration::from_millis(300));
         tracker.cleanup();
         verify_bandwidth_match(&tracker);
         assert!(tracker.packets.is_empty());
@@ -140,21 +140,21 @@ mod tests {
 
     #[test]
     fn test_wait_time_calculation() {
-        let (mut tracker, mut ts) = mock_tracker(Duration::seconds(1));
+        let (mut tracker, mut ts) = mock_tracker(Duration::from_secs(1));
         tracker.add_packet(5000);
         verify_bandwidth_match(&tracker);
-        ts.advance_time(Duration::milliseconds(500));
+        ts.advance_time(Duration::from_millis(500));
         tracker.add_packet(4000);
         verify_bandwidth_match(&tracker);
         match tracker.can_send_packet(10000, 2000) {
             Ok(_) => panic!("Should require waiting"),
-            Err(wait_time) => assert_eq!(wait_time, Duration::milliseconds(500)),
+            Err(wait_time) => assert_eq!(wait_time, Duration::from_millis(500)),
         }
     }
 
     #[test]
     fn test_immediate_send() {
-        let mut tracker = PacketBWTracker::new(Duration::milliseconds(10));
+        let mut tracker = PacketBWTracker::new(Duration::from_millis(10));
         tracker.add_packet(3000);
         assert_eq!(tracker.can_send_packet(10000, 2000), Ok(()));
     }

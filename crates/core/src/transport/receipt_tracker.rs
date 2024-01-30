@@ -1,9 +1,9 @@
 use crate::util::{SystemTime, TimeSource};
 use std::collections::{HashMap, VecDeque};
 use std::mem;
-use time::{Duration, Instant};
+use std::time::{Duration, Instant};
 
-const RETAIN_TIME: Duration = Duration::seconds(10);
+const RETAIN_TIME: Duration = Duration::from_secs(60);
 const MAX_PENDING_RECEIPTS: usize = 20;
 
 pub(super) struct ReceiptTracker<T: TimeSource> {
@@ -35,8 +35,9 @@ impl<T: TimeSource> ReceiptTracker<T> {
             self.message_id_time
                 .push_back((message_id, self.time_source.now()));
 
+            self.pending_receipts.push(message_id);
+
             if self.pending_receipts.len() < MAX_PENDING_RECEIPTS {
-                self.pending_receipts.push(message_id);
                 ReportResult::Ok
             } else {
                 ReportResult::QueueFull
@@ -54,6 +55,8 @@ impl<T: TimeSource> ReceiptTracker<T> {
         mem::take(self.pending_receipts.as_mut())
     }
 
+    /// This function cleans up the `message_id_time` and `time_by_message_id` data structures.
+    /// It removes entries that are older than `RETAIN_TIME`.
     fn cleanup(&mut self) {
         let remove_before = self.time_source.now() - RETAIN_TIME;
         while self
@@ -66,11 +69,13 @@ impl<T: TimeSource> ReceiptTracker<T> {
                 self.time_by_message_id.remove(&message_id);
             }
         }
+        // Note: We deliberately don't clean up the pending_receipts list because it will
+        // be emptied every time get_receipts is called.
     }
 }
 
 #[derive(Debug, PartialEq)]
-enum ReportResult {
+pub(super) enum ReportResult {
     /// Packet was received for the first time and recorded
     Ok,
 
@@ -101,5 +106,55 @@ mod tests {
         assert_eq!(tracker.report_received_packets(0), ReportResult::Ok);
         assert_eq!(tracker.pending_receipts.len(), 1);
         assert_eq!(tracker.time_by_message_id.len(), 1);
+    }
+
+    #[test]
+    fn test_report_receipt_already_received() {
+        let mut tracker = ReceiptTracker::new();
+        assert_eq!(tracker.report_received_packets(0), ReportResult::Ok);
+        assert_eq!(
+            tracker.report_received_packets(0),
+            ReportResult::AlreadyReceived
+        );
+        assert_eq!(tracker.pending_receipts.len(), 1);
+        assert_eq!(tracker.time_by_message_id.len(), 1);
+    }
+
+    #[test]
+    fn test_report_receipt_queue_full() {
+        let mut tracker = ReceiptTracker::new();
+        for i in 0..(MAX_PENDING_RECEIPTS - 1) {
+            assert_eq!(tracker.report_received_packets(i as u32), ReportResult::Ok);
+        }
+        assert_eq!(
+            tracker.report_received_packets((MAX_PENDING_RECEIPTS as u32) + 1),
+            ReportResult::QueueFull
+        );
+        assert_eq!(tracker.pending_receipts.len(), MAX_PENDING_RECEIPTS);
+        assert_eq!(tracker.time_by_message_id.len(), MAX_PENDING_RECEIPTS);
+    }
+
+    #[test]
+    fn test_cleanup() {
+        let time_source = MockTimeSource::new(Instant::now());
+
+        let mut tracker = ReceiptTracker {
+            pending_receipts: Vec::new(),
+            message_id_time: VecDeque::new(),
+            time_by_message_id: HashMap::new(),
+            time_source: time_source.clone(),
+        };
+
+        for i in 0..10 {
+            assert_eq!(tracker.report_received_packets(i), ReportResult::Ok);
+        }
+        assert_eq!(tracker.time_by_message_id.len(), 10);
+        assert_eq!(tracker.message_id_time.len(), 10);
+
+        time_source.advance_time(RETAIN_TIME + Duration::from_secs(1));
+
+        tracker.cleanup();
+        assert_eq!(tracker.time_by_message_id.len(), 0);
+        assert_eq!(tracker.message_id_time.len(), 0);
     }
 }
