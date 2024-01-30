@@ -28,7 +28,7 @@ thread_local! {
 struct AssertSize<const N: usize>;
 
 impl<const N: usize> AssertSize<N> {
-    const OK: () = assert!(N < MAX_PACKET_SIZE);
+    const OK: () = assert!(N <= MAX_PACKET_SIZE);
 }
 
 // trying to bypass limitations with const generic checks on where clauses

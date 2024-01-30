@@ -7,6 +7,7 @@ use rand::{
     prelude::{Rng, StdRng},
     SeedableRng,
 };
+use time::Instant;
 
 use crate::node::PeerId;
 
@@ -240,6 +241,44 @@ impl<'x> Contains<PeerId> for &'x [&PeerId] {
 impl<'x> Contains<PeerId> for &'x Vec<&PeerId> {
     fn has_element(&self, target: &PeerId) -> bool {
         self.contains(&target)
+    }
+}
+
+pub trait TimeSource {
+    fn now(&self) -> Instant;
+}
+
+pub struct SystemTime;
+
+impl TimeSource for SystemTime {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub struct MockTimeSource {
+    current_instant: Instant,
+}
+
+#[cfg(test)]
+impl MockTimeSource {
+    pub fn new(start_instant: Instant) -> Self {
+        MockTimeSource {
+            current_instant: start_instant,
+        }
+    }
+
+    pub fn advance_time(&mut self, duration: time::Duration) {
+        self.current_instant += duration;
+    }
+}
+
+#[cfg(test)]
+impl TimeSource for MockTimeSource {
+    fn now(&self) -> Instant {
+        self.current_instant
     }
 }
 
