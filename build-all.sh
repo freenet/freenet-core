@@ -25,6 +25,7 @@ export CARGO_TARGET_DIR="$(pwd)/target" &&
 cd stdlib/typescript/ &&
 npm run dev.package &&
 cd ../.. &&
+cargo install dioxus-cli
 cargo install --path crates/core --force &&
 cargo install --path crates/fdev --force &&
 cd ./modules/identity-management/ && make build &&
