@@ -7,9 +7,9 @@ const RETAIN_TIME: Duration = Duration::seconds(10);
 const MAX_PENDING_RECEIPTS: usize = 20;
 
 pub(super) struct ReceiptTracker<T: TimeSource> {
-    pending_receipts: Vec<u16>,
-    packet_id_time: VecDeque<(u16, Instant)>,
-    time_by_packet: HashMap<u16, Instant>,
+    pending_receipts: Vec<u32>,
+    message_id_time: VecDeque<(u32, Instant)>,
+    time_by_message_id: HashMap<u32, Instant>,
     time_source: T,
 }
 
@@ -17,26 +17,26 @@ impl ReceiptTracker<SystemTime> {
     pub(super) fn new() -> Self {
         ReceiptTracker {
             pending_receipts: Vec::new(),
-            packet_id_time: VecDeque::new(),
-            time_by_packet: HashMap::new(),
+            message_id_time: VecDeque::new(),
+            time_by_message_id: HashMap::new(),
             time_source: SystemTime,
         }
     }
 }
 
 impl<T: TimeSource> ReceiptTracker<T> {
-    pub(super) fn report_received_packets(&mut self, packet_id: u16) -> ReportResult {
+    pub(super) fn report_received_packets(&mut self, message_id: u32) -> ReportResult {
         self.cleanup();
-        if self.time_by_packet.contains_key(&packet_id) {
+        if self.time_by_message_id.contains_key(&message_id) {
             ReportResult::AlreadyReceived
         } else {
-            self.time_by_packet
-                .insert(packet_id, self.time_source.now());
-            self.packet_id_time
-                .push_back((packet_id, self.time_source.now()));
+            self.time_by_message_id
+                .insert(message_id, self.time_source.now());
+            self.message_id_time
+                .push_back((message_id, self.time_source.now()));
 
             if self.pending_receipts.len() < MAX_PENDING_RECEIPTS {
-                self.pending_receipts.push(packet_id);
+                self.pending_receipts.push(message_id);
                 ReportResult::Ok
             } else {
                 ReportResult::QueueFull
@@ -48,7 +48,7 @@ impl<T: TimeSource> ReceiptTracker<T> {
     /// This should be called every time a packet is sent to ensure that receipts are sent
     /// promptly. Every `MAX_CONFIRMATION_DELAY` (50ms) this should be called and if the returned
     /// list is not empty, the list should be sent as receipts immediately in a noop packet.
-    pub(super) fn get_receipts(&mut self) -> Vec<u16> {
+    pub(super) fn get_receipts(&mut self) -> Vec<u32> {
         self.cleanup();
 
         mem::take(self.pending_receipts.as_mut())
@@ -57,18 +57,19 @@ impl<T: TimeSource> ReceiptTracker<T> {
     fn cleanup(&mut self) {
         let remove_before = self.time_source.now() - RETAIN_TIME;
         while self
-            .packet_id_time
+            .message_id_time
             .front()
             .map_or(false, |&(_, time)| time < remove_before)
         {
-            let expired = self.packet_id_time.pop_front();
-            if let Some((packet_id, _)) = expired {
-                self.time_by_packet.remove(&packet_id);
+            let expired = self.message_id_time.pop_front();
+            if let Some((message_id, _)) = expired {
+                self.time_by_message_id.remove(&message_id);
             }
         }
     }
 }
 
+#[derive(Debug, PartialEq)]
 enum ReportResult {
     /// Packet was received for the first time and recorded
     Ok,
@@ -82,4 +83,23 @@ enum ReportResult {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use crate::util::MockTimeSource;
+
+    #[test]
+    fn test_initialization() {
+        let mut tracker = ReceiptTracker::new();
+        assert_eq!(tracker.get_receipts().len(), 0);
+        assert_eq!(tracker.pending_receipts.len(), 0);
+        assert_eq!(tracker.time_by_message_id.len(), 0);
+    }
+
+    #[test]
+    fn test_report_receipt_ok() {
+        let mut tracker = ReceiptTracker::new();
+        assert_eq!(tracker.report_received_packets(0), ReportResult::Ok);
+        assert_eq!(tracker.pending_receipts.len(), 1);
+        assert_eq!(tracker.time_by_message_id.len(), 1);
+    }
+}

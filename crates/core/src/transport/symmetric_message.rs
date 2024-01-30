@@ -12,15 +12,15 @@ use super::{packet_data::MAX_PACKET_SIZE, PacketData};
 #[derive(Serialize, Deserialize)]
 pub(super) struct SymmetricMessage {
     // todo: make sure we handle wrapping around the u16 properly
-    pub message_id: u16,
+    pub message_id: u32,
     // todo: profile what is better here on average in the future
     // (vec, fixed array size of what given length etc.
     #[serde_as(as = "Option<[_; 50]>")]
-    pub confirm_receipt: Option<[u16; 50]>,
+    pub confirm_receipt: Option<[u32; 50]>,
     pub payload: SymmetricMessagePayload,
 }
 
-const FIRST_MESSAGE_ID: u16 = 0u16;
+const FIRST_MESSAGE_ID: u32 = 0u32;
 
 impl SymmetricMessage {
     pub fn deser(bytes: &[u8]) -> Result<Self, bincode::Error> {
@@ -52,7 +52,7 @@ impl SymmetricMessage {
     }
 
     pub fn short_message(
-        message_id: u16,
+        message_id: u32,
         payload: Vec<u8>,
         inbound_sym_key: &Aes128Gcm,
     ) -> Result<PacketData, bincode::Error> {

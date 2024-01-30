@@ -470,7 +470,7 @@ pub(super) struct RemoteConnection {
     remote_is_gateway: bool,
     remote_addr: SocketAddr,
     inbound_packet_sender: mpsc::Sender<PacketData>,
-    last_message_id: u16,
+    last_message_id: u32,
 }
 
 // Define a custom error type for the transport layer
