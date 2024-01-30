@@ -34,7 +34,6 @@ impl Args {
             None => std::env::current_dir()?,
         };
         let key = pargs.opt_value_from_str(["-k", "--key"])?;
-        println!("path: {:?}", path);
         if !path.exists() {
             fs::create_dir_all(&path)?;
         } else if !path.is_dir() {
