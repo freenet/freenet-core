@@ -5,9 +5,9 @@ use std::vec::Vec;
 use std::{borrow::Cow, time::Duration};
 
 use aes_gcm::{Aes128Gcm, KeyInit};
-use futures::{channel::oneshot, stream::FuturesUnordered, FutureExt, SinkExt, StreamExt};
+use futures::{stream::FuturesUnordered, FutureExt, SinkExt, StreamExt};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task;
 
 use super::peer_connection::SenderStreamError;
@@ -44,6 +44,7 @@ struct OutboundMessage {
 pub(crate) struct ConnectionHandler {
     max_upstream_rate: Arc<arc_swap::ArcSwap<BytesPerSecond>>,
     send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>,
+    new_connection_notifier: mpsc::Receiver<SocketAddr>,
 }
 
 impl ConnectionHandler {
@@ -58,19 +59,23 @@ impl ConnectionHandler {
 
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(1);
+        let (new_connection_sender, new_connection_notifier) = mpsc::channel(100);
 
         let max_upstream_rate = Arc::new(arc_swap::ArcSwap::from_pointee(max_upstream_rate));
         let transport = UdpPacketsListener {
-            remote_connections: HashMap::new(),
-            socket,
-            connection_handler: conn_handler_receiver,
-            this_peer_keypair: keypair,
-            max_upstream_rate: max_upstream_rate.clone(),
             is_gateway,
+            socket,
+            this_peer_keypair: keypair,
+            remote_connections: HashMap::new(),
+            inbound_connections: HashMap::new(),
+            connection_handler: conn_handler_receiver,
+            max_upstream_rate: max_upstream_rate.clone(),
+            new_connection_notifier: new_connection_sender,
         };
         let connection_handler = ConnectionHandler {
-            send_queue: conn_handler_sender,
             max_upstream_rate,
+            send_queue: conn_handler_sender,
+            new_connection_notifier,
         };
 
         task::spawn(transport.listen());
@@ -109,6 +114,10 @@ impl ConnectionHandler {
         }
     }
 
+    pub async fn new_connection(&mut self) -> Option<SocketAddr> {
+        self.new_connection_notifier.recv().await
+    }
+
     fn update_max_upstream_rate(&mut self, max_upstream_rate: BytesPerSecond) {
         self.max_upstream_rate.store(Arc::new(max_upstream_rate));
     }
@@ -122,7 +131,12 @@ struct UdpPacketsListener {
     this_peer_keypair: TransportKeypair,
     max_upstream_rate: Arc<arc_swap::ArcSwap<BytesPerSecond>>,
     is_gateway: bool,
+    /// A new inbound connection that we haven't sent an explicit message yet
+    inbound_connections:
+        HashMap<SocketAddr, (PeerChannel, Aes128Gcm, mpsc::Receiver<SerializedMessage>)>,
+    new_connection_notifier: mpsc::Sender<SocketAddr>,
 }
+
 enum ConnectionState {
     Start {
         remote_public_key: TransportPublicKey,
@@ -136,6 +150,9 @@ enum ConnectionState {
 impl UdpPacketsListener {
     async fn listen(mut self) {
         let mut peer_messages = FuturesUnordered::new();
+        const DEFAULT_BW_TRACKER_WINDOW_SIZE: Duration = Duration::from_secs(10);
+        const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
+        let mut bw_tracker = super::bw::PacketBWTracker::new(DEFAULT_BW_TRACKER_WINDOW_SIZE);
         loop {
             let mut buf = [0u8; MAX_PACKET_SIZE];
             tokio::select! {
@@ -153,7 +170,16 @@ impl UdpPacketsListener {
                                     }
                                 }
                                 None => {
-                                    self.handle_unrecogized_remote(remote_addr, &buf[..size]).await;
+                                    match self.handle_unrecogized_remote(remote_addr, &buf[..size]).await {
+                                        Err(error) => {
+                                            tracing::error!(%error, ?remote_addr, "Failed to establish connection");
+                                        }
+                                        Ok((remote_connection, inbound_recv, inbound_sym_key)) => {
+                                            let (outbound_sender, outbound_receiver) = mpsc::channel(1);
+                                            self.remote_connections.insert(remote_addr, remote_connection);
+                                            self.inbound_connections.insert(remote_addr, ((outbound_sender, inbound_recv), inbound_sym_key, outbound_receiver));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -172,9 +198,15 @@ impl UdpPacketsListener {
                                 }
                             }
                             ConnectionEvent::ConnectionStart { remote_public_key, open_connection  }  => {
+                                if let Some(((outbound_sender, inbound_recv), inbound_sym_key, outbound_receiver)) = self.inbound_connections.remove(&remote_addr) {
+                                    let _ = open_connection.send(Ok(((outbound_sender, inbound_recv), inbound_sym_key)));
+                                    peer_messages.push(peer_message(outbound_receiver, remote_addr));
+                                    continue;
+                                }
                                 match self.traverse_nat(remote_addr, ConnectionState::Start { remote_public_key }).await {
                                     Err(error) => {
                                         tracing::error!(%error, ?remote_addr, "Failed to establish connection");
+                                        let _ = open_connection.send(Err(error));
                                     }
                                     Ok((remote_connection, inbound_recv, inbound_sym_key)) => {
                                         let (outbound_sender, outbound_receiver) = mpsc::channel(1);
@@ -210,10 +242,15 @@ impl UdpPacketsListener {
                         // the connection was dropped by the other side
                         continue;
                     };
+                    let size = msg.len();
+                    if let Some(wait_time) = bw_tracker.can_send_packet(BANDWITH_LIMIT, msg.len()) {
+                        tokio::time::sleep(wait_time).await;
+                    }
                     let Ok(remote_conn) = self.send_outbound_msg(remote_conn, msg).await else {
                         tracing::debug!(%remote_addr, "Remote disconnected");
                         continue;
                     };
+                    bw_tracker.add_packet(size);
                     self.remote_connections.insert(remote_addr, remote_conn);
                     peer_messages.push(peer_message(recv, remote_addr));
                 }

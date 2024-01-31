@@ -45,8 +45,8 @@ impl<T: TimeSource> PacketBWTracker<T> {
         }
     }
 
-    /// Returns Ok(()) if the packet can be sent immediately without `bandwidth_limit` being
-    /// exceeded within the `window_size`. Otherwise returns Err(wait_time) where wait_time is the
+    /// Returns none if the packet can be sent immediately without `bandwidth_limit` being
+    /// exceeded within the `window_size`. Otherwise returns Some(wait_time) where wait_time is the
     /// amount of time that should be waited before sending the packet.
     ///
     /// `bandwidth_limit` should be set to 50% higher than the target upstream bandwidth the
@@ -56,11 +56,11 @@ impl<T: TimeSource> PacketBWTracker<T> {
         &mut self,
         bandwidth_limit: usize,
         packet_size: usize,
-    ) -> Result<(), Duration> {
+    ) -> Option<Duration> {
         self.cleanup();
 
         if self.current_bandwidth + packet_size <= bandwidth_limit {
-            return Ok(());
+            return None;
         }
 
         let mut temp_bandwidth = self.current_bandwidth;
@@ -74,10 +74,7 @@ impl<T: TimeSource> PacketBWTracker<T> {
             }
         }
 
-        match wait_time {
-            Some(wait_time) => Err(wait_time),
-            None => Err(self.window_size),
-        }
+        wait_time
     }
 }
 
@@ -85,7 +82,7 @@ pub(super) trait TimeSource {
     fn now(&self) -> Instant;
 }
 
-struct SystemTime;
+pub(super) struct SystemTime;
 
 impl TimeSource for SystemTime {
     fn now(&self) -> Instant {
@@ -180,8 +177,8 @@ mod tests {
         tracker.add_packet(4000);
         verify_bandwidth_match(&tracker);
         match tracker.can_send_packet(10000, 2000) {
-            Ok(_) => panic!("Should require waiting"),
-            Err(wait_time) => assert_eq!(wait_time, Duration::from_millis(500)),
+            None => panic!("Should require waiting"),
+            Some(wait_time) => assert_eq!(wait_time, Duration::from_millis(500)),
         }
     }
 
@@ -189,6 +186,6 @@ mod tests {
     fn test_immediate_send() {
         let mut tracker = PacketBWTracker::new(Duration::from_secs(10));
         tracker.add_packet(3000);
-        assert_eq!(tracker.can_send_packet(10000, 2000), Ok(()));
+        assert_eq!(tracker.can_send_packet(10000, 2000), None);
     }
 }
