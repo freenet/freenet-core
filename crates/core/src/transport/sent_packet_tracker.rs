@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_packet_lost() {
-        let (mut tracker, time_source) = mock_tracker();
+        let (mut tracker, mut time_source) = mock_tracker();
         tracker.report_sent_packet(1, vec![1, 2, 3]);
         time_source.advance_time(MESSAGE_CONFIRMATION_TIMEOUT);
         let resend_action = tracker.get_resend();

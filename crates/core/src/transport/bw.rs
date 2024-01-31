@@ -79,18 +79,6 @@ impl<T: TimeSource> PacketBWTracker<T> {
     }
 }
 
-pub(super) trait TimeSource {
-    fn now(&self) -> Instant;
-}
-
-pub(super) struct SystemTime;
-
-impl TimeSource for SystemTime {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

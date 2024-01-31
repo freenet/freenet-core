@@ -244,44 +244,40 @@ impl<'x> Contains<PeerId> for &'x Vec<&PeerId> {
 }
 
 pub trait TimeSource {
-    fn now(&self) -> Instant;
+    fn now(&mut self) -> Instant;
 }
 
 pub struct SystemTime;
 
 impl TimeSource for SystemTime {
-    fn now(&self) -> Instant {
+    fn now(&mut self) -> Instant {
         Instant::now()
     }
 }
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 #[cfg(test)]
 #[derive(Clone)]
 pub struct MockTimeSource {
-    current_instant: Rc<RefCell<Instant>>,
+    current_instant: Instant,
 }
 
 #[cfg(test)]
 impl MockTimeSource {
     pub fn new(start_instant: Instant) -> Self {
         MockTimeSource {
-            current_instant: Rc::new(RefCell::new(start_instant)),
+            current_instant: start_instant,
         }
     }
 
-    pub fn advance_time(&self, duration: Duration) {
-        let mut instant = self.current_instant.borrow_mut();
-        *instant += duration;
+    pub fn advance_time(&mut self, duration: Duration) {
+        self.current_instant += duration;
     }
 }
 
 #[cfg(test)]
 impl TimeSource for MockTimeSource {
-    fn now(&self) -> Instant {
-        self.current_instant.borrow().clone()
+    fn now(&mut self) -> Instant {
+        self.current_instant.clone()
     }
 }
 

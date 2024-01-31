@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_cleanup() {
-        let time_source = MockTimeSource::new(Instant::now());
+        let mut time_source = MockTimeSource::new(Instant::now());
 
         let mut tracker = ReceivedPacketTracker {
             pending_receipts: Vec::new(),
