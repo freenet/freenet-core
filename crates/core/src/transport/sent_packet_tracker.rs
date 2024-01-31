@@ -18,7 +18,7 @@ const PACKET_LOSS_DECAY_FACTOR: f64 = 1.0 / 1000.0;
 /// this:
 ///
 /// ```
-/// let sent_packet_tracker = todo!();
+/// let mut sent_packet_tracker = todo!();
 /// loop {
 ///   match sent_packet_tracker.get_resend() {
 ///      WaitUntil(wait_until) => {

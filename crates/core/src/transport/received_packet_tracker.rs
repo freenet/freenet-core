@@ -7,6 +7,29 @@ use std::time::{Duration, Instant};
 const RETAIN_TIME: Duration = Duration::from_secs(60);
 const MAX_PENDING_RECEIPTS: usize = 20;
 
+/// This struct is responsible for tracking received packets and deciding when to send receipts
+/// from/to a specific peer.
+///
+/// The caller must report when packets are received using the `report_received_packets` method.
+/// The caller must also call `get_receipts` periodically to check if any receipts need to be sent.
+///
+/// `get_receipts` should be called whenever a packet is sent.
+///
+/// `get_receipts` must **also** be called every `MAX_CONFIRMATION_DELAY` (50ms) and
+/// if the returned list is not empty, the list should be sent as receipts immediately in a noop.
+/// This may look something like this:
+///
+/// ```rust
+/// use std::thread::sleep;
+/// let mut received_packet_tracker = todo!();
+/// loop {
+///    let receipts = received_packet_tracker.get_receipts();
+///     if !receipts.is_empty() {
+///        // Send receipts in a noop message
+///     }
+///     sleep(MAX_CONFIRMATION_DELAY);
+///  }
+/// ```
 pub(super) struct ReceivedPacketTracker<T: TimeSource> {
     pending_receipts: Vec<MessageId>,
     message_id_time: VecDeque<(MessageId, Instant)>,
