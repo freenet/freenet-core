@@ -21,10 +21,10 @@ const PACKET_LOSS_DECAY_FACTOR: f64 = 1.0 / 1000.0;
 /// let mut sent_packet_tracker = todo!();
 /// loop {
 ///   match sent_packet_tracker.get_resend() {
-///      WaitUntil(wait_until) => {
+///      ResendAction::WaitUntil(wait_until) => {
 ///        sleep_until(wait_until);
 ///      }
-///      Resend(message_id, packet) => {
+///      ResendAction::Resend(message_id, packet) => {
 ///       // Send packet and then call report_sent_packet again with the same message_id.
 ///      }
 ///   }
@@ -115,7 +115,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
 }
 
 #[derive(Debug, PartialEq)]
-pub(super) enum ResendAction {
+pub enum ResendAction {
     WaitUntil(Instant),
     Resend(u32, MessagePayload),
 }
