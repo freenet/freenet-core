@@ -163,13 +163,11 @@ mod tests {
 
     #[test]
     fn test_cleanup() {
-        let mut time_source = MockTimeSource::new(Instant::now());
-
         let mut tracker = ReceivedPacketTracker {
             pending_receipts: Vec::new(),
             message_id_time: VecDeque::new(),
             time_by_message_id: HashMap::new(),
-            time_source: time_source.clone(),
+            time_source: MockTimeSource::new(Instant::now()),
         };
 
         for i in 0..10 {
@@ -178,7 +176,9 @@ mod tests {
         assert_eq!(tracker.time_by_message_id.len(), 10);
         assert_eq!(tracker.message_id_time.len(), 10);
 
-        time_source.advance_time(RETAIN_TIME + Duration::from_secs(1));
+        tracker
+            .time_source
+            .advance_time(RETAIN_TIME + Duration::from_secs(1));
 
         tracker.cleanup();
         assert_eq!(tracker.time_by_message_id.len(), 0);

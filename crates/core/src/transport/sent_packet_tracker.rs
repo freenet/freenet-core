@@ -131,20 +131,20 @@ mod tests {
     use super::*;
     use crate::util::MockTimeSource;
 
-    fn mock_tracker() -> (SentPacketTracker<MockTimeSource>, MockTimeSource) {
+    fn mock_tracker() -> SentPacketTracker<MockTimeSource> {
         let time_source = MockTimeSource::new(Instant::now());
         let tracker = SentPacketTracker {
             pending_receipts: HashMap::new(),
             resend_queue: VecDeque::new(),
             packet_loss_proportion: 0.0,
-            time_source: time_source.clone(),
+            time_source,
         };
-        (tracker, time_source)
+        tracker
     }
 
     #[test]
     fn test_report_sent_packet() {
-        let (mut tracker, _) = mock_tracker();
+        let mut tracker = mock_tracker();
         tracker.report_sent_packet(1, vec![1, 2, 3]);
         assert_eq!(tracker.pending_receipts.len(), 1);
         assert_eq!(tracker.resend_queue.len(), 1);
@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn test_report_received_receipts() {
-        let (mut tracker, _) = mock_tracker();
+        let mut tracker = mock_tracker();
         tracker.report_sent_packet(1, vec![1, 2, 3]);
         tracker.report_received_receipts(&[1]);
         assert_eq!(tracker.pending_receipts.len(), 0);
@@ -163,9 +163,11 @@ mod tests {
 
     #[test]
     fn test_packet_lost() {
-        let (mut tracker, mut time_source) = mock_tracker();
+        let mut tracker = mock_tracker();
         tracker.report_sent_packet(1, vec![1, 2, 3]);
-        time_source.advance_time(MESSAGE_CONFIRMATION_TIMEOUT);
+        tracker
+            .time_source
+            .advance_time(MESSAGE_CONFIRMATION_TIMEOUT);
         let resend_action = tracker.get_resend();
         assert_eq!(resend_action, ResendAction::Resend(1, vec![1, 2, 3]));
         assert_eq!(tracker.pending_receipts.len(), 0);

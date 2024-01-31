@@ -84,15 +84,14 @@ mod tests {
     use super::*;
     use crate::util::MockTimeSource;
 
-    fn mock_tracker(window_size: Duration) -> (PacketBWTracker<MockTimeSource>, MockTimeSource) {
-        let time_source = MockTimeSource::new(Instant::now());
+    fn mock_tracker(window_size: Duration) -> PacketBWTracker<MockTimeSource> {
         let tracker = PacketBWTracker {
             packets: VecDeque::new(),
             window_size,
             current_bandwidth: 0,
-            time_source: time_source.clone(),
+            time_source: MockTimeSource::new(Instant::now()),
         };
-        (tracker, time_source)
+        tracker
     }
 
     fn verify_bandwidth_match<T: TimeSource>(tracker: &PacketBWTracker<T>) {
@@ -126,10 +125,10 @@ mod tests {
 
     #[test]
     fn test_packet_expiry() {
-        let (mut tracker, mut ts) = mock_tracker(Duration::from_millis(200));
+        let mut tracker = mock_tracker(Duration::from_millis(200));
         tracker.add_packet(1500);
         verify_bandwidth_match(&tracker);
-        ts.advance_time(Duration::from_millis(300));
+        tracker.time_source.advance_time(Duration::from_millis(300));
         tracker.cleanup();
         verify_bandwidth_match(&tracker);
         assert!(tracker.packets.is_empty());
@@ -137,10 +136,10 @@ mod tests {
 
     #[test]
     fn test_wait_time_calculation() {
-        let (mut tracker, mut ts) = mock_tracker(Duration::from_secs(1));
+        let mut tracker = mock_tracker(Duration::from_secs(1));
         tracker.add_packet(5000);
         verify_bandwidth_match(&tracker);
-        ts.advance_time(Duration::from_millis(500));
+        tracker.time_source.advance_time(Duration::from_millis(500));
         tracker.add_packet(4000);
         verify_bandwidth_match(&tracker);
         match tracker.can_send_packet(10000, 2000) {
