@@ -6,7 +6,7 @@ use serde_with::serde_as;
 
 use crate::transport::packet_data::MAX_DATA_SIZE;
 
-use super::{packet_data::MAX_PACKET_SIZE, PacketData};
+use super::{packet_data::MAX_PACKET_SIZE, MessagePayload, PacketData};
 
 #[serde_as]
 #[derive(Serialize, Deserialize)]
@@ -53,7 +53,7 @@ impl SymmetricMessage {
 
     pub fn short_message(
         message_id: u32,
-        payload: Vec<u8>,
+        payload: MessagePayload,
         inbound_sym_key: &Aes128Gcm,
     ) -> Result<PacketData, bincode::Error> {
         let message = Self {
@@ -93,12 +93,12 @@ pub(super) enum SymmetricMessagePayload {
         result: Result<(), Cow<'static, str>>,
     },
     ShortMessage {
-        payload: Vec<u8>,
+        payload: MessagePayload,
     },
     LongMessageFragment {
         total_length: u64,
         index: u64,
-        payload: Vec<u8>,
+        payload: MessagePayload,
     },
 }
 
