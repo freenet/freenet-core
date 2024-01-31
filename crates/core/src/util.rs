@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashSet},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rand::{
@@ -240,6 +240,48 @@ impl<'x> Contains<PeerId> for &'x [&PeerId] {
 impl<'x> Contains<PeerId> for &'x Vec<&PeerId> {
     fn has_element(&self, target: &PeerId) -> bool {
         self.contains(&target)
+    }
+}
+
+pub trait TimeSource {
+    fn now(&self) -> Instant;
+}
+
+pub struct SystemTime;
+
+impl TimeSource for SystemTime {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+#[cfg(test)]
+#[derive(Clone)]
+pub struct MockTimeSource {
+    current_instant: Rc<RefCell<Instant>>,
+}
+
+#[cfg(test)]
+impl MockTimeSource {
+    pub fn new(start_instant: Instant) -> Self {
+        MockTimeSource {
+            current_instant: Rc::new(RefCell::new(start_instant)),
+        }
+    }
+
+    pub fn advance_time(&self, duration: Duration) {
+        let mut instant = self.current_instant.borrow_mut();
+        *instant += duration;
+    }
+}
+
+#[cfg(test)]
+impl TimeSource for MockTimeSource {
+    fn now(&self) -> Instant {
+        self.current_instant.borrow().clone()
     }
 }
 

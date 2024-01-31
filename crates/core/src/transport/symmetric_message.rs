@@ -6,21 +6,21 @@ use serde_with::serde_as;
 
 use crate::transport::packet_data::MAX_DATA_SIZE;
 
-use super::{packet_data::MAX_PACKET_SIZE, PacketData};
+use super::{packet_data::MAX_PACKET_SIZE, MessagePayload, PacketData};
 
 #[serde_as]
 #[derive(Serialize, Deserialize)]
 pub(super) struct SymmetricMessage {
     // todo: make sure we handle wrapping around the u16 properly
-    pub message_id: u16,
+    pub message_id: u32,
     // todo: profile what is better here on average in the future
     // (vec, fixed array size of what given length etc.
     #[serde_as(as = "Option<[_; 50]>")]
-    pub confirm_receipt: Option<[u16; 50]>,
+    pub confirm_receipt: Option<[u32; 50]>,
     pub payload: SymmetricMessagePayload,
 }
 
-const FIRST_MESSAGE_ID: u16 = 0u16;
+const FIRST_MESSAGE_ID: u32 = 0u32;
 
 impl SymmetricMessage {
     pub fn deser(bytes: &[u8]) -> Result<Self, bincode::Error> {
@@ -52,8 +52,8 @@ impl SymmetricMessage {
     }
 
     pub fn short_message(
-        message_id: u16,
-        payload: Vec<u8>,
+        message_id: u32,
+        payload: MessagePayload,
         inbound_sym_key: &Aes128Gcm,
     ) -> Result<PacketData, bincode::Error> {
         let message = Self {
@@ -93,12 +93,12 @@ pub(super) enum SymmetricMessagePayload {
         result: Result<(), Cow<'static, str>>,
     },
     ShortMessage {
-        payload: Vec<u8>,
+        payload: MessagePayload,
     },
     LongMessageFragment {
         total_length: u64,
         index: u64,
-        payload: Vec<u8>,
+        payload: MessagePayload,
     },
 }
 
@@ -108,7 +108,7 @@ fn ack_error_msg() -> Result<(), Box<dyn std::error::Error>> {
     let key = Aes128Gcm::new(&[0; 16].into());
     let packet = SymmetricMessage::ack_error(&key)?;
 
-    let _packet = PacketData::<1501>::encrypted_with_cipher(packet.data(), &key);
+    let _packet = PacketData::<1500>::encrypted_with_cipher(packet.data(), &key);
 
     let data = packet.decrypt(&key).unwrap();
     let deser = SymmetricMessage::deser(data.data())?;

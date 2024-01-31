@@ -1,3 +1,4 @@
+use crate::util::{SystemTime, TimeSource};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -93,29 +94,7 @@ impl TimeSource for SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[derive(Clone)]
-    struct MockTimeSource {
-        current_instant: Instant,
-    }
-
-    impl MockTimeSource {
-        fn new(start_instant: Instant) -> Self {
-            MockTimeSource {
-                current_instant: start_instant,
-            }
-        }
-
-        fn advance_time(&mut self, duration: Duration) {
-            self.current_instant += duration;
-        }
-    }
-
-    impl TimeSource for MockTimeSource {
-        fn now(&self) -> Instant {
-            self.current_instant
-        }
-    }
+    use crate::util::MockTimeSource;
 
     fn mock_tracker(window_size: Duration) -> (PacketBWTracker<MockTimeSource>, MockTimeSource) {
         let time_source = MockTimeSource::new(Instant::now());
@@ -184,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_immediate_send() {
-        let mut tracker = PacketBWTracker::new(Duration::from_secs(10));
+        let mut tracker = PacketBWTracker::new(Duration::from_millis(10));
         tracker.add_packet(3000);
         assert_eq!(tracker.can_send_packet(10000, 2000), None);
     }

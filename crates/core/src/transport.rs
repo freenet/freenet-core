@@ -40,7 +40,12 @@ mod connection_handler;
 mod crypto;
 mod packet_data;
 mod peer_connection;
+mod received_packet_tracker;
+mod sent_packet_tracker;
 mod symmetric_message;
+
+type MessagePayload = Vec<u8>;
+type MessageId = u32;
 
 use self::packet_data::PacketData;
 
