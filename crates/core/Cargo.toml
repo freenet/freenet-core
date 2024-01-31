@@ -59,7 +59,7 @@ tokio = { features = ["fs", "macros", "rt-multi-thread", "sync", "process"], ver
 tokio-tungstenite = "0.21"
 tower-http = { features = ["fs", "trace"], version = "0.5" }
 ulid = { features = ["serde"], version = "1.1" }
-unsigned-varint = "0.7"
+unsigned-varint = "0.8"
 wasmer = { features = ["sys"], workspace = true }
 xz2 = { version = "0.1" }
 reqwest = { version = "0.11.23", features = ["json"] }
