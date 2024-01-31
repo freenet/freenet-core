@@ -22,7 +22,7 @@ const PACKET_LOSS_DECAY_FACTOR: f64 = 1.0 / 1000.0;
 /// loop {
 ///   match sent_packet_tracker.get_resend() {
 ///      ResendAction::WaitUntil(wait_until) => {
-///        sleep_until(wait_until);
+///        sleep_until(wait_until).await;
 ///      }
 ///      ResendAction::Resend(message_id, packet) => {
 ///       // Send packet and then call report_sent_packet again with the same message_id.
