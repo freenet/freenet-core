@@ -11,7 +11,7 @@ const PACKET_LOSS_DECAY_FACTOR: f64 = 1.0 / 1000.0;
 /// It is also responsible for deciding when to resend packets that have not been acknowledged.
 ///
 /// The caller must report when packets are sent and when receipts are received using the
-/// `report_sent_packet` and `report_received_receipts` methods. The caller must also call
+/// `report_sent_packet` and `report_received_receipts` functions. The caller must also call
 /// `get_resend` periodically to check if any packets need to be resent.
 ///
 /// The expectation is that get_resend will be called as part of a loop that looks something like
