@@ -1,10 +1,28 @@
-use crate::transport::{MessageId, MessagePayload};
+use super::{MessageId, MessagePayload, MAX_CONFIRMATION_DELAY};
 use crate::util::{SystemTime, TimeSource};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
-const MESSAGE_CONFIRMATION_TIMEOUT: Duration = Duration::from_millis(100);
+const NETWORK_DELAY_ALLOWANCE: Duration = Duration::from_millis(500);
+
+/// If we don't get a receipt for a message within 500ms, we assume the message was lost and
+/// resend it. This must be significantly higher than MAX_CONFIRMATION_DELAY (100ms) to
+/// account for network delay
+const MESSAGE_CONFIRMATION_TIMEOUT: Duration = {
+    let millis: u128 = MAX_CONFIRMATION_DELAY.as_millis() + NETWORK_DELAY_ALLOWANCE.as_millis();
+
+    // Check for overflow
+    if millis > u64::MAX as u128 {
+        panic!("Value too large for u64");
+    }
+
+    // Safe to convert now
+    Duration::from_millis(millis as u64)
+};
+
+/// Determines the accuracy/sensitivity of the packet loss estimate. A lower value will result
+/// in a more accurate estimate, but it will take longer to converge to the true value.
 const PACKET_LOSS_DECAY_FACTOR: f64 = 1.0 / 1000.0;
 
 /// This struct is responsible for tracking packets that have been sent but not yet acknowledged.

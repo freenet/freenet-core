@@ -48,6 +48,11 @@ type MessagePayload = Vec<u8>;
 type MessageId = u32;
 
 use self::packet_data::PacketData;
+use std::time::Duration;
+
+/// We can wait up to 100ms to confirm a message was received, this allows us to batch
+/// receipts together and send them in a single message.
+const MAX_CONFIRMATION_DELAY: Duration = Duration::from_millis(100);
 
 struct BytesPerSecond(f64);
 

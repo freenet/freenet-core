@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::mem;
 use std::time::{Duration, Instant};
 
+/// How long to reain packets in case they need to be retransmitted
 const RETAIN_TIME: Duration = Duration::from_secs(60);
 const MAX_PENDING_RECEIPTS: usize = 20;
 
@@ -15,11 +16,12 @@ const MAX_PENDING_RECEIPTS: usize = 20;
 ///
 /// `get_receipts` should be called whenever a packet is sent.
 ///
-/// `get_receipts` must **also** be called every `MAX_CONFIRMATION_DELAY` (50ms) and
+/// `get_receipts` must **also** be called every `MAX_CONFIRMATION_DELAY` (100ms) and
 /// if the returned list is not empty, the list should be sent as receipts immediately in a noop.
 /// This may look something like this:
 ///
 /// ```
+/// use super::MAX_CONFIRMATION_DELAY;
 /// use std::thread::sleep;
 /// let mut received_packet_tracker = todo!();
 /// loop {
