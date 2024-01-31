@@ -91,22 +91,20 @@ impl<T: TimeSource> SentPacketTracker<T> {
                     let wait_until = entry.timeout_at;
                     self.resend_queue.push_front(entry);
                     ResendAction::WaitUntil(wait_until)
-                } else {
-                    if let Some(packet) = self.pending_receipts.remove(&entry.message_id) {
-                        // Update packet loss proportion for a lost packet, this can be
-                        // simplified but I'm leaving it like this for readability.
-                        self.packet_loss_proportion = self.packet_loss_proportion
-                            * (1.0 - PACKET_LOSS_DECAY_FACTOR)
-                            + PACKET_LOSS_DECAY_FACTOR;
+                } else if let Some(packet) = self.pending_receipts.remove(&entry.message_id) {
+                    // Update packet loss proportion for a lost packet, this can be
+                    // simplified but I'm leaving it like this for readability.
+                    self.packet_loss_proportion = self.packet_loss_proportion
+                        * (1.0 - PACKET_LOSS_DECAY_FACTOR)
+                        + PACKET_LOSS_DECAY_FACTOR;
 
-                        ResendAction::Resend(entry.message_id, packet)
-                    } else {
-                        warn!(
-                            "Message ID {} not found in pending receipts",
-                            entry.message_id
-                        );
-                        ResendAction::WaitUntil(now + MESSAGE_CONFIRMATION_TIMEOUT)
-                    }
+                    ResendAction::Resend(entry.message_id, packet)
+                } else {
+                    warn!(
+                        "Message ID {} not found in pending receipts",
+                        entry.message_id
+                    );
+                    ResendAction::WaitUntil(now + MESSAGE_CONFIRMATION_TIMEOUT)
                 }
             }
             None => ResendAction::WaitUntil(now + MESSAGE_CONFIRMATION_TIMEOUT),

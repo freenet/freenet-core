@@ -51,20 +51,20 @@ impl ReceivedPacketTracker<SystemTime> {
 impl<T: TimeSource> ReceivedPacketTracker<T> {
     pub(super) fn report_received_packets(&mut self, message_id: MessageId) -> ReportResult {
         self.cleanup();
-        if self.time_by_message_id.contains_key(&message_id) {
-            ReportResult::AlreadyReceived
-        } else {
-            self.time_by_message_id
-                .insert(message_id, self.time_source.now());
-            self.message_id_time
-                .push_back((message_id, self.time_source.now()));
+        let current_time = self.time_source.now();
 
-            self.pending_receipts.push(message_id);
+        match self.time_by_message_id.entry(message_id) {
+            std::collections::hash_map::Entry::Occupied(_) => ReportResult::AlreadyReceived,
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(current_time);
+                self.message_id_time.push_back((message_id, current_time));
+                self.pending_receipts.push(message_id);
 
-            if self.pending_receipts.len() < MAX_PENDING_RECEIPTS {
-                ReportResult::Ok
-            } else {
-                ReportResult::QueueFull
+                if self.pending_receipts.len() < MAX_PENDING_RECEIPTS {
+                    ReportResult::Ok
+                } else {
+                    ReportResult::QueueFull
+                }
             }
         }
     }
