@@ -241,6 +241,7 @@ impl Operation for UpdateOp {
                         );
                     } else {
                         tracing::debug!("contract not found in this peer. Should throw an error");
+                        return Err(OpError::RingError(RingError::NoCachingPeers(key.clone())));
                     }
 
                     match try_to_broadcast(
@@ -422,74 +423,76 @@ impl Operation for UpdateOp {
                     sender,
                     skip_list,
                 } => {
-                    let peer_loc = op_manager.ring.own_location();
+                    // let peer_loc = op_manager.ring.own_location();
 
-                    tracing::debug!(
-                        %key,
-                        this_peer = % peer_loc.peer,
-                        "Forwarding changes, trying to update the contract - update"
-                    );
+                    // tracing::debug!(
+                    //     %key,
+                    //     this_peer = % peer_loc.peer,
+                    //     "Forwarding changes, trying to update the contract - update"
+                    // );
 
-                    let is_subscribed_contract = op_manager.ring.is_subscribed_to_contract(&key);
+                    // let is_subscribed_contract = op_manager.ring.is_subscribed_to_contract(&key);
 
-                    if is_subscribed_contract {
-                        // after the contract has been cached, push the update query
-                        update_contract(
-                            op_manager,
-                            key.clone(),
-                            new_value.clone(),
-                            RelatedContracts::default(),
-                        )
-                        .await?;
-                    } else {
-                        tracing::debug!(%key, "is not suscribed to contract at {:?}", peer_loc.location);
-                    }
+                    // if is_subscribed_contract {
+                    //     // after the contract has been cached, push the update query
+                    //     update_contract(
+                    //         op_manager,
+                    //         key.clone(),
+                    //         new_value.clone(),
+                    //         RelatedContracts::default(),
+                    //     )
+                    //     .await?;
+                    // } else {
+                    //     tracing::debug!(%key, "is not suscribed to contract at {:?}", peer_loc.location);
+                    // }
 
-                    let broadcast_to = op_manager.get_broadcast_targets_update(&key, &sender.peer);
+                    // let broadcast_to = op_manager.get_broadcast_targets_update(&key, &sender.peer);
 
-                    // if successful, forward to the next closest peers (if any)
-                    let last_hop = if let Some(new_htl) = htl.checked_sub(1) {
-                        let mut new_skip_list = skip_list.clone();
-                        new_skip_list.push(sender.peer);
+                    // // if successful, forward to the next closest peers (if any)
+                    // let last_hop = if let Some(new_htl) = htl.checked_sub(1) {
+                    //     let mut new_skip_list = skip_list.clone();
+                    //     new_skip_list.push(sender.peer);
 
-                        // only hop forward if there are closer peers
-                        let put_here = forward_update(
-                            op_manager,
-                            conn_manager,
-                            key.clone(),
-                            new_value.clone(),
-                            *id,
-                            new_htl,
-                            new_skip_list,
-                        )
-                        .await;
+                    //     // only hop forward if there are closer peers
+                    //     let put_here = forward_update(
+                    //         op_manager,
+                    //         conn_manager,
+                    //         key.clone(),
+                    //         new_value.clone(),
+                    //         *id,
+                    //         new_htl,
+                    //         new_skip_list,
+                    //     )
+                    //     .await;
 
-                        put_here
-                    } else {
-                        if !is_subscribed_contract {
-                            tracing::error!("didnt find the contract to update and no hops left. This should throw an error");
-                        }
-                        true
-                    };
+                    //     put_here
+                    // } else {
+                    //     if !is_subscribed_contract {
+                    //         tracing::error!("didnt find the contract to update and no hops left. This should throw an error");
+                    //     }
+                    //     true
+                    // };
 
-                    match try_to_broadcast(
-                        *id,
-                        last_hop,
-                        op_manager,
-                        self.state,
-                        (broadcast_to, *sender),
-                        key.clone(),
-                        new_value.clone(),
-                        false,
-                    )
-                    .await
-                    {
-                        Ok((state, msg)) => {
-                            new_state = state;
-                            return_msg = msg;
-                        }
-                        Err(err) => return Err(err),
-                    }
+                    // match try_to_broadcast(
+                    //     *id,
+                    //     last_hop,
+                    //     op_manager,
+                    //     self.state,
+                    //     (broadcast_to, *sender),
+                    //     key.clone(),
+                    //     new_value.clone(),
+                    //     false,
+                    // )
+                    // .await
+                    // {
+                    //     Ok((state, msg)) => {
+                    //         new_state = state;
+                    //         return_msg = msg;
+                    //     }
+                    //     Err(err) => return Err(err),
+                    // }
+                    new_state = None;
+                    return_msg = None;
                 }
                 _ => return Err(OpError::UnexpectedOpState),
             }
@@ -615,23 +618,12 @@ fn build_op_result(
 ) -> Result<super::OperationResult, OpError> {
     let mut state_is_none = false;
     if state.as_ref().is_none() {
-        tracing::debug!("state is none - build_op_result 1");
         state_is_none = true;
     }
 
     let output_op = Some(UpdateOp { id, state, stats });
 
     let op_enum_update = output_op.map(OpEnum::Update);
-
-    if state_is_none {
-        if let Some(OpEnum::Update(op)) = &op_enum_update {
-            // tracing::debug!(state = ?op.state, "state is Some error - build_op_result 2");
-        };
-
-        if let None = &op_enum_update {
-            tracing::debug!("op_enum_update is None ok - build_op_result 3");
-        }
-    }
 
     Ok(OperationResult {
         return_msg: return_msg.map(NetMessage::from),
@@ -641,7 +633,7 @@ fn build_op_result(
             } else {
                 op_enum_update
             }
-        }, // state: output_op.map(OpEnum::Update),
+        },
     })
 }
 
@@ -765,12 +757,23 @@ pub(crate) async fn request_update(
     // the initial request must provide:
     // - a peer as close as possible to the contract location
     // - and the value to update
-    let target = op_manager
-        .ring
-        .closest_potentially_caching(&key, [&sender.peer].as_slice())
-        .into_iter()
-        .next()
-        .ok_or(RingError::EmptyRing)?;
+    let target = if let Some(location) = op_manager.ring.subscribed_to_contract(key) {
+        location
+    } else {
+        let closest = op_manager
+            .ring
+            .closest_potentially_caching(key, [sender.peer].as_slice())
+            .into_iter()
+            .next()
+            .ok_or_else(|| RingError::EmptyRing)?;
+
+        op_manager
+            .ring
+            .add_subscriber(key, sender)
+            .map_err(|_| RingError::NoCachingPeers(key.clone()))?;
+
+        closest
+    };
 
     let id = update_op.id;
     if let Some(stats) = &mut update_op.stats {
