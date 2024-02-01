@@ -256,9 +256,12 @@ pub trait TimeSource {
     fn now(&self) -> Instant;
 }
 
-pub struct SystemTimeSrc;
+/// A time source that caches the current time in a global state. This is useful for
+/// avoiding the overhead of calling `Instant::now()` in tight loops (such as when
+/// sending or receiving UDP packets).
+pub struct CachingSystemTimeSrc;
 
-impl Default for SystemTimeSrc {
+impl Default for CachingSystemTimeSrc {
     fn default() -> Self {
         let mut time_state = GLOBAL_TIME_STATE.lock().unwrap();
         if !time_state.1 {
@@ -266,14 +269,14 @@ impl Default for SystemTimeSrc {
             drop(time_state); // Drop the lock here before spawning the async task
             let updater_state = Arc::clone(&GLOBAL_TIME_STATE);
             spawn(async move {
-                SystemTimeSrc::update_instant(updater_state).await;
+                CachingSystemTimeSrc::update_instant(updater_state).await;
             });
         }
-        SystemTimeSrc
+        CachingSystemTimeSrc
     }
 }
 
-impl SystemTimeSrc {
+impl CachingSystemTimeSrc {
     async fn update_instant(global_time_state: Arc<Mutex<(Instant, bool)>>) {
         loop {
             {
@@ -285,7 +288,7 @@ impl SystemTimeSrc {
     }
 }
 
-impl TimeSource for SystemTimeSrc {
+impl TimeSource for CachingSystemTimeSrc {
     fn now(&self) -> Instant {
         let state = GLOBAL_TIME_STATE.lock().unwrap();
         state.0
@@ -329,7 +332,7 @@ pub mod tests {
     fn test_now_returns_instant() {
         let rt = Runtime::new().unwrap();
         rt.block_on(async {
-            let time_source = SystemTimeSrc;
+            let time_source = CachingSystemTimeSrc;
             let now = time_source.now();
             assert!(now.elapsed() >= Duration::from_secs(0));
         });
@@ -339,7 +342,7 @@ pub mod tests {
     fn test_instant_is_updated() {
         let rt = Runtime::new().unwrap();
         rt.block_on(async {
-            let time_source = SystemTimeSrc;
+            let time_source = CachingSystemTimeSrc;
             let first_instant = time_source.now();
             sleep(Duration::from_millis(120)).await;
             let second_instant = time_source.now();

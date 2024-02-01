@@ -1,5 +1,5 @@
 use super::{MessageId, MessagePayload, MAX_CONFIRMATION_DELAY};
-use crate::util::{SystemTimeSrc, TimeSource};
+use crate::util::{CachingSystemTimeSrc, TimeSource};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::warn;
@@ -59,13 +59,13 @@ pub(super) struct SentPacketTracker<T: TimeSource> {
     time_source: T,
 }
 
-impl SentPacketTracker<SystemTimeSrc> {
+impl SentPacketTracker<CachingSystemTimeSrc> {
     pub(super) fn new() -> Self {
         SentPacketTracker {
             pending_receipts: HashMap::new(),
             resend_queue: VecDeque::new(),
             packet_loss_proportion: 0.0,
-            time_source: SystemTimeSrc,
+            time_source: CachingSystemTimeSrc,
         }
     }
 }

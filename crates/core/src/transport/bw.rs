@@ -1,4 +1,4 @@
-use crate::util::{SystemTimeSrc, TimeSource};
+use crate::util::{CachingSystemTimeSrc, TimeSource};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -11,13 +11,13 @@ pub(super) struct PacketBWTracker<T: TimeSource> {
     time_source: T,
 }
 
-impl PacketBWTracker<SystemTimeSrc> {
+impl PacketBWTracker<CachingSystemTimeSrc> {
     pub(super) fn new(window_size: Duration) -> Self {
         PacketBWTracker {
             packets: VecDeque::new(),
             window_size,
             current_bandwidth: 0,
-            time_source: SystemTimeSrc,
+            time_source: CachingSystemTimeSrc,
         }
     }
 }
