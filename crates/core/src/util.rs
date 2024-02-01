@@ -276,7 +276,7 @@ impl CachingSystemTimeSrc {
             )
             .is_ok()
         {
-            let mut drop_guard = Arc::new(AtomicBool::new(false));
+            let drop_guard = Arc::new(AtomicBool::new(false));
             tokio::spawn(Self::update_instant(drop_guard.clone()));
             // we hold onto current_unix_epoch_ts until update_instant is running to not leave a dangling pointer
             while !drop_guard.load(std::sync::atomic::Ordering::Acquire) {
@@ -355,14 +355,14 @@ pub mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_now_returns_instant() {
         let time_source = CachingSystemTimeSrc::new();
         let now = time_source.now();
         assert!(now.elapsed() >= Duration::from_secs(0));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_instant_is_updated() {
         let time_source = CachingSystemTimeSrc::new();
         let first_instant = time_source.now();
@@ -383,7 +383,6 @@ pub mod tests {
                     let now = time_source.now();
                     assert!(now > prev);
                     prev = now;
-                    println!("now: {:?}", now);
                     std::thread::sleep(Duration::from_millis(25));
                 }
             }));
