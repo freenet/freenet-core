@@ -17,7 +17,7 @@ impl PacketBWTracker<CachingSystemTimeSrc> {
             packets: VecDeque::new(),
             window_size,
             current_bandwidth: 0,
-            time_source: CachingSystemTimeSrc,
+            time_source: CachingSystemTimeSrc::new(),
         }
     }
 }

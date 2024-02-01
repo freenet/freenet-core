@@ -1,5 +1,5 @@
 use lazy_static::lazy_static;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::{
     collections::{BTreeMap, HashSet},
     time::{Duration, Instant},
@@ -248,8 +248,8 @@ impl<'x> Contains<PeerId> for &'x Vec<&PeerId> {
 }
 
 lazy_static! {
-    static ref GLOBAL_TIME_STATE: Arc<Mutex<(Instant, bool)>> =
-        Arc::new(Mutex::new((Instant::now(), false)));
+    static ref GLOBAL_TIME_STATE: Arc<RwLock<(Instant, bool)>> =
+        Arc::new(RwLock::new((Instant::now(), false)));
 }
 
 pub trait TimeSource {
@@ -259,28 +259,33 @@ pub trait TimeSource {
 /// A time source that caches the current time in a global state. This is useful for
 /// avoiding the overhead of calling `Instant::now()` in tight loops (such as when
 /// sending or receiving UDP packets). The time is re-cached every 20ms.
-pub struct CachingSystemTimeSrc;
-
-impl Default for CachingSystemTimeSrc {
-    fn default() -> Self {
-        let mut time_state = GLOBAL_TIME_STATE.lock().unwrap();
-        if !time_state.1 {
-            time_state.1 = true; // Set the flag to indicate the thread is launched
-            drop(time_state); // Drop the lock here before spawning the async task
-            let updater_state = Arc::clone(&GLOBAL_TIME_STATE);
-            spawn(async move {
-                CachingSystemTimeSrc::update_instant(updater_state).await;
-            });
-        }
-        CachingSystemTimeSrc
-    }
-}
+///
+/// The private () field is used to make the struct non-constructible outside of
+/// this module to ensure that the time updater is spawned.
+pub struct CachingSystemTimeSrc(());
 
 impl CachingSystemTimeSrc {
-    async fn update_instant(global_time_state: Arc<Mutex<(Instant, bool)>>) {
+    pub(crate) fn new() -> Self {
+        {
+            let mut time_state = GLOBAL_TIME_STATE.write().unwrap();
+            println!("Checking whether to spawn the time updater");
+            if !time_state.1 {
+                println!("Spawning the time updater");
+                time_state.1 = true; // Set the flag
+                let updater_state = Arc::clone(&GLOBAL_TIME_STATE);
+                spawn(async move {
+                    CachingSystemTimeSrc::update_instant(updater_state).await;
+                });
+            }
+        } // Release the write lock here
+        CachingSystemTimeSrc(())
+    }
+
+    async fn update_instant(global_time_state: Arc<RwLock<(Instant, bool)>>) {
         loop {
             {
-                let mut state = global_time_state.lock().unwrap();
+                let mut state = global_time_state.write().unwrap();
+                println!("Updating time");
                 state.0 = Instant::now();
             } // MutexGuard is dropped here
             sleep(Duration::from_millis(20)).await;
@@ -290,7 +295,7 @@ impl CachingSystemTimeSrc {
 
 impl TimeSource for CachingSystemTimeSrc {
     fn now(&self) -> Instant {
-        let state = GLOBAL_TIME_STATE.lock().unwrap();
+        let state = GLOBAL_TIME_STATE.read().unwrap();
         state.0
     }
 }
@@ -332,7 +337,7 @@ pub mod tests {
     fn test_now_returns_instant() {
         let rt = Runtime::new().unwrap();
         rt.block_on(async {
-            let time_source = CachingSystemTimeSrc;
+            let time_source = CachingSystemTimeSrc::new();
             let now = time_source.now();
             assert!(now.elapsed() >= Duration::from_secs(0));
         });
@@ -342,7 +347,7 @@ pub mod tests {
     fn test_instant_is_updated() {
         let rt = Runtime::new().unwrap();
         rt.block_on(async {
-            let time_source = CachingSystemTimeSrc;
+            let time_source = CachingSystemTimeSrc::new();
             let first_instant = time_source.now();
             sleep(Duration::from_millis(120)).await;
             let second_instant = time_source.now();

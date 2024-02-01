@@ -65,7 +65,7 @@ impl SentPacketTracker<CachingSystemTimeSrc> {
             pending_receipts: HashMap::new(),
             resend_queue: VecDeque::new(),
             packet_loss_proportion: 0.0,
-            time_source: CachingSystemTimeSrc,
+            time_source: CachingSystemTimeSrc::new(),
         }
     }
 }

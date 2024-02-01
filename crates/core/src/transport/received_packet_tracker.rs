@@ -45,7 +45,7 @@ impl ReceivedPacketTracker<CachingSystemTimeSrc> {
             pending_receipts: Vec::new(),
             message_id_time: VecDeque::new(),
             time_by_message_id: HashMap::new(),
-            time_source: CachingSystemTimeSrc,
+            time_source: CachingSystemTimeSrc::new(),
         }
     }
 }
