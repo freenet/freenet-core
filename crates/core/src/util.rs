@@ -258,7 +258,7 @@ pub trait TimeSource {
 
 /// A time source that caches the current time in a global state. This is useful for
 /// avoiding the overhead of calling `Instant::now()` in tight loops (such as when
-/// sending or receiving UDP packets).
+/// sending or receiving UDP packets). The time is re-cached every 20ms.
 pub struct CachingSystemTimeSrc;
 
 impl Default for CachingSystemTimeSrc {
