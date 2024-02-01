@@ -51,7 +51,7 @@ impl ReceivedPacketTracker<CachingSystemTimeSrc> {
 }
 
 impl<T: TimeSource> ReceivedPacketTracker<T> {
-    pub(super) fn report_received_packets(&mut self, message_id: MessageId) -> ReportResult {
+    pub(super) fn report_received_packet(&mut self, message_id: MessageId) -> ReportResult {
         self.cleanup();
         let current_time = self.time_source.now();
 
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn test_report_receipt_ok() {
         let mut tracker = ReceivedPacketTracker::new();
-        assert_eq!(tracker.report_received_packets(0), ReportResult::Ok);
+        assert_eq!(tracker.report_received_packet(0), ReportResult::Ok);
         assert_eq!(tracker.pending_receipts.len(), 1);
         assert_eq!(tracker.time_by_message_id.len(), 1);
     }
@@ -137,9 +137,9 @@ mod tests {
     #[test]
     fn test_report_receipt_already_received() {
         let mut tracker = ReceivedPacketTracker::new();
-        assert_eq!(tracker.report_received_packets(0), ReportResult::Ok);
+        assert_eq!(tracker.report_received_packet(0), ReportResult::Ok);
         assert_eq!(
-            tracker.report_received_packets(0),
+            tracker.report_received_packet(0),
             ReportResult::AlreadyReceived
         );
         assert_eq!(tracker.pending_receipts.len(), 1);
@@ -151,12 +151,12 @@ mod tests {
         let mut tracker = ReceivedPacketTracker::new();
         for i in 0..(MAX_PENDING_RECEIPTS - 1) {
             assert_eq!(
-                tracker.report_received_packets(i as MessageId),
+                tracker.report_received_packet(i as MessageId),
                 ReportResult::Ok
             );
         }
         assert_eq!(
-            tracker.report_received_packets((MAX_PENDING_RECEIPTS as MessageId) + 1),
+            tracker.report_received_packet((MAX_PENDING_RECEIPTS as MessageId) + 1),
             ReportResult::QueueFull
         );
         assert_eq!(tracker.pending_receipts.len(), MAX_PENDING_RECEIPTS);
@@ -173,7 +173,7 @@ mod tests {
         };
 
         for i in 0..10 {
-            assert_eq!(tracker.report_received_packets(i), ReportResult::Ok);
+            assert_eq!(tracker.report_received_packet(i), ReportResult::Ok);
         }
         assert_eq!(tracker.time_by_message_id.len(), 10);
         assert_eq!(tracker.message_id_time.len(), 10);

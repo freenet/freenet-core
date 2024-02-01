@@ -104,7 +104,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
     pub(super) fn get_resend(&mut self) -> ResendAction {
         let now = self.time_source.now();
 
-        while let Some(mut entry) = self.resend_queue.pop_front() {
+        while let Some(entry) = self.resend_queue.pop_front() {
             if entry.timeout_at > now {
                 let wait_until = entry.timeout_at;
                 self.resend_queue.push_front(entry);
