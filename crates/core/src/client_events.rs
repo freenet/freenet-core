@@ -391,9 +391,8 @@ pub(crate) mod test {
                         }
                     }
                     val if (35..80).contains(&val) => {
+                        let new_state = UpdateData::State(State::from(self.random_byte_vec()));
                         if let Some(contract) = self.choose(&state.existing_contracts) {
-                            let new_state = UpdateData::State(State::from(self.random_byte_vec()));
-
                             // TODO: It will be used when the delta updates are available
                             // let delta = UpdateData::Delta(StateDelta::from(self.random_byte_vec()));
                             if !for_this_peer {

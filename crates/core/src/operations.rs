@@ -108,7 +108,6 @@ where
         }) => {
             // updated op
             let id = *msg.id();
-
             if let Some(target) = msg.target().cloned() {
                 network_bridge.send(&target.peer, msg).await?;
             }
@@ -129,7 +128,6 @@ where
         }) => {
             // interim state
             let id = *updated_state.id();
-
             op_manager.push(id, updated_state).await?;
         }
         Ok(OperationResult {

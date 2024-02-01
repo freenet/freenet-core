@@ -2,9 +2,9 @@
 //! a given radius will cache a copy of the contract and it's current value,
 //! as well as will broadcast updates to the contract value to all subscribers.
 
+use std::future::Future;
 use std::pin::Pin;
 use std::time::Instant;
-use std::{future::Future, time::UNIX_EPOCH};
 
 pub(crate) use self::messages::PutMsg;
 use freenet_stdlib::{
@@ -581,15 +581,7 @@ impl OpManager {
             })
             .unwrap_or_default();
         if let Some(peer) = self.ring.subscribed_to_contract(key) {
-            if &peer.peer == sender {
-                tracing::warn!("1 - about to add sender peer to broadcast targets");
-                subscribers.push(peer);
-            } else if subscribers.contains(&peer) {
-                tracing::warn!("2 - about to add already added peer to broadcast targets");
-                subscribers.push(peer);
-            } else {
-                subscribers.push(peer);
-            }
+            subscribers.push(peer);
         }
         subscribers
     }
