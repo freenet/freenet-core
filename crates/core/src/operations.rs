@@ -88,9 +88,6 @@ async fn handle_op_result<CB>(
 where
     CB: NetworkBridge,
 {
-    tracing::debug!("paso por aca - handle_op_result");
-    tracing::debug!(tx_id = %tx_id, sender = ?sender);
-
     match result {
         Err(OpError::StatePushed) => {
             // do nothing and continue, the operation will just continue later on
@@ -112,16 +109,7 @@ where
             // updated op
             let id = *msg.id();
 
-            tracing::debug!("possible coming here? - return msg y state some - handle_op_result 1");
-
-            if let OpEnum::Update(op) = &updated_state {
-                tracing::debug!(state = ?op.state, " - handle_op_result");
-            };
-
-            tracing::debug!(sender = ?sender, msg = ?msg, tx_id = %tx_id, " - handle_op_result 2");
-
             if let Some(target) = msg.target().cloned() {
-                tracing::debug!(%target, "msg target - handle_op_result 3");
                 network_bridge.send(&target.peer, msg).await?;
             }
             op_manager.push(id, updated_state).await?;
@@ -132,14 +120,6 @@ where
             state: Some(final_state),
         }) if final_state.finalized() => {
             // operation finished_completely with result
-            tracing::debug!(
-                "possible coming here? - return msg none y state final_state - handle_op_result 4"
-            );
-
-            if let OpEnum::Update(op) = &final_state {
-                tracing::debug!(state = ?op.state, " - handle_op_result 5");
-            };
-
             op_manager.completed(tx_id);
             return Ok(Some(final_state));
         }
@@ -147,12 +127,6 @@ where
             return_msg: None,
             state: Some(updated_state),
         }) => {
-            tracing::debug!(
-                "possible coming here? - return msg none y state updated_state - handle_op_result 6"
-            );
-            if let OpEnum::Update(op) = &updated_state {
-                tracing::debug!(state = ?op.state, " - handle_op_result 7");
-            };
             // interim state
             let id = *updated_state.id();
 
@@ -165,11 +139,7 @@ where
             op_manager.completed(tx_id);
             // finished the operation at this node, informing back
 
-            tracing::debug!("here then goes to SuccessfulUpdate - handle_op_result 8");
-            tracing::debug!(sender = ?sender, msg = ?msg, tx_id = %tx_id, " - handle_op_result 9");
-
             if let Some(target) = msg.target().cloned() {
-                tracing::debug!(%target, "msg target - handle_op_result 10");
                 network_bridge.send(&target.peer, msg).await?;
             }
         }
