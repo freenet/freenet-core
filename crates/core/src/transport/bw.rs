@@ -85,13 +85,12 @@ mod tests {
     use crate::util::MockTimeSource;
 
     fn mock_tracker(window_size: Duration) -> PacketBWTracker<MockTimeSource> {
-        let tracker = PacketBWTracker {
+        PacketBWTracker {
             packets: VecDeque::new(),
             window_size,
             current_bandwidth: 0,
             time_source: MockTimeSource::new(Instant::now()),
-        };
-        tracker
+        }
     }
 
     fn verify_bandwidth_match<T: TimeSource>(tracker: &PacketBWTracker<T>) {
