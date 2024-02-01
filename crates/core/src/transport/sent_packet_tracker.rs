@@ -149,7 +149,7 @@ mod tests {
 
     fn mock_tracker() -> SentPacketTracker<MockTimeSource> {
         let time_source = MockTimeSource::new(Instant::now());
-        
+
         SentPacketTracker {
             pending_receipts: HashMap::new(),
             resend_queue: VecDeque::new(),
