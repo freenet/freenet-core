@@ -1,3 +1,5 @@
+use lazy_static::lazy_static;
+use std::sync::{Arc, Mutex};
 use std::{
     collections::{BTreeMap, HashSet},
     time::{Duration, Instant},
@@ -7,6 +9,8 @@ use rand::{
     prelude::{Rng, StdRng},
     SeedableRng,
 };
+use tokio::spawn;
+use tokio::time::sleep;
 
 use crate::node::PeerId;
 
@@ -243,15 +247,48 @@ impl<'x> Contains<PeerId> for &'x Vec<&PeerId> {
     }
 }
 
+lazy_static! {
+    static ref GLOBAL_TIME_STATE: Arc<Mutex<(Instant, bool)>> =
+        Arc::new(Mutex::new((Instant::now(), false)));
+}
+
 pub trait TimeSource {
-    fn now(&mut self) -> Instant;
+    fn now(&self) -> Instant;
 }
 
 pub struct SystemTimeSrc;
 
+impl Default for SystemTimeSrc {
+    fn default() -> Self {
+        let mut time_state = GLOBAL_TIME_STATE.lock().unwrap();
+        if !time_state.1 {
+            time_state.1 = true; // Set the flag to indicate the thread is launched
+            drop(time_state); // Drop the lock here before spawning the async task
+            let updater_state = Arc::clone(&GLOBAL_TIME_STATE);
+            spawn(async move {
+                SystemTimeSrc::update_instant(updater_state).await;
+            });
+        }
+        SystemTimeSrc
+    }
+}
+
+impl SystemTimeSrc {
+    async fn update_instant(global_time_state: Arc<Mutex<(Instant, bool)>>) {
+        loop {
+            {
+                let mut state = global_time_state.lock().unwrap();
+                state.0 = Instant::now();
+            } // MutexGuard is dropped here
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
 impl TimeSource for SystemTimeSrc {
-    fn now(&mut self) -> Instant {
-        Instant::now()
+    fn now(&self) -> Instant {
+        let state = GLOBAL_TIME_STATE.lock().unwrap();
+        state.0
     }
 }
 
@@ -276,15 +313,39 @@ impl MockTimeSource {
 
 #[cfg(test)]
 impl TimeSource for MockTimeSource {
-    fn now(&mut self) -> Instant {
-        self.current_instant.clone()
+    fn now(&self) -> Instant {
+        self.current_instant
     }
 }
 
 #[cfg(test)]
 pub mod tests {
-
+    use super::*;
+    use std::time::Duration;
     use tempfile::TempDir;
+    use tokio::runtime::Runtime;
+
+    #[test]
+    fn test_now_returns_instant() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let time_source = SystemTimeSrc;
+            let now = time_source.now();
+            assert!(now.elapsed() >= Duration::from_secs(0));
+        });
+    }
+
+    #[test]
+    fn test_instant_is_updated() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let time_source = SystemTimeSrc;
+            let first_instant = time_source.now();
+            sleep(Duration::from_millis(120)).await;
+            let second_instant = time_source.now();
+            assert!(second_instant > first_instant);
+        });
+    }
 
     /// Use this to guarantee unique directory names in case you are running multiple tests in parallel.
     pub fn get_temp_dir() -> TempDir {

@@ -76,6 +76,7 @@ tracing-subscriber = { optional = true, version = "0.3.16" }
 freenet-stdlib = { features = ["net"], workspace = true }
 time = "0.3.30"
 aes-gcm = "0.10.3"
+lazy_static = { version = "1.4.0", features = [] }
 
 [dev-dependencies]
 arbitrary = { features = ["derive"], version = "1" }
