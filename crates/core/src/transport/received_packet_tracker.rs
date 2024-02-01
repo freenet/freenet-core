@@ -210,4 +210,12 @@ mod tests {
         assert_eq!(tracker.time_by_message_id.len(), 0);
         assert_eq!(tracker.message_id_time.len(), 0);
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_many_trackers() {
+        let mut trackers = vec![];
+        for i in 1..100 {
+            trackers.push(ReceivedPacketTracker::new());
+        }
+    }
 }
