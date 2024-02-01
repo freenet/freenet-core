@@ -120,7 +120,13 @@ mod tests {
 
     #[test]
     fn test_initialization() {
-        let mut tracker = ReceivedPacketTracker::new();
+        let mut tracker = ReceivedPacketTracker {
+            pending_receipts: Vec::new(),
+            message_id_time: VecDeque::new(),
+            time_by_message_id: HashMap::new(),
+            time_source: MockTimeSource::new(Instant::now()),
+        };
+
         assert_eq!(tracker.get_receipts().len(), 0);
         assert_eq!(tracker.pending_receipts.len(), 0);
         assert_eq!(tracker.time_by_message_id.len(), 0);
@@ -128,7 +134,13 @@ mod tests {
 
     #[test]
     fn test_report_receipt_ok() {
-        let mut tracker = ReceivedPacketTracker::new();
+        let mut tracker = ReceivedPacketTracker {
+            pending_receipts: Vec::new(),
+            message_id_time: VecDeque::new(),
+            time_by_message_id: HashMap::new(),
+            time_source: MockTimeSource::new(Instant::now()),
+        };
+
         assert_eq!(tracker.report_received_packet(0), ReportResult::Ok);
         assert_eq!(tracker.pending_receipts.len(), 1);
         assert_eq!(tracker.time_by_message_id.len(), 1);
@@ -136,7 +148,13 @@ mod tests {
 
     #[test]
     fn test_report_receipt_already_received() {
-        let mut tracker = ReceivedPacketTracker::new();
+        let mut tracker = ReceivedPacketTracker {
+            pending_receipts: Vec::new(),
+            message_id_time: VecDeque::new(),
+            time_by_message_id: HashMap::new(),
+            time_source: MockTimeSource::new(Instant::now()),
+        };
+
         assert_eq!(tracker.report_received_packet(0), ReportResult::Ok);
         assert_eq!(
             tracker.report_received_packet(0),
@@ -148,7 +166,13 @@ mod tests {
 
     #[test]
     fn test_report_receipt_queue_full() {
-        let mut tracker = ReceivedPacketTracker::new();
+        let mut tracker = ReceivedPacketTracker {
+            pending_receipts: Vec::new(),
+            message_id_time: VecDeque::new(),
+            time_by_message_id: HashMap::new(),
+            time_source: MockTimeSource::new(Instant::now()),
+        };
+
         for i in 0..(MAX_PENDING_RECEIPTS - 1) {
             assert_eq!(
                 tracker.report_received_packet(i as MessageId),

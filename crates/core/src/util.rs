@@ -348,6 +348,14 @@ pub mod tests {
     use tempfile::TempDir;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_many_timesources() {
+        let mut ts = vec![];
+        for i in 1..100 {
+            ts.push(CachingSystemTimeSrc::new());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_now_returns_instant() {
         let time_source = CachingSystemTimeSrc::new();
         let now = time_source.now();
