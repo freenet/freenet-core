@@ -103,30 +103,26 @@ impl<T: TimeSource> SentPacketTracker<T> {
     /// `report_sent_packet` again with the same message_id.
     pub(super) fn get_resend(&mut self) -> ResendAction {
         let now = self.time_source.now();
-        match self.resend_queue.pop_front() {
-            Some(entry) => {
-                if entry.timeout_at > now {
-                    let wait_until = entry.timeout_at;
-                    self.resend_queue.push_front(entry);
-                    ResendAction::WaitUntil(wait_until)
-                } else if let Some(packet) = self.pending_receipts.remove(&entry.message_id) {
-                    // Update packet loss proportion for a lost packet, this can be
-                    // simplified but I'm leaving it like this for readability.
-                    self.packet_loss_proportion = self.packet_loss_proportion
-                        * (1.0 - PACKET_LOSS_DECAY_FACTOR)
-                        + PACKET_LOSS_DECAY_FACTOR;
 
-                    ResendAction::Resend(entry.message_id, packet)
-                } else {
-                    warn!(
-                        "Message ID {} not found in pending receipts",
-                        entry.message_id
-                    );
-                    ResendAction::WaitUntil(now + MESSAGE_CONFIRMATION_TIMEOUT)
-                }
+        while let Some(mut entry) = self.resend_queue.pop_front() {
+            if entry.timeout_at > now {
+                let wait_until = entry.timeout_at;
+                self.resend_queue.push_front(entry);
+                return ResendAction::WaitUntil(wait_until);
+            } else if let Some(packet) = self.pending_receipts.remove(&entry.message_id) {
+                // Update packet loss proportion for a lost packet
+                // Resend logic
+                self.packet_loss_proportion = self.packet_loss_proportion
+                    * (1.0 - PACKET_LOSS_DECAY_FACTOR)
+                    + PACKET_LOSS_DECAY_FACTOR;
+
+                return ResendAction::Resend(entry.message_id, packet);
             }
-            None => ResendAction::WaitUntil(now + MESSAGE_CONFIRMATION_TIMEOUT),
+            // If the packet is no longer in pending_receipts, it means its receipt has been received.
+            // No action needed, continue to check the next entry in the queue.
         }
+
+        ResendAction::WaitUntil(now + MESSAGE_CONFIRMATION_TIMEOUT)
     }
 }
 
@@ -189,5 +185,37 @@ mod tests {
         assert_eq!(tracker.pending_receipts.len(), 0);
         assert_eq!(tracker.resend_queue.len(), 0);
         assert_eq!(tracker.packet_loss_proportion, PACKET_LOSS_DECAY_FACTOR);
+    }
+
+    #[test]
+    fn test_immediate_receipt_then_resend() {
+        let mut tracker = mock_tracker();
+
+        // Report two packets sent
+        tracker.report_sent_packet(1, vec![1, 2, 3]);
+        tracker.report_sent_packet(2, vec![4, 5, 6]);
+
+        // Immediately report receipt for the first packet
+        tracker.report_received_receipts(&[1]);
+
+        // Simulate time just before the resend time for packet 2
+        tracker
+            .time_source
+            .advance_time(MESSAGE_CONFIRMATION_TIMEOUT - Duration::from_millis(1));
+
+        // This should not trigger a resend yet
+        match tracker.get_resend() {
+            ResendAction::WaitUntil(_) => (),
+            _ => panic!("Expected WaitUntil, got Resend too early"),
+        }
+
+        // Now advance time to trigger resend for packet 2
+        tracker.time_source.advance_time(Duration::from_millis(2));
+
+        // This should now trigger a resend for packet 2
+        match tracker.get_resend() {
+            ResendAction::Resend(message_id, _) => assert_eq!(message_id, 2),
+            _ => panic!("Expected Resend for message ID 2"),
+        }
     }
 }
