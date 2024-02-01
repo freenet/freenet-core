@@ -247,9 +247,9 @@ pub trait TimeSource {
     fn now(&mut self) -> Instant;
 }
 
-pub struct SystemTime;
+pub struct SystemTimeSrc;
 
-impl TimeSource for SystemTime {
+impl TimeSource for SystemTimeSrc {
     fn now(&mut self) -> Instant {
         Instant::now()
     }
