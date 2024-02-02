@@ -27,7 +27,7 @@ impl SymmetricMessage {
         bincode::deserialize(bytes)
     }
 
-    pub fn ack_error(inbound_sym_key: &Aes128Gcm) -> Result<PacketData, bincode::Error> {
+    pub fn ack_error(outbound_sym_key: &Aes128Gcm) -> Result<PacketData, bincode::Error> {
         static SERIALIZED: OnceLock<Box<[u8]>> = OnceLock::new();
         let bytes = SERIALIZED.get_or_init(|| {
             let mut packet = [0u8; MAX_PACKET_SIZE];
@@ -36,10 +36,10 @@ impl SymmetricMessage {
             (&packet[..size as usize]).into()
         });
         // todo: we need exact size of this packet so we can return an optimized PacketData
-        Ok(PacketData::encrypted_with_cipher(bytes, inbound_sym_key))
+        Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
     }
 
-    pub fn ack_ok(inbound_sym_key: &Aes128Gcm) -> Result<PacketData, bincode::Error> {
+    pub fn ack_ok(outbound_sym_key: &Aes128Gcm) -> Result<PacketData, bincode::Error> {
         static SERIALIZED: OnceLock<Box<[u8]>> = OnceLock::new();
         let bytes = SERIALIZED.get_or_init(|| {
             let mut packet = [0u8; MAX_PACKET_SIZE];
@@ -48,13 +48,13 @@ impl SymmetricMessage {
             (&packet[..size as usize]).into()
         });
         // todo: we need exact size of this packet so we can return an optimized PacketData
-        Ok(PacketData::encrypted_with_cipher(bytes, inbound_sym_key))
+        Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
     }
 
     pub fn short_message(
         message_id: u32,
         payload: MessagePayload,
-        inbound_sym_key: &Aes128Gcm,
+        outbound_sym_key: &Aes128Gcm,
     ) -> Result<PacketData, bincode::Error> {
         let message = Self {
             message_id,
@@ -66,7 +66,7 @@ impl SymmetricMessage {
         debug_assert!(size <= MAX_DATA_SIZE as u64);
         bincode::serialize_into(packet.as_mut_slice(), &message)?;
         let bytes = &packet[..size as usize];
-        Ok(PacketData::encrypted_with_cipher(bytes, inbound_sym_key))
+        Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
     }
 
     const ACK_ERROR: SymmetricMessage = SymmetricMessage {

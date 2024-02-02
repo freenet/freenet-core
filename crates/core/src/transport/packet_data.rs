@@ -40,7 +40,7 @@ const fn _check_valid_size<const N: usize>() {
 // todo: maybe split this into type for handling inbound (encrypted)/outbound (decrypted) packets for clarity
 pub(super) struct PacketData<const N: usize = MAX_PACKET_SIZE> {
     data: [u8; N],
-    size: usize,
+    pub size: usize,
 }
 
 pub(super) const fn packet_size<const DATA_SIZE: usize>() -> usize {
@@ -90,6 +90,7 @@ impl<const N: usize> PacketData<N> {
         }
     }
 
+    // todo: this function will be unnecessary when we guarantee that size = N
     pub(super) fn data(&self) -> &[u8] {
         &self.data[..self.size]
     }
@@ -118,6 +119,17 @@ impl<const N: usize> From<[u8; N]> for PacketData<N> {
     fn from(data: [u8; N]) -> Self {
         _check_valid_size::<N>();
         Self { data, size: N }
+    }
+}
+
+impl<'a> From<&'a [u8]> for PacketData<MAX_PACKET_SIZE> {
+    fn from(value: &'a [u8]) -> Self {
+        let mut data = [0; MAX_PACKET_SIZE];
+        data[..value.len()].copy_from_slice(value);
+        Self {
+            data,
+            size: value.len(),
+        }
     }
 }
 
