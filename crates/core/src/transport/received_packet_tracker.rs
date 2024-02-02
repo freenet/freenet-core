@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::mem;
 use std::time::{Duration, Instant};
 
-/// How long to reain packets in case they need to be retransmitted
+/// How long to retain packets in case they need to be retransmitted
 const RETAIN_TIME: Duration = Duration::from_secs(60);
 const MAX_PENDING_RECEIPTS: usize = 20;
 
@@ -114,9 +114,19 @@ pub(super) enum ReportResult {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::transport) mod tests {
     use super::*;
     use crate::util::MockTimeSource;
+
+    pub(in crate::transport) fn mock_received_packet_tracker(
+    ) -> ReceivedPacketTracker<MockTimeSource> {
+        ReceivedPacketTracker {
+            pending_receipts: Vec::new(),
+            message_id_time: VecDeque::new(),
+            time_by_message_id: HashMap::new(),
+            time_source: MockTimeSource::new(Instant::now()),
+        }
+    }
 
     #[test]
     fn test_initialization() {
@@ -148,12 +158,7 @@ mod tests {
 
     #[test]
     fn test_report_receipt_already_received() {
-        let mut tracker = ReceivedPacketTracker {
-            pending_receipts: Vec::new(),
-            message_id_time: VecDeque::new(),
-            time_by_message_id: HashMap::new(),
-            time_source: MockTimeSource::new(Instant::now()),
-        };
+        let mut tracker = mock_received_packet_tracker();
 
         assert_eq!(tracker.report_received_packet(0), ReportResult::Ok);
         assert_eq!(

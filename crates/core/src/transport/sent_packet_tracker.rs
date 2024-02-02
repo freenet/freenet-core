@@ -9,7 +9,7 @@ const NETWORK_DELAY_ALLOWANCE: Duration = Duration::from_millis(500);
 /// If we don't get a receipt for a message within 500ms, we assume the message was lost and
 /// resend it. This must be significantly higher than MAX_CONFIRMATION_DELAY (100ms) to
 /// account for network delay
-const MESSAGE_CONFIRMATION_TIMEOUT: Duration = {
+pub(super) const MESSAGE_CONFIRMATION_TIMEOUT: Duration = {
     let millis: u128 = MAX_CONFIRMATION_DELAY.as_millis() + NETWORK_DELAY_ALLOWANCE.as_millis();
 
     // Check for overflow
@@ -56,7 +56,7 @@ pub(super) struct SentPacketTracker<T: TimeSource> {
 
     packet_loss_proportion: f64,
 
-    time_source: T,
+    pub(super) time_source: T,
 }
 
 impl SentPacketTracker<CachingSystemTimeSrc> {
@@ -142,11 +142,11 @@ struct ResendQueueEntry {
 
 // Unit tests
 #[cfg(test)]
-mod tests {
+pub(in crate::transport) mod tests {
     use super::*;
     use crate::util::MockTimeSource;
 
-    fn mock_tracker() -> SentPacketTracker<MockTimeSource> {
+    pub(in crate::transport) fn mock_sent_packet_tracker() -> SentPacketTracker<MockTimeSource> {
         let time_source = MockTimeSource::new(Instant::now());
 
         SentPacketTracker {
@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn test_report_sent_packet() {
-        let mut tracker = mock_tracker();
+        let mut tracker = mock_sent_packet_tracker();
         tracker.report_sent_packet(1, vec![1, 2, 3]);
         assert_eq!(tracker.pending_receipts.len(), 1);
         assert_eq!(tracker.resend_queue.len(), 1);
@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn test_report_received_receipts() {
-        let mut tracker = mock_tracker();
+        let mut tracker = mock_sent_packet_tracker();
         tracker.report_sent_packet(1, vec![1, 2, 3]);
         tracker.report_received_receipts(&[1]);
         assert_eq!(tracker.pending_receipts.len(), 0);
@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn test_packet_lost() {
-        let mut tracker = mock_tracker();
+        let mut tracker = mock_sent_packet_tracker();
         tracker.report_sent_packet(1, vec![1, 2, 3]);
         tracker
             .time_source
@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn test_immediate_receipt_then_resend() {
-        let mut tracker = mock_tracker();
+        let mut tracker = mock_sent_packet_tracker();
 
         // Report two packets sent
         tracker.report_sent_packet(1, vec![1, 2, 3]);
@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn test_get_resend_with_pending_receipts() {
-        let mut tracker = mock_tracker();
+        let mut tracker = mock_sent_packet_tracker();
 
         tracker.report_sent_packet(0, MessagePayload::new());
 

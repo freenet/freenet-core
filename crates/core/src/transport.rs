@@ -1,39 +1,7 @@
 #![allow(dead_code)] // TODO: Remove before integration
 //! Freenet Transport protocol implementation.
 //!
-//! # Transport
-//!
-//! The transport layer is responsible for reliably sending and receiving messages
-//! over the network.
-//!
-//! ## Message Streaming
-//!
-//! The transport layer supports two types of messages:
-//!
-//! - Short messages that can fit in a single UDP packet.
-//! - Streamed messages that are split into multiple UDP packets.
-//!
-//! The purpose of streamed messages is to allow a node to start sending a message before
-//! it has been received completely (although it must know the message size before starting
-//! to send).
-//!
-//! ## Congestion Control
-//!
-//! The transport layer implements a simple congestion control algorithm which assumes
-//! that congestion won't occur if the upstream rate is less than `max_upstream_rate`.
-//! Choosing an appropriate and conservative value for `max_upstream_rate` is therefore
-//! important to avoid congestion.
-//!
-//! ## Encryption
-//!
-//! Each peer chooses a symmetric key that is used to encrypt *inbound* messages for that peer,
-//! the exception is inbound connections to the gateway peer which will use the key provided
-//! by the peer initiating the connection in both directions.
-//!
-//! Each peer initiates a connection by encrypting its chosen key with the public key of the
-//! peer it is connecting to. The encrypted key is then sent to the peer in the first message
-//! of the connection, repeated until a correctly encrypted response is received. The peer
-//! receiving the message will decrypt the key and use it to encrypt future messages.
+//! Please see `docs/architecture/transport.md` for more information.
 
 mod bw;
 mod connection_handler;
@@ -64,5 +32,51 @@ impl BytesPerSecond {
 
     pub fn as_f64(&self) -> f64 {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::received_packet_tracker::ReportResult;
+    use crate::transport::sent_packet_tracker::{ResendAction, MESSAGE_CONFIRMATION_TIMEOUT};
+
+    #[test]
+    fn test_packet_send_receive_acknowledge_flow() {
+        let mut sent_tracker = sent_packet_tracker::tests::mock_sent_packet_tracker();
+        let mut received_tracker = received_packet_tracker::tests::mock_received_packet_tracker();
+
+        // Simulate sending packets
+        for id in 1..=5 {
+            sent_tracker.report_sent_packet(id, vec![id as u8]);
+        }
+
+        // Simulate receiving some packets
+        for id in [1, 3, 5] {
+            assert_eq!(
+                received_tracker.report_received_packet(id),
+                ReportResult::Ok
+            );
+        }
+
+        // Get receipts and simulate acknowledging them
+        let receipts = received_tracker.get_receipts();
+        assert_eq!(receipts, vec![1, 3, 5]);
+        sent_tracker.report_received_receipts(&receipts);
+
+        // Check resend action for lost packets
+        sent_tracker
+            .time_source
+            .advance_time(MESSAGE_CONFIRMATION_TIMEOUT);
+        for id in [2, 4] {
+            match sent_tracker.get_resend() {
+                ResendAction::Resend(message_id, packet) => {
+                    assert_eq!(message_id, id);
+                    // Simulate resending packet
+                    sent_tracker.report_sent_packet(id, packet);
+                }
+                _ => panic!("Expected resend action for packet {}", id),
+            }
+        }
     }
 }
