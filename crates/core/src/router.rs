@@ -60,6 +60,7 @@ impl Router {
         self
     }
 
+    /// Add a new event to the router's history and update the estimators.
     pub fn add_event(&mut self, event: RouteEvent) {
         match event.outcome {
             RouteOutcome::Success {
