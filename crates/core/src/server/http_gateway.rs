@@ -95,14 +95,14 @@ async fn web_home(
     let token = AuthToken::generate();
 
     let auth_header = headers::Authorization::<headers::authorization::Bearer>::name().to_string();
-    let cookie = cookie::Cookie::build(auth_header, format!("Bearer {}", token.as_str()))
+    let cookie = cookie::Cookie::build((auth_header, format!("Bearer {}", token.as_str())))
         .domain(domain)
         .path(format!("/contract/web/{key}"))
         .same_site(cookie::SameSite::Strict)
         .max_age(cookie::time::Duration::days(1))
         .secure(!config.localhost)
         .http_only(false)
-        .finish();
+        .build();
 
     let token_header = headers::Authorization::bearer(token.as_str()).unwrap();
     let contract_idx = path_handlers::contract_home(key, rs, token).await?;
