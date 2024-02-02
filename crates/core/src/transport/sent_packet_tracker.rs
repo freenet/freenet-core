@@ -106,6 +106,9 @@ impl<T: TimeSource> SentPacketTracker<T> {
 
         while let Some(entry) = self.resend_queue.pop_front() {
             if entry.timeout_at > now {
+                if !self.pending_receipts.contains_key(&entry.message_id) {
+                    continue;
+                }
                 let wait_until = entry.timeout_at;
                 self.resend_queue.push_front(entry);
                 return ResendAction::WaitUntil(wait_until);
@@ -216,6 +219,33 @@ mod tests {
         match tracker.get_resend() {
             ResendAction::Resend(message_id, _) => assert_eq!(message_id, 2),
             _ => panic!("Expected Resend for message ID 2"),
+        }
+    }
+
+    #[test]
+    fn test_get_resend_with_pending_receipts() {
+        let mut tracker = mock_tracker();
+
+        tracker.report_sent_packet(0, MessagePayload::new());
+
+        tracker.time_source.advance_time(Duration::from_millis(10));
+
+        tracker.report_sent_packet(1, MessagePayload::new());
+
+        let packet_1_timeout = tracker.time_source.now() + MESSAGE_CONFIRMATION_TIMEOUT;
+
+        // Acknowledge receipt of the first packet
+        tracker.report_received_receipts(&[0]);
+
+        // The next call to get_resend should calculate the wait time based on the second packet (id 1)
+        match tracker.get_resend() {
+            ResendAction::WaitUntil(wait_until) => {
+                assert_eq!(
+                    wait_until, packet_1_timeout,
+                    "Wait time does not match expected for second packet"
+                );
+            }
+            _ => panic!("Expected ResendAction::WaitUntil"),
         }
     }
 }
