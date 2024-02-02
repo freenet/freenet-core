@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::mem;
 use std::time::{Duration, Instant};
 
-/// How long to reain packets in case they need to be retransmitted
+/// How long to retain packets in case they need to be retransmitted
 const RETAIN_TIME: Duration = Duration::from_secs(60);
 const MAX_PENDING_RECEIPTS: usize = 20;
 
@@ -51,7 +51,7 @@ impl ReceivedPacketTracker<CachingSystemTimeSrc> {
 }
 
 impl<T: TimeSource> ReceivedPacketTracker<T> {
-    pub(super) fn report_received_packets(&mut self, message_id: MessageId) -> ReportResult {
+    pub(super) fn report_received_packet(&mut self, message_id: MessageId) -> ReportResult {
         self.cleanup();
         let current_time = self.time_source.now();
 
@@ -114,13 +114,29 @@ pub(super) enum ReportResult {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::transport) mod tests {
     use super::*;
     use crate::util::MockTimeSource;
 
+    pub(in crate::transport) fn mock_received_packet_tracker(
+    ) -> ReceivedPacketTracker<MockTimeSource> {
+        ReceivedPacketTracker {
+            pending_receipts: Vec::new(),
+            message_id_time: VecDeque::new(),
+            time_by_message_id: HashMap::new(),
+            time_source: MockTimeSource::new(Instant::now()),
+        }
+    }
+
     #[test]
     fn test_initialization() {
-        let mut tracker = ReceivedPacketTracker::new();
+        let mut tracker = ReceivedPacketTracker {
+            pending_receipts: Vec::new(),
+            message_id_time: VecDeque::new(),
+            time_by_message_id: HashMap::new(),
+            time_source: MockTimeSource::new(Instant::now()),
+        };
+
         assert_eq!(tracker.get_receipts().len(), 0);
         assert_eq!(tracker.pending_receipts.len(), 0);
         assert_eq!(tracker.time_by_message_id.len(), 0);
@@ -128,18 +144,25 @@ mod tests {
 
     #[test]
     fn test_report_receipt_ok() {
-        let mut tracker = ReceivedPacketTracker::new();
-        assert_eq!(tracker.report_received_packets(0), ReportResult::Ok);
+        let mut tracker = ReceivedPacketTracker {
+            pending_receipts: Vec::new(),
+            message_id_time: VecDeque::new(),
+            time_by_message_id: HashMap::new(),
+            time_source: MockTimeSource::new(Instant::now()),
+        };
+
+        assert_eq!(tracker.report_received_packet(0), ReportResult::Ok);
         assert_eq!(tracker.pending_receipts.len(), 1);
         assert_eq!(tracker.time_by_message_id.len(), 1);
     }
 
     #[test]
     fn test_report_receipt_already_received() {
-        let mut tracker = ReceivedPacketTracker::new();
-        assert_eq!(tracker.report_received_packets(0), ReportResult::Ok);
+        let mut tracker = mock_received_packet_tracker();
+
+        assert_eq!(tracker.report_received_packet(0), ReportResult::Ok);
         assert_eq!(
-            tracker.report_received_packets(0),
+            tracker.report_received_packet(0),
             ReportResult::AlreadyReceived
         );
         assert_eq!(tracker.pending_receipts.len(), 1);
@@ -148,15 +171,21 @@ mod tests {
 
     #[test]
     fn test_report_receipt_queue_full() {
-        let mut tracker = ReceivedPacketTracker::new();
+        let mut tracker = ReceivedPacketTracker {
+            pending_receipts: Vec::new(),
+            message_id_time: VecDeque::new(),
+            time_by_message_id: HashMap::new(),
+            time_source: MockTimeSource::new(Instant::now()),
+        };
+
         for i in 0..(MAX_PENDING_RECEIPTS - 1) {
             assert_eq!(
-                tracker.report_received_packets(i as MessageId),
+                tracker.report_received_packet(i as MessageId),
                 ReportResult::Ok
             );
         }
         assert_eq!(
-            tracker.report_received_packets((MAX_PENDING_RECEIPTS as MessageId) + 1),
+            tracker.report_received_packet((MAX_PENDING_RECEIPTS as MessageId) + 1),
             ReportResult::QueueFull
         );
         assert_eq!(tracker.pending_receipts.len(), MAX_PENDING_RECEIPTS);
@@ -173,7 +202,7 @@ mod tests {
         };
 
         for i in 0..10 {
-            assert_eq!(tracker.report_received_packets(i), ReportResult::Ok);
+            assert_eq!(tracker.report_received_packet(i), ReportResult::Ok);
         }
         assert_eq!(tracker.time_by_message_id.len(), 10);
         assert_eq!(tracker.message_id_time.len(), 10);
@@ -185,5 +214,13 @@ mod tests {
         tracker.cleanup();
         assert_eq!(tracker.time_by_message_id.len(), 0);
         assert_eq!(tracker.message_id_time.len(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_many_trackers() {
+        let mut trackers = vec![];
+        for i in 1..100 {
+            trackers.push(ReceivedPacketTracker::new());
+        }
     }
 }

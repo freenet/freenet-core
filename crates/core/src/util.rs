@@ -1,6 +1,5 @@
-use std::cell::{OnceCell, RefCell};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64};
-use std::sync::{Arc, Barrier, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicPtr};
+use std::sync::Arc;
 use std::time::SystemTime;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -251,22 +250,20 @@ pub trait TimeSource {
     fn now(&self) -> Instant;
 }
 
-/// A time source that caches the current time in a global state. This is useful for
-/// avoiding the overhead of calling `Instant::now()` in tight loops (such as when
-/// sending or receiving UDP packets). The time is re-cached every 20ms.
-///
-/// The private () field is used to make the struct non-constructible outside of
-/// this module to ensure that the time updater is spawned.
+// A time source that caches the current time in a global state to reduce overhead in performance-critical sections.
 #[derive(Clone, Copy)]
 pub(crate) struct CachingSystemTimeSrc(());
 
-// would be nice to use AtomicU128 and store unix timestamp, unfortunately
-// atomic u128 is not available
-static GLOBAL_TIME_STATE: AtomicPtr<u128> = AtomicPtr::new(std::ptr::null_mut());
+// Global atomic pointer to the cached time. Initialized as a null pointer.
+static GLOBAL_TIME_STATE: AtomicPtr<Instant> = AtomicPtr::new(std::ptr::null_mut());
 
 impl CachingSystemTimeSrc {
+    // Creates a new instance and ensures only one updater task is spawned.
     pub(crate) fn new() -> Self {
-        let mut current_unix_epoch_ts = Self::get_curremt_unix_epoch_ts();
+        let mut current_unix_epoch_ts = Instant::now();
+
+        // Attempt to set the global time state if it's currently null.
+        // This ensures only the first thread to execute this will spawn the updater task.
         if GLOBAL_TIME_STATE
             .compare_exchange(
                 std::ptr::null_mut(),
@@ -276,50 +273,45 @@ impl CachingSystemTimeSrc {
             )
             .is_ok()
         {
+            // Use a flag to synchronize the updater task's initialization.
             let drop_guard = Arc::new(AtomicBool::new(false));
+
+            // Spawn the updater task asynchronously.
             tokio::spawn(Self::update_instant(drop_guard.clone()));
-            // we hold onto current_unix_epoch_ts until update_instant is running to not leave a dangling pointer
+
+            // Wait until the updater task signals it's safe to proceed.
             while !drop_guard.load(std::sync::atomic::Ordering::Acquire) {
                 std::hint::spin_loop();
             }
         }
+
         CachingSystemTimeSrc(())
     }
 
+    // Asynchronously updates the global time state every 20ms.
     async fn update_instant(drop_guard: Arc<AtomicBool>) {
-        let mut current_unix_epoch_ts = Self::get_curremt_unix_epoch_ts();
-        GLOBAL_TIME_STATE.store(
-            &mut current_unix_epoch_ts,
-            std::sync::atomic::Ordering::Release,
-        );
+        let mut now = Instant::now();
+
+        // Initially set the global time state and notify the constructor to proceed.
+        GLOBAL_TIME_STATE.store(&mut now, std::sync::atomic::Ordering::Release);
         drop_guard.store(true, std::sync::atomic::Ordering::Release);
-        #[allow(unused_assignments)] // keeping the reference alive
-        let mut current_unix_epoch_ts = Self::get_curremt_unix_epoch_ts();
+
         loop {
-            current_unix_epoch_ts = Self::get_curremt_unix_epoch_ts();
-            println!("updated ts: {}", current_unix_epoch_ts);
-            GLOBAL_TIME_STATE.store(
-                &mut current_unix_epoch_ts,
-                std::sync::atomic::Ordering::Release,
-            );
+            // Update the time and store it in the global state.
+            now = Instant::now();
+            GLOBAL_TIME_STATE.store(&mut now, std::sync::atomic::Ordering::Release);
+
+            // Wait for 20ms before the next update.
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }
-
-    fn get_curremt_unix_epoch_ts() -> u128 {
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("now should be always be later than unix epoch")
-            .as_millis()
     }
 }
 
 impl TimeSource for CachingSystemTimeSrc {
+    // Returns the current time from the global state.
     fn now(&self) -> Instant {
-        let ts = unsafe { *GLOBAL_TIME_STATE.load(std::sync::atomic::Ordering::Acquire) };
-        println!("ts: {}", ts);
-        // Instant::from(system_time)
-        Instant::now()
+        // Unsafe dereference is required for the raw pointer.
+        unsafe { *GLOBAL_TIME_STATE.load(std::sync::atomic::Ordering::Acquire) }
     }
 }
 
@@ -356,6 +348,14 @@ pub mod tests {
     use tempfile::TempDir;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_many_timesources() {
+        let mut ts = vec![];
+        for i in 1..100 {
+            ts.push(CachingSystemTimeSrc::new());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_now_returns_instant() {
         let time_source = CachingSystemTimeSrc::new();
         let now = time_source.now();
@@ -371,17 +371,17 @@ pub mod tests {
         assert!(second_instant > first_instant);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn caching_system_time_is_thread_safe() {
+        let mut prev = Instant::now();
         let time_source = CachingSystemTimeSrc::new();
         let mut handles = vec![];
         for _ in 0..10 {
             handles.push(std::thread::spawn(move || {
                 let time = Instant::now();
-                let mut prev = Instant::now();
                 while time.elapsed() < Duration::from_secs(1) {
                     let now = time_source.now();
-                    assert!(now > prev);
+                    assert!(prev <= now);
                     prev = now;
                     std::thread::sleep(Duration::from_millis(25));
                 }
