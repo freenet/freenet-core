@@ -6,7 +6,7 @@ use serde_with::serde_as;
 
 use crate::transport::packet_data::MAX_DATA_SIZE;
 
-use super::{packet_data::MAX_PACKET_SIZE, MessagePayload, PacketData};
+use super::{crypto::TransportPublicKey, packet_data::MAX_PACKET_SIZE, MessagePayload, PacketData};
 
 #[serde_as]
 #[derive(Serialize, Deserialize)]
@@ -39,11 +39,21 @@ impl SymmetricMessage {
         Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
     }
 
-    pub fn ack_ok(outbound_sym_key: &Aes128Gcm) -> Result<PacketData, bincode::Error> {
+    pub fn ack_ok(
+        outbound_sym_key: &Aes128Gcm,
+        pub_key: &TransportPublicKey,
+    ) -> Result<PacketData, bincode::Error> {
         static SERIALIZED: OnceLock<Box<[u8]>> = OnceLock::new();
-        let bytes = SERIALIZED.get_or_init(|| {
+        let bytes = SERIALIZED.get_or_init(move || {
             let mut packet = [0u8; MAX_PACKET_SIZE];
-            let size = bincode::serialized_size(&Self::ACK_OK).unwrap();
+            let size = bincode::serialized_size(&SymmetricMessage {
+                message_id: FIRST_MESSAGE_ID,
+                confirm_receipt: None,
+                payload: SymmetricMessagePayload::AckConnection {
+                    result: Ok(pub_key.clone()),
+                },
+            })
+            .unwrap();
             bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_ERROR).unwrap();
             (&packet[..size as usize]).into()
         });
@@ -79,18 +89,14 @@ impl SymmetricMessage {
             )),
         },
     };
-
-    const ACK_OK: SymmetricMessage = SymmetricMessage {
-        message_id: FIRST_MESSAGE_ID,
-        confirm_receipt: None,
-        payload: SymmetricMessagePayload::AckConnection { result: Ok(()) },
-    };
 }
 
 #[derive(Serialize, Deserialize)]
 pub(super) enum SymmetricMessagePayload {
     AckConnection {
-        result: Result<(), Cow<'static, str>>,
+        // if we successfully connected to a remote we attempt to connect to initially
+        // then we return our TransportPublicKey so they can enroute other peers to us
+        result: Result<TransportPublicKey, Cow<'static, str>>,
     },
     ShortMessage {
         payload: MessagePayload,

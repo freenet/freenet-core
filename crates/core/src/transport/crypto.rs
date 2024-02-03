@@ -1,5 +1,6 @@
 use rand::rngs::OsRng;
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
+use serde::{Deserialize, Serialize};
 
 pub(super) struct TransportKeypair {
     pub public: TransportPublicKey,
@@ -21,6 +22,7 @@ impl TransportKeypair {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone)]
 pub(super) struct TransportPublicKey(RsaPublicKey);
 
 impl TransportPublicKey {
