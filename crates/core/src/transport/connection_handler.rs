@@ -346,32 +346,30 @@ impl UdpPacketsListener {
                     }
                 }
                 ConnectionState::AckConnection => {
-                    // let packet = PacketData::from(&packet[..size]);
-                    // let decrypted = packet.decrypt(&inbound_sym_key).unwrap();
-                    //     let packet =
-                    //         bincode::deserialize::<SymmetricMessage>(decrypted.data())?;
-                    //     if let SymmetricMessagePayload::AckConnection { result: Ok(_) } =
-                    //         packet.payload
-                    //     {
-                    //         let (inbound_sender, inbound_recv) = mpsc::channel(1);
-                    //         return Ok((
-                    //             RemoteConnection {
-                    //                 outbound_symmetric_key: outbound_sym_key
-                    //                     .expect("should be set at this stage"),
-                    //                 inbound_packet_sender: inbound_sender,
-                    //                 remote_is_gateway: false,
-                    //                 remote_addr,
-                    //                 last_message_id: 0,
-                    //             },
-                    //             inbound_recv,
-                    //             inbound_sym_key,
-                    //         ));
-                    //     }
-                    //     tracing::debug!("Received unrecognized message from remote");
-                    //     return Err(TransportError::ConnectionEstablishmentFailure {
-                    //         cause: "received unrecognized message from remote".into(),
-                    //     });
-                    todo!("need to send our public remote key");
+                    let acknowledgment = SymmetricMessage::ack_ok(
+                        outbound_sym_key.as_mut().unwrap(),
+                        &self.this_peer_keypair.public,
+                    )?;
+                    let _ = self
+                        .socket
+                        .send_to(acknowledgment.data(), remote_addr)
+                        .await;
+                    // we are connected to the remote and we just send the pub key to them
+                    // if they fail to receive it, they will re-request the packet through
+                    // the regular error control mechanism
+                    // todo: we need to cache this packet in case is requested again
+                    return Ok((
+                        RemoteConnection {
+                            outbound_symmetric_key: outbound_sym_key
+                                .expect("should be set at this stage"),
+                            inbound_packet_sender: mpsc::channel(1).0,
+                            remote_is_gateway: false,
+                            remote_addr,
+                            last_message_id: 0,
+                        },
+                        mpsc::channel(1).1,
+                        inbound_sym_key,
+                    ));
                 }
                 ConnectionState::RemoteResponse { .. } => {
                     if outbound_intro_packet.is_none() {
@@ -396,14 +394,7 @@ impl UdpPacketsListener {
                         tick.tick().await;
                         continue;
                     }
-                } // ConnectionState::AckConnection => {
-                  //     self.socket
-                  //         .send_to(
-                  //             SymmetricMessage::ack_ok(outbound_sym_key.as_mut().unwrap())?.data(),
-                  //             remote_addr,
-                  //         )
-                  //         .await?;
-                  // }
+                }
             }
             let next_inbound = {
                 // todo: if a message is received from a different remote, reduce the timeout
@@ -479,10 +470,6 @@ impl UdpPacketsListener {
                                 }
                                 // if is not an intro packet, the connection is successful and we can proceed
                                 let (inbound_sender, inbound_recv) = mpsc::channel(1);
-                                // todo: check if the whole ack stuff is necessary, we are not even sending it once here...
-                                // the Ack packet in practice is our intro_packet with the encrypted key, seems unnecessary
-                                // (in the docs this is Bob sending to Alice), if we reach this point it means the NAT has been traversed
-                                // and the remote is ready to receive our messages
                                 // todo: store the intro_packet to filter potential duplicates later (and probably dismiss that after a while)
                                 return Ok((
                                     RemoteConnection {
@@ -501,33 +488,7 @@ impl UdpPacketsListener {
                         ConnectionState::AckConnection => {
                             // we never reach this state cause we break out of this function before checking for more remote packets
                             unreachable!()
-                        } // ConnectionState::AckConnection => {
-                          //     let packet = PacketData::from(&packet[..size]);
-                          //     let decrypted = packet.decrypt(&inbound_sym_key).unwrap();
-                          //     let packet =
-                          //         bincode::deserialize::<SymmetricMessage>(decrypted.data())?;
-                          //     if let SymmetricMessagePayload::AckConnection { result: Ok(_) } =
-                          //         packet.payload
-                          //     {
-                          //         let (inbound_sender, inbound_recv) = mpsc::channel(1);
-                          //         return Ok((
-                          //             RemoteConnection {
-                          //                 outbound_symmetric_key: outbound_sym_key
-                          //                     .expect("should be set at this stage"),
-                          //                 inbound_packet_sender: inbound_sender,
-                          //                 remote_is_gateway: false,
-                          //                 remote_addr,
-                          //                 last_message_id: 0,
-                          //             },
-                          //             inbound_recv,
-                          //             inbound_sym_key,
-                          //         ));
-                          //     }
-                          //     tracing::debug!("Received unrecognized message from remote");
-                          //     return Err(TransportError::ConnectionEstablishmentFailure {
-                          //         cause: "received unrecognized message from remote".into(),
-                          //     });
-                          // }
+                        }
                     }
                 }
                 Ok(Err(io_error)) => {
