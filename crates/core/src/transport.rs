@@ -2,12 +2,13 @@
 //! Freenet Transport protocol implementation.
 //!
 //! Please see `docs/architecture/transport.md` for more information.
-
+//!
 mod bw;
 mod connection_handler;
 mod crypto;
 mod packet_data;
 mod peer_connection;
+// todo: optimize trackers
 mod received_packet_tracker;
 mod sent_packet_tracker;
 mod symmetric_message;

@@ -15,8 +15,9 @@ pub(super) struct SymmetricMessage {
     pub message_id: u32,
     // todo: profile what is better here on average in the future
     // (vec, fixed array size of what given length etc.
-    #[serde_as(as = "Option<[_; 50]>")]
-    pub confirm_receipt: Option<[u32; 50]>,
+    // #[serde_as(as = "Option<[_; 50]>")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub confirm_receipt: Vec<u32>,
     pub payload: SymmetricMessagePayload,
 }
 
@@ -48,7 +49,7 @@ impl SymmetricMessage {
             let mut packet = [0u8; MAX_PACKET_SIZE];
             let size = bincode::serialized_size(&SymmetricMessage {
                 message_id: FIRST_MESSAGE_ID,
-                confirm_receipt: None,
+                confirm_receipt: vec![],
                 payload: SymmetricMessagePayload::AckConnection {
                     result: Ok(pub_key.clone()),
                 },
@@ -65,10 +66,11 @@ impl SymmetricMessage {
         message_id: u32,
         payload: MessagePayload,
         outbound_sym_key: &Aes128Gcm,
+        confirm_receipt: Vec<u32>,
     ) -> Result<PacketData, bincode::Error> {
         let message = Self {
             message_id,
-            confirm_receipt: None,
+            confirm_receipt,
             payload: SymmetricMessagePayload::ShortMessage { payload },
         };
         let mut packet = [0u8; MAX_PACKET_SIZE]; // todo: optimize this
@@ -81,7 +83,7 @@ impl SymmetricMessage {
 
     const ACK_ERROR: SymmetricMessage = SymmetricMessage {
         message_id: FIRST_MESSAGE_ID,
-        confirm_receipt: None,
+        confirm_receipt: Vec::new(),
         payload: SymmetricMessagePayload::AckConnection {
             // todo: change to return UnsupportedProtocolVersion
             result: Err(Cow::Borrowed(

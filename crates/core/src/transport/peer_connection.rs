@@ -17,7 +17,7 @@ use super::{
 ///
 /// Can be awaited for incoming messages or used to send messages to the remote peer.
 pub(crate) struct PeerConnection {
-    pub(super) inbound_recv: mpsc::Receiver<PacketData>,
+    pub(super) inbound_recv: mpsc::Receiver<SymmetricMessagePayload>,
     pub(super) outbound_sender: mpsc::Sender<SerializedMessage>,
     pub(super) inbound_sym_key: Aes128Gcm,
     pub(super) ongoing_stream: Option<ReceiverStream>,
@@ -31,7 +31,7 @@ impl Future for PeerConnection {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         use SymmetricMessagePayload::*;
-        let packet_data = match self.inbound_recv.poll_recv(cx) {
+        let payload = match self.inbound_recv.poll_recv(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(None) => {
                 // connection finished
@@ -39,14 +39,6 @@ impl Future for PeerConnection {
             }
             Poll::Ready(Some(packet)) => packet,
         };
-        let decrypted = match packet_data
-            .decrypt(&self.inbound_sym_key)
-            .map_err(TransportError::PrivateKeyDecryptionError)
-        {
-            Ok(decrypted) => decrypted,
-            Err(e) => return Poll::Ready(Err(e)),
-        };
-        let SymmetricMessage { payload, .. } = SymmetricMessage::deser(decrypted.data())?;
         // todo: handle out of order messages, repeated messages, missing packets, etc.
         match payload {
             ShortMessage { payload } => Poll::Ready(Ok(payload)),

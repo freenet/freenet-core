@@ -11,7 +11,12 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
 
+use crate::transport::received_packet_tracker::ReportResult;
+use crate::util::CachingSystemTimeSrc;
+
 use super::peer_connection::SenderStreamError;
+use super::received_packet_tracker::ReceivedPacketTracker;
+use super::sent_packet_tracker::SentPacketTracker;
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
     packet_data::{MAX_DATA_SIZE, MAX_PACKET_SIZE},
@@ -34,7 +39,10 @@ const MAX_INTERVAL: Duration = Duration::from_millis(5000); // Maximum interval 
 
 type ConnectionHandlerMessage = (SocketAddr, Vec<u8>);
 pub type SerializedMessage = Vec<u8>;
-type PeerChannel = (mpsc::Sender<SerializedMessage>, mpsc::Receiver<PacketData>);
+type PeerChannel = (
+    mpsc::Sender<SerializedMessage>,
+    mpsc::Receiver<SymmetricMessagePayload>,
+);
 
 struct OutboundMessage {
     remote_addr: SocketAddr,
@@ -150,6 +158,7 @@ enum ConnectionState {
     AckConnection,
 }
 
+// todo: review potential issues with packet sending fairness per remote
 impl UdpPacketsListener {
     async fn listen(mut self) {
         let mut peer_messages = FuturesUnordered::new();
@@ -165,12 +174,22 @@ impl UdpPacketsListener {
                         Ok((size, remote_addr)) => {
                             let remote_conn = self.remote_connections.remove(&remote_addr);
                             match remote_conn {
-                                Some(remote_conn) => {
+                                Some(mut remote_conn) => {
                                     // todo: in the future optimize this to just take a PacketData only as large as necessary
-                                    let packet_data = PacketData::from(std::mem::replace(&mut buf, [0; MAX_PACKET_SIZE]));
-                                    if remote_conn.inbound_packet_sender.send(packet_data).await.is_err() {
-                                        // dropping this remote connection since we don't care about their messages anymore
-                                        tracing::debug!(%remote_addr, "Remote disconnected");
+                                    let packet_data = PacketData::from(&buf[..size]);
+                                    let decrypted = packet_data.decrypt(&remote_conn.outbound_symmetric_key).map_err(|e| {
+                                        tracing::error!(%e, ?remote_addr, "Failed to decrypt packet");
+                                    }).unwrap();
+                                    let msg = SymmetricMessage::deser(decrypted.data()).unwrap();
+                                    match remote_conn.received_tracker.report_received_packet(msg.message_id) {
+                                        ReportResult::Ok => {
+                                            if remote_conn.inbound_packet_sender.send(msg.payload).await.is_err() {
+                                                // dropping this remote connection since we don't care about their messages anymore
+                                                tracing::debug!(%remote_addr, "Remote disconnected");
+                                            }
+                                        },
+                                        ReportResult::AlreadyReceived => {}
+                                        ReportResult::QueueFull => todo!(),
                                     }
                                 }
                                 None => {
@@ -191,38 +210,31 @@ impl UdpPacketsListener {
                             }
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to receive UDP packet: {:?}", e);
+                            // todo: this should panic and be propgated to the rest of the peer or retry and eventually fail
+                            tracing::error!("Failed to receive UDP packet: {:?}", e);
+                            break;
                         }
                     }
                 },
                 // Handling of connection events
                 send_message = self.connection_handler.recv() => {
-                    if let Some((remote_addr, event)) = send_message {
-                        match event {
-                            ConnectionEvent::SendRawPacket(data) => {
-                                if let Err(e) = self.socket.send_to(data.data(), remote_addr).await {
-                                    tracing::warn!("Failed to send UDP packet: {:?}", e);
-                                }
-                            }
-                            ConnectionEvent::ConnectionStart { remote_public_key, open_connection  }  => {
-                                if let Some(((outbound_sender, inbound_recv), inbound_sym_key, outbound_receiver)) = self.inbound_connections.remove(&remote_addr) {
-                                    let _ = open_connection.send(Ok(((outbound_sender, inbound_recv), inbound_sym_key)));
-                                    peer_messages.push(peer_message(outbound_receiver, remote_addr));
-                                    continue;
-                                }
-                                match self.traverse_nat(remote_addr, ConnectionState::Start { remote_public_key }).await {
-                                    Err(error) => {
-                                        tracing::error!(%error, ?remote_addr, "Failed to establish connection");
-                                        let _ = open_connection.send(Err(error));
-                                    }
-                                    Ok((remote_connection, inbound_recv, inbound_sym_key)) => {
-                                        let (outbound_sender, outbound_receiver) = mpsc::channel(1);
-                                        self.remote_connections.insert(remote_addr, remote_connection);
-                                        let _ = open_connection.send(Ok(((outbound_sender, inbound_recv), inbound_sym_key)));
-                                        peer_messages.push(peer_message(outbound_receiver, remote_addr));
-                                    }
-                                }
-                            }
+                    let Some((remote_addr, event)) = send_message else { break; };
+                    let   ConnectionEvent::ConnectionStart { remote_public_key, open_connection  }  = event;
+                    if let Some(((outbound_sender, inbound_recv), inbound_sym_key, outbound_receiver)) = self.inbound_connections.remove(&remote_addr) {
+                        let _ = open_connection.send(Ok(((outbound_sender, inbound_recv), inbound_sym_key)));
+                        peer_messages.push(peer_message(outbound_receiver, remote_addr));
+                        continue;
+                    }
+                    match self.traverse_nat(remote_addr, ConnectionState::Start { remote_public_key }).await {
+                        Err(error) => {
+                            tracing::error!(%error, ?remote_addr, "Failed to establish connection");
+                            let _ = open_connection.send(Err(error));
+                        }
+                        Ok((remote_connection, inbound_recv, inbound_sym_key)) => {
+                            let (outbound_sender, outbound_receiver) = mpsc::channel(1);
+                            self.remote_connections.insert(remote_addr, remote_connection);
+                            let _ = open_connection.send(Ok(((outbound_sender, inbound_recv), inbound_sym_key)));
+                            peer_messages.push(peer_message(outbound_receiver, remote_addr));
                         }
                     }
                 },
@@ -271,6 +283,7 @@ impl UdpPacketsListener {
         mut remote_conn: RemoteConnection,
         serialized_data: SerializedMessage,
     ) -> Result<RemoteConnection, TransportError> {
+        let receipts = remote_conn.received_tracker.get_receipts();
         if serialized_data.len() > MAX_DATA_SIZE {
             let mut sender = SenderStream::new(&self.socket, &mut remote_conn);
             sender.send(serialized_data).await?;
@@ -280,10 +293,14 @@ impl UdpPacketsListener {
                 msg_id,
                 serialized_data,
                 &remote_conn.outbound_symmetric_key,
+                receipts,
             )?;
             self.socket
                 .send_to(packet.data(), remote_conn.remote_addr)
                 .await?;
+            remote_conn
+                .sent_tracker
+                .report_sent_packet(msg_id, packet.data().to_vec()); // todo: should not need call to_vec here
         }
         Ok(remote_conn)
     }
@@ -292,7 +309,14 @@ impl UdpPacketsListener {
         &self,
         remote_addr: SocketAddr,
         mut state: ConnectionState,
-    ) -> Result<(RemoteConnection, mpsc::Receiver<PacketData>, Aes128Gcm), TransportError> {
+    ) -> Result<
+        (
+            RemoteConnection,
+            mpsc::Receiver<SymmetricMessagePayload>,
+            Aes128Gcm,
+        ),
+        TransportError,
+    > {
         // Initialize timeout and interval
         let mut timeout = INITIAL_TIMEOUT;
         let mut interval_duration = INITIAL_INTERVAL;
@@ -365,6 +389,8 @@ impl UdpPacketsListener {
                             inbound_packet_sender: mpsc::channel(1).0,
                             remote_is_gateway: false,
                             remote_addr,
+                            received_tracker: ReceivedPacketTracker::new(),
+                            sent_tracker: SentPacketTracker::new(),
                             last_message_id: 0,
                         },
                         mpsc::channel(1).1,
@@ -478,6 +504,8 @@ impl UdpPacketsListener {
                                         inbound_packet_sender: inbound_sender,
                                         remote_is_gateway: false,
                                         remote_addr,
+                                        received_tracker: ReceivedPacketTracker::new(),
+                                        sent_tracker: SentPacketTracker::new(),
                                         last_message_id: 0,
                                     },
                                     inbound_recv,
@@ -528,7 +556,14 @@ impl UdpPacketsListener {
         &self,
         remote_addr: SocketAddr,
         packet: PacketData,
-    ) -> Result<(RemoteConnection, mpsc::Receiver<PacketData>, Aes128Gcm), TransportError> {
+    ) -> Result<
+        (
+            RemoteConnection,
+            mpsc::Receiver<SymmetricMessagePayload>,
+            Aes128Gcm,
+        ),
+        TransportError,
+    > {
         // logic for gateway should be slightly different cause we don't need to do nat traversal
         let decrypted_packet = match self.this_peer_keypair.secret.decrypt(packet.data()) {
             Ok(req) => req,
@@ -572,14 +607,12 @@ async fn peer_message(
     })
 }
 
-#[allow(clippy::large_enum_variant)]
 // we don't care about ConnectionStart being smaller since it's only used to establish the connection
 enum ConnectionEvent {
     ConnectionStart {
         remote_public_key: TransportPublicKey,
         open_connection: oneshot::Sender<Result<(PeerChannel, Aes128Gcm), TransportError>>,
     },
-    SendRawPacket(PacketData),
 }
 
 #[must_use]
@@ -587,7 +620,9 @@ pub(super) struct RemoteConnection {
     outbound_symmetric_key: Aes128Gcm,
     remote_is_gateway: bool,
     remote_addr: SocketAddr,
-    inbound_packet_sender: mpsc::Sender<PacketData>,
+    inbound_packet_sender: mpsc::Sender<SymmetricMessagePayload>,
+    received_tracker: ReceivedPacketTracker<CachingSystemTimeSrc>,
+    sent_tracker: SentPacketTracker<CachingSystemTimeSrc>,
     last_message_id: u32,
 }
 

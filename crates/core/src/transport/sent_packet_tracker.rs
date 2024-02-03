@@ -2,7 +2,6 @@ use super::{MessageId, MessagePayload, MAX_CONFIRMATION_DELAY};
 use crate::util::{CachingSystemTimeSrc, TimeSource};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
-use tracing::warn;
 
 const NETWORK_DELAY_ALLOWANCE: Duration = Duration::from_millis(500);
 

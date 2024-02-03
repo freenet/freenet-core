@@ -100,6 +100,7 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
     }
 }
 
+#[must_use]
 #[derive(Debug, PartialEq)]
 pub(super) enum ReportResult {
     /// Packet was received for the first time and recorded
