@@ -3,7 +3,6 @@
 use std::ops::{Deref, DerefMut};
 
 use either::Either;
-use libp2p::swarm::StreamUpgradeError;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
@@ -55,17 +54,6 @@ pub(crate) enum ConnectionError {
 impl From<std::io::Error> for ConnectionError {
     fn from(err: std::io::Error) -> Self {
         Self::IOError(format!("{err}"))
-    }
-}
-
-impl<TUpgrErr: std::error::Error> From<StreamUpgradeError<TUpgrErr>> for ConnectionError {
-    fn from(err: StreamUpgradeError<TUpgrErr>) -> Self {
-        match err {
-            StreamUpgradeError::Timeout => Self::Timeout,
-            StreamUpgradeError::Apply(err) => Self::Upgrade(format!("{err}")),
-            StreamUpgradeError::NegotiationFailed => Self::NegotiationFailed,
-            StreamUpgradeError::Io(err) => Self::IOError(format!("{err}")),
-        }
     }
 }
 

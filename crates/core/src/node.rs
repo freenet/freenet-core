@@ -8,6 +8,7 @@
 //! - in-memory: a simplifying node used for emulation purposes mainly.
 //! - inter-process: similar to in-memory, but can be rana cross multiple processes, closer to the real p2p impl
 
+use std::net::SocketAddr;
 use std::{
     fmt::Display,
     io::Write,
@@ -815,7 +816,7 @@ where
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
-pub struct PeerId(Libp2pPeerId);
+pub struct PeerId(SocketAddr);
 
 #[cfg(test)]
 impl<'a> arbitrary::Arbitrary<'a> for PeerId {
