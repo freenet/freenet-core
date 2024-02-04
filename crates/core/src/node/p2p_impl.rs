@@ -9,6 +9,7 @@ use super::{
     },
     NetEventRegister, PeerId as FreenetPeerId,
 };
+use crate::transport::connection_handler::ConnectionHandler;
 use crate::transport::crypto::TransportKeypair;
 use crate::{
     client_events::{combinator::ClientEventsCombinator, BoxedClient},

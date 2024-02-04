@@ -24,7 +24,6 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ErrorKind},
     prelude::{ContractKey, RelatedContracts, WrappedState},
 };
-use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId as Libp2pPeerId};
 
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
@@ -54,6 +53,7 @@ pub use network_bridge::inter_process::InterProcessConnManager;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
 
 use crate::topology::rate::Rate;
+use crate::transport::crypto::{TransportKeypair, TransportPublicKey};
 pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
 mod network_bridge;
@@ -196,7 +196,7 @@ impl NodeConfig {
         self,
         config: PeerCliConfig,
         clients: [BoxedClient; CLIENTS],
-        private_key: identity::Keypair,
+        private_key: TransportKeypair,
     ) -> Result<Node, anyhow::Error> {
         let event_register = {
             #[cfg(feature = "trace-ot")]
@@ -267,16 +267,16 @@ impl Default for NodeConfig {
 /// Gateway node to bootstrap the network.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct InitPeerNode {
-    addr: Option<Multiaddr>,
+    addr: Option<SocketAddr>,
     identifier: PeerId,
     location: Location,
 }
 
 impl InitPeerNode {
-    pub fn new(identifier: Libp2pPeerId, location: Location) -> Self {
+    pub fn new(identifier: SocketAddr, pub_key: TransportPublicKey, location: Location) -> Self {
         Self {
             addr: None,
-            identifier: PeerId(identifier),
+            identifier: PeerId::new(identifier, pub_key),
             location,
         }
     }
@@ -285,21 +285,21 @@ impl InitPeerNode {
     ///
     /// # Panic
     /// Will panic if is not a valid representation.
-    pub fn decode_peer_id<T: AsMut<[u8]>>(mut bytes: T) -> Libp2pPeerId {
-        Libp2pPeerId::from_public_key(
-            &identity::Keypair::from(
-                identity::ed25519::Keypair::try_from_bytes(bytes.as_mut()).unwrap(),
-            )
-            .public(),
-        )
+    pub fn decode_peer_id<T: AsMut<[u8]>>(mut bytes: T) -> SocketAddr {
+        let mut bytes = bytes.as_mut();
+        let len = bytes.len();
+        let port = u16::from_be_bytes([bytes[len - 2], bytes[len - 1]]);
+        bytes.truncate(len - 2);
+        let ip = Ipv4Addr::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        SocketAddr::new(ip.into(), port)
     }
 
     /// IP which will be assigned to this node.
     pub fn listening_ip<T: Into<IpAddr>>(mut self, ip: T) -> Self {
         if let Some(addr) = &mut self.addr {
-            addr.push(Protocol::from(ip.into()));
+            addr.set_ip(ip.into());
         } else {
-            self.addr = Some(Multiaddr::from(ip.into()));
+            self.addr = Some(SocketAddr::new(ip.into(), 0));
         }
         self
     }
@@ -308,9 +308,9 @@ impl InitPeerNode {
     /// If not specified port 7800 will be used as default.
     pub fn listening_port(mut self, port: u16) -> Self {
         if let Some(addr) = &mut self.addr {
-            addr.push(Protocol::Tcp(port));
+            addr.set_port(port);
         } else {
-            self.addr = Some(Multiaddr::from(Protocol::Tcp(port)));
+            self.addr = Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port));
         }
         self
     }
@@ -815,30 +815,45 @@ where
     Ok(())
 }
 
-#[derive(PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
-pub struct PeerId(SocketAddr);
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
+pub struct PeerId {
+    addr: SocketAddr,
+    pub_key: TransportPublicKey,
+}
+
+impl PeerId {
+    pub fn new(addr: SocketAddr, pub_key: TransportPublicKey) -> Self {
+        Self { addr, pub_key }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    pub fn pub_key(&self) -> &TransportPublicKey {
+        self.pub_key.borrow()
+    }
+}
 
 #[cfg(test)]
 impl<'a> arbitrary::Arbitrary<'a> for PeerId {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let data: [u8; 32] = u.arbitrary()?;
-        let id = Libp2pPeerId::from_multihash(
-            libp2p::multihash::Multihash::wrap(0, data.as_slice()).unwrap(),
-        )
-        .unwrap();
-        Ok(Self(id))
+        let addr = u.arbitrary()?;
+        let pub_key = TransportPublicKey::arbitrary(u)?;
+        Ok(Self { addr, pub_key })
     }
 }
 
 impl PeerId {
     pub fn random() -> Self {
-        use libp2p::identity::Keypair;
-        PeerId::from(Keypair::generate_ed25519().public())
+        let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
+        let pub_key = TransportPublicKey::random();
+        Self { addr, pub_key }
     }
 
     #[cfg(test)]
     pub fn to_bytes(self) -> Vec<u8> {
-        self.0.to_bytes()
+        bincode::serialize(&self).unwrap()
     }
 }
 
@@ -850,54 +865,6 @@ impl std::fmt::Debug for PeerId {
 
 impl Display for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<identity::PublicKey> for PeerId {
-    fn from(val: identity::PublicKey) -> Self {
-        PeerId(Libp2pPeerId::from(val))
-    }
-}
-
-impl From<Libp2pPeerId> for PeerId {
-    fn from(val: Libp2pPeerId) -> Self {
-        PeerId(val)
-    }
-}
-
-impl FromStr for PeerId {
-    type Err = libp2p_identity::ParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(Libp2pPeerId::from_str(s)?))
-    }
-}
-
-mod serialization {
-    use libp2p::PeerId as Libp2pPeerId;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    use super::PeerId;
-
-    impl Serialize for PeerId {
-        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
-        {
-            serializer.serialize_bytes(&self.0.to_bytes())
-        }
-    }
-
-    impl<'de> Deserialize<'de> for PeerId {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
-            Ok(PeerId(
-                Libp2pPeerId::from_bytes(&bytes).expect("failed deserialization of PeerKey"),
-            ))
-        }
+        write!(f, "{:?}", self.addr)
     }
 }

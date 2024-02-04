@@ -23,7 +23,7 @@ impl TransportKeypair {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(super) struct TransportPublicKey(RsaPublicKey);
+pub(crate) struct TransportPublicKey(RsaPublicKey);
 
 impl TransportPublicKey {
     pub fn encrypt(&self, data: &[u8]) -> Vec<u8> {

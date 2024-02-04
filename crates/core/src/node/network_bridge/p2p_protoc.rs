@@ -14,10 +14,11 @@ use tracing::Instrument;
 
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::node::PeerId;
-use crate::transport::{crypto::TransportKeypair, peer_connection::PeerConnection};
+use crate::transport::connection_handler::ConnectionHandler;
+use crate::transport::{crypto::TransportKeypair, peer_connection::PeerConnection, BytesPerSecond};
 use crate::{
     client_events::ClientId,
-    config::{self, GlobalExecutor},
+    config::GlobalExecutor,
     contract::{
         ClientResponsesSender, ContractHandlerChannel, ExecutorToEventLoopChannel,
         NetworkEventListenerHalve, WaitingResolution,
@@ -111,6 +112,7 @@ impl NetworkBridge for P2pBridge {
 }
 
 pub(in crate::node) struct P2pConnManager {
+    conn_handler: ConnectionHandler,
     pub(in crate::node) gateways: Vec<PeerKeyLocation>,
     pub(in crate::node) bridge: P2pBridge,
     conn_bridge_rx: Receiver<P2pBridgeEvent>,
@@ -146,11 +148,23 @@ impl P2pConnManager {
             None
         };
 
+        let listen_port = public_addr
+            .ok_or_else(|| anyhow::anyhow!("private_addr does not contain a port"))?
+            .port();
+
+        let conn_handler = ConnectionHandler::new(
+            private_key,
+            listen_port,
+            config.is_gateway(),
+            BytesPerSecond::new(0.1),
+        );
+
         let (tx_bridge_cmd, rx_bridge_cmd) = mpsc::channel(100);
         let bridge = P2pBridge::new(tx_bridge_cmd, op_manager, event_listener.clone());
 
         let gateways = config.get_gateways()?;
         Ok(P2pConnManager {
+            conn_handler,
             gateways,
             bridge,
             conn_bridge_rx: rx_bridge_cmd,
