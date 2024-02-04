@@ -116,6 +116,7 @@ impl ConnectionHandler {
                 outbound_sender,
                 inbound_sym_key,
                 ongoing_stream: None,
+                pub_key: None,
             })
         } else {
             todo!("establish connection with a gateway")
@@ -195,9 +196,23 @@ impl UdpPacketsListener {
                                     let msg = SymmetricMessage::deser(decrypted.data()).unwrap();
                                     if let SymmetricMessagePayload::AckConnection { result } = &msg.payload {
                                         match result {
-                                            Ok(pub_key) => {}
+                                            Ok(pub_key) => {
+                                                if let Some(((outbound_sender, inbound_recv), inbound_sym_key, outbound_receiver)) = self.inbound_connections.remove(&remote_addr) {
+                                                    if self.new_connection_notifier.send(PeerConnection {
+                                                        inbound_recv,
+                                                        outbound_sender,
+                                                        inbound_sym_key,
+                                                        ongoing_stream: None,
+                                                        pub_key: Some(pub_key.clone()),
+                                                    }).await.is_err() {
+                                                        break;
+                                                    }
+                                                    peer_messages.push(peer_message(outbound_receiver, remote_addr));
+                                                }
+                                            }
                                             Err(error) => {
                                                 tracing::error!(%error, ?remote_addr, "Failed to establish connection");
+                                                continue;
                                             }
                                         }
                                     }
@@ -280,11 +295,6 @@ impl UdpPacketsListener {
                 send_message = self.connection_handler.recv() => {
                     let Some((remote_addr, event)) = send_message else { break; };
                     let ConnectionEvent::ConnectionStart { remote_public_key, open_connection } = event;
-                    if let Some(((outbound_sender, inbound_recv), inbound_sym_key, outbound_receiver)) = self.inbound_connections.remove(&remote_addr) {
-                        let _ = open_connection.send(Ok(((outbound_sender, inbound_recv), inbound_sym_key)));
-                        peer_messages.push(peer_message(outbound_receiver, remote_addr));
-                        continue;
-                    }
                     match self.traverse_nat(remote_addr, ConnectionState::StartOutbound { remote_public_key }).await {
                         Err(error) => {
                             tracing::error!(%error, ?remote_addr, "Failed to establish connection");

@@ -9,8 +9,9 @@ use tokio::{net::UdpSocket, sync::mpsc};
 
 use super::{
     connection_handler::{RemoteConnection, SerializedMessage, TransportError},
+    crypto::TransportPublicKey,
     packet_data::PacketData,
-    symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
+    symmetric_message::SymmetricMessagePayload,
 };
 
 /// Handles the connection with a remote peer.
@@ -21,6 +22,10 @@ pub(crate) struct PeerConnection {
     pub(super) outbound_sender: mpsc::Sender<SerializedMessage>,
     pub(super) inbound_sym_key: Aes128Gcm,
     pub(super) ongoing_stream: Option<ReceiverStream>,
+    /// In case the connection is from a joiner they will send back their public key
+    /// so we can handle that back to other peers in the network in case they want to connect
+    /// with this joiner.
+    pub(super) pub_key: Option<TransportPublicKey>,
 }
 
 impl Future for PeerConnection {
