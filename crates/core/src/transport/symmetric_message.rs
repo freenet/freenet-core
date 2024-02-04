@@ -21,9 +21,8 @@ pub(super) struct SymmetricMessage {
     pub payload: SymmetricMessagePayload,
 }
 
-const FIRST_MESSAGE_ID: u32 = 0u32;
-
 impl SymmetricMessage {
+    pub const FIRST_MESSAGE_ID: u32 = 0u32;
     pub fn deser(bytes: &[u8]) -> Result<Self, bincode::Error> {
         bincode::deserialize(bytes)
     }
@@ -48,7 +47,7 @@ impl SymmetricMessage {
         let bytes = SERIALIZED.get_or_init(move || {
             let mut packet = [0u8; MAX_PACKET_SIZE];
             let size = bincode::serialized_size(&SymmetricMessage {
-                message_id: FIRST_MESSAGE_ID,
+                message_id: Self::FIRST_MESSAGE_ID,
                 confirm_receipt: vec![],
                 payload: SymmetricMessagePayload::AckConnection {
                     result: Ok(pub_key.clone()),
@@ -82,7 +81,7 @@ impl SymmetricMessage {
     }
 
     const ACK_ERROR: SymmetricMessage = SymmetricMessage {
-        message_id: FIRST_MESSAGE_ID,
+        message_id: Self::FIRST_MESSAGE_ID,
         confirm_receipt: Vec::new(),
         payload: SymmetricMessagePayload::AckConnection {
             // todo: change to return UnsupportedProtocolVersion

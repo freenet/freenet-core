@@ -38,6 +38,7 @@ const fn _check_valid_size<const N: usize>() {
 }
 
 // todo: maybe split this into type for handling inbound (encrypted)/outbound (decrypted) packets for clarity
+#[derive(Clone)]
 pub(super) struct PacketData<const N: usize = MAX_PACKET_SIZE> {
     data: [u8; N],
     pub size: usize,
@@ -95,7 +96,7 @@ impl<const N: usize> PacketData<N> {
         &self.data[..self.size]
     }
 
-    pub(super) fn decrypt(self, inbound_sym_key: &Aes128Gcm) -> Result<Self, aes_gcm::Error> {
+    pub(super) fn decrypt(&self, inbound_sym_key: &Aes128Gcm) -> Result<Self, aes_gcm::Error> {
         debug_assert!(self.data.len() >= NONCE_SIZE + TAG_SIZE);
 
         let nonce = GenericArray::from_slice(&self.data[..NONCE_SIZE]);
@@ -112,6 +113,23 @@ impl<const N: usize> PacketData<N> {
             data: buffer,
             size: buffer_len,
         })
+    }
+
+    pub(super) fn is_intro_packet(&self, other: &PacketData<N>) -> bool {
+        if self.size != other.size {
+            return false;
+        }
+        let mut is_intro_packet = true;
+        // todo: how many bytes do we need to check to be sure that it's not the intro packet?
+        // for now we randomly check 64 bytes (intro_packet is 1500 bytes long)
+        for i in (0..64).map(|_| thread_rng().gen_range(0..self.size)) {
+            // todo: use a fast rng here?
+            if self.data[i] != other.data[i] {
+                is_intro_packet = false;
+                break;
+            }
+        }
+        is_intro_packet
     }
 }
 
