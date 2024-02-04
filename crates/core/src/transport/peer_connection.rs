@@ -8,7 +8,7 @@ use serde::Serialize;
 use tokio::{net::UdpSocket, sync::mpsc};
 
 use super::{
-    connection_handler::{RemoteConnection, SerializedMessage, TransportError},
+    connection_handler::{RemoteConnection, SerializedMessage, Socket, TransportError},
     crypto::TransportPublicKey,
     packet_data::PacketData,
     symmetric_message::SymmetricMessagePayload,
@@ -106,17 +106,17 @@ struct StreamedMessagePart {
 }
 
 /// Handles breaking a message into parts, encryption, etc.
-pub(super) struct SenderStream<'a> {
-    socket: &'a UdpSocket,
+pub(super) struct SenderStream<'a, S = UdpSocket> {
+    socket: &'a S,
 }
 
 impl<'a> SenderStream<'a> {
-    pub fn new(socket: &'a UdpSocket, remote_conn: &mut RemoteConnection) -> Self {
+    pub fn new<S: Socket>(socket: &'a S, remote_conn: &mut RemoteConnection) -> Self {
         todo!()
     }
 }
 
-impl Sink<StreamBytes> for SenderStream<'_> {
+impl<S> Sink<StreamBytes> for SenderStream<'_, S> {
     type Error = SenderStreamError;
 
     fn poll_ready(

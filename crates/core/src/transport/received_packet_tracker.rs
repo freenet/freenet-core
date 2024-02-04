@@ -220,7 +220,7 @@ pub(in crate::transport) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_many_trackers() {
         let mut trackers = vec![];
-        for i in 1..100 {
+        for _ in 1..100 {
             trackers.push(ReceivedPacketTracker::new());
         }
     }

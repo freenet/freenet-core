@@ -23,6 +23,7 @@ pub(super) struct SymmetricMessage {
 
 impl SymmetricMessage {
     pub const FIRST_MESSAGE_ID: u32 = 0u32;
+
     pub fn deser(bytes: &[u8]) -> Result<Self, bincode::Error> {
         bincode::deserialize(bytes)
     }

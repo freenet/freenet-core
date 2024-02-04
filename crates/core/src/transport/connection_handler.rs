@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::vec::Vec;
@@ -6,7 +8,7 @@ use std::{borrow::Cow, time::Duration};
 
 use aes_gcm::{Aes128Gcm, KeyInit};
 use futures::{stream::FuturesUnordered, FutureExt, SinkExt, StreamExt};
-use tokio::net::UdpSocket;
+use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
 
@@ -56,14 +58,14 @@ pub(crate) struct ConnectionHandler {
 }
 
 impl ConnectionHandler {
-    pub async fn new(
+    pub async fn new<S: Socket>(
         keypair: TransportKeypair,
         listen_port: u16,
         is_gateway: bool,
         max_upstream_rate: BytesPerSecond,
     ) -> Result<Self, TransportError> {
         // Bind the UDP socket to the specified port
-        let socket = UdpSocket::bind(("0.0.0.0", listen_port)).await?;
+        let socket = S::bind(("0.0.0.0", listen_port)).await?;
 
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(1);
@@ -74,8 +76,8 @@ impl ConnectionHandler {
             is_gateway,
             socket,
             this_peer_keypair: keypair,
-            remote_connections: HashMap::new(),
-            inbound_connections: HashMap::new(),
+            remote_connections: BTreeMap::new(),
+            inbound_connections: BTreeMap::new(),
             connection_handler: conn_handler_receiver,
             max_upstream_rate: max_upstream_rate.clone(),
             new_connection_notifier: new_connection_sender,
@@ -123,8 +125,15 @@ impl ConnectionHandler {
         }
     }
 
-    pub async fn new_connection(&mut self) -> Option<PeerConnection> {
-        self.new_connection_notifier.recv().await
+    pub async fn new_connection(&mut self) -> Option<(PeerConnection, TransportPublicKey)> {
+        let conn = self.new_connection_notifier.recv().await;
+        conn.map(|mut conn| {
+            let pub_key = conn
+                .pub_key
+                .take()
+                .expect("inboud connections should have their key reported");
+            (conn, pub_key)
+        })
     }
 
     fn update_max_upstream_rate(&mut self, max_upstream_rate: BytesPerSecond) {
@@ -132,22 +141,49 @@ impl ConnectionHandler {
     }
 }
 
+/// Make connection handler more testable
+pub(super) trait Socket: Sized + Send + Sync + 'static {
+    fn bind<A: ToSocketAddrs + Send>(addr: A) -> impl Future<Output = io::Result<Self>> + Send;
+    fn recv_from(
+        &self,
+        buf: &mut [u8],
+    ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send;
+    fn send_to<A: ToSocketAddrs + Send>(
+        &self,
+        buf: &[u8],
+        target: A,
+    ) -> impl Future<Output = io::Result<usize>> + Send;
+}
+
+impl Socket for UdpSocket {
+    async fn bind<A: ToSocketAddrs + Send>(addr: A) -> io::Result<Self> {
+        Self::bind(addr).await
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.recv_from(buf).await
+    }
+
+    async fn send_to<A: ToSocketAddrs + Send>(&self, buf: &[u8], target: A) -> io::Result<usize> {
+        self.send_to(buf, target).await
+    }
+}
+
 /// Handles UDP transport internally.
-struct UdpPacketsListener {
-    socket: UdpSocket,
-    // todo: since this maps will be rather small, change to using a vec
-    remote_connections: HashMap<SocketAddr, RemoteConnection>,
+struct UdpPacketsListener<S = UdpSocket> {
+    socket: S,
+    remote_connections: BTreeMap<SocketAddr, RemoteConnection>,
     connection_handler: mpsc::Receiver<(SocketAddr, ConnectionEvent)>,
     this_peer_keypair: TransportKeypair,
     max_upstream_rate: Arc<arc_swap::ArcSwap<BytesPerSecond>>,
     is_gateway: bool,
-    // todo: since this maps will be rather small, change to using a vec
     /// A new inbound connection that we haven't sent an explicit message yet
     inbound_connections:
-        HashMap<SocketAddr, (PeerChannel, Aes128Gcm, mpsc::Receiver<SerializedMessage>)>,
+        BTreeMap<SocketAddr, (PeerChannel, Aes128Gcm, mpsc::Receiver<SerializedMessage>)>,
     new_connection_notifier: mpsc::Sender<PeerConnection>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum ConnectionState {
     /// Initial state of the joiner
     StartOutbound {
@@ -164,7 +200,7 @@ enum ConnectionState {
 }
 
 // todo: review potential issues with packet sending fairness per remote
-impl UdpPacketsListener {
+impl<S: Socket> UdpPacketsListener<S> {
     async fn listen(mut self) {
         let mut peer_messages = FuturesUnordered::new();
         const DEFAULT_BW_TRACKER_WINDOW_SIZE: Duration = Duration::from_secs(10);
@@ -172,7 +208,8 @@ impl UdpPacketsListener {
         let mut bw_tracker = super::bw::PacketBWTracker::new(DEFAULT_BW_TRACKER_WINDOW_SIZE);
         // todo: refactor this loop a bit so the code is more readable
         // todo: we probably need to refactor this a bit so we don't block the socket listening
-        // with decryption, deserialziation etc. so we keep the socket getting new packets as fast as possible
+        // with decryption, deserialization, msg handling etc. so we keep the socket getting new packets
+        // from multiple peers as fast as possible
         loop {
             let mut buf = [0u8; MAX_PACKET_SIZE];
             tokio::select! {
@@ -646,7 +683,6 @@ async fn peer_message(
     })
 }
 
-// we don't care about ConnectionStart being smaller since it's only used to establish the connection
 enum ConnectionEvent {
     ConnectionStart {
         remote_public_key: TransportPublicKey,
@@ -676,7 +712,8 @@ impl RemoteConnection {
             }
         }
         self.inbound_checked_times += 1;
-        if self.inbound_checked_times >= UdpPacketsListener::NAT_TRAVERSAL_MAX_ATTEMPS {
+        if self.inbound_checked_times >= UdpPacketsListener::<UdpSocket>::NAT_TRAVERSAL_MAX_ATTEMPS
+        {
             // no point in checking more than the max attemps since they won't be sending
             // the intro packet more than this amount of times
             self.inbound_intro_packet = None;
@@ -708,3 +745,7 @@ pub(crate) enum TransportError {
     #[error("received unexpected message from remote: {0}")]
     UnexpectedMessage(Cow<'static, str>),
 }
+
+// TODO: add test for establishing a connection between two non-gateways (at localhost)
+// it should be already possible to do this with the current code
+// (spawn an other thread for the 2nd peer)
