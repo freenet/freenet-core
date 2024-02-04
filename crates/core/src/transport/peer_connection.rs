@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::task::Poll;
 use std::vec::Vec;
@@ -44,7 +45,6 @@ impl Future for PeerConnection {
             }
             Poll::Ready(Some(packet)) => packet,
         };
-        // todo: handle out of order messages, repeated messages, missing packets, etc.
         match payload {
             ShortMessage { payload } => Poll::Ready(Ok(payload)),
             AckConnection { .. } => Poll::Ready(Err(TransportError::UnexpectedMessage(
@@ -55,11 +55,10 @@ impl Future for PeerConnection {
                 index,
                 payload,
             } => {
-                // todo: IGNORE THIS FOR NOW, needs more work
                 let mut stream = self
                     .ongoing_stream
                     .take()
-                    .unwrap_or_else(|| ReceiverStream::new(total_length));
+                    .unwrap_or_else(|| ReceiverStream::new(total_length, index));
                 if let Some(msg) = stream.push_fragment(index, payload) {
                     return Poll::Ready(Ok(msg));
                 }
@@ -86,16 +85,56 @@ impl PeerConnection {
 
 type StreamBytes = Vec<u8>;
 
-pub(super) struct ReceiverStream {}
+// todo:  unit test
+pub(super) struct ReceiverStream {
+    start_index: u64,
+    total_length: u64,
+    last_contiguous: u64,
+    received_fragments: u64,
+    fragments: BTreeMap<u64, Vec<u8>>,
+    message: Vec<u8>,
+}
 
 impl ReceiverStream {
-    fn new(total_length: u64) -> Self {
-        todo!()
+    fn new(total_length: u64, start_index: u64) -> Self {
+        Self {
+            start_index,
+            total_length,
+            last_contiguous: start_index,
+            received_fragments: 0,
+            fragments: BTreeMap::new(),
+            message: vec![],
+        }
     }
 
     /// Returns some if the message has been completely streamed, none otherwise.
-    fn push_fragment(&mut self, index: u64, fragment: StreamBytes) -> Option<Vec<u8>> {
-        todo!()
+    fn push_fragment(&mut self, index: u64, mut fragment: StreamBytes) -> Option<Vec<u8>> {
+        self.received_fragments += 1;
+        if index == self.last_contiguous + 1 {
+            self.last_contiguous = index;
+            self.message.append(&mut fragment);
+            self.get_if_finished()
+        } else {
+            self.fragments.insert(index, fragment);
+            while let Some((idx, mut v)) = self.fragments.pop_first() {
+                if idx == self.last_contiguous + 1 {
+                    self.last_contiguous += 1;
+                    self.message.append(&mut v);
+                } else {
+                    self.fragments.insert(idx, v);
+                    break;
+                }
+            }
+            self.get_if_finished()
+        }
+    }
+
+    fn get_if_finished(&mut self) -> Option<Vec<u8>> {
+        if self.message.len() as u64 == self.total_length {
+            Some(std::mem::take(&mut self.message))
+        } else {
+            None
+        }
     }
 }
 

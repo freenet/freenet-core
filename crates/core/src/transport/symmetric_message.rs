@@ -104,6 +104,7 @@ pub(super) enum SymmetricMessagePayload {
         payload: MessagePayload,
     },
     LongMessageFragment {
+        /// Total length in bytes
         total_length: u64,
         index: u64,
         payload: MessagePayload,
