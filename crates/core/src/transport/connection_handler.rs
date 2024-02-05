@@ -118,22 +118,14 @@ impl ConnectionHandler {
                 outbound_sender,
                 inbound_sym_key,
                 ongoing_stream: None,
-                pub_key: None,
             })
         } else {
             todo!("establish connection with a gateway")
         }
     }
 
-    pub async fn new_connection(&mut self) -> Option<(PeerConnection, TransportPublicKey)> {
-        let conn = self.new_connection_notifier.recv().await;
-        conn.map(|mut conn| {
-            let pub_key = conn
-                .pub_key
-                .take()
-                .expect("inboud connections should have their key reported");
-            (conn, pub_key)
-        })
+    pub async fn new_connection(&mut self) -> Option<PeerConnection> {
+        self.new_connection_notifier.recv().await
     }
 
     fn update_max_upstream_rate(&mut self, max_upstream_rate: BytesPerSecond) {
@@ -233,14 +225,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     let msg = SymmetricMessage::deser(decrypted.data()).unwrap();
                                     if let SymmetricMessagePayload::AckConnection { result } = &msg.payload {
                                         match result {
-                                            Ok(pub_key) => {
+                                            Ok(_) => {
                                                 if let Some(((outbound_sender, inbound_recv), inbound_sym_key, outbound_receiver)) = self.inbound_connections.remove(&remote_addr) {
                                                     if self.new_connection_notifier.send(PeerConnection {
                                                         inbound_recv,
                                                         outbound_sender,
                                                         inbound_sym_key,
                                                         ongoing_stream: None,
-                                                        pub_key: Some(pub_key.clone()),
                                                     }).await.is_err() {
                                                         break;
                                                     }
@@ -357,8 +348,8 @@ impl<S: Socket> UdpPacketsListener<S> {
     ) -> Result<RemoteConnection, TransportError> {
         let receipts = remote_conn.received_tracker.get_receipts();
         if serialized_data.len() > MAX_DATA_SIZE {
-            let mut sender = SenderStream::new(&self.socket, &mut remote_conn);
-            sender.send(serialized_data).await?;
+            let mut sender = SenderStream::new(&self.socket, &mut remote_conn, serialized_data);
+            sender.send(()).await?;
         } else {
             let msg_id = remote_conn.last_message_id.wrapping_add(1);
             let packet = SymmetricMessage::short_message(
@@ -443,10 +434,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                     }
                 }
                 ConnectionState::AckConnectionOutbound => {
-                    let acknowledgment = SymmetricMessage::ack_ok(
-                        outbound_sym_key.as_mut().unwrap(),
-                        &self.this_peer_keypair.public,
-                    )?;
+                    let acknowledgment =
+                        SymmetricMessage::ack_ok(outbound_sym_key.as_mut().unwrap())?;
                     let _ = self
                         .socket
                         .send_to(acknowledgment.data(), remote_addr)
@@ -692,15 +681,15 @@ enum ConnectionEvent {
 
 #[must_use]
 pub(super) struct RemoteConnection {
-    outbound_symmetric_key: Aes128Gcm,
+    pub outbound_symmetric_key: Aes128Gcm,
     remote_is_gateway: bool,
-    remote_addr: SocketAddr,
+    pub remote_addr: SocketAddr,
     inbound_packet_sender: mpsc::Sender<SymmetricMessagePayload>,
-    received_tracker: ReceivedPacketTracker<CachingSystemTimeSrc>,
-    sent_tracker: SentPacketTracker<CachingSystemTimeSrc>,
+    pub received_tracker: ReceivedPacketTracker<CachingSystemTimeSrc>,
+    pub sent_tracker: SentPacketTracker<CachingSystemTimeSrc>,
     inbound_intro_packet: Option<PacketData>,
     inbound_checked_times: usize,
-    last_message_id: u32,
+    pub last_message_id: u32,
 }
 
 impl RemoteConnection {

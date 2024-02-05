@@ -8,10 +8,11 @@ use futures::Sink;
 use serde::Serialize;
 use tokio::{net::UdpSocket, sync::mpsc};
 
+use crate::transport::packet_data::MAX_PACKET_SIZE;
+
 use super::{
     connection_handler::{RemoteConnection, SerializedMessage, Socket, TransportError},
-    crypto::TransportPublicKey,
-    packet_data::PacketData,
+    packet_data::{PacketData, MAX_DATA_SIZE},
     symmetric_message::SymmetricMessagePayload,
 };
 
@@ -23,10 +24,6 @@ pub(crate) struct PeerConnection {
     pub(super) outbound_sender: mpsc::Sender<SerializedMessage>,
     pub(super) inbound_sym_key: Aes128Gcm,
     pub(super) ongoing_stream: Option<ReceiverStream>,
-    /// In case the connection is from a joiner they will send back their public key
-    /// so we can handle that back to other peers in the network in case they want to connect
-    /// with this joiner.
-    pub(super) pub_key: Option<TransportPublicKey>,
 }
 
 impl Future for PeerConnection {
@@ -87,16 +84,17 @@ type StreamBytes = Vec<u8>;
 
 // todo:  unit test
 pub(super) struct ReceiverStream {
-    start_index: u64,
+    start_index: u32,
     total_length: u64,
-    last_contiguous: u64,
+    // todo: although unlikey to ever happen, wrapping around the u32 limit is not handled
+    last_contiguous: u32,
     received_fragments: u64,
-    fragments: BTreeMap<u64, Vec<u8>>,
+    fragments: BTreeMap<u32, Vec<u8>>,
     message: Vec<u8>,
 }
 
 impl ReceiverStream {
-    fn new(total_length: u64, start_index: u64) -> Self {
+    fn new(total_length: u64, start_index: u32) -> Self {
         Self {
             start_index,
             total_length,
@@ -108,7 +106,7 @@ impl ReceiverStream {
     }
 
     /// Returns some if the message has been completely streamed, none otherwise.
-    fn push_fragment(&mut self, index: u64, mut fragment: StreamBytes) -> Option<Vec<u8>> {
+    fn push_fragment(&mut self, index: u32, mut fragment: StreamBytes) -> Option<Vec<u8>> {
         self.received_fragments += 1;
         if index == self.last_contiguous + 1 {
             self.last_contiguous = index;
@@ -140,34 +138,68 @@ impl ReceiverStream {
 
 struct StreamedMessagePart {
     data: PacketData,
-    part_start_position: usize,
-    message_size: usize,
+    part_position: usize,
 }
 
 /// Handles breaking a message into parts, encryption, etc.
 pub(super) struct SenderStream<'a, S = UdpSocket> {
     socket: &'a S,
+    remote_conn: &'a mut RemoteConnection,
+    message: StreamBytes,
+    start_index: u32,
+    sent_contiguos: usize,
+    total_messages: usize,
+    sent_not_confirmed: BTreeMap<u32, PacketData>,
 }
 
-impl<'a> SenderStream<'a> {
-    pub fn new<S: Socket>(socket: &'a S, remote_conn: &mut RemoteConnection) -> Self {
-        todo!()
+impl<'a, S: Socket> SenderStream<'a, S> {
+    pub fn new(
+        socket: &'a S,
+        remote_conn: &'a mut RemoteConnection,
+        whole_message: StreamBytes,
+    ) -> Self {
+        let start_index = remote_conn.last_message_id + 1;
+        let mut total_messages = whole_message.len() / MAX_DATA_SIZE;
+        total_messages += if whole_message.len() % MAX_DATA_SIZE == 0 {
+            0
+        } else {
+            1
+        };
+        Self {
+            socket,
+            remote_conn,
+            message: whole_message,
+            start_index,
+            sent_contiguos: 0,
+            total_messages,
+            sent_not_confirmed: BTreeMap::new(),
+        }
     }
 }
 
-impl<S> Sink<StreamBytes> for SenderStream<'_, S> {
+impl<S: Socket> Sink<()> for SenderStream<'_, S> {
     type Error = SenderStreamError;
 
     fn poll_ready(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
+        let sent_so_far = self.sent_contiguos + self.sent_not_confirmed.len();
+        if sent_so_far < self.total_messages && self.message.len() > MAX_DATA_SIZE {
+            let mut rest = self.message.split_off(MAX_DATA_SIZE);
+            std::mem::swap(&mut self.message, &mut rest);
+            let encrypted: PacketData<MAX_PACKET_SIZE> = PacketData::encrypted_with_cipher(
+                &rest[..],
+                &self.remote_conn.outbound_symmetric_key,
+            );
+            self.socket
+                .send_to(encrypted.data(), self.remote_conn.remote_addr);
+        }
         todo!()
     }
 
-    fn start_send(self: std::pin::Pin<&mut Self>, data: StreamBytes) -> Result<(), Self::Error> {
-        // we break the message into parts, encrypt them, and send them
-        todo!()
+    fn start_send(self: std::pin::Pin<&mut Self>, _: ()) -> Result<(), Self::Error> {
+        Ok(())
     }
 
     fn poll_flush(
