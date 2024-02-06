@@ -191,7 +191,7 @@ impl<'a> NetEventLog<'a> {
                     EventKind::Connect(ConnectEvent::Connected {
                         this: this_peer,
                         connected: PeerKeyLocation {
-                            peer: *joiner,
+                            peer: joiner.clone(),
                             location: None,
                         },
                     })
@@ -228,10 +228,10 @@ impl<'a> NetEventLog<'a> {
                     .map(|peer| {
                         let kind: EventKind = EventKind::Connect(ConnectEvent::Connected {
                             this: PeerKeyLocation {
-                                peer: *your_peer_id,
+                                peer: your_peer_id.clone(),
                                 location: Some(*your_location),
                             },
-                            connected: *peer,
+                            connected: peer.clone(),
                         });
                         NetEventLog {
                             tx: msg.id(),
@@ -245,7 +245,7 @@ impl<'a> NetEventLog<'a> {
                         tx: msg.id(),
                         peer_id: this_peer,
                         kind: EventKind::Connect(ConnectEvent::Finished {
-                            initiator: *your_peer_id,
+                            initiator: your_peer_id.clone(),
                             location: *your_location,
                         }),
                     });
@@ -257,12 +257,12 @@ impl<'a> NetEventLog<'a> {
             }) => {
                 let key = contract.key();
                 EventKind::Put(PutEvent::Request {
-                    requester: target.peer,
+                    requester: target.peer.clone(),
                     key,
                 })
             }
             NetMessage::Put(PutMsg::SuccessfulPut { .. }) => EventKind::Put(PutEvent::PutSuccess {
-                requester: op_manager.ring.peer_key,
+                requester: op_manager.ring.peer_key.clone(),
             }),
             NetMessage::Put(PutMsg::Broadcasting {
                 new_value,
@@ -280,7 +280,7 @@ impl<'a> NetEventLog<'a> {
                 key,
                 ..
             }) => EventKind::Put(PutEvent::BroadcastReceived {
-                requester: sender.peer,
+                requester: sender.peer.clone(),
                 key: key.clone(),
                 value: new_value.clone(),
             }),
@@ -296,7 +296,7 @@ impl<'a> NetEventLog<'a> {
                 ..
             }) => EventKind::Subscribed {
                 key: key.clone(),
-                at: *sender,
+                at: sender.clone(),
             },
             _ => EventKind::Ignored,
         };
@@ -351,7 +351,7 @@ impl<'a> From<NetEventLog<'a>> for NetLogMessage {
             datetime: Utc::now(),
             tx: *log.tx,
             kind: log.kind,
-            peer_id: *log.peer_id,
+            peer_id: log.peer_id.clone(),
         }
     }
 }
@@ -1425,14 +1425,16 @@ pub(super) mod test {
                 .iter()
                 .filter(|l| matches!(l.kind, EventKind::Disconnected { .. }))
                 .fold(HashMap::<_, Vec<_>>::new(), |mut map, log| {
-                    map.entry(log.peer_id).or_default().push(log.datetime);
+                    map.entry(log.peer_id.clone())
+                        .or_default()
+                        .push(log.datetime);
                     map
                 });
 
             let iter = logs
                 .iter()
                 .filter_map(|l| {
-                    if let EventKind::Connect(ConnectEvent::Connected { this, connected }) = l.kind
+                    if let EventKind::Connect(ConnectEvent::Connected { this, connected }) = &l.kind
                     {
                         let disconnected = disconnects
                             .get(&connected.peer)
@@ -1441,7 +1443,7 @@ pub(super) mod test {
                             .any(|dc| dc > &l.datetime);
                         if let Some((this_loc, conn_loc)) = this.location.zip(connected.location) {
                             if this.peer == peer && !disconnected {
-                                return Some((connected.peer, conn_loc.distance(this_loc)));
+                                return Some((connected.peer.clone(), conn_loc.distance(this_loc)));
                             }
                         }
                     }
@@ -1458,7 +1460,7 @@ pub(super) mod test {
             let msg_log = NetLogMessage {
                 datetime: Utc::now(),
                 tx: *log.tx,
-                peer_id: *peer_id,
+                peer_id: peer_id.clone(),
                 kind,
             };
             (msg_log, log_id)
@@ -1535,11 +1537,11 @@ pub(super) mod test {
                     peer_id: &peer_id,
                     kind: EventKind::Connect(ConnectEvent::Connected {
                         this: PeerKeyLocation {
-                            peer: peer_id,
+                            peer: peer_id.clone(),
                             location: Some(loc),
                         },
                         connected: PeerKeyLocation {
-                            peer: *other,
+                            peer: other.clone(),
                             location: Some(*location),
                         },
                     }),
