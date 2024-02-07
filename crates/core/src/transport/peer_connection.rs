@@ -1,10 +1,11 @@
-use std::collections::BTreeMap;
 use std::future::Future;
+use std::sync::Arc;
 use std::task::Poll;
 use std::vec::Vec;
+use std::{collections::BTreeMap, pin};
 
 use aes_gcm::Aes128Gcm;
-use futures::Sink;
+use futures::{pin_mut, FutureExt, Sink};
 use serde::Serialize;
 use tokio::{net::UdpSocket, sync::mpsc};
 
@@ -149,7 +150,7 @@ pub(super) struct SenderStream<'a, S = UdpSocket> {
     start_index: u32,
     sent_contiguos: usize,
     total_messages: usize,
-    sent_not_confirmed: BTreeMap<u32, PacketData>,
+    sent_not_confirmed: BTreeMap<u32, Arc<[u8]>>,
 }
 
 impl<'a, S: Socket> SenderStream<'a, S> {
@@ -188,14 +189,44 @@ impl<S: Socket> Sink<()> for SenderStream<'_, S> {
         if sent_so_far < self.total_messages && self.message.len() > MAX_DATA_SIZE {
             let mut rest = self.message.split_off(MAX_DATA_SIZE);
             std::mem::swap(&mut self.message, &mut rest);
-            let encrypted: PacketData<MAX_PACKET_SIZE> = PacketData::encrypted_with_cipher(
+            let encrypted: Arc<[u8]> = PacketData::<MAX_PACKET_SIZE>::encrypted_with_cipher(
                 &rest[..],
                 &self.remote_conn.outbound_symmetric_key,
+            )
+            .into();
+            let idx = self.start_index + sent_so_far as u32;
+            self.sent_not_confirmed.insert(idx, encrypted.clone());
+            let f = self
+                .socket
+                .send_to(&encrypted, self.remote_conn.remote_addr);
+            pin_mut!(f);
+            match f.poll(cx) {
+                Poll::Ready(Err(_)) => Poll::Ready(Err(SenderStreamError::Closed)),
+                Poll::Ready(Ok(_)) => {
+                    self.sent_contiguos += 1;
+                    Poll::Pending
+                }
+                _ => Poll::Pending,
+            }
+        } else if self.message.is_empty() && self.sent_not_confirmed.is_empty() {
+            Poll::Ready(Ok(()))
+        } else if self.sent_not_confirmed.is_empty() {
+            let encrypted: PacketData<MAX_PACKET_SIZE> = PacketData::encrypted_with_cipher(
+                &self.message,
+                &self.remote_conn.outbound_symmetric_key,
             );
-            self.socket
+            let f = self
+                .socket
                 .send_to(encrypted.data(), self.remote_conn.remote_addr);
+            pin_mut!(f);
+            match f.poll(cx) {
+                Poll::Ready(Err(_)) => Poll::Ready(Err(SenderStreamError::Closed)),
+                Poll::Ready(Ok(_)) if self.sent_not_confirmed.is_empty() => Poll::Ready(Ok(())),
+                _ => Poll::Pending,
+            }
+        } else {
+            todo!()
         }
-        todo!()
     }
 
     fn start_send(self: std::pin::Pin<&mut Self>, _: ()) -> Result<(), Self::Error> {

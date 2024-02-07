@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::{cell::RefCell, sync::Arc};
 
 use aes_gcm::{
     aead::{generic_array::GenericArray, rand_core::SeedableRng, AeadInPlace},
@@ -9,7 +9,7 @@ use rand::{prelude::SmallRng, thread_rng, Rng};
 use crate::transport::crypto::TransportPublicKey;
 
 /// The maximum size of a received UDP packet, MTU typically is 1500
-pub(super) const MAX_PACKET_SIZE: usize = 1500;
+pub(super) const MAX_PACKET_SIZE: usize = 1500 - UDP_HEADER_SIZE;
 
 // These are the same as the AES-GCM 128 constants, but extracting them from Aes128Gcm
 // as consts was awkward.
@@ -17,6 +17,7 @@ const NONCE_SIZE: usize = 12;
 const TAG_SIZE: usize = 16;
 
 pub(super) const MAX_DATA_SIZE: usize = MAX_PACKET_SIZE - NONCE_SIZE - TAG_SIZE;
+const UDP_HEADER_SIZE: usize = 8;
 
 thread_local! {
     // This must be very fast, but doesn't need to be cryptographically secure.
@@ -148,6 +149,12 @@ impl<'a> From<&'a [u8]> for PacketData<MAX_PACKET_SIZE> {
             data,
             size: value.len(),
         }
+    }
+}
+
+impl<const N: usize> From<PacketData<N>> for Arc<[u8]> {
+    fn from(packet_data: PacketData<N>) -> Arc<[u8]> {
+        packet_data.data.into()
     }
 }
 
