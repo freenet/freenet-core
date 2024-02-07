@@ -65,7 +65,7 @@ impl ConnectionHandler {
         max_upstream_rate: BytesPerSecond,
     ) -> Result<Self, TransportError> {
         // Bind the UDP socket to the specified port
-        let socket = S::bind(("0.0.0.0", listen_port)).await?;
+        let socket = Arc::new(S::bind(("0.0.0.0", listen_port)).await?);
 
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(1);
@@ -163,7 +163,7 @@ impl Socket for UdpSocket {
 
 /// Handles UDP transport internally.
 struct UdpPacketsListener<S = UdpSocket> {
-    socket: S,
+    socket: Arc<S>,
     remote_connections: BTreeMap<SocketAddr, RemoteConnection>,
     connection_handler: mpsc::Receiver<(SocketAddr, ConnectionEvent)>,
     this_peer_keypair: TransportKeypair,
@@ -192,7 +192,7 @@ enum ConnectionState {
 }
 
 impl<S: Socket> UdpPacketsListener<S> {
-    async fn listen(mut self) {
+    async fn listen(mut self) -> Result<(), TransportError> {
         let mut peer_messages = FuturesUnordered::new();
         const DEFAULT_BW_TRACKER_WINDOW_SIZE: Duration = Duration::from_secs(10);
         const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
@@ -232,9 +232,17 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                         inbound_sym_key,
                                                         ongoing_stream: None,
                                                     }).await.is_err() {
-                                                        break;
+                                                        return Err(TransportError::ChannelClosed);
                                                     }
-                                                    peer_messages.push(peer_message(outbound_receiver, remote_addr));
+                                                    let socket = self.socket.clone();
+                                                    // fixme
+                                                    // peer_messages.push(tokio::spawn(async move {
+                                                    //     outbound_messages(
+                                                    //         socket,
+                                                    //         outbound_receiver,
+                                                    //         remote_addr
+                                                    //     ).await
+                                                    // }));
                                                 }
                                             }
                                             Err(error) => {
@@ -279,48 +287,38 @@ impl<S: Socket> UdpPacketsListener<S> {
                         Err(e) => {
                             // todo: this should panic and be propagate to the main task or retry and eventually fail
                             tracing::error!("Failed to receive UDP packet: {:?}", e);
-                            break;
+                            return Err(e.into());
                         }
                     }
                 },
                 // Handling of outbound packets
-                outbound_message = peer_messages.next(), if !peer_messages.is_empty() => {
-                    let Some(outbound_msg) = outbound_message else {
+                res = peer_messages.next(), if !peer_messages.is_empty() => {
+                    let Some(res) = res else {
                         // this should be unreachable, but it wouldn't matter either way
                         // the remote conn has been dropped
                         tracing::error!("peer_messages.next() returned None");
                         continue;
                     };
-                    let OutboundMessage { remote_addr, msg, recv } = {
-                        match outbound_msg {
-                            Ok(outbound) => outbound,
-                            Err(remote_addr) => {
-                                // dropping this remote connection since we don't care about their messages anymore
-                                tracing::debug!(%remote_addr, "Remote disconnected");
-                                self.remote_connections.remove(&remote_addr);
-                                continue;
-                            }
-                        }
-                    };
-                    let Some(remote_conn) = self.remote_connections.remove(&remote_addr) else {
-                        // the connection was dropped by the other side
-                        continue;
-                    };
-                    let size = msg.len();
-                    if let Some(wait_time) = bw_tracker.can_send_packet(BANDWITH_LIMIT, msg.len()) {
-                        tokio::time::sleep(wait_time).await;
-                    }
-                    let Ok(remote_conn) = self.send_outbound_msg(remote_conn, msg).await else {
-                        tracing::debug!(%remote_addr, "Remote disconnected");
-                        continue;
-                    };
-                    bw_tracker.add_packet(size);
-                    self.remote_connections.insert(remote_addr, remote_conn);
-                    peer_messages.push(peer_message(recv, remote_addr));
+                    let remote_addr = res.map_err(|e| anyhow::anyhow!(e))?.unwrap_err();
+                    tracing::debug!(%remote_addr, "Remote disconnected");
+                    self.remote_connections.remove(&remote_addr);
+                    continue;
+
+                //     let size = msg.len();
+                //     if let Some(wait_time) = bw_tracker.can_send_packet(BANDWITH_LIMIT, msg.len()) {
+                //         tokio::time::sleep(wait_time).await;
+                //     }
+                //     let Ok(remote_conn) = self.send_outbound_msg(remote_conn, msg).await else {
+                //         tracing::debug!(%remote_addr, "Remote disconnected");
+                //         continue;
+                //     };
+                //     bw_tracker.add_packet(size);
+                //     self.remote_connections.insert(remote_addr, remote_conn);
+                //     peer_messages.push(peer_message(recv, remote_addr));
                 }
                 // Handling of connection events
                 send_message = self.connection_handler.recv() => {
-                    let Some((remote_addr, event)) = send_message else { break; };
+                    let Some((remote_addr, event)) = send_message else { return Ok(()); };
                     let ConnectionEvent::ConnectionStart { remote_public_key, open_connection } = event;
                     match self.traverse_nat(remote_addr, ConnectionState::StartOutbound { remote_public_key }).await {
                         Err(error) => {
@@ -329,53 +327,22 @@ impl<S: Socket> UdpPacketsListener<S> {
                         }
                         Ok((remote_connection, inbound_recv, inbound_sym_key)) => {
                             let (outbound_sender, outbound_receiver) = mpsc::channel(1);
-                            self.remote_connections.insert(remote_addr, remote_connection);
+                            // self.remote_connections.insert(remote_addr, remote_connection);
                             let _ = open_connection.send(Ok(((outbound_sender, inbound_recv), inbound_sym_key)));
-                            peer_messages.push(peer_message(outbound_receiver, remote_addr));
+                            let socket = self.socket.clone();
+                            peer_messages.push(tokio::spawn(async move {
+                                outbound_messages(
+                                    socket,
+                                    outbound_receiver,
+                                    remote_addr,
+                                    remote_connection
+                                ).await
+                            }));
                         }
                     }
                 },
             }
         }
-    }
-
-    #[inline]
-    async fn send_outbound_msg(
-        &self,
-        mut remote_conn: RemoteConnection,
-        serialized_data: SerializedMessage,
-    ) -> Result<RemoteConnection, TransportError> {
-        let receipts = remote_conn.received_tracker.get_receipts();
-        if serialized_data.len() > MAX_DATA_SIZE {
-            // todo: WIP, this code path is unlikely to ever complete, need to do the refactor commented above,
-            // so the outbound traffic is separated from the inboudn packet listener
-            // otherwise we will never be getting the receipts back and be able to finishing this task
-
-            // allow some buffering so we don't suspend the listener task while awaiting for sending multiple notifications
-            let (_receipts_notifier, receipts_notification) = mpsc::channel(10);
-            SenderStream::new(
-                &self.socket,
-                &mut remote_conn,
-                serialized_data,
-                receipts_notification,
-            )
-            .await?;
-        } else {
-            let msg_id = remote_conn.last_message_id.wrapping_add(1);
-            let packet = SymmetricMessage::short_message(
-                msg_id,
-                serialized_data,
-                &remote_conn.outbound_symmetric_key,
-                receipts,
-            )?;
-            self.socket
-                .send_to(packet.data(), remote_conn.remote_addr)
-                .await?;
-            remote_conn
-                .sent_tracker
-                .report_sent_packet(msg_id, packet.data().into()); // todo: should not need call to_vec here
-        }
-        Ok(remote_conn)
     }
 
     const NAT_TRAVERSAL_MAX_ATTEMPS: usize = 20;
@@ -671,20 +638,55 @@ impl<S: Socket> UdpPacketsListener<S> {
 }
 
 #[inline]
-async fn peer_message(
+async fn outbound_messages(
+    socket: Arc<impl Socket>,
     mut outbound_receiver: mpsc::Receiver<SerializedMessage>,
     remote_addr: SocketAddr,
-) -> Result<OutboundMessage, SocketAddr> {
-    let msg = outbound_receiver.recv().await.ok_or({
-        // dropping this remote connection since we don't care about their messages anymore
-        // since the other side dropped the PeerConnectin
-        remote_addr
-    })?;
-    Ok(OutboundMessage {
-        remote_addr,
-        msg,
-        recv: outbound_receiver,
-    })
+    mut remote_conn: RemoteConnection,
+) -> Result<(), SocketAddr> {
+    loop {
+        let msg = outbound_receiver.recv().await.ok_or({
+            // dropping this remote connection since we don't care about their messages anymore
+            // since the other side dropped the PeerConnectin
+            remote_addr
+        })?;
+        send_outbound_msg(&*socket, &mut remote_conn, msg)
+            .await
+            .map_err(|_| remote_addr)?;
+    }
+}
+
+#[inline]
+async fn send_outbound_msg(
+    socket: &impl Socket,
+    remote_conn: &mut RemoteConnection,
+    serialized_data: SerializedMessage,
+) -> Result<(), TransportError> {
+    let receipts = remote_conn.received_tracker.get_receipts();
+    if serialized_data.len() > MAX_DATA_SIZE {
+        // todo: WIP, this code path is unlikely to ever complete, need to do the refactor commented above,
+        // so the outbound traffic is separated from the inboudn packet listener
+        // otherwise we will never be getting the receipts back and be able to finishing this task
+
+        // allow some buffering so we don't suspend the listener task while awaiting for sending multiple notifications
+        let (_receipts_notifier, receipts_notification) = mpsc::channel(10);
+        SenderStream::new(socket, remote_conn, serialized_data, receipts_notification).await?;
+    } else {
+        let msg_id = remote_conn.last_message_id.wrapping_add(1);
+        let packet = SymmetricMessage::short_message(
+            msg_id,
+            serialized_data,
+            &remote_conn.outbound_symmetric_key,
+            receipts,
+        )?;
+        socket
+            .send_to(packet.data(), remote_conn.remote_addr)
+            .await?;
+        remote_conn
+            .sent_tracker
+            .report_sent_packet(msg_id, packet.data().into());
+    }
+    Ok(())
 }
 
 enum ConnectionEvent {
