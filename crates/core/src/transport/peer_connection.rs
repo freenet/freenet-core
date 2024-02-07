@@ -6,7 +6,7 @@ use std::time::Instant;
 use std::vec::Vec;
 
 use aes_gcm::Aes128Gcm;
-use futures::{pin_mut, Sink};
+use futures::pin_mut;
 use serde::Serialize;
 use tokio::{net::UdpSocket, sync::mpsc};
 
@@ -139,11 +139,6 @@ impl ReceiverStream {
     }
 }
 
-struct StreamedMessagePart {
-    data: PacketData,
-    part_position: usize,
-}
-
 // todo: unit test
 /// Handles breaking a message into parts, encryption, etc.
 pub(super) struct SenderStream<'a, S = UdpSocket> {
@@ -190,13 +185,15 @@ impl<'a, S: Socket> SenderStream<'a, S> {
     }
 }
 
-impl<S: Socket> Sink<()> for SenderStream<'_, S> {
-    type Error = SenderStreamError;
+// this really doesn't need to be a sink, is enough with a future and we can merge poll_ready and poll_flush logic
+// into poll really
+impl<S: Socket> Future for SenderStream<'_, S> {
+    type Output = Result<(), SenderStreamError>;
 
-    fn poll_ready(
+    fn poll(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
+    ) -> std::task::Poll<Self::Output> {
         match self.receipts_notification.poll_recv(cx) {
             Poll::Pending => {}
             Poll::Ready(Some(receipts)) => {
@@ -212,39 +209,27 @@ impl<S: Socket> Sink<()> for SenderStream<'_, S> {
             Poll::Ready(None) => return Poll::Ready(Err(SenderStreamError::Closed)),
         }
 
-        if self.next_sent_check > Instant::now() {
-            return Poll::Ready(Ok(()));
-        }
-
-        match self.remote_conn.sent_tracker.get_resend() {
-            ResendAction::WaitUntil(wait) => {
-                self.next_sent_check = wait;
-                Poll::Ready(Ok(()))
-            }
-            ResendAction::Resend(idx, packet) => {
-                let packet_c = packet.clone();
-                let f = self.socket.send_to(&packet_c, self.remote_conn.remote_addr);
-                self.remote_conn
-                    .sent_tracker
-                    .report_sent_packet(idx, packet);
-                pin_mut!(f);
-                match f.poll(cx) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
-                    Poll::Ready(Err(_)) => Poll::Ready(Err(SenderStreamError::Closed)),
+        if self.next_sent_check <= Instant::now() {
+            match self.remote_conn.sent_tracker.get_resend() {
+                ResendAction::WaitUntil(wait) => {
+                    self.next_sent_check = wait;
+                }
+                ResendAction::Resend(idx, packet) => {
+                    let packet_c = packet.clone();
+                    let f = self.socket.send_to(&packet_c, self.remote_conn.remote_addr);
+                    self.remote_conn
+                        .sent_tracker
+                        .report_sent_packet(idx, packet);
+                    pin_mut!(f);
+                    match f.poll(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Ok(_)) => {}
+                        Poll::Ready(Err(_)) => return Poll::Ready(Err(SenderStreamError::Closed)),
+                    }
                 }
             }
         }
-    }
 
-    fn start_send(self: std::pin::Pin<&mut Self>, _: ()) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
         let sent_so_far = self.sent_packets();
         if sent_so_far < self.total_messages {
             let mut rest = {
@@ -272,7 +257,7 @@ impl<S: Socket> Sink<()> for SenderStream<'_, S> {
             match f.poll(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(Ok(_)) => {
-                    self.sent_confirmed += 1;
+                    self.sent_not_confirmed.insert(idx);
                     Poll::Pending
                 }
                 Poll::Ready(Err(_)) => Poll::Ready(Err(SenderStreamError::Closed)),
@@ -284,17 +269,6 @@ impl<S: Socket> Sink<()> for SenderStream<'_, S> {
             debug_assert!(self.message.is_empty());
             debug_assert!(!self.sent_not_confirmed.is_empty());
             Poll::Pending
-        }
-    }
-
-    fn poll_close(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        if self.sent_packets() < self.total_messages {
-            Poll::Pending
-        } else {
-            Poll::Ready(Ok(()))
         }
     }
 }

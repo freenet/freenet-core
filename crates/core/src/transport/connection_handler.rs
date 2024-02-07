@@ -7,7 +7,7 @@ use std::vec::Vec;
 use std::{borrow::Cow, time::Duration};
 
 use aes_gcm::{Aes128Gcm, KeyInit};
-use futures::{stream::FuturesUnordered, FutureExt, SinkExt, StreamExt};
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
@@ -347,15 +347,19 @@ impl<S: Socket> UdpPacketsListener<S> {
     ) -> Result<RemoteConnection, TransportError> {
         let receipts = remote_conn.received_tracker.get_receipts();
         if serialized_data.len() > MAX_DATA_SIZE {
-            // allow some buffering so we don't block on the listener side
-            let (receipts_notifier, receipts_notification) = mpsc::channel(10);
-            let mut sender = SenderStream::new(
+            // todo: WIP, this code path is unlikely to ever complete, need to do the refactor commented above,
+            // so the outbound traffic is separated from the inboudn packet listener
+            // otherwise we will never be getting the receipts back and be able to finishing this task
+
+            // allow some buffering so we don't suspend the listener task while awaiting for sending multiple notifications
+            let (_receipts_notifier, receipts_notification) = mpsc::channel(10);
+            SenderStream::new(
                 &self.socket,
                 &mut remote_conn,
                 serialized_data,
                 receipts_notification,
-            );
-            sender.send(()).await?;
+            )
+            .await?;
         } else {
             let msg_id = remote_conn.last_message_id.wrapping_add(1);
             let packet = SymmetricMessage::short_message(
