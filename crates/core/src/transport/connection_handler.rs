@@ -191,7 +191,6 @@ enum ConnectionState {
     AckConnectionOutbound,
 }
 
-// todo: review potential issues with packet sending fairness per remote
 impl<S: Socket> UdpPacketsListener<S> {
     async fn listen(mut self) {
         let mut peer_messages = FuturesUnordered::new();
@@ -201,7 +200,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         // todo: refactor this loop a bit so the code is more readable
         // todo: we probably need to refactor this a bit so we don't block the socket listening
         // with decryption, deserialization, msg handling etc. so we keep the socket getting new packets
-        // from multiple peers as fast as possible
+        // from multiple peers as fast as possible, we can wrap socket into an arc so this should be easy to do
         loop {
             let mut buf = [0u8; MAX_PACKET_SIZE];
             tokio::select! {
@@ -252,7 +251,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                             }
                                         },
                                         ReportResult::AlreadyReceived => {
-                                            remote_conn.sent_tracker.report_sent_packet(msg.message_id, packet_data.data().to_vec());
+                                            remote_conn.sent_tracker.report_sent_packet(msg.message_id, packet_data.data().into());
                                         }
                                         ReportResult::QueueFull => todo!(),
                                     }
@@ -348,7 +347,14 @@ impl<S: Socket> UdpPacketsListener<S> {
     ) -> Result<RemoteConnection, TransportError> {
         let receipts = remote_conn.received_tracker.get_receipts();
         if serialized_data.len() > MAX_DATA_SIZE {
-            let mut sender = SenderStream::new(&self.socket, &mut remote_conn, serialized_data);
+            // allow some buffering so we don't block on the listener side
+            let (receipts_notifier, receipts_notification) = mpsc::channel(10);
+            let mut sender = SenderStream::new(
+                &self.socket,
+                &mut remote_conn,
+                serialized_data,
+                receipts_notification,
+            );
             sender.send(()).await?;
         } else {
             let msg_id = remote_conn.last_message_id.wrapping_add(1);
@@ -363,13 +369,18 @@ impl<S: Socket> UdpPacketsListener<S> {
                 .await?;
             remote_conn
                 .sent_tracker
-                .report_sent_packet(msg_id, packet.data().to_vec()); // todo: should not need call to_vec here
+                .report_sent_packet(msg_id, packet.data().into()); // todo: should not need call to_vec here
         }
         Ok(remote_conn)
     }
 
     const NAT_TRAVERSAL_MAX_ATTEMPS: usize = 20;
 
+    // fixme: there is a problem when establishing conenction since both peers are trying to connect simultaneously
+    // they have an attempt where the connection is outbound and the other is inbound 2 different instances
+    // of RemoteConnection will be created and the only the last one may be tracked, this is a race condition
+    // that might (not sure) lead to weird behaviour for the packet trackers etc. so need to ensure both connections
+    // are consolidated into one properly
     async fn traverse_nat(
         &self,
         remote_addr: SocketAddr,
@@ -443,7 +454,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     let mut sent_tracker = SentPacketTracker::new();
                     sent_tracker.report_sent_packet(
                         SymmetricMessage::FIRST_MESSAGE_ID,
-                        acknowledgment.data().to_vec(),
+                        acknowledgment.data().into(),
                     );
                     // we are connected to the remote and we just send the pub key to them
                     // if they fail to receive it, they will re-request the packet through

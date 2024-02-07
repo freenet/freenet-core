@@ -72,7 +72,7 @@ impl NetworkPeer {
         let event_register = {
             #[cfg(feature = "trace-ot")]
             {
-                use crate::tracing::{CombinedRegister, OTEventRegister};
+                use crate::tracing::OTEventRegister;
                 crate::tracing::CombinedRegister::new([
                     Box::new(EventRegister::new(
                         crate::config::Config::conf().event_log(),

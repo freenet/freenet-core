@@ -1,15 +1,17 @@
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::task::Poll;
+use std::time::Instant;
 use std::vec::Vec;
-use std::{collections::BTreeMap, pin};
 
 use aes_gcm::Aes128Gcm;
-use futures::{pin_mut, FutureExt, Sink};
+use futures::{pin_mut, Sink};
 use serde::Serialize;
 use tokio::{net::UdpSocket, sync::mpsc};
 
 use crate::transport::packet_data::MAX_PACKET_SIZE;
+use crate::transport::sent_packet_tracker::ResendAction;
 
 use super::{
     connection_handler::{RemoteConnection, SerializedMessage, Socket, TransportError},
@@ -142,15 +144,18 @@ struct StreamedMessagePart {
     part_position: usize,
 }
 
+// todo: unit test
 /// Handles breaking a message into parts, encryption, etc.
 pub(super) struct SenderStream<'a, S = UdpSocket> {
     socket: &'a S,
     remote_conn: &'a mut RemoteConnection,
     message: StreamBytes,
     start_index: u32,
-    sent_contiguos: usize,
     total_messages: usize,
-    sent_not_confirmed: BTreeMap<u32, Arc<[u8]>>,
+    sent_confirmed: usize,
+    sent_not_confirmed: HashSet<u32>,
+    receipts_notification: mpsc::Receiver<Vec<u32>>,
+    next_sent_check: Instant,
 }
 
 impl<'a, S: Socket> SenderStream<'a, S> {
@@ -158,6 +163,7 @@ impl<'a, S: Socket> SenderStream<'a, S> {
         socket: &'a S,
         remote_conn: &'a mut RemoteConnection,
         whole_message: StreamBytes,
+        receipts_notification: mpsc::Receiver<Vec<u32>>,
     ) -> Self {
         let start_index = remote_conn.last_message_id + 1;
         let mut total_messages = whole_message.len() / MAX_DATA_SIZE;
@@ -171,10 +177,16 @@ impl<'a, S: Socket> SenderStream<'a, S> {
             remote_conn,
             message: whole_message,
             start_index,
-            sent_contiguos: 0,
             total_messages,
-            sent_not_confirmed: BTreeMap::new(),
+            sent_confirmed: 0,
+            sent_not_confirmed: HashSet::new(),
+            receipts_notification,
+            next_sent_check: Instant::now(),
         }
+    }
+
+    fn sent_packets(&self) -> usize {
+        self.sent_confirmed + self.sent_not_confirmed.len()
     }
 }
 
@@ -185,47 +197,43 @@ impl<S: Socket> Sink<()> for SenderStream<'_, S> {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        let sent_so_far = self.sent_contiguos + self.sent_not_confirmed.len();
-        if sent_so_far < self.total_messages && self.message.len() > MAX_DATA_SIZE {
-            let mut rest = self.message.split_off(MAX_DATA_SIZE);
-            std::mem::swap(&mut self.message, &mut rest);
-            let encrypted: Arc<[u8]> = PacketData::<MAX_PACKET_SIZE>::encrypted_with_cipher(
-                &rest[..],
-                &self.remote_conn.outbound_symmetric_key,
-            )
-            .into();
-            let idx = self.start_index + sent_so_far as u32;
-            self.sent_not_confirmed.insert(idx, encrypted.clone());
-            let f = self
-                .socket
-                .send_to(&encrypted, self.remote_conn.remote_addr);
-            pin_mut!(f);
-            match f.poll(cx) {
-                Poll::Ready(Err(_)) => Poll::Ready(Err(SenderStreamError::Closed)),
-                Poll::Ready(Ok(_)) => {
-                    self.sent_contiguos += 1;
-                    Poll::Pending
+        match self.receipts_notification.poll_recv(cx) {
+            Poll::Pending => {}
+            Poll::Ready(Some(receipts)) => {
+                self.remote_conn
+                    .sent_tracker
+                    .report_received_receipts(&receipts);
+                for receipt in receipts {
+                    if self.sent_not_confirmed.remove(&receipt) {
+                        self.sent_confirmed += 1;
+                    }
                 }
-                _ => Poll::Pending,
             }
-        } else if self.message.is_empty() && self.sent_not_confirmed.is_empty() {
-            Poll::Ready(Ok(()))
-        } else if self.sent_not_confirmed.is_empty() {
-            let encrypted: PacketData<MAX_PACKET_SIZE> = PacketData::encrypted_with_cipher(
-                &self.message,
-                &self.remote_conn.outbound_symmetric_key,
-            );
-            let f = self
-                .socket
-                .send_to(encrypted.data(), self.remote_conn.remote_addr);
-            pin_mut!(f);
-            match f.poll(cx) {
-                Poll::Ready(Err(_)) => Poll::Ready(Err(SenderStreamError::Closed)),
-                Poll::Ready(Ok(_)) if self.sent_not_confirmed.is_empty() => Poll::Ready(Ok(())),
-                _ => Poll::Pending,
+            Poll::Ready(None) => return Poll::Ready(Err(SenderStreamError::Closed)),
+        }
+
+        if self.next_sent_check > Instant::now() {
+            return Poll::Ready(Ok(()));
+        }
+
+        match self.remote_conn.sent_tracker.get_resend() {
+            ResendAction::WaitUntil(wait) => {
+                self.next_sent_check = wait;
+                Poll::Ready(Ok(()))
             }
-        } else {
-            todo!()
+            ResendAction::Resend(idx, packet) => {
+                let packet_c = packet.clone();
+                let f = self.socket.send_to(&packet_c, self.remote_conn.remote_addr);
+                self.remote_conn
+                    .sent_tracker
+                    .report_sent_packet(idx, packet);
+                pin_mut!(f);
+                match f.poll(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
+                    Poll::Ready(Err(_)) => Poll::Ready(Err(SenderStreamError::Closed)),
+                }
+            }
         }
     }
 
@@ -234,17 +242,60 @@ impl<S: Socket> Sink<()> for SenderStream<'_, S> {
     }
 
     fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        todo!()
+        let sent_so_far = self.sent_packets();
+        if sent_so_far < self.total_messages {
+            let mut rest = {
+                if self.message.len() > MAX_DATA_SIZE {
+                    self.message.split_off(MAX_DATA_SIZE)
+                } else {
+                    std::mem::take(&mut self.message)
+                }
+            };
+            std::mem::swap(&mut self.message, &mut rest);
+            // todo: this is blocking, but hopefully meaningless, measure and improve if necessary
+            let packet: Arc<[u8]> = PacketData::<MAX_PACKET_SIZE>::encrypted_with_cipher(
+                &rest[..],
+                &self.remote_conn.outbound_symmetric_key,
+            )
+            .into();
+            let idx = self.start_index + sent_so_far as u32 + 1;
+            self.sent_not_confirmed.insert(idx);
+            let packet_c = packet.clone();
+            let f = self.socket.send_to(&packet_c, self.remote_conn.remote_addr);
+            self.remote_conn
+                .sent_tracker
+                .report_sent_packet(idx, packet);
+            pin_mut!(f);
+            match f.poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(_)) => {
+                    self.sent_confirmed += 1;
+                    Poll::Pending
+                }
+                Poll::Ready(Err(_)) => Poll::Ready(Err(SenderStreamError::Closed)),
+            }
+        } else if self.message.is_empty() && self.sent_not_confirmed.is_empty() {
+            Poll::Ready(Ok(()))
+        } else {
+            // we sent all messages (self.message is empty) but we still need to confirm all were received
+            debug_assert!(self.message.is_empty());
+            debug_assert!(!self.sent_not_confirmed.is_empty());
+            Poll::Pending
+        }
     }
 
     fn poll_close(
         self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        todo!()
+        if self.sent_packets() < self.total_messages {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
+        }
     }
 }
 

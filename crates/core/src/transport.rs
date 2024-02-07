@@ -49,7 +49,7 @@ mod tests {
 
         // Simulate sending packets
         for id in 1..=5 {
-            sent_tracker.report_sent_packet(id, vec![id as u8]);
+            sent_tracker.report_sent_packet(id, vec![id as u8].into());
         }
 
         // Simulate receiving some packets

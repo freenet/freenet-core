@@ -11,7 +11,7 @@ use super::{packet_data::MAX_PACKET_SIZE, MessagePayload, PacketData};
 #[serde_as]
 #[derive(Serialize, Deserialize)]
 pub(super) struct SymmetricMessage {
-    // todo: make sure we handle wrapping around the u16 properly
+    // todo: make sure we handle wrapping around the u32 properly
     pub message_id: u32,
     // todo: profile what is better here on average in the future
     // (vec, fixed array size of what given length etc.
