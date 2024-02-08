@@ -9,12 +9,13 @@ use std::{borrow::Cow, time::Duration};
 use aes_gcm::{Aes128Gcm, KeyInit};
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use tokio::net::{ToSocketAddrs, UdpSocket};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task;
 
 use crate::transport::received_packet_tracker::ReportResult;
-use crate::util::CachingSystemTimeSrc;
+use crate::util::{CachingSystemTimeSrc, TimeSource};
 
+use super::bw;
 use super::peer_connection::SenderStreamError;
 use super::received_packet_tracker::ReceivedPacketTracker;
 use super::sent_packet_tracker::SentPacketTracker;
@@ -195,8 +196,9 @@ impl<S: Socket> UdpPacketsListener<S> {
     async fn listen(mut self) -> Result<(), TransportError> {
         let mut peer_messages = FuturesUnordered::new();
         const DEFAULT_BW_TRACKER_WINDOW_SIZE: Duration = Duration::from_secs(10);
-        const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
-        let mut bw_tracker = super::bw::PacketBWTracker::new(DEFAULT_BW_TRACKER_WINDOW_SIZE);
+        let bw_tracker = Arc::new(Mutex::new(super::bw::PacketBWTracker::new(
+            DEFAULT_BW_TRACKER_WINDOW_SIZE,
+        )));
         // todo: refactor this loop a bit so the code is more readable
         // todo: we probably need to refactor this a bit so we don't block the socket listening
         // with decryption, deserialization, msg handling etc. so we keep the socket getting new packets
@@ -293,6 +295,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 },
                 // Handling of outbound packets
                 res = peer_messages.next(), if !peer_messages.is_empty() => {
+                    let res: Option<Result<Result<(), SocketAddr>, tokio::task::JoinError>> = res;
                     let Some(res) = res else {
                         // this should be unreachable, but it wouldn't matter either way
                         // the remote conn has been dropped
@@ -303,18 +306,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                     tracing::debug!(%remote_addr, "Remote disconnected");
                     self.remote_connections.remove(&remote_addr);
                     continue;
-
-                //     let size = msg.len();
-                //     if let Some(wait_time) = bw_tracker.can_send_packet(BANDWITH_LIMIT, msg.len()) {
-                //         tokio::time::sleep(wait_time).await;
-                //     }
-                //     let Ok(remote_conn) = self.send_outbound_msg(remote_conn, msg).await else {
-                //         tracing::debug!(%remote_addr, "Remote disconnected");
-                //         continue;
-                //     };
-                //     bw_tracker.add_packet(size);
-                //     self.remote_connections.insert(remote_addr, remote_conn);
-                //     peer_messages.push(peer_message(recv, remote_addr));
                 }
                 // Handling of connection events
                 send_message = self.connection_handler.recv() => {
@@ -330,12 +321,14 @@ impl<S: Socket> UdpPacketsListener<S> {
                             // self.remote_connections.insert(remote_addr, remote_connection);
                             let _ = open_connection.send(Ok(((outbound_sender, inbound_recv), inbound_sym_key)));
                             let socket = self.socket.clone();
+                            let bw_c = bw_tracker.clone();
                             peer_messages.push(tokio::spawn(async move {
                                 outbound_messages(
                                     socket,
                                     outbound_receiver,
                                     remote_addr,
-                                    remote_connection
+                                    remote_connection,
+                                    bw_c
                                 ).await
                             }));
                         }
@@ -637,12 +630,15 @@ impl<S: Socket> UdpPacketsListener<S> {
     }
 }
 
+const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
+
 #[inline]
 async fn outbound_messages(
     socket: Arc<impl Socket>,
     mut outbound_receiver: mpsc::Receiver<SerializedMessage>,
     remote_addr: SocketAddr,
     mut remote_conn: RemoteConnection,
+    bw_tracker: Arc<Mutex<bw::PacketBWTracker<impl TimeSource>>>,
 ) -> Result<(), SocketAddr> {
     loop {
         let msg = outbound_receiver.recv().await.ok_or({
@@ -650,9 +646,18 @@ async fn outbound_messages(
             // since the other side dropped the PeerConnectin
             remote_addr
         })?;
-        send_outbound_msg(&*socket, &mut remote_conn, msg)
+        if let Some(wait_time) = bw_tracker
+            .lock()
+            .await
+            .can_send_packet(BANDWITH_LIMIT, msg.len())
+        {
+            tokio::time::sleep(wait_time).await;
+        }
+        let size = msg.len();
+        send_outbound_msg(&*socket, &mut remote_conn, msg, &bw_tracker)
             .await
             .map_err(|_| remote_addr)?;
+        bw_tracker.lock().await.add_packet(size);
     }
 }
 
@@ -661,6 +666,7 @@ async fn send_outbound_msg(
     socket: &impl Socket,
     remote_conn: &mut RemoteConnection,
     serialized_data: SerializedMessage,
+    bw_tracker: &Arc<Mutex<bw::PacketBWTracker<impl TimeSource>>>,
 ) -> Result<(), TransportError> {
     let receipts = remote_conn.received_tracker.get_receipts();
     if serialized_data.len() > MAX_DATA_SIZE {
@@ -669,8 +675,16 @@ async fn send_outbound_msg(
         // otherwise we will never be getting the receipts back and be able to finishing this task
 
         // allow some buffering so we don't suspend the listener task while awaiting for sending multiple notifications
-        let (_receipts_notifier, receipts_notification) = mpsc::channel(10);
-        SenderStream::new(socket, remote_conn, serialized_data, receipts_notification).await?;
+        let (receipts_notifier, receipts_notification) = mpsc::channel(10);
+        SenderStream::new(
+            socket,
+            remote_conn,
+            serialized_data,
+            receipts_notification,
+            bw_tracker,
+            BANDWITH_LIMIT,
+        )
+        .await?;
     } else {
         let msg_id = remote_conn.last_message_id.wrapping_add(1);
         let packet = SymmetricMessage::short_message(
