@@ -1,6 +1,7 @@
-use super::{MessageId, MessagePayload, MAX_CONFIRMATION_DELAY};
+use super::{MessageId, MAX_CONFIRMATION_DELAY};
 use crate::util::{CachingSystemTimeSrc, TimeSource};
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const NETWORK_DELAY_ALLOWANCE: Duration = Duration::from_millis(500);
@@ -49,7 +50,7 @@ const PACKET_LOSS_DECAY_FACTOR: f64 = 1.0 / 1000.0;
 /// ```
 pub(super) struct SentPacketTracker<T: TimeSource> {
     /// The list of packets that have been sent but not yet acknowledged
-    pending_receipts: HashMap<MessageId, MessagePayload>,
+    pending_receipts: HashMap<MessageId, Arc<[u8]>>,
 
     resend_queue: VecDeque<ResendQueueEntry>,
 
@@ -79,7 +80,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
         self.packet_loss_proportion
     }
 
-    pub(super) fn report_sent_packet(&mut self, message_id: u32, payload: MessagePayload) {
+    pub(super) fn report_sent_packet(&mut self, message_id: u32, payload: Arc<[u8]>) {
         self.pending_receipts.insert(message_id, payload);
         self.resend_queue.push_back(ResendQueueEntry {
             timeout_at: self.time_source.now() + MESSAGE_CONFIRMATION_TIMEOUT,
@@ -131,7 +132,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
 #[derive(Debug, PartialEq)]
 pub enum ResendAction {
     WaitUntil(Instant),
-    Resend(u32, MessagePayload),
+    Resend(u32, Arc<[u8]>),
 }
 
 struct ResendQueueEntry {
@@ -143,7 +144,7 @@ struct ResendQueueEntry {
 #[cfg(test)]
 pub(in crate::transport) mod tests {
     use super::*;
-    use crate::util::MockTimeSource;
+    use crate::{transport::MessagePayload, util::MockTimeSource};
 
     pub(in crate::transport) fn mock_sent_packet_tracker() -> SentPacketTracker<MockTimeSource> {
         let time_source = MockTimeSource::new(Instant::now());
@@ -159,7 +160,7 @@ pub(in crate::transport) mod tests {
     #[test]
     fn test_report_sent_packet() {
         let mut tracker = mock_sent_packet_tracker();
-        tracker.report_sent_packet(1, vec![1, 2, 3]);
+        tracker.report_sent_packet(1, vec![1, 2, 3].into());
         assert_eq!(tracker.pending_receipts.len(), 1);
         assert_eq!(tracker.resend_queue.len(), 1);
         assert_eq!(tracker.packet_loss_proportion, 0.0);
@@ -168,7 +169,7 @@ pub(in crate::transport) mod tests {
     #[test]
     fn test_report_received_receipts() {
         let mut tracker = mock_sent_packet_tracker();
-        tracker.report_sent_packet(1, vec![1, 2, 3]);
+        tracker.report_sent_packet(1, vec![1, 2, 3].into());
         tracker.report_received_receipts(&[1]);
         assert_eq!(tracker.pending_receipts.len(), 0);
         assert!(tracker.resend_queue.len() <= 1);
@@ -178,12 +179,12 @@ pub(in crate::transport) mod tests {
     #[test]
     fn test_packet_lost() {
         let mut tracker = mock_sent_packet_tracker();
-        tracker.report_sent_packet(1, vec![1, 2, 3]);
+        tracker.report_sent_packet(1, vec![1, 2, 3].into());
         tracker
             .time_source
             .advance_time(MESSAGE_CONFIRMATION_TIMEOUT);
         let resend_action = tracker.get_resend();
-        assert_eq!(resend_action, ResendAction::Resend(1, vec![1, 2, 3]));
+        assert_eq!(resend_action, ResendAction::Resend(1, vec![1, 2, 3].into()));
         assert_eq!(tracker.pending_receipts.len(), 0);
         assert_eq!(tracker.resend_queue.len(), 0);
         assert_eq!(tracker.packet_loss_proportion, PACKET_LOSS_DECAY_FACTOR);
@@ -194,8 +195,8 @@ pub(in crate::transport) mod tests {
         let mut tracker = mock_sent_packet_tracker();
 
         // Report two packets sent
-        tracker.report_sent_packet(1, vec![1, 2, 3]);
-        tracker.report_sent_packet(2, vec![4, 5, 6]);
+        tracker.report_sent_packet(1, vec![1, 2, 3].into());
+        tracker.report_sent_packet(2, vec![4, 5, 6].into());
 
         // Immediately report receipt for the first packet
         tracker.report_received_receipts(&[1]);
@@ -225,11 +226,11 @@ pub(in crate::transport) mod tests {
     fn test_get_resend_with_pending_receipts() {
         let mut tracker = mock_sent_packet_tracker();
 
-        tracker.report_sent_packet(0, MessagePayload::new());
+        tracker.report_sent_packet(0, MessagePayload::new().into());
 
         tracker.time_source.advance_time(Duration::from_millis(10));
 
-        tracker.report_sent_packet(1, MessagePayload::new());
+        tracker.report_sent_packet(1, MessagePayload::new().into());
 
         let packet_1_timeout = tracker.time_source.now() + MESSAGE_CONFIRMATION_TIMEOUT;
 

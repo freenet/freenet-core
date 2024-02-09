@@ -1,6 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicPtr};
 use std::sync::Arc;
-use std::time::SystemTime;
 use std::{
     collections::{BTreeMap, HashSet},
     time::{Duration, Instant},
@@ -350,7 +349,7 @@ pub mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_many_timesources() {
         let mut ts = vec![];
-        for i in 1..100 {
+        for _ in 1..100 {
             ts.push(CachingSystemTimeSrc::new());
         }
     }
