@@ -17,7 +17,7 @@ use crate::util::{CachingSystemTimeSrc, TimeSource};
 
 use super::bw;
 use super::{
-    connection_handler::{RemoteConnection, SerializedMessage, Socket, TransportError},
+    connection_handler::{OutboundRemoteConnection, SerializedMessage, Socket, TransportError},
     packet_data::{PacketData, MAX_DATA_SIZE},
     symmetric_message::SymmetricMessagePayload,
 };
@@ -146,13 +146,12 @@ impl ReceiverStream {
 /// Handles breaking a message into parts, encryption, etc.
 pub(super) struct SenderStream<'a, S = UdpSocket, T: TimeSource = CachingSystemTimeSrc> {
     socket: &'a S,
-    remote_conn: &'a mut RemoteConnection,
+    remote_conn: &'a mut OutboundRemoteConnection,
     message: StreamBytes,
     start_index: u32,
     total_messages: usize,
     sent_confirmed: usize,
     sent_not_confirmed: HashSet<u32>,
-    receipts_notification: mpsc::Receiver<Vec<u32>>,
     next_sent_check: Instant,
     bw_tracker: &'a Mutex<bw::PacketBWTracker<T>>,
     bw_limit: usize,
@@ -163,9 +162,8 @@ pub(super) struct SenderStream<'a, S = UdpSocket, T: TimeSource = CachingSystemT
 impl<'a, S: Socket, T: TimeSource> SenderStream<'a, S, T> {
     pub fn new(
         socket: &'a S,
-        remote_conn: &'a mut RemoteConnection,
+        remote_conn: &'a mut OutboundRemoteConnection,
         whole_message: StreamBytes,
-        receipts_notification: mpsc::Receiver<Vec<u32>>,
         bw_tracker: &'a Mutex<bw::PacketBWTracker<T>>,
         bw_limit: usize,
     ) -> Self {
@@ -184,7 +182,6 @@ impl<'a, S: Socket, T: TimeSource> SenderStream<'a, S, T> {
             total_messages,
             sent_confirmed: 0,
             sent_not_confirmed: HashSet::new(),
-            receipts_notification,
             next_sent_check: Instant::now(),
             bw_tracker,
             bw_limit,
@@ -240,7 +237,7 @@ impl<S: Socket, T: TimeSource> Future for SenderStream<'_, S, T> {
         if self.wait_for_sending_until > Instant::now() {
             return Poll::Pending;
         }
-        match self.receipts_notification.poll_recv(cx) {
+        match self.remote_conn.receipts_notifier.poll_recv(cx) {
             Poll::Pending => {}
             Poll::Ready(Some(receipts)) => {
                 self.remote_conn
