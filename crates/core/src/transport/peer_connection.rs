@@ -331,35 +331,39 @@ pub(super) enum SenderStreamError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_simple_receiver_sequence() {
-        let mut stream = ReceiverStream::new(6);
-        assert_eq!(stream.push_fragment(0, vec![1, 2, 3]), None);
-        assert_eq!(
-            stream.push_fragment(1, vec![4, 5, 6]),
-            Some(vec![1, 2, 3, 4, 5, 6])
-        );
-    }
+    mod receiver_stream {
+        use crate::transport::peer_connection::ReceiverStream;
 
-    #[test]
-    fn test_out_of_order_fragment_receiver_sequence() {
-        let mut stream = ReceiverStream::new(6);
-        assert_eq!(stream.push_fragment(0, vec![1, 2]), None);
-        assert_eq!(stream.push_fragment(2, vec![5, 6]), None);
-        assert_eq!(
-            stream.push_fragment(1, vec![3, 4]),
-            Some(vec![1, 2, 3, 4, 5, 6])
-        );
-    }
+        #[test]
+        fn test_simple_sequence() {
+            let mut stream = ReceiverStream::new(6);
+            assert_eq!(stream.push_fragment(0, vec![1, 2, 3]), None);
+            assert_eq!(
+                stream.push_fragment(1, vec![4, 5, 6]),
+                Some(vec![1, 2, 3, 4, 5, 6])
+            );
+        }
 
-    #[test]
-    fn test_very_out_of_order_fragment_receiver_sequence() {
-        let mut stream = ReceiverStream::new(6);
-        assert_eq!(stream.push_fragment(1, vec![3, 4]), None);
-        assert_eq!(stream.push_fragment(2, vec![5, 6]), None);
-        assert_eq!(
-            stream.push_fragment(0, vec![1, 2]),
-            Some(vec![1, 2, 3, 4, 5, 6])
-        );
+        #[test]
+        fn test_out_of_order_fragment_1() {
+            let mut stream = ReceiverStream::new(6);
+            assert_eq!(stream.push_fragment(0, vec![1, 2]), None);
+            assert_eq!(stream.push_fragment(2, vec![5, 6]), None);
+            assert_eq!(
+                stream.push_fragment(1, vec![3, 4]),
+                Some(vec![1, 2, 3, 4, 5, 6])
+            );
+        }
+
+        #[test]
+        fn test_out_of_order_fragment_2() {
+            let mut stream = ReceiverStream::new(6);
+            assert_eq!(stream.push_fragment(1, vec![3, 4]), None);
+            assert_eq!(stream.push_fragment(2, vec![5, 6]), None);
+            assert_eq!(
+                stream.push_fragment(0, vec![1, 2]),
+                Some(vec![1, 2, 3, 4, 5, 6])
+            );
+        }
     }
 }
