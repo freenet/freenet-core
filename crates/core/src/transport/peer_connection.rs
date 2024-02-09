@@ -87,50 +87,46 @@ type StreamBytes = Vec<u8>;
 
 // todo:  unit test
 pub(super) struct ReceiverStream {
-    start_index: u64,
-    total_length: u64,
-    last_contiguous: u64,
-    received_fragments: u64,
-    fragments: BTreeMap<u64, Vec<u8>>,
+    total_length_bytes: u64,
+    last_contiguous_fragment_ix: i64,
+    non_contiguous_fragments: BTreeMap<u64, Vec<u8>>,
     message: Vec<u8>,
 }
 
 impl ReceiverStream {
-    fn new(total_length: u64, start_index: u64) -> Self {
+    fn new(total_length_bytes: u64) -> Self {
         Self {
-            start_index,
-            total_length,
-            last_contiguous: start_index,
-            received_fragments: 0,
-            fragments: BTreeMap::new(),
+            total_length_bytes,
+            last_contiguous_fragment_ix: -1,
+            non_contiguous_fragments: BTreeMap::new(),
             message: vec![],
         }
     }
 
     /// Returns some if the message has been completely streamed, none otherwise.
-    fn push_fragment(&mut self, index: u64, mut fragment: StreamBytes) -> Option<Vec<u8>> {
-        self.received_fragments += 1;
-        if index == self.last_contiguous + 1 {
-            self.last_contiguous = index;
+    fn push_fragment(&mut self, fragment_index: u64, mut fragment: StreamBytes) -> Option<Vec<u8>> {
+        if (fragment_index as i64) == self.last_contiguous_fragment_ix + 1 {
+            self.last_contiguous_fragment_ix = fragment_index as i64;
             self.message.append(&mut fragment);
-            self.get_if_finished()
+            self.get_and_clear()
         } else {
-            self.fragments.insert(index, fragment);
-            while let Some((idx, mut v)) = self.fragments.pop_first() {
-                if idx == self.last_contiguous + 1 {
-                    self.last_contiguous += 1;
+            self.non_contiguous_fragments
+                .insert(fragment_index, fragment);
+            while let Some((idx, mut v)) = self.non_contiguous_fragments.pop_first() {
+                if (idx as i64) == self.last_contiguous_fragment_ix + 1 {
+                    self.last_contiguous_fragment_ix += 1;
                     self.message.append(&mut v);
                 } else {
-                    self.fragments.insert(idx, v);
+                    self.non_contiguous_fragments.insert(idx, v);
                     break;
                 }
             }
-            self.get_if_finished()
+            self.get_and_clear()
         }
     }
 
-    fn get_if_finished(&mut self) -> Option<Vec<u8>> {
-        if self.message.len() as u64 == self.total_length {
+    fn get_and_clear(&mut self) -> Option<Vec<u8>> {
+        if self.message.len() as u64 == self.total_length_bytes {
             Some(std::mem::take(&mut self.message))
         } else {
             None
@@ -191,4 +187,20 @@ pub(super) enum SenderStreamError {
     Closed,
     #[error("message too big, size: {size}, max size: {max_size}")]
     MessageExceedsLength { size: usize, max_size: usize },
+}
+
+// Tests
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_simple_receiver_sequence() {
+        let mut stream = ReceiverStream::new(6, 0);
+        assert_eq!(stream.push_fragment(0, vec![1, 2, 3]), None);
+        assert_eq!(
+            stream.push_fragment(1, vec![4, 5, 6]),
+            Some(vec![1, 2, 3, 4, 5, 6])
+        );
+    }
 }
