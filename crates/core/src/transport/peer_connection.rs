@@ -58,7 +58,7 @@ impl Future for PeerConnection {
                 let mut stream = self
                     .ongoing_stream
                     .take()
-                    .unwrap_or_else(|| ReceiverStream::new(total_length, index));
+                    .unwrap_or_else(|| ReceiverStream::new(total_length)); // TODO: Is index used appropriately?
                 if let Some(msg) = stream.push_fragment(index, payload) {
                     return Poll::Ready(Ok(msg));
                 }
@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn test_simple_receiver_sequence() {
-        let mut stream = ReceiverStream::new(6, 0);
+        let mut stream = ReceiverStream::new(6);
         assert_eq!(stream.push_fragment(0, vec![1, 2, 3]), None);
         assert_eq!(
             stream.push_fragment(1, vec![4, 5, 6]),
