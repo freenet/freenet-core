@@ -99,9 +99,8 @@ pub(super) enum SymmetricMessagePayload {
         payload: MessagePayload,
     },
     LongMessageFragment {
-        /// Total length in bytes
-        total_length: u64,
-        index: u32,
+        total_length_bytes: u64,
+        fragment_number: u32,
         payload: MessagePayload,
     },
 }
@@ -112,7 +111,7 @@ fn ack_error_msg() -> Result<(), Box<dyn std::error::Error>> {
     let key = Aes128Gcm::new(&[0; 16].into());
     let packet = SymmetricMessage::ack_error(&key)?;
 
-    let _packet = PacketData::<1500>::encrypted_with_cipher(packet.data(), &key);
+    let _packet = PacketData::<1000>::encrypted_with_cipher(packet.data(), &key);
 
     let data = packet.decrypt(&key).unwrap();
     let deser = SymmetricMessage::deser(data.data())?;
