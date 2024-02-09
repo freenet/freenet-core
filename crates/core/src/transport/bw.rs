@@ -8,7 +8,7 @@ pub(super) struct PacketBWTracker<T: TimeSource> {
     packets: VecDeque<(usize, Instant)>,
     window_size: Duration,
     current_bandwidth: usize,
-    time_source: T,
+    pub time_source: T,
 }
 
 impl PacketBWTracker<CachingSystemTimeSrc> {
