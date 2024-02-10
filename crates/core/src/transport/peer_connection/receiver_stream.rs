@@ -65,6 +65,8 @@ mod tests {
                 stream.push_fragment(1, vec![4, 5, 6]),
                 Some(vec![1, 2, 3, 4, 5, 6])
             );
+            assert!(stream.non_contiguous_fragments.is_empty());
+            assert!(stream.message.is_empty());
         }
 
         #[test]
@@ -76,6 +78,8 @@ mod tests {
                 stream.push_fragment(1, vec![3, 4]),
                 Some(vec![1, 2, 3, 4, 5, 6])
             );
+            assert!(stream.non_contiguous_fragments.is_empty());
+            assert!(stream.message.is_empty());
         }
 
         #[test]
@@ -87,6 +91,8 @@ mod tests {
                 stream.push_fragment(0, vec![1, 2]),
                 Some(vec![1, 2, 3, 4, 5, 6])
             );
+            assert!(stream.non_contiguous_fragments.is_empty());
+            assert!(stream.message.is_empty());
         }
     }
 }
