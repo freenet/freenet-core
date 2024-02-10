@@ -16,23 +16,27 @@ use crate::transport::sent_packet_tracker::ResendAction;
 use crate::util::{CachingSystemTimeSrc, TimeSource};
 
 use super::bw;
+use super::symmetric_message::SymmetricMessage;
 use super::{
     connection_handler::{OutboundRemoteConnection, SerializedMessage, Socket, TransportError},
     packet_data::{PacketData, MAX_DATA_SIZE},
     symmetric_message::SymmetricMessagePayload,
 };
 
+const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
+
 /// Handles the connection with a remote peer.
 ///
 /// Can be awaited for incoming messages or used to send messages to the remote peer.
-pub(crate) struct PeerConnection {
+pub(crate) struct PeerConnection<S = UdpSocket> {
     pub(super) inbound_recv: mpsc::Receiver<SymmetricMessagePayload>,
     pub(super) outbound_sender: mpsc::Sender<SerializedMessage>,
+    pub(super) outbound_connection: OutboundRemoteConnection<S>,
     pub(super) inbound_sym_key: Aes128Gcm,
     pub(super) ongoing_stream: Option<ReceiverStream>,
 }
 
-impl Future for PeerConnection {
+impl<S: Socket> Future for PeerConnection<S> {
     type Output = Result<Vec<u8>, TransportError>;
 
     fn poll(
@@ -72,16 +76,72 @@ impl Future for PeerConnection {
     }
 }
 
-impl PeerConnection {
+impl<S: Socket> PeerConnection<S> {
     pub async fn send<T: Serialize>(&mut self, data: &T) -> Result<(), TransportError> {
         // todo: improve: careful with blocking while serializing here
         let serialized_data = bincode::serialize(data).unwrap();
-        // todo: improve cancel safety just in case, although is unlikely to be an issue
-        // when calling this methods because the &mut ref
-        self.outbound_sender
-            .send(serialized_data)
+        let bw_tracker: Arc<Mutex<bw::PacketBWTracker<CachingSystemTimeSrc>>> = { todo!() };
+        self.outbound_messages(serialized_data, bw_tracker).await?;
+        Ok(())
+    }
+
+    async fn outbound_messages(
+        &mut self,
+        msg: SerializedMessage,
+        bw_tracker: Arc<Mutex<bw::PacketBWTracker<impl TimeSource>>>,
+    ) -> Result<(), TransportError> {
+        if let Some(wait_time) = bw_tracker
+            .lock()
             .await
-            .map_err(|_| TransportError::ConnectionClosed)?;
+            .can_send_packet(BANDWITH_LIMIT, msg.len())
+        {
+            tokio::time::sleep(wait_time).await;
+        }
+        let size = msg.len();
+        self.send_outbound_msg(msg, &bw_tracker).await?;
+        bw_tracker.lock().await.add_packet(size);
+        Ok(())
+    }
+
+    async fn send_outbound_msg(
+        &mut self,
+        serialized_data: SerializedMessage,
+        bw_tracker: &Arc<Mutex<bw::PacketBWTracker<impl TimeSource>>>,
+    ) -> Result<(), TransportError> {
+        let receipts = self
+            .outbound_connection
+            .receipts_notifier
+            .try_recv()
+            .unwrap_or_default();
+        if serialized_data.len() > MAX_DATA_SIZE {
+            // todo: WIP, this code path is unlikely to ever complete, need to do the refactor commented above,
+            // so the outbound traffic is separated from the inboudn packet listener
+            // otherwise we will never be getting the receipts back and be able to finishing this task
+
+            // allow some buffering so we don't suspend the listener task while awaiting for sending multiple notifications
+            SenderStream::new(
+                &mut self.outbound_connection,
+                serialized_data,
+                bw_tracker,
+                BANDWITH_LIMIT,
+            )
+            .await?;
+        } else {
+            let msg_id = self.outbound_connection.last_message_id.wrapping_add(1);
+            let packet = SymmetricMessage::short_message(
+                msg_id,
+                serialized_data,
+                &self.outbound_connection.outbound_symmetric_key,
+                receipts,
+            )?;
+            self.outbound_connection
+                .socket
+                .send_to(packet.data(), self.outbound_connection.remote_addr)
+                .await?;
+            self.outbound_connection
+                .sent_tracker
+                .report_sent_packet(msg_id, packet.data().into());
+        }
         Ok(())
     }
 }
@@ -145,8 +205,7 @@ impl ReceiverStream {
 // todo: unit test
 /// Handles breaking a message into parts, encryption, etc.
 pub(super) struct SenderStream<'a, S = UdpSocket, T: TimeSource = CachingSystemTimeSrc> {
-    socket: &'a S,
-    remote_conn: &'a mut OutboundRemoteConnection,
+    remote_conn: &'a mut OutboundRemoteConnection<S>,
     message: StreamBytes,
     start_index: u32,
     total_messages: usize,
@@ -161,8 +220,7 @@ pub(super) struct SenderStream<'a, S = UdpSocket, T: TimeSource = CachingSystemT
 
 impl<'a, S: Socket, T: TimeSource> SenderStream<'a, S, T> {
     pub fn new(
-        socket: &'a S,
-        remote_conn: &'a mut OutboundRemoteConnection,
+        remote_conn: &'a mut OutboundRemoteConnection<S>,
         whole_message: StreamBytes,
         bw_tracker: &'a Mutex<bw::PacketBWTracker<T>>,
         bw_limit: usize,
@@ -175,7 +233,6 @@ impl<'a, S: Socket, T: TimeSource> SenderStream<'a, S, T> {
             1
         };
         Self {
-            socket,
             remote_conn,
             message: whole_message,
             start_index,
@@ -195,7 +252,8 @@ impl<'a, S: Socket, T: TimeSource> SenderStream<'a, S, T> {
     }
 
     async fn send_packet(&mut self, idx: u32, packet: Arc<[u8]>) -> Result<(), SenderStreamError> {
-        self.socket
+        self.remote_conn
+            .socket
             .send_to(&packet, self.remote_conn.remote_addr)
             .await
             .map_err(|_| SenderStreamError::Closed)?;

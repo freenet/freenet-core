@@ -7,22 +7,21 @@ use std::vec::Vec;
 use std::{borrow::Cow, time::Duration};
 
 use aes_gcm::{Aes128Gcm, KeyInit};
-use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
+use futures::FutureExt;
 use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task;
 
 use crate::transport::received_packet_tracker::ReportResult;
-use crate::util::{CachingSystemTimeSrc, TimeSource};
+use crate::util::CachingSystemTimeSrc;
 
-use super::bw;
 use super::peer_connection::SenderStreamError;
 use super::received_packet_tracker::ReceivedPacketTracker;
 use super::sent_packet_tracker::SentPacketTracker;
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
-    packet_data::{MAX_DATA_SIZE, MAX_PACKET_SIZE},
-    peer_connection::{PeerConnection, SenderStream},
+    packet_data::MAX_PACKET_SIZE,
+    peer_connection::PeerConnection,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
     BytesPerSecond, PacketData,
 };
@@ -52,14 +51,14 @@ struct OutboundMessage {
     recv: mpsc::Receiver<SerializedMessage>,
 }
 
-pub(crate) struct ConnectionHandler {
+pub(crate) struct ConnectionHandler<S> {
     max_upstream_rate: Arc<arc_swap::ArcSwap<BytesPerSecond>>,
-    send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>,
-    new_connection_notifier: mpsc::Receiver<PeerConnection>,
+    send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent<S>)>,
+    new_connection_notifier: mpsc::Receiver<PeerConnection<S>>,
 }
 
-impl ConnectionHandler {
-    pub async fn new<S: Socket>(
+impl<S: Socket> ConnectionHandler<S> {
+    pub async fn new(
         keypair: TransportKeypair,
         listen_port: u16,
         is_gateway: bool,
@@ -125,7 +124,7 @@ impl ConnectionHandler {
         }
     }
 
-    pub async fn new_connection(&mut self) -> Option<PeerConnection> {
+    pub async fn new_connection(&mut self) -> Option<PeerConnection<S>> {
         self.new_connection_notifier.recv().await
     }
 
@@ -166,14 +165,14 @@ impl Socket for UdpSocket {
 struct UdpPacketsListener<S = UdpSocket> {
     socket: Arc<S>,
     remote_connections: BTreeMap<SocketAddr, InboundRemoteConnection>,
-    connection_handler: mpsc::Receiver<(SocketAddr, ConnectionEvent)>,
+    connection_handler: mpsc::Receiver<(SocketAddr, ConnectionEvent<S>)>,
     this_peer_keypair: TransportKeypair,
     max_upstream_rate: Arc<arc_swap::ArcSwap<BytesPerSecond>>,
     is_gateway: bool,
     // /// A new inbound connection that we haven't sent an explicit message yet
     // inbound_connections:
     //     BTreeMap<SocketAddr, (PeerChannel, Aes128Gcm, mpsc::Receiver<SerializedMessage>)>,
-    new_connection_notifier: mpsc::Sender<PeerConnection>,
+    new_connection_notifier: mpsc::Sender<PeerConnection<S>>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -335,7 +334,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         &self,
         remote_addr: SocketAddr,
         mut state: ConnectionState,
-    ) -> Result<(OutboundRemoteConnection, InboundRemoteConnection), TransportError> {
+    ) -> Result<(OutboundRemoteConnection<S>, InboundRemoteConnection), TransportError> {
         // Initialize timeout and interval
         let mut timeout = INITIAL_TIMEOUT;
         let mut interval_duration = INITIAL_INTERVAL;
@@ -406,6 +405,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     let (receipts_sender, receipts_notifier) = mpsc::channel(10);
                     return Ok((
                         OutboundRemoteConnection {
+                            socket: self.socket.clone(),
                             outbound_symmetric_key: outbound_sym_key
                                 .expect("should be set at this stage"),
                             remote_is_gateway: false,
@@ -514,6 +514,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             let (receipts_sender, receipts_notifier) = mpsc::channel(10);
                             return Ok((
                                 OutboundRemoteConnection {
+                                    socket: self.socket.clone(),
                                     outbound_symmetric_key: outbound_sym_key
                                         .expect("should be set at this stage"),
                                     remote_is_gateway: false,
@@ -577,7 +578,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         &self,
         remote_addr: SocketAddr,
         inbound_intro_packet: PacketData,
-    ) -> Result<(OutboundRemoteConnection, InboundRemoteConnection), TransportError> {
+    ) -> Result<(OutboundRemoteConnection<S>, InboundRemoteConnection), TransportError> {
         // logic for gateway should be slightly different cause we don't need to do nat traversal
         let decrypted_intro_packet = match self
             .this_peer_keypair
@@ -613,93 +614,23 @@ impl<S: Socket> UdpPacketsListener<S> {
     }
 }
 
-const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
-
-#[inline]
-async fn outbound_messages(
-    socket: Arc<impl Socket>,
-    mut outbound_receiver: mpsc::Receiver<SerializedMessage>,
-    remote_addr: SocketAddr,
-    mut remote_conn: OutboundRemoteConnection,
-    bw_tracker: Arc<Mutex<bw::PacketBWTracker<impl TimeSource>>>,
-) -> Result<(), SocketAddr> {
-    loop {
-        let msg = outbound_receiver.recv().await.ok_or({
-            // dropping this remote connection since we don't care about their messages anymore
-            // since the other side dropped the PeerConnectin
-            remote_addr
-        })?;
-        if let Some(wait_time) = bw_tracker
-            .lock()
-            .await
-            .can_send_packet(BANDWITH_LIMIT, msg.len())
-        {
-            tokio::time::sleep(wait_time).await;
-        }
-        let size = msg.len();
-        send_outbound_msg(&*socket, &mut remote_conn, msg, &bw_tracker)
-            .await
-            .map_err(|_| remote_addr)?;
-        bw_tracker.lock().await.add_packet(size);
-    }
-}
-
-#[inline]
-async fn send_outbound_msg(
-    socket: &impl Socket,
-    remote_conn: &mut OutboundRemoteConnection,
-    serialized_data: SerializedMessage,
-    bw_tracker: &Arc<Mutex<bw::PacketBWTracker<impl TimeSource>>>,
-) -> Result<(), TransportError> {
-    let receipts = remote_conn.receipts_notifier.try_recv().unwrap_or_default();
-    if serialized_data.len() > MAX_DATA_SIZE {
-        // todo: WIP, this code path is unlikely to ever complete, need to do the refactor commented above,
-        // so the outbound traffic is separated from the inboudn packet listener
-        // otherwise we will never be getting the receipts back and be able to finishing this task
-
-        // allow some buffering so we don't suspend the listener task while awaiting for sending multiple notifications
-        SenderStream::new(
-            socket,
-            remote_conn,
-            serialized_data,
-            bw_tracker,
-            BANDWITH_LIMIT,
-        )
-        .await?;
-    } else {
-        let msg_id = remote_conn.last_message_id.wrapping_add(1);
-        let packet = SymmetricMessage::short_message(
-            msg_id,
-            serialized_data,
-            &remote_conn.outbound_symmetric_key,
-            receipts,
-        )?;
-        socket
-            .send_to(packet.data(), remote_conn.remote_addr)
-            .await?;
-        remote_conn
-            .sent_tracker
-            .report_sent_packet(msg_id, packet.data().into());
-    }
-    Ok(())
-}
-
-enum ConnectionEvent {
+enum ConnectionEvent<S = UdpSocket> {
     ConnectionStart {
         remote_public_key: TransportPublicKey,
-        open_connection: oneshot::Sender<Result<OutboundRemoteConnection, TransportError>>,
+        open_connection: oneshot::Sender<Result<OutboundRemoteConnection<S>, TransportError>>,
     },
 }
 
 #[must_use]
-pub(super) struct OutboundRemoteConnection {
+pub(super) struct OutboundRemoteConnection<S> {
+    pub socket: Arc<S>,
     pub outbound_symmetric_key: Aes128Gcm,
-    remote_is_gateway: bool,
+    pub remote_is_gateway: bool,
     pub remote_addr: SocketAddr,
     pub sent_tracker: SentPacketTracker<CachingSystemTimeSrc>,
     pub last_message_id: u32,
     pub receipts_notifier: mpsc::Receiver<Vec<u32>>,
-    inbound_recv: mpsc::Receiver<SymmetricMessagePayload>,
+    pub inbound_recv: mpsc::Receiver<SymmetricMessagePayload>,
 }
 
 struct InboundRemoteConnection {
