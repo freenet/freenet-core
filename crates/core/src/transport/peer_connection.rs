@@ -70,6 +70,7 @@ impl<S: Socket> Future for PeerConnection<S> {
                 "AckConnection".into(),
             ))),
             LongMessageFragment {
+                message_id,
                 total_length_bytes: total_length,
                 fragment_number: index,
                 payload,

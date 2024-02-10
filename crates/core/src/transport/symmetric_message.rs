@@ -99,6 +99,7 @@ pub(super) enum SymmetricMessagePayload {
         payload: MessagePayload,
     },
     LongMessageFragment {
+        message_id: u32,
         total_length_bytes: u64,
         fragment_number: u32,
         payload: MessagePayload,
