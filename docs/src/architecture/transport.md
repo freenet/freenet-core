@@ -124,9 +124,9 @@ pub enum SymmetricMessagePayload {
     Disconnect,
     ShortMessage { payload: Vec<u8> },
     LongMessageFragment {
-        total_length: u64,
-        start_index: u64,
-        payload: Vec<u8>,
+        total_length_bytes: u64,
+        fragment_number: u32,
+        payload: MessagePayload,
     },
 }
 
