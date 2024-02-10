@@ -6,27 +6,27 @@ use std::time::Instant;
 
 use futures::{pin_mut, FutureExt};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 
 use crate::transport::bw;
-use crate::transport::connection_handler::{RemoteConnection, Socket};
+use crate::transport::connection_handler::Socket;
 use crate::transport::packet_data::{PacketData, MAX_DATA_SIZE, MAX_PACKET_SIZE};
 use crate::transport::sent_packet_tracker::ResendAction;
 use crate::util::{CachingSystemTimeSrc, TimeSource};
+
+use super::OutboundRemoteConnection;
 
 pub(crate) type StreamBytes = Vec<u8>;
 
 // todo: unit test
 /// Handles breaking a message into parts, encryption, etc.
 pub(crate) struct SenderStream<'a, S = UdpSocket, T: TimeSource = CachingSystemTimeSrc> {
-    socket: &'a S,
-    remote_conn: &'a mut RemoteConnection,
+    remote_conn: &'a mut OutboundRemoteConnection<S>,
     message: StreamBytes,
     start_index: u32,
     total_messages: usize,
     sent_confirmed: usize,
     sent_not_confirmed: HashSet<u32>,
-    receipts_notification: mpsc::Receiver<Vec<u32>>,
     next_sent_check: Instant,
     bw_tracker: &'a Mutex<bw::PacketBWTracker<T>>,
     bw_limit: usize,
@@ -36,10 +36,8 @@ pub(crate) struct SenderStream<'a, S = UdpSocket, T: TimeSource = CachingSystemT
 
 impl<'a, S: Socket, T: TimeSource> SenderStream<'a, S, T> {
     pub fn new(
-        socket: &'a S,
-        remote_conn: &'a mut RemoteConnection,
+        remote_conn: &'a mut OutboundRemoteConnection<S>,
         whole_message: StreamBytes,
-        receipts_notification: mpsc::Receiver<Vec<u32>>,
         bw_tracker: &'a Mutex<bw::PacketBWTracker<T>>,
         bw_limit: usize,
     ) -> Self {
@@ -51,14 +49,12 @@ impl<'a, S: Socket, T: TimeSource> SenderStream<'a, S, T> {
             1
         };
         Self {
-            socket,
             remote_conn,
             message: whole_message,
             start_index,
             total_messages,
             sent_confirmed: 0,
             sent_not_confirmed: HashSet::new(),
-            receipts_notification,
             next_sent_check: Instant::now(),
             bw_tracker,
             bw_limit,
@@ -72,7 +68,8 @@ impl<'a, S: Socket, T: TimeSource> SenderStream<'a, S, T> {
     }
 
     async fn send_packet(&mut self, idx: u32, packet: Arc<[u8]>) -> Result<(), SenderStreamError> {
-        self.socket
+        self.remote_conn
+            .socket
             .send_to(&packet, self.remote_conn.remote_addr)
             .await
             .map_err(|_| SenderStreamError::Closed)?;
@@ -114,7 +111,7 @@ impl<S: Socket, T: TimeSource> Future for SenderStream<'_, S, T> {
         if self.wait_for_sending_until > Instant::now() {
             return Poll::Pending;
         }
-        match self.receipts_notification.try_recv() {
+        match self.remote_conn.receipts_notifier.try_recv() {
             Ok(receipts) => {
                 self.remote_conn
                     .sent_tracker
@@ -194,7 +191,7 @@ impl<S: Socket, T: TimeSource> Future for SenderStream<'_, S, T> {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum SenderStreamError {
+pub enum SenderStreamError {
     #[error("stream closed unexpectedly")]
     Closed,
     #[error("message too big, size: {size}, max size: {max_size}")]
