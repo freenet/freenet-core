@@ -1,3 +1,6 @@
+use crate::transport::peer_connection::sender_stream::{SenderStream, SenderStreamError};
+use aes_gcm::{Aes128Gcm, KeyInit};
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
@@ -5,9 +8,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::vec::Vec;
 use std::{borrow::Cow, time::Duration};
-
-use aes_gcm::{Aes128Gcm, KeyInit};
-use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task;
@@ -16,13 +16,12 @@ use crate::transport::received_packet_tracker::ReportResult;
 use crate::util::{CachingSystemTimeSrc, TimeSource};
 
 use super::bw;
-use super::peer_connection::SenderStreamError;
 use super::received_packet_tracker::ReceivedPacketTracker;
 use super::sent_packet_tracker::SentPacketTracker;
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
     packet_data::{MAX_DATA_SIZE, MAX_PACKET_SIZE},
-    peer_connection::{PeerConnection, SenderStream},
+    peer_connection::PeerConnection,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
     BytesPerSecond, PacketData,
 };

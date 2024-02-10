@@ -9,7 +9,7 @@ use rand::{prelude::SmallRng, thread_rng, Rng};
 use crate::transport::crypto::TransportPublicKey;
 
 /// The maximum size of a received UDP packet, MTU typically is 1500
-pub(super) const MAX_PACKET_SIZE: usize = 1500 - UDP_HEADER_SIZE;
+pub(in crate::transport) const MAX_PACKET_SIZE: usize = 1500 - UDP_HEADER_SIZE;
 
 // These are the same as the AES-GCM 128 constants, but extracting them from Aes128Gcm
 // as consts was awkward.

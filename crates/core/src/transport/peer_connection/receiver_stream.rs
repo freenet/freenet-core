@@ -1,4 +1,4 @@
-use crate::transport::peer_connection::StreamBytes;
+use crate::transport::peer_connection::sender_stream::StreamBytes;
 use std::collections::BTreeMap;
 
 pub(crate) struct ReceiverStream {
