@@ -15,7 +15,8 @@ use tokio::task;
 use crate::transport::received_packet_tracker::ReportResult;
 use crate::util::CachingSystemTimeSrc;
 
-use super::peer_connection::SenderStreamError;
+use super::bw;
+use super::peer_connection::{OutboundRemoteConnection, SenderStreamError};
 use super::received_packet_tracker::ReceivedPacketTracker;
 use super::sent_packet_tracker::SentPacketTracker;
 use super::{
@@ -38,6 +39,8 @@ const INITIAL_INTERVAL: Duration = Duration::from_millis(200);
 const INTERVAL_INCREASE_FACTOR: u64 = 2;
 const MAX_INTERVAL: Duration = Duration::from_millis(5000); // Maximum interval limit
 
+const DEFAULT_BW_TRACKER_WINDOW_SIZE: Duration = Duration::from_secs(10);
+
 type ConnectionHandlerMessage = (SocketAddr, Vec<u8>);
 pub type SerializedMessage = Vec<u8>;
 type PeerChannel = (
@@ -51,10 +54,11 @@ struct OutboundMessage {
     recv: mpsc::Receiver<SerializedMessage>,
 }
 
-pub(crate) struct ConnectionHandler<S> {
+pub(crate) struct ConnectionHandler<S = UdpSocket> {
     max_upstream_rate: Arc<arc_swap::ArcSwap<BytesPerSecond>>,
     send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent<S>)>,
     new_connection_notifier: mpsc::Receiver<PeerConnection<S>>,
+    bw_tracker: Arc<Mutex<bw::PacketBWTracker<CachingSystemTimeSrc>>>,
 }
 
 impl<S: Socket> ConnectionHandler<S> {
@@ -81,10 +85,14 @@ impl<S: Socket> ConnectionHandler<S> {
             max_upstream_rate: max_upstream_rate.clone(),
             new_connection_notifier: new_connection_sender,
         };
+        let bw_tracker = Arc::new(Mutex::new(super::bw::PacketBWTracker::new(
+            DEFAULT_BW_TRACKER_WINDOW_SIZE,
+        )));
         let connection_handler = ConnectionHandler {
             max_upstream_rate,
             send_queue: conn_handler_sender,
             new_connection_notifier,
+            bw_tracker,
         };
 
         task::spawn(transport.listen());
@@ -97,7 +105,7 @@ impl<S: Socket> ConnectionHandler<S> {
         remote_public_key: TransportPublicKey,
         remote_addr: SocketAddr,
         remote_is_gateway: bool,
-    ) -> Result<PeerConnection, TransportError> {
+    ) -> Result<PeerConnection<S>, TransportError> {
         if !remote_is_gateway {
             let (open_connection, recv_connection) = oneshot::channel();
             self.send_queue
@@ -110,15 +118,8 @@ impl<S: Socket> ConnectionHandler<S> {
                 ))
                 .await
                 .map_err(|_| TransportError::ChannelClosed)?;
-            // let ((outbound_sender, inbound_recv), inbound_sym_key) =
-            //     recv_connection.await.map_err(|e| anyhow::anyhow!(e))??;
-            // Ok(PeerConnection {
-            //     inbound_recv,
-            //     outbound_sender,
-            //     inbound_sym_key,
-            //     ongoing_stream: None,
-            // })
-            todo!()
+            let outbound_conn = recv_connection.await.map_err(|e| anyhow::anyhow!(e))??;
+            Ok(PeerConnection::new(outbound_conn, self.bw_tracker.clone()))
         } else {
             todo!("establish connection with a gateway")
         }
@@ -193,14 +194,6 @@ enum ConnectionState {
 
 impl<S: Socket> UdpPacketsListener<S> {
     async fn listen(mut self) -> Result<(), TransportError> {
-        const DEFAULT_BW_TRACKER_WINDOW_SIZE: Duration = Duration::from_secs(10);
-        let bw_tracker = Arc::new(Mutex::new(super::bw::PacketBWTracker::new(
-            DEFAULT_BW_TRACKER_WINDOW_SIZE,
-        )));
-        // todo: refactor this loop a bit so the code is more readable
-        // todo: we probably need to refactor this a bit so we don't block the socket listening
-        // with decryption, deserialization, msg handling etc. so we keep the socket getting new packets
-        // from multiple peers as fast as possible, we can wrap socket into an arc so this should be easy to do
         loop {
             let mut buf = [0u8; MAX_PACKET_SIZE];
             tokio::select! {
@@ -305,17 +298,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                         Ok((outbound_remote_connection, inbound_remote_connection)) => {
                             self.remote_connections.insert(remote_addr, inbound_remote_connection);
                             let _ = open_connection.send(Ok(outbound_remote_connection));
-                            // let socket = self.socket.clone();
-                            // let bw_c = bw_tracker.clone();
-                            // peer_messages.push(tokio::spawn(async move {
-                            //     outbound_messages(
-                            //         socket,
-                            //         outbound_receiver,
-                            //         remote_addr,
-                            //         outbound_remote_connection,
-                            //         bw_c,
-                            //     ).await
-                            // }));
                         }
                     }
                 },
@@ -619,18 +601,6 @@ enum ConnectionEvent<S = UdpSocket> {
         remote_public_key: TransportPublicKey,
         open_connection: oneshot::Sender<Result<OutboundRemoteConnection<S>, TransportError>>,
     },
-}
-
-#[must_use]
-pub(super) struct OutboundRemoteConnection<S> {
-    pub socket: Arc<S>,
-    pub outbound_symmetric_key: Aes128Gcm,
-    pub remote_is_gateway: bool,
-    pub remote_addr: SocketAddr,
-    pub sent_tracker: SentPacketTracker<CachingSystemTimeSrc>,
-    pub last_message_id: u32,
-    pub receipts_notifier: mpsc::Receiver<Vec<u32>>,
-    pub inbound_recv: mpsc::Receiver<SymmetricMessagePayload>,
 }
 
 struct InboundRemoteConnection {

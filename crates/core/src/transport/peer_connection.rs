@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Instant;
@@ -16,24 +17,35 @@ use crate::transport::sent_packet_tracker::ResendAction;
 use crate::util::{CachingSystemTimeSrc, TimeSource};
 
 use super::bw;
+use super::sent_packet_tracker::SentPacketTracker;
 use super::symmetric_message::SymmetricMessage;
 use super::{
-    connection_handler::{OutboundRemoteConnection, SerializedMessage, Socket, TransportError},
+    connection_handler::{SerializedMessage, Socket, TransportError},
     packet_data::{PacketData, MAX_DATA_SIZE},
     symmetric_message::SymmetricMessagePayload,
 };
 
 const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
 
+#[must_use]
+pub(super) struct OutboundRemoteConnection<S> {
+    pub socket: Arc<S>,
+    pub outbound_symmetric_key: Aes128Gcm,
+    pub remote_is_gateway: bool,
+    pub remote_addr: SocketAddr,
+    pub sent_tracker: SentPacketTracker<CachingSystemTimeSrc>,
+    pub last_message_id: u32,
+    pub receipts_notifier: mpsc::Receiver<Vec<u32>>,
+    pub inbound_recv: mpsc::Receiver<SymmetricMessagePayload>,
+}
+
 /// Handles the connection with a remote peer.
 ///
 /// Can be awaited for incoming messages or used to send messages to the remote peer.
 pub(crate) struct PeerConnection<S = UdpSocket> {
-    pub(super) inbound_recv: mpsc::Receiver<SymmetricMessagePayload>,
-    pub(super) outbound_sender: mpsc::Sender<SerializedMessage>,
-    pub(super) outbound_connection: OutboundRemoteConnection<S>,
-    pub(super) inbound_sym_key: Aes128Gcm,
-    pub(super) ongoing_stream: Option<ReceiverStream>,
+    outbound_connection: OutboundRemoteConnection<S>,
+    ongoing_stream: Option<ReceiverStream>,
+    bw_tracker: Arc<Mutex<bw::PacketBWTracker<CachingSystemTimeSrc>>>,
 }
 
 impl<S: Socket> Future for PeerConnection<S> {
@@ -44,7 +56,7 @@ impl<S: Socket> Future for PeerConnection<S> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         use SymmetricMessagePayload::*;
-        let payload = match self.inbound_recv.poll_recv(cx) {
+        let payload = match self.outbound_connection.inbound_recv.poll_recv(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(None) => {
                 // connection finished
@@ -77,20 +89,27 @@ impl<S: Socket> Future for PeerConnection<S> {
 }
 
 impl<S: Socket> PeerConnection<S> {
+    pub fn new(
+        outbound_connection: OutboundRemoteConnection<S>,
+        bw_tracker: Arc<Mutex<bw::PacketBWTracker<CachingSystemTimeSrc>>>,
+    ) -> Self {
+        Self {
+            outbound_connection,
+            ongoing_stream: None,
+            bw_tracker,
+        }
+    }
+
     pub async fn send<T: Serialize>(&mut self, data: &T) -> Result<(), TransportError> {
         // todo: improve: careful with blocking while serializing here
         let serialized_data = bincode::serialize(data).unwrap();
-        let bw_tracker: Arc<Mutex<bw::PacketBWTracker<CachingSystemTimeSrc>>> = { todo!() };
-        self.outbound_messages(serialized_data, bw_tracker).await?;
+        self.outbound_messages(serialized_data).await?;
         Ok(())
     }
 
-    async fn outbound_messages(
-        &mut self,
-        msg: SerializedMessage,
-        bw_tracker: Arc<Mutex<bw::PacketBWTracker<impl TimeSource>>>,
-    ) -> Result<(), TransportError> {
-        if let Some(wait_time) = bw_tracker
+    async fn outbound_messages(&mut self, msg: SerializedMessage) -> Result<(), TransportError> {
+        if let Some(wait_time) = self
+            .bw_tracker
             .lock()
             .await
             .can_send_packet(BANDWITH_LIMIT, msg.len())
@@ -98,15 +117,14 @@ impl<S: Socket> PeerConnection<S> {
             tokio::time::sleep(wait_time).await;
         }
         let size = msg.len();
-        self.send_outbound_msg(msg, &bw_tracker).await?;
-        bw_tracker.lock().await.add_packet(size);
+        self.send_outbound_msg(msg).await?;
+        self.bw_tracker.lock().await.add_packet(size);
         Ok(())
     }
 
     async fn send_outbound_msg(
         &mut self,
         serialized_data: SerializedMessage,
-        bw_tracker: &Arc<Mutex<bw::PacketBWTracker<impl TimeSource>>>,
     ) -> Result<(), TransportError> {
         let receipts = self
             .outbound_connection
@@ -122,7 +140,7 @@ impl<S: Socket> PeerConnection<S> {
             SenderStream::new(
                 &mut self.outbound_connection,
                 serialized_data,
-                bw_tracker,
+                &self.bw_tracker,
                 BANDWITH_LIMIT,
             )
             .await?;
