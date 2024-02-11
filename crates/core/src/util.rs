@@ -277,8 +277,14 @@ impl CachingSystemTimeSrc {
     async fn update_instant() {
         loop {
             let elapsed = START_TIME.elapsed().as_nanos() as u64;
+            let prev_elapsed = ELAPSED.load(Ordering::SeqCst);
             ELAPSED.store(elapsed, Ordering::SeqCst);
-            println!("update_instant: elapsed: {:?}", elapsed);
+            println!(
+                "update_instant: elapsed: {:?}, prev_elapsed: {:?}, diff: {:?}ms",
+                elapsed,
+                prev_elapsed,
+                ((elapsed - prev_elapsed) as f64) / 1_000_000.0
+            );
             sleep(Duration::from_millis(20)).await;
         }
     }
@@ -344,7 +350,7 @@ pub mod tests {
         assert!(now.elapsed() >= Duration::from_secs(0));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 20)]
     async fn test_instant_is_updated() {
         let time_source = CachingSystemTimeSrc::new();
         // Give the time source a chance to initialize
