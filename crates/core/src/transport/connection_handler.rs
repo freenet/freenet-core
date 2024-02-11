@@ -313,7 +313,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         }
     }
 
-    const NAT_TRAVERSAL_MAX_ATTEMPS: usize = 20;
+    const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 20;
 
     // fixme: there is a problem when establishing conenction since both peers are trying to connect simultaneously
     // they have an attempt where the connection is outbound and the other is inbound 2 different instances
@@ -346,7 +346,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         let mut outbound_intro_packet = None;
         let mut update_state: Option<ConnectionState> = None;
 
-        while failures < Self::NAT_TRAVERSAL_MAX_ATTEMPS {
+        while failures < Self::NAT_TRAVERSAL_MAX_ATTEMPTS {
             if let Some(new_state) = update_state.take() {
                 state = new_state;
             }
@@ -369,7 +369,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     tracing::debug!("Sending protocol version and inbound key to remote");
                     if let Err(error) = self.socket.send_to(data.data(), remote_addr).await {
                         failures += 1;
-                        if failures == Self::NAT_TRAVERSAL_MAX_ATTEMPS {
+                        if failures == Self::NAT_TRAVERSAL_MAX_ATTEMPTS {
                             return Err(error.into());
                         }
                         tick.tick().await;
@@ -432,7 +432,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     tracing::debug!("Sending back protocol version and inbound key to remote");
                     if let Err(error) = self.socket.send_to(data.data(), remote_addr).await {
                         failures += 1;
-                        if failures == Self::NAT_TRAVERSAL_MAX_ATTEMPS {
+                        if failures == Self::NAT_TRAVERSAL_MAX_ATTEMPTS {
                             return Err(error.into());
                         }
                         tick.tick().await;
@@ -629,7 +629,7 @@ impl InboundRemoteConnection {
             }
         }
         self.inbound_checked_times += 1;
-        if self.inbound_checked_times >= UdpPacketsListener::<UdpSocket>::NAT_TRAVERSAL_MAX_ATTEMPS
+        if self.inbound_checked_times >= UdpPacketsListener::<UdpSocket>::NAT_TRAVERSAL_MAX_ATTEMPTS
         {
             // no point in checking more than the max attemps since they won't be sending
             // the intro packet more than this amount of times
