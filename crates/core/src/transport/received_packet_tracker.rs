@@ -1,5 +1,5 @@
 use crate::transport::MessageId;
-use crate::util::{CachingSystemTimeSrc, TimeSource};
+use crate::util::time_source::{CachingSystemTimeSrc, TimeSource};
 use std::collections::{HashMap, VecDeque};
 use std::mem;
 use std::time::{Duration, Instant};
@@ -117,7 +117,7 @@ pub(super) enum ReportResult {
 #[cfg(test)]
 pub(in crate::transport) mod tests {
     use super::*;
-    use crate::util::MockTimeSource;
+    use crate::util::time_source::MockTimeSource;
 
     pub(in crate::transport) fn mock_received_packet_tracker(
     ) -> ReceivedPacketTracker<MockTimeSource> {

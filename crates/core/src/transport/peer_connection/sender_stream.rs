@@ -9,7 +9,7 @@ use crate::{
         bw, connection_handler::Socket, packet_data, sent_packet_tracker::ResendAction,
         symmetric_message::SymmetricMessage,
     },
-    util::{CachingSystemTimeSrc, TimeSource},
+    util::time_source::{CachingSystemTimeSrc, TimeSource},
 };
 
 use super::OutboundRemoteConnection;

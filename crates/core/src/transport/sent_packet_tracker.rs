@@ -1,5 +1,5 @@
 use super::{MessageId, MAX_CONFIRMATION_DELAY};
-use crate::util::{CachingSystemTimeSrc, TimeSource};
+use crate::util::time_source::{CachingSystemTimeSrc, TimeSource};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -144,7 +144,8 @@ struct ResendQueueEntry {
 #[cfg(test)]
 pub(in crate::transport) mod tests {
     use super::*;
-    use crate::{transport::MessagePayload, util::MockTimeSource};
+    use crate::transport::MessagePayload;
+    use crate::util::time_source::MockTimeSource;
 
     pub(in crate::transport) fn mock_sent_packet_tracker() -> SentPacketTracker<MockTimeSource> {
         let time_source = MockTimeSource::new(Instant::now());

@@ -1,4 +1,4 @@
-use crate::util::{CachingSystemTimeSrc, TimeSource};
+use crate::util::time_source::{CachingSystemTimeSrc, TimeSource};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -82,7 +82,7 @@ impl<T: TimeSource> PacketBWTracker<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::MockTimeSource;
+    use crate::util::time_source::MockTimeSource;
 
     fn mock_tracker(window_size: Duration) -> PacketBWTracker<MockTimeSource> {
         PacketBWTracker {
