@@ -1,5 +1,3 @@
-use once_cell::sync::Lazy;
-use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicPtr};
 use std::sync::Arc;
 use std::{
@@ -11,8 +9,6 @@ use rand::{
     prelude::{Rng, StdRng},
     SeedableRng,
 };
-use tokio::spawn;
-use tokio::time::sleep;
 
 use crate::node::PeerId;
 
@@ -253,45 +249,9 @@ pub trait TimeSource {
     fn now(&self) -> Instant;
 }
 
-static GLOBAL_TIME_STATE: Lazy<Arc<RwLock<(Instant, bool)>>> =
-    Lazy::new(|| Arc::new(RwLock::new((Instant::now(), false))));
-
-pub struct CachingSystemTimeSrc(());
-
-impl CachingSystemTimeSrc {
-    pub(crate) fn new() -> Self {
-        {
-            let mut time_state = GLOBAL_TIME_STATE.write();
-            if !time_state.1 {
-                time_state.1 = true; // Set the flag
-                let updater_state = Arc::clone(&GLOBAL_TIME_STATE);
-                spawn(async move {
-                    CachingSystemTimeSrc::update_instant(updater_state).await;
-                });
-            }
-        }
-        CachingSystemTimeSrc(())
-    }
-
-    async fn update_instant(global_time_state: Arc<RwLock<(Instant, bool)>>) {
-        loop {
-            {
-                let mut state = global_time_state.write();
-                state.0 = Instant::now();
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
-    }
-}
-
-impl TimeSource for CachingSystemTimeSrc {
-    fn now(&self) -> Instant {
-        let state = GLOBAL_TIME_STATE.read();
-        state.0
-    }
-}
-
-/*
+// A time source that caches the current time in a global state to reduce overhead in performance-critical sections.
+#[derive(Clone, Copy)]
+pub(crate) struct CachingSystemTimeSrc(());
 
 // Global atomic pointer to the cached time. Initialized as a null pointer.
 static GLOBAL_TIME_STATE: AtomicPtr<Instant> = AtomicPtr::new(std::ptr::null_mut());
@@ -353,7 +313,6 @@ impl TimeSource for CachingSystemTimeSrc {
         unsafe { *GLOBAL_TIME_STATE.load(std::sync::atomic::Ordering::Acquire) }
     }
 }
- */
 
 #[cfg(test)]
 #[derive(Clone)]
@@ -414,11 +373,11 @@ pub mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn caching_system_time_is_thread_safe() {
         let mut prev = Instant::now();
+        let time_source = CachingSystemTimeSrc::new();
         let mut handles = vec![];
         for _ in 0..10 {
             handles.push(std::thread::spawn(move || {
                 let time = Instant::now();
-                let time_source = CachingSystemTimeSrc::new();
                 while time.elapsed() < Duration::from_secs(1) {
                     let now = time_source.now();
                     assert!(prev <= now);
