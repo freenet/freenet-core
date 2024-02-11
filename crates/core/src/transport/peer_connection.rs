@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, Mutex};
 mod receiver_stream;
 mod sender_stream;
 
-use self::sender_stream::SenderStream;
+use self::sender_stream::send_long_message;
 use receiver_stream::ReceiverStream;
 pub(super) use sender_stream::SenderStreamError;
 
@@ -70,7 +70,7 @@ impl<S: Socket> Future for PeerConnection<S> {
                 "AckConnection".into(),
             ))),
             LongMessageFragment {
-                message_id,
+                // message_id,
                 total_length_bytes: total_length,
                 fragment_number: index,
                 payload,
@@ -127,25 +127,20 @@ impl<S: Socket> PeerConnection<S> {
         &mut self,
         serialized_data: SerializedMessage,
     ) -> Result<(), TransportError> {
-        let receipts = self
-            .outbound_connection
-            .receipts_notifier
-            .try_recv()
-            .unwrap_or_default();
         if serialized_data.len() > MAX_DATA_SIZE {
-            // todo: WIP, this code path is unlikely to ever complete, need to do the refactor commented above,
-            // so the outbound traffic is separated from the inboudn packet listener
-            // otherwise we will never be getting the receipts back and be able to finishing this task
-
-            // allow some buffering so we don't suspend the listener task while awaiting for sending multiple notifications
-            let stream = SenderStream::new(
+            send_long_message(
                 &mut self.outbound_connection,
                 serialized_data,
                 &self.bw_tracker,
                 BANDWITH_LIMIT,
-            );
-            stream.await?;
+            )
+            .await?;
         } else {
+            let receipts = self
+                .outbound_connection
+                .receipts_notifier
+                .try_recv()
+                .unwrap_or_default();
             let msg_id = self.outbound_connection.last_message_id.wrapping_add(1);
             let packet = SymmetricMessage::short_message(
                 msg_id,

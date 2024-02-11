@@ -123,25 +123,6 @@ impl<S: Socket> ConnectionHandler<S> {
         }
     }
 
-    /*
-     * Proposed external interface functions for ConnectionHandler
-     */
-
-    pub async fn send_short_message(&self, message: Vec<u8>) {
-        todo!()
-    }
-
-    pub async fn send_long_message(
-        &self,
-        message: Vec<u8>,
-    ) -> Result<mpsc::Sender<LongMessageFragment>, ()> {
-        todo!()
-    }
-
-    pub async fn receive_message(&self) -> Result<Message, ()> {
-        todo!()
-    }
-
     pub async fn new_connection(&mut self) -> Option<PeerConnection<S>> {
         self.new_connection_notifier.recv().await
     }

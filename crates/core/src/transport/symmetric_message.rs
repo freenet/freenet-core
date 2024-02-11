@@ -76,6 +76,31 @@ impl SymmetricMessage {
         Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
     }
 
+    pub fn fragmented_message(
+        message_id: u32,
+        total_length_bytes: u64,
+        fragment_number: u32,
+        payload: MessagePayload,
+        outbound_sym_key: &Aes128Gcm,
+        confirm_receipt: Vec<u32>,
+    ) -> Result<PacketData, bincode::Error> {
+        let message = Self {
+            message_id,
+            confirm_receipt,
+            payload: SymmetricMessagePayload::LongMessageFragment {
+                total_length_bytes,
+                fragment_number,
+                payload,
+            },
+        };
+        let mut packet = [0u8; MAX_PACKET_SIZE]; // todo: optimize this
+        let size = bincode::serialized_size(&message)?;
+        debug_assert!(size <= MAX_DATA_SIZE as u64);
+        bincode::serialize_into(packet.as_mut_slice(), &message)?;
+        let bytes = &packet[..size as usize];
+        Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
+    }
+
     const ACK_ERROR: SymmetricMessage = SymmetricMessage {
         message_id: Self::FIRST_MESSAGE_ID,
         confirm_receipt: Vec::new(),
@@ -99,8 +124,8 @@ pub(super) enum SymmetricMessagePayload {
         payload: MessagePayload,
     },
     LongMessageFragment {
-        message_id: u32,
-        total_length_bytes: u64,
+        // message_id: u32,
+        total_length_bytes: u64, // we shouldn't allow messages larger than u32, that's already crazy big
         fragment_number: u32,
         payload: MessagePayload,
     },
