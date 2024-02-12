@@ -255,7 +255,8 @@ impl Ring {
     ) -> Result<Arc<Self>, anyhow::Error> {
         let (live_tx_tracker, missing_candidate_rx) = LiveTransactionTracker::new();
 
-        let peer_key = config.peer_id;
+        //FIXME: The config.peer_id field should be optional and only set in the gateways.
+        let peer_key = config.peer_id.clone().unwrap();
 
         // for location here consider -1 == None
         let own_location = AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()));

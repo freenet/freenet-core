@@ -9,8 +9,7 @@ use super::{
     },
     NetEventRegister, PeerId as FreenetPeerId,
 };
-use crate::transport::connection_handler::ConnectionHandler;
-use crate::transport::crypto::TransportKeypair;
+use crate::transport::{TransportKeypair, TransportPublicKey};
 use crate::{
     client_events::{combinator::ClientEventsCombinator, BoxedClient},
     config::{self, GlobalExecutor},
@@ -26,7 +25,7 @@ use crate::{
 use super::OpManager;
 
 pub(super) struct NodeP2P {
-    pub(crate) peer_key: FreenetPeerId,
+    pub(crate) peer_pub_key: TransportPublicKey,
     pub(crate) op_manager: Arc<OpManager>,
     notification_channel: EventLoopNotificationsReceiver,
     client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
@@ -39,18 +38,15 @@ pub(super) struct NodeP2P {
 
 impl NodeP2P {
     pub(super) async fn run_node(mut self) -> Result<(), anyhow::Error> {
-        // start listening in case this is a listening node (gateway) and join the ring
-        if self.is_gateway {
-            self.conn_manager.listen_on()?;
+        if !self.is_gateway {
+            connect::initial_join_procedure(
+                &self.op_manager,
+                &mut self.conn_manager.bridge,
+                self.peer_pub_key,
+                &self.conn_manager.gateways,
+            )
+            .await?;
         }
-
-        connect::initial_join_procedure(
-            &self.op_manager,
-            &mut self.conn_manager.bridge,
-            self.peer_key,
-            &self.conn_manager.gateways,
-        )
-        .await?;
 
         // start the p2p event loop
         self.conn_manager
@@ -76,7 +72,7 @@ impl NodeP2P {
         CH: ContractHandler + Send + 'static,
         ER: NetEventRegister + Clone,
     {
-        let peer_key = config.peer_id.clone();
+        let peer_pub_key = config.pub_key.clone();
 
         let (notification_channel, notification_tx) = event_loop_notification_channel();
         let (ch_outbound, ch_inbound, wait_for_event) = contract::contract_handler_channel();
@@ -114,7 +110,7 @@ impl NodeP2P {
         );
 
         Ok(NodeP2P {
-            peer_key,
+            peer_pub_key,
             conn_manager,
             notification_channel,
             client_wait_for_transaction: wait_for_event,

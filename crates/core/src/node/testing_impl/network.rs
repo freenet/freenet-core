@@ -3,7 +3,7 @@ use crate::contract::MemoryContractHandler;
 use crate::node::p2p_impl::NodeP2P;
 use crate::node::Node;
 use crate::tracing::EventRegister;
-use crate::transport::crypto::TransportKeypair;
+use crate::transport::TransportKeypair;
 use anyhow::Error;
 use futures::SinkExt;
 use libp2p_identity::Keypair;
@@ -52,7 +52,7 @@ impl NetworkPeer {
         tracing::debug!(peer_config = ?peer_config, "Received peer config");
 
         let (user_ev_controller, receiver_ch): (PeerEventSender, PeerEventReceiver) =
-            tokio::sync::watch::channel((0, peer_config.peer_id.clone()));
+            tokio::sync::watch::channel((0, peer_config.peer_id.clone().unwrap()));
 
         Ok(NetworkPeer {
             id: peer_id,

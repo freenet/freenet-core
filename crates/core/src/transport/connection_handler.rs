@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
@@ -63,12 +63,13 @@ pub(crate) struct ConnectionHandler {
 impl ConnectionHandler {
     pub async fn new<S: Socket>(
         keypair: TransportKeypair,
+        listen_host: IpAddr,
         listen_port: u16,
         is_gateway: bool,
     ) -> Result<Self, TransportError> {
         // Bind the UDP socket to the specified port
-        let socket = Arc::new(S::bind((Ipv4Addr::UNSPECIFIED, listen_port).into()).await?);
-        Self::config_listener(socket, keypair, is_gateway)
+        let socket = S::bind((listen_host, listen_port).into()).await?;
+        Self::config_listener(Arc::new(socket), keypair, is_gateway)
     }
 
     fn config_listener(

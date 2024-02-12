@@ -29,7 +29,7 @@ use crate::{
     operations::connect,
     ring::{Distance, Location, PeerKeyLocation},
     tracing::TestEventListener,
-    transport::crypto::TransportKeypair,
+    transport::TransportKeypair,
 };
 
 mod in_memory;

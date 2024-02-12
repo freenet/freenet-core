@@ -52,7 +52,7 @@ pub use network_bridge::inter_process::InterProcessConnManager;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
 
 use crate::topology::rate::Rate;
-use crate::transport::crypto::{TransportKeypair, TransportPublicKey};
+use crate::transport::{TransportKeypair, TransportPublicKey};
 pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
 mod network_bridge;
@@ -98,8 +98,14 @@ impl Node {
 /// be listening but also try to connect to an existing peer.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NodeConfig {
+    /// Determines if an initial connection should be attempted.
+    /// Only true for an initial gateway/node. If false, the gateway will be disconnected unless other peers connect through it.
+    pub should_connect: bool,
+    /// Public key of the peer. A path can optionally be passed. If not specified, a key is generated and used when creating the node.
+    pub pub_key: TransportPublicKey,
     /// public identifier for the peer
-    pub peer_id: PeerId,
+    pub peer_id: Option<PeerId>,
+    pub listener_ip: IpAddr,
     // optional local info, in case this is an initial bootstrap node
     /// IP to bind to the listener
     pub local_ip: Option<IpAddr>,
@@ -124,9 +130,12 @@ pub struct NodeConfig {
 
 impl NodeConfig {
     pub fn new() -> NodeConfig {
-        let local_key = { todo!() };
+        let key_pair = TransportKeypair::random();
         NodeConfig {
-            peer_id: local_key,
+            should_connect: true,
+            pub_key: key_pair.public,
+            peer_id: None,
+            listener_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             remote_nodes: Vec::with_capacity(1),
             local_ip: None,
             local_port: None,
@@ -140,6 +149,16 @@ impl NodeConfig {
             max_upstream_bandwidth: None,
             max_downstream_bandwidth: None,
         }
+    }
+
+    pub fn with_pub_key(&mut self, key: TransportPublicKey) -> &mut Self {
+        self.pub_key = key;
+        self
+    }
+
+    pub fn with_should_connect(&mut self, should_connect: bool) -> &mut Self {
+        self.should_connect = should_connect;
+        self
     }
 
     pub fn max_hops_to_live(&mut self, num_hops: usize) -> &mut Self {
@@ -175,7 +194,7 @@ impl NodeConfig {
     /// Optional identity key of this node.
     /// If not provided it will be either obtained from the configuration or freshly generated.
     pub fn with_key(&mut self, key: PeerId) -> &mut Self {
-        self.peer_id = key;
+        self.peer_id = Some(key);
         self
     }
 
@@ -225,7 +244,7 @@ impl NodeConfig {
     }
 
     pub fn is_gateway(&self) -> bool {
-        self.local_ip.is_some() && self.local_port.is_some() && self.location.is_some()
+        !self.should_connect
     }
 
     /// Returns all specified gateways for this peer. Returns an error if the peer is not a gateway
@@ -245,7 +264,8 @@ impl NodeConfig {
                     None
                 }
             })
-            .filter(|pkloc| pkloc.peer != peer)
+            // todo: remove unwrap
+            .filter(|pkloc| pkloc.peer != peer.unwrap())
             .collect();
         if (self.local_ip.is_none() || self.local_port.is_none()) && gateways.is_empty() {
             anyhow::bail!(
@@ -763,6 +783,7 @@ where
     CM: NetworkBridge + Send,
 {
     use crate::util::IterExt;
+    let peer_pub_key = this_peer.clone().pub_key;
     if let TransactionType::Connect = tx.transaction_type() {
         // attempt to establish a connection failed, this could be a fatal error since the node
         // is useless without connecting to the network, we will retry with exponential backoff
@@ -780,7 +801,7 @@ where
                     tracing::warn!("Retry connecting to gateway {}", gateway.peer);
                     connect::join_ring_request(
                         backoff,
-                        this_peer,
+                        peer_pub_key,
                         &gateway,
                         op_manager,
                         conn_manager,
@@ -800,7 +821,7 @@ where
                     {
                         connect::join_ring_request(
                             None,
-                            this_peer,
+                            peer_pub_key,
                             gateway,
                             op_manager,
                             conn_manager,

@@ -15,7 +15,7 @@ use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
 
 use crate::node::PeerId;
-use crate::{local_node::OperationMode, transport::crypto::TransportKeypair};
+use crate::{local_node::OperationMode, transport::TransportKeypair};
 
 /// Default maximum number of connections for the peer.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 20;
@@ -331,7 +331,7 @@ impl GlobalExecutor {
     }
 }
 
-pub fn set_logger() {
+pub fn set_logger(level: Option<tracing::level_filters::LevelFilter>) {
     #[cfg(feature = "trace")]
     {
         static LOGGER_SET: AtomicBool = AtomicBool::new(false);

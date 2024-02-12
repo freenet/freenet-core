@@ -7,6 +7,7 @@ use std::{collections::HashSet, time::Duration};
 
 use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::client_events::HostResult;
+use crate::transport::TransportPublicKey;
 use crate::{
     message::{InnerMessage, NetMessage, Transaction},
     node::{ConnectionError, NetworkBridge, OpManager, PeerId},
@@ -228,10 +229,10 @@ impl Operation for ConnectOp {
                         },
                 } => {
                     // likely a gateway which accepts connections
+                    // TODO: Add from to the trace
                     tracing::debug!(
                         tx = %id,
                         at = %this_peer.peer,
-                        from = %joiner,
                         %hops_to_live,
                         "Connection request received",
                     );
@@ -239,16 +240,18 @@ impl Operation for ConnectOp {
                     // todo: location should be based on your public IP
                     let new_location = assigned_location.unwrap_or_else(Location::random);
                     let accepted_by = if op_manager.ring.should_accept(new_location, joiner) {
-                        tracing::debug!(tx = %id, %joiner, "Accepting connection from");
+                        // TODO: Add joiner to the trace
+                        tracing::debug!(tx = %id, "Accepting connection from");
                         HashSet::from_iter([*this_peer])
                     } else {
-                        tracing::debug!(tx = %id, at = %this_peer.peer, from = %joiner, "Rejecting connection");
+                        // TODO: Add joiner to the trace
+                        tracing::debug!(tx = %id, at = %this_peer.peer, "Rejecting connection");
                         HashSet::new()
                     };
 
                     let new_peer_loc = PeerKeyLocation {
                         location: Some(new_location),
-                        peer: *joiner,
+                        peer: joiner.unwrap(), //FIXME: Fix this unwrap
                     };
                     if let Some(mut updated_state) = forward_conn(
                         *id,
@@ -257,7 +260,7 @@ impl Operation for ConnectOp {
                         (new_peer_loc, new_peer_loc),
                         *hops_to_live,
                         accepted_by.clone(),
-                        vec![this_peer.peer, *joiner],
+                        vec![this_peer.peer, *joiner.unwrap()], //FIXME: Fix this unwrap
                     )
                     .await?
                     {
@@ -272,10 +275,10 @@ impl Operation for ConnectOp {
                         return_msg = None;
                     } else {
                         if !accepted_by.is_empty() {
+                            // TODO: Add joiner to the trace
                             tracing::debug!(
                                 tx = %id,
                                 at = %this_peer.peer,
-                                %joiner,
                                 "Open connection received at gateway",
                             );
                             new_state = Some(ConnectState::OCReceived);
@@ -785,7 +788,8 @@ enum ConnectState {
 #[derive(Debug, Clone)]
 struct ConnectionInfo {
     gateway: PeerKeyLocation,
-    this_peer: PeerId,
+    this_peer: Option<PeerId>,
+    peer_pub_key: TransportPublicKey,
     max_hops_to_live: usize,
 }
 
@@ -821,7 +825,7 @@ impl ConnectState {
 pub(crate) async fn initial_join_procedure<CM>(
     op_manager: &OpManager,
     conn_manager: &mut CM,
-    this_peer: PeerId,
+    peer_pub_key: TransportPublicKey,
     gateways: &[PeerKeyLocation],
 ) -> Result<(), OpError>
 where
@@ -831,11 +835,7 @@ where
     let number_of_parallel_connections = {
         let max_potential_conns_per_gw = op_manager.ring.max_hops_to_live;
         // e.g. 10 gateways and htl 5 -> only need 2 connections in parallel
-        let needed_to_cover_max = gateways
-            .iter()
-            .filter(|conn| conn.peer != this_peer)
-            .count()
-            / max_potential_conns_per_gw;
+        let needed_to_cover_max = gateways.iter().count() / max_potential_conns_per_gw;
         needed_to_cover_max.max(1)
     };
     tracing::info!(
@@ -845,17 +845,23 @@ where
     for gateway in gateways
         .iter()
         .shuffle()
-        .filter(|conn| &conn.peer != &this_peer)
         .take(number_of_parallel_connections)
     {
-        join_ring_request(None, this_peer.clone(), gateway, op_manager, conn_manager).await?;
+        join_ring_request(
+            None,
+            peer_pub_key.clone(),
+            gateway,
+            op_manager,
+            conn_manager,
+        )
+        .await?;
     }
     Ok(())
 }
 
 pub(crate) async fn join_ring_request<CM>(
     backoff: Option<ExponentialBackoff>,
-    peer_key: PeerId,
+    peer_pub_key: TransportPublicKey,
     gateway: &PeerKeyLocation,
     op_manager: &OpManager,
     conn_manager: &mut CM,
@@ -865,7 +871,7 @@ where
 {
     let tx_id = Transaction::new::<ConnectMsg>();
     let mut op = initial_request(
-        peer_key,
+        peer_pub_key,
         gateway.clone(),
         op_manager.ring.max_hops_to_live,
         tx_id,
@@ -893,15 +899,16 @@ where
 }
 
 fn initial_request(
-    this_peer: PeerId,
+    peer_pub_key: TransportPublicKey,
     gateway: PeerKeyLocation,
     max_hops_to_live: usize,
     id: Transaction,
 ) -> ConnectOp {
     const MAX_JOIN_RETRIES: usize = usize::MAX;
     let state = ConnectState::Connecting(ConnectionInfo {
-        gateway,
-        this_peer,
+        gateway: gateway.clone(),
+        this_peer: None,
+        peer_pub_key: peer_pub_key.clone(),
         max_hops_to_live,
     });
     let ceiling = if cfg!(test) {
@@ -937,12 +944,13 @@ where
     let ConnectionInfo {
         gateway,
         this_peer,
+        peer_pub_key,
         max_hops_to_live,
     } = state.expect("infallible").try_unwrap_connecting()?;
 
     tracing::info!(
         tx = %id,
-        %this_peer,
+        this_peer = %this_peer.unwrap(),
         gateway = %gateway,
         "Connecting to gateway",
     );
@@ -953,7 +961,8 @@ where
         id: tx,
         msg: messages::ConnectRequest::StartReq {
             target: gateway.clone(),
-            joiner: this_peer.clone(),
+            joiner: None,
+            joiner_key: peer_pub_key.clone(),
             assigned_location,
             hops_to_live: max_hops_to_live,
             max_hops_to_live,
@@ -967,7 +976,8 @@ where
                 id,
                 state: Some(ConnectState::Connecting(ConnectionInfo {
                     gateway: gateway.clone(),
-                    this_peer,
+                    this_peer: None,
+                    peer_pub_key,
                     max_hops_to_live,
                 })),
                 gateway: Some(Box::new(gateway)),
@@ -1138,13 +1148,7 @@ mod messages {
             match self {
                 Response { sender, .. } => Some(&sender.peer),
                 Connected { sender, .. } => Some(&sender.peer),
-                Request {
-                    msg:
-                        ConnectRequest::StartReq {
-                            joiner: req_peer, ..
-                        },
-                    ..
-                } => Some(req_peer),
+                Request { .. } => None,
                 _ => None,
             }
         }
@@ -1184,7 +1188,8 @@ mod messages {
     pub(crate) enum ConnectRequest {
         StartReq {
             target: PeerKeyLocation,
-            joiner: PeerId,
+            joiner: Option<PeerId>,
+            joiner_key: TransportPublicKey,
             assigned_location: Option<Location>,
             hops_to_live: usize,
             max_hops_to_live: usize,
