@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicPtr};
 use std::sync::Arc;
+use std::thread;
+use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 pub trait TimeSource {
@@ -40,7 +42,8 @@ impl CachingSystemTimeSrc {
             let drop_guard = Arc::new(AtomicBool::new(false));
 
             // Spawn the updater task asynchronously.
-            tokio::spawn(Self::update_instant(drop_guard.clone()));
+            let drop_guard_clone = drop_guard.clone();
+            thread::spawn(move || Self::update_instant(drop_guard_clone));
 
             // Wait until the updater task signals it's safe to proceed.
             while !drop_guard.load(std::sync::atomic::Ordering::Acquire) {
@@ -52,7 +55,7 @@ impl CachingSystemTimeSrc {
     }
 
     // Asynchronously updates the global time state every 20ms.
-    async fn update_instant(drop_guard: Arc<AtomicBool>) {
+    fn update_instant(drop_guard: Arc<AtomicBool>) {
         let mut now = Instant::now();
 
         // Initially set the global time state and notify the constructor to proceed.
@@ -65,7 +68,7 @@ impl CachingSystemTimeSrc {
             GLOBAL_TIME_STATE.store(&mut now, std::sync::atomic::Ordering::Release);
 
             // Wait for 20ms before the next update.
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            sleep(Duration::from_millis(20));
         }
     }
 }
@@ -108,23 +111,15 @@ impl TimeSource for MockTimeSource {
 pub mod tests {
     use super::*;
     use std::time::Duration;
-    use tempfile::TempDir;
 
-    /*
-     * If the Tokio runtime is restarted, as in the case of running multiple
-     * tests in parallel, the global state will be reset and the updater task
-     * will be killed and not respawned, leading to the time not updating,
-     * so it's important that there is only one Tokio runtime. This shouldn't
-     * be an issue in practice.
-     */
-    #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
-    async fn test_instant_is_updated() {
+    #[test]
+    fn test_instant_is_updated() {
         let time_source = CachingSystemTimeSrc::new();
         let first_instant = time_source.now();
 
         assert!(first_instant.elapsed().as_millis() < 30);
 
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        sleep(Duration::from_millis(120));
         let second_instant = time_source.now();
 
         assert!(second_instant.elapsed().as_millis() < 30);
