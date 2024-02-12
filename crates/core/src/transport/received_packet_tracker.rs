@@ -1,5 +1,5 @@
 use crate::transport::MessageId;
-use crate::util::time_source::{CachingSystemTimeSrc, TimeSource};
+use crate::util::time_source::{InstantTimeSrc, TimeSource};
 use std::collections::{HashMap, VecDeque};
 use std::mem;
 use std::time::{Duration, Instant};
@@ -39,13 +39,13 @@ pub(super) struct ReceivedPacketTracker<T: TimeSource> {
     time_source: T,
 }
 
-impl ReceivedPacketTracker<CachingSystemTimeSrc> {
+impl ReceivedPacketTracker<InstantTimeSrc> {
     pub(super) fn new() -> Self {
         ReceivedPacketTracker {
             pending_receipts: Vec::new(),
             message_id_time: VecDeque::new(),
             time_by_message_id: HashMap::new(),
-            time_source: CachingSystemTimeSrc::new(),
+            time_source: InstantTimeSrc::new(),
         }
     }
 }

@@ -4,12 +4,13 @@ use std::time::Instant;
 
 use tokio::sync::Mutex;
 
+use crate::util::time_source::InstantTimeSrc;
 use crate::{
     transport::{
         bw, connection_handler::Socket, packet_data, sent_packet_tracker::ResendAction,
         symmetric_message::SymmetricMessage,
     },
-    util::time_source::{CachingSystemTimeSrc, TimeSource},
+    util::time_source::TimeSource,
 };
 
 use super::OutboundRemoteConnection;
@@ -28,7 +29,7 @@ const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 100;
 pub(super) async fn send_long_message(
     remote_conn: &mut OutboundRemoteConnection<impl Socket>,
     mut message: StreamBytes,
-    bw_tracker: &Mutex<bw::PacketBWTracker<CachingSystemTimeSrc>>,
+    bw_tracker: &Mutex<bw::PacketBWTracker<InstantTimeSrc>>,
     bw_limit: usize,
 ) -> Result<(), SenderStreamError> {
     let total_length_bytes = message.len() as u32;

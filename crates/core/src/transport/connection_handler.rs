@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task;
 
 use crate::transport::received_packet_tracker::ReportResult;
-use crate::util::time_source::CachingSystemTimeSrc;
+use crate::util::time_source::InstantTimeSrc;
 
 use super::{
     bw,
@@ -56,7 +56,7 @@ pub(crate) struct ConnectionHandler<S = UdpSocket> {
     max_upstream_rate: Arc<arc_swap::ArcSwap<BytesPerSecond>>,
     send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent<S>)>,
     new_connection_notifier: mpsc::Receiver<PeerConnection<S>>,
-    bw_tracker: Arc<Mutex<bw::PacketBWTracker<CachingSystemTimeSrc>>>,
+    bw_tracker: Arc<Mutex<bw::PacketBWTracker<InstantTimeSrc>>>,
 }
 
 impl<S: Socket> ConnectionHandler<S> {
@@ -616,7 +616,7 @@ struct InboundRemoteConnection {
     inbound_packet_sender: mpsc::Sender<SymmetricMessagePayload>,
     inbound_intro_packet: Option<PacketData>,
     inbound_checked_times: usize,
-    received_tracker: ReceivedPacketTracker<CachingSystemTimeSrc>,
+    received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
     receipts_sender: mpsc::Sender<Vec<u32>>,
 }
 

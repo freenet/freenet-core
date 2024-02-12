@@ -23,7 +23,7 @@ use super::{
     packet_data::MAX_DATA_SIZE,
     symmetric_message::SymmetricMessagePayload,
 };
-use crate::util::time_source::CachingSystemTimeSrc;
+use crate::util::time_source::{CachingSystemTimeSrc, InstantTimeSrc};
 
 const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
 
@@ -33,7 +33,7 @@ pub(super) struct OutboundRemoteConnection<S> {
     pub outbound_symmetric_key: Aes128Gcm,
     pub remote_is_gateway: bool,
     pub remote_addr: SocketAddr,
-    pub sent_tracker: SentPacketTracker<CachingSystemTimeSrc>,
+    pub sent_tracker: SentPacketTracker<InstantTimeSrc>,
     pub last_message_id: u32,
     pub receipts_notifier: mpsc::Receiver<Vec<u32>>,
     pub inbound_recv: mpsc::Receiver<SymmetricMessagePayload>,
@@ -45,7 +45,7 @@ pub(super) struct OutboundRemoteConnection<S> {
 pub(crate) struct PeerConnection<S = UdpSocket> {
     outbound_connection: OutboundRemoteConnection<S>,
     ongoing_stream: Option<ReceiverStream>,
-    bw_tracker: Arc<Mutex<bw::PacketBWTracker<CachingSystemTimeSrc>>>,
+    bw_tracker: Arc<Mutex<bw::PacketBWTracker<InstantTimeSrc>>>,
 }
 
 impl<S: Socket> Future for PeerConnection<S> {
@@ -92,7 +92,7 @@ impl<S: Socket> Future for PeerConnection<S> {
 impl<S: Socket> PeerConnection<S> {
     pub fn new(
         outbound_connection: OutboundRemoteConnection<S>,
-        bw_tracker: Arc<Mutex<bw::PacketBWTracker<CachingSystemTimeSrc>>>,
+        bw_tracker: Arc<Mutex<bw::PacketBWTracker<InstantTimeSrc>>>,
     ) -> Self {
         Self {
             outbound_connection,

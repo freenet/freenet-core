@@ -10,14 +10,28 @@ pub trait TimeSource {
     fn now(&self) -> Instant;
 }
 
+/// A simple time source that returns the current time using `Instant::now()`.
+#[derive(Clone, Copy)]
+pub struct InstantTimeSrc(());
+
+impl InstantTimeSrc {
+    pub fn new() -> Self {
+        InstantTimeSrc(())
+    }
+}
+
+impl TimeSource for InstantTimeSrc {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
 /// A time source that caches the current time in a global state to reduce
 /// overhead in performance-critical sections.
 ///
-/// **Note**: This time source will only be accurate to within about 20ms.
-///
-/// **Warning**: If the Tokio runtime is restarted then the time updater task
-/// will stop and **will not** be restarted. This should not be an issue in
-/// practice as the Tokio runtime should only be started once.
+/// **Warning**: This time source will only be accurate to within about 20ms,
+/// any usage should be tested carefully to verify that this inaccuracy is acceptable.
+/// In the absence of such testing use [`InstantTimeSrc`] instead.
 #[derive(Clone, Copy)]
 pub(crate) struct CachingSystemTimeSrc(());
 
