@@ -4,6 +4,8 @@ use std::thread;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+const UPDATE_CACHED_TIME_EVERY: Duration = Duration::from_millis(10);
+
 pub trait TimeSource {
     fn now(&self) -> Instant;
 }
@@ -54,7 +56,7 @@ impl CachingSystemTimeSrc {
         CachingSystemTimeSrc(())
     }
 
-    // Asynchronously updates the global time state every 20ms.
+    // Asynchronously updates the global time state every UPDATE_CACHED_TIME_EVERY (10ms).
     fn update_instant(drop_guard: Arc<AtomicBool>) {
         let mut now = Instant::now();
 
@@ -68,7 +70,7 @@ impl CachingSystemTimeSrc {
             GLOBAL_TIME_STATE.store(&mut now, std::sync::atomic::Ordering::Release);
 
             // Wait for 20ms before the next update.
-            sleep(Duration::from_millis(20));
+            sleep(UPDATE_CACHED_TIME_EVERY);
         }
     }
 }
