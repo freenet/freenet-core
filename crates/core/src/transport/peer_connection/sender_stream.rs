@@ -147,3 +147,14 @@ pub enum SenderStreamError {
     #[error(transparent)]
     SerializationError(#[from] bincode::Error),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::MessagePayload;
+    use crate::util::time_source::MockTimeSource;
+
+    fn mock_outbound_remote_connection() -> OutboundRemoteConnection<impl Socket> {
+        let time_source = MockTimeSource::new(Instant::now());
+
+}

@@ -23,7 +23,7 @@ use super::{
     packet_data::MAX_DATA_SIZE,
     symmetric_message::SymmetricMessagePayload,
 };
-use crate::util::time_source::{CachingSystemTimeSrc, InstantTimeSrc};
+use crate::util::time_source::InstantTimeSrc;
 
 const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
 
