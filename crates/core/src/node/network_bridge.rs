@@ -23,7 +23,7 @@ pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 /// to other peers in the network with whom connection has been established.
 #[async_trait::async_trait]
 pub(crate) trait NetworkBridge: Send + Sync {
-    async fn add_connection(&mut self, peer: PeerId) -> ConnResult<()>;
+    async fn try_add_connection(&mut self, peer: PeerId) -> ConnResult<()>;
 
     async fn drop_connection(&mut self, peer: &PeerId) -> ConnResult<()>;
 

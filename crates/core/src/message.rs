@@ -5,6 +5,7 @@ use std::{
     fmt::Display,
     time::{Duration, SystemTime},
 };
+use tokio::sync::mpsc::Sender;
 
 use freenet_stdlib::prelude::ContractKey;
 use serde::{Deserialize, Serialize};
@@ -259,7 +260,8 @@ pub(crate) enum NodeEvent {
     /// Drop the given peer connection.
     DropConnection(PeerId),
     /// Accept the connections from the given peer.
-    AcceptConnection(PeerId),
+    #[serde(skip)]
+    AcceptConnection(PeerId, Sender<ConnectionResult>),
     /// Error while sending a message by the connection bridge from within the ops.
     #[serde(skip)]
     Error(ConnectionError),
@@ -276,7 +278,7 @@ impl Display for NodeEvent {
             NodeEvent::DropConnection(peer) => {
                 write!(f, "DropConnection (from {peer})")
             }
-            NodeEvent::AcceptConnection(peer) => {
+            NodeEvent::AcceptConnection(peer, _) => {
                 write!(f, "AcceptConnection (from {peer})")
             }
             NodeEvent::Error(err) => write!(f, "{err}"),
@@ -367,6 +369,15 @@ impl Display for NetMessage {
         };
         write!(f, "}}")
     }
+}
+
+/// The result of a connection attempt.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) enum ConnectionResult {
+    /// The target node for connection is valid
+    Accepted,
+    /// The target node for connection is not valid
+    Connection,
 }
 
 #[cfg(test)]

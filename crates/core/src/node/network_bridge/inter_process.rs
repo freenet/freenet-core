@@ -101,7 +101,7 @@ impl NetworkBridge for InterProcessConnManager {
         Ok(())
     }
 
-    async fn add_connection(&mut self, _peer: PeerId) -> super::ConnResult<()> {
+    async fn try_add_connection(&mut self, _peer: PeerId) -> super::ConnResult<()> {
         Ok(())
     }
 

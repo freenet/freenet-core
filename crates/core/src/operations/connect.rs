@@ -627,14 +627,11 @@ impl Operation for ConnectOp {
                         }
                     }
 
-                    network_bridge.add_connection(sender.peer).await?;
-                    op_manager
-                        .ring
-                        .add_connection(
-                            sender.location.ok_or(ConnectionError::LocationUnknown)?,
-                            sender.peer,
-                        )
-                        .await;
+                    network_bridge.try_add_connection(sender.peer).await?;
+                    op_manager.ring.add_connection(
+                        sender.location.ok_or(ConnectionError::LocationUnknown)?,
+                        sender.peer,
+                    );
                     tracing::debug!(tx = %id, from = %by_peer.peer, "Opened connection with peer");
                     if target != gateway {
                         new_state = None;
@@ -660,14 +657,11 @@ impl Operation for ConnectOp {
                         assigned_location = ?op_manager.ring.own_location().location,
                         "Successfully completed connection",
                     );
-                    network_bridge.add_connection(sender.peer).await?;
-                    op_manager
-                        .ring
-                        .add_connection(
-                            sender.location.ok_or(ConnectionError::LocationUnknown)?,
-                            sender.peer,
-                        )
-                        .await;
+                    network_bridge.try_add_connection(sender.peer).await?;
+                    op_manager.ring.add_connection(
+                        sender.location.ok_or(ConnectionError::LocationUnknown)?,
+                        sender.peer,
+                    );
                     new_state = None;
                 }
                 _ => return Err(OpError::UnexpectedOpState),
@@ -744,7 +738,7 @@ async fn propagate_oc_to_responding_peers<NB: NetworkBridge>(
     ) {
         tracing::info!(tx = %id, from = %sender.peer, to = %other_peer.peer, "Established connection");
         network_bridge
-            .add_connection(other_peer.peer.clone())
+            .try_add_connection(other_peer.peer.clone())
             .await?;
         op_manager.ring.add_connection(
             other_peer
@@ -955,7 +949,7 @@ where
         "Connecting to gateway",
     );
 
-    conn_bridge.add_connection(gateway.peer.clone()).await?;
+    conn_bridge.try_add_connection(gateway.peer.clone()).await?;
     let assigned_location = op_manager.ring.own_location().location;
     let join_req = NetMessage::from(messages::ConnectMsg::Request {
         id: tx,
