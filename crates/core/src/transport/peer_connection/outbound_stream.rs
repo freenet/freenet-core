@@ -1,17 +1,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
 
 use tokio::sync::Mutex;
 
-use crate::util::time_source::InstantTimeSrc;
-use crate::{
-    transport::{
-        bw, connection_handler::Socket, packet_data, sent_packet_tracker::ResendAction,
-        symmetric_message::SymmetricMessage,
-    },
-    util::time_source::TimeSource,
+use crate::transport::{
+    bw, connection_handler::Socket, packet_data, symmetric_message::SymmetricMessage,
 };
+use crate::util::time_source::InstantTimeSrc;
 
 use super::OutboundRemoteConnection;
 
@@ -21,6 +16,8 @@ pub(crate) type StreamBytes = Vec<u8>;
 /// The max payload we can send in a single fragment, this MUST be less than packet_data::MAX_DATA_SIZE
 /// since we need to account for the space overhead of SymmetricMessage::LongMessage metadata
 const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 100;
+
+struct OutboundStream {}
 
 // todo: unit test
 /// Handles sending a long message which is not being streamed,
@@ -33,7 +30,9 @@ pub(super) async fn send_long_message(
     bw_limit: usize,
 ) -> Result<(), SenderStreamError> {
     let total_length_bytes = message.len() as u32;
-    let start_index = remote_conn.last_message_id + 1;
+    let start_index = remote_conn
+        .last_message_id
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
     let mut total_messages = message.len() / MAX_DATA_SIZE;
     total_messages += if message.len() % MAX_DATA_SIZE == 0 {
         0

@@ -1,4 +1,5 @@
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Instant;
 use std::vec::Vec;
@@ -7,14 +8,15 @@ use aes_gcm::Aes128Gcm;
 use serde::Serialize;
 use tokio::sync::{mpsc, Mutex};
 
-mod receiver_stream;
-mod sender_stream;
+mod inbound_stream;
+mod outbound_stream;
 
-use receiver_stream::ReceiverStream;
-pub(super) use sender_stream::SenderStreamError;
+use inbound_stream::InboundStream;
+pub(super) use outbound_stream::SenderStreamError;
 
-use self::sender_stream::send_long_message;
+use self::outbound_stream::send_long_message;
 
+use super::received_packet_tracker::ReceivedPacketTracker;
 use super::{
     bw,
     connection_handler::{SerializedMessage, Socket, TransportError},
@@ -23,6 +25,7 @@ use super::{
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
 };
+use crate::transport::received_packet_tracker::ReportResult;
 use crate::util::time_source::InstantTimeSrc;
 
 const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
@@ -34,9 +37,8 @@ pub(super) struct OutboundRemoteConnection<S> {
     pub remote_is_gateway: bool,
     pub remote_addr: SocketAddr,
     pub sent_tracker: SentPacketTracker<InstantTimeSrc>,
-    pub last_message_id: u32,
-    pub receipts_notifier: mpsc::Receiver<Vec<u32>>,
-    pub inbound_recv: mpsc::Receiver<SymmetricMessagePayload>,
+    pub last_message_id: Arc<AtomicU32>,
+    pub inbound_packet_recv: mpsc::Receiver<SymmetricMessage>,
 }
 
 impl<S: Socket> OutboundRemoteConnection<S> {
@@ -56,8 +58,12 @@ impl<S: Socket> OutboundRemoteConnection<S> {
 #[must_use = "call await on the `recv` function to start listening for incoming messages"]
 pub(crate) struct PeerConnection<S = UdpSocket> {
     outbound_connection: OutboundRemoteConnection<S>,
-    ongoing_stream: Option<ReceiverStream>,
+    ongoing_stream: Option<InboundStream>,
     bw_tracker: Arc<Mutex<bw::PacketBWTracker<InstantTimeSrc>>>,
+    // todo: periodically we need to send a noop message with the receipts if
+    // a period has passed without reporting the inbound receipts
+    inbound_receipts: Vec<u32>,
+    received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
 }
 
 impl<S: Socket> PeerConnection<S> {
@@ -69,12 +75,18 @@ impl<S: Socket> PeerConnection<S> {
             outbound_connection,
             ongoing_stream: None,
             bw_tracker,
+            inbound_receipts: vec![],
+            received_tracker: ReceivedPacketTracker::new(),
         }
     }
 
-    pub async fn send<T: Serialize>(&mut self, data: &T) -> Result<(), TransportError> {
-        // todo: improve: careful with blocking while serializing here
-        let msg = bincode::serialize(data).unwrap();
+    pub async fn send<T>(&mut self, data: T) -> Result<(), TransportError>
+    where
+        T: Serialize + Send + 'static,
+    {
+        let msg = tokio::task::spawn_blocking(move || bincode::serialize(&data).unwrap())
+            .await
+            .unwrap();
         if let Some(wait_time) = self
             .bw_tracker
             .lock()
@@ -87,17 +99,15 @@ impl<S: Socket> PeerConnection<S> {
         if size > MAX_DATA_SIZE {
             self.send_long(msg).await;
         } else {
-            let receipts = self
+            let msg_id = self
                 .outbound_connection
-                .receipts_notifier
-                .try_recv()
-                .unwrap_or_default();
-            let msg_id = self.outbound_connection.last_message_id.wrapping_add(1);
+                .last_message_id
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
             let packet = SymmetricMessage::short_message(
                 msg_id,
                 msg,
                 &self.outbound_connection.outbound_symmetric_key,
-                receipts,
+                std::mem::take(&mut self.inbound_receipts),
             )?;
             self.outbound_connection
                 .socket
@@ -127,39 +137,58 @@ impl<S: Socket> PeerConnection<S> {
 
             // if necessary, check if we need to resend any packet and if possible do so
             if next_sent_check <= Instant::now() {
-                match self.outbound_connection.sent_tracker.get_resend() {
-                    ResendAction::WaitUntil(wait) => {
-                        next_sent_check = wait;
+                match self.maybe_resend().await? {
+                    SendCheck::NextCheck(next) => {
+                        next_sent_check = next;
                     }
-                    ResendAction::Resend(idx, packet) => {
-                        let mut bw_tracker = self.bw_tracker.lock().await;
-                        if let Some(send_wait) =
-                            bw_tracker.can_send_packet(BANDWITH_LIMIT, packet.len())
-                        {
-                            wait_for_sending_until = Instant::now() + send_wait;
-                            pending_outbound_packet = Some((idx, packet));
-                        } else {
-                            self.outbound_connection.send_packet(idx, packet).await?;
-                            continue;
-                        }
+                    SendCheck::WaitForBandwith {
+                        time,
+                        pending_packet: (idx, packet),
+                    } => {
+                        wait_for_sending_until = time;
+                        pending_outbound_packet = Some((idx, packet));
                     }
+                    SendCheck::KeepSending => continue,
                 }
             }
 
             // listen for incoming messages or receipts or wait until is time to do anything else again
             tokio::select! {
-                payload = self.outbound_connection.inbound_recv.recv() => {
-                    let payload = payload.ok_or(TransportError::ConnectionClosed)?;
-                    if let Some(msg) = self.process_inbound(payload).await? {
-                        return Ok(msg);
+                inbound = self.outbound_connection.inbound_packet_recv.recv() => {
+                    let SymmetricMessage { message_id, confirm_receipt, payload } = inbound.ok_or(TransportError::ConnectionClosed)?;
+                    self.inbound_receipts.push(message_id);
+                    self.outbound_connection.sent_tracker.report_received_receipts(&confirm_receipt);
+                    match self.received_tracker.report_received_packet(message_id) {
+                        ReportResult::Ok => {
+                            if let Some(msg) = self.process_inbound(payload).await? {
+                                return Ok(msg);
+                            }
+                        }
+                        ReportResult::AlreadyReceived => {}
+                        ReportResult::QueueFull => todo!(),
                     }
-                }
-                new_receipts = self.outbound_connection.receipts_notifier.recv() => {
-                    let new_receipts = new_receipts.ok_or(TransportError::ConnectionClosed)?;
-                    self.outbound_connection.sent_tracker.report_received_receipts(&new_receipts);
                 }
                 _ = tokio::time::sleep_until(next_sent_check.into()) => {}
                 _ = tokio::time::sleep_until(wait_for_sending_until.into()), if pending_outbound_packet.is_some() => {}
+            }
+        }
+    }
+
+    async fn maybe_resend(&mut self) -> Result<SendCheck, TransportError> {
+        match self.outbound_connection.sent_tracker.get_resend() {
+            ResendAction::WaitUntil(wait) => Ok(SendCheck::NextCheck(wait)),
+            ResendAction::Resend(idx, packet) => {
+                let mut bw_tracker = self.bw_tracker.lock().await;
+                if let Some(send_wait) = bw_tracker.can_send_packet(BANDWITH_LIMIT, packet.len()) {
+                    let time: Instant = Instant::now() + send_wait;
+                    Ok(SendCheck::WaitForBandwith {
+                        time,
+                        pending_packet: (idx, packet),
+                    })
+                } else {
+                    self.outbound_connection.send_packet(idx, packet).await?;
+                    Ok(SendCheck::KeepSending)
+                }
             }
         }
     }
@@ -182,7 +211,7 @@ impl<S: Socket> PeerConnection<S> {
                 let mut stream = self
                     .ongoing_stream
                     .take()
-                    .unwrap_or_else(|| ReceiverStream::new(total_length));
+                    .unwrap_or_else(|| InboundStream::new(total_length));
                 if let Some(msg) = stream.push_fragment(index, fragment) {
                     return Ok(Some(msg));
                 }
@@ -202,4 +231,13 @@ impl<S: Socket> PeerConnection<S> {
         // .await?;
         let task = tokio::spawn(async move {});
     }
+}
+
+enum SendCheck {
+    NextCheck(Instant),
+    WaitForBandwith {
+        time: Instant,
+        pending_packet: (u32, Arc<[u8]>),
+    },
+    KeepSending,
 }

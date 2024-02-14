@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::vec::Vec;
 use std::{borrow::Cow, time::Duration};
@@ -11,7 +12,6 @@ use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task;
 
-use crate::transport::received_packet_tracker::ReportResult;
 use crate::util::time_source::InstantTimeSrc;
 
 use super::{
@@ -19,7 +19,6 @@ use super::{
     crypto::{TransportKeypair, TransportPublicKey},
     packet_data::MAX_PACKET_SIZE,
     peer_connection::{OutboundRemoteConnection, PeerConnection, SenderStreamError},
-    received_packet_tracker::ReceivedPacketTracker,
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
     BytesPerSecond, PacketData,
@@ -253,20 +252,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                                             }
                                         }
                                     }
-                                    match remote_conn.received_tracker.report_received_packet(msg.message_id) {
-                                        ReportResult::Ok => {
-                                            if remote_conn.inbound_packet_sender.send(msg.payload).await.is_err() {
-                                                // dropping this remote connection since we don't care about their messages anymore
-                                                tracing::debug!(%remote_addr, "Remote disconnected");
-                                            }
-                                        },
-                                        ReportResult::AlreadyReceived => {
-                                            if remote_conn.receipts_sender.send(vec![msg.message_id]).await.is_err() {
-                                                tracing::debug!(%remote_addr, "Remote disconnected");
-                                            }
-                                        }
-                                        ReportResult::QueueFull => todo!(),
-                                    }
                                 }
                                 None => {
                                     // if we received a message, it means that a packet reached us and ports were mapped
@@ -392,7 +377,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                     // if they fail to receive it, they will re-request the packet through
                     // the regular error control mechanism
                     let (inbound_sender, inbound_recv) = mpsc::channel(1);
-                    let (receipts_sender, receipts_notifier) = mpsc::channel(10);
                     return Ok((
                         OutboundRemoteConnection {
                             socket: self.socket.clone(),
@@ -401,17 +385,14 @@ impl<S: Socket> UdpPacketsListener<S> {
                             remote_is_gateway: false,
                             remote_addr,
                             sent_tracker,
-                            last_message_id: 0,
-                            receipts_notifier,
-                            inbound_recv,
+                            last_message_id: Arc::new(AtomicU32::new(0)),
+                            inbound_packet_recv: inbound_recv,
                         },
                         InboundRemoteConnection {
                             inbound_symmetric_key: inbound_sym_key,
                             inbound_packet_sender: inbound_sender,
                             inbound_intro_packet: None,
                             inbound_checked_times: 0,
-                            received_tracker: ReceivedPacketTracker::new(),
-                            receipts_sender,
                         },
                     ));
                 }
@@ -501,7 +482,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
                             // if is not an intro packet, the connection is successful and we can proceed
                             let (inbound_sender, inbound_recv) = mpsc::channel(1);
-                            let (receipts_sender, receipts_notifier) = mpsc::channel(10);
                             return Ok((
                                 OutboundRemoteConnection {
                                     socket: self.socket.clone(),
@@ -510,17 +490,14 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     remote_is_gateway: false,
                                     remote_addr,
                                     sent_tracker: SentPacketTracker::new(),
-                                    last_message_id: 0,
-                                    receipts_notifier,
-                                    inbound_recv,
+                                    last_message_id: Arc::new(AtomicU32::new(0)),
+                                    inbound_packet_recv: inbound_recv,
                                 },
                                 InboundRemoteConnection {
                                     inbound_symmetric_key: inbound_sym_key,
                                     inbound_packet_sender: inbound_sender,
                                     inbound_intro_packet: None,
                                     inbound_checked_times: 0,
-                                    received_tracker: ReceivedPacketTracker::new(),
-                                    receipts_sender,
                                 },
                             ));
                         }
@@ -613,11 +590,9 @@ enum ConnectionEvent<S = UdpSocket> {
 
 struct InboundRemoteConnection {
     inbound_symmetric_key: Aes128Gcm,
-    inbound_packet_sender: mpsc::Sender<SymmetricMessagePayload>,
+    inbound_packet_sender: mpsc::Sender<SymmetricMessage>,
     inbound_intro_packet: Option<PacketData>,
     inbound_checked_times: usize,
-    received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
-    receipts_sender: mpsc::Sender<Vec<u32>>,
 }
 
 impl InboundRemoteConnection {
