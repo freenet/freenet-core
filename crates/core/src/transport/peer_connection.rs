@@ -96,6 +96,8 @@ impl<S: Socket> PeerConnection<S> {
             tokio::time::sleep(wait_time).await;
         }
         let size = msg.len();
+        // todo: refactor so we reuse logic for keeping track of sent packets
+        // for both short and long messages
         if size > MAX_DATA_SIZE {
             self.send_long(msg).await;
         } else {

@@ -92,6 +92,7 @@ impl<S: Socket> ConnectionHandler<S> {
             bw_tracker,
         };
 
+        // task::spawn(sender_point)
         task::spawn(transport.listen());
 
         Ok(connection_handler)

@@ -1,14 +1,17 @@
 use std::collections::HashSet;
+use std::net::SocketAddr;
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use aes_gcm::Aes128Gcm;
+use futures::channel::mpsc;
+use futures::SinkExt;
 
 use crate::transport::{
-    bw, connection_handler::Socket, packet_data, symmetric_message::SymmetricMessage,
+    connection_handler::Socket, packet_data, symmetric_message::SymmetricMessage,
 };
-use crate::util::time_source::InstantTimeSrc;
 
-use super::OutboundRemoteConnection;
+use super::{OutboundRemoteConnection, PeerConnection};
 
 pub(crate) type StreamBytes = Vec<u8>;
 
@@ -17,22 +20,40 @@ pub(crate) type StreamBytes = Vec<u8>;
 /// since we need to account for the space overhead of SymmetricMessage::LongMessage metadata
 const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 100;
 
-struct OutboundStream {}
+/*
+
+Remote A:  t0 Vec<u8> ------ -> Stream<(Packet, Socket)>
+Remote B:  ------ t1 Vec<u8> -> Stream<(Packet, Socket)>   ----> channel(1) --->  (thread) OutboundTrafficChannel<Packet> udp_socket.send(packet)
+Remote C:  ------ t2 Vec<u8> -> Stream<(Packet, Socket)>
+
+
+async fn sender_spot(...) {
+    let bw_tracker;
+    // let map: HashMap<SocketAddr, SentPacketTracker> = HashMap::new();
+    while let Some((socket_addr, packet, report_sent)) = self.outbound_packet.recv().await {
+        if bw_tracker.can_send_packet(packet.size()) {
+            self.socket.send(socket_addr, packet).await;
+            bw_tracker.report_sent_packet(now, packet_size);
+        //    report_sent.await;
+        }
+    }
+}
+*/
 
 // todo: unit test
 /// Handles sending a long message which is not being streamed,
 /// streaming messages will be tackled differently, in the interim time before
 /// the necessary changes are done to the codebase we will use this function
 pub(super) async fn send_long_message(
-    remote_conn: &mut OutboundRemoteConnection<impl Socket>,
+    // remote_conn: &mut OutboundRemoteConnection<impl Socket>,
+    last_message_id: Arc<AtomicU32>,
+    mut sender: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
+    remote_socket: SocketAddr,
     mut message: StreamBytes,
-    bw_tracker: &Mutex<bw::PacketBWTracker<InstantTimeSrc>>,
-    bw_limit: usize,
+    outbound_symmetric_key: Aes128Gcm,
 ) -> Result<(), SenderStreamError> {
     let total_length_bytes = message.len() as u32;
-    let start_index = remote_conn
-        .last_message_id
-        .fetch_add(1, std::sync::atomic::Ordering::Release);
+    let start_index = last_message_id.fetch_add(1, std::sync::atomic::Ordering::Release);
     let mut total_messages = message.len() / MAX_DATA_SIZE;
     total_messages += if message.len() % MAX_DATA_SIZE == 0 {
         0
@@ -55,18 +76,19 @@ pub(super) async fn send_long_message(
             };
             std::mem::swap(&mut message, &mut rest);
             let idx = start_index + sent_so_far as u32 + 1;
-            let fragment = SymmetricMessage::fragmented_message(
+            let fragment: Arc<[u8]> = SymmetricMessage::fragmented_message(
                 start_index,
                 total_length_bytes as u64,
                 sent_so_far as u32 + 1,
                 rest,
-                &remote_conn.outbound_symmetric_key,
+                &outbound_symmetric_key,
                 std::mem::take(&mut confirm_receipts),
             )?
             .into();
             // todo: this is blocking, but hopefully meaningless, measure and improve if necessary
             sent_not_confirmed.insert(idx);
-            send_packet(remote_conn, idx, fragment).await?;
+            // send_packet(&connection, remote_socket, fragment).await?;
+            sender.send((remote_socket, fragment)).await.unwrap();
             continue;
         }
 
@@ -83,16 +105,14 @@ pub(super) async fn send_long_message(
 }
 
 async fn send_packet(
-    remote_conn: &mut OutboundRemoteConnection<impl Socket>,
-    idx: u32,
+    connection: &impl Socket,
+    remote_addr: SocketAddr,
     packet: Arc<[u8]>,
 ) -> Result<(), SenderStreamError> {
-    remote_conn
-        .socket
-        .send_to(&packet, remote_conn.remote_addr)
+    connection
+        .send_to(&packet, remote_addr)
         .await
         .map_err(|_| SenderStreamError::Closed)?;
-    remote_conn.sent_tracker.report_sent_packet(idx, packet);
     Ok(())
 }
 
