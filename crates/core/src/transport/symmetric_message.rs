@@ -88,6 +88,7 @@ impl SymmetricMessage {
             message_id,
             confirm_receipt,
             payload: SymmetricMessagePayload::LongMessageFragment {
+                message_id,
                 total_length_bytes,
                 fragment_number,
                 payload,
@@ -124,7 +125,7 @@ pub(super) enum SymmetricMessagePayload {
         payload: MessagePayload,
     },
     LongMessageFragment {
-        // message_id: u32,
+        message_id: u32,
         total_length_bytes: u64, // we shouldn't allow messages larger than u32, that's already crazy big
         fragment_number: u32,
         payload: MessagePayload,

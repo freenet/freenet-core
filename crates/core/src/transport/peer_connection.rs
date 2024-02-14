@@ -1,7 +1,6 @@
-use std::future::Future;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
-use std::task::Poll;
+use std::time::Instant;
 use std::vec::Vec;
 
 use aes_gcm::Aes128Gcm;
@@ -11,17 +10,18 @@ use tokio::sync::{mpsc, Mutex};
 mod receiver_stream;
 mod sender_stream;
 
-use self::sender_stream::send_long_message;
 use receiver_stream::ReceiverStream;
 pub(super) use sender_stream::SenderStreamError;
 
-use super::bw;
-use super::sent_packet_tracker::SentPacketTracker;
-use super::symmetric_message::SymmetricMessage;
+use self::sender_stream::send_long_message;
+
 use super::{
+    bw,
     connection_handler::{SerializedMessage, Socket, TransportError},
     packet_data::MAX_DATA_SIZE,
-    symmetric_message::SymmetricMessagePayload,
+    sent_packet_tracker::ResendAction,
+    sent_packet_tracker::SentPacketTracker,
+    symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
 };
 use crate::util::time_source::InstantTimeSrc;
 
@@ -39,54 +39,25 @@ pub(super) struct OutboundRemoteConnection<S> {
     pub inbound_recv: mpsc::Receiver<SymmetricMessagePayload>,
 }
 
+impl<S: Socket> OutboundRemoteConnection<S> {
+    async fn send_packet(&mut self, idx: u32, packet: Arc<[u8]>) -> Result<(), SenderStreamError> {
+        self.socket
+            .send_to(&packet, self.remote_addr)
+            .await
+            .map_err(|_| SenderStreamError::Closed)?;
+        self.sent_tracker.report_sent_packet(idx, packet);
+        Ok(())
+    }
+}
+
 /// Handles the connection with a remote peer.
 ///
 /// Can be awaited for incoming messages or used to send messages to the remote peer.
+#[must_use = "call await on the `recv` function to start listening for incoming messages"]
 pub(crate) struct PeerConnection<S = UdpSocket> {
     outbound_connection: OutboundRemoteConnection<S>,
     ongoing_stream: Option<ReceiverStream>,
     bw_tracker: Arc<Mutex<bw::PacketBWTracker<InstantTimeSrc>>>,
-}
-
-impl<S: Socket> Future for PeerConnection<S> {
-    type Output = Result<Vec<u8>, TransportError>;
-
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        use SymmetricMessagePayload::*;
-        let payload = match self.outbound_connection.inbound_recv.poll_recv(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(None) => {
-                // connection finished
-                return Poll::Ready(Err(TransportError::ConnectionClosed));
-            }
-            Poll::Ready(Some(packet)) => packet,
-        };
-        match payload {
-            ShortMessage { payload } => Poll::Ready(Ok(payload)),
-            AckConnection { .. } => Poll::Ready(Err(TransportError::UnexpectedMessage(
-                "AckConnection".into(),
-            ))),
-            LongMessageFragment {
-                // message_id,
-                total_length_bytes: total_length,
-                fragment_number: index,
-                payload,
-            } => {
-                let mut stream = self
-                    .ongoing_stream
-                    .take()
-                    .unwrap_or_else(|| ReceiverStream::new(total_length)); // TODO: Is index used appropriately?
-                if let Some(msg) = stream.push_fragment(index, payload) {
-                    return Poll::Ready(Ok(msg));
-                }
-                self.ongoing_stream = Some(stream);
-                Poll::Pending
-            }
-        }
-    }
 }
 
 impl<S: Socket> PeerConnection<S> {
@@ -103,12 +74,7 @@ impl<S: Socket> PeerConnection<S> {
 
     pub async fn send<T: Serialize>(&mut self, data: &T) -> Result<(), TransportError> {
         // todo: improve: careful with blocking while serializing here
-        let serialized_data = bincode::serialize(data).unwrap();
-        self.outbound_messages(serialized_data).await?;
-        Ok(())
-    }
-
-    async fn outbound_messages(&mut self, msg: SerializedMessage) -> Result<(), TransportError> {
+        let msg = bincode::serialize(data).unwrap();
         if let Some(wait_time) = self
             .bw_tracker
             .lock()
@@ -118,23 +84,8 @@ impl<S: Socket> PeerConnection<S> {
             tokio::time::sleep(wait_time).await;
         }
         let size = msg.len();
-        self.send_outbound_msg(msg).await?;
-        self.bw_tracker.lock().await.add_packet(size);
-        Ok(())
-    }
-
-    async fn send_outbound_msg(
-        &mut self,
-        serialized_data: SerializedMessage,
-    ) -> Result<(), TransportError> {
-        if serialized_data.len() > MAX_DATA_SIZE {
-            send_long_message(
-                &mut self.outbound_connection,
-                serialized_data,
-                &self.bw_tracker,
-                BANDWITH_LIMIT,
-            )
-            .await?;
+        if size > MAX_DATA_SIZE {
+            self.send_long(msg).await;
         } else {
             let receipts = self
                 .outbound_connection
@@ -144,7 +95,7 @@ impl<S: Socket> PeerConnection<S> {
             let msg_id = self.outbound_connection.last_message_id.wrapping_add(1);
             let packet = SymmetricMessage::short_message(
                 msg_id,
-                serialized_data,
+                msg,
                 &self.outbound_connection.outbound_symmetric_key,
                 receipts,
             )?;
@@ -156,6 +107,99 @@ impl<S: Socket> PeerConnection<S> {
                 .sent_tracker
                 .report_sent_packet(msg_id, packet.data().into());
         }
+        self.bw_tracker.lock().await.add_packet(size);
         Ok(())
+    }
+
+    pub async fn recv(&mut self) -> Result<Vec<u8>, TransportError> {
+        let mut next_sent_check = Instant::now();
+        let mut wait_for_sending_until = Instant::now();
+        let mut pending_outbound_packet: Option<(u32, Arc<[u8]>)> = None;
+        loop {
+            // if there are pending packets just send them out first
+            if let Some((idx, pending_packet)) = pending_outbound_packet.take() {
+                if Instant::now() >= wait_for_sending_until {
+                    self.outbound_connection
+                        .send_packet(idx, pending_packet)
+                        .await?;
+                }
+            }
+
+            // if necessary, check if we need to resend any packet and if possible do so
+            if next_sent_check <= Instant::now() {
+                match self.outbound_connection.sent_tracker.get_resend() {
+                    ResendAction::WaitUntil(wait) => {
+                        next_sent_check = wait;
+                    }
+                    ResendAction::Resend(idx, packet) => {
+                        let mut bw_tracker = self.bw_tracker.lock().await;
+                        if let Some(send_wait) =
+                            bw_tracker.can_send_packet(BANDWITH_LIMIT, packet.len())
+                        {
+                            wait_for_sending_until = Instant::now() + send_wait;
+                            pending_outbound_packet = Some((idx, packet));
+                        } else {
+                            self.outbound_connection.send_packet(idx, packet).await?;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // listen for incoming messages or receipts or wait until is time to do anything else again
+            tokio::select! {
+                payload = self.outbound_connection.inbound_recv.recv() => {
+                    let payload = payload.ok_or(TransportError::ConnectionClosed)?;
+                    if let Some(msg) = self.process_inbound(payload).await? {
+                        return Ok(msg);
+                    }
+                }
+                new_receipts = self.outbound_connection.receipts_notifier.recv() => {
+                    let new_receipts = new_receipts.ok_or(TransportError::ConnectionClosed)?;
+                    self.outbound_connection.sent_tracker.report_received_receipts(&new_receipts);
+                }
+                _ = tokio::time::sleep_until(next_sent_check.into()) => {}
+                _ = tokio::time::sleep_until(wait_for_sending_until.into()), if pending_outbound_packet.is_some() => {}
+            }
+        }
+    }
+
+    async fn process_inbound(
+        &mut self,
+        payload: SymmetricMessagePayload,
+    ) -> Result<Option<Vec<u8>>, TransportError> {
+        use SymmetricMessagePayload::*;
+        match payload {
+            ShortMessage { payload } => Ok(Some(payload)),
+            AckConnection { .. } => Err(TransportError::UnexpectedMessage("AckConnection".into())),
+            LongMessageFragment {
+                message_id,
+                total_length_bytes: total_length,
+                fragment_number: index,
+                payload: fragment,
+            } => {
+                // TODO: change to make multiplexing possible, use message_id for identifying the stream which fragment belongs to
+                let mut stream = self
+                    .ongoing_stream
+                    .take()
+                    .unwrap_or_else(|| ReceiverStream::new(total_length));
+                if let Some(msg) = stream.push_fragment(index, fragment) {
+                    return Ok(Some(msg));
+                }
+                self.ongoing_stream = Some(stream);
+                Ok(None)
+            }
+        }
+    }
+
+    async fn send_long(&mut self, data: SerializedMessage) {
+        // send_long_message(
+        //     &mut self.outbound_connection,
+        //     serialized_data,
+        //     &self.bw_tracker,
+        //     BANDWITH_LIMIT,
+        // )
+        // .await?;
+        let task = tokio::spawn(async move {});
     }
 }

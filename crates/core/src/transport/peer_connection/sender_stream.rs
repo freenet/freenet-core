@@ -40,52 +40,11 @@ pub(super) async fn send_long_message(
     } else {
         1
     };
-    let mut wait_for_sending_until = Instant::now();
     let mut sent_not_confirmed = HashSet::new();
     let mut sent_confirmed = 0;
-    let mut pending_outbound_packet: Option<(u32, Arc<[u8]>)> = None;
-    let mut next_sent_check = Instant::now();
     let mut confirm_receipts = Vec::new();
 
     loop {
-        match remote_conn.receipts_notifier.try_recv() {
-            Ok(mut receipts) => {
-                remote_conn.sent_tracker.report_received_receipts(&receipts);
-                for receipt in receipts.iter() {
-                    if sent_not_confirmed.remove(receipt) {
-                        sent_confirmed += 1;
-                    }
-                }
-                std::mem::swap(&mut confirm_receipts, &mut receipts);
-            }
-            Err(_) => return Err(SenderStreamError::Closed),
-        }
-        if Instant::now() < wait_for_sending_until {
-            tokio::time::sleep_until(wait_for_sending_until.into()).await;
-        }
-        if let Some((idx, pending_packet)) = pending_outbound_packet.take() {
-            send_packet(remote_conn, idx, pending_packet).await?;
-        }
-
-        // if necessary, check if we need to resend any packet
-        if next_sent_check <= bw_tracker.lock().await.time_source.now() {
-            match remote_conn.sent_tracker.get_resend() {
-                ResendAction::WaitUntil(wait) => {
-                    next_sent_check = wait;
-                }
-                ResendAction::Resend(idx, packet) => {
-                    let mut bw_tracker = bw_tracker.lock().await;
-                    if let Some(send_wait) = bw_tracker.can_send_packet(bw_limit, packet.len()) {
-                        wait_for_sending_until = bw_tracker.time_source.now() + send_wait;
-                        pending_outbound_packet = Some((idx, packet));
-                    } else {
-                        send_packet(remote_conn, idx, packet).await?;
-                        continue;
-                    }
-                }
-            }
-        }
-
         let sent_so_far = sent_confirmed + sent_not_confirmed.len();
         if sent_so_far < total_messages {
             let mut rest = {
@@ -98,7 +57,7 @@ pub(super) async fn send_long_message(
             std::mem::swap(&mut message, &mut rest);
             let idx = start_index + sent_so_far as u32 + 1;
             let fragment = SymmetricMessage::fragmented_message(
-                idx,
+                start_index,
                 total_length_bytes as u64,
                 sent_so_far as u32 + 1,
                 rest,
@@ -150,11 +109,11 @@ pub enum SenderStreamError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::transport::MessagePayload;
-    use crate::util::time_source::MockTimeSource;
+    // use super::*;
+    // use crate::transport::MessagePayload;
+    // use crate::util::time_source::MockTimeSource;
 
-    fn mock_outbound_remote_connection() -> OutboundRemoteConnection<impl Socket> {
-        let time_source = MockTimeSource::new(Instant::now());
-
+    // fn mock_outbound_remote_connection() -> OutboundRemoteConnection<impl Socket> {
+    //     let time_source = MockTimeSource::new(Instant::now());
+    // }
 }

@@ -39,6 +39,7 @@ pub(crate) struct CachingSystemTimeSrc(());
 static GLOBAL_TIME_STATE: AtomicPtr<Instant> = AtomicPtr::new(std::ptr::null_mut());
 
 impl CachingSystemTimeSrc {
+    #![allow(unused)]
     // Creates a new instance and ensures only one updater task is spawned.
     pub(crate) fn new() -> Self {
         let mut current_unix_epoch_ts = Instant::now();
