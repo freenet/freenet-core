@@ -210,7 +210,7 @@ impl Operation for UpdateOp {
                     target,
                     sender,
                 } => {
-                    let is_subscribed_contract = op_manager.ring.is_subscribed_to_contract(&key);
+                    let is_subscribed_contract = op_manager.ring.is_seeding_contract(&key);
 
                     let this_peer = op_manager.ring.own_location();
                     tracing::debug!(
@@ -507,7 +507,7 @@ impl OpManager {
         key: &ContractKey,
         sender: &PeerId,
     ) -> Vec<PeerKeyLocation> {
-        let mut subscribers = self
+        let subscribers = self
             .ring
             .subscribers_of(key)
             .map(|subs| {
@@ -518,15 +518,7 @@ impl OpManager {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        if let Some(peer) = self.ring.subscribed_to_contract(key) {
-            if &peer.peer == sender {
-                // tracing::warn!("1 - about to add sender peer to broadcast targets");
-            } else if subscribers.contains(&peer) {
-                // tracing::warn!("2 - about to add already added peer to broadcast targets");
-            } else {
-                subscribers.push(peer);
-            }
-        }
+
         subscribers
     }
 }
@@ -636,8 +628,11 @@ pub(crate) async fn request_update(
     // the initial request must provide:
     // - a peer as close as possible to the contract location
     // - and the value to update
-    let target = if let Some(location) = op_manager.ring.subscribed_to_contract(key) {
+    let target = if let Some(location) = op_manager.ring.subscribers_of(key) {
         location
+            .clone()
+            .pop()
+            .ok_or(OpError::RingError(RingError::NoLocation))?
     } else {
         let closest = op_manager
             .ring

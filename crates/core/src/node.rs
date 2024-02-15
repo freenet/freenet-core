@@ -21,7 +21,7 @@ use std::{
 use either::Either;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ErrorKind},
-    prelude::{RelatedContracts, State, WrappedState, ContractKey},
+    prelude::{ContractKey, RelatedContracts, State, WrappedState},
 };
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId as Libp2pPeerId};
 
@@ -685,6 +685,8 @@ async fn process_message<CB>(
                     &mut *event_listener,
                 )
                 .await;
+            }
+
             NetMessage::Unsubscribed { key, .. } => {
                 subscribe(op_manager, key.clone(), None).await;
                 break;
