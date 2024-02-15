@@ -270,7 +270,7 @@ impl Operation for UpdateOp {
                     sender,
                 } => {
                     if let Some(UpdateState::AwaitingResponse { .. }) = self.state {
-                        tracing::debug!("Trying to broadcast to a peer that was the initiator of the op because it received the client request, or is in the middle of a seek node or forward process");
+                        tracing::debug!("Trying to broadcast to a peer that was the initiator of the op because it received the client request, or is in the middle of a seek node process");
                         return Err(OpError::StatePushed);
                     };
 
@@ -415,85 +415,6 @@ impl Operation for UpdateOp {
                         }
                     };
                 }
-                UpdateMsg::UpdateForward {
-                    id,
-                    key,
-                    new_value,
-                    htl,
-                    sender,
-                    skip_list,
-                } => {
-                    // let peer_loc = op_manager.ring.own_location();
-
-                    // tracing::debug!(
-                    //     %key,
-                    //     this_peer = % peer_loc.peer,
-                    //     "Forwarding changes, trying to update the contract - update"
-                    // );
-
-                    // let is_subscribed_contract = op_manager.ring.is_subscribed_to_contract(&key);
-
-                    // if is_subscribed_contract {
-                    //     // after the contract has been cached, push the update query
-                    //     update_contract(
-                    //         op_manager,
-                    //         key.clone(),
-                    //         new_value.clone(),
-                    //         RelatedContracts::default(),
-                    //     )
-                    //     .await?;
-                    // } else {
-                    //     tracing::debug!(%key, "is not suscribed to contract at {:?}", peer_loc.location);
-                    // }
-
-                    // let broadcast_to = op_manager.get_broadcast_targets_update(&key, &sender.peer);
-
-                    // // if successful, forward to the next closest peers (if any)
-                    // let last_hop = if let Some(new_htl) = htl.checked_sub(1) {
-                    //     let mut new_skip_list = skip_list.clone();
-                    //     new_skip_list.push(sender.peer);
-
-                    //     // only hop forward if there are closer peers
-                    //     let put_here = forward_update(
-                    //         op_manager,
-                    //         conn_manager,
-                    //         key.clone(),
-                    //         new_value.clone(),
-                    //         *id,
-                    //         new_htl,
-                    //         new_skip_list,
-                    //     )
-                    //     .await;
-
-                    //     put_here
-                    // } else {
-                    //     if !is_subscribed_contract {
-                    //         tracing::error!("didnt find the contract to update and no hops left. This should throw an error");
-                    //     }
-                    //     true
-                    // };
-
-                    // match try_to_broadcast(
-                    //     *id,
-                    //     last_hop,
-                    //     op_manager,
-                    //     self.state,
-                    //     (broadcast_to, *sender),
-                    //     key.clone(),
-                    //     new_value.clone(),
-                    //     false,
-                    // )
-                    // .await
-                    // {
-                    //     Ok((state, msg)) => {
-                    //         new_state = state;
-                    //         return_msg = msg;
-                    //     }
-                    //     Err(err) => return Err(err),
-                    // }
-                    new_state = None;
-                    return_msg = None;
-                }
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
@@ -635,48 +556,6 @@ fn build_op_result(
             }
         },
     })
-}
-
-async fn forward_update<NB: NetworkBridge>(
-    op_manager: &OpManager,
-    conn_manager: &mut NB,
-    key: ContractKey,
-    new_value: WrappedState,
-    id: Transaction,
-    htl: usize,
-    skip_list: Vec<PeerId>,
-) -> bool {
-    let contract_loc = Location::from(&key);
-    let forward_to = op_manager
-        .ring
-        .closest_potentially_caching(&key, &*skip_list);
-    let own_pkloc = op_manager.ring.own_location();
-    let own_loc = own_pkloc.location.expect("infallible");
-    if let Some(peer) = forward_to {
-        let other_loc = peer.location.as_ref().expect("infallible");
-        let other_distance = contract_loc.distance(other_loc);
-        let self_distance = contract_loc.distance(own_loc);
-        if other_distance < self_distance {
-            // forward the contract towards this node since it is indeed closer to the contract location
-            // and forget about it, no need to keep track of this op or wait for response
-            let _ = conn_manager
-                .send(
-                    &peer.peer,
-                    (UpdateMsg::UpdateForward {
-                        id,
-                        key,
-                        sender: own_pkloc,
-                        new_value: new_value.clone(),
-                        htl,
-                        skip_list,
-                    })
-                    .into(),
-                )
-                .await;
-            return false;
-        }
-    }
-    true
 }
 
 async fn update_contract(
@@ -841,16 +720,6 @@ mod messages {
             value: WrappedState,
             htl: usize,
         },
-        /// Forward a contract and it's latest value to an other node
-        UpdateForward {
-            id: Transaction,
-            sender: PeerKeyLocation,
-            key: ContractKey,
-            new_value: WrappedState,
-            /// current htl, reduced by one at each hop
-            htl: usize,
-            skip_list: Vec<PeerId>,
-        },
         /// Value successfully inserted/updated.
         SuccessfulUpdate {
             id: Transaction,
@@ -895,7 +764,6 @@ mod messages {
         fn id(&self) -> &Transaction {
             match self {
                 UpdateMsg::RequestUpdate { id, .. } => id,
-                UpdateMsg::UpdateForward { id, .. } => id,
                 UpdateMsg::SuccessfulUpdate { id, .. } => id,
                 UpdateMsg::AwaitUpdate { id, .. } => id,
                 UpdateMsg::SeekNode { id, .. } => id,
@@ -915,16 +783,12 @@ mod messages {
 
         fn terminal(&self) -> bool {
             use UpdateMsg::*;
-            matches!(
-                self,
-                SuccessfulUpdate { .. } | UpdateForward { .. } | SeekNode { .. }
-            )
+            matches!(self, SuccessfulUpdate { .. } | SeekNode { .. })
         }
 
         fn requested_location(&self) -> Option<crate::ring::Location> {
             match self {
                 UpdateMsg::RequestUpdate { key, .. } => Some(Location::from(key.id())),
-                UpdateMsg::UpdateForward { key, .. } => Some(Location::from(key.id())),
                 UpdateMsg::SeekNode { key, .. } => Some(Location::from(key.id())),
                 UpdateMsg::Broadcasting { key, .. } => Some(Location::from(key.id())),
                 UpdateMsg::BroadcastTo { key, .. } => Some(Location::from(key.id())),
@@ -948,7 +812,6 @@ mod messages {
             let id = self.id();
             match self {
                 UpdateMsg::RequestUpdate { id, .. } => write!(f, "RequestUpdate(id: {id})"),
-                UpdateMsg::UpdateForward { id, .. } => write!(f, "UpdateForward(id: {id})"),
                 UpdateMsg::SuccessfulUpdate { id, .. } => write!(f, "SuccessfulUpdate(id: {id})"),
                 UpdateMsg::AwaitUpdate { id } => write!(f, "AwaitUpdate(id: {id})"),
                 UpdateMsg::SeekNode { id, .. } => write!(f, "SeekNode(id: {id})"),
