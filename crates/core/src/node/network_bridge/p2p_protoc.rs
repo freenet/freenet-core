@@ -267,7 +267,7 @@ impl P2pConnManager {
         Ok(())
     }
 
-    #[tracing::instrument(name = "network_event_listener", skip_all)]
+    #[tracing::instrument(name = "network_event_listener", fields(peer = %self.bridge.op_manager.ring.peer_key), skip_all)]
     pub async fn run_event_listener(
         mut self,
         op_manager: Arc<OpManager>,

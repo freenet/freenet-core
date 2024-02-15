@@ -7,7 +7,7 @@ resolver = "2"
 publish = false
 
 [dependencies]
-freenet-stdlib = { workspace = true }
+freenet-stdlib = { workspace = true, features = ["contract"] }
 
 [lib]
 crate-type = ["cdylib"]

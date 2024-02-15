@@ -1,6 +1,8 @@
 # Getting Started
 
-This tutorial will show you how to build decentralized software on Freenet. For a similar working and up to date example check the `freenet-email` app (located in under the `apps/freenet-email-app` directory in the `freenet-core` repository).
+This tutorial will show you how to build decentralized software on Freenet. For a similar working
+and up to date example check the `freenet-email` app (located in under the `apps/freenet-email-app`
+directory in the `freenet-core` repository).
 
 <!-- toc -->
 
@@ -16,6 +18,7 @@ curl https://sh.rustup.rs -sSf | sh
 ```
 
 #### Note for MacOS install
+
 Do not have the `brew` version of rust installed as it will cause compications with `fdev`.
 
 ### Freenet development tool (fdev)
@@ -27,10 +30,11 @@ tools:
 cargo install freenet fdev
 ```
 
-This command will install `fdev` (Freenet development tool) and a working Freenet kernel that can
+This command will install `fdev` (Freenet development tool) and a working Freenet peer that can
 be used for local development.
 
 ### Add WebAssembly target
+
 ```bash
 rustup target add wasm32-unknown-unknown
 ```
@@ -38,14 +42,14 @@ rustup target add wasm32-unknown-unknown
 ### Node.js and TypeScript
 
 To build user interfaces in JavaScript or TypeScript, you need to have Node.js
-and npm installed. On Linux or Mac:
+and npm installed. For example on Ubuntu Linux:
 
 ```bash
 sudo apt update
 sudo apt install nodejs npm
 ```
 
-For Windows, you can download Node.js and npm from [here](https://nodejs.org/en/download/).
+For Mac or Windows, you can download Node.js and npm from [here](https://nodejs.org/en/download/).
 
 Once Node.js and npm are installed, you can install TypeScript globally on your
 system, which includes the `tsc` command:
@@ -72,14 +76,14 @@ contracts](glossary.md#container-contract). Currently, the following
 technological stacks are supported (more to be added in the future):
 
 - Regular contracts:
-  - Rust (_default_)
-- Web applications:
-  - Container development:
     - Rust (_default_)
-  - Web/state development:
-    - Typescript. (_default: using npm and webpack_)
-    - JavaScript.
-    - Rust (**WIP**).
+- Web applications:
+    - Container development:
+        - Rust (_default_)
+    - Web/state development:
+        - Typescript. (_default: using npm and webpack_)
+        - JavaScript.
+        - Rust (**WIP**).
 
 We will need to create a directory that will hold our web app and initialize it:
 

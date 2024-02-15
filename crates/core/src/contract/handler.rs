@@ -21,7 +21,7 @@ use crate::{client_events::ClientId, node::PeerCliConfig, wasm_runtime::Runtime,
 
 pub(crate) struct ClientResponsesReceiver(UnboundedReceiver<(ClientId, HostResult)>);
 
-pub fn client_responses_channel() -> (ClientResponsesReceiver, ClientResponsesSender) {
+pub(crate) fn client_responses_channel() -> (ClientResponsesReceiver, ClientResponsesSender) {
     let (tx, rx) = mpsc::unbounded_channel();
     (ClientResponsesReceiver(rx), ClientResponsesSender(tx))
 }

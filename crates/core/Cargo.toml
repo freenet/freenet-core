@@ -3,7 +3,7 @@ name = "freenet"
 version = "0.0.7"
 edition = "2021"
 rust-version = "1.71.1"
-publish =  true
+publish = true
 description = "Freenet core software"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/freenet/freenet-core"
@@ -14,9 +14,9 @@ path = "src/bin/freenet.rs"
 
 [dependencies]
 anyhow = "1"
-asynchronous-codec = "0.6"
+asynchronous-codec = "0.7"
 async-trait = "0.1"
-axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws"], workspace = true }
+axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws", "json"], workspace = true }
 bincode = "1"
 blake3 = { workspace = true }
 bs58 = "0.5"
@@ -27,18 +27,18 @@ chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 clap = { features = ["derive", "env"], workspace = true }
 config = { features = ["toml"], version = "0.13.0" }
-cookie = "0.17"
-crossbeam = { workspace = true } 
+cookie = "0.18"
+crossbeam = { workspace = true }
 ctrlc = { features = ["termination"], workspace = true }
 dashmap = { workspace = true }
-delegate = "0.10"
+delegate = "0.12"
 directories = "5"
 either = { features = ["serde"], workspace = true }
 fastrand = { workspace = true }
 flatbuffers = "23.5.26"
 futures = "0.3.21"
 headers = "0.4"
-itertools = "0.11"
+itertools = "0.12.1"
 libp2p = { default-features = false, features = ["autonat", "dns", "ed25519", "identify", "macros", "noise", "ping", "tcp", "tokio", "yamux"], version = "0.52.3" }
 libp2p-identity = { features = ["ed25519", "rand"], version = "0.2.7" }
 notify = "6"
@@ -56,12 +56,14 @@ stretto = { features = ["async", "sync"], version = "0.8" }
 tar = { version = "0.4.38" }
 thiserror = "1"
 tokio = { features = ["fs", "macros", "rt-multi-thread", "sync", "process"], version = "1" }
-tokio-tungstenite = "0.20"
+tokio-tungstenite = "0.21"
 tower-http = { features = ["fs", "trace"], version = "0.5" }
 ulid = { features = ["serde"], version = "1.1" }
-unsigned-varint = "0.7"
+unsigned-varint = { version = "0.8", features = ["codec", "asynchronous_codec"] }
 wasmer = { features = ["sys"], workspace = true }
 xz2 = { version = "0.1" }
+reqwest = { version = "0.11.23", features = ["json"] }
+# enum-iterator = "1.4.1"
 
 # Tracing deps
 opentelemetry = "0.21.0"
@@ -72,6 +74,7 @@ tracing-subscriber = { optional = true, version = "0.3.16" }
 
 # internal deps
 freenet-stdlib = { features = ["net"], workspace = true }
+time = "0.3.30"
 
 [dev-dependencies]
 arbitrary = { features = ["derive"], version = "1" }

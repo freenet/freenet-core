@@ -34,8 +34,10 @@ use crate::{
 
 mod in_memory;
 mod inter_process;
+mod network;
 
 pub use self::inter_process::SimPeer;
+pub use self::network::{NetworkPeer, PeerMessage, PeerStatus};
 
 use super::{
     network_bridge::EventLoopNotificationsReceiver, ConnectionError, NetworkBridge, PeerId,
@@ -127,7 +129,7 @@ impl<'a> From<&'a str> for NodeLabel {
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct NodeSpecification {
-    pub owned_contracts: Vec<(ContractContainer, WrappedState, Option<PeerKeyLocation>)>,
+    pub owned_contracts: Vec<(ContractContainer, WrappedState, bool)>,
     pub events_to_generate: HashMap<EventId, freenet_stdlib::client_api::ClientRequest<'static>>,
     pub contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
 }
@@ -283,7 +285,7 @@ pub(super) struct Builder<ER> {
     contract_handler_name: String,
     add_noise: bool,
     event_register: ER,
-    contracts: Vec<(ContractContainer, WrappedState, Option<PeerKeyLocation>)>,
+    contracts: Vec<(ContractContainer, WrappedState, bool)>,
     contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
 }
 
@@ -482,7 +484,9 @@ impl SimNetwork {
                 .max_hops_to_live(self.ring_max_htl)
                 .rnd_if_htl_above(self.rnd_if_htl_above)
                 .max_number_of_connections(self.max_connections)
-                .with_key(pair.public().into());
+                .with_key(pair.public().into())
+                .with_ip(Ipv6Addr::LOCALHOST)
+                .with_port(get_free_port().unwrap());
 
             let peer = PeerId::from(id);
             self.event_listener.add_node(label.clone(), peer);

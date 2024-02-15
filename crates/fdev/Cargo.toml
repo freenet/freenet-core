@@ -29,10 +29,14 @@ semver = { workspace = true }
 tar = "0.4"
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signal", "parking_lot", "process"] }
+tokio-tungstenite = "0.21.0"
 toml = { version = "0.8", features = ["default", "preserve_order"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 xz2 = "0.1"
+libp2p-identity = { features = ["ed25519", "rand"], version = "0.2.7" }
+reqwest = { version = "0.11.23", features = ["json"] }
+http = "1.0.0"
 
 # internal
 freenet = { path = "../core" }

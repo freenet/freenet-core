@@ -51,7 +51,7 @@ impl Display for ClientId {
 
 type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AuthToken(#[serde(deserialize_with = "AuthToken::deser_auth_token")] Arc<str>);
 
 impl AuthToken {
@@ -162,9 +162,13 @@ pub(crate) mod test {
         client_api::{ContractRequest, ErrorKind},
         prelude::*,
     };
-    use futures::FutureExt;
+    use futures::{FutureExt, StreamExt};
     use rand::{seq::SliceRandom, SeedableRng};
+    use tokio::net::TcpStream;
     use tokio::sync::watch::Receiver;
+    use tokio::sync::Mutex;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
     use crate::node::{testing_impl::EventId, PeerId};
 
@@ -307,6 +311,96 @@ pub(crate) mod test {
             })) = response
             {
                 self.internal_state
+                    .as_mut()
+                    .expect("state should be set")
+                    .owns_contracts
+                    .insert(key);
+            }
+            async { Ok(()) }.boxed()
+        }
+    }
+
+    pub struct NetworkEventGenerator<R = rand::rngs::SmallRng> {
+        id: PeerId,
+        memory_event_generator: MemoryEventsGen<R>,
+        ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+    }
+
+    impl<R> NetworkEventGenerator<R>
+    where
+        R: RandomEventGenerator,
+    {
+        pub fn new(
+            id: PeerId,
+            memory_event_generator: MemoryEventsGen<R>,
+            ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+        ) -> Self {
+            Self {
+                id,
+                memory_event_generator,
+                ws_client,
+            }
+        }
+    }
+
+    impl<R> ClientEventsProxy for NetworkEventGenerator<R>
+    where
+        R: RandomEventGenerator + Send + Clone,
+    {
+        fn recv(&mut self) -> BoxFuture<'_, HostIncomingMsg> {
+            let ws_client_clone = self.ws_client.clone();
+
+            async move {
+                loop {
+                    let message = {
+                        let mut lock = ws_client_clone.lock().await;
+                        lock.next().await
+                    };
+
+                    match message {
+                        Some(Ok(Message::Binary(data))) => {
+                            if let Ok((_, pk)) = bincode::deserialize::<(EventId, PeerId)>(&data) {
+                                if pk == self.id {
+                                    let res = OpenRequest {
+                                        client_id: ClientId::FIRST,
+                                        request: self
+                                            .memory_event_generator
+                                            .generate_rand_event()
+                                            .await
+                                            .ok_or_else(|| {
+                                                ClientError::from(ErrorKind::Disconnect)
+                                            })?
+                                            .into(),
+                                        notification_channel: None,
+                                        token: None,
+                                    };
+                                    return Ok(res.into_owned());
+                                }
+                            } else {
+                                continue;
+                            }
+                        }
+                        None => {
+                            return Err(ClientError::from(ErrorKind::Disconnect));
+                        }
+                        _ => continue,
+                    }
+                }
+            }
+            .boxed()
+        }
+
+        fn send(
+            &mut self,
+            _id: ClientId,
+            response: Result<HostResponse, ClientError>,
+        ) -> BoxFuture<'_, Result<(), ClientError>> {
+            if let Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key, ..
+            })) = response
+            {
+                self.memory_event_generator
+                    .internal_state
                     .as_mut()
                     .expect("state should be set")
                     .owns_contracts

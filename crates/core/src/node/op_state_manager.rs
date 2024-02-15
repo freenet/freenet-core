@@ -201,9 +201,9 @@ impl OpManager {
     /// Notify the operation manager that a transaction is being transacted over the network.
     pub fn sending_transaction(&self, peer: &PeerId, msg: &NetMessage) {
         let transaction = msg.id();
-        if let Some(loc) = msg.requested_location() {
+        if let (Some(recipient), Some(target)) = (msg.target(), msg.requested_location()) {
             self.ring
-                .record_request(loc, transaction.transaction_type());
+                .record_request(*recipient, target, transaction.transaction_type());
         }
         self.ring
             .live_tx_tracker
