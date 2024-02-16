@@ -16,6 +16,109 @@ pub enum PeerChange<'a> {
     Error(topology::Error<'a>),
 }
 
+pub enum ContractChange {
+    PutRequest,
+    PutSuccess,
+}
+
+impl ContractChange {
+    pub fn put_new_contract_msg(
+        transaction: impl AsRef<str>,
+        contract: impl AsRef<str>,
+        requester: impl AsRef<str>,
+        target: impl AsRef<str>,
+    ) -> Vec<u8> {
+        let mut buf = flatbuffers::FlatBufferBuilder::new();
+        let transaction = buf.create_string(transaction.as_ref());
+        let contract = buf.create_string(contract.as_ref());
+        let requester = buf.create_string(requester.as_ref());
+        let target = buf.create_string(target.as_ref());
+        let put_req = topology::PutRequest::create(
+            &mut buf,
+            &topology::PutRequestArgs {
+                transaction: Some(transaction),
+                key: Some(contract),
+                requester: Some(requester),
+                target: Some(target),
+            },
+        );
+        let msg = topology::ContractChangeRequest::create(
+            &mut buf,
+            &topology::ContractChangeRequestArgs {
+                contract_id: Some(contract),
+                change_type: topology::ContractChangeRequestType::PutRequest,
+                change: Some(put_req.as_union_value()),
+            },
+        );
+        buf.finish_minimal(msg);
+        buf.finished_data().to_vec()
+    }
+
+    pub fn put_success_msg(
+        transaction: impl AsRef<str>,
+        contract: impl AsRef<str>,
+        requester: impl AsRef<str>,
+        target: impl AsRef<str>,
+    ) -> Vec<u8> {
+        let mut buf = flatbuffers::FlatBufferBuilder::new();
+        let transaction = buf.create_string(transaction.as_ref());
+        let contract = buf.create_string(contract.as_ref());
+        let requester = buf.create_string(requester.as_ref());
+        let target = buf.create_string(target.as_ref());
+        let put_success = topology::PutSuccess::create(
+            &mut buf,
+            &topology::PutSuccessArgs {
+                transaction: Some(transaction),
+                key: Some(contract),
+                requester: Some(requester),
+                target: Some(target),
+            },
+        );
+        let msg = topology::ContractChange::create(
+            &mut buf,
+            &topology::ContractChangeArgs {
+                contract_id: Some(contract),
+                change_type: topology::ContractChangeType::PutSuccess,
+                change: Some(put_success.as_union_value()),
+            },
+        );
+        buf.finish_minimal(msg);
+        buf.finished_data().to_vec()
+    }
+
+    pub fn put_failure_msg(
+        transaction: impl AsRef<str>,
+        contract: impl AsRef<str>,
+        requester: impl AsRef<str>,
+        target: impl AsRef<str>,
+    ) -> Vec<u8> {
+        let mut buf = flatbuffers::FlatBufferBuilder::new();
+        let transaction = buf.create_string(transaction.as_ref());
+        let contract = buf.create_string(contract.as_ref());
+        let requester = buf.create_string(requester.as_ref());
+        let target = buf.create_string(target.as_ref());
+        let put_failure = topology::PutFailure::create(
+            &mut buf,
+            &topology::PutFailureArgs {
+                transaction: Some(transaction),
+                key: Some(contract),
+                requester: Some(requester),
+                target: Some(target),
+            },
+        );
+        let msg = topology::ContractChange::create(
+            &mut buf,
+            &topology::ContractChangeArgs {
+                contract_id: Some(contract),
+                change_type: topology::ContractChangeType::PutFailure,
+                change: Some(put_failure.as_union_value()),
+            },
+        );
+        buf.finish_minimal(msg);
+        buf.finished_data().to_vec()
+    }
+}
+
 impl PeerChange<'_> {
     pub fn current_state_msg<'a>(
         to: PeerId,

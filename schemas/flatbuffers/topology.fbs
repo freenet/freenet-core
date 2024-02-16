@@ -40,3 +40,69 @@ union Response {
 table ControllerResponse {
   response:Response(required);
 }
+
+
+table PutRequest {
+  transaction: string(required);
+  key: string(required);
+  requester: string(required);
+  target: string(required);
+}
+
+table UpdateRequest {
+  transaction: string(required);
+  key: string(required);
+  requester: string(required);
+  target: string(required);
+}
+
+table PutSuccess {
+  transaction: string(required);
+  requester: string(required);
+  target: string(required);
+  key: string(required);
+}
+
+table PutFailure {
+  transaction: string(required);
+  requester: string(required);
+  target: string(required);
+  key: string(required);
+}
+
+table UpdateSuccess {
+  transaction: string(required);
+  requester: string(required);
+  target: string(required);
+  key: string(required);
+}
+
+table UpdateFailure {
+  transaction: string(required);
+  requester: string(required);
+  target: string(required);
+  key: string(required);
+}
+
+union ContractChangeType {
+  PutSuccess,
+  PutFailure,
+  UpdateSuccess,
+  UpdateFailure,
+}
+
+table ContractChange {
+  contract_id: string(required);
+  change: ContractChangeType;
+}
+
+
+union ContractChangeRequestType {
+  PutRequest,
+  UpdateRequest,
+}
+
+table ContractChangeRequest {
+  contract_id: string(required);
+  change: ContractChangeRequestType(required);
+}

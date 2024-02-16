@@ -260,9 +260,13 @@ impl<'a> NetEventLog<'a> {
                     key,
                 })
             }
-            NetMessage::Put(PutMsg::SuccessfulPut { .. }) => EventKind::Put(PutEvent::PutSuccess {
-                requester: op_manager.ring.peer_key,
-            }),
+            NetMessage::Put(PutMsg::SuccessfulPut { id, target }) => {
+                EventKind::Put(PutEvent::PutSuccess {
+                    id: *id,
+                    requester: op_manager.ring.peer_key,
+                    target: *target,
+                })
+            }
             NetMessage::Put(PutMsg::Broadcasting {
                 new_value,
                 broadcast_to,
@@ -784,7 +788,21 @@ async fn send_to_metrics_server(
             let msg = PeerChange::removed_connection_msg(*from, send_msg.peer_id);
             ws_stream.send(Message::Binary(msg)).await
         }
-        // todo: send op events too (put, get, update, etc) so we can keep track of transactions
+        EventKind::Put(PutEvent::Request { requester, key }) => {
+            println!("put event: key {} requester {}", key, requester);
+            Ok(())
+        }
+        EventKind::Put(PutEvent::PutSuccess {
+            id,
+            requester,
+            target,
+        }) => {
+            println!(
+                "put event: id {} requester {} target {}",
+                id, requester, target
+            );
+            Ok(())
+        }
         _ => Ok(()),
     };
     if let Err(error) = res {
@@ -1126,7 +1144,9 @@ enum PutEvent {
         key: ContractKey,
     },
     PutSuccess {
+        id: Transaction,
         requester: PeerId,
+        target: PeerKeyLocation,
     },
     BroadcastEmitted {
         /// subscribed peers
@@ -1343,7 +1363,7 @@ pub(super) mod test {
                         PutEvent::Request { key, .. } if key == for_key => {
                             is_expected_key = true;
                         }
-                        PutEvent::PutSuccess { requester } if requester == peer => {
+                        PutEvent::PutSuccess { requester, .. } if requester == peer => {
                             is_expected_peer = true;
                         }
                         _ => {}
