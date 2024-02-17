@@ -57,44 +57,16 @@ impl SymmetricMessage {
         Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
     }
 
-    pub fn short_message(
+    pub fn pack(
         message_id: u32,
-        payload: MessagePayload,
-        outbound_sym_key: &Aes128Gcm,
-        confirm_receipt: Vec<u32>,
-    ) -> Result<PacketData, bincode::Error> {
-        let payload = SymmetricMessagePayload::ShortMessage { payload };
-        Self::send_message(message_id, payload, outbound_sym_key, confirm_receipt)
-    }
-
-    pub fn fragmented_message(
-        fragment_id: u32,
-        message_id: u32,
-        total_length_bytes: u64,
-        fragment_number: u32,
-        payload: MessagePayload,
-        outbound_sym_key: &Aes128Gcm,
-        confirm_receipt: Vec<u32>,
-    ) -> Result<PacketData, bincode::Error> {
-        let payload = SymmetricMessagePayload::LongMessageFragment {
-            message_id,
-            total_length_bytes,
-            fragment_number,
-            payload,
-        };
-        Self::send_message(fragment_id, payload, outbound_sym_key, confirm_receipt)
-    }
-
-    fn send_message(
-        message_id: u32,
-        payload: SymmetricMessagePayload,
+        payload: impl Into<SymmetricMessagePayload>,
         outbound_sym_key: &Aes128Gcm,
         confirm_receipt: Vec<u32>,
     ) -> Result<PacketData, bincode::Error> {
         let message = Self {
             message_id,
             confirm_receipt,
-            payload,
+            payload: payload.into(),
         };
         let mut packet = [0u8; MAX_PACKET_SIZE];
         let size = bincode::serialized_size(&message)?;
@@ -116,6 +88,40 @@ impl SymmetricMessage {
     };
 }
 
+impl From<()> for SymmetricMessagePayload {
+    fn from(_: ()) -> Self {
+        Self::NoOp {}
+    }
+}
+
+pub(super) struct ShortMessage(pub MessagePayload);
+
+impl From<ShortMessage> for SymmetricMessagePayload {
+    fn from(short_message: ShortMessage) -> Self {
+        Self::ShortMessage {
+            payload: short_message.0,
+        }
+    }
+}
+
+pub(super) struct LongMessageFragment {
+    pub message_id: u32,
+    pub total_length_bytes: u64,
+    pub fragment_number: u32,
+    pub payload: MessagePayload,
+}
+
+impl From<LongMessageFragment> for SymmetricMessagePayload {
+    fn from(long_message_fragment: LongMessageFragment) -> Self {
+        Self::LongMessageFragment {
+            message_id: long_message_fragment.message_id,
+            total_length_bytes: long_message_fragment.total_length_bytes,
+            fragment_number: long_message_fragment.fragment_number,
+            payload: long_message_fragment.payload,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub(super) enum SymmetricMessagePayload {
     AckConnection {
@@ -132,6 +138,7 @@ pub(super) enum SymmetricMessagePayload {
         fragment_number: u32,
         payload: MessagePayload,
     },
+    NoOp,
 }
 
 #[test]

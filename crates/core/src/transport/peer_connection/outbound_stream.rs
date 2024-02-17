@@ -8,8 +8,10 @@ use tokio::sync::mpsc;
 
 use crate::{
     transport::{
-        connection_handler::TransportError, packet_data, sent_packet_tracker::SentPacketTracker,
-        symmetric_message::SymmetricMessage,
+        connection_handler::TransportError,
+        packet_data,
+        sent_packet_tracker::SentPacketTracker,
+        symmetric_message::{self},
     },
     util::time_source::InstantTimeSrc,
 };
@@ -74,19 +76,22 @@ pub(super) async fn send_long_message(
                 }
             };
             std::mem::swap(&mut message, &mut rest);
-            let idx = start_index + sent_so_far as u32 + 1;
-            let packet_id = last_message_id.fetch_add(1, std::sync::atomic::Ordering::Release);
-            let fragment = SymmetricMessage::fragmented_message(
-                packet_id,
-                start_index,
-                total_length_bytes as u64,
-                sent_so_far as u32 + 1,
-                rest,
+            let idx = super::packet_sending(
+                remote_addr,
+                &sender,
+                &last_message_id,
                 &outbound_symmetric_key,
                 std::mem::take(&mut confirm_receipts),
-            )?;
+                symmetric_message::LongMessageFragment {
+                    message_id: start_index,
+                    total_length_bytes: total_length_bytes as u64,
+                    fragment_number: sent_so_far as u32 + 2, // 1-indexed, so need to add 1 + 1
+                    payload: rest,
+                },
+                &sent_tracker,
+            )
+            .await?;
             sent_not_confirmed.insert(idx);
-            super::packet_sending(remote_addr, &sender, idx, fragment, &sent_tracker).await?;
             continue;
         }
 
