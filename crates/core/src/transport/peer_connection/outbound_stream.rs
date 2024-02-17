@@ -4,12 +4,10 @@ use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
 use aes_gcm::Aes128Gcm;
-use futures::channel::mpsc;
 use futures::SinkExt;
+use tokio::sync::mpsc;
 
-use crate::transport::{
-    connection_handler::Socket, packet_data, symmetric_message::SymmetricMessage,
-};
+use crate::transport::{packet_data, symmetric_message::SymmetricMessage};
 
 pub(crate) type StreamBytes = Vec<u8>;
 
@@ -29,6 +27,7 @@ pub(super) async fn send_long_message(
     remote_socket: SocketAddr,
     mut message: StreamBytes,
     outbound_symmetric_key: Aes128Gcm,
+    mut sent_confirmed_recv: mpsc::Receiver<u32>,
 ) -> Result<(), SenderStreamError> {
     let total_length_bytes = message.len() as u32;
     let start_index = last_message_id.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -43,6 +42,22 @@ pub(super) async fn send_long_message(
     let mut confirm_receipts = Vec::new();
 
     loop {
+        loop {
+            match sent_confirmed_recv.try_recv() {
+                Ok(idx) => {
+                    if sent_not_confirmed.remove(&idx) {
+                        sent_confirmed += 1;
+                        confirm_receipts.push(idx);
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) if !sent_not_confirmed.is_empty() => {
+                    // the receiver has been dropped, we should stop sending
+                    return Err(SenderStreamError::Closed);
+                }
+                _ => break,
+            }
+        }
+
         let sent_so_far = sent_confirmed + sent_not_confirmed.len();
         if sent_so_far < total_messages {
             let mut rest = {
@@ -63,9 +78,7 @@ pub(super) async fn send_long_message(
                 std::mem::take(&mut confirm_receipts),
             )?
             .into();
-            // todo: this is blocking, but hopefully meaningless, measure and improve if necessary
             sent_not_confirmed.insert(idx);
-            // send_packet(&connection, remote_socket, fragment).await?;
             sender.send((remote_socket, fragment)).await.unwrap();
             continue;
         }
@@ -82,18 +95,6 @@ pub(super) async fn send_long_message(
     Ok(())
 }
 
-async fn send_packet(
-    connection: &impl Socket,
-    remote_addr: SocketAddr,
-    packet: Arc<[u8]>,
-) -> Result<(), SenderStreamError> {
-    connection
-        .send_to(&packet, remote_addr)
-        .await
-        .map_err(|_| SenderStreamError::Closed)?;
-    Ok(())
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum SenderStreamError {
     #[error("stream closed unexpectedly")]
@@ -105,12 +106,4 @@ pub enum SenderStreamError {
 }
 
 #[cfg(test)]
-mod tests {
-    // use super::*;
-    // use crate::transport::MessagePayload;
-    // use crate::util::time_source::MockTimeSource;
-
-    // fn mock_outbound_remote_connection() -> OutboundRemoteConnection<impl Socket> {
-    //     let time_source = MockTimeSource::new(Instant::now());
-    // }
-}
+mod tests {}

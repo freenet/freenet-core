@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::vec::Vec;
 
 use aes_gcm::Aes128Gcm;
+use parking_lot::Mutex;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
@@ -12,6 +13,7 @@ mod outbound_stream;
 
 use inbound_stream::InboundStream;
 pub(super) use outbound_stream::SenderStreamError;
+use tokio::task::JoinHandle;
 
 use self::outbound_stream::send_long_message;
 
@@ -31,7 +33,7 @@ pub(super) struct OutboundRemoteConnection {
     pub outbound_symmetric_key: Aes128Gcm,
     pub remote_is_gateway: bool,
     pub remote_addr: SocketAddr,
-    pub sent_tracker: SentPacketTracker<InstantTimeSrc>,
+    pub sent_tracker: Arc<Mutex<SentPacketTracker<InstantTimeSrc>>>,
     pub last_message_id: Arc<AtomicU32>,
     pub inbound_packet_recv: mpsc::Receiver<SymmetricMessage>,
 }
@@ -42,7 +44,7 @@ impl OutboundRemoteConnection {
             .send((self.remote_addr, packet.clone()))
             .await
             .map_err(|_| SenderStreamError::Closed)?;
-        self.sent_tracker.report_sent_packet(idx, packet);
+        self.sent_tracker.lock().report_sent_packet(idx, packet);
         Ok(())
     }
 }
@@ -58,6 +60,7 @@ pub(crate) struct PeerConnection {
     // a period has passed without reporting the inbound receipts
     inbound_receipts: Vec<u32>,
     received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
+    // ongoing_outbound_streams: HashMap<u32, JoinHandle<()>>,
 }
 
 impl PeerConnection {
@@ -101,6 +104,7 @@ impl PeerConnection {
                 .unwrap();
             self.outbound_connection
                 .sent_tracker
+                .lock()
                 .report_sent_packet(msg_id, packet);
         }
         Ok(())
@@ -118,6 +122,7 @@ impl PeerConnection {
             self.inbound_receipts.push(message_id);
             self.outbound_connection
                 .sent_tracker
+                .lock()
                 .report_received_receipts(&confirm_receipt);
             match self.received_tracker.report_received_packet(message_id) {
                 ReportResult::Ok => {
@@ -160,14 +165,16 @@ impl PeerConnection {
     }
 
     async fn send_long(&mut self, data: SerializedMessage) {
-        // send_long_message(
-        //     &mut self.outbound_connection,
-        //     serialized_data,
-        //     &self.bw_tracker,
-        //     BANDWITH_LIMIT,
-        // )
-        // .await?;
-        let task = tokio::spawn(async move {});
+        let (sent_confirm_sender, sent_confirm_recv) = mpsc::channel(1);
+        let task = send_long_message(
+            self.outbound_connection.last_message_id.clone(),
+            self.outbound_connection.outbound_packets.clone(),
+            self.outbound_connection.remote_addr,
+            data,
+            self.outbound_connection.outbound_symmetric_key.clone(),
+            sent_confirm_recv,
+        );
+        let task = tokio::spawn(task);
     }
 }
 

@@ -370,8 +370,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                         .socket
                         .send_to(acknowledgment.data(), remote_addr)
                         .await;
-                    let mut sent_tracker = SentPacketTracker::new();
-                    sent_tracker.report_sent_packet(
+                    let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+                    sent_tracker.lock().report_sent_packet(
                         SymmetricMessage::FIRST_MESSAGE_ID,
                         acknowledgment.data().into(),
                     );
@@ -491,7 +491,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         .expect("should be set at this stage"),
                                     remote_is_gateway: false,
                                     remote_addr,
-                                    sent_tracker: SentPacketTracker::new(),
+                                    sent_tracker: Arc::new(parking_lot::Mutex::new(
+                                        SentPacketTracker::new(),
+                                    )),
                                     last_message_id: Arc::new(AtomicU32::new(0)),
                                     inbound_packet_recv: inbound_recv,
                                 },
