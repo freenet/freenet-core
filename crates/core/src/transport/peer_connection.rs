@@ -1,21 +1,19 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::vec::Vec;
 
 use aes_gcm::Aes128Gcm;
 use futures::stream::FuturesUnordered;
-use futures::StreamExt;
+use futures::{Future, FutureExt, StreamExt};
 use parking_lot::Mutex;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
 mod inbound_stream;
 mod outbound_stream;
-
-use inbound_stream::InboundStream;
-use tokio::task::JoinHandle;
 
 use super::received_packet_tracker::ReceivedPacketTracker;
 use super::sent_packet_tracker::ResendAction;
@@ -52,8 +50,10 @@ pub(crate) struct PeerConnection {
     // a period has passed without reporting the inbound receipts
     inbound_receipts: Vec<u32>,
     received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
-    ongoing_inbound_stream: Option<InboundStream>,
-    ongoing_outbound_streams: FuturesUnordered<JoinHandle<Result>>,
+    inbound_streams: HashMap<u32, mpsc::Sender<(u32, Vec<u8>)>>,
+    ongoing_inbound_streams:
+        FuturesUnordered<Pin<Box<dyn Future<Output = Result<SerializedMessage>> + Send>>>,
+    ongoing_outbound_streams: FuturesUnordered<Pin<Box<dyn Future<Output = Result> + Send>>>,
     outbound_receipts_notifiers: HashMap<u32, mpsc::Sender<u32>>,
 }
 
@@ -61,9 +61,10 @@ impl PeerConnection {
     pub fn new(outbound_connection: OutboundRemoteConnection) -> Self {
         Self {
             outbound_connection,
-            ongoing_inbound_stream: None,
             inbound_receipts: vec![],
             received_tracker: ReceivedPacketTracker::new(),
+            inbound_streams: HashMap::new(),
+            ongoing_inbound_streams: FuturesUnordered::new(),
             ongoing_outbound_streams: FuturesUnordered::new(),
             outbound_receipts_notifiers: HashMap::new(),
         }
@@ -110,17 +111,20 @@ impl PeerConnection {
                         ReportResult::QueueFull => todo!(),
                     }
                 }
-                stream = self.ongoing_outbound_streams.next(), if !self.ongoing_outbound_streams.is_empty() => {
-                    let Some(stream) = stream else {
+                inbound_stream = self.ongoing_inbound_streams.next(), if !self.ongoing_inbound_streams.is_empty() => {
+                    let Some(res) = inbound_stream else {
+                        tracing::error!("unexpected no-stream from ongoing_inbound_streams");
+                        continue
+                    };
+                    return res;
+                }
+                outbound_stream = self.ongoing_outbound_streams.next(), if !self.ongoing_outbound_streams.is_empty() => {
+                    let Some(res) = outbound_stream else {
                         tracing::error!("unexpected no-stream from ongoing_outbound_streams");
                         continue
                     };
-                    let Ok(res) = stream else {
-                        tracing::error!("unexpected join error from ongoing_outbound_streams");
-                        continue
-                    };
                     res?
-                }
+               }
                 _ = resend_check.take().expect("should be set") => {
                     loop {
                         let maybe_resend = self.outbound_connection
@@ -157,19 +161,35 @@ impl PeerConnection {
             AckConnection { .. } => Err(TransportError::UnexpectedMessage("AckConnection".into())),
             LongMessageFragment {
                 message_id,
-                total_length_bytes: total_length,
-                fragment_number: index,
-                payload: fragment,
+                total_length_bytes,
+                fragment_number,
+                payload,
             } => {
-                // TODO: change to make multiplexing possible, use message_id for identifying the stream which fragment belongs to
-                let mut stream = self
-                    .ongoing_inbound_stream
-                    .take()
-                    .unwrap_or_else(|| InboundStream::new(total_length));
-                if let Some(msg) = stream.push_fragment(index, fragment) {
-                    return Ok(Some(msg));
+                if let Some(sender) = self.inbound_streams.get(&message_id) {
+                    sender
+                        .send((fragment_number, payload))
+                        .await
+                        .map_err(|_| TransportError::ConnectionClosed)?;
+                } else {
+                    let (sender, mut receiver) = mpsc::channel(1);
+                    self.inbound_streams.insert(message_id, sender);
+                    let mut stream = inbound_stream::InboundStream::new(total_length_bytes);
+                    if let Some(msg) = stream.push_fragment(fragment_number, payload) {
+                        self.inbound_streams.remove(&message_id);
+                        return Ok(Some(msg));
+                    }
+                    self.ongoing_inbound_streams.push(
+                        async move {
+                            while let Some((fragment_number, payload)) = receiver.recv().await {
+                                if let Some(msg) = stream.push_fragment(fragment_number, payload) {
+                                    return Ok(msg);
+                                }
+                            }
+                            Err(TransportError::IncompleteInboundStream(message_id))
+                        }
+                        .boxed(),
+                    );
                 }
-                self.ongoing_inbound_stream = Some(stream);
                 Ok(None)
             }
         }
@@ -212,8 +232,7 @@ impl PeerConnection {
             sent_confirm_recv,
             self.outbound_connection.sent_tracker.clone(),
         );
-        let task = tokio::spawn(task);
-        self.ongoing_outbound_streams.push(task);
+        self.ongoing_outbound_streams.push(task.boxed());
         self.outbound_receipts_notifiers
             .insert(stream_id, sent_confirm_sender);
     }

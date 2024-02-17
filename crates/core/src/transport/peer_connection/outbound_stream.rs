@@ -58,7 +58,7 @@ pub(super) async fn send_long_message(
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) if !sent_not_confirmed.is_empty() => {
                     // the receiver has been dropped, we should stop sending
-                    return Err(TransportError::ConnectionClosed.into());
+                    return Err(TransportError::ConnectionClosed);
                 }
                 _ => break,
             }

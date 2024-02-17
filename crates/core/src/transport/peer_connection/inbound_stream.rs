@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 pub(crate) struct InboundStream {
     total_length_bytes: u64,
-    last_contiguous_fragment_ix: i64,
+    last_contiguous_fragment_idx: u32,
     non_contiguous_fragments: BTreeMap<u32, Vec<u8>>,
     message: Vec<u8>,
 }
@@ -12,7 +12,7 @@ impl InboundStream {
     pub(crate) fn new(total_length_bytes: u64) -> Self {
         Self {
             total_length_bytes,
-            last_contiguous_fragment_ix: -1,
+            last_contiguous_fragment_idx: 0,
             non_contiguous_fragments: BTreeMap::new(),
             message: vec![],
         }
@@ -24,16 +24,16 @@ impl InboundStream {
         fragment_number: u32,
         mut fragment: StreamBytes,
     ) -> Option<Vec<u8>> {
-        if (fragment_number as i64) == self.last_contiguous_fragment_ix + 1 {
-            self.last_contiguous_fragment_ix = fragment_number as i64;
+        if fragment_number == self.last_contiguous_fragment_idx + 1 {
+            self.last_contiguous_fragment_idx = fragment_number;
             self.message.append(&mut fragment);
         } else {
             self.non_contiguous_fragments
                 .insert(fragment_number, fragment);
         }
         while let Some((idx, mut v)) = self.non_contiguous_fragments.pop_first() {
-            if (idx as i64) == self.last_contiguous_fragment_ix + 1 {
-                self.last_contiguous_fragment_ix += 1;
+            if idx == self.last_contiguous_fragment_idx + 1 {
+                self.last_contiguous_fragment_idx += 1;
                 self.message.append(&mut v);
             } else {
                 self.non_contiguous_fragments.insert(idx, v);

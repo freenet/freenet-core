@@ -620,20 +620,22 @@ impl InboundRemoteConnection {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TransportError {
-    #[error(transparent)]
-    IO(#[from] std::io::Error),
     #[error("transport handler channel closed")]
     ChannelClosed,
     #[error("connection to remote closed")]
     ConnectionClosed,
     #[error("failed while establishing connection, reason: {cause}")]
     ConnectionEstablishmentFailure { cause: Cow<'static, str> },
+    #[error("incomplete inbound stream: {0}")]
+    IncompleteInboundStream(u32),
     #[error(transparent)]
-    PubKeyDecryptionError(#[from] rsa::errors::Error),
+    IO(#[from] std::io::Error),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
     #[error("{0}")]
     PrivateKeyDecryptionError(aes_gcm::aead::Error),
     #[error(transparent)]
-    Other(#[from] anyhow::Error),
+    PubKeyDecryptionError(#[from] rsa::errors::Error),
     #[error(transparent)]
     Serialization(#[from] bincode::Error),
     #[error("received unexpected message from remote: {0}")]
