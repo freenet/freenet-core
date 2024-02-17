@@ -63,20 +63,12 @@ impl SymmetricMessage {
         outbound_sym_key: &Aes128Gcm,
         confirm_receipt: Vec<u32>,
     ) -> Result<PacketData, bincode::Error> {
-        let message = Self {
-            message_id,
-            confirm_receipt,
-            payload: SymmetricMessagePayload::ShortMessage { payload },
-        };
-        let mut packet = [0u8; MAX_PACKET_SIZE]; // todo: optimize this
-        let size = bincode::serialized_size(&message)?;
-        debug_assert!(size <= MAX_DATA_SIZE as u64);
-        bincode::serialize_into(packet.as_mut_slice(), &message)?;
-        let bytes = &packet[..size as usize];
-        Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
+        let payload = SymmetricMessagePayload::ShortMessage { payload };
+        Self::send_message(message_id, payload, outbound_sym_key, confirm_receipt)
     }
 
     pub fn fragmented_message(
+        fragment_id: u32,
         message_id: u32,
         total_length_bytes: u64,
         fragment_number: u32,
@@ -84,17 +76,27 @@ impl SymmetricMessage {
         outbound_sym_key: &Aes128Gcm,
         confirm_receipt: Vec<u32>,
     ) -> Result<PacketData, bincode::Error> {
+        let payload = SymmetricMessagePayload::LongMessageFragment {
+            message_id,
+            total_length_bytes,
+            fragment_number,
+            payload,
+        };
+        Self::send_message(fragment_id, payload, outbound_sym_key, confirm_receipt)
+    }
+
+    fn send_message(
+        message_id: u32,
+        payload: SymmetricMessagePayload,
+        outbound_sym_key: &Aes128Gcm,
+        confirm_receipt: Vec<u32>,
+    ) -> Result<PacketData, bincode::Error> {
         let message = Self {
             message_id,
             confirm_receipt,
-            payload: SymmetricMessagePayload::LongMessageFragment {
-                message_id,
-                total_length_bytes,
-                fragment_number,
-                payload,
-            },
+            payload,
         };
-        let mut packet = [0u8; MAX_PACKET_SIZE]; // todo: optimize this
+        let mut packet = [0u8; MAX_PACKET_SIZE];
         let size = bincode::serialized_size(&message)?;
         debug_assert!(size <= MAX_DATA_SIZE as u64);
         bincode::serialize_into(packet.as_mut_slice(), &message)?;

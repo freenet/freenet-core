@@ -4,10 +4,15 @@ use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
 use aes_gcm::Aes128Gcm;
-use futures::SinkExt;
 use tokio::sync::mpsc;
 
-use crate::transport::{packet_data, symmetric_message::SymmetricMessage};
+use crate::{
+    transport::{
+        connection_handler::TransportError, packet_data, sent_packet_tracker::SentPacketTracker,
+        symmetric_message::SymmetricMessage,
+    },
+    util::time_source::InstantTimeSrc,
+};
 
 pub(crate) type StreamBytes = Vec<u8>;
 
@@ -20,17 +25,18 @@ const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 100;
 /// Handles sending a long message which is not being streamed,
 /// streaming messages will be tackled differently, in the interim time before
 /// the necessary changes are done to the codebase we will use this function
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_long_message(
-    // remote_conn: &mut OutboundRemoteConnection<impl Socket>,
+    start_index: u32,
     last_message_id: Arc<AtomicU32>,
-    mut sender: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
-    remote_socket: SocketAddr,
+    sender: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
+    remote_addr: SocketAddr,
     mut message: StreamBytes,
     outbound_symmetric_key: Aes128Gcm,
     mut sent_confirmed_recv: mpsc::Receiver<u32>,
-) -> Result<(), SenderStreamError> {
+    sent_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
+) -> Result<(), TransportError> {
     let total_length_bytes = message.len() as u32;
-    let start_index = last_message_id.fetch_add(1, std::sync::atomic::Ordering::Release);
     let mut total_messages = message.len() / MAX_DATA_SIZE;
     total_messages += if message.len() % MAX_DATA_SIZE == 0 {
         0
@@ -52,7 +58,7 @@ pub(super) async fn send_long_message(
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) if !sent_not_confirmed.is_empty() => {
                     // the receiver has been dropped, we should stop sending
-                    return Err(SenderStreamError::Closed);
+                    return Err(SenderStreamError::Closed.into());
                 }
                 _ => break,
             }
@@ -69,17 +75,18 @@ pub(super) async fn send_long_message(
             };
             std::mem::swap(&mut message, &mut rest);
             let idx = start_index + sent_so_far as u32 + 1;
-            let fragment: Arc<[u8]> = SymmetricMessage::fragmented_message(
+            let packet_id = last_message_id.fetch_add(1, std::sync::atomic::Ordering::Release);
+            let fragment = SymmetricMessage::fragmented_message(
+                packet_id,
                 start_index,
                 total_length_bytes as u64,
                 sent_so_far as u32 + 1,
                 rest,
                 &outbound_symmetric_key,
                 std::mem::take(&mut confirm_receipts),
-            )?
-            .into();
+            )?;
             sent_not_confirmed.insert(idx);
-            sender.send((remote_socket, fragment)).await.unwrap();
+            super::packet_sending(remote_addr, &sender, idx, fragment, &sent_tracker).await?;
             continue;
         }
 

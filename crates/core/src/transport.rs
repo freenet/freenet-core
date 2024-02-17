@@ -3,11 +3,11 @@
 //!
 //! Please see `docs/architecture/transport.md` for more information.
 //!
-mod rate_limiter;
 mod connection_handler;
 mod crypto;
 mod packet_data;
 mod peer_connection;
+mod rate_limiter;
 // todo: optimize trackers
 mod received_packet_tracker;
 mod sent_packet_tracker;
