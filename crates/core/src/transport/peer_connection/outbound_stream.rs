@@ -11,34 +11,12 @@ use crate::transport::{
     connection_handler::Socket, packet_data, symmetric_message::SymmetricMessage,
 };
 
-use super::{OutboundRemoteConnection, PeerConnection};
-
 pub(crate) type StreamBytes = Vec<u8>;
 
 // TODO: measure the space overhead of SymmetricMessage::LongMessage since is likely less than 100
 /// The max payload we can send in a single fragment, this MUST be less than packet_data::MAX_DATA_SIZE
 /// since we need to account for the space overhead of SymmetricMessage::LongMessage metadata
 const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 100;
-
-/*
-
-Remote A:  t0 Vec<u8> ------ -> Stream<(Packet, Socket)>
-Remote B:  ------ t1 Vec<u8> -> Stream<(Packet, Socket)>   ----> channel(1) --->  (thread) OutboundTrafficChannel<Packet> udp_socket.send(packet)
-Remote C:  ------ t2 Vec<u8> -> Stream<(Packet, Socket)>
-
-
-async fn sender_spot(...) {
-    let bw_tracker;
-    // let map: HashMap<SocketAddr, SentPacketTracker> = HashMap::new();
-    while let Some((socket_addr, packet, report_sent)) = self.outbound_packet.recv().await {
-        if bw_tracker.can_send_packet(packet.size()) {
-            self.socket.send(socket_addr, packet).await;
-            bw_tracker.report_sent_packet(now, packet_size);
-        //    report_sent.await;
-        }
-    }
-}
-*/
 
 // todo: unit test
 /// Handles sending a long message which is not being streamed,

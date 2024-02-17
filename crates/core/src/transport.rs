@@ -3,7 +3,7 @@
 //!
 //! Please see `docs/architecture/transport.md` for more information.
 //!
-mod bw;
+mod rate_limiter;
 mod connection_handler;
 mod crypto;
 mod packet_data;

@@ -1,30 +1,58 @@
+use tokio::sync::mpsc;
+
 use crate::util::time_source::{InstantTimeSrc, TimeSource};
 use std::collections::VecDeque;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use super::connection_handler::Socket;
 
 /// Keeps track of the bandwidth used in the last window_size. Recommend a `window_size` of
 /// 10 seconds.
-pub(super) struct PacketBWTracker<T: TimeSource> {
+pub(super) struct PacketRateLimiter<T: TimeSource> {
     packets: VecDeque<(usize, Instant)>,
     window_size: Duration,
     current_bandwidth: usize,
+    outbound_packets: mpsc::Receiver<(SocketAddr, Arc<[u8]>)>,
     pub time_source: T,
 }
 
-impl PacketBWTracker<InstantTimeSrc> {
-    pub(super) fn new(window_size: Duration) -> Self {
-        PacketBWTracker {
+impl PacketRateLimiter<InstantTimeSrc> {
+    pub(super) fn new(
+        window_size: Duration,
+        outbound_packets: mpsc::Receiver<(SocketAddr, Arc<[u8]>)>,
+    ) -> Self {
+        PacketRateLimiter {
             packets: VecDeque::new(),
             window_size,
             current_bandwidth: 0,
+            outbound_packets,
             time_source: InstantTimeSrc::new(),
         }
     }
 }
 
-impl<T: TimeSource> PacketBWTracker<T> {
+impl<T: TimeSource> PacketRateLimiter<T> {
+    pub(super) async fn rate_limiter<S: Socket>(mut self, bandwidth_limit: usize, socket: Arc<S>) {
+        while let Some((socket_addr, packet)) = self.outbound_packets.recv().await {
+            if let Some(wait_time) = self.can_send_packet(bandwidth_limit, packet.len()) {
+                tokio::time::sleep(wait_time).await;
+                if let Err(error) = socket.send_to(&packet, socket_addr).await {
+                    tracing::debug!("Error sending packet: {:?}", error);
+                }
+                self.add_packet(packet.len());
+            } else {
+                if let Err(error) = socket.send_to(&packet, socket_addr).await {
+                    tracing::debug!("Error sending packet: {:?}", error);
+                }
+                self.add_packet(packet.len());
+            }
+        }
+    }
+
     /// Report that a packet was sent
-    pub(super) fn add_packet(&mut self, packet_size: usize) {
+    fn add_packet(&mut self, packet_size: usize) {
         let now = self.time_source.now();
         self.packets.push_back((packet_size, now));
         self.current_bandwidth += packet_size;
@@ -53,11 +81,7 @@ impl<T: TimeSource> PacketBWTracker<T> {
     /// `bandwidth_limit` should be set to 50% higher than the target upstream bandwidth the
     /// [topology manager](crate::topology::TopologyManager) is aiming for, as it serves
     /// as a hard limit which we'd prefer not to hit.
-    pub(super) fn can_send_packet(
-        &mut self,
-        bandwidth_limit: usize,
-        packet_size: usize,
-    ) -> Option<Duration> {
+    fn can_send_packet(&mut self, bandwidth_limit: usize, packet_size: usize) -> Option<Duration> {
         self.cleanup();
 
         if self.current_bandwidth + packet_size <= bandwidth_limit {
@@ -84,16 +108,17 @@ mod tests {
     use super::*;
     use crate::util::time_source::MockTimeSource;
 
-    fn mock_tracker(window_size: Duration) -> PacketBWTracker<MockTimeSource> {
-        PacketBWTracker {
+    fn mock_tracker(window_size: Duration) -> PacketRateLimiter<MockTimeSource> {
+        PacketRateLimiter {
             packets: VecDeque::new(),
             window_size,
             current_bandwidth: 0,
+            outbound_packets: mpsc::channel(0).1,
             time_source: MockTimeSource::new(Instant::now()),
         }
     }
 
-    fn verify_bandwidth_match<T: TimeSource>(tracker: &PacketBWTracker<T>) {
+    fn verify_bandwidth_match<T: TimeSource>(tracker: &PacketRateLimiter<T>) {
         let mut total_bandwidth = 0;
         for &(size, _) in tracker.packets.iter() {
             total_bandwidth += size;
@@ -103,7 +128,7 @@ mod tests {
 
     #[test]
     fn test_adding_packets() {
-        let mut tracker = PacketBWTracker::new(Duration::from_secs(1));
+        let mut tracker = PacketRateLimiter::new(Duration::from_secs(1), mpsc::channel(0).1);
         verify_bandwidth_match(&tracker);
         tracker.add_packet(1500);
         verify_bandwidth_match(&tracker);
@@ -112,7 +137,7 @@ mod tests {
 
     #[test]
     fn test_bandwidth_calculation() {
-        let mut tracker = PacketBWTracker::new(Duration::from_secs(1));
+        let mut tracker = PacketRateLimiter::new(Duration::from_secs(1), mpsc::channel(0).1);
         tracker.add_packet(1500);
         tracker.add_packet(2500);
         verify_bandwidth_match(&tracker);
@@ -149,7 +174,7 @@ mod tests {
 
     #[test]
     fn test_immediate_send() {
-        let mut tracker = PacketBWTracker::new(Duration::from_millis(10));
+        let mut tracker = PacketRateLimiter::new(Duration::from_millis(10), mpsc::channel(0).1);
         tracker.add_packet(3000);
         assert_eq!(tracker.can_send_packet(10000, 2000), None);
     }
