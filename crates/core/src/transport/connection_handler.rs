@@ -15,7 +15,7 @@ use tokio::task;
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
     packet_data::MAX_PACKET_SIZE,
-    peer_connection::{OutboundRemoteConnection, PeerConnection, SenderStreamError},
+    peer_connection::{OutboundRemoteConnection, PeerConnection},
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
     BytesPerSecond, PacketData,
@@ -636,8 +636,6 @@ pub(crate) enum TransportError {
     Other(#[from] anyhow::Error),
     #[error(transparent)]
     Serialization(#[from] bincode::Error),
-    #[error(transparent)]
-    StreamingError(#[from] SenderStreamError),
     #[error("received unexpected message from remote: {0}")]
     UnexpectedMessage(Cow<'static, str>),
 }

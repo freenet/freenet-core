@@ -58,7 +58,7 @@ pub(super) async fn send_long_message(
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) if !sent_not_confirmed.is_empty() => {
                     // the receiver has been dropped, we should stop sending
-                    return Err(SenderStreamError::Closed.into());
+                    return Err(TransportError::ConnectionClosed.into());
                 }
                 _ => break,
             }
@@ -100,16 +100,6 @@ pub(super) async fn send_long_message(
     }
 
     Ok(())
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum SenderStreamError {
-    #[error("stream closed unexpectedly")]
-    Closed,
-    #[error("message too big, size: {size}, max size: {max_size}")]
-    MessageExceedsLength { size: usize, max_size: usize },
-    #[error(transparent)]
-    SerializationError(#[from] bincode::Error),
 }
 
 #[cfg(test)]
