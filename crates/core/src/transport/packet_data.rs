@@ -38,7 +38,7 @@ const fn _check_valid_size<const N: usize>() {
     let () = AssertSize::<N>::OK;
 }
 
-// todo: maybe split this into type for handling inbound (encrypted)/outbound (decrypted) packets for clarity
+// TODO: maybe split this into type for handling inbound (encrypted)/outbound (decrypted) packets for clarity
 #[derive(Clone)]
 pub(super) struct PacketData<const N: usize = MAX_PACKET_SIZE> {
     data: [u8; N],
@@ -92,7 +92,7 @@ impl<const N: usize> PacketData<N> {
         }
     }
 
-    // todo: this function will be unnecessary when we guarantee that size = N
+    // TODO: this function will be unnecessary when we guarantee that size = N
     pub(super) fn data(&self) -> &[u8] {
         &self.data[..self.size]
     }
@@ -121,10 +121,10 @@ impl<const N: usize> PacketData<N> {
             return false;
         }
         let mut is_intro_packet = true;
-        // todo: how many bytes do we need to check to be sure that it's not the intro packet?
+        // TODO: how many bytes do we need to check to be sure that it's not the intro packet?
         // for now we randomly check 64 bytes (intro_packet is 1500 bytes long)
         for i in (0..64).map(|_| thread_rng().gen_range(0..self.size)) {
-            // todo: use a fast rng here?
+            // TODO: use a fast rng here?
             if self.data[i] != other.data[i] {
                 is_intro_packet = false;
                 break;

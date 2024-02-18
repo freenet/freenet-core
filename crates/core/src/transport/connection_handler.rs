@@ -74,13 +74,14 @@ impl ConnectionHandler {
         let (outbound_sender, outbound_recv) = mpsc::channel(1);
         let transport = UdpPacketsListener {
             is_gateway,
-            socket: socket.clone(),
+            socket_listener: socket.clone(),
             this_peer_keypair: keypair,
             remote_connections: BTreeMap::new(),
             connection_handler: conn_handler_receiver,
             max_upstream_rate: max_upstream_rate.clone(),
             new_connection_notifier: new_connection_sender,
             outbound_packets: outbound_sender,
+            pending_inbound_queue: Vec::new(),
         };
         let bw_tracker = super::rate_limiter::PacketRateLimiter::new(
             DEFAULT_BW_TRACKER_WINDOW_SIZE,
@@ -172,120 +173,80 @@ impl Socket for UdpSocket {
 
 /// Handles UDP transport internally.
 struct UdpPacketsListener<S = UdpSocket> {
-    socket: Arc<S>,
+    socket_listener: Arc<S>,
     remote_connections: BTreeMap<SocketAddr, InboundRemoteConnection>,
     connection_handler: mpsc::Receiver<(SocketAddr, ConnectionEvent)>,
     this_peer_keypair: TransportKeypair,
     max_upstream_rate: Arc<arc_swap::ArcSwap<BytesPerSecond>>,
     is_gateway: bool,
-    // /// A new inbound connection that we haven't sent an explicit message yet
-    // inbound_connections:
-    //     BTreeMap<SocketAddr, (PeerChannel, Aes128Gcm, mpsc::Receiver<SerializedMessage>)>,
     new_connection_notifier: mpsc::Sender<PeerConnection>,
     outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
-}
-
-#[allow(clippy::large_enum_variant)]
-enum ConnectionState {
-    /// Initial state of the joiner
-    StartOutbound {
-        remote_public_key: TransportPublicKey,
-    },
-    /// Initial state of the joinee, at this point NAT has been already traversed
-    RemoteInbound {
-        outbound_key: Aes128Gcm,
-        /// Encrypted intro packet for comparison
-        intro_packet: PacketData,
-    },
-    /// Second state of the joiner, acknowledging their connection
-    AckConnectionOutbound,
+    pending_inbound_queue: Vec<(SocketAddr, PacketData)>,
 }
 
 impl<S: Socket> UdpPacketsListener<S> {
     async fn listen(mut self) -> Result<(), TransportError> {
         loop {
             let mut buf = [0u8; MAX_PACKET_SIZE];
+            for (remote, packet) in std::mem::take(&mut self.pending_inbound_queue) {
+                let remote_conn = self.remote_connections.remove(&remote);
+                match remote_conn {
+                    Some(mut remote_conn) => {
+                        if self
+                            .process_known_inbound(remote, &mut remote_conn, packet)
+                            .await
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        self.remote_connections.insert(remote, remote_conn);
+                    }
+                    None => {
+                        todo!()
+                    }
+                }
+            }
+
             tokio::select! {
                 // Handling of inbound packets
-                recv_result = self.socket.recv_from(&mut buf) => {
+                recv_result = self.socket_listener.recv_from(&mut buf) => {
                     match recv_result {
                         Ok((size, remote_addr)) => {
                             let remote_conn = self.remote_connections.remove(&remote_addr);
                             match remote_conn {
                                 Some(mut remote_conn) => {
-                                    // todo: in the future optimize this to just take a PacketData only as large as necessary
+                                    // TODO: in the future optimize this to just take a PacketData only as large as necessary
                                     let packet_data = PacketData::from(&buf[..size]);
-                                    if remote_conn.check_inbound_packet(&packet_data) {
-                                        // we received a duplicate of the intro packet from the remote
-                                        // we can ignore it since we already have the connection established
+                                    if self.process_known_inbound(remote_addr, &mut remote_conn, packet_data).await.is_err() {
                                         continue;
                                     }
-                                    let decrypted = packet_data.decrypt(&remote_conn.inbound_symmetric_key).map_err(|e| {
-                                        tracing::error!(%e, ?remote_addr, "Failed to decrypt packet");
-                                    }).unwrap();
-                                    let msg = SymmetricMessage::deser(decrypted.data()).unwrap();
-                                    if let SymmetricMessagePayload::AckConnection { result } = &msg.payload {
-                                        match result {
-                                            Ok(_) => {
-                                                // if let Some(((outbound_sender, inbound_recv), inbound_sym_key, outbound_receiver)) = self.inbound_connections.remove(&remote_addr) {
-                                                //     if self.new_connection_notifier.send(PeerConnection {
-                                                //         inbound_recv,
-                                                //         outbound_sender,
-                                                //         inbound_sym_key,
-                                                //         ongoing_stream: None,
-                                                //     }).await.is_err() {
-                                                //         return Err(TransportError::ChannelClosed);
-                                                //     }
-                                                //     let socket = self.socket.clone();
-                                                //     // fixme
-                                                //     // peer_messages.push(tokio::spawn(async move {
-                                                //     //     outbound_messages(
-                                                //     //         socket,
-                                                //     //         outbound_receiver,
-                                                //     //         remote_addr
-                                                //     //     ).await
-                                                //     // }));
-                                                // }
-                                                todo!()
-                                            }
-                                            Err(error) => {
-                                                tracing::error!(%error, ?remote_addr, "Failed to establish connection");
-                                                continue;
-                                            }
-                                        }
-                                    }
+                                    self.remote_connections.insert(remote_addr, remote_conn);
                                 }
                                 None => {
                                     // if we received a message, it means that a packet reached us and ports were mapped
                                     // so we can successfully receive messages from the remote
                                     let packet_data = PacketData::from(std::mem::replace(&mut buf, [0; MAX_PACKET_SIZE]));
-                                    match self.handle_unrecogized_remote(remote_addr, packet_data).await {
-                                        Err(error) => {
-                                            tracing::error!(%error, ?remote_addr, "Failed to establish connection");
-                                        }
-                                        Ok((outbound_remote_conn, inbound_remote_conn)) => {
-                                            self.remote_connections.insert(remote_addr, inbound_remote_conn);
-                                            // self.inbound_connections.insert(
-                                            //     remote_addr,
-                                            //     ((outbound_sender, inbound_recv), inbound_sym_key, outbound_receiver)
-                                            // );
-                                        }
-                                    }
+                                    // TODO: this branch is only possible for gateways,
+                                    // since if we are trying to establish a connection we should be inside the `traverse_nat` function
+                                    // otherwise
                                 }
                             }
                         }
                         Err(e) => {
-                            // todo: this should panic and be propagate to the main task or retry and eventually fail
+                            // TODO: this should panic and be propagate to the main task or retry and eventually fail
                             tracing::error!("Failed to receive UDP packet: {:?}", e);
                             return Err(e.into());
                         }
                     }
                 },
                 // Handling of connection events
-                send_message = self.connection_handler.recv() => {
-                    let Some((remote_addr, event)) = send_message else { return Ok(()); };
+                connection_event = self.connection_handler.recv() => {
+                    let Some((remote_addr, event)) = connection_event else { return Ok(()); };
                     let ConnectionEvent::ConnectionStart { remote_public_key, open_connection } = event;
-                    match self.traverse_nat(remote_addr, ConnectionState::StartOutbound { remote_public_key }).await {
+
+                    match self.traverse_nat(
+                        remote_addr,  remote_public_key,
+                    ).await {
                         Err(error) => {
                             tracing::error!(%error, ?remote_addr, "Failed to establish connection");
                             let _ = open_connection.send(Err(error));
@@ -300,18 +261,62 @@ impl<S: Socket> UdpPacketsListener<S> {
         }
     }
 
-    const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 20;
-
-    // fixme: there is a problem when establishing conenction since both peers are trying to connect simultaneously
-    // they have an attempt where the connection is outbound and the other is inbound 2 different instances
-    // of RemoteConnection will be created and the only the last one may be tracked, this is a race condition
-    // that might (not sure) lead to weird behaviour for the packet trackers etc. so need to ensure both connections
-    // are consolidated into one properly
-    async fn traverse_nat(
+    async fn process_known_inbound(
         &self,
         remote_addr: SocketAddr,
-        mut state: ConnectionState,
+        remote_conn: &mut InboundRemoteConnection,
+        packet_data: PacketData,
+    ) -> Result<(), ()> {
+        if remote_conn.check_inbound_packet(&packet_data) {
+            // we received a duplicate of the intro packet from the remote
+            // we can ignore it since we already have the connection established
+            return Ok(());
+        }
+        let Ok(decrypted) = packet_data.decrypt(&remote_conn.inbound_symmetric_key).map_err(|error| {
+            tracing::error!(%error, ?remote_addr, "Failed to decrypt packet, might be an intro packet");
+        }) else {
+            // just ignore this message
+            // todo: this branch should at much happen UdpPacketsListener::NAT_TRAVERSAL_MAX_ATTEMPTS
+            // since never more intro packets will be sent than this amount,
+            // after checking that amount of times we should drop the connection if sending corrupt messages
+            return Ok(());
+        };
+        let msg = SymmetricMessage::deser(decrypted.data()).unwrap();
+        if let SymmetricMessagePayload::AckConnection { result } = &msg.payload {
+            match result {
+                Ok(_) => {
+                    // we have a connection already so we can ignore this message
+                }
+                Err(error) => {
+                    tracing::error!(%error, ?remote_addr, "Failed to establish connection");
+                    return Err(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 20;
+
+    async fn traverse_nat(
+        &mut self,
+        remote_addr: SocketAddr,
+        remote_public_key: TransportPublicKey,
     ) -> Result<(OutboundRemoteConnection, InboundRemoteConnection), TransportError> {
+        #[allow(clippy::large_enum_variant)]
+        enum ConnectionState {
+            /// Initial state of the joiner
+            StartOutbound {},
+            /// Initial state of the joinee, at this point NAT has been already traversed
+            RemoteInbound {
+                /// Encrypted intro packet for comparison
+                intro_packet: PacketData,
+            },
+            /// Second state of the joiner, acknowledging their connection
+            AckConnectionOutbound,
+        }
+
+        let mut state = ConnectionState::StartOutbound {};
         // Initialize timeout and interval
         let mut timeout = INITIAL_TIMEOUT;
         let mut interval_duration = INITIAL_INTERVAL;
@@ -322,42 +327,29 @@ impl<S: Socket> UdpPacketsListener<S> {
 
         let inbound_sym_key_bytes = rand::random::<[u8; 16]>();
         let inbound_sym_key = Aes128Gcm::new(&inbound_sym_key_bytes.into());
-        let mut outbound_sym_key: Option<Aes128Gcm> = {
-            if let ConnectionState::RemoteInbound { outbound_key, .. } = &state {
-                Some(outbound_key.clone())
-            } else {
-                None
-            }
+        let mut inbound_intro_packet: Option<PacketData> = None;
+
+        let mut outbound_sym_key: Option<Aes128Gcm> = None;
+        let outbound_intro_packet = {
+            let mut data = [0u8; { 16 + PROTOC_VERSION.len() }];
+            data[..PROTOC_VERSION.len()].copy_from_slice(&PROTOC_VERSION);
+            data[PROTOC_VERSION.len()..].copy_from_slice(&inbound_sym_key_bytes);
+            PacketData::<MAX_PACKET_SIZE>::encrypted_with_remote(&data, &remote_public_key)
         };
 
-        let mut outbound_intro_packet = None;
-        let mut update_state: Option<ConnectionState> = None;
-
         while failures < Self::NAT_TRAVERSAL_MAX_ATTEMPTS {
-            if let Some(new_state) = update_state.take() {
-                state = new_state;
-            }
             match state {
-                ConnectionState::StartOutbound {
-                    ref remote_public_key,
-                } => {
-                    // todo: refactor so Start and Remote response use the same code
-                    if outbound_intro_packet.is_none() {
-                        let mut data = [0u8; { 16 + PROTOC_VERSION.len() }];
-                        data[..PROTOC_VERSION.len()].copy_from_slice(&PROTOC_VERSION);
-                        data[PROTOC_VERSION.len()..].copy_from_slice(&inbound_sym_key_bytes);
-                        outbound_intro_packet =
-                            Some(PacketData::<MAX_PACKET_SIZE>::encrypted_with_remote(
-                                &data,
-                                remote_public_key,
-                            ));
-                    }
-                    let data = outbound_intro_packet.as_ref().unwrap();
+                ConnectionState::StartOutbound { .. } => {
                     tracing::debug!("Sending protocol version and inbound key to remote");
-                    if let Err(error) = self.socket.send_to(data.data(), remote_addr).await {
+                    if self
+                        .outbound_packets
+                        .send((remote_addr, outbound_intro_packet.data().into()))
+                        .await
+                        .is_err()
+                    {
                         failures += 1;
                         if failures == Self::NAT_TRAVERSAL_MAX_ATTEMPTS {
-                            return Err(error.into());
+                            return Err(TransportError::ConnectionClosed);
                         }
                         tick.tick().await;
                         continue;
@@ -367,8 +359,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                     let acknowledgment =
                         SymmetricMessage::ack_ok(outbound_sym_key.as_mut().unwrap())?;
                     let _ = self
-                        .socket
-                        .send_to(acknowledgment.data(), remote_addr)
+                        .outbound_packets
+                        .send((remote_addr, acknowledgment.data().into()))
                         .await;
                     let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
                     sent_tracker.lock().report_sent_packet(
@@ -393,30 +385,23 @@ impl<S: Socket> UdpPacketsListener<S> {
                         InboundRemoteConnection {
                             inbound_symmetric_key: inbound_sym_key,
                             inbound_packet_sender: inbound_sender,
-                            inbound_intro_packet: None,
+                            inbound_intro_packet: inbound_intro_packet.take(),
                             inbound_checked_times: 0,
                         },
                     ));
                 }
                 ConnectionState::RemoteInbound { .. } => {
-                    if outbound_intro_packet.is_none() {
-                        // if an intro packet hasn't been created yet, create it
-                        let mut data = [0u8; { 16 + PROTOC_VERSION.len() }];
-                        data[..PROTOC_VERSION.len()].copy_from_slice(&PROTOC_VERSION);
-                        data[PROTOC_VERSION.len()..].copy_from_slice(&inbound_sym_key_bytes);
-                        outbound_intro_packet =
-                            Some(PacketData::<MAX_PACKET_SIZE>::encrypted_with_cipher(
-                                &data,
-                                outbound_sym_key.as_ref().unwrap(),
-                            ));
-                    }
                     // the other peer, which is at the Start state, will receive our inbound key (see below)
-                    let data = outbound_intro_packet.as_ref().unwrap();
                     tracing::debug!("Sending back protocol version and inbound key to remote");
-                    if let Err(error) = self.socket.send_to(data.data(), remote_addr).await {
+                    if self
+                        .outbound_packets
+                        .send((remote_addr, outbound_intro_packet.data().into()))
+                        .await
+                        .is_err()
+                    {
                         failures += 1;
                         if failures == Self::NAT_TRAVERSAL_MAX_ATTEMPTS {
-                            return Err(error.into());
+                            return Err(TransportError::ConnectionClosed);
                         }
                         tick.tick().await;
                         continue;
@@ -424,50 +409,79 @@ impl<S: Socket> UdpPacketsListener<S> {
                 }
             }
             let next_inbound = {
-                // todo: if a message is received from a different remote, reduce the timeout
+                // TODO: if a message is received from a different remote, reduce the timeout
                 // by the passed time since it doesn't count
-                tokio::time::timeout(timeout, self.socket.recv_from(&mut packet)).boxed()
+                tokio::time::timeout(timeout, self.socket_listener.recv_from(&mut packet)).boxed()
             };
             match next_inbound.await {
                 Ok(Ok((size, response_remote))) => {
                     if response_remote != remote_addr {
-                        todo!("is a different remote, handle this message");
+                        self.pending_inbound_queue
+                            .push((response_remote, PacketData::from(&packet[..size])));
+                        continue;
                     }
                     match state {
                         ConnectionState::StartOutbound { .. } => {
-                            let data = PacketData::from(&packet[..size]);
-                            // the peer initially received our intro packet and encrypted with our inbound_key
-                            // see `handle_unrecogized_remote` for details, so decrypting with our key should work
-                            // means that at this point the NAT has been traversed and they are already receiving our messages
-                            let Ok(decrypted_packet) = data.decrypt(&inbound_sym_key) else {
-                                failures += 1;
-                                tracing::debug!("Failed to decrypt packet");
-                                continue;
-                            };
-                            let key = Aes128Gcm::new_from_slice(
-                                &decrypted_packet.data()[PROTOC_VERSION.len()..],
-                            )
-                            .map_err(|_| {
-                                TransportError::ConnectionEstablishmentFailure {
-                                    cause: "invalid symmetric key".into(),
+                            // at this point it's either the remote sending us an intro packet or a symmetric packet
+                            // cause is the first packet that passes through the NAT
+
+                            let packet = PacketData::from(&packet[..size]);
+                            if let Ok(decrypted_packet) = packet.decrypt(&inbound_sym_key) {
+                                // the other peer initially received our intro packet and encrypted with our inbound_key
+                                // so decrypting with our key should work
+                                // means that at this point the NAT has been traversed and they are already receiving our messages
+                                let key = Aes128Gcm::new_from_slice(
+                                    &decrypted_packet.data()[PROTOC_VERSION.len()..],
+                                )
+                                .map_err(|_| {
+                                    TransportError::ConnectionEstablishmentFailure {
+                                        cause: "invalid symmetric key".into(),
+                                    }
+                                })?;
+                                let protocol_version =
+                                    &decrypted_packet.data()[..PROTOC_VERSION.len()];
+                                if protocol_version != PROTOC_VERSION {
+                                    let packet = SymmetricMessage::ack_error(&key)?;
+                                    let _ = self
+                                        .outbound_packets
+                                        .send((remote_addr, packet.into()))
+                                        .await;
+                                    return Err(TransportError::ConnectionEstablishmentFailure {
+                                        cause: format!(
+                                            "remote is using a different protocol version: {:?}",
+                                            String::from_utf8_lossy(protocol_version)
+                                        )
+                                        .into(),
+                                    });
                                 }
-                            })?;
-                            let protocol_version = &decrypted_packet.data()[..PROTOC_VERSION.len()];
-                            if protocol_version != PROTOC_VERSION {
-                                let packet = SymmetricMessage::ack_error(&key)?;
-                                let _ = self.socket.send_to(packet.data(), remote_addr).await;
-                                return Err(TransportError::ConnectionEstablishmentFailure {
-                                    cause: format!(
-                                        "remote is using a different protocol version: {:?}",
-                                        String::from_utf8_lossy(protocol_version)
-                                    )
-                                    .into(),
-                                });
+                                outbound_sym_key = Some(key);
+                                // now we need to send back a packet with our asymetric pub key for the remote to have
+                                // so it can enroute others to us if necessary
+                                state = ConnectionState::AckConnectionOutbound;
+                                continue;
                             }
-                            outbound_sym_key = Some(key);
-                            // now we need to send back a packet with our asymetric pub key for the remote to have
-                            // so it can enroute others to us if necessary
-                            state = ConnectionState::AckConnectionOutbound;
+
+                            // probably the first packet to punch through the NAT
+                            if let Ok(decrypted_intro_packet) =
+                                self.this_peer_keypair.secret.decrypt(packet.data())
+                            {
+                                let protoc = &decrypted_intro_packet[..PROTOC_VERSION.len()];
+                                if protoc != PROTOC_VERSION {
+                                    todo!("return error");
+                                }
+                                let outbound_key_bytes = &decrypted_intro_packet
+                                    [PROTOC_VERSION.len()..PROTOC_VERSION.len() + 16];
+                                let outbound_key = Aes128Gcm::new_from_slice(outbound_key_bytes)
+                                    .expect("correct length");
+                                outbound_sym_key = Some(outbound_key.clone());
+                                state = ConnectionState::RemoteInbound {
+                                    intro_packet: packet,
+                                };
+                                continue;
+                            }
+
+                            failures += 1;
+                            tracing::debug!("Failed to decrypt packet");
                             continue;
                         }
                         ConnectionState::RemoteInbound {
@@ -475,7 +489,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                             ref intro_packet,
                             ..
                         } => {
-                            // update_state = Some(ConnectionState::AckConnection);
                             // next packet should be an acknowledgement packet, but might also be a repeated
                             // intro packet so we need to handle that
                             let packet = PacketData::from(&packet[..size]);
@@ -500,7 +513,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 InboundRemoteConnection {
                                     inbound_symmetric_key: inbound_sym_key,
                                     inbound_packet_sender: inbound_sender,
-                                    inbound_intro_packet: None,
+                                    inbound_intro_packet: Some(intro_packet.clone()),
                                     inbound_checked_times: 0,
                                 },
                             ));
@@ -544,45 +557,6 @@ impl<S: Socket> UdpPacketsListener<S> {
             cause: "max connection attempts reached".into(),
         })
     }
-
-    async fn handle_unrecogized_remote(
-        &self,
-        remote_addr: SocketAddr,
-        inbound_intro_packet: PacketData,
-    ) -> Result<(OutboundRemoteConnection, InboundRemoteConnection), TransportError> {
-        // logic for gateway should be slightly different cause we don't need to do nat traversal
-        let decrypted_intro_packet = match self
-            .this_peer_keypair
-            .secret
-            .decrypt(inbound_intro_packet.data())
-        {
-            Ok(req) => req,
-            Err(error) => {
-                tracing::debug!(%error, "Failed to decrypt packet");
-                return Err(error.into());
-            }
-        };
-        let protoc = &decrypted_intro_packet[..PROTOC_VERSION.len()];
-        if protoc != PROTOC_VERSION {
-            todo!("return error");
-        }
-        let outbound_key_bytes =
-            &decrypted_intro_packet[PROTOC_VERSION.len()..PROTOC_VERSION.len() + 16];
-        let outbound_key = Aes128Gcm::new_from_slice(outbound_key_bytes).expect("correct length");
-        // now we need to attempt punching through the NAT to the remote connection that can reach us
-        let (or, mut ir) = self
-            .traverse_nat(
-                remote_addr,
-                ConnectionState::RemoteInbound {
-                    outbound_key,
-                    intro_packet: inbound_intro_packet.clone(),
-                },
-            )
-            .await?;
-        // store the original intro packet encrypted with the pub key
-        ir.inbound_intro_packet = Some(inbound_intro_packet);
-        Ok((or, ir))
-    }
 }
 
 enum ConnectionEvent {
@@ -607,12 +581,13 @@ impl InboundRemoteConnection {
                 inbound = true;
             }
         }
-        self.inbound_checked_times += 1;
         if self.inbound_checked_times >= UdpPacketsListener::<UdpSocket>::NAT_TRAVERSAL_MAX_ATTEMPTS
         {
             // no point in checking more than the max attemps since they won't be sending
             // the intro packet more than this amount of times
             self.inbound_intro_packet = None;
+        } else {
+            self.inbound_checked_times += 1;
         }
         inbound
     }

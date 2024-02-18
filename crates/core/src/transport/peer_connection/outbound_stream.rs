@@ -23,7 +23,7 @@ pub(crate) type StreamBytes = Vec<u8>;
 /// since we need to account for the space overhead of SymmetricMessage::LongMessage metadata
 const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 100;
 
-// todo: unit test
+// TODO: unit test
 /// Handles sending a long message which is not being streamed,
 /// streaming messages will be tackled differently, in the interim time before
 /// the necessary changes are done to the codebase we will use this function

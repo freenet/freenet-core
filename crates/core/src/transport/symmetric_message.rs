@@ -11,9 +11,9 @@ use super::{packet_data::MAX_PACKET_SIZE, MessagePayload, PacketData};
 #[serde_as]
 #[derive(Serialize, Deserialize)]
 pub(super) struct SymmetricMessage {
-    // todo: make sure we handle wrapping around the u32 properly
+    // TODO: make sure we handle wrapping around the u32 properly
     pub message_id: u32,
-    // todo: profile what is better here on average in the future
+    // TODO: profile what is better here on average in the future
     // (vec, fixed array size of what given length etc.
     // #[serde_as(as = "Option<[_; 50]>")]
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -36,7 +36,7 @@ impl SymmetricMessage {
             bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_ERROR).unwrap();
             (&packet[..size as usize]).into()
         });
-        // todo: we need exact size of this packet so we can return an optimized PacketData
+        // TODO: we need exact size of this packet so we can return an optimized PacketData
         Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
     }
 
@@ -53,7 +53,7 @@ impl SymmetricMessage {
             bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_ERROR).unwrap();
             (&packet[..size as usize]).into()
         });
-        // todo: we need exact size of this packet so we can return an optimized PacketData
+        // TODO: we need exact size of this packet so we can return an optimized PacketData
         Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
     }
 
@@ -80,7 +80,7 @@ impl SymmetricMessage {
         message_id: Self::FIRST_MESSAGE_ID,
         confirm_receipt: Vec::new(),
         payload: SymmetricMessagePayload::AckConnection {
-            // todo: change to return UnsupportedProtocolVersion
+            // TODO: change to return UnsupportedProtocolVersion
             result: Err(Cow::Borrowed(
                 "remote is using a different protocol version",
             )),
