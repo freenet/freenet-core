@@ -300,6 +300,7 @@ impl Operation for PutOp {
                     };
 
                     let broadcast_to = op_manager.get_broadcast_targets(&key, &sender.peer);
+
                     match try_to_broadcast(
                         *id,
                         last_hop,
