@@ -21,7 +21,7 @@ use std::{
 use either::Either;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ErrorKind},
-    prelude::{ContractKey, RelatedContracts, State, WrappedState},
+    prelude::{ContractKey, RelatedContracts, WrappedState},
 };
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId as Libp2pPeerId};
 
@@ -413,12 +413,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
 
                     let related_contracts = RelatedContracts::default();
 
-                    let op = update::start_op(
-                        key,
-                        wrapped_state,
-                        related_contracts,
-                        op_manager.ring.max_hops_to_live,
-                    );
+                    let op = update::start_op(key, wrapped_state, related_contracts);
 
                     let _ = op_manager
                         .ch_outbound

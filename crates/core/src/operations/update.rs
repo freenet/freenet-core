@@ -10,7 +10,7 @@ use crate::contract::ContractHandlerEvent;
 use crate::message::{InnerMessage, NetMessage, Transaction};
 use crate::ring::{Location, PeerKeyLocation, RingError};
 use crate::{
-    client_events::{ClientId, HostResult},
+    client_events::HostResult,
     node::{NetworkBridge, OpManager, PeerId},
 };
 
@@ -176,7 +176,6 @@ impl Operation for UpdateOp {
                     target,
                     related_contracts,
                     value,
-                    htl,
                 } => {
                     let sender = op_manager.ring.own_location();
 
@@ -187,7 +186,6 @@ impl Operation for UpdateOp {
                         target.peer
                     );
 
-                    // fixme: this node should filter out incoming redundant puts since is the one initiating the request
                     return_msg = Some(UpdateMsg::SeekNode {
                         id: *id,
                         sender,
@@ -195,7 +193,6 @@ impl Operation for UpdateOp {
                         value: value.clone(),
                         key: key.clone(),
                         related_contracts: related_contracts.clone(),
-                        htl: *htl,
                     });
 
                     // no changes to state yet, still in AwaitResponse state
@@ -206,13 +203,11 @@ impl Operation for UpdateOp {
                     value,
                     key,
                     related_contracts,
-                    htl,
                     target,
                     sender,
                 } => {
-                    let is_subscribed_contract = op_manager.ring.is_seeding_contract(&key);
+                    let is_subscribed_contract = op_manager.ring.is_seeding_contract(key);
 
-                    let this_peer = op_manager.ring.own_location();
                     tracing::debug!(
                         tx = %id,
                         %key,
@@ -220,9 +215,7 @@ impl Operation for UpdateOp {
                         "Updating contract at target peer",
                     );
 
-                    let broadcast_to = op_manager.get_broadcast_targets_update(&key, &sender.peer);
-
-                    let mut new_htl = *htl;
+                    let broadcast_to = op_manager.get_broadcast_targets_update(key, &sender.peer);
 
                     if is_subscribed_contract {
                         tracing::debug!("Peer is subscribed to contract. About to update it");
@@ -423,6 +416,7 @@ impl Operation for UpdateOp {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn try_to_broadcast(
     id: Transaction,
     last_hop: bool,
@@ -584,7 +578,6 @@ pub(crate) fn start_op(
     key: ContractKey,
     new_state: WrappedState,
     related_contracts: RelatedContracts<'static>,
-    htl: usize,
 ) -> UpdateOp {
     let contract_location = Location::from(&key);
     tracing::debug!(%contract_location, %key, "Requesting update");
@@ -595,7 +588,6 @@ pub(crate) fn start_op(
         key,
         related_contracts,
         value: new_state,
-        htl,
     });
 
     UpdateOp {
@@ -658,7 +650,6 @@ pub(crate) async fn request_update(
         Some(UpdateState::PrepareRequest {
             key,
             value,
-            htl,
             related_contracts,
         }) => {
             let new_state = Some(UpdateState::AwaitingResponse {
@@ -669,7 +660,6 @@ pub(crate) async fn request_update(
                 id,
                 key,
                 related_contracts,
-                htl,
                 target,
                 value,
             };
@@ -693,14 +683,11 @@ pub(crate) async fn request_update(
 mod messages {
     use std::fmt::Display;
 
-    use freenet_stdlib::prelude::{
-        ContractContainer, ContractKey, RelatedContracts, StateSummary, WrappedState,
-    };
+    use freenet_stdlib::prelude::{ContractKey, RelatedContracts, StateSummary, WrappedState};
     use serde::{Deserialize, Serialize};
 
     use crate::{
         message::{InnerMessage, Transaction},
-        node::PeerId,
         ring::{Location, PeerKeyLocation},
     };
 
@@ -713,7 +700,6 @@ mod messages {
             #[serde(deserialize_with = "RelatedContracts::deser_related_contracts")]
             related_contracts: RelatedContracts<'static>,
             value: WrappedState,
-            htl: usize,
         },
         /// Value successfully inserted/updated.
         SuccessfulUpdate {
@@ -733,8 +719,6 @@ mod messages {
             key: ContractKey,
             #[serde(deserialize_with = "RelatedContracts::deser_related_contracts")]
             related_contracts: RelatedContracts<'static>,
-            /// max hops to live
-            htl: usize,
         },
         /// Internal node instruction that  a change (either a first time insert or an update).
         Broadcasting {
@@ -804,7 +788,6 @@ mod messages {
 
     impl Display for UpdateMsg {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            let id = self.id();
             match self {
                 UpdateMsg::RequestUpdate { id, .. } => write!(f, "RequestUpdate(id: {id})"),
                 UpdateMsg::SuccessfulUpdate { id, .. } => write!(f, "SuccessfulUpdate(id: {id})"),
@@ -832,7 +815,6 @@ pub enum UpdateState {
         key: ContractKey,
         related_contracts: RelatedContracts<'static>,
         value: WrappedState,
-        htl: usize,
     },
     BroadcastOngoing,
 }
