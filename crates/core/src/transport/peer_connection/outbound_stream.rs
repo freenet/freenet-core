@@ -48,6 +48,7 @@ pub(super) async fn send_long_message(
     let mut sent_not_confirmed = HashSet::new();
     let mut sent_confirmed = 0;
     let mut confirm_receipts = Vec::new();
+    let mut next_fragment_number = 1; // 1-indexed
 
     loop {
         loop {
@@ -76,6 +77,7 @@ pub(super) async fn send_long_message(
                 }
             };
             std::mem::swap(&mut message, &mut rest);
+            next_fragment_number += 1;
             let idx = super::packet_sending(
                 remote_addr,
                 &sender,
@@ -85,7 +87,7 @@ pub(super) async fn send_long_message(
                 symmetric_message::LongMessageFragment {
                     message_id: start_index,
                     total_length_bytes: total_length_bytes as u64,
-                    fragment_number: sent_so_far as u32 + 2, // 1-indexed, so need to add 1 + 1
+                    fragment_number: next_fragment_number,
                     payload: rest,
                 },
                 &sent_tracker,
