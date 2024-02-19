@@ -13,9 +13,6 @@ use super::{packet_data::MAX_PACKET_SIZE, MessagePayload, PacketData};
 pub(super) struct SymmetricMessage {
     // TODO: make sure we handle wrapping around the u32 properly
     pub message_id: u32,
-    // TODO: profile what is better here on average in the future
-    // (vec, fixed array size of what given length etc.
-    // #[serde_as(as = "Option<[_; 50]>")]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub confirm_receipt: Vec<u32>,
     pub payload: SymmetricMessagePayload,

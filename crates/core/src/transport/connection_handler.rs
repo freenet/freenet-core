@@ -1,6 +1,6 @@
 use aes_gcm::{Aes128Gcm, KeyInit};
 use futures::FutureExt;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, LinkedList};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -15,7 +15,7 @@ use tokio::task;
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
     packet_data::MAX_PACKET_SIZE,
-    peer_connection::{OutboundRemoteConnection, PeerConnection},
+    peer_connection::{PeerConnection, RemoteConnection},
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
     BytesPerSecond, PacketData,
@@ -81,7 +81,7 @@ impl ConnectionHandler {
             max_upstream_rate: max_upstream_rate.clone(),
             new_connection_notifier: new_connection_sender,
             outbound_packets: outbound_sender,
-            pending_inbound_queue: Vec::new(),
+            pending_inbound_queue: LinkedList::new(),
         };
         let bw_tracker = super::rate_limiter::PacketRateLimiter::new(
             DEFAULT_BW_TRACKER_WINDOW_SIZE,
@@ -181,32 +181,26 @@ struct UdpPacketsListener<S = UdpSocket> {
     is_gateway: bool,
     new_connection_notifier: mpsc::Sender<PeerConnection>,
     outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
-    pending_inbound_queue: Vec<(SocketAddr, PacketData)>,
+    /// using linked list cause is unbounded and we are only using it as a queue
+    pending_inbound_queue: LinkedList<(SocketAddr, PacketData)>,
 }
 
 impl<S: Socket> UdpPacketsListener<S> {
     async fn listen(mut self) -> Result<(), TransportError> {
         loop {
             let mut buf = [0u8; MAX_PACKET_SIZE];
-            for (remote, packet) in std::mem::take(&mut self.pending_inbound_queue) {
+            while let Some((remote, packet)) = self.pending_inbound_queue.pop_front() {
                 let remote_conn = self.remote_connections.remove(&remote);
                 match remote_conn {
-                    Some(mut remote_conn) => {
-                        if self
-                            .process_known_inbound(remote, &mut remote_conn, packet)
-                            .await
-                            .is_err()
-                        {
-                            continue;
-                        }
+                    Some(remote_conn) => {
+                        let _ = remote_conn.inbound_packet_sender.send(packet).await;
                         self.remote_connections.insert(remote, remote_conn);
                     }
                     None => {
-                        todo!()
+                        // TODO: handle in case of gateway
                     }
                 }
             }
-
             tokio::select! {
                 // Handling of inbound packets
                 recv_result = self.socket_listener.recv_from(&mut buf) => {
@@ -214,17 +208,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                         Ok((size, remote_addr)) => {
                             let remote_conn = self.remote_connections.remove(&remote_addr);
                             match remote_conn {
-                                Some(mut remote_conn) => {
-                                    // TODO: in the future optimize this to just take a PacketData only as large as necessary
+                                Some(remote_conn) => {
                                     let packet_data = PacketData::from(&buf[..size]);
-                                    if self.process_known_inbound(remote_addr, &mut remote_conn, packet_data).await.is_err() {
-                                        continue;
-                                    }
+                                    let _ = remote_conn.inbound_packet_sender.send(packet_data).await;
                                     self.remote_connections.insert(remote_addr, remote_conn);
                                 }
                                 None => {
-                                    // if we received a message, it means that a packet reached us and ports were mapped
-                                    // so we can successfully receive messages from the remote
                                     let packet_data = PacketData::from(std::mem::replace(&mut buf, [0; MAX_PACKET_SIZE]));
                                     // TODO: this branch is only possible for gateways,
                                     // since if we are trying to establish a connection we should be inside the `traverse_nat` function
@@ -261,48 +250,13 @@ impl<S: Socket> UdpPacketsListener<S> {
         }
     }
 
-    async fn process_known_inbound(
-        &self,
-        remote_addr: SocketAddr,
-        remote_conn: &mut InboundRemoteConnection,
-        packet_data: PacketData,
-    ) -> Result<(), ()> {
-        if remote_conn.check_inbound_packet(&packet_data) {
-            // we received a duplicate of the intro packet from the remote
-            // we can ignore it since we already have the connection established
-            return Ok(());
-        }
-        let Ok(decrypted) = packet_data.decrypt(&remote_conn.inbound_symmetric_key).map_err(|error| {
-            tracing::error!(%error, ?remote_addr, "Failed to decrypt packet, might be an intro packet");
-        }) else {
-            // just ignore this message
-            // todo: this branch should at much happen UdpPacketsListener::NAT_TRAVERSAL_MAX_ATTEMPTS
-            // since never more intro packets will be sent than this amount,
-            // after checking that amount of times we should drop the connection if sending corrupt messages
-            return Ok(());
-        };
-        let msg = SymmetricMessage::deser(decrypted.data()).unwrap();
-        if let SymmetricMessagePayload::AckConnection { result } = &msg.payload {
-            match result {
-                Ok(_) => {
-                    // we have a connection already so we can ignore this message
-                }
-                Err(error) => {
-                    tracing::error!(%error, ?remote_addr, "Failed to establish connection");
-                    return Err(());
-                }
-            }
-        }
-        Ok(())
-    }
-
     const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 20;
 
     async fn traverse_nat(
         &mut self,
         remote_addr: SocketAddr,
         remote_public_key: TransportPublicKey,
-    ) -> Result<(OutboundRemoteConnection, InboundRemoteConnection), TransportError> {
+    ) -> Result<(RemoteConnection, InboundRemoteConnection), TransportError> {
         #[allow(clippy::large_enum_variant)]
         enum ConnectionState {
             /// Initial state of the joiner
@@ -370,9 +324,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                     // we are connected to the remote and we just send the pub key to them
                     // if they fail to receive it, they will re-request the packet through
                     // the regular error control mechanism
-                    let (inbound_sender, inbound_recv) = mpsc::channel(1);
+                    let (inbound_sender, inbound_recv) = mpsc::channel(100);
                     return Ok((
-                        OutboundRemoteConnection {
+                        RemoteConnection {
                             outbound_packets: self.outbound_packets.clone(),
                             outbound_symmetric_key: outbound_sym_key
                                 .expect("should be set at this stage"),
@@ -381,9 +335,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                             sent_tracker,
                             last_message_id: Arc::new(AtomicU32::new(0)),
                             inbound_packet_recv: inbound_recv,
+                            inbound_symmetric_key: inbound_sym_key,
                         },
                         InboundRemoteConnection {
-                            inbound_symmetric_key: inbound_sym_key,
                             inbound_packet_sender: inbound_sender,
                             inbound_intro_packet: inbound_intro_packet.take(),
                             inbound_checked_times: 0,
@@ -416,8 +370,15 @@ impl<S: Socket> UdpPacketsListener<S> {
             match next_inbound.await {
                 Ok(Ok((size, response_remote))) => {
                     if response_remote != remote_addr {
-                        self.pending_inbound_queue
-                            .push((response_remote, PacketData::from(&packet[..size])));
+                        if let Some(remote) = self.remote_connections.remove(&remote_addr) {
+                            let _ = remote
+                                .inbound_packet_sender
+                                .send(PacketData::from(&packet[..size]))
+                                .await;
+                        } else {
+                            self.pending_inbound_queue
+                                .push_back((response_remote, PacketData::from(&packet[..size])));
+                        }
                         continue;
                     }
                     match state {
@@ -496,9 +457,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 continue;
                             }
                             // if is not an intro packet, the connection is successful and we can proceed
-                            let (inbound_sender, inbound_recv) = mpsc::channel(1);
+                            let (inbound_sender, inbound_recv) = mpsc::channel(100);
                             return Ok((
-                                OutboundRemoteConnection {
+                                RemoteConnection {
                                     outbound_packets: self.outbound_packets.clone(),
                                     outbound_symmetric_key: outbound_sym_key
                                         .expect("should be set at this stage"),
@@ -509,9 +470,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     )),
                                     last_message_id: Arc::new(AtomicU32::new(0)),
                                     inbound_packet_recv: inbound_recv,
+                                    inbound_symmetric_key: inbound_sym_key,
                                 },
                                 InboundRemoteConnection {
-                                    inbound_symmetric_key: inbound_sym_key,
                                     inbound_packet_sender: inbound_sender,
                                     inbound_intro_packet: Some(intro_packet.clone()),
                                     inbound_checked_times: 0,
@@ -562,13 +523,12 @@ impl<S: Socket> UdpPacketsListener<S> {
 enum ConnectionEvent {
     ConnectionStart {
         remote_public_key: TransportPublicKey,
-        open_connection: oneshot::Sender<Result<OutboundRemoteConnection, TransportError>>,
+        open_connection: oneshot::Sender<Result<RemoteConnection, TransportError>>,
     },
 }
 
 struct InboundRemoteConnection {
-    inbound_symmetric_key: Aes128Gcm,
-    inbound_packet_sender: mpsc::Sender<SymmetricMessage>,
+    inbound_packet_sender: mpsc::Sender<PacketData>,
     inbound_intro_packet: Option<PacketData>,
     inbound_checked_times: usize,
 }

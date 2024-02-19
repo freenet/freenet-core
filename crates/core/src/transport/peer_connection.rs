@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 mod inbound_stream;
 mod outbound_stream;
 
+use super::packet_data::PacketData;
 use super::received_packet_tracker::ReceivedPacketTracker;
 use super::sent_packet_tracker::ResendAction;
 use super::symmetric_message;
@@ -30,14 +31,15 @@ use crate::util::time_source::InstantTimeSrc;
 type Result<T = ()> = std::result::Result<T, TransportError>;
 
 #[must_use]
-pub(super) struct OutboundRemoteConnection {
+pub(super) struct RemoteConnection {
     pub outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
     pub outbound_symmetric_key: Aes128Gcm,
     pub remote_is_gateway: bool,
     pub remote_addr: SocketAddr,
     pub sent_tracker: Arc<Mutex<SentPacketTracker<InstantTimeSrc>>>,
     pub last_message_id: Arc<AtomicU32>,
-    pub inbound_packet_recv: mpsc::Receiver<SymmetricMessage>,
+    pub inbound_packet_recv: mpsc::Receiver<PacketData>,
+    pub inbound_symmetric_key: Aes128Gcm,
 }
 
 /// Handles the connection with a remote peer.
@@ -45,7 +47,7 @@ pub(super) struct OutboundRemoteConnection {
 /// Can be awaited for incoming messages or used to send messages to the remote peer.
 #[must_use = "call await on the `recv` function to start listening for incoming messages"]
 pub(crate) struct PeerConnection {
-    outbound_connection: OutboundRemoteConnection,
+    remote_conn: RemoteConnection,
     received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
     inbound_streams: HashMap<u32, mpsc::Sender<(u32, Vec<u8>)>>,
     ongoing_inbound_streams:
@@ -55,9 +57,9 @@ pub(crate) struct PeerConnection {
 }
 
 impl PeerConnection {
-    pub fn new(outbound_connection: OutboundRemoteConnection) -> Self {
+    pub fn new(remote_conn: RemoteConnection) -> Self {
         Self {
-            outbound_connection,
+            remote_conn,
             received_tracker: ReceivedPacketTracker::new(),
             inbound_streams: HashMap::new(),
             ongoing_inbound_streams: FuturesUnordered::new(),
@@ -86,13 +88,24 @@ impl PeerConnection {
         let mut resend_check = Some(tokio::time::sleep(tokio::time::Duration::from_secs(1)));
         loop {
             tokio::select! {
-                inbound = self.outbound_connection.inbound_packet_recv.recv() => {
+                inbound = self.remote_conn.inbound_packet_recv.recv() => {
+                    let packet_data = inbound.ok_or(TransportError::ConnectionClosed)?;
+                    let Ok(decrypted) = packet_data.decrypt(&self.remote_conn.inbound_symmetric_key).map_err(|error| {
+                        tracing::error!(%error, ?self.remote_conn.remote_addr, "Failed to decrypt packet, might be an intro packet");
+                    }) else {
+                        // just ignore this message
+                        // todo: this branch should at much happen UdpPacketsListener::NAT_TRAVERSAL_MAX_ATTEMPTS
+                        // since never more intro packets will be sent than this amount,
+                        // after checking that amount of times we should drop the connection if sending corrupt messages
+                        continue;
+                    };
+                    let msg = SymmetricMessage::deser(decrypted.data()).unwrap();
                     let SymmetricMessage {
                         message_id,
                         confirm_receipt,
                         payload,
-                    } = inbound.ok_or(TransportError::ConnectionClosed)?;
-                    self.outbound_connection
+                    } = msg;
+                    self.remote_conn
                         .sent_tracker
                         .lock()
                         .report_received_receipts(&confirm_receipt);
@@ -125,7 +138,7 @@ impl PeerConnection {
                }
                 _ = resend_check.take().expect("should be set") => {
                     loop {
-                        let maybe_resend = self.outbound_connection
+                        let maybe_resend = self.remote_conn
                             .sent_tracker
                             .lock()
                             .get_resend();
@@ -135,12 +148,12 @@ impl PeerConnection {
                                 break;
                             }
                             ResendAction::Resend(idx, packet) => {
-                                self.outbound_connection
+                                self.remote_conn
                                     .outbound_packets
-                                    .send((self.outbound_connection.remote_addr, packet.clone()))
+                                    .send((self.remote_conn.remote_addr, packet.clone()))
                                     .await
                                     .map_err(|_| TransportError::ConnectionClosed)?;
-                                self.outbound_connection.sent_tracker.lock().report_sent_packet(idx, packet);
+                                self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
                             }
                         }
                     }
@@ -197,13 +210,13 @@ impl PeerConnection {
     #[inline]
     async fn noop(&mut self, receipts: Vec<u32>) -> Result<u32> {
         packet_sending(
-            self.outbound_connection.remote_addr,
-            &self.outbound_connection.outbound_packets,
-            &self.outbound_connection.last_message_id,
-            &self.outbound_connection.outbound_symmetric_key,
+            self.remote_conn.remote_addr,
+            &self.remote_conn.outbound_packets,
+            &self.remote_conn.last_message_id,
+            &self.remote_conn.outbound_symmetric_key,
             receipts,
             (),
-            &self.outbound_connection.sent_tracker,
+            &self.remote_conn.sent_tracker,
         )
         .await
     }
@@ -212,13 +225,13 @@ impl PeerConnection {
     async fn outbound_short_message(&mut self, data: SerializedMessage) -> Result<u32> {
         let receipts = self.received_tracker.get_receipts();
         packet_sending(
-            self.outbound_connection.remote_addr,
-            &self.outbound_connection.outbound_packets,
-            &self.outbound_connection.last_message_id,
-            &self.outbound_connection.outbound_symmetric_key,
+            self.remote_conn.remote_addr,
+            &self.remote_conn.outbound_packets,
+            &self.remote_conn.last_message_id,
+            &self.remote_conn.outbound_symmetric_key,
             receipts,
             symmetric_message::ShortMessage(data),
-            &self.outbound_connection.sent_tracker,
+            &self.remote_conn.sent_tracker,
         )
         .await
     }
@@ -226,18 +239,18 @@ impl PeerConnection {
     async fn outbound_stream(&mut self, data: SerializedMessage) {
         let (sent_confirm_sender, sent_confirm_recv) = mpsc::channel(1);
         let stream_id = self
-            .outbound_connection
+            .remote_conn
             .last_message_id
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         let task = outbound_stream::send_long_message(
             stream_id,
-            self.outbound_connection.last_message_id.clone(),
-            self.outbound_connection.outbound_packets.clone(),
-            self.outbound_connection.remote_addr,
+            self.remote_conn.last_message_id.clone(),
+            self.remote_conn.outbound_packets.clone(),
+            self.remote_conn.remote_addr,
             data,
-            self.outbound_connection.outbound_symmetric_key.clone(),
+            self.remote_conn.outbound_symmetric_key.clone(),
             sent_confirm_recv,
-            self.outbound_connection.sent_tracker.clone(),
+            self.remote_conn.sent_tracker.clone(),
         );
         self.ongoing_outbound_streams.push(task.boxed());
         self.outbound_receipts_notifiers
