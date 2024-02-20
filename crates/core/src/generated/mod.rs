@@ -2,6 +2,7 @@
 
 #[cfg(feature = "trace")]
 pub(crate) mod topology_generated;
+use freenet_stdlib::prelude::ContractKey;
 pub use topology_generated::*;
 
 use crate::{message::Transaction, node::PeerId};
@@ -16,23 +17,29 @@ pub enum PeerChange<'a> {
     Error(topology::Error<'a>),
 }
 
-pub enum ContractChange {
-    PutRequest,
-    PutSuccess,
+pub enum ContractChange<'a> {
+    PutRequest(topology::PutRequest<'a>),
+    PutSuccess(topology::PutSuccess<'a>),
+    PutFailure(topology::PutFailure<'a>),
 }
 
-impl ContractChange {
-    pub fn put_new_contract_msg(
-        transaction: impl AsRef<str>,
-        contract: impl AsRef<str>,
-        requester: impl AsRef<str>,
-        target: impl AsRef<str>,
+pub enum ChangesWrapper<'a> {
+    ContractChange(ContractChange<'a>),
+    PeerChange(PeerChange<'a>),
+}
+
+impl ContractChange<'_> {
+    pub fn put_request_msg(
+        transaction: String,
+        contract: String,
+        requester: String,
+        target: String,
     ) -> Vec<u8> {
         let mut buf = flatbuffers::FlatBufferBuilder::new();
-        let transaction = buf.create_string(transaction.as_ref());
-        let contract = buf.create_string(contract.as_ref());
-        let requester = buf.create_string(requester.as_ref());
-        let target = buf.create_string(target.as_ref());
+        let transaction = buf.create_string(transaction.as_str());
+        let contract = buf.create_string(contract.as_str());
+        let requester = buf.create_string(requester.as_str());
+        let target = buf.create_string(target.as_str());
         let put_req = topology::PutRequest::create(
             &mut buf,
             &topology::PutRequestArgs {
@@ -42,11 +49,11 @@ impl ContractChange {
                 target: Some(target),
             },
         );
-        let msg = topology::ContractChangeRequest::create(
+        let msg = topology::ContractChange::create(
             &mut buf,
-            &topology::ContractChangeRequestArgs {
+            &topology::ContractChangeArgs {
                 contract_id: Some(contract),
-                change_type: topology::ContractChangeRequestType::PutRequest,
+                change_type: topology::ContractChangeType::PutRequest,
                 change: Some(put_req.as_union_value()),
             },
         );
@@ -55,16 +62,16 @@ impl ContractChange {
     }
 
     pub fn put_success_msg(
-        transaction: impl AsRef<str>,
-        contract: impl AsRef<str>,
-        requester: impl AsRef<str>,
-        target: impl AsRef<str>,
+        transaction: String,
+        contract: String,
+        requester: String,
+        target: String,
     ) -> Vec<u8> {
         let mut buf = flatbuffers::FlatBufferBuilder::new();
-        let transaction = buf.create_string(transaction.as_ref());
-        let contract = buf.create_string(contract.as_ref());
-        let requester = buf.create_string(requester.as_ref());
-        let target = buf.create_string(target.as_ref());
+        let transaction = buf.create_string(transaction.as_str());
+        let contract = buf.create_string(contract.as_str());
+        let requester = buf.create_string(requester.as_str());
+        let target = buf.create_string(target.to_string().as_str());
         let put_success = topology::PutSuccess::create(
             &mut buf,
             &topology::PutSuccessArgs {
@@ -271,5 +278,44 @@ impl<'a> topology::ControllerResponse<'a> {
         );
         builder.finish(response, None);
         builder.finished_data().to_vec()
+    }
+}
+
+impl<'a> TryFromFbs<'a> for ContractChange<'a> {
+    fn try_decode_fbs(buf: &'a [u8]) -> Result<Self, flatbuffers::InvalidFlatbuffer> {
+        let req = flatbuffers::root::<topology::ContractChange>(&buf)?;
+        match req.change_type() {
+            topology::ContractChangeType::PutRequest => {
+                let req = req.change_as_put_request().ok_or_else(|| {
+                    flatbuffers::InvalidFlatbuffer::InconsistentUnion {
+                        field: "change_type",
+                        field_type: "ContractChangeType",
+                        error_trace: Default::default(),
+                    }
+                })?;
+                Ok(Self::PutRequest(req))
+            }
+            topology::ContractChangeType::PutSuccess => {
+                let req = req.change_as_put_success().ok_or_else(|| {
+                    flatbuffers::InvalidFlatbuffer::InconsistentUnion {
+                        field: "change_type",
+                        field_type: "ContractChangeType",
+                        error_trace: Default::default(),
+                    }
+                })?;
+                Ok(Self::PutSuccess(req))
+            }
+            topology::ContractChangeType::PutFailure => {
+                let req = req.change_as_put_failure().ok_or_else(|| {
+                    flatbuffers::InvalidFlatbuffer::InconsistentUnion {
+                        field: "change_type",
+                        field_type: "ContractChangeType",
+                        error_trace: Default::default(),
+                    }
+                })?;
+                Ok(Self::PutFailure(req))
+            }
+            _ => unreachable!(),
+        }
     }
 }

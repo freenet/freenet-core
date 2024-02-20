@@ -224,16 +224,18 @@ pub mod topology {
         since = "2.0.0",
         note = "Use associated constants instead. This will no longer be generated in 2021."
     )]
-    pub const ENUM_MAX_CONTRACT_CHANGE_TYPE: u8 = 4;
+    pub const ENUM_MAX_CONTRACT_CHANGE_TYPE: u8 = 6;
     #[deprecated(
         since = "2.0.0",
         note = "Use associated constants instead. This will no longer be generated in 2021."
     )]
     #[allow(non_camel_case_types)]
-    pub const ENUM_VALUES_CONTRACT_CHANGE_TYPE: [ContractChangeType; 5] = [
+    pub const ENUM_VALUES_CONTRACT_CHANGE_TYPE: [ContractChangeType; 7] = [
         ContractChangeType::NONE,
+        ContractChangeType::PutRequest,
         ContractChangeType::PutSuccess,
         ContractChangeType::PutFailure,
+        ContractChangeType::UpdateRequest,
         ContractChangeType::UpdateSuccess,
         ContractChangeType::UpdateFailure,
     ];
@@ -244,17 +246,21 @@ pub mod topology {
     #[allow(non_upper_case_globals)]
     impl ContractChangeType {
         pub const NONE: Self = Self(0);
-        pub const PutSuccess: Self = Self(1);
-        pub const PutFailure: Self = Self(2);
-        pub const UpdateSuccess: Self = Self(3);
-        pub const UpdateFailure: Self = Self(4);
+        pub const PutRequest: Self = Self(1);
+        pub const PutSuccess: Self = Self(2);
+        pub const PutFailure: Self = Self(3);
+        pub const UpdateRequest: Self = Self(4);
+        pub const UpdateSuccess: Self = Self(5);
+        pub const UpdateFailure: Self = Self(6);
 
         pub const ENUM_MIN: u8 = 0;
-        pub const ENUM_MAX: u8 = 4;
+        pub const ENUM_MAX: u8 = 6;
         pub const ENUM_VALUES: &'static [Self] = &[
             Self::NONE,
+            Self::PutRequest,
             Self::PutSuccess,
             Self::PutFailure,
+            Self::UpdateRequest,
             Self::UpdateSuccess,
             Self::UpdateFailure,
         ];
@@ -262,8 +268,10 @@ pub mod topology {
         pub fn variant_name(self) -> Option<&'static str> {
             match self {
                 Self::NONE => Some("NONE"),
+                Self::PutRequest => Some("PutRequest"),
                 Self::PutSuccess => Some("PutSuccess"),
                 Self::PutFailure => Some("PutFailure"),
+                Self::UpdateRequest => Some("UpdateRequest"),
                 Self::UpdateSuccess => Some("UpdateSuccess"),
                 Self::UpdateFailure => Some("UpdateFailure"),
                 _ => None,
@@ -323,104 +331,6 @@ pub mod topology {
 
     impl flatbuffers::SimpleToVerifyInSlice for ContractChangeType {}
     pub struct ContractChangeTypeUnionTableOffset {}
-
-    #[deprecated(
-        since = "2.0.0",
-        note = "Use associated constants instead. This will no longer be generated in 2021."
-    )]
-    pub const ENUM_MIN_CONTRACT_CHANGE_REQUEST_TYPE: u8 = 0;
-    #[deprecated(
-        since = "2.0.0",
-        note = "Use associated constants instead. This will no longer be generated in 2021."
-    )]
-    pub const ENUM_MAX_CONTRACT_CHANGE_REQUEST_TYPE: u8 = 2;
-    #[deprecated(
-        since = "2.0.0",
-        note = "Use associated constants instead. This will no longer be generated in 2021."
-    )]
-    #[allow(non_camel_case_types)]
-    pub const ENUM_VALUES_CONTRACT_CHANGE_REQUEST_TYPE: [ContractChangeRequestType; 3] = [
-        ContractChangeRequestType::NONE,
-        ContractChangeRequestType::PutRequest,
-        ContractChangeRequestType::UpdateRequest,
-    ];
-
-    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    #[repr(transparent)]
-    pub struct ContractChangeRequestType(pub u8);
-    #[allow(non_upper_case_globals)]
-    impl ContractChangeRequestType {
-        pub const NONE: Self = Self(0);
-        pub const PutRequest: Self = Self(1);
-        pub const UpdateRequest: Self = Self(2);
-
-        pub const ENUM_MIN: u8 = 0;
-        pub const ENUM_MAX: u8 = 2;
-        pub const ENUM_VALUES: &'static [Self] =
-            &[Self::NONE, Self::PutRequest, Self::UpdateRequest];
-        /// Returns the variant's name or "" if unknown.
-        pub fn variant_name(self) -> Option<&'static str> {
-            match self {
-                Self::NONE => Some("NONE"),
-                Self::PutRequest => Some("PutRequest"),
-                Self::UpdateRequest => Some("UpdateRequest"),
-                _ => None,
-            }
-        }
-    }
-    impl core::fmt::Debug for ContractChangeRequestType {
-        fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-            if let Some(name) = self.variant_name() {
-                f.write_str(name)
-            } else {
-                f.write_fmt(format_args!("<UNKNOWN {:?}>", self.0))
-            }
-        }
-    }
-    impl<'a> flatbuffers::Follow<'a> for ContractChangeRequestType {
-        type Inner = Self;
-        #[inline]
-        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
-            let b = flatbuffers::read_scalar_at::<u8>(buf, loc);
-            Self(b)
-        }
-    }
-
-    impl flatbuffers::Push for ContractChangeRequestType {
-        type Output = ContractChangeRequestType;
-        #[inline]
-        unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
-            flatbuffers::emplace_scalar::<u8>(dst, self.0);
-        }
-    }
-
-    impl flatbuffers::EndianScalar for ContractChangeRequestType {
-        type Scalar = u8;
-        #[inline]
-        fn to_little_endian(self) -> u8 {
-            self.0.to_le()
-        }
-        #[inline]
-        #[allow(clippy::wrong_self_convention)]
-        fn from_little_endian(v: u8) -> Self {
-            let b = u8::from_le(v);
-            Self(b)
-        }
-    }
-
-    impl<'a> flatbuffers::Verifiable for ContractChangeRequestType {
-        #[inline]
-        fn run_verifier(
-            v: &mut flatbuffers::Verifier,
-            pos: usize,
-        ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
-            use self::flatbuffers::Verifiable;
-            u8::run_verifier(v, pos)
-        }
-    }
-
-    impl flatbuffers::SimpleToVerifyInSlice for ContractChangeRequestType {}
-    pub struct ContractChangeRequestTypeUnionTableOffset {}
 
     pub enum AddedConnectionOffset {}
     #[derive(Copy, Clone, PartialEq)]
@@ -2706,6 +2616,21 @@ pub mod topology {
         }
         #[inline]
         #[allow(non_snake_case)]
+        pub fn change_as_put_request(&self) -> Option<PutRequest<'a>> {
+            if self.change_type() == ContractChangeType::PutRequest {
+                self.change().map(|t| {
+                    // Safety:
+                    // Created from a valid Table for this object
+                    // Which contains a valid union in this slot
+                    unsafe { PutRequest::init_from_table(t) }
+                })
+            } else {
+                None
+            }
+        }
+
+        #[inline]
+        #[allow(non_snake_case)]
         pub fn change_as_put_success(&self) -> Option<PutSuccess<'a>> {
             if self.change_type() == ContractChangeType::PutSuccess {
                 self.change().map(|t| {
@@ -2728,6 +2653,21 @@ pub mod topology {
                     // Created from a valid Table for this object
                     // Which contains a valid union in this slot
                     unsafe { PutFailure::init_from_table(t) }
+                })
+            } else {
+                None
+            }
+        }
+
+        #[inline]
+        #[allow(non_snake_case)]
+        pub fn change_as_update_request(&self) -> Option<UpdateRequest<'a>> {
+            if self.change_type() == ContractChangeType::UpdateRequest {
+                self.change().map(|t| {
+                    // Safety:
+                    // Created from a valid Table for this object
+                    // Which contains a valid union in this slot
+                    unsafe { UpdateRequest::init_from_table(t) }
                 })
             } else {
                 None
@@ -2785,6 +2725,11 @@ pub mod topology {
                     Self::VT_CHANGE,
                     false,
                     |key, v, pos| match key {
+                        ContractChangeType::PutRequest => v
+                            .verify_union_variant::<flatbuffers::ForwardsUOffset<PutRequest>>(
+                                "ContractChangeType::PutRequest",
+                                pos,
+                            ),
                         ContractChangeType::PutSuccess => v
                             .verify_union_variant::<flatbuffers::ForwardsUOffset<PutSuccess>>(
                                 "ContractChangeType::PutSuccess",
@@ -2793,6 +2738,11 @@ pub mod topology {
                         ContractChangeType::PutFailure => v
                             .verify_union_variant::<flatbuffers::ForwardsUOffset<PutFailure>>(
                                 "ContractChangeType::PutFailure",
+                                pos,
+                            ),
+                        ContractChangeType::UpdateRequest => v
+                            .verify_union_variant::<flatbuffers::ForwardsUOffset<UpdateRequest>>(
+                                "ContractChangeType::UpdateRequest",
                                 pos,
                             ),
                         ContractChangeType::UpdateSuccess => v
@@ -2878,6 +2828,16 @@ pub mod topology {
             ds.field("contract_id", &self.contract_id());
             ds.field("change_type", &self.change_type());
             match self.change_type() {
+                ContractChangeType::PutRequest => {
+                    if let Some(x) = self.change_as_put_request() {
+                        ds.field("change", &x)
+                    } else {
+                        ds.field(
+                            "change",
+                            &"InvalidFlatbuffer: Union discriminant does not match value.",
+                        )
+                    }
+                }
                 ContractChangeType::PutSuccess => {
                     if let Some(x) = self.change_as_put_success() {
                         ds.field("change", &x)
@@ -2898,6 +2858,16 @@ pub mod topology {
                         )
                     }
                 }
+                ContractChangeType::UpdateRequest => {
+                    if let Some(x) = self.change_as_update_request() {
+                        ds.field("change", &x)
+                    } else {
+                        ds.field(
+                            "change",
+                            &"InvalidFlatbuffer: Union discriminant does not match value.",
+                        )
+                    }
+                }
                 ContractChangeType::UpdateSuccess => {
                     if let Some(x) = self.change_as_update_success() {
                         ds.field("change", &x)
@@ -2910,254 +2880,6 @@ pub mod topology {
                 }
                 ContractChangeType::UpdateFailure => {
                     if let Some(x) = self.change_as_update_failure() {
-                        ds.field("change", &x)
-                    } else {
-                        ds.field(
-                            "change",
-                            &"InvalidFlatbuffer: Union discriminant does not match value.",
-                        )
-                    }
-                }
-                _ => {
-                    let x: Option<()> = None;
-                    ds.field("change", &x)
-                }
-            };
-            ds.finish()
-        }
-    }
-    pub enum ContractChangeRequestOffset {}
-    #[derive(Copy, Clone, PartialEq)]
-
-    pub struct ContractChangeRequest<'a> {
-        pub _tab: flatbuffers::Table<'a>,
-    }
-
-    impl<'a> flatbuffers::Follow<'a> for ContractChangeRequest<'a> {
-        type Inner = ContractChangeRequest<'a>;
-        #[inline]
-        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
-            Self {
-                _tab: flatbuffers::Table::new(buf, loc),
-            }
-        }
-    }
-
-    impl<'a> ContractChangeRequest<'a> {
-        pub const VT_CONTRACT_ID: flatbuffers::VOffsetT = 4;
-        pub const VT_CHANGE_TYPE: flatbuffers::VOffsetT = 6;
-        pub const VT_CHANGE: flatbuffers::VOffsetT = 8;
-
-        #[inline]
-        pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
-            ContractChangeRequest { _tab: table }
-        }
-        #[allow(unused_mut)]
-        pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
-            _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
-            args: &'args ContractChangeRequestArgs<'args>,
-        ) -> flatbuffers::WIPOffset<ContractChangeRequest<'bldr>> {
-            let mut builder = ContractChangeRequestBuilder::new(_fbb);
-            if let Some(x) = args.change {
-                builder.add_change(x);
-            }
-            if let Some(x) = args.contract_id {
-                builder.add_contract_id(x);
-            }
-            builder.add_change_type(args.change_type);
-            builder.finish()
-        }
-
-        #[inline]
-        pub fn contract_id(&self) -> &'a str {
-            // Safety:
-            // Created from valid Table for this object
-            // which contains a valid value in this slot
-            unsafe {
-                self._tab
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(
-                        ContractChangeRequest::VT_CONTRACT_ID,
-                        None,
-                    )
-                    .unwrap()
-            }
-        }
-        #[inline]
-        pub fn change_type(&self) -> ContractChangeRequestType {
-            // Safety:
-            // Created from valid Table for this object
-            // which contains a valid value in this slot
-            unsafe {
-                self._tab
-                    .get::<ContractChangeRequestType>(
-                        ContractChangeRequest::VT_CHANGE_TYPE,
-                        Some(ContractChangeRequestType::NONE),
-                    )
-                    .unwrap()
-            }
-        }
-        #[inline]
-        pub fn change(&self) -> flatbuffers::Table<'a> {
-            // Safety:
-            // Created from valid Table for this object
-            // which contains a valid value in this slot
-            unsafe {
-                self._tab
-                    .get::<flatbuffers::ForwardsUOffset<flatbuffers::Table<'a>>>(
-                        ContractChangeRequest::VT_CHANGE,
-                        None,
-                    )
-                    .unwrap()
-            }
-        }
-        #[inline]
-        #[allow(non_snake_case)]
-        pub fn change_as_put_request(&self) -> Option<PutRequest<'a>> {
-            if self.change_type() == ContractChangeRequestType::PutRequest {
-                let u = self.change();
-                // Safety:
-                // Created from a valid Table for this object
-                // Which contains a valid union in this slot
-                Some(unsafe { PutRequest::init_from_table(u) })
-            } else {
-                None
-            }
-        }
-
-        #[inline]
-        #[allow(non_snake_case)]
-        pub fn change_as_update_request(&self) -> Option<UpdateRequest<'a>> {
-            if self.change_type() == ContractChangeRequestType::UpdateRequest {
-                let u = self.change();
-                // Safety:
-                // Created from a valid Table for this object
-                // Which contains a valid union in this slot
-                Some(unsafe { UpdateRequest::init_from_table(u) })
-            } else {
-                None
-            }
-        }
-    }
-
-    impl flatbuffers::Verifiable for ContractChangeRequest<'_> {
-        #[inline]
-        fn run_verifier(
-            v: &mut flatbuffers::Verifier,
-            pos: usize,
-        ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
-            use self::flatbuffers::Verifiable;
-            v.visit_table(pos)?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "contract_id",
-                    Self::VT_CONTRACT_ID,
-                    true,
-                )?
-                .visit_union::<ContractChangeRequestType, _>(
-                    "change_type",
-                    Self::VT_CHANGE_TYPE,
-                    "change",
-                    Self::VT_CHANGE,
-                    true,
-                    |key, v, pos| match key {
-                        ContractChangeRequestType::PutRequest => v
-                            .verify_union_variant::<flatbuffers::ForwardsUOffset<PutRequest>>(
-                                "ContractChangeRequestType::PutRequest",
-                                pos,
-                            ),
-                        ContractChangeRequestType::UpdateRequest => v
-                            .verify_union_variant::<flatbuffers::ForwardsUOffset<UpdateRequest>>(
-                                "ContractChangeRequestType::UpdateRequest",
-                                pos,
-                            ),
-                        _ => Ok(()),
-                    },
-                )?
-                .finish();
-            Ok(())
-        }
-    }
-    pub struct ContractChangeRequestArgs<'a> {
-        pub contract_id: Option<flatbuffers::WIPOffset<&'a str>>,
-        pub change_type: ContractChangeRequestType,
-        pub change: Option<flatbuffers::WIPOffset<flatbuffers::UnionWIPOffset>>,
-    }
-    impl<'a> Default for ContractChangeRequestArgs<'a> {
-        #[inline]
-        fn default() -> Self {
-            ContractChangeRequestArgs {
-                contract_id: None, // required field
-                change_type: ContractChangeRequestType::NONE,
-                change: None, // required field
-            }
-        }
-    }
-
-    pub struct ContractChangeRequestBuilder<'a: 'b, 'b> {
-        fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
-        start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
-    }
-    impl<'a: 'b, 'b> ContractChangeRequestBuilder<'a, 'b> {
-        #[inline]
-        pub fn add_contract_id(&mut self, contract_id: flatbuffers::WIPOffset<&'b str>) {
-            self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(
-                ContractChangeRequest::VT_CONTRACT_ID,
-                contract_id,
-            );
-        }
-        #[inline]
-        pub fn add_change_type(&mut self, change_type: ContractChangeRequestType) {
-            self.fbb_.push_slot::<ContractChangeRequestType>(
-                ContractChangeRequest::VT_CHANGE_TYPE,
-                change_type,
-                ContractChangeRequestType::NONE,
-            );
-        }
-        #[inline]
-        pub fn add_change(&mut self, change: flatbuffers::WIPOffset<flatbuffers::UnionWIPOffset>) {
-            self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(
-                ContractChangeRequest::VT_CHANGE,
-                change,
-            );
-        }
-        #[inline]
-        pub fn new(
-            _fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>,
-        ) -> ContractChangeRequestBuilder<'a, 'b> {
-            let start = _fbb.start_table();
-            ContractChangeRequestBuilder {
-                fbb_: _fbb,
-                start_: start,
-            }
-        }
-        #[inline]
-        pub fn finish(self) -> flatbuffers::WIPOffset<ContractChangeRequest<'a>> {
-            let o = self.fbb_.end_table(self.start_);
-            self.fbb_
-                .required(o, ContractChangeRequest::VT_CONTRACT_ID, "contract_id");
-            self.fbb_
-                .required(o, ContractChangeRequest::VT_CHANGE, "change");
-            flatbuffers::WIPOffset::new(o.value())
-        }
-    }
-
-    impl core::fmt::Debug for ContractChangeRequest<'_> {
-        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            let mut ds = f.debug_struct("ContractChangeRequest");
-            ds.field("contract_id", &self.contract_id());
-            ds.field("change_type", &self.change_type());
-            match self.change_type() {
-                ContractChangeRequestType::PutRequest => {
-                    if let Some(x) = self.change_as_put_request() {
-                        ds.field("change", &x)
-                    } else {
-                        ds.field(
-                            "change",
-                            &"InvalidFlatbuffer: Union discriminant does not match value.",
-                        )
-                    }
-                }
-                ContractChangeRequestType::UpdateRequest => {
-                    if let Some(x) = self.change_as_update_request() {
                         ds.field("change", &x)
                     } else {
                         ds.field(

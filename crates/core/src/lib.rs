@@ -46,6 +46,7 @@ pub mod dev_tool {
     pub use client_events::{test::MemoryEventsGen, ClientEventsProxy, ClientId, OpenRequest};
     pub use contract::{storages::Storage, Executor, OperationMode};
     pub use flatbuffers;
+    pub use message::Transaction;
     pub use node::{
         testing_impl::{EventChain, NodeLabel, SimNetwork, SimPeer},
         InitPeerNode, InterProcessConnManager, NodeConfig, PeerCliConfig, PeerId,

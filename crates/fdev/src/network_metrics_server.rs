@@ -13,8 +13,10 @@ use axum::{
 };
 use dashmap::DashMap;
 use freenet::{
-    dev_tool::PeerId,
-    generated::{topology::ControllerResponse, PeerChange, TryFromFbs},
+    dev_tool::{PeerId, Transaction},
+    generated::{
+        topology::ControllerResponse, ChangesWrapper, ContractChange, PeerChange, TryFromFbs,
+    },
 };
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -76,6 +78,7 @@ async fn run_server(
         .with_state(Arc::new(ServerState {
             changes,
             peer_data: DashMap::new(),
+            transactions_data: DashMap::new(),
         }));
 
     tracing::info!("Starting metrics server on port {port}");
@@ -127,7 +130,27 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                         break;
                     }
                     Ok(change) => {
-                        if let Err(err) = state.save_record(change) {
+                        if let Err(err) = state.save_record(ChangesWrapper::PeerChange(change)) {
+                            tracing::error!(error = %err, "Failed saving report");
+                            tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
+                                format!("{err}"),
+                            ))))
+                            .await?;
+                        }
+                    }
+                    Err(decoding_error) => {
+                        tracing::error!(error = %decoding_error, "Failed to decode message");
+                        tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
+                            format!("{decoding_error}"),
+                        ))))
+                        .await?;
+                    }
+                }
+                match ContractChange::try_decode_fbs(&msg) {
+                    Ok(ContractChange::PutFailure(err)) => todo!(),
+                    Ok(change) => {
+                        if let Err(err) = state.save_record(ChangesWrapper::ContractChange(change))
+                        {
                             tracing::error!(error = %err, "Failed saving report");
                             tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
                                 format!("{err}"),
@@ -194,6 +217,16 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                 let msg = PeerChange::removed_connection_msg(at.0, from.0);
                 tx.send(Message::Binary(msg)).await?;
             }
+            Change::PutRequest {
+                tx_id,
+                key,
+                requester,
+                target,
+            } => {
+                let msg = ContractChange::put_request_msg(tx_id, key, requester, target);
+                tx.send(Message::Binary(msg)).await?;
+            }
+            Change::PutSuccess { tx_id, key, target } => todo!(),
         }
     }
     Ok(())
@@ -202,6 +235,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
 struct ServerState {
     changes: tokio::sync::broadcast::Sender<Change>,
     peer_data: DashMap<PeerId, PeerData>,
+    transactions_data: DashMap<String, Vec<String>>,
 }
 
 struct PeerData {
@@ -221,6 +255,17 @@ pub(crate) enum Change {
     RemovedConnection {
         from: PeerIdHumanReadable,
         at: PeerIdHumanReadable,
+    },
+    PutRequest {
+        tx_id: String,
+        key: String,
+        requester: String,
+        target: String,
+    },
+    PutSuccess {
+        tx_id: String,
+        key: String,
+        target: String,
     },
 }
 
@@ -249,9 +294,9 @@ impl From<PeerId> for PeerIdHumanReadable {
 }
 
 impl ServerState {
-    fn save_record(&self, change: PeerChange<'_>) -> Result<(), anyhow::Error> {
+    fn save_record(&self, change: ChangesWrapper) -> Result<(), anyhow::Error> {
         match change {
-            PeerChange::AddedConnection(added) => {
+            ChangesWrapper::PeerChange(PeerChange::AddedConnection(added)) => {
                 let from_peer_id = PeerId::from_str(added.from())?;
                 let from_loc = added.from_location();
 
@@ -294,7 +339,7 @@ impl ServerState {
                     to: (to_peer_id.into(), to_loc),
                 });
             }
-            PeerChange::RemovedConnection(removed) => {
+            ChangesWrapper::PeerChange(PeerChange::RemovedConnection(removed)) => {
                 let from_peer_id = PeerId::from_str(removed.from())?;
                 let at_peer_id = PeerId::from_str(removed.at())?;
 
@@ -315,6 +360,62 @@ impl ServerState {
                     at: at_peer_id.into(),
                 });
             }
+            ChangesWrapper::ContractChange(ContractChange::PutRequest(change)) => {
+                let tx_id = change.transaction().to_string();
+                let key = change.key().to_string();
+                let requester = change.requester().to_string();
+                let target = change.target().to_string();
+
+                if let Some(mut entry) = self.transactions_data.get_mut(&tx_id) {
+                    tracing::error!(
+                        "found an already included in logs transaction when it should create it."
+                    );
+
+                    unreachable!();
+                } else {
+                    self.transactions_data.insert(
+                        tx_id.clone(),
+                        vec![format!(
+                            "tx_id {} key {} req {} target {} state PutRequest",
+                            tx_id, key, requester, target
+                        )],
+                    );
+                }
+
+                tracing::debug!(%tx_id, %key, %requester, %target, "checking values from save_record -- putrequest");
+
+                println!("{:?}", change);
+
+                let _ = self.changes.send(Change::PutRequest {
+                    tx_id,
+                    key,
+                    requester,
+                    target,
+                });
+            }
+            ChangesWrapper::ContractChange(ContractChange::PutSuccess(change)) => {
+                let tx_id = change.transaction().to_string();
+                let key = change.key().to_string();
+                let requester = change.requester().to_string();
+                let target = change.target().to_string();
+
+                if let Some(mut entry) = self.transactions_data.get_mut(&tx_id) {
+                    entry.push(format!(
+                        "tx_id {} key {} req {} target {} state PutSuccess",
+                        tx_id, key, requester, target
+                    ));
+                } else {
+                    tracing::error!("transaction data not found for this tx when it should.");
+                    unreachable!()
+                }
+
+                tracing::debug!(%tx_id, %key, %requester, %target, "checking values from save_record -- putsuccess");
+
+                println!("{:?}", change);
+
+                let _ = self.changes.send(Change::PutSuccess { tx_id, key, target });
+            }
+
             _ => unreachable!(),
         }
         Ok(())

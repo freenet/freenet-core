@@ -30,7 +30,7 @@ pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
 ///
 /// A transaction may span different messages sent across the network.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
-pub(crate) struct Transaction {
+pub struct Transaction {
     id: Ulid,
 }
 
@@ -140,7 +140,7 @@ impl Ord for Transaction {
 }
 
 /// Get the transaction type associated to a given message type.
-pub(crate) trait TxType: sealed_msg_type::SealedTxType {
+pub trait TxType: sealed_msg_type::SealedTxType {
     fn tx_type_id() -> TransactionTypeId;
 }
 
@@ -158,18 +158,18 @@ mod sealed_msg_type {
 
     use super::*;
 
-    pub(crate) trait SealedTxType {
+    pub trait SealedTxType {
         fn tx_type_id() -> TransactionTypeId;
     }
 
     #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
     #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-    pub(crate) struct TransactionTypeId(pub(super) TransactionType);
+    pub struct TransactionTypeId(pub(super) TransactionType);
 
     #[repr(u8)]
     #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
     #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-    pub(crate) enum TransactionType {
+    pub enum TransactionType {
         Connect = 0,
         Put = 1,
         Get = 2,

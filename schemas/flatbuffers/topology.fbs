@@ -85,8 +85,10 @@ table UpdateFailure {
 }
 
 union ContractChangeType {
+  PutRequest,
   PutSuccess,
   PutFailure,
+  UpdateRequest,
   UpdateSuccess,
   UpdateFailure,
 }
@@ -97,12 +99,3 @@ table ContractChange {
 }
 
 
-union ContractChangeRequestType {
-  PutRequest,
-  UpdateRequest,
-}
-
-table ContractChangeRequest {
-  contract_id: string(required);
-  change: ContractChangeRequestType(required);
-}
