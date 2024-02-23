@@ -277,3 +277,58 @@ async fn packet_sending(
     sent_tracker.lock().report_sent_packet(msg_id, packet);
     Ok(msg_id)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::peer_connection::inbound_stream::InboundStream;
+    use crate::transport::peer_connection::outbound_stream::{send_long_message, StreamBytes};
+    use aes_gcm::KeyInit;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn test_inbound_outbound_interaction() {
+        let (sender, mut receiver) = mpsc::channel(100);
+        let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let message = vec![1, 2, 3, 4, 5];
+        let key = rand::random::<[u8; 16]>();
+        let cipher = Aes128Gcm::new(&key.into());
+        let (sent_confirmed_send, sent_confirmed_recv) = mpsc::channel(100);
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+
+        // Send a long message using the outbound stream
+        let send_result = send_long_message(
+            0,
+            Arc::new(AtomicU32::new(0)),
+            sender.clone(),
+            remote_addr,
+            message.clone(),
+            cipher.clone(),
+            sent_confirmed_recv,
+            sent_tracker,
+        )
+        .await;
+
+        assert!(send_result.is_ok());
+
+        // Create an inbound stream to receive the message
+        let mut inbound_stream = InboundStream::new(message.len() as u64);
+
+        // Simulate receiving the message
+        while let Some((_, received_message)) = receiver.recv().await {
+            let fragment_number = 0; // This is a simplification, in reality you would need to extract the fragment number from the received message
+            let received_message = (*received_message).to_vec(); // Convert Arc<[u8]> to Vec<u8>
+
+            let result = inbound_stream.push_fragment(fragment_number, received_message);
+
+            if let Some(complete_message) = result {
+                // Check that the received message matches the sent message
+                assert_eq!(complete_message, message);
+                return;
+            }
+        }
+
+        panic!("Did not receive complete message");
+    }
+}

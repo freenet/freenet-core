@@ -110,4 +110,36 @@ pub(super) async fn send_long_message(
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use aes_gcm::KeyInit;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn test_send_long_message_success() {
+        let (sender, _receiver) = mpsc::channel(100);
+        let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let message = vec![1, 2, 3, 4, 5];
+        let key = rand::random::<[u8; 16]>();
+        let cipher = Aes128Gcm::new(&key.into());
+        let (sent_confirmed_send, sent_confirmed_recv) = mpsc::channel(100);
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+
+        let result = send_long_message(
+            0,
+            Arc::new(AtomicU32::new(0)),
+            sender,
+            remote_addr,
+            message,
+            cipher,
+            sent_confirmed_recv,
+            sent_tracker,
+        )
+        .await;
+
+        assert!(result.is_ok());
+    }
+
+    // Add more tests here for other scenarios
+}

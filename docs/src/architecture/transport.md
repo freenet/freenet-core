@@ -175,7 +175,7 @@ pub enum HelloError {
 ### Serialization
 
 - Try to avoid unnecessary copies of data, especially for large messages.
-- Ensure serialization format is robust against untrusted data.
+- Ensure serialization format is robust against untrustedf data.
 - Note that there will be nested layers of serialization, both internal to FrTP and
   by the FrTP user.
 
