@@ -29,7 +29,7 @@ const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 100;
 /// the necessary changes are done to the codebase we will use this function
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn send_long_message(
-    start_index: u32,
+    stream_id: u32,
     last_message_id: Arc<AtomicU32>,
     sender: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
     remote_addr: SocketAddr,
@@ -85,7 +85,7 @@ pub(super) async fn send_long_message(
                 &outbound_symmetric_key,
                 std::mem::take(&mut confirm_receipts),
                 symmetric_message::LongMessageFragment {
-                    message_id: start_index,
+                    stream_id,
                     total_length_bytes: total_length_bytes as u64,
                     fragment_number: next_fragment_number,
                     payload: rest,
