@@ -35,7 +35,7 @@ pub(super) async fn send_long_message(
     destination_addr: SocketAddr,
     mut message_to_send: StreamBytes,
     outbound_symmetric_key: Aes128Gcm,
-    mut sent_confirmed_recv: mpsc::Receiver<u32>,
+    mut confirmed_sent_message_receiver: mpsc::Receiver<u32>,
     sent_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
 ) -> Result<(), TransportError> {
     let total_length_bytes = message_to_send.len() as u32;
@@ -53,7 +53,7 @@ pub(super) async fn send_long_message(
     let mut msg_id = stream_id;
     loop {
         loop {
-            match sent_confirmed_recv.try_recv() {
+            match confirmed_sent_message_receiver.try_recv() {
                 Ok(idx) => {
                     if sent_not_confirmed.remove(&idx) {
                         sent_confirmed += 1;
