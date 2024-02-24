@@ -34,7 +34,6 @@ type Result<T = ()> = std::result::Result<T, TransportError>;
 pub(super) struct RemoteConnection {
     pub outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
     pub outbound_symmetric_key: Aes128Gcm,
-    pub remote_is_gateway: bool,
     pub remote_addr: SocketAddr,
     pub sent_tracker: Arc<Mutex<SentPacketTracker<InstantTimeSrc>>>,
     pub last_message_id: Arc<AtomicU32>,
@@ -169,7 +168,8 @@ impl PeerConnection {
         use SymmetricMessagePayload::*;
         match payload {
             ShortMessage { payload } => Ok(Some(payload)),
-            AckConnection { .. } => Err(TransportError::UnexpectedMessage("AckConnection".into())),
+            AckConnection { .. } => Ok(None),
+            GatewayConnection { .. } => Ok(None),
             LongMessageFragment {
                 message_id,
                 total_length_bytes,

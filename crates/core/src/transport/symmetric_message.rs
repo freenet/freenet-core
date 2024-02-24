@@ -54,6 +54,23 @@ impl SymmetricMessage {
         Ok(PacketData::encrypt_symmetric(bytes, outbound_sym_key))
     }
 
+    pub fn ack_gateway_connection(
+        outbound_sym_key: &Aes128Gcm,
+        key: [u8; 16],
+    ) -> Result<PacketData, bincode::Error> {
+        let message = Self {
+            message_id: Self::FIRST_MESSAGE_ID,
+            confirm_receipt: vec![],
+            payload: SymmetricMessagePayload::GatewayConnection { key },
+        };
+        let mut packet = [0u8; MAX_PACKET_SIZE];
+        let size = bincode::serialized_size(&message)?;
+        debug_assert!(size <= MAX_DATA_SIZE as u64);
+        bincode::serialize_into(packet.as_mut_slice(), &message)?;
+        let bytes = &packet[..size as usize];
+        Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
+    }
+
     pub fn serialize_msg_to_packet_data(
         message_id: u32,
         payload: impl Into<SymmetricMessagePayload>,
@@ -125,6 +142,11 @@ pub(super) enum SymmetricMessagePayload {
         // if we successfully connected to a remote we attempt to connect to initially
         // then we return our TransportPublicKey so they can enroute other peers to us
         result: Result<(), Cow<'static, str>>,
+    },
+    GatewayConnection {
+        // a gateway acknowledges a connection and returns the private key to use
+        // for communication
+        key: [u8; 16],
     },
     ShortMessage {
         payload: MessagePayload,
