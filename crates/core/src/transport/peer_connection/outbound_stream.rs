@@ -33,14 +33,14 @@ pub(super) async fn send_long_message(
     last_message_id: Arc<AtomicU32>,
     sender: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
     destination_addr: SocketAddr,
-    mut message: StreamBytes,
+    mut message_to_send: StreamBytes,
     outbound_symmetric_key: Aes128Gcm,
     mut sent_confirmed_recv: mpsc::Receiver<u32>,
     sent_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
 ) -> Result<(), TransportError> {
-    let total_length_bytes = message.len() as u32;
-    let mut total_messages = message.len() / MAX_DATA_SIZE;
-    total_messages += if message.len() % MAX_DATA_SIZE == 0 {
+    let total_length_bytes = message_to_send.len() as u32;
+    let mut total_messages = message_to_send.len() / MAX_DATA_SIZE;
+    total_messages += if message_to_send.len() % MAX_DATA_SIZE == 0 {
         0
     } else {
         1
@@ -71,13 +71,13 @@ pub(super) async fn send_long_message(
         let sent_so_far = sent_confirmed + sent_not_confirmed.len();
         if sent_so_far < total_messages {
             let mut rest = {
-                if message.len() > MAX_DATA_SIZE {
-                    message.split_off(MAX_DATA_SIZE)
+                if message_to_send.len() > MAX_DATA_SIZE {
+                    message_to_send.split_off(MAX_DATA_SIZE)
                 } else {
-                    std::mem::take(&mut message)
+                    std::mem::take(&mut message_to_send)
                 }
             };
-            std::mem::swap(&mut message, &mut rest);
+            std::mem::swap(&mut message_to_send, &mut rest);
             next_fragment_number += 1;
             let idx = super::packet_sending(
                 destination_addr,
@@ -102,12 +102,12 @@ pub(super) async fn send_long_message(
             continue;
         }
 
-        if message.is_empty() && sent_not_confirmed.is_empty() {
+        if message_to_send.is_empty() && sent_not_confirmed.is_empty() {
             break;
         }
 
         // we sent all messages (self.message is empty) but we still need to confirm all were received
-        debug_assert!(message.is_empty());
+        debug_assert!(message_to_send.is_empty());
         debug_assert!(!sent_not_confirmed.is_empty());
     }
 
