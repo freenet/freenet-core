@@ -68,7 +68,7 @@ impl SymmetricMessage {
         debug_assert!(size <= MAX_DATA_SIZE as u64);
         bincode::serialize_into(packet.as_mut_slice(), &message)?;
         let bytes = &packet[..size as usize];
-        Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
+        Ok(PacketData::encrypt_symmetric(bytes, outbound_sym_key))
     }
 
     pub fn serialize_msg_to_packet_data(
