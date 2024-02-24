@@ -209,7 +209,7 @@ impl PeerConnection {
 
     #[inline]
     async fn noop(&mut self, receipts: Vec<u32>) -> Result<u32> {
-        packet_sending(
+        send_packet_with_receipt_tracking(
             self.remote_conn.remote_addr,
             &self.remote_conn.outbound_packets,
             &self.remote_conn.last_message_id,
@@ -224,7 +224,7 @@ impl PeerConnection {
     #[inline]
     async fn outbound_short_message(&mut self, data: SerializedMessage) -> Result<u32> {
         let receipts = self.received_tracker.get_receipts();
-        packet_sending(
+        send_packet_with_receipt_tracking(
             self.remote_conn.remote_addr,
             &self.remote_conn.outbound_packets,
             &self.remote_conn.last_message_id,
@@ -258,7 +258,7 @@ impl PeerConnection {
     }
 }
 
-async fn packet_sending(
+async fn send_packet_with_receipt_tracking(
     remote_addr: SocketAddr,
     outbound_packets: &mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
     last_message_id: &AtomicU32,

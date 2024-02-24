@@ -78,7 +78,7 @@ pub(super) async fn send_long_message(
             };
             std::mem::swap(&mut message, &mut rest);
             next_fragment_number += 1;
-            let idx = super::packet_sending(
+            let idx = super::send_packet_with_receipt_tracking(
                 remote_addr,
                 &sender,
                 &last_message_id,
@@ -118,13 +118,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_long_message_success() {
-        let (sender, _receiver) = mpsc::channel(100);
+        let (sender, mut receiver) = mpsc::channel(100);
         let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let message = vec![1, 2, 3, 4, 5];
+        let message = vec![0u8; 20 * 1024];
+        let message = message.into_iter().map(|_| rand::random::<u8>()).collect();
         let key = rand::random::<[u8; 16]>();
         let cipher = Aes128Gcm::new(&key.into());
         let (sent_confirmed_send, sent_confirmed_recv) = mpsc::channel(100);
+
+        let packets_sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let packets_sent_clone = packets_sent.clone();
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+
+        tokio::spawn(async move {
+            loop {
+                let packet = { receiver.recv().await.unwrap() };
+                packets_sent_clone.lock().push(packet);
+            }
+        });
 
         let result = send_long_message(
             0,
