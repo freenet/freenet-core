@@ -50,7 +50,7 @@ pub(super) const fn packet_size<const DATA_SIZE: usize>() -> usize {
 }
 
 impl<const N: usize> PacketData<N> {
-    pub(super) fn encrypted_with_cipher(data: &[u8], cipher: &Aes128Gcm) -> Self {
+    pub(super) fn encrypt_symmetric(data: &[u8], cipher: &Aes128Gcm) -> Self {
         _check_valid_size::<N>();
         debug_assert!(data.len() <= MAX_DATA_SIZE);
 
@@ -80,7 +80,7 @@ impl<const N: usize> PacketData<N> {
         }
     }
 
-    pub(super) fn encrypted_with_remote(data: &[u8], remote_key: &TransportPublicKey) -> Self {
+    pub(super) fn encrypt_with_pubkey(data: &[u8], remote_key: &TransportPublicKey) -> Self {
         _check_valid_size::<N>();
         let encrypted_data: Vec<u8> = remote_key.encrypt(data);
         debug_assert!(encrypted_data.len() <= MAX_PACKET_SIZE);
@@ -178,7 +178,7 @@ mod tests {
         let cipher = Aes128Gcm::new(key);
         const ORIGINAL_DATA: &[u8] = b"Hello, world!";
         let packet_data: PacketData<{ packet_size::<{ ORIGINAL_DATA.len() }>() }> =
-            PacketData::encrypted_with_cipher(ORIGINAL_DATA, &cipher);
+            PacketData::encrypt_symmetric(ORIGINAL_DATA, &cipher);
 
         // Ensure data is not plainly visible
         assert_ne!(packet_data.data[..packet_data.size], *ORIGINAL_DATA);
@@ -200,7 +200,7 @@ mod tests {
         let cipher = Aes128Gcm::new(key);
         const ORIGINAL_DATA: &[u8] = b"Hello, world!";
         let packet_data: PacketData<{ packet_size::<{ ORIGINAL_DATA.len() }>() }> =
-            PacketData::encrypted_with_cipher(ORIGINAL_DATA, &cipher);
+            PacketData::encrypt_symmetric(ORIGINAL_DATA, &cipher);
 
         // Ensure data is not plainly visible
         let overlap = longest_common_subsequence(&packet_data.data, ORIGINAL_DATA);
@@ -223,7 +223,7 @@ mod tests {
         let cipher = Aes128Gcm::new(key);
         const ORIGINAL_DATA: &[u8] = b"Hello, world!";
         let mut packet_data: PacketData<{ packet_size::<{ ORIGINAL_DATA.len() }>() }> =
-            PacketData::encrypted_with_cipher(ORIGINAL_DATA, &cipher);
+            PacketData::encrypt_symmetric(ORIGINAL_DATA, &cipher);
 
         // Corrupt the packet data
         packet_data.data[packet_data.size / 2] = 0;

@@ -34,7 +34,7 @@ impl SymmetricMessage {
             (&packet[..size as usize]).into()
         });
         // TODO: we need exact size of this packet so we can return an optimized PacketData
-        Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
+        Ok(PacketData::encrypt_symmetric(bytes, outbound_sym_key))
     }
 
     pub fn ack_ok(outbound_sym_key: &Aes128Gcm) -> Result<PacketData, bincode::Error> {
@@ -51,7 +51,7 @@ impl SymmetricMessage {
             (&packet[..size as usize]).into()
         });
         // TODO: we need exact size of this packet so we can return an optimized PacketData
-        Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
+        Ok(PacketData::encrypt_symmetric(bytes, outbound_sym_key))
     }
 
     pub fn serialize_msg_to_packet_data(
@@ -70,7 +70,7 @@ impl SymmetricMessage {
         debug_assert!(size <= MAX_DATA_SIZE as u64);
         bincode::serialize_into(packet.as_mut_slice(), &message)?;
         let bytes = &packet[..size as usize];
-        Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
+        Ok(PacketData::encrypt_symmetric(bytes, outbound_sym_key))
     }
 
     const ACK_ERROR: SymmetricMessage = SymmetricMessage {
@@ -144,7 +144,7 @@ fn ack_error_msg() -> Result<(), Box<dyn std::error::Error>> {
     let key = Aes128Gcm::new(&[0; 16].into());
     let packet = SymmetricMessage::ack_error(&key)?;
 
-    let _packet = PacketData::<1000>::encrypted_with_cipher(packet.data(), &key);
+    let _packet = PacketData::<1000>::encrypt_symmetric(packet.data(), &key);
 
     let data = packet.decrypt(&key).unwrap();
     let deser = SymmetricMessage::deser(data.data())?;

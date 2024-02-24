@@ -288,7 +288,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             let mut data = [0u8; { 16 + PROTOC_VERSION.len() }];
             data[..PROTOC_VERSION.len()].copy_from_slice(&PROTOC_VERSION);
             data[PROTOC_VERSION.len()..].copy_from_slice(&inbound_sym_key_bytes);
-            PacketData::<MAX_PACKET_SIZE>::encrypted_with_remote(&data, &remote_public_key)
+            PacketData::<MAX_PACKET_SIZE>::encrypt_with_pubkey(&data, &remote_public_key)
         };
 
         while failures < Self::NAT_TRAVERSAL_MAX_ATTEMPTS {
