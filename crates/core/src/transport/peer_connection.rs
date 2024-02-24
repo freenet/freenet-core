@@ -212,7 +212,9 @@ impl PeerConnection {
         packet_sending(
             self.remote_conn.remote_addr,
             &self.remote_conn.outbound_packets,
-            self.remote_conn.last_message_id.fetch_add(1, std::sync::atomic::Ordering::Release),
+            self.remote_conn
+                .last_message_id
+                .fetch_add(1, std::sync::atomic::Ordering::Release),
             &self.remote_conn.outbound_symmetric_key,
             receipts,
             (),
@@ -227,7 +229,9 @@ impl PeerConnection {
         packet_sending(
             self.remote_conn.remote_addr,
             &self.remote_conn.outbound_packets,
-            self.remote_conn.last_message_id.fetch_add(1, std::sync::atomic::Ordering::Release),
+            self.remote_conn
+                .last_message_id
+                .fetch_add(1, std::sync::atomic::Ordering::Release),
             &self.remote_conn.outbound_symmetric_key,
             receipts,
             symmetric_message::ShortMessage(data),
@@ -267,7 +271,12 @@ async fn packet_sending(
     payload: impl Into<SymmetricMessagePayload>,
     sent_tracker: &Mutex<SentPacketTracker<InstantTimeSrc>>,
 ) -> Result<u32> {
-    let payload = SymmetricMessage::serialize_msg_to_packet_data(msg_id, payload, outbound_sym_key, confirm_receipt)?;
+    let payload = SymmetricMessage::serialize_msg_to_packet_data(
+        msg_id,
+        payload,
+        outbound_sym_key,
+        confirm_receipt,
+    )?;
     let packet: Arc<[u8]> = payload.into();
     outbound_packets
         .send((remote_addr, packet.clone()))
