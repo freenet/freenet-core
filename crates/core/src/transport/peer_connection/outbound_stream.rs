@@ -32,7 +32,7 @@ pub(super) async fn send_long_message(
     stream_id: u32,
     last_message_id: Arc<AtomicU32>,
     sender: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
-    remote_addr: SocketAddr,
+    destination_addr: SocketAddr,
     mut message: StreamBytes,
     outbound_symmetric_key: Aes128Gcm,
     mut sent_confirmed_recv: mpsc::Receiver<u32>,
@@ -80,7 +80,7 @@ pub(super) async fn send_long_message(
             std::mem::swap(&mut message, &mut rest);
             next_fragment_number += 1;
             let idx = super::packet_sending(
-                remote_addr,
+                destination_addr,
                 &sender,
                 msg_id,
                 &outbound_symmetric_key,
@@ -144,22 +144,6 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        /*
-        for (addr, bytes) in packets_sent.lock().iter() {
-            let packet = packet_data::PacketData::decrypt(bytsamees.as_ref(), &cipher).unwrap();
-            let message = symmetric_message::SymmetricMessage::deser(packet.data()).unwrap();
-            assert_eq!(
-                message.payload,
-                symmetric_message::SymmetricMessagePayload::LongMessageFragment(
-                    symmetric_message::LongMessageFragment {
-                        stream_id: 0,
-                        total_length_bytes: 20 * 1024,
-                        fragment_number: 1,
-                        payload: vec![0u8; MAX_DATA_SIZE],
-                    }
-                )
-            );
-        } */
     }
 
     // Add more tests here for other scenarios
