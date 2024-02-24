@@ -6,6 +6,7 @@ use std::sync::Arc;
 use aes_gcm::Aes128Gcm;
 use tokio::sync::mpsc;
 
+use crate::transport::MessageId;
 use crate::{
     transport::{
         connection_handler::TransportError,
@@ -29,14 +30,14 @@ const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 100;
 /// the necessary changes are done to the codebase we will use this function
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn send_long_message(
-    stream_id: u32,
+    stream_id: MessageId,
     last_message_id: Arc<AtomicU32>,
     sender: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
     destination_addr: SocketAddr,
     mut message_to_send: StreamBytes,
     outbound_symmetric_key: Aes128Gcm,
-    mut confirmed_sent_message_receiver: mpsc::Receiver<u32>,
-    sent_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
+    mut confirmed_sent_message_receiver: mpsc::Receiver<MessageId>,
+    sent_packet_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
 ) -> Result<(), TransportError> {
     let total_length_bytes = message_to_send.len() as u32;
     let mut total_messages = message_to_send.len() / MAX_DATA_SIZE;
@@ -91,7 +92,7 @@ pub(super) async fn send_long_message(
                     fragment_number: next_fragment_number,
                     payload: rest,
                 },
-                &sent_tracker,
+                &sent_packet_tracker,
             )
             .await?;
             if sent_so_far + 1 < total_messages {
