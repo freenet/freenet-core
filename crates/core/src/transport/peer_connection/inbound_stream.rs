@@ -1,4 +1,4 @@
-use crate::transport::peer_connection::outbound_stream::StreamBytes;
+use crate::transport::peer_connection::outbound_stream::SerializedLongMessage;
 use std::collections::BTreeMap;
 
 pub(crate) struct InboundStream {
@@ -22,7 +22,7 @@ impl InboundStream {
     pub(crate) fn push_fragment(
         &mut self,
         fragment_number: u32,
-        mut fragment: StreamBytes,
+        mut fragment: SerializedLongMessage,
     ) -> Option<Vec<u8>> {
         if fragment_number == self.last_contiguous_fragment_idx + 1 {
             self.last_contiguous_fragment_idx = fragment_number;

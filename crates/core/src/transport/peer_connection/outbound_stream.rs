@@ -17,7 +17,7 @@ use crate::{
     util::time_source::InstantTimeSrc,
 };
 
-pub(crate) type StreamBytes = Vec<u8>;
+pub(crate) type SerializedLongMessage = Vec<u8>;
 
 // TODO: measure the space overhead of SymmetricMessage::LongMessage since is likely less than 100
 /// The max payload we can send in a single fragment, this MUST be less than packet_data::MAX_DATA_SIZE
@@ -34,7 +34,7 @@ pub(super) async fn send_long_message(
     last_message_id: Arc<AtomicU32>,
     sender: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
     destination_addr: SocketAddr,
-    mut message_to_send: StreamBytes,
+    mut message_to_send: SerializedLongMessage,
     outbound_symmetric_key: Aes128Gcm,
     mut confirmed_sent_message_receiver: mpsc::Receiver<MessageId>,
     sent_packet_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
