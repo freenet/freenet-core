@@ -54,7 +54,7 @@ impl SymmetricMessage {
         Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
     }
 
-    pub fn pack(
+    pub fn serialize_msg_to_packet_data(
         message_id: u32,
         payload: impl Into<SymmetricMessagePayload>,
         outbound_sym_key: &Aes128Gcm,

@@ -268,7 +268,12 @@ async fn send_packet_with_receipt_tracking(
     sent_tracker: &Mutex<SentPacketTracker<InstantTimeSrc>>,
 ) -> Result<u32> {
     let msg_id = last_message_id.fetch_add(1, std::sync::atomic::Ordering::Release);
-    let payload = SymmetricMessage::pack(msg_id, payload, outbound_sym_key, confirm_receipt)?;
+    let payload = SymmetricMessage::serialize_msg_to_packet_data(
+        msg_id,
+        payload,
+        outbound_sym_key,
+        confirm_receipt,
+    )?;
     let packet: Arc<[u8]> = payload.into();
     outbound_packets
         .send((remote_addr, packet.clone()))
