@@ -50,6 +50,7 @@ pub(super) async fn send_long_message(
     let mut confirm_receipts = Vec::new();
     let mut next_fragment_number = 1; // 1-indexed
 
+    let mut msg_id = stream_id;
     loop {
         loop {
             match sent_confirmed_recv.try_recv() {
@@ -78,10 +79,10 @@ pub(super) async fn send_long_message(
             };
             std::mem::swap(&mut message, &mut rest);
             next_fragment_number += 1;
-            let idx = super::send_packet_with_receipt_tracking(
+            let idx = super::packet_sending(
                 remote_addr,
                 &sender,
-                &last_message_id,
+                msg_id,
                 &outbound_symmetric_key,
                 std::mem::take(&mut confirm_receipts),
                 symmetric_message::LongMessageFragment {
@@ -93,6 +94,10 @@ pub(super) async fn send_long_message(
                 &sent_tracker,
             )
             .await?;
+            if sent_so_far + 1 < total_messages {
+                // there will be more packets send, so we need to increment the message id
+                msg_id = last_message_id.fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
             sent_not_confirmed.insert(idx);
             continue;
         }
@@ -118,24 +123,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_long_message_success() {
-        let (sender, mut receiver) = mpsc::channel(100);
+        let (sender, _receiver) = mpsc::channel(100);
         let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let message = vec![0u8; 20 * 1024];
-        let message = message.into_iter().map(|_| rand::random::<u8>()).collect();
+        let message = vec![1, 2, 3, 4, 5];
         let key = rand::random::<[u8; 16]>();
         let cipher = Aes128Gcm::new(&key.into());
         let (sent_confirmed_send, sent_confirmed_recv) = mpsc::channel(100);
-
-        let packets_sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let packets_sent_clone = packets_sent.clone();
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
-
-        tokio::spawn(async move {
-            loop {
-                let packet = { receiver.recv().await.unwrap() };
-                packets_sent_clone.lock().push(packet);
-            }
-        });
 
         let result = send_long_message(
             0,

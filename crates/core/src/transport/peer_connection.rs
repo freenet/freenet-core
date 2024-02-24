@@ -209,10 +209,10 @@ impl PeerConnection {
 
     #[inline]
     async fn noop(&mut self, receipts: Vec<u32>) -> Result<u32> {
-        send_packet_with_receipt_tracking(
+        packet_sending(
             self.remote_conn.remote_addr,
             &self.remote_conn.outbound_packets,
-            &self.remote_conn.last_message_id,
+            self.remote_conn.last_message_id.fetch_add(1, std::sync::atomic::Ordering::Release),
             &self.remote_conn.outbound_symmetric_key,
             receipts,
             (),
@@ -224,10 +224,10 @@ impl PeerConnection {
     #[inline]
     async fn outbound_short_message(&mut self, data: SerializedMessage) -> Result<u32> {
         let receipts = self.received_tracker.get_receipts();
-        send_packet_with_receipt_tracking(
+        packet_sending(
             self.remote_conn.remote_addr,
             &self.remote_conn.outbound_packets,
-            &self.remote_conn.last_message_id,
+            self.remote_conn.last_message_id.fetch_add(1, std::sync::atomic::Ordering::Release),
             &self.remote_conn.outbound_symmetric_key,
             receipts,
             symmetric_message::ShortMessage(data),
@@ -258,22 +258,16 @@ impl PeerConnection {
     }
 }
 
-async fn send_packet_with_receipt_tracking(
+async fn packet_sending(
     remote_addr: SocketAddr,
     outbound_packets: &mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
-    last_message_id: &AtomicU32,
+    msg_id: u32,
     outbound_sym_key: &Aes128Gcm,
     confirm_receipt: Vec<u32>,
     payload: impl Into<SymmetricMessagePayload>,
     sent_tracker: &Mutex<SentPacketTracker<InstantTimeSrc>>,
 ) -> Result<u32> {
-    let msg_id = last_message_id.fetch_add(1, std::sync::atomic::Ordering::Release);
-    let payload = SymmetricMessage::serialize_msg_to_packet_data(
-        msg_id,
-        payload,
-        outbound_sym_key,
-        confirm_receipt,
-    )?;
+    let payload = SymmetricMessage::serialize_msg_to_packet_data(msg_id, payload, outbound_sym_key, confirm_receipt)?;
     let packet: Arc<[u8]> = payload.into();
     outbound_packets
         .send((remote_addr, packet.clone()))
@@ -287,7 +281,7 @@ async fn send_packet_with_receipt_tracking(
 mod tests {
     use super::*;
     use crate::transport::peer_connection::inbound_stream::InboundStream;
-    use crate::transport::peer_connection::outbound_stream::{send_long_message, StreamBytes};
+    use crate::transport::peer_connection::outbound_stream::send_long_message;
     use aes_gcm::KeyInit;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use tokio::sync::mpsc;
