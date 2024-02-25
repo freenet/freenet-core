@@ -1182,11 +1182,19 @@ mod messages {
     pub(crate) enum ConnectRequest {
         StartReq {
             target: PeerKeyLocation,
+            /// Initially this is none for the first request to connect to the network,
+            /// since the remote does not know it's own public address yet.
+            /// After the initial connection, the remote will be informed of it's own public address.
             joiner: Option<PeerId>,
             joiner_key: TransportPublicKey,
             assigned_location: Option<Location>,
             hops_to_live: usize,
             max_hops_to_live: usize,
+        },
+        /// An external physical connection is going to be attempted to this peer.
+        /// Providing the PeerId of the joiner.
+        InboundNewConnection {
+            inbound_peer_id: PeerId,
         },
         /// Query target should find a good candidate for joiner to join.
         FindOptimalPeer {
@@ -1209,6 +1217,12 @@ mod messages {
 
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum ConnectResponse {
+        InformRemoteOfConnection {
+            /// Your peer id, which contains the external address. In case is your first connection
+            /// to the network, then the PeerId must be set at the OpManager/Ring level.
+            your_id: PeerId,
+            target_id: PeerId,
+        },
         AcceptedBy {
             peers: HashSet<PeerKeyLocation>,
             your_location: Location,

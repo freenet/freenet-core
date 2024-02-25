@@ -836,6 +836,10 @@ where
     Ok(())
 }
 
+/*
+- Cuando es un gateway: se define desde el inicio del nodo
+- Cuando es un peer regular: se define en el momento de la conexión con el gateway
+*/
 #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, PartialOrd, Ord)]
 pub struct PeerId {
     addr: SocketAddr,

@@ -185,7 +185,7 @@ impl P2pConnManager {
         })
     }
 
-    #[tracing::instrument(name = "network_event_listener", fields(peer = % self.bridge.op_manager.ring.peer_key), skip_all)]
+    #[tracing::instrument(name = "network_event_listener", fields(peer = ?self.bridge.op_manager.ring.get_peer_key()), skip_all)]
     pub async fn run_event_listener(
         mut self,
         op_manager: Arc<OpManager>,
@@ -218,6 +218,7 @@ impl P2pConnManager {
                                 msg:
                                     ConnectRequest::StartReq {
                                         target: this_peer,
+                                        joiner_key,
                                         joiner,
                                         ..
                                     },
@@ -225,10 +226,13 @@ impl P2pConnManager {
                             {
                                 match self
                                     .conn_handler
-                                    .connect(peer.pub_key.clone(), peer.addr, true)
+                                    .connect(peer.pub_key.clone(), peer.addr, true) // FIXME: propagate if it's a gateway or not from the config
                                     .await
                                 {
-                                    Ok(peer_conn) => {
+                                    Ok((peer_conn, your_external_socket)) => {
+                                        let own_peer_id =
+                                            PeerId::new(your_external_socket, joiner_key.clone());
+                                        self.bridge.op_manager.ring.set_peer_key(own_peer_id);
                                         tracing::debug!(
                                             "Connection established with peer {}",
                                             peer.addr.clone()
@@ -297,7 +301,7 @@ impl P2pConnManager {
                         NetMessage::Aborted(tx) => {
                             handle_aborted_op(
                                 tx,
-                                op_manager.ring.peer_key.clone(),
+                                op_manager.ring.get_peer_key().clone(),
                                 &op_manager,
                                 &mut self.bridge,
                                 &self.gateways,
@@ -340,8 +344,8 @@ impl P2pConnManager {
                 }
                 Ok(Right(SendMessage { peer, msg })) => {
                     tracing::debug!(
-                        "Sending swarm message from {} to {}",
-                        op_manager.ring.peer_key,
+                        "Sending swarm message from {:?} to {}",
+                        op_manager.ring.get_peer_key(),
                         peer
                     );
                     if let Some(tx) = self.connection.get(&peer) {

@@ -23,7 +23,7 @@ use anyhow::bail;
 use dashmap::{mapref::one::Ref as DmRef, DashMap};
 use either::Either;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -182,7 +182,7 @@ impl Eq for Score {}
 pub(crate) struct Ring {
     pub rnd_if_htl_above: usize,
     pub max_hops_to_live: usize,
-    pub peer_key: PeerId,
+    peer_key: Mutex<Option<PeerId>>,
     pub max_connections: usize,
     pub min_connections: usize,
     router: Arc<RwLock<Router>>,
@@ -349,6 +349,15 @@ impl Ring {
         );
 
         Ok(ring)
+    }
+
+    pub fn get_peer_key(&self) -> Option<PeerId> {
+        *self.peer_key.lock()
+    }
+
+    pub fn set_peer_key(&self, peer_key: PeerId) {
+        // TODO: insert only if is none
+        *self.peer_key.lock() = Some(peer_key);
     }
 
     pub fn open_connections(&self) -> usize {
