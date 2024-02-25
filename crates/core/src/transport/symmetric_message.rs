@@ -6,15 +6,15 @@ use serde_with::serde_as;
 
 use crate::transport::packet_data::MAX_DATA_SIZE;
 
-use super::{packet_data::MAX_PACKET_SIZE, MessagePayload, PacketData};
+use super::{packet_data::MAX_PACKET_SIZE, MessageId, MessagePayload, PacketData};
 
 #[serde_as]
 #[derive(Serialize, Deserialize)]
 pub(super) struct SymmetricMessage {
     // TODO: make sure we handle wrapping around the u32 properly
-    pub message_id: u32,
+    pub message_id: MessageId,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub confirm_receipt: Vec<u32>,
+    pub confirm_receipt: Vec<MessageId>,
     pub payload: SymmetricMessagePayload,
 }
 
@@ -68,11 +68,11 @@ impl SymmetricMessage {
         debug_assert!(size <= MAX_DATA_SIZE as u64);
         bincode::serialize_into(packet.as_mut_slice(), &message)?;
         let bytes = &packet[..size as usize];
-        Ok(PacketData::encrypted_with_cipher(bytes, outbound_sym_key))
+        Ok(PacketData::encrypt_symmetric(bytes, outbound_sym_key))
     }
 
     pub fn serialize_msg_to_packet_data(
-        message_id: u32,
+        message_id: MessageId,
         payload: impl Into<SymmetricMessagePayload>,
         outbound_sym_key: &Aes128Gcm,
         confirm_receipt: Vec<u32>,
@@ -119,7 +119,7 @@ impl From<ShortMessage> for SymmetricMessagePayload {
 }
 
 pub(super) struct LongMessageFragment {
-    pub stream_id: u32,
+    pub stream_id: MessageId,
     pub total_length_bytes: u64,
     pub fragment_number: u32,
     pub payload: MessagePayload,
