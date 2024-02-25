@@ -76,7 +76,7 @@ impl NodeP2P {
         CH: ContractHandler + Send + 'static,
         ER: NetEventRegister + Clone,
     {
-        let peer_key = config.peer_id;
+        let peer_key = config.peer_id.clone();
 
         let (notification_channel, notification_tx) = event_loop_notification_channel();
         let (ch_outbound, ch_inbound, wait_for_event) = contract::contract_handler_channel();
@@ -93,10 +93,8 @@ impl NodeP2P {
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        let conn_manager = {
-            let transport = Self::config_transport(&private_key)?;
-            P2pConnManager::build(&config, op_manager.clone(), event_register, private_key)?
-        };
+        let conn_manager =
+            P2pConnManager::build(&config, op_manager.clone(), event_register, private_key).await?;
 
         let parent_span = tracing::Span::current();
         GlobalExecutor::spawn(

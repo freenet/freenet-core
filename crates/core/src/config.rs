@@ -5,18 +5,17 @@ use std::{
     io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
-    pin::Pin,
     str::FromStr,
     sync::atomic::AtomicBool,
     time::Duration,
 };
 
 use directories::ProjectDirs;
-use libp2p::{identity, PeerId};
 use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
 
-use crate::local_node::OperationMode;
+use crate::node::PeerId;
+use crate::{local_node::OperationMode, transport::crypto::TransportKeypair};
 
 /// Default maximum number of connections for the peer.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 20;
@@ -51,7 +50,7 @@ pub struct Config {
     pub bootstrap_ip: IpAddr,
     pub bootstrap_port: u16,
     pub bootstrap_id: Option<PeerId>,
-    pub local_peer_keypair: identity::Keypair,
+    pub local_peer_keypair: TransportKeypair,
     pub log_level: tracing::log::LevelFilter,
     config_paths: ConfigPaths,
     local_mode: AtomicBool,
@@ -239,10 +238,7 @@ impl Config {
             });
             let mut buf = Vec::new();
             key_file.read_to_end(&mut buf).unwrap();
-            Some(
-                identity::Keypair::from_protobuf_encoding(&buf)
-                    .map_err(|_| std::io::ErrorKind::InvalidData)?,
-            )
+            todo!()
         } else {
             None
         };
@@ -263,8 +259,7 @@ impl Config {
             bootstrap_ip,
             bootstrap_port,
             bootstrap_id,
-            local_peer_keypair: local_peer_keypair
-                .unwrap_or_else(identity::Keypair::generate_ed25519),
+            local_peer_keypair: local_peer_keypair.unwrap_or_else(|| todo!()),
             log_level,
             config_paths,
             local_mode: AtomicBool::new(local_mode),
@@ -336,13 +331,7 @@ impl GlobalExecutor {
     }
 }
 
-impl libp2p::swarm::Executor for GlobalExecutor {
-    fn exec(&self, future: Pin<Box<dyn Future<Output = ()> + 'static + Send>>) {
-        GlobalExecutor::spawn(future);
-    }
-}
-
-pub fn set_logger(level: Option<tracing::level_filters::LevelFilter>) {
+pub fn set_logger() {
     #[cfg(feature = "trace")]
     {
         static LOGGER_SET: AtomicBool = AtomicBool::new(false);

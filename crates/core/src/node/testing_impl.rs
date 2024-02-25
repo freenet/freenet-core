@@ -11,7 +11,6 @@ use either::Either;
 use freenet_stdlib::prelude::*;
 use futures::{future::BoxFuture, Future};
 use itertools::Itertools;
-use libp2p::{identity, PeerId as Libp2pPeerId};
 use rand::{seq::SliceRandom, Rng};
 use tokio::sync::{mpsc, watch};
 use tracing::{info, Instrument};
@@ -30,6 +29,7 @@ use crate::{
     operations::connect,
     ring::{Distance, Location, PeerKeyLocation},
     tracing::TestEventListener,
+    transport::crypto::TransportKeypair,
 };
 
 mod in_memory;
@@ -138,7 +138,7 @@ pub(crate) struct NodeSpecification {
 struct GatewayConfig {
     label: NodeLabel,
     port: u16,
-    id: Libp2pPeerId,
+    id: PeerId,
     location: Location,
 }
 
@@ -388,8 +388,8 @@ impl SimNetwork {
         let mut configs = Vec::with_capacity(num);
         for node_no in 0..num {
             let label = NodeLabel::gateway(node_no);
-            let pair = identity::Keypair::generate_ed25519();
-            let id = pair.public().to_peer_id();
+            let pair = TransportKeypair::random();
+            let id = todo!();
             let port = get_free_port().unwrap();
             let location = Location::random();
 
@@ -397,7 +397,7 @@ impl SimNetwork {
             config
                 .with_ip(Ipv6Addr::LOCALHOST)
                 .with_port(port)
-                .with_key(pair.public().into())
+                // .with_key(pair.public().into()) // FIXME
                 .with_location(location)
                 .max_hops_to_live(self.ring_max_htl)
                 .max_number_of_connections(self.max_connections)
@@ -426,7 +426,7 @@ impl SimNetwork {
                 .filter(|config| this_config.label != config.label)
             {
                 this_node.add_gateway(
-                    InitPeerNode::new(*id, *location)
+                    InitPeerNode::new(id.clone(), *location)
                         .listening_ip(Ipv6Addr::LOCALHOST)
                         .listening_port(*port),
                 );
@@ -466,8 +466,9 @@ impl SimNetwork {
 
         for node_no in self.number_of_gateways..num + self.number_of_gateways {
             let label = NodeLabel::node(node_no);
-            let pair = identity::Keypair::generate_ed25519();
-            let id = pair.public().to_peer_id();
+            // let pair = identity::Keypair::generate_ed25519();
+            // let id = pair.public().to_peer_id();
+            let (pair, id): (TransportKeypair, PeerId) = { todo!() };
 
             let mut config = NodeConfig::new();
             for GatewayConfig {
@@ -484,7 +485,7 @@ impl SimNetwork {
                 .max_hops_to_live(self.ring_max_htl)
                 .rnd_if_htl_above(self.rnd_if_htl_above)
                 .max_number_of_connections(self.max_connections)
-                .with_key(pair.public().into())
+                // .with_key(pair.public().into()) // FIXME
                 .with_ip(Ipv6Addr::LOCALHOST)
                 .with_port(get_free_port().unwrap());
 
@@ -529,7 +530,8 @@ impl SimNetwork {
         for (mut node, label) in gw.chain(self.nodes.drain(..)).collect::<Vec<_>>() {
             tracing::debug!(peer = %label, "initializing");
             let node_spec = specs.remove(&label);
-            let mut user_events = MemoryEventsGen::new(self.receiver_ch.clone(), node.peer_key);
+            let mut user_events =
+                MemoryEventsGen::new(self.receiver_ch.clone(), node.peer_key.clone());
             if let Some(specs) = node_spec.clone() {
                 user_events.generate_events(specs.events_to_generate);
             }
@@ -541,7 +543,7 @@ impl SimNetwork {
             if let Some(specs) = node_spec {
                 node.append_contracts(specs.owned_contracts, specs.contract_subscribers);
             }
-            self.labels.push((label, node.peer_key));
+            self.labels.push((label, node.peer_key.clone()));
 
             let node_task = async move { node.run_node(user_events, span).await };
             GlobalExecutor::spawn(node_task);
@@ -565,15 +567,18 @@ impl SimNetwork {
         let mut peers = vec![];
         for (node, label) in gw.chain(self.nodes.drain(..)).collect::<Vec<_>>() {
             tracing::debug!(peer = %label, "initializing");
-            let mut user_events =
-                MemoryEventsGen::<R>::new_with_seed(self.receiver_ch.clone(), node.peer_key, seed);
+            let mut user_events = MemoryEventsGen::<R>::new_with_seed(
+                self.receiver_ch.clone(),
+                node.peer_key.clone(),
+                seed,
+            );
             user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
             let span = if label.is_gateway() {
                 tracing::info_span!("in_mem_gateway", %node.peer_key)
             } else {
                 tracing::info_span!("in_mem_node", %node.peer_key)
             };
-            self.labels.push((label, node.peer_key));
+            self.labels.push((label, node.peer_key.clone()));
 
             let node_task = async move { node.run_node(user_events, span).await };
             let handle = GlobalExecutor::spawn(node_task);
@@ -714,7 +719,7 @@ impl SimNetwork {
         self.user_ev_controller
             .as_ref()
             .expect("should be set")
-            .send((event_id, *peer))
+            .send((event_id, peer.clone()))
             .expect("node listeners disconnected");
         if let Some(sleep_time) = await_for {
             tokio::time::sleep(sleep_time).await;
@@ -994,7 +999,7 @@ where
     connect::initial_join_procedure(
         &config.op_manager,
         &mut config.conn_manager,
-        config.peer_key,
+        config.peer_key.clone(),
         &config.gateways,
     )
     .await?;
@@ -1007,7 +1012,7 @@ where
                 tracing::info_span!(
                     parent: parent_span,
                     "client_event_handling",
-                    peer = %config.peer_key
+                    peer = %config.peer_key.clone()
                 )
             })
             .unwrap_or_else(
@@ -1089,8 +1094,14 @@ where
         };
 
         if let Ok(Either::Left(NetMessage::Aborted(tx))) = msg {
-            super::handle_aborted_op(tx, peer_key, &op_manager, &mut conn_manager, &gateways)
-                .await?;
+            super::handle_aborted_op(
+                tx,
+                peer_key.clone(),
+                &op_manager,
+                &mut conn_manager,
+                &gateways,
+            )
+            .await?;
         }
 
         let msg = match msg {

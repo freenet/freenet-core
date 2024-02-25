@@ -44,7 +44,7 @@ use crate::{
     DynError,
 };
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 /// The location of a peer in the ring. This location allows routing towards the peer.
 pub struct PeerKeyLocation {
@@ -87,7 +87,7 @@ impl Display for PeerKeyLocation {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct Connection {
     location: PeerKeyLocation,
     open_at: Instant,

@@ -150,7 +150,7 @@ impl<'a> NetEventLog<'a> {
         NetEventLog {
             tx: Transaction::NULL,
             peer_id: &ring.peer_key,
-            kind: EventKind::Disconnected { from: *from },
+            kind: EventKind::Disconnected { from: from.clone() },
         }
     }
 
@@ -170,7 +170,7 @@ impl<'a> NetEventLog<'a> {
                     EventKind::Connect(ConnectEvent::Connected {
                         this: this_peer,
                         connected: PeerKeyLocation {
-                            peer: *your_peer_id,
+                            peer: your_peer_id.clone(),
                             location: Some(*your_location),
                         },
                     })
@@ -776,13 +776,13 @@ async fn send_to_metrics_server(
         }) => {
             let msg = PeerChange::added_connection_msg(
                 (&send_msg.tx != Transaction::NULL).then(|| send_msg.tx.to_string()),
-                (*from_peer, from_loc.as_f64()),
-                (*to_peer, to_loc.as_f64()),
+                (from_peer.clone(), from_loc.as_f64()),
+                (to_peer.clone(), to_loc.as_f64()),
             );
             ws_stream.send(Message::Binary(msg)).await
         }
         EventKind::Disconnected { from } => {
-            let msg = PeerChange::removed_connection_msg(*from, send_msg.peer_id);
+            let msg = PeerChange::removed_connection_msg(from.clone(), send_msg.peer_id.clone());
             ws_stream.send(Message::Binary(msg)).await
         }
         // todo: send op events too (put, get, update, etc) so we can keep track of transactions

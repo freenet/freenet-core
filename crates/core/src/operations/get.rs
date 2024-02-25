@@ -87,7 +87,7 @@ pub(crate) async fn request_get(op_manager: &OpManager, get_op: GetOp) -> Result
             let msg = GetMsg::RequestGet {
                 id,
                 key,
-                target,
+                target: target.clone(),
                 fetch_contract,
             };
 
@@ -760,7 +760,7 @@ async fn try_forward_or_return(
     );
 
     let mut new_skip_list = skip_list.to_vec();
-    new_skip_list.push(this_peer.peer);
+    new_skip_list.push(this_peer.peer.clone());
 
     let new_htl = htl - 1;
     if new_htl == 0 {

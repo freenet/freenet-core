@@ -266,7 +266,7 @@ impl Operation for ConnectOp {
                             at = %this_peer.peer,
                             "Awaiting proxy response",
                         );
-                        updated_state.add_new_proxy(accepted_by.iter().copied())?;
+                        updated_state.add_new_proxy(accepted_by.iter().cloned())?;
                         // awaiting responses from proxies
                         new_state = Some(updated_state);
                         return_msg = None;
@@ -346,7 +346,7 @@ impl Operation for ConnectOp {
                     )
                     .await?
                     {
-                        updated_state.add_new_proxy(accepted_by.iter().copied())?;
+                        updated_state.add_new_proxy(accepted_by.iter().cloned())?;
                         // awaiting responses from proxies
                         new_state = Some(updated_state);
                         return_msg = None;
@@ -490,7 +490,7 @@ impl Operation for ConnectOp {
                             let own_loc = op_manager.ring.own_location();
                             let target_is_joiner = new_peer_id == original_target.peer;
 
-                            previously_accepted.extend(accepted_by.iter().copied());
+                            previously_accepted.extend(accepted_by.iter().cloned());
                             let is_accepted: bool = previously_accepted.contains(&own_loc);
                             if is_accepted {
                                 new_state = Some(ConnectState::OCReceived);
@@ -740,16 +740,15 @@ async fn propagate_oc_to_responding_peers<NB: NetworkBridge>(
         &other_peer.peer,
     ) {
         tracing::info!(tx = %id, from = %sender.peer, to = %other_peer.peer, "Established connection");
-        network_bridge.add_connection(other_peer.peer).await?;
-        op_manager
-            .ring
-            .add_connection(
-                other_peer
-                    .location
-                    .ok_or(ConnectionError::LocationUnknown)?,
-                other_peer.peer,
-            )
-            .await;
+        network_bridge
+            .add_connection(other_peer.peer.clone())
+            .await?;
+        op_manager.ring.add_connection(
+            other_peer
+                .location
+                .ok_or(ConnectionError::LocationUnknown)?,
+            other_peer.peer.clone(),
+        );
         if other_peer.peer != sender.peer {
             // notify all the additional peers which accepted a request;
             // the gateway will be notified in the last message
@@ -846,10 +845,10 @@ where
     for gateway in gateways
         .iter()
         .shuffle()
-        .filter(|conn| conn.peer != this_peer)
+        .filter(|conn| &conn.peer != &this_peer)
         .take(number_of_parallel_connections)
     {
-        join_ring_request(None, this_peer, gateway, op_manager, conn_manager).await?;
+        join_ring_request(None, this_peer.clone(), gateway, op_manager, conn_manager).await?;
     }
     Ok(())
 }
@@ -865,7 +864,12 @@ where
     CM: NetworkBridge + Send,
 {
     let tx_id = Transaction::new::<ConnectMsg>();
-    let mut op = initial_request(peer_key, *gateway, op_manager.ring.max_hops_to_live, tx_id);
+    let mut op = initial_request(
+        peer_key,
+        gateway.clone(),
+        op_manager.ring.max_hops_to_live,
+        tx_id,
+    );
     if let Some(mut backoff) = backoff {
         // backoff to retry later in case it failed
         tracing::warn!("Performing a new join, attempt {}", backoff.retries() + 1);
@@ -943,13 +947,13 @@ where
         "Connecting to gateway",
     );
 
-    conn_bridge.add_connection(gateway.peer).await?;
+    conn_bridge.add_connection(gateway.peer.clone()).await?;
     let assigned_location = op_manager.ring.own_location().location;
     let join_req = NetMessage::from(messages::ConnectMsg::Request {
         id: tx,
         msg: messages::ConnectRequest::StartReq {
-            target: gateway,
-            joiner: this_peer,
+            target: gateway.clone(),
+            joiner: this_peer.clone(),
             assigned_location,
             hops_to_live: max_hops_to_live,
             max_hops_to_live,
@@ -962,7 +966,7 @@ where
             OpEnum::Connect(Box::new(ConnectOp {
                 id,
                 state: Some(ConnectState::Connecting(ConnectionInfo {
-                    gateway,
+                    gateway: gateway.clone(),
                     this_peer,
                     max_hops_to_live,
                 })),
@@ -1027,7 +1031,7 @@ where
         let forwarded = NetMessage::from(ConnectMsg::Request {
             id,
             msg: ConnectRequest::Proxy {
-                joiner,
+                joiner: joiner.clone(),
                 hops_to_live: left_htl.saturating_sub(1),
                 sender: ring.own_location(),
                 skip_list,
@@ -1046,7 +1050,7 @@ where
             target: req_peer,
             accepted_by,
             new_location: joiner.location.unwrap(),
-            new_peer_id: joiner.peer,
+            new_peer_id: joiner.peer.clone(),
         };
         Ok(Some(new_state))
     } else {

@@ -31,7 +31,6 @@ use tracing::Instrument;
 use self::p2p_impl::NodeP2P;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
-    config::Config,
     config::GlobalExecutor,
     contract::{
         Callback, ClientResponsesReceiver, ClientResponsesSender, ContractError,
@@ -125,7 +124,7 @@ pub struct NodeConfig {
 
 impl NodeConfig {
     pub fn new() -> NodeConfig {
-        let local_key = Config::conf().local_peer_keypair.public().into();
+        let local_key = { todo!() };
         NodeConfig {
             peer_id: local_key,
             remote_nodes: Vec::with_capacity(1),
@@ -273,10 +272,10 @@ pub struct InitPeerNode {
 }
 
 impl InitPeerNode {
-    pub fn new(identifier: SocketAddr, pub_key: TransportPublicKey, location: Location) -> Self {
+    pub fn new(identifier: PeerId, location: Location) -> Self {
         Self {
             addr: None,
-            identifier: PeerId::new(identifier, pub_key),
+            identifier,
             location,
         }
     }
@@ -286,12 +285,13 @@ impl InitPeerNode {
     /// # Panic
     /// Will panic if is not a valid representation.
     pub fn decode_peer_id<T: AsMut<[u8]>>(mut bytes: T) -> SocketAddr {
-        let mut bytes = bytes.as_mut();
-        let len = bytes.len();
-        let port = u16::from_be_bytes([bytes[len - 2], bytes[len - 1]]);
-        bytes.truncate(len - 2);
-        let ip = Ipv4Addr::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        SocketAddr::new(ip.into(), port)
+        // let mut bytes = bytes.as_mut();
+        // let len = bytes.len();
+        // let port = u16::from_be_bytes([bytes[len - 2], bytes[len - 1]]);
+        // bytes.truncate(len - 2);
+        // let ip = Ipv4Addr::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        // SocketAddr::new(ip.into(), port)
+        todo!()
     }
 
     /// IP which will be assigned to this node.
@@ -498,7 +498,7 @@ async fn report_result(
                     payload_transfer_time,
                 } => {
                     let event = RouteEvent {
-                        peer: *target_peer,
+                        peer: target_peer.clone(),
                         contract_location,
                         outcome: RouteOutcome::Success {
                             time_to_response_start: first_response_time,
@@ -815,10 +815,18 @@ where
     Ok(())
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, PartialOrd, Ord)]
 pub struct PeerId {
     addr: SocketAddr,
     pub_key: TransportPublicKey,
+}
+
+impl FromStr for PeerId {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        todo!()
+    }
 }
 
 impl PeerId {
@@ -831,24 +839,26 @@ impl PeerId {
     }
 
     pub fn pub_key(&self) -> &TransportPublicKey {
-        self.pub_key.borrow()
+        &self.pub_key
     }
 }
 
 #[cfg(test)]
 impl<'a> arbitrary::Arbitrary<'a> for PeerId {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let addr = u.arbitrary()?;
-        let pub_key = TransportPublicKey::arbitrary(u)?;
-        Ok(Self { addr, pub_key })
+        // let addr = u.arbitrary()?;
+        // let pub_key = TransportPublicKey::arbitrary(u)?;
+        // Ok(Self { addr, pub_key })
+        todo!()
     }
 }
 
 impl PeerId {
     pub fn random() -> Self {
         let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
-        let pub_key = TransportPublicKey::random();
-        Self { addr, pub_key }
+        // let pub_key = TransportPublicKey::random();
+        // Self { addr, pub_key }
+        todo!()
     }
 
     #[cfg(test)]

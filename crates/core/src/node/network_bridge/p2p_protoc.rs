@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::net::SocketAddr;
 use std::{
     collections::{HashMap, HashSet},
@@ -8,14 +9,17 @@ use std::{
 use asynchronous_codec::BytesMut;
 use dashmap::{DashMap, DashSet};
 use either::{Either, Left, Right};
-use futures::{FutureExt, Sink, SinkExt, StreamExt, TryStreamExt};
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt, TryFutureExt};
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::Instrument;
 
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
+use crate::message::ConnectionResult;
 use crate::node::PeerId;
-use crate::transport::connection_handler::ConnectionHandler;
-use crate::transport::{crypto::TransportKeypair, peer_connection::PeerConnection, BytesPerSecond};
+use crate::operations::connect::{ConnectMsg, ConnectRequest};
+use crate::transport::{BytesPerSecond, ConnectionHandler, PeerConnection, TransportKeypair};
 use crate::{
     client_events::ClientId,
     config::GlobalExecutor,
@@ -25,7 +29,7 @@ use crate::{
     },
     message::{NetMessage, NodeEvent, Transaction},
     node::{
-        handle_aborted_op, process_message, InitPeerNode, NetEventRegister, NodeConfig, OpManager,
+        handle_aborted_op, process_message, NetEventRegister, NodeConfig, OpManager,
         PeerId as FreenetPeerId,
     },
     ring::PeerKeyLocation,
@@ -72,15 +76,24 @@ impl P2pBridge {
 
 #[async_trait::async_trait]
 impl NetworkBridge for P2pBridge {
-    async fn add_connection(&mut self, peer: FreenetPeerId) -> super::ConnResult<()> {
+    async fn try_add_connection(&mut self, peer: FreenetPeerId) -> super::ConnResult<()> {
         if self.active_net_connections.contains_key(&peer) {
             self.accepted_peers.insert(peer);
         }
+        // Implement typed channel to sent ok if all fine or error if not
+        let (result_sender, mut result_receiver) = mpsc::channel(1);
         self.ev_listener_tx
-            .send(Right(NodeEvent::AcceptConnection(peer)))
+            .send(Right(NodeEvent::AcceptConnection(
+                peer.clone(),
+                result_sender,
+            )))
             .await
             .map_err(|_| ConnectionError::SendNotCompleted)?;
-        Ok(())
+        // Retrun Ok or ConnectionError depending if reciver recives a ConnAcion::ConnectionAccepted OR NOT
+        match result_receiver.recv().await {
+            Some(ConnectionResult::Accepted) => Ok(()),
+            _ => Err(ConnectionError::SendNotCompleted),
+        }
     }
 
     async fn drop_connection(&mut self, peer: &FreenetPeerId) -> super::ConnResult<()> {
@@ -111,6 +124,8 @@ impl NetworkBridge for P2pBridge {
     }
 }
 
+type PeerConnChannel = Sender<NetMessage>;
+
 pub(in crate::node) struct P2pConnManager {
     conn_handler: ConnectionHandler,
     pub(in crate::node) gateways: Vec<PeerKeyLocation>,
@@ -120,19 +135,19 @@ pub(in crate::node) struct P2pConnManager {
     public_addr: Option<SocketAddr>,
     listening_addr: Option<SocketAddr>,
     event_listener: Box<dyn NetEventRegister>,
-    connection: HashMap<PeerId, PeerConnection>,
+    connection: HashMap<PeerId, PeerConnChannel>,
 }
 
 impl P2pConnManager {
-    pub fn build(
+    pub async fn build(
         config: &NodeConfig,
         op_manager: Arc<OpManager>,
         event_listener: impl NetEventRegister + Clone,
         private_key: TransportKeypair,
     ) -> Result<Self, anyhow::Error> {
-        // We set a global executor which is virtually the Tokio multi-threaded executor
-        // to reuse it's thread pool and scheduler in order to drive futures.
-        let global_executor = GlobalExecutor;
+        let listen_port = config
+            .local_port
+            .ok_or_else(|| anyhow::anyhow!("private_addr does not contain a port"))?;
 
         let private_addr = if let Some(conn) = config.local_ip.zip(config.local_port) {
             let public_addr = SocketAddr::from(conn);
@@ -141,23 +156,14 @@ impl P2pConnManager {
             None
         };
 
-        let public_addr = if let Some(conn) = config.public_ip.zip(config.public_port) {
-            let public_addr = SocketAddr::from(conn);
-            Some(public_addr)
-        } else {
-            None
-        };
-
-        let listen_port = public_addr
-            .ok_or_else(|| anyhow::anyhow!("private_addr does not contain a port"))?
-            .port();
-
-        let conn_handler = ConnectionHandler::new(
+        let conn_handler = ConnectionHandler::new::<UdpSocket>(
             private_key,
+            config.listener_ip,
             listen_port,
             config.is_gateway(),
             BytesPerSecond::new(0.1),
-        );
+        )
+        .await?;
 
         let (tx_bridge_cmd, rx_bridge_cmd) = mpsc::channel(100);
         let bridge = P2pBridge::new(tx_bridge_cmd, op_manager, event_listener.clone());
@@ -168,21 +174,32 @@ impl P2pConnManager {
             gateways,
             bridge,
             conn_bridge_rx: rx_bridge_cmd,
-            public_addr,
+            public_addr: None,
             listening_addr: private_addr,
             event_listener: Box::new(event_listener),
             connection: HashMap::new(),
         })
     }
 
-    pub fn listen_on(&mut self) -> Result<(), anyhow::Error> {
-        // if let Some(listening_addr) = &self.listening_addr {
-        //     self.swarm.listen_on(listening_addr.clone())?;
-        // }
+    async fn handle_outbound_messages(
+        mut rx: Receiver<NetMessage>,
+        mut peer_conn: PeerConnection,
+    ) -> Result<(), ConnectionError> {
+        loop {
+            let msg = rx.recv().await;
+            if let Some(msg) = msg {
+                peer_conn
+                    .send(&msg)
+                    .await
+                    .map_err(|err| ConnectionError::IOError(err.to_string()))?;
+            } else {
+                break;
+            }
+        }
         Ok(())
     }
 
-    #[tracing::instrument(name = "network_event_listener", fields(peer = %self.bridge.op_manager.ring.peer_key), skip_all)]
+    #[tracing::instrument(name = "network_event_listener", fields(peer = % self.bridge.op_manager.ring.peer_key), skip_all)]
     pub async fn run_event_listener(
         mut self,
         op_manager: Arc<OpManager>,
@@ -198,103 +215,67 @@ impl P2pConnManager {
         let mut pending_from_executor = HashSet::new();
         let mut tx_to_client: HashMap<Transaction, ClientId> = HashMap::new();
 
-        let this_peer = FreenetPeerId::from(
-            crate::config::Config::conf()
-                .local_peer_keypair
-                .public()
-                .to_peer_id(),
-        );
+        let mut peer_connections: FuturesUnordered<PeerConnection> = FuturesUnordered::new();
 
         loop {
-            // let network_msg = self.swarm.select_next_some().map(|event| match event {
-            //     SwarmEvent::Behaviour(NetEvent::Freenet(msg)) => {
-            //         tracing::debug!("Message inbound: {:?}", msg);
-            //         Ok(Left(*msg))
-            //     }
-            //     SwarmEvent::ConnectionClosed { peer_id, .. } => {
-            //         Ok(Right(ConnMngrActions::ConnectionClosed {
-            //             peer: FreenetPeerId::from(peer_id),
-            //         }))
-            //     }
-            //     SwarmEvent::Dialing { peer_id, .. } => {
-            //         if let Some(peer_id) = peer_id {
-            //             tracing::debug!("Attempting connection to {}", peer_id);
-            //         }
-            //         Ok(Right(ConnMngrActions::NoAction))
-            //     }
-            //     SwarmEvent::Behaviour(NetEvent::Identify(id)) => {
-            //         if let identify::Event::Received { peer_id, info } = *id {
-            //             if Self::is_compatible_peer(&info) {
-            //                 Ok(Right(ConnMngrActions::ConnectionEstablished {
-            //                     peer: FreenetPeerId::from(peer_id),
-            //                     address: info.observed_addr,
-            //                 }))
-            //             } else {
-            //                 tracing::warn!("Incompatible peer: {}, disconnecting", peer_id);
-            //                 Ok(Right(ConnMngrActions::ConnectionClosed {
-            //                     peer: FreenetPeerId::from(peer_id),
-            //                 }))
-            //             }
-            //         } else {
-            //             Ok(Right(ConnMngrActions::NoAction))
-            //         }
-            //     }
-            //     SwarmEvent::Behaviour(NetEvent::Autonat(event)) => match event {
-            //         autonat::Event::InboundProbe(autonat::InboundProbeEvent::Response {
-            //             address,
-            //             peer,
-            //             ..
-            //         }) => {
-            //             tracing::debug!(
-            //                 "Successful autonat probe, established conn with {peer} @ {address}"
-            //             );
-            //             Ok(Right(ConnMngrActions::ConnectionEstablished {
-            //                 peer: FreenetPeerId::from(peer),
-            //                 address,
-            //             }))
-            //         }
-            //         autonat::Event::InboundProbe(autonat::InboundProbeEvent::Error {
-            //             peer,
-            //             error: autonat::InboundProbeError::Response(err),
-            //             ..
-            //         }) => match err {
-            //             autonat::ResponseError::DialError | autonat::ResponseError::DialRefused => {
-            //                 Ok(Right(ConnMngrActions::IsPrivatePeer(peer)))
-            //             }
-            //             _ => Ok(Right(ConnMngrActions::NoAction)),
-            //         },
-            //         autonat::Event::StatusChanged {
-            //             new: autonat::NatStatus::Public(address),
-            //             ..
-            //         } => {
-            //             tracing::debug!("NAT status: public @ {address}");
-            //             Ok(Right(ConnMngrActions::UpdatePublicAddr(address)))
-            //         }
-            //         _ => Ok(Right(ConnMngrActions::NoAction)),
-            //     },
-            //     other_event => {
-            //         tracing::debug!("Received other swarm event: {:?}", other_event);
-            //         Ok(Right(ConnMngrActions::NoAction))
-            //     }
-            // });
-
             let notification_msg = notification_channel.0.recv().map(|m| match m {
                 None => Ok(Right(ClosedChannel)),
                 Some(Left(msg)) => Ok(Left(msg)),
                 Some(Right(action)) => Ok(Right(NodeAction(action))),
             });
 
-            let bridge_msg = self.conn_bridge_rx.recv().map(|msg| match msg {
-                Some(Left((peer, msg))) => {
-                    tracing::debug!("Message outbound: {:?}", msg);
-                    Ok(Right(SendMessage { peer, msg }))
+            let bridge_msg = async {
+                match self.conn_bridge_rx.recv().await {
+                    Some(msg) => match msg {
+                        Left((peer, msg)) => {
+                            if let NetMessage::Connect(ConnectMsg::Request {
+                                id,
+                                msg:
+                                    ConnectRequest::StartReq {
+                                        target: this_peer,
+                                        joiner,
+                                        ..
+                                    },
+                            }) = &*msg
+                            {
+                                match self
+                                    .conn_handler
+                                    .connect(peer.pub_key, peer.addr, true)
+                                    .await
+                                {
+                                    Ok(peer_conn) => {
+                                        tracing::debug!(
+                                            "Connection established with peer {}",
+                                            peer.addr.clone()
+                                        );
+                                        Ok(Right(ConnectionEstablished {
+                                            peer: peer.clone(),
+                                            peer_conn,
+                                        }))
+                                    }
+                                    Err(e) => Ok(Right(ClosedChannel)),
+                                }
+                            } else {
+                                tracing::debug!("Message outbound: {:?}", msg);
+                                Ok(Right(SendMessage { peer, msg }))
+                            }
+                        }
+                        Right(action) => Ok(Right(NodeAction(action))),
+                    },
+                    None => Ok(Right(ClosedChannel)), // Manejar el caso de canal cerrado
                 }
-                Some(Right(action)) => Ok(Right(NodeAction(action))),
-                None => Ok(Right(ClosedChannel)),
-            });
+            };
 
             let msg: Result<_, ConnectionError> = tokio::select! {
-                //msg = network_msg => { msg }
+                msg = peer_connections.next(), if !peer_connections.is_empty() => {
+                    match msg {
+                        Some(Ok(incoming_msg)) => {
+                            let netwiork_msg = decode_msg(BytesMut::from(incoming_msg.as_slice())).map_err(|err| anyhow::anyhow!(err))?;
+                            Ok(Left(netwiork_msg))
+                        },
+                        _ => Ok(Right(ClosedChannel))
+                    }
+                }
                 msg = notification_msg => { msg }
                 msg = bridge_msg => { msg }
                 msg = node_controller.recv() => {
@@ -323,7 +304,7 @@ impl P2pConnManager {
                         NetMessage::Aborted(tx) => {
                             handle_aborted_op(
                                 tx,
-                                op_manager.ring.peer_key,
+                                op_manager.ring.peer_key.clone(),
                                 &op_manager,
                                 &mut self.bridge,
                                 &self.gateways,
@@ -345,7 +326,8 @@ impl P2pConnManager {
                             let span = tracing::info_span!(
                                 parent: parent_span,
                                 "process_network_message",
-                                peer = %this_peer, transaction = %msg.id(),
+                                // peer = %this_peer,
+                                transaction = %msg.id(),
                                 tx_type = %msg.id().transaction_type()
                             );
                             GlobalExecutor::spawn(
@@ -369,6 +351,11 @@ impl P2pConnManager {
                         op_manager.ring.peer_key,
                         peer
                     );
+                    if let Some(tx) = self.connection.get(&peer) {
+                        tx.send(*msg).await?;
+                    } else {
+                        tracing::warn!("No connection to peer {}", peer);
+                    }
                 }
                 Ok(Right(NodeAction(NodeEvent::ShutdownNode))) => {
                     tracing::info!("Shutting down message loop gracefully");
@@ -377,9 +364,10 @@ impl P2pConnManager {
                 Ok(Right(NodeAction(NodeEvent::Error(err)))) => {
                     tracing::error!("Bridge conn error: {err}");
                 }
-                Ok(Right(NodeAction(NodeEvent::AcceptConnection(_key)))) => {
+                Ok(Right(NodeAction(NodeEvent::AcceptConnection(_key, result_sender)))) => {
                     // todo: if we prefilter connections, should only accept ones informed this way
                     //       (except 'join ring' requests)
+                    result_sender.send(ConnectionResult::Accepted).await?;
                 }
                 Ok(Right(NodeAction(NodeEvent::Disconnect { cause }))) => {
                     match cause {
@@ -389,16 +377,44 @@ impl P2pConnManager {
                     return Ok(());
                 }
                 Ok(Right(ConnectionEstablished {
-                    address: addr,
                     peer,
+                    mut peer_conn,
                 })) => {
-                    tracing::debug!("Established connection with peer {} @ {}", peer, addr);
-                    self.bridge.active_net_connections.insert(peer, addr);
+                    let addr = peer.addr.clone();
+                    tracing::debug!("Established connection with peer @ {}", addr);
+                    self.bridge
+                        .active_net_connections
+                        .insert(peer.clone(), addr);
+
+                    let (tx, mut rx) = mpsc::channel(100);
+                    self.connection.insert(peer.clone(), tx);
+
+                    // Spawn a task to handle the connection outbound messages
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::select! {
+                                Some(msg) = rx.recv() => {
+                                    peer_conn
+                                        .send(&msg)
+                                        .await
+                                        .map_err(|err| ConnectionError::IOError(err.to_string()))?;
+                                }
+                                else => {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok::<_, ConnectionError>(())
+                    });
+
+                    let a = peer_conn.into_future().await;
+
+                    peer_connections.push(peer_conn);
                 }
                 Ok(Right(ConnectionClosed { peer: peer_id }))
                 | Ok(Right(NodeAction(NodeEvent::DropConnection(peer_id)))) => {
                     self.bridge.active_net_connections.remove(&peer_id);
-                    op_manager.ring.prune_connection(peer_id).await;
+                    op_manager.ring.prune_connection(peer_id.clone()).await;
                     // todo: notify the handler, read `disconnect_peer_id` doc
                     tracing::info!("Dropped connection with peer {}", peer_id);
                 }
@@ -424,6 +440,7 @@ impl P2pConnManager {
                     .await;
                 }
                 Ok(Right(NoAction)) | Ok(Right(NodeAction(NodeEvent::ConfirmedInbound))) => {}
+                _ => {}
             }
         }
         Ok(())
@@ -434,7 +451,7 @@ enum ConnMngrActions {
     /// Received a new connection
     ConnectionEstablished {
         peer: FreenetPeerId,
-        address: SocketAddr,
+        peer_conn: PeerConnection,
     },
     /// Closed a connection with the peer
     ConnectionClosed {

@@ -577,7 +577,7 @@ impl OpManager {
                 subs.value()
                     .iter()
                     .filter(|pk| &pk.peer != sender)
-                    .copied()
+                    .cloned()
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -733,7 +733,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
 
     let id = put_op.id;
     if let Some(stats) = &mut put_op.stats {
-        stats.target = Some(target);
+        stats.target = Some(target.clone());
     }
 
     match put_op.state {
@@ -754,7 +754,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
                 related_contracts,
                 value,
                 htl,
-                target,
+                target: target.clone(),
             };
 
             let op = PutOp {
