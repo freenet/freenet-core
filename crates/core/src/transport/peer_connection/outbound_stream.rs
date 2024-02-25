@@ -9,10 +9,10 @@ use tokio::sync::mpsc;
 use crate::transport::MessageId;
 use crate::{
     transport::{
-        connection_handler::TransportError,
         packet_data,
         sent_packet_tracker::SentPacketTracker,
         symmetric_message::{self},
+        TransportError,
     },
     util::time_source::InstantTimeSrc,
 };

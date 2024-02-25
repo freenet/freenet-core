@@ -1,14 +1,13 @@
-use aes_gcm::{Aes128Gcm, KeyInit};
-use futures::FutureExt;
-use std::collections::{BTreeMap, LinkedList};
-use std::future::Future;
-use std::io;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::time::Duration;
 use std::vec::Vec;
-use std::{borrow::Cow, time::Duration};
-use tokio::net::{ToSocketAddrs, UdpSocket};
+
+use aes_gcm::{Aes128Gcm, KeyInit};
+use futures::FutureExt;
+use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
 
@@ -18,7 +17,7 @@ use super::{
     peer_connection::{PeerConnection, RemoteConnection},
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
-    BytesPerSecond, PacketData,
+    BytesPerSecond, PacketData, Socket, TransportError,
 };
 
 const PROTOC_VERSION: [u8; 2] = 1u16.to_le_bytes();
@@ -80,7 +79,6 @@ impl ConnectionHandler {
             max_upstream_rate: max_upstream_rate.clone(),
             new_connection_notifier: new_connection_sender,
             outbound_packets: outbound_sender,
-            pending_inbound_queue: LinkedList::new(),
         };
         let bw_tracker = super::rate_limiter::PacketRateLimiter::new(
             DEFAULT_BW_TRACKER_WINDOW_SIZE,
@@ -139,34 +137,6 @@ pub struct LongMessageFragment {
     pub fragment: Vec<u8>,
 }
 
-/// Make connection handler more testable
-pub(super) trait Socket: Sized + Send + Sync + 'static {
-    fn bind<A: ToSocketAddrs + Send>(addr: A) -> impl Future<Output = io::Result<Self>> + Send;
-    fn recv_from(
-        &self,
-        buf: &mut [u8],
-    ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send;
-    fn send_to<A: ToSocketAddrs + Send>(
-        &self,
-        buf: &[u8],
-        target: A,
-    ) -> impl Future<Output = io::Result<usize>> + Send;
-}
-
-impl Socket for UdpSocket {
-    async fn bind<A: ToSocketAddrs + Send>(addr: A) -> io::Result<Self> {
-        Self::bind(addr).await
-    }
-
-    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        self.recv_from(buf).await
-    }
-
-    async fn send_to<A: ToSocketAddrs + Send>(&self, buf: &[u8], target: A) -> io::Result<usize> {
-        self.send_to(buf, target).await
-    }
-}
-
 /// Handles UDP transport internally.
 struct UdpPacketsListener<S = UdpSocket> {
     socket_listener: Arc<S>,
@@ -177,8 +147,6 @@ struct UdpPacketsListener<S = UdpSocket> {
     is_gateway: bool,
     new_connection_notifier: mpsc::Sender<PeerConnection>,
     outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
-    /// using linked list cause is unbounded and we are only using it as a queue
-    pending_inbound_queue: LinkedList<(SocketAddr, PacketData)>,
 }
 
 impl<S: Socket> UdpPacketsListener<S> {
@@ -260,10 +228,10 @@ impl<S: Socket> UdpPacketsListener<S> {
         })?;
         if protoc != PROTOC_VERSION {
             let packet = SymmetricMessage::ack_error(&outbound_key)?;
-            let _ = self
-                .outbound_packets
+            self.outbound_packets
                 .send((remote_addr, packet.into()))
-                .await;
+                .await
+                .map_err(|_| TransportError::ChannelClosed)?;
             return Err(TransportError::ConnectionEstablishmentFailure {
                 cause: format!(
                     "remote is using a different protocol version: {:?}",
@@ -279,26 +247,44 @@ impl<S: Socket> UdpPacketsListener<S> {
             SymmetricMessage::ack_gateway_connection(&outbound_key, inbound_key_bytes)?;
 
         let mut buf = [0u8; MAX_PACKET_SIZE];
-        loop {
-            // todo: add timeouts, max attempts and exponential backoff in this loop
+        let mut waiting_time = INITIAL_INTERVAL;
+        let mut attempts = 0;
+        const MAX_ATTEMPTS: usize = 20;
+        while attempts < MAX_ATTEMPTS {
             self.outbound_packets
                 .send((remote_addr, outbound_ack_packet.clone().into()))
                 .await
-                .map_err(|_| TransportError::ConnectionClosed)?;
+                .map_err(|_| TransportError::ChannelClosed)?;
 
             // wait until the remote sends the ack packet
-            let (size, remote) = self.socket_listener.recv_from(&mut buf).await?;
-            if remote != remote_addr {
-                if let Some(remote) = self.remote_connections.remove(&remote_addr) {
-                    let _ = remote
-                        .inbound_packet_sender
-                        .send(PacketData::from(&buf[..size]))
-                        .await;
-                    self.remote_connections.insert(remote_addr, remote);
+            let timeout =
+                tokio::time::timeout(waiting_time, self.socket_listener.recv_from(&mut buf));
+            let packet = match timeout.await {
+                Ok(Ok((size, remote))) => {
+                    let packet = PacketData::from(&buf[..size]);
+                    if remote != remote_addr {
+                        if let Some(remote) = self.remote_connections.remove(&remote_addr) {
+                            let _ = remote.inbound_packet_sender.send(packet).await;
+                            self.remote_connections.insert(remote_addr, remote);
+                            continue;
+                        }
+                    }
+                    packet
+                }
+                Ok(Err(_)) => {
+                    return Err(TransportError::ChannelClosed);
+                }
+                Err(_) => {
+                    attempts += 1;
+                    waiting_time = std::cmp::min(
+                        Duration::from_millis(
+                            waiting_time.as_millis() as u64 * INTERVAL_INCREASE_FACTOR,
+                        ),
+                        MAX_INTERVAL,
+                    );
                     continue;
                 }
-            }
-            let packet = PacketData::from(&buf[..size]);
+            };
             let Ok(_decrypted_packet) = packet.decrypt(&inbound_key) else {
                 tracing::debug!(%remote_addr, "Failed to decrypt packet with inbound key");
                 return Err(TransportError::ConnectionEstablishmentFailure {
@@ -324,7 +310,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         self.new_connection_notifier
             .send(peer_connection)
             .await
-            .map_err(|_| TransportError::ConnectionClosed)?;
+            .map_err(|_| TransportError::ChannelClosed)?;
 
         sent_tracker.lock().report_sent_packet(
             SymmetricMessage::FIRST_MESSAGE_ID,
@@ -380,27 +366,18 @@ impl<S: Socket> UdpPacketsListener<S> {
             match state {
                 ConnectionState::StartOutbound { .. } => {
                     tracing::debug!("Sending protocol version and inbound key to remote");
-                    if self
-                        .outbound_packets
+                    self.outbound_packets
                         .send((remote_addr, outbound_intro_packet.data().into()))
                         .await
-                        .is_err()
-                    {
-                        failures += 1;
-                        if failures == Self::NAT_TRAVERSAL_MAX_ATTEMPTS {
-                            return Err(TransportError::ConnectionClosed);
-                        }
-                        tick.tick().await;
-                        continue;
-                    }
+                        .map_err(|_| TransportError::ChannelClosed)?;
                 }
                 ConnectionState::AckConnectionOutbound => {
                     let acknowledgment =
                         SymmetricMessage::ack_ok(outbound_sym_key.as_mut().unwrap())?;
-                    let _ = self
-                        .outbound_packets
+                    self.outbound_packets
                         .send((remote_addr, acknowledgment.data().into()))
-                        .await;
+                        .await
+                        .map_err(|_| TransportError::ChannelClosed)?;
                     let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
                     sent_tracker.lock().report_sent_packet(
                         SymmetricMessage::FIRST_MESSAGE_ID,
@@ -431,19 +408,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                 ConnectionState::RemoteInbound { .. } => {
                     // the other peer, which is at the Start state, will receive our inbound key (see below)
                     tracing::debug!("Sending back protocol version and inbound key to remote");
-                    if self
-                        .outbound_packets
+                    self.outbound_packets
                         .send((remote_addr, outbound_intro_packet.data().into()))
                         .await
-                        .is_err()
-                    {
-                        failures += 1;
-                        if failures == Self::NAT_TRAVERSAL_MAX_ATTEMPTS {
-                            return Err(TransportError::ConnectionClosed);
-                        }
-                        tick.tick().await;
-                        continue;
-                    }
+                        .map_err(|_| TransportError::ChannelClosed)?;
                 }
             }
             let next_inbound = {
@@ -483,6 +451,25 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                         cause: "invalid symmetric key".into(),
                                                     }
                                                 })?;
+                                            let packet =
+                                                SymmetricMessage::ack_ok(&outbound_sym_key)?;
+                                            // burst the gateway with oks so it does not keep waiting for inbound packets
+                                            // one of them hopefully will arrive fine
+                                            for _ in 0..5 {
+                                                self.outbound_packets
+                                                    .send((remote_addr, packet.data().into()))
+                                                    .await
+                                                    .map_err(|_| TransportError::ChannelClosed)?;
+                                            }
+                                            self.outbound_packets
+                                                .send((
+                                                    remote_addr,
+                                                    SymmetricMessage::ack_ok(&outbound_sym_key)?
+                                                        .data()
+                                                        .into(),
+                                                ))
+                                                .await
+                                                .map_err(|_| TransportError::ChannelClosed)?;
                                             let (inbound_sender, inbound_recv) = mpsc::channel(100);
                                             return Ok((
                                                 RemoteConnection {
@@ -516,7 +503,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                                             );
                                         }
                                         _ => {
-                                            continue;
+                                            return Err(
+                                                TransportError::ConnectionEstablishmentFailure {
+                                                    cause: "Unexpected message".into(),
+                                                },
+                                            );
                                         }
                                     }
                                 }
@@ -536,10 +527,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     &decrypted_packet.data()[..PROTOC_VERSION.len()];
                                 if protocol_version != PROTOC_VERSION {
                                     let packet = SymmetricMessage::ack_error(&key)?;
-                                    let _ = self
-                                        .outbound_packets
+                                    self.outbound_packets
                                         .send((remote_addr, packet.into()))
-                                        .await;
+                                        .await
+                                        .map_err(|_| TransportError::ChannelClosed)?;
                                     return Err(TransportError::ConnectionEstablishmentFailure {
                                         cause: format!(
                                             "remote is using a different protocol version: {:?}",
@@ -684,30 +675,6 @@ impl InboundRemoteConnection {
         }
         inbound
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum TransportError {
-    #[error("transport handler channel closed")]
-    ChannelClosed,
-    #[error("connection to remote closed")]
-    ConnectionClosed,
-    #[error("failed while establishing connection, reason: {cause}")]
-    ConnectionEstablishmentFailure { cause: Cow<'static, str> },
-    #[error("incomplete inbound stream: {0}")]
-    IncompleteInboundStream(u32),
-    #[error(transparent)]
-    IO(#[from] std::io::Error),
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
-    #[error("{0}")]
-    PrivateKeyDecryptionError(aes_gcm::aead::Error),
-    #[error(transparent)]
-    PubKeyDecryptionError(#[from] rsa::errors::Error),
-    #[error(transparent)]
-    Serialization(#[from] bincode::Error),
-    #[error("received unexpected message from remote: {0}")]
-    UnexpectedMessage(Cow<'static, str>),
 }
 
 // TODO: add test for establishing a connection between two non-gateways (at localhost)

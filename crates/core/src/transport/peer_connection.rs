@@ -15,17 +15,15 @@ use tokio::sync::mpsc;
 mod inbound_stream;
 mod outbound_stream;
 
-use super::packet_data::PacketData;
-use super::received_packet_tracker::ReceivedPacketTracker;
-use super::sent_packet_tracker::ResendAction;
-use super::symmetric_message;
 use super::{
-    connection_handler::{SerializedMessage, TransportError},
-    packet_data::MAX_DATA_SIZE,
-    sent_packet_tracker::SentPacketTracker,
-    symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
+    connection_handler::SerializedMessage,
+    packet_data::{PacketData, MAX_DATA_SIZE},
+    received_packet_tracker::ReceivedPacketTracker,
+    received_packet_tracker::ReportResult,
+    sent_packet_tracker::{ResendAction, SentPacketTracker},
+    symmetric_message::{self, SymmetricMessage, SymmetricMessagePayload},
+    TransportError,
 };
-use crate::transport::received_packet_tracker::ReportResult;
 use crate::util::time_source::InstantTimeSrc;
 
 type Result<T = ()> = std::result::Result<T, TransportError>;
@@ -93,7 +91,7 @@ impl PeerConnection {
                         tracing::error!(%error, ?self.remote_conn.remote_addr, "Failed to decrypt packet, might be an intro packet");
                     }) else {
                         // just ignore this message
-                        // todo: this branch should at much happen UdpPacketsListener::NAT_TRAVERSAL_MAX_ATTEMPTS
+                        // TODO: this branch should at much happen UdpPacketsListener::NAT_TRAVERSAL_MAX_ATTEMPTS
                         // since never more intro packets will be sent than this amount,
                         // after checking that amount of times we should drop the connection if sending corrupt messages
                         continue;

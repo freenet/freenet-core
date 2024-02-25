@@ -3,6 +3,11 @@
 //!
 //! Please see `docs/architecture/transport.md` for more information.
 //!
+use std::{borrow::Cow, io, net::SocketAddr, time::Duration};
+
+use futures::Future;
+use tokio::net::{ToSocketAddrs, UdpSocket};
+
 mod connection_handler;
 mod crypto;
 mod packet_data;
@@ -17,7 +22,6 @@ type MessagePayload = Vec<u8>;
 type MessageId = u32;
 
 use self::packet_data::PacketData;
-use std::time::Duration;
 
 /// We can wait up to 100ms to confirm a message was received, this allows us to batch
 /// receipts together and send them in a single message.
@@ -33,6 +37,58 @@ impl BytesPerSecond {
 
     pub fn as_f64(&self) -> f64 {
         self.0
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TransportError {
+    #[error("transport handler channel closed, socket likely closed")]
+    ChannelClosed,
+    #[error("connection to remote closed")]
+    ConnectionClosed,
+    #[error("failed while establishing connection, reason: {cause}")]
+    ConnectionEstablishmentFailure { cause: Cow<'static, str> },
+    #[error("incomplete inbound stream: {0}")]
+    IncompleteInboundStream(u32),
+    #[error(transparent)]
+    IO(#[from] std::io::Error),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+    #[error("{0}")]
+    PrivateKeyDecryptionError(aes_gcm::aead::Error),
+    #[error(transparent)]
+    PubKeyDecryptionError(#[from] rsa::errors::Error),
+    #[error(transparent)]
+    Serialization(#[from] bincode::Error),
+    #[error("received unexpected message from remote: {0}")]
+    UnexpectedMessage(Cow<'static, str>),
+}
+
+/// Make connection handler more testable
+trait Socket: Sized + Send + Sync + 'static {
+    fn bind<A: ToSocketAddrs + Send>(addr: A) -> impl Future<Output = io::Result<Self>> + Send;
+    fn recv_from(
+        &self,
+        buf: &mut [u8],
+    ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send;
+    fn send_to<A: ToSocketAddrs + Send>(
+        &self,
+        buf: &[u8],
+        target: A,
+    ) -> impl Future<Output = io::Result<usize>> + Send;
+}
+
+impl Socket for UdpSocket {
+    async fn bind<A: ToSocketAddrs + Send>(addr: A) -> io::Result<Self> {
+        Self::bind(addr).await
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.recv_from(buf).await
+    }
+
+    async fn send_to<A: ToSocketAddrs + Send>(&self, buf: &[u8], target: A) -> io::Result<usize> {
+        self.send_to(buf, target).await
     }
 }
 

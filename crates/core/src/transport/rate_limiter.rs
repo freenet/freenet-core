@@ -1,12 +1,12 @@
 use tokio::sync::mpsc;
 
-use crate::util::time_source::{InstantTimeSrc, TimeSource};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::connection_handler::Socket;
+use super::Socket;
+use crate::util::time_source::{InstantTimeSrc, TimeSource};
 
 /// Keeps track of the bandwidth used in the last window_size. Recommend a `window_size` of
 /// 10 seconds.
@@ -15,7 +15,7 @@ pub(super) struct PacketRateLimiter<T: TimeSource> {
     window_size: Duration,
     current_bandwidth: usize,
     outbound_packets: mpsc::Receiver<(SocketAddr, Arc<[u8]>)>,
-    pub time_source: T,
+    time_source: T,
 }
 
 impl PacketRateLimiter<InstantTimeSrc> {
