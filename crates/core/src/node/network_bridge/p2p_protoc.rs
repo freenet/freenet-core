@@ -17,6 +17,9 @@ use tracing::Instrument;
 
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::message::ConnectionResult;
+use crate::node::network_bridge::p2p_protoc::ConnMngrActions::{
+    ClosedChannel, ConnectionEstablished, NodeAction, SendMessage,
+};
 use crate::node::PeerId;
 use crate::operations::connect::{ConnectMsg, ConnectRequest};
 use crate::transport::{BytesPerSecond, ConnectionHandler, PeerConnection, TransportKeypair};
@@ -99,7 +102,7 @@ impl NetworkBridge for P2pBridge {
     async fn drop_connection(&mut self, peer: &FreenetPeerId) -> super::ConnResult<()> {
         self.accepted_peers.remove(peer);
         self.ev_listener_tx
-            .send(Right(NodeEvent::DropConnection(*peer)))
+            .send(Right(NodeEvent::DropConnection(peer.clone())))
             .await
             .map_err(|_| ConnectionError::SendNotCompleted)?;
         self.log_register
@@ -117,7 +120,7 @@ impl NetworkBridge for P2pBridge {
             .await;
         self.op_manager.sending_transaction(target, &msg);
         self.ev_listener_tx
-            .send(Left((*target, Box::new(msg))))
+            .send(Left((target.clone(), Box::new(msg))))
             .await
             .map_err(|_| ConnectionError::SendNotCompleted)?;
         Ok(())
@@ -181,24 +184,6 @@ impl P2pConnManager {
         })
     }
 
-    async fn handle_outbound_messages(
-        mut rx: Receiver<NetMessage>,
-        mut peer_conn: PeerConnection,
-    ) -> Result<(), ConnectionError> {
-        loop {
-            let msg = rx.recv().await;
-            if let Some(msg) = msg {
-                peer_conn
-                    .send(&msg)
-                    .await
-                    .map_err(|err| ConnectionError::IOError(err.to_string()))?;
-            } else {
-                break;
-            }
-        }
-        Ok(())
-    }
-
     #[tracing::instrument(name = "network_event_listener", fields(peer = % self.bridge.op_manager.ring.peer_key), skip_all)]
     pub async fn run_event_listener(
         mut self,
@@ -215,7 +200,7 @@ impl P2pConnManager {
         let mut pending_from_executor = HashSet::new();
         let mut tx_to_client: HashMap<Transaction, ClientId> = HashMap::new();
 
-        let mut peer_connections: FuturesUnordered<PeerConnection> = FuturesUnordered::new();
+        let mut peer_connections = FuturesUnordered::new();
 
         loop {
             let notification_msg = notification_channel.0.recv().map(|m| match m {
@@ -262,7 +247,7 @@ impl P2pConnManager {
                         }
                         Right(action) => Ok(Right(NodeAction(action))),
                     },
-                    None => Ok(Right(ClosedChannel)), // Manejar el caso de canal cerrado
+                    None => Ok(Right(ClosedChannel)),
                 }
             };
 
@@ -270,6 +255,7 @@ impl P2pConnManager {
                 msg = peer_connections.next(), if !peer_connections.is_empty() => {
                     match msg {
                         Some(Ok(incoming_msg)) => {
+                            let incoming_msg: Vec<u8> = incoming_msg;
                             let netwiork_msg = decode_msg(BytesMut::from(incoming_msg.as_slice())).map_err(|err| anyhow::anyhow!(err))?;
                             Ok(Left(netwiork_msg))
                         },
@@ -407,9 +393,7 @@ impl P2pConnManager {
                         Ok::<_, ConnectionError>(())
                     });
 
-                    let a = peer_conn.into_future().await;
-
-                    peer_connections.push(peer_conn);
+                    peer_connections.push(peer_conn.recv());
                 }
                 Ok(Right(ConnectionClosed { peer: peer_id }))
                 | Ok(Right(NodeAction(NodeEvent::DropConnection(peer_id)))) => {
