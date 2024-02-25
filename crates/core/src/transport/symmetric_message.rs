@@ -119,7 +119,7 @@ impl From<ShortMessage> for SymmetricMessagePayload {
 }
 
 pub(super) struct LongMessageFragment {
-    pub stream_id: MessageId,
+    pub long_message_id: MessageId,
     pub total_length_bytes: u64,
     pub fragment_number: u32,
     pub payload: MessagePayload,
@@ -128,7 +128,7 @@ pub(super) struct LongMessageFragment {
 impl From<LongMessageFragment> for SymmetricMessagePayload {
     fn from(long_message_fragment: LongMessageFragment) -> Self {
         Self::LongMessageFragment {
-            message_id: long_message_fragment.stream_id,
+            message_id: long_message_fragment.long_message_id,
             total_length_bytes: long_message_fragment.total_length_bytes,
             fragment_number: long_message_fragment.fragment_number,
             payload: long_message_fragment.payload,

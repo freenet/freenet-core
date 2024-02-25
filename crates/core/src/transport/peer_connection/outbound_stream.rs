@@ -30,7 +30,7 @@ const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 100;
 /// the necessary changes are done to the codebase we will use this function
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn send_long_message(
-    stream_id: MessageId,
+    long_message_id: MessageId,
     last_message_id: Arc<AtomicU32>,
     sender: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
     destination_addr: SocketAddr,
@@ -51,7 +51,7 @@ pub(super) async fn send_long_message(
     let mut confirm_receipts = Vec::new();
     let mut next_fragment_number = 1; // 1-indexed
 
-    let mut msg_id = stream_id;
+    let mut msg_id = long_message_id;
     loop {
         loop {
             match confirmed_sent_message_receiver.try_recv() {
@@ -87,7 +87,7 @@ pub(super) async fn send_long_message(
                 &outbound_symmetric_key,
                 std::mem::take(&mut confirm_receipts),
                 symmetric_message::LongMessageFragment {
-                    stream_id,
+                    long_message_id,
                     total_length_bytes: total_length_bytes as u64,
                     fragment_number: next_fragment_number,
                     payload: rest,

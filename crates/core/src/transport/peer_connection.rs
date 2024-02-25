@@ -240,12 +240,12 @@ impl PeerConnection {
 
     async fn outbound_stream(&mut self, data: SerializedMessage) {
         let (sent_confirm_sender, sent_confirm_recv) = mpsc::channel(1);
-        let stream_id = self
+        let long_message_id = self
             .remote_conn
             .last_message_id
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         let task = outbound_stream::send_long_message(
-            stream_id,
+            long_message_id,
             self.remote_conn.last_message_id.clone(),
             self.remote_conn.outbound_packets.clone(),
             self.remote_conn.remote_addr,
@@ -256,7 +256,7 @@ impl PeerConnection {
         );
         self.ongoing_outbound_streams.push(task.boxed());
         self.outbound_receipts_notifiers
-            .insert(stream_id, sent_confirm_sender);
+            .insert(long_message_id, sent_confirm_sender);
     }
 }
 
