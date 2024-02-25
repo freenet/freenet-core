@@ -17,6 +17,8 @@ use crate::{
     util::time_source::InstantTimeSrc,
 };
 
+use super::StreamId;
+
 pub(crate) type SerializedLongMessage = Vec<u8>;
 
 // TODO: measure the space overhead of SymmetricMessage::LongMessage since is likely less than 100
@@ -30,7 +32,7 @@ const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 100;
 /// the necessary changes are done to the codebase we will use this function
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn send_long_message(
-    long_message_id: MessageId,
+    stream_id: StreamId,
     last_message_id: Arc<AtomicU32>,
     sender: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
     destination_addr: SocketAddr,
@@ -51,7 +53,6 @@ pub(super) async fn send_long_message(
     let mut confirm_receipts = Vec::new();
     let mut next_fragment_number = 1; // 1-indexed
 
-    let mut msg_id = long_message_id;
     loop {
         loop {
             match confirmed_sent_message_receiver.try_recv() {
@@ -83,11 +84,11 @@ pub(super) async fn send_long_message(
             let idx = super::packet_sending(
                 destination_addr,
                 &sender,
-                msg_id,
+                last_message_id.fetch_add(1, std::sync::atomic::Ordering::Release),
                 &outbound_symmetric_key,
                 std::mem::take(&mut confirm_receipts),
                 symmetric_message::LongMessageFragment {
-                    long_message_id,
+                    stream_id,
                     total_length_bytes: total_length_bytes as u64,
                     fragment_number: next_fragment_number,
                     payload: rest,
@@ -95,10 +96,6 @@ pub(super) async fn send_long_message(
                 &sent_packet_tracker,
             )
             .await?;
-            if sent_so_far + 1 < total_messages {
-                // there will be more packets send, so we need to increment the message id
-                msg_id = last_message_id.fetch_add(1, std::sync::atomic::Ordering::Release);
-            }
             sent_not_confirmed.insert(idx);
             continue;
         }
@@ -133,7 +130,7 @@ mod tests {
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
 
         let result = send_long_message(
-            0,
+            StreamId::next(),
             Arc::new(AtomicU32::new(0)),
             sender,
             remote_addr,

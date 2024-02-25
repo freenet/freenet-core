@@ -6,7 +6,9 @@ use serde_with::serde_as;
 
 use crate::transport::packet_data::MAX_DATA_SIZE;
 
-use super::{packet_data::MAX_PACKET_SIZE, MessageId, MessagePayload, PacketData};
+use super::{
+    packet_data::MAX_PACKET_SIZE, peer_connection::StreamId, MessageId, MessagePayload, PacketData,
+};
 
 #[serde_as]
 #[derive(Serialize, Deserialize)]
@@ -119,7 +121,7 @@ impl From<ShortMessage> for SymmetricMessagePayload {
 }
 
 pub(super) struct LongMessageFragment {
-    pub long_message_id: MessageId,
+    pub stream_id: StreamId,
     pub total_length_bytes: u64,
     pub fragment_number: u32,
     pub payload: MessagePayload,
@@ -128,7 +130,7 @@ pub(super) struct LongMessageFragment {
 impl From<LongMessageFragment> for SymmetricMessagePayload {
     fn from(long_message_fragment: LongMessageFragment) -> Self {
         Self::LongMessageFragment {
-            message_id: long_message_fragment.long_message_id,
+            stream_id: long_message_fragment.stream_id,
             total_length_bytes: long_message_fragment.total_length_bytes,
             fragment_number: long_message_fragment.fragment_number,
             payload: long_message_fragment.payload,
@@ -152,7 +154,7 @@ pub(super) enum SymmetricMessagePayload {
         payload: MessagePayload,
     },
     LongMessageFragment {
-        message_id: u32,
+        stream_id: StreamId,
         total_length_bytes: u64, // we shouldn't allow messages larger than u32, that's already crazy big
         fragment_number: u32,
         payload: MessagePayload,
