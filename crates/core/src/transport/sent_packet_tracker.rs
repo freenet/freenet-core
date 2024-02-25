@@ -42,8 +42,8 @@ const PACKET_LOSS_DECAY_FACTOR: f64 = 1.0 / 1000.0;
 ///      ResendAction::WaitUntil(wait_until) => {
 ///        sleep_until(wait_until).await;
 ///      }
-///      ResendAction::Resend(message_id, packet) => {
-///       // Send packet and then call report_sent_packet again with the same message_id.
+///      ResendAction::Resend(packet_id, packet) => {
+///       // Send packet and then call report_sent_packet again with the same packet_id.
 ///      }
 ///   }
 /// }
@@ -84,42 +84,42 @@ impl<T: TimeSource> SentPacketTracker<T> {
         self.pending_receipts.insert(packet_id, payload);
         self.resend_queue.push_back(ResendQueueEntry {
             timeout_at: self.time_source.now() + MESSAGE_CONFIRMATION_TIMEOUT,
-            message_id: packet_id,
+            packet_id,
         });
     }
 
     pub(super) fn report_received_receipts(&mut self, packet_ids: &[PacketId]) {
-        for message_id in packet_ids {
+        for packet_id in packet_ids {
             // This can be simplified but I'm leaving it like this for readability.
             self.packet_loss_proportion = self.packet_loss_proportion
                 * (1.0 - PACKET_LOSS_DECAY_FACTOR)
                 + (PACKET_LOSS_DECAY_FACTOR * 0.0);
-            self.pending_receipts.remove(message_id);
+            self.pending_receipts.remove(packet_id);
         }
     }
 
     /// Either get a packet that needs to be resent, or how long the caller should wait until
     /// calling this function again. If a packet is resent you **must** call
-    /// `report_sent_packet` again with the same message_id.
+    /// `report_sent_packet` again with the same packet_id.
     pub(super) fn get_resend(&mut self) -> ResendAction {
         let now = self.time_source.now();
 
         while let Some(entry) = self.resend_queue.pop_front() {
             if entry.timeout_at > now {
-                if !self.pending_receipts.contains_key(&entry.message_id) {
+                if !self.pending_receipts.contains_key(&entry.packet_id) {
                     continue;
                 }
                 let wait_until = entry.timeout_at;
                 self.resend_queue.push_front(entry);
                 return ResendAction::WaitUntil(wait_until);
-            } else if let Some(packet) = self.pending_receipts.remove(&entry.message_id) {
+            } else if let Some(packet) = self.pending_receipts.remove(&entry.packet_id) {
                 // Update packet loss proportion for a lost packet
                 // Resend logic
                 self.packet_loss_proportion = self.packet_loss_proportion
                     * (1.0 - PACKET_LOSS_DECAY_FACTOR)
                     + PACKET_LOSS_DECAY_FACTOR;
 
-                return ResendAction::Resend(entry.message_id, packet);
+                return ResendAction::Resend(entry.packet_id, packet);
             }
             // If the packet is no longer in pending_receipts, it means its receipt has been received.
             // No action needed, continue to check the next entry in the queue.
@@ -137,7 +137,7 @@ pub enum ResendAction {
 
 struct ResendQueueEntry {
     timeout_at: Instant,
-    message_id: u32,
+    packet_id: u32,
 }
 
 // Unit tests
@@ -218,7 +218,7 @@ pub(in crate::transport) mod tests {
 
         // This should now trigger a resend for packet 2
         match tracker.get_resend() {
-            ResendAction::Resend(message_id, _) => assert_eq!(message_id, 2),
+            ResendAction::Resend(packet_id, _) => assert_eq!(packet_id, 2),
             _ => panic!("Expected Resend for message ID 2"),
         }
     }

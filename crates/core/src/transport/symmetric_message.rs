@@ -74,13 +74,13 @@ impl SymmetricMessage {
     }
 
     pub fn serialize_msg_to_packet_data(
-        message_id: PacketId,
+        packet_id: PacketId,
         payload: impl Into<SymmetricMessagePayload>,
         outbound_sym_key: &Aes128Gcm,
         confirm_receipt: Vec<u32>,
     ) -> Result<PacketData, bincode::Error> {
         let message = Self {
-            packet_id: message_id,
+            packet_id,
             confirm_receipt,
             payload: payload.into(),
         };
