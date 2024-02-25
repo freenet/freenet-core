@@ -1,4 +1,4 @@
-use super::{MessageId, MAX_CONFIRMATION_DELAY};
+use super::{PacketId, MAX_CONFIRMATION_DELAY};
 use crate::util::time_source::{InstantTimeSrc, TimeSource};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -50,7 +50,7 @@ const PACKET_LOSS_DECAY_FACTOR: f64 = 1.0 / 1000.0;
 /// ```
 pub(super) struct SentPacketTracker<T: TimeSource> {
     /// The list of packets that have been sent but not yet acknowledged
-    pending_receipts: HashMap<MessageId, Arc<[u8]>>,
+    pending_receipts: HashMap<PacketId, Arc<[u8]>>,
 
     resend_queue: VecDeque<ResendQueueEntry>,
 
@@ -80,16 +80,16 @@ impl<T: TimeSource> SentPacketTracker<T> {
         self.packet_loss_proportion
     }
 
-    pub(super) fn report_sent_packet(&mut self, message_id: u32, payload: Arc<[u8]>) {
-        self.pending_receipts.insert(message_id, payload);
+    pub(super) fn report_sent_packet(&mut self, packet_id: PacketId, payload: Arc<[u8]>) {
+        self.pending_receipts.insert(packet_id, payload);
         self.resend_queue.push_back(ResendQueueEntry {
             timeout_at: self.time_source.now() + MESSAGE_CONFIRMATION_TIMEOUT,
-            message_id,
+            message_id: packet_id,
         });
     }
 
-    pub(super) fn report_received_receipts(&mut self, message_ids: &[MessageId]) {
-        for message_id in message_ids {
+    pub(super) fn report_received_receipts(&mut self, packet_ids: &[PacketId]) {
+        for message_id in packet_ids {
             // This can be simplified but I'm leaving it like this for readability.
             self.packet_loss_proportion = self.packet_loss_proportion
                 * (1.0 - PACKET_LOSS_DECAY_FACTOR)

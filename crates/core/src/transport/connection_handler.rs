@@ -302,7 +302,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             outbound_symmetric_key: outbound_key,
             remote_addr,
             sent_tracker: sent_tracker.clone(),
-            last_message_id: Arc::new(AtomicU32::new(0)),
+            last_packet_id: Arc::new(AtomicU32::new(0)),
             inbound_packet_recv: mpsc::channel(100).1,
             inbound_symmetric_key: inbound_key,
         });
@@ -313,7 +313,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             .map_err(|_| TransportError::ChannelClosed)?;
 
         sent_tracker.lock().report_sent_packet(
-            SymmetricMessage::FIRST_MESSAGE_ID,
+            SymmetricMessage::FIRST_PACKET_ID,
             outbound_ack_packet.into(),
         );
 
@@ -380,7 +380,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                         .map_err(|_| TransportError::ChannelClosed)?;
                     let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
                     sent_tracker.lock().report_sent_packet(
-                        SymmetricMessage::FIRST_MESSAGE_ID,
+                        SymmetricMessage::FIRST_PACKET_ID,
                         acknowledgment.data().into(),
                     );
                     // we are connected to the remote and we just send the pub key to them
@@ -394,7 +394,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 .expect("should be set at this stage"),
                             remote_addr,
                             sent_tracker,
-                            last_message_id: Arc::new(AtomicU32::new(0)),
+                            last_packet_id: Arc::new(AtomicU32::new(0)),
                             inbound_packet_recv: inbound_recv,
                             inbound_symmetric_key: inbound_sym_key,
                         },
@@ -481,7 +481,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                             SentPacketTracker::new(),
                                                         ),
                                                     ),
-                                                    last_message_id: Arc::new(AtomicU32::new(0)),
+                                                    last_packet_id: Arc::new(AtomicU32::new(0)),
                                                     inbound_packet_recv: inbound_recv,
                                                     inbound_symmetric_key: inbound_sym_key,
                                                 },
@@ -591,7 +591,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     sent_tracker: Arc::new(parking_lot::Mutex::new(
                                         SentPacketTracker::new(),
                                     )),
-                                    last_message_id: Arc::new(AtomicU32::new(0)),
+                                    last_packet_id: Arc::new(AtomicU32::new(0)),
                                     inbound_packet_recv: inbound_recv,
                                     inbound_symmetric_key: inbound_sym_key,
                                 },

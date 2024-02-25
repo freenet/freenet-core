@@ -1,4 +1,4 @@
-use crate::transport::MessageId;
+use crate::transport::PacketId;
 use crate::util::time_source::{InstantTimeSrc, TimeSource};
 use std::collections::{HashMap, VecDeque};
 use std::mem;
@@ -33,9 +33,9 @@ const MAX_PENDING_RECEIPTS: usize = 20;
 ///  }
 /// ```
 pub(super) struct ReceivedPacketTracker<T: TimeSource> {
-    pending_receipts: Vec<MessageId>,
-    message_id_time: VecDeque<(MessageId, Instant)>,
-    time_by_message_id: HashMap<MessageId, Instant>,
+    pending_receipts: Vec<PacketId>,
+    message_id_time: VecDeque<(PacketId, Instant)>,
+    time_by_message_id: HashMap<PacketId, Instant>,
     time_source: T,
 }
 
@@ -51,7 +51,7 @@ impl ReceivedPacketTracker<InstantTimeSrc> {
 }
 
 impl<T: TimeSource> ReceivedPacketTracker<T> {
-    pub(super) fn report_received_packet(&mut self, message_id: MessageId) -> ReportResult {
+    pub(super) fn report_received_packet(&mut self, message_id: PacketId) -> ReportResult {
         self.cleanup();
         let current_time = self.time_source.now();
 
@@ -75,7 +75,7 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
     /// This should be called every time a packet is sent to ensure that receipts are sent
     /// promptly. Every `MAX_CONFIRMATION_DELAY` (50ms) this should be called and if the returned
     /// list is not empty, the list should be sent as receipts immediately in a noop packet.
-    pub(super) fn get_receipts(&mut self) -> Vec<MessageId> {
+    pub(super) fn get_receipts(&mut self) -> Vec<PacketId> {
         self.cleanup();
 
         mem::take(self.pending_receipts.as_mut())
@@ -181,12 +181,12 @@ pub(in crate::transport) mod tests {
 
         for i in 0..(MAX_PENDING_RECEIPTS - 1) {
             assert_eq!(
-                tracker.report_received_packet(i as MessageId),
+                tracker.report_received_packet(i as PacketId),
                 ReportResult::Ok
             );
         }
         assert_eq!(
-            tracker.report_received_packet((MAX_PENDING_RECEIPTS as MessageId) + 1),
+            tracker.report_received_packet((MAX_PENDING_RECEIPTS as PacketId) + 1),
             ReportResult::QueueFull
         );
         assert_eq!(tracker.pending_receipts.len(), MAX_PENDING_RECEIPTS);

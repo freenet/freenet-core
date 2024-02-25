@@ -19,7 +19,8 @@ mod sent_packet_tracker;
 mod symmetric_message;
 
 type MessagePayload = Vec<u8>;
-type MessageId = u32;
+
+type PacketId = u32;
 
 use self::{packet_data::PacketData, peer_connection::StreamId};
 
@@ -109,7 +110,7 @@ mod tests {
         }
 
         // Simulate receiving some packets
-        for id in [1, 3, 5] {
+        for id in [1u32, 3, 5] {
             assert_eq!(
                 received_tracker.report_received_packet(id),
                 ReportResult::Ok
@@ -118,7 +119,7 @@ mod tests {
 
         // Get receipts and simulate acknowledging them
         let receipts = received_tracker.get_receipts();
-        assert_eq!(receipts, vec![1, 3, 5]);
+        assert_eq!(receipts, vec![1u32, 3, 5]);
         sent_tracker.report_received_receipts(&receipts);
 
         // Check resend action for lost packets
@@ -127,8 +128,8 @@ mod tests {
             .advance_time(MESSAGE_CONFIRMATION_TIMEOUT);
         for id in [2, 4] {
             match sent_tracker.get_resend() {
-                ResendAction::Resend(message_id, packet) => {
-                    assert_eq!(message_id, id);
+                ResendAction::Resend(packet_id, packet) => {
+                    assert_eq!(packet_id, id);
                     // Simulate resending packet
                     sent_tracker.report_sent_packet(id, packet);
                 }

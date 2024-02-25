@@ -7,21 +7,21 @@ use serde_with::serde_as;
 use crate::transport::packet_data::MAX_DATA_SIZE;
 
 use super::{
-    packet_data::MAX_PACKET_SIZE, peer_connection::StreamId, MessageId, MessagePayload, PacketData,
+    packet_data::MAX_PACKET_SIZE, peer_connection::StreamId, MessagePayload, PacketData, PacketId,
 };
 
 #[serde_as]
 #[derive(Serialize, Deserialize)]
 pub(super) struct SymmetricMessage {
     // TODO: make sure we handle wrapping around the u32 properly
-    pub message_id: MessageId,
+    pub packet_id: PacketId,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub confirm_receipt: Vec<MessageId>,
+    pub confirm_receipt: Vec<PacketId>,
     pub payload: SymmetricMessagePayload,
 }
 
 impl SymmetricMessage {
-    pub const FIRST_MESSAGE_ID: u32 = 0u32;
+    pub const FIRST_PACKET_ID: u32 = 0u32;
 
     pub fn deser(bytes: &[u8]) -> Result<Self, bincode::Error> {
         bincode::deserialize(bytes)
@@ -44,7 +44,7 @@ impl SymmetricMessage {
         let bytes = SERIALIZED.get_or_init(move || {
             let mut packet = [0u8; MAX_PACKET_SIZE];
             let size = bincode::serialized_size(&SymmetricMessage {
-                message_id: Self::FIRST_MESSAGE_ID,
+                packet_id: Self::FIRST_PACKET_ID,
                 confirm_receipt: vec![],
                 payload: SymmetricMessagePayload::AckConnection { result: Ok(()) },
             })
@@ -61,7 +61,7 @@ impl SymmetricMessage {
         key: [u8; 16],
     ) -> Result<PacketData, bincode::Error> {
         let message = Self {
-            message_id: Self::FIRST_MESSAGE_ID,
+            packet_id: Self::FIRST_PACKET_ID,
             confirm_receipt: vec![],
             payload: SymmetricMessagePayload::GatewayConnection { key },
         };
@@ -74,13 +74,13 @@ impl SymmetricMessage {
     }
 
     pub fn serialize_msg_to_packet_data(
-        message_id: MessageId,
+        message_id: PacketId,
         payload: impl Into<SymmetricMessagePayload>,
         outbound_sym_key: &Aes128Gcm,
         confirm_receipt: Vec<u32>,
     ) -> Result<PacketData, bincode::Error> {
         let message = Self {
-            message_id,
+            packet_id: message_id,
             confirm_receipt,
             payload: payload.into(),
         };
@@ -93,7 +93,7 @@ impl SymmetricMessage {
     }
 
     const ACK_ERROR: SymmetricMessage = SymmetricMessage {
-        message_id: Self::FIRST_MESSAGE_ID,
+        packet_id: Self::FIRST_PACKET_ID,
         confirm_receipt: Vec::new(),
         payload: SymmetricMessagePayload::AckConnection {
             // TODO: change to return UnsupportedProtocolVersion

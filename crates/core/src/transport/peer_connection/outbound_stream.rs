@@ -6,7 +6,7 @@ use std::sync::Arc;
 use aes_gcm::Aes128Gcm;
 use tokio::sync::mpsc;
 
-use crate::transport::MessageId;
+use crate::transport::PacketId;
 use crate::{
     transport::{
         packet_data,
@@ -27,18 +27,21 @@ pub(crate) type SerializedLongMessage = Vec<u8>;
 const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 100;
 
 // TODO: unit test
-/// Handles sending a long message which is not being streamed,
+/// Handles sending a long message which is not being streamed, in the future
+/// this will be replaced by streaming messages. The identifier is indistingishable
+/// from a long message id and a stream id, as they are representing the same thing.
+
 /// streaming messages will be tackled differently, in the interim time before
 /// the necessary changes are done to the codebase we will use this function
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn send_long_message(
     stream_id: StreamId,
-    last_message_id: Arc<AtomicU32>,
+    last_packet_id: Arc<AtomicU32>,
     sender: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
     destination_addr: SocketAddr,
     mut message_to_send: SerializedLongMessage,
     outbound_symmetric_key: Aes128Gcm,
-    mut confirmed_sent_message_receiver: mpsc::Receiver<MessageId>,
+    mut confirmed_sent_message_receiver: mpsc::Receiver<PacketId>,
     sent_packet_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
 ) -> Result<(), TransportError> {
     let total_length_bytes = message_to_send.len() as u32;
@@ -81,10 +84,11 @@ pub(super) async fn send_long_message(
             };
             std::mem::swap(&mut message_to_send, &mut rest);
             next_fragment_number += 1;
-            let idx = super::packet_sending(
+            let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::Release);
+            super::packet_sending(
                 destination_addr,
                 &sender,
-                last_message_id.fetch_add(1, std::sync::atomic::Ordering::Release),
+                packet_id,
                 &outbound_symmetric_key,
                 std::mem::take(&mut confirm_receipts),
                 symmetric_message::LongMessageFragment {
@@ -96,7 +100,7 @@ pub(super) async fn send_long_message(
                 &sent_packet_tracker,
             )
             .await?;
-            sent_not_confirmed.insert(idx);
+            sent_not_confirmed.insert(packet_id);
             continue;
         }
 
