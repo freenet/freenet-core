@@ -2,7 +2,6 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::{
     collections::{HashMap, HashSet},
-    pin::Pin,
     sync::Arc,
 };
 
@@ -10,19 +9,19 @@ use asynchronous_codec::BytesMut;
 use dashmap::{DashMap, DashSet};
 use either::{Either, Left, Right};
 use futures::stream::FuturesUnordered;
-use futures::{FutureExt, StreamExt, TryFutureExt};
+use futures::{FutureExt, StreamExt};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::Instrument;
 
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::message::ConnectionResult;
-use crate::node::network_bridge::p2p_protoc::ConnMngrActions::{
-    ClosedChannel, ConnectionEstablished, NodeAction, SendMessage,
-};
+
 use crate::node::PeerId;
 use crate::operations::connect::{ConnectMsg, ConnectRequest};
-use crate::transport::{BytesPerSecond, ConnectionHandler, PeerConnection, TransportKeypair};
+use crate::transport::{
+    BytesPerSecond, ConnectionHandler, PeerConnection, TransportError, TransportKeypair,
+};
 use crate::{
     client_events::ClientId,
     config::GlobalExecutor,
@@ -38,6 +37,8 @@ use crate::{
     ring::PeerKeyLocation,
     tracing::NetEventLog,
 };
+
+type EncodedNetMessage = Vec<u8>;
 
 /// The default maximum size for a varint length-delimited packet.
 pub const DEFAULT_MAX_PACKET_SIZE: usize = 16 * 1024;
@@ -201,7 +202,6 @@ impl P2pConnManager {
         let mut tx_to_client: HashMap<Transaction, ClientId> = HashMap::new();
 
         let mut peer_connections = FuturesUnordered::new();
-
         loop {
             let notification_msg = notification_channel.0.recv().map(|m| match m {
                 None => Ok(Right(ClosedChannel)),
@@ -225,7 +225,7 @@ impl P2pConnManager {
                             {
                                 match self
                                     .conn_handler
-                                    .connect(peer.pub_key, peer.addr, true)
+                                    .connect(peer.pub_key.clone(), peer.addr, true)
                                     .await
                                 {
                                     Ok(peer_conn) => {
@@ -253,14 +253,21 @@ impl P2pConnManager {
 
             let msg: Result<_, ConnectionError> = tokio::select! {
                 msg = peer_connections.next(), if !peer_connections.is_empty() => {
-                    match msg {
-                        Some(Ok(incoming_msg)) => {
-                            let incoming_msg: Vec<u8> = incoming_msg;
-                            let netwiork_msg = decode_msg(BytesMut::from(incoming_msg.as_slice())).map_err(|err| anyhow::anyhow!(err))?;
-                            Ok(Left(netwiork_msg))
-                        },
-                        _ => Ok(Right(ClosedChannel))
-                    }
+                    let PeerConnectionInbound { conn, rx, msg } = match msg {
+                        Some(Ok(peer_conn)) => peer_conn,
+                        Some(Err(err)) => {
+                            tracing::error!("Error in peer connection: {err}");
+                            // FIXME: clean up the remote connection from everywhere
+                            continue;
+                        }
+                        None =>  {
+                            tracing::error!("All peer connections closed");
+                            continue;
+                        }
+                    };
+                    let task = peer_connection_listener(rx, conn).boxed();
+                    peer_connections.push(task);
+                    Ok(Left(msg))
                 }
                 msg = notification_msg => { msg }
                 msg = bridge_msg => { msg }
@@ -362,38 +369,19 @@ impl P2pConnManager {
                     }
                     return Ok(());
                 }
-                Ok(Right(ConnectionEstablished {
-                    peer,
-                    mut peer_conn,
-                })) => {
+                Ok(Right(ConnectionEstablished { peer, peer_conn })) => {
                     let addr = peer.addr.clone();
                     tracing::debug!("Established connection with peer @ {}", addr);
                     self.bridge
                         .active_net_connections
                         .insert(peer.clone(), addr);
 
-                    let (tx, mut rx) = mpsc::channel(100);
+                    let (tx, rx) = mpsc::channel(10);
                     self.connection.insert(peer.clone(), tx);
 
-                    // Spawn a task to handle the connection outbound messages
-                    tokio::spawn(async move {
-                        loop {
-                            tokio::select! {
-                                Some(msg) = rx.recv() => {
-                                    peer_conn
-                                        .send(&msg)
-                                        .await
-                                        .map_err(|err| ConnectionError::IOError(err.to_string()))?;
-                                }
-                                else => {
-                                    break;
-                                }
-                            }
-                        }
-                        Ok::<_, ConnectionError>(())
-                    });
-
-                    peer_connections.push(peer_conn.recv());
+                    // Spawn a task to handle the connection messages (inbound and outbound)
+                    let task = peer_connection_listener(rx, peer_conn).boxed();
+                    peer_connections.push(task);
                 }
                 Ok(Right(ConnectionClosed { peer: peer_id }))
                 | Ok(Right(NodeAction(NodeEvent::DropConnection(peer_id)))) => {
@@ -471,13 +459,40 @@ enum ProtocolStatus {
     Failed,
 }
 
+struct PeerConnectionInbound {
+    conn: PeerConnection,
+    /// Receiver for inbound messages for the peer connection
+    rx: Receiver<NetMessage>,
+    msg: NetMessage,
+}
+
+async fn peer_connection_listener(
+    mut rx: mpsc::Receiver<NetMessage>,
+    mut conn: PeerConnection,
+) -> Result<PeerConnectionInbound, TransportError> {
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                let Some(msg) = msg else { break Err(TransportError::ConnectionClosed); };
+                conn
+                    .send(msg)
+                    .await?;
+            }
+            msg = conn.recv() => {
+                let msg = msg.unwrap();
+                let net_message = decode_msg(&msg).unwrap();
+                break Ok(PeerConnectionInbound { conn, rx, msg: net_message });
+            }
+        }
+    }
+}
+
 #[inline(always)]
 fn encode_msg(msg: NetMessage) -> Result<Vec<u8>, ConnectionError> {
     bincode::serialize(&msg).map_err(|err| ConnectionError::Serialization(Some(err)))
 }
 
 #[inline(always)]
-fn decode_msg(buf: BytesMut) -> Result<NetMessage, ConnectionError> {
-    let cursor = std::io::Cursor::new(buf);
-    bincode::deserialize_from(cursor).map_err(|err| ConnectionError::Serialization(Some(err)))
+fn decode_msg(data: &[u8]) -> Result<NetMessage, ConnectionError> {
+    bincode::deserialize(data).map_err(|err| ConnectionError::Serialization(Some(err)))
 }
