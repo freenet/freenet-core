@@ -1,14 +1,14 @@
-use crate::transport::peer_connection::outbound_stream::SerializedLongMessage;
+use crate::transport::peer_connection::outbound_long_msg::SerializedLongMessage;
 use std::collections::BTreeMap;
 
-pub(crate) struct InboundStream {
+pub(crate) struct InboundLongMessage {
     total_length_bytes: u64,
     last_contiguous_fragment_idx: u32,
     non_contiguous_fragments: BTreeMap<u32, Vec<u8>>,
     message: Vec<u8>,
 }
 
-impl InboundStream {
+impl InboundLongMessage {
     pub(crate) fn new(total_length_bytes: u64) -> Self {
         Self {
             total_length_bytes,
@@ -55,11 +55,11 @@ impl InboundStream {
 #[cfg(test)]
 mod tests {
     mod receiver_stream {
-        use super::super::InboundStream;
+        use super::super::InboundLongMessage;
 
         #[test]
         fn test_simple_sequence() {
-            let mut stream = InboundStream::new(6);
+            let mut stream = InboundLongMessage::new(6);
             assert_eq!(stream.push_fragment(0, vec![1, 2, 3]), None);
             assert_eq!(
                 stream.push_fragment(1, vec![4, 5, 6]),
@@ -71,7 +71,7 @@ mod tests {
 
         #[test]
         fn test_out_of_order_fragment_1() {
-            let mut stream = InboundStream::new(6);
+            let mut stream = InboundLongMessage::new(6);
             assert_eq!(stream.push_fragment(0, vec![1, 2]), None);
             assert_eq!(stream.push_fragment(2, vec![5, 6]), None);
             assert_eq!(
@@ -84,7 +84,7 @@ mod tests {
 
         #[test]
         fn test_out_of_order_fragment_2() {
-            let mut stream = InboundStream::new(6);
+            let mut stream = InboundLongMessage::new(6);
             assert_eq!(stream.push_fragment(1, vec![3, 4]), None);
             assert_eq!(stream.push_fragment(2, vec![5, 6]), None);
             assert_eq!(

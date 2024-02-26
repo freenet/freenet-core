@@ -49,8 +49,8 @@ pub(crate) enum TransportError {
     ConnectionClosed,
     #[error("failed while establishing connection, reason: {cause}")]
     ConnectionEstablishmentFailure { cause: Cow<'static, str> },
-    #[error("incomplete inbound stream: {0}")]
-    IncompleteInboundStream(LongMessageId),
+    #[error("incomplete inbound long message: {0}")]
+    IncompleteInboundLongMessage(LongMessageId),
     #[error(transparent)]
     IO(#[from] std::io::Error),
     #[error(transparent)]
