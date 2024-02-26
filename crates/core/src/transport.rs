@@ -22,7 +22,7 @@ type MessagePayload = Vec<u8>;
 
 type PacketId = u32;
 
-use self::{packet_data::PacketData, peer_connection::StreamId};
+use self::{packet_data::PacketData, peer_connection::LongMessageId};
 
 /// We can wait up to 100ms to confirm a message was received, this allows us to batch
 /// receipts together and send them in a single message.
@@ -50,7 +50,7 @@ pub(crate) enum TransportError {
     #[error("failed while establishing connection, reason: {cause}")]
     ConnectionEstablishmentFailure { cause: Cow<'static, str> },
     #[error("incomplete inbound stream: {0}")]
-    IncompleteInboundStream(StreamId),
+    IncompleteInboundStream(LongMessageId),
     #[error(transparent)]
     IO(#[from] std::io::Error),
     #[error(transparent)]

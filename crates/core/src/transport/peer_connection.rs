@@ -41,16 +41,16 @@ pub(super) struct RemoteConnection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(transparent)]
-pub(crate) struct StreamId(u32);
+pub(crate) struct LongMessageId(u32);
 
-impl StreamId {
+impl LongMessageId {
     fn next() -> Self {
         static NEXT_ID: AtomicU32 = AtomicU32::new(0);
         Self(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Release))
     }
 }
 
-impl std::fmt::Display for StreamId {
+impl std::fmt::Display for LongMessageId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }
@@ -63,11 +63,11 @@ impl std::fmt::Display for StreamId {
 pub(crate) struct PeerConnection {
     remote_conn: RemoteConnection,
     received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
-    inbound_streams: HashMap<StreamId, mpsc::Sender<(u32, Vec<u8>)>>,
+    inbound_streams: HashMap<LongMessageId, mpsc::Sender<(u32, Vec<u8>)>>,
     ongoing_inbound_streams:
         FuturesUnordered<Pin<Box<dyn Future<Output = Result<SerializedMessage>> + Send>>>,
     ongoing_outbound_streams: FuturesUnordered<Pin<Box<dyn Future<Output = Result> + Send>>>,
-    outbound_receipts_notifiers: HashMap<StreamId, mpsc::Sender<u32>>,
+    outbound_receipts_notifiers: HashMap<LongMessageId, mpsc::Sender<u32>>,
 }
 
 impl PeerConnection {
@@ -186,22 +186,22 @@ impl PeerConnection {
             AckConnection { .. } => Ok(None),
             GatewayConnection { .. } => Ok(None),
             LongMessageFragment {
-                stream_id,
+                long_message_id,
                 total_length_bytes,
                 fragment_number,
                 payload,
             } => {
-                if let Some(sender) = self.inbound_streams.get(&stream_id) {
+                if let Some(sender) = self.inbound_streams.get(&long_message_id) {
                     sender
                         .send((fragment_number, payload))
                         .await
                         .map_err(|_| TransportError::ConnectionClosed)?;
                 } else {
                     let (sender, mut receiver) = mpsc::channel(1);
-                    self.inbound_streams.insert(stream_id, sender);
+                    self.inbound_streams.insert(long_message_id, sender);
                     let mut stream = inbound_stream::InboundStream::new(total_length_bytes);
                     if let Some(msg) = stream.push_fragment(fragment_number, payload) {
-                        self.inbound_streams.remove(&stream_id);
+                        self.inbound_streams.remove(&long_message_id);
                         return Ok(Some(msg));
                     }
                     self.ongoing_inbound_streams.push(
@@ -211,7 +211,7 @@ impl PeerConnection {
                                     return Ok(msg);
                                 }
                             }
-                            Err(TransportError::IncompleteInboundStream(stream_id))
+                            Err(TransportError::IncompleteInboundStream(long_message_id))
                         }
                         .boxed(),
                     );
@@ -260,9 +260,9 @@ impl PeerConnection {
 
     async fn outbound_stream(&mut self, data: SerializedMessage) {
         let (sent_confirm_sender, sent_confirm_recv) = mpsc::channel(1);
-        let stream_id = StreamId::next();
+        let long_message_id = LongMessageId::next();
         let task = outbound_stream::send_long_message(
-            stream_id,
+            long_message_id,
             self.remote_conn.last_packet_id.clone(),
             self.remote_conn.outbound_packets.clone(),
             self.remote_conn.remote_addr,
@@ -273,7 +273,7 @@ impl PeerConnection {
         );
         self.ongoing_outbound_streams.push(task.boxed());
         self.outbound_receipts_notifiers
-            .insert(stream_id, sent_confirm_sender);
+            .insert(long_message_id, sent_confirm_sender);
     }
 }
 
@@ -322,7 +322,7 @@ mod tests {
 
         // Send a long message using the outbound stream
         let send_result = send_long_message(
-            StreamId::next(),
+            LongMessageId::next(),
             Arc::new(AtomicU32::new(0)),
             sender.clone(),
             remote_addr,
