@@ -12,8 +12,8 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-mod inbound_long_msg;
-mod outbound_long_msg;
+mod inbound_stream;
+mod outbound_stream;
 
 use super::{
     connection_handler::SerializedMessage,
@@ -41,33 +41,50 @@ pub(super) struct RemoteConnection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(transparent)]
-pub(crate) struct LongMessageId(u32);
+pub(crate) struct StreamId(u32);
 
-impl LongMessageId {
+impl StreamId {
     fn next() -> Self {
         static NEXT_ID: AtomicU32 = AtomicU32::new(0);
         Self(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Release))
     }
 }
 
-impl std::fmt::Display for LongMessageId {
+impl std::fmt::Display for StreamId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }
 }
 
-/// Handles the connection with a remote peer.
+/// The `PeerConnection` struct is responsible for managing the connection with a remote peer.
+/// It provides methods for sending and receiving messages to and from the remote peer.
 ///
-/// Can be awaited for incoming messages or used to send messages to the remote peer.
+/// The `PeerConnection` struct maintains the state of the connection, including the remote
+/// connection details, trackers for received and sent packets, and futures for inbound and
+/// outbound streams.
+///
+/// The `send` method is used to send serialized data to the remote peer. If the data size
+/// exceeds the maximum allowed size, it is sent as a stream; otherwise, it is sent as a
+/// short message.
+///
+/// The `recv` method is used to receive incoming packets from the remote peer. It listens for
+/// incoming packets or receipts, and resends packets if necessary.
+///
+/// The `process_inbound` method is used to process incoming payloads based on their type.
+///
+/// The `noop`, `outbound_short_message`, and `outbound_stream` methods are used internally for
+/// sending different types of messages.
+///
+/// The `packet_sending` function is a helper function used to send packets to the remote peer.
 #[must_use = "call await on the `recv` function to start listening for incoming messages"]
 pub(crate) struct PeerConnection {
     remote_conn: RemoteConnection,
     received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
-    inbound_long_messages: HashMap<LongMessageId, mpsc::Sender<(u32, Vec<u8>)>>,
-    ongoing_inbound_long_messages:
+    inbound_streams: HashMap<StreamId, mpsc::Sender<(u32, Vec<u8>)>>,
+    inbound_stream_futures:
         FuturesUnordered<Pin<Box<dyn Future<Output = Result<SerializedMessage>> + Send>>>,
-    ongoing_outbound_long_messages: FuturesUnordered<Pin<Box<dyn Future<Output = Result> + Send>>>,
-    outbound_receipts_notifiers: HashMap<LongMessageId, mpsc::Sender<u32>>,
+    outbound_stream_futures: FuturesUnordered<Pin<Box<dyn Future<Output = Result> + Send>>>,
+    outbound_receipts_notifiers: HashMap<StreamId, mpsc::Sender<u32>>,
 }
 
 impl PeerConnection {
@@ -75,9 +92,9 @@ impl PeerConnection {
         Self {
             remote_conn,
             received_tracker: ReceivedPacketTracker::new(),
-            inbound_long_messages: HashMap::new(),
-            ongoing_inbound_long_messages: FuturesUnordered::new(),
-            ongoing_outbound_long_messages: FuturesUnordered::new(),
+            inbound_streams: HashMap::new(),
+            inbound_stream_futures: FuturesUnordered::new(),
+            outbound_stream_futures: FuturesUnordered::new(),
             outbound_receipts_notifiers: HashMap::new(),
         }
     }
@@ -136,14 +153,14 @@ impl PeerConnection {
                         },
                     }
                 }
-                inbound_stream = self.ongoing_inbound_long_messages.next(), if !self.ongoing_inbound_long_messages.is_empty() => {
+                inbound_stream = self.inbound_stream_futures.next(), if !self.inbound_stream_futures.is_empty() => {
                     let Some(res) = inbound_stream else {
                         tracing::error!("unexpected no-stream from ongoing_inbound_streams");
                         continue
                     };
                     return res;
                 }
-                outbound_stream = self.ongoing_outbound_long_messages.next(), if !self.ongoing_outbound_long_messages.is_empty() => {
+                outbound_stream = self.outbound_stream_futures.next(), if !self.outbound_stream_futures.is_empty() => {
                     let Some(res) = outbound_stream else {
                         tracing::error!("unexpected no-stream from ongoing_outbound_streams");
                         continue
@@ -185,35 +202,33 @@ impl PeerConnection {
             ShortMessage { payload } => Ok(Some(payload)),
             AckConnection { .. } => Ok(None),
             GatewayConnection { .. } => Ok(None),
-            LongMessageFragment {
-                long_message_id,
+            StreamFragment {
+                stream_id: stream_id,
                 total_length_bytes,
                 fragment_number,
                 payload,
             } => {
-                if let Some(sender) = self.inbound_long_messages.get(&long_message_id) {
+                if let Some(sender) = self.inbound_streams.get(&stream_id) {
                     sender
                         .send((fragment_number, payload))
                         .await
                         .map_err(|_| TransportError::ConnectionClosed)?;
                 } else {
                     let (sender, mut receiver) = mpsc::channel(1);
-                    self.inbound_long_messages.insert(long_message_id, sender);
-                    let mut stream = inbound_long_msg::InboundLongMessage::new(total_length_bytes);
+                    self.inbound_streams.insert(stream_id, sender);
+                    let mut stream = inbound_stream::InboundStream::new(total_length_bytes);
                     if let Some(msg) = stream.push_fragment(fragment_number, payload) {
-                        self.inbound_long_messages.remove(&long_message_id);
+                        self.inbound_streams.remove(&stream_id);
                         return Ok(Some(msg));
                     }
-                    self.ongoing_inbound_long_messages.push(
+                    self.inbound_stream_futures.push(
                         async move {
                             while let Some((fragment_number, payload)) = receiver.recv().await {
                                 if let Some(msg) = stream.push_fragment(fragment_number, payload) {
                                     return Ok(msg);
                                 }
                             }
-                            Err(TransportError::IncompleteInboundLongMessage(
-                                long_message_id,
-                            ))
+                            Err(TransportError::IncompleteInboundStream(stream_id))
                         }
                         .boxed(),
                     );
@@ -262,9 +277,9 @@ impl PeerConnection {
 
     async fn outbound_stream(&mut self, data: SerializedMessage) {
         let (sent_confirm_sender, sent_confirm_recv) = mpsc::channel(1);
-        let long_message_id = LongMessageId::next();
-        let task = outbound_long_msg::send_long_message(
-            long_message_id,
+        let stream_id = StreamId::next();
+        let task = outbound_stream::send_stream(
+            stream_id,
             self.remote_conn.last_packet_id.clone(),
             self.remote_conn.outbound_packets.clone(),
             self.remote_conn.remote_addr,
@@ -273,9 +288,9 @@ impl PeerConnection {
             sent_confirm_recv,
             self.remote_conn.sent_tracker.clone(),
         );
-        self.ongoing_outbound_long_messages.push(task.boxed());
+        self.outbound_stream_futures.push(task.boxed());
         self.outbound_receipts_notifiers
-            .insert(long_message_id, sent_confirm_sender);
+            .insert(stream_id, sent_confirm_sender);
     }
 }
 
@@ -306,8 +321,8 @@ async fn packet_sending(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::peer_connection::inbound_long_msg::InboundLongMessage;
-    use crate::transport::peer_connection::outbound_long_msg::send_long_message;
+    use crate::transport::peer_connection::inbound_stream::InboundStream;
+    use crate::transport::peer_connection::outbound_stream::send_stream;
     use aes_gcm::KeyInit;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use tokio::sync::mpsc;
@@ -323,8 +338,8 @@ mod tests {
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
 
         // Send a long message using the outbound stream
-        let send_result = send_long_message(
-            LongMessageId::next(),
+        let send_result = send_stream(
+            StreamId::next(),
             Arc::new(AtomicU32::new(0)),
             sender.clone(),
             remote_addr,
@@ -338,7 +353,7 @@ mod tests {
         assert!(send_result.is_ok());
 
         // Create an inbound stream to receive the message
-        let mut inbound_stream = InboundLongMessage::new(message.len() as u64);
+        let mut inbound_stream = InboundStream::new(message.len() as u64);
 
         // Simulate receiving the message
         while let Some((_, received_message)) = receiver.recv().await {

@@ -1,5 +1,9 @@
 # Freenet Transport Protocol (FrTP)
 
+**Note**: This document is a work in progress and is subject to change, it is currently out-of-sync
+with the codebase and should be updated to reflect the current state of the codebase once it has
+stabilized.
+
 ## Introduction
 
 The Freenet Transport Protocol (FrTP) is a UDP-based system designed to ensure reliable and encrypted
@@ -106,28 +110,33 @@ is terminated if a peer fails to receive any message within 120 seconds.
 ## Symmetric Message Schema
 
 ```rust
-pub struct SymmetricMessage {
-    pub message_id: u16,
-    // Unique number for message tracking and duplicate detection
-    pub confirm_receipt: Vec<u16>,
-    // Confirmation mechanism to identify dropped messages
+pub(super) struct SymmetricMessage {
+    pub packet_id: PacketId,
+    pub confirm_receipt: Vec<PacketId>,
     pub payload: SymmetricMessagePayload,
 }
 
-pub enum SymmetricMessagePayload {
-    AcknowledgeHello { result : Result<(), HelloError> },
-    NoOperation,
-    KeepAlive {
-        /// Arbitrary data peers can share with their neighbors
-        metadata: HashMap<String, Vec<u8>>
+pub(super) enum SymmetricMessagePayload {
+    AckConnection {
+        // if we successfully connected to a remote we attempt to connect to initially
+        // then we return our TransportPublicKey so they can enroute other peers to us
+        result: Result<(), Cow<'static, str>>,
     },
-    Disconnect,
-    ShortMessage { payload: Vec<u8> },
-    LongMessageFragment {
-        total_length_bytes: u64,
+    GatewayConnection {
+        // a gateway acknowledges a connection and returns the private key to use
+        // for communication
+        key: [u8; 16],
+    },
+    ShortMessage {
+        payload: MessagePayload,
+    },
+    StreamFragment {
+        stream_id: StreamId,
+        total_length_bytes: u64, // we shouldn't allow messages larger than u32, that's already crazy big
         fragment_number: u32,
         payload: MessagePayload,
     },
+    NoOp,
 }
 
 pub enum HelloError {

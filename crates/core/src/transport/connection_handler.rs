@@ -129,10 +129,10 @@ impl ConnectionHandler {
 
 pub enum Message {
     Short(Vec<u8>),
-    Long(Vec<u8>, mpsc::Receiver<LongMessageFragment>),
+    Streamed(Vec<u8>, mpsc::Receiver<StreamFragment>),
 }
 
-pub struct LongMessageFragment {
+pub struct StreamFragment {
     pub fragment_number: u32,
     pub fragment: Vec<u8>,
 }

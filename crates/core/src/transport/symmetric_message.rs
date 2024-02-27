@@ -7,8 +7,7 @@ use serde_with::serde_as;
 use crate::transport::packet_data::MAX_DATA_SIZE;
 
 use super::{
-    packet_data::MAX_PACKET_SIZE, peer_connection::LongMessageId, MessagePayload, PacketData,
-    PacketId,
+    packet_data::MAX_PACKET_SIZE, peer_connection::StreamId, MessagePayload, PacketData, PacketId,
 };
 
 #[serde_as]
@@ -121,20 +120,20 @@ impl From<ShortMessage> for SymmetricMessagePayload {
     }
 }
 
-pub(super) struct LongMessageFragment {
-    pub long_message_id: LongMessageId,
+pub(super) struct StreamFragment {
+    pub stream_id: StreamId,
     pub total_length_bytes: u64,
     pub fragment_number: u32,
     pub payload: MessagePayload,
 }
 
-impl From<LongMessageFragment> for SymmetricMessagePayload {
-    fn from(long_message_fragment: LongMessageFragment) -> Self {
-        Self::LongMessageFragment {
-            long_message_id: long_message_fragment.long_message_id,
-            total_length_bytes: long_message_fragment.total_length_bytes,
-            fragment_number: long_message_fragment.fragment_number,
-            payload: long_message_fragment.payload,
+impl From<StreamFragment> for SymmetricMessagePayload {
+    fn from(stream_fragment: StreamFragment) -> Self {
+        Self::StreamFragment {
+            stream_id: stream_fragment.stream_id,
+            total_length_bytes: stream_fragment.total_length_bytes,
+            fragment_number: stream_fragment.fragment_number,
+            payload: stream_fragment.payload,
         }
     }
 }
@@ -154,8 +153,8 @@ pub(super) enum SymmetricMessagePayload {
     ShortMessage {
         payload: MessagePayload,
     },
-    LongMessageFragment {
-        long_message_id: LongMessageId,
+    StreamFragment {
+        stream_id: StreamId,
         total_length_bytes: u64, // we shouldn't allow messages larger than u32, that's already crazy big
         fragment_number: u32,
         payload: MessagePayload,

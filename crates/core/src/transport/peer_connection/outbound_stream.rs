@@ -17,9 +17,9 @@ use crate::{
     util::time_source::InstantTimeSrc,
 };
 
-use super::LongMessageId;
+use super::StreamId;
 
-pub(crate) type SerializedLongMessage = Vec<u8>;
+pub(crate) type SerializedStream = Vec<u8>;
 
 // TODO: measure the space overhead of SymmetricMessage::LongMessage since is likely less than 100
 /// The max payload we can send in a single fragment, this MUST be less than packet_data::MAX_DATA_SIZE
@@ -27,26 +27,22 @@ pub(crate) type SerializedLongMessage = Vec<u8>;
 const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 100;
 
 // TODO: unit test
-/// Handles sending a long message which is not being streamed, in the future
-/// this will be replaced by streaming messages. The identifier is indistingishable
-/// from a long message id and a stream id, as they are representing the same thing.
-
-/// streaming messages will be tackled differently, in the interim time before
-/// the necessary changes are done to the codebase we will use this function
+/// Handles sending a stream that is *not piped*. In the future this will be replaced by
+/// piped streams which start forwarding before the stream has been received.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn send_long_message(
-    long_message_id: LongMessageId,
+pub(super) async fn send_stream(
+    stream_id: StreamId,
     last_packet_id: Arc<AtomicU32>,
     sender: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
     destination_addr: SocketAddr,
-    mut message_to_send: SerializedLongMessage,
+    mut stream_to_send: SerializedStream,
     outbound_symmetric_key: Aes128Gcm,
-    mut confirmed_sent_message_receiver: mpsc::Receiver<PacketId>,
+    mut confirmed_sent_packet_receiver: mpsc::Receiver<PacketId>,
     sent_packet_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
 ) -> Result<(), TransportError> {
-    let total_length_bytes = message_to_send.len() as u32;
-    let mut total_messages = message_to_send.len() / MAX_DATA_SIZE;
-    total_messages += if message_to_send.len() % MAX_DATA_SIZE == 0 {
+    let total_length_bytes = stream_to_send.len() as u32;
+    let mut total_packets = stream_to_send.len() / MAX_DATA_SIZE;
+    total_packets += if stream_to_send.len() % MAX_DATA_SIZE == 0 {
         0
     } else {
         1
@@ -58,7 +54,7 @@ pub(super) async fn send_long_message(
 
     loop {
         loop {
-            match confirmed_sent_message_receiver.try_recv() {
+            match confirmed_sent_packet_receiver.try_recv() {
                 Ok(idx) => {
                     if sent_not_confirmed.remove(&idx) {
                         sent_confirmed += 1;
@@ -74,15 +70,15 @@ pub(super) async fn send_long_message(
         }
 
         let sent_so_far = sent_confirmed + sent_not_confirmed.len();
-        if sent_so_far < total_messages {
+        if sent_so_far < total_packets {
             let mut rest = {
-                if message_to_send.len() > MAX_DATA_SIZE {
-                    message_to_send.split_off(MAX_DATA_SIZE)
+                if stream_to_send.len() > MAX_DATA_SIZE {
+                    stream_to_send.split_off(MAX_DATA_SIZE)
                 } else {
-                    std::mem::take(&mut message_to_send)
+                    std::mem::take(&mut stream_to_send)
                 }
             };
-            std::mem::swap(&mut message_to_send, &mut rest);
+            std::mem::swap(&mut stream_to_send, &mut rest);
             next_fragment_number += 1;
             let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::Release);
             super::packet_sending(
@@ -91,8 +87,8 @@ pub(super) async fn send_long_message(
                 packet_id,
                 &outbound_symmetric_key,
                 std::mem::take(&mut confirm_receipts),
-                symmetric_message::LongMessageFragment {
-                    long_message_id,
+                symmetric_message::StreamFragment {
+                    stream_id: stream_id,
                     total_length_bytes: total_length_bytes as u64,
                     fragment_number: next_fragment_number,
                     payload: rest,
@@ -104,12 +100,12 @@ pub(super) async fn send_long_message(
             continue;
         }
 
-        if message_to_send.is_empty() && sent_not_confirmed.is_empty() {
+        if stream_to_send.is_empty() && sent_not_confirmed.is_empty() {
             break;
         }
 
-        // we sent all messages (self.message is empty) but we still need to confirm all were received
-        debug_assert!(message_to_send.is_empty());
+        // we sent all packets (self.package is empty) but we still need to confirm all were received
+        debug_assert!(stream_to_send.is_empty());
         debug_assert!(!sent_not_confirmed.is_empty());
     }
 
@@ -124,7 +120,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[tokio::test]
-    async fn test_send_long_message_success() {
+    async fn test_send_stream_success() {
         let (sender, _receiver) = mpsc::channel(100);
         let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let message = vec![1, 2, 3, 4, 5];
@@ -133,8 +129,8 @@ mod tests {
         let (sent_confirmed_send, sent_confirmed_recv) = mpsc::channel(100);
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
 
-        let result = send_long_message(
-            LongMessageId::next(),
+        let result = send_stream(
+            StreamId::next(),
             Arc::new(AtomicU32::new(0)),
             sender,
             remote_addr,
