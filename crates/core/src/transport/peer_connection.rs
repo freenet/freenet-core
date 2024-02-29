@@ -203,7 +203,7 @@ impl PeerConnection {
             AckConnection { .. } => Ok(None),
             GatewayConnection { .. } => Ok(None),
             StreamFragment {
-                stream_id: stream_id,
+                stream_id,
                 total_length_bytes,
                 fragment_number,
                 payload,

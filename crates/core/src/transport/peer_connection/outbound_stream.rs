@@ -88,7 +88,7 @@ pub(super) async fn send_stream(
                 &outbound_symmetric_key,
                 std::mem::take(&mut confirm_receipts),
                 symmetric_message::StreamFragment {
-                    stream_id: stream_id,
+                    stream_id,
                     total_length_bytes: total_length_bytes as u64,
                     fragment_number: next_fragment_number,
                     payload: rest,
@@ -121,7 +121,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_stream_success() {
-        let (sender, _receiver) = mpsc::channel(100);
+        let (outbound_sender, _outbound_receiver) = mpsc::channel(100);
         let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let message = vec![1, 2, 3, 4, 5];
         let key = rand::random::<[u8; 16]>();
@@ -129,10 +129,35 @@ mod tests {
         let (sent_confirmed_send, sent_confirmed_recv) = mpsc::channel(100);
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
 
+        // todo: in a background task (tokio::spawn) listen to the send_stream
+
+        // and in the main thread we collect from outbound_receiver
+        // and when the backgound task completes call `.await`, we check that after decrypting all the inbound packets
+        // the message is complete
+        /*
+        e.g.
+        let background_task = tokio::task(async move {
+            let result = send_stream(...).await;
+            Ok(result)
+        });
+
+        let mut inbound_bytes = Vec::new();
+        while let Some(packet) = outbound_receiver.recv().await {
+            let descrypted_packet = PacketData:decrypt(packet);
+            inbound_bytes.extend_from_slice(descrypted_packet);
+        }
+
+        let result = background_task.await.unwrap();
+
+        assert_eq!(result, inbound_bytes);
+        */
+
+        // todo: in order to test this, we need to use the `sent_confirmed_send` to send a confirmation
+        // that the packet was received
         let result = send_stream(
             StreamId::next(),
             Arc::new(AtomicU32::new(0)),
-            sender,
+            outbound_sender,
             remote_addr,
             message,
             cipher,
