@@ -115,58 +115,51 @@ pub(super) async fn send_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::packet_data::PacketData;
     use aes_gcm::KeyInit;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn test_send_stream_success() {
-        let (outbound_sender, _outbound_receiver) = mpsc::channel(100);
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(100);
         let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let message = vec![1, 2, 3, 4, 5];
+        let message_clone = message.clone();
         let key = rand::random::<[u8; 16]>();
         let cipher = Aes128Gcm::new(&key.into());
+        let cipher_clone = cipher.clone();
         let (sent_confirmed_send, sent_confirmed_recv) = mpsc::channel(100);
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
 
-        // todo: in a background task (tokio::spawn) listen to the send_stream
-
-        // and in the main thread we collect from outbound_receiver
-        // and when the backgound task completes call `.await`, we check that after decrypting all the inbound packets
-        // the message is complete
-        /*
-        e.g.
-        let background_task = tokio::task(async move {
-            let result = send_stream(...).await;
-            Ok(result)
+        let background_task = tokio::spawn(async move {
+            let result = send_stream(
+                StreamId::next(),
+                Arc::new(AtomicU32::new(0)),
+                outbound_sender,
+                remote_addr,
+                message.clone(),
+                cipher.clone(),
+                sent_confirmed_recv,
+                sent_tracker,
+            )
+            .await;
+            result
         });
 
         let mut inbound_bytes = Vec::new();
         while let Some(packet) = outbound_receiver.recv().await {
-            let descrypted_packet = PacketData:decrypt(packet);
-            inbound_bytes.extend_from_slice(descrypted_packet);
+            let packet_data: PacketData = packet.1.as_ref().into();
+
+            let decrypted_packet = packet_data.decrypt(&cipher_clone).unwrap();
+
+            inbound_bytes.extend_from_slice(decrypted_packet.data());
         }
 
         let result = background_task.await.unwrap();
 
-        assert_eq!(result, inbound_bytes);
-        */
-
-        // todo: in order to test this, we need to use the `sent_confirmed_send` to send a confirmation
-        // that the packet was received
-        let result = send_stream(
-            StreamId::next(),
-            Arc::new(AtomicU32::new(0)),
-            outbound_sender,
-            remote_addr,
-            message,
-            cipher,
-            sent_confirmed_recv,
-            sent_tracker,
-        )
-        .await;
-
         assert!(result.is_ok());
+        assert_eq!(message_clone, inbound_bytes);
     }
 
     // Add more tests here for other scenarios
