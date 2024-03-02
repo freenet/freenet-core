@@ -69,7 +69,7 @@ impl NetworkBridge for MemoryConnManager {
             .await;
         self.op_manager.sending_transaction(target, &msg);
         let msg = bincode::serialize(&msg)?;
-        self.transport.send(*target, msg);
+        self.transport.send(target.clone(), msg);
         Ok(())
     }
 
@@ -141,7 +141,7 @@ impl InMemoryTransport {
                             msg.origin
                         );
                         if rng.gen_bool(0.5) && delayed.len() < MAX_DELAYED_MSG && add_noise {
-                            delayed.entry(msg.target).or_default().push(msg);
+                            delayed.entry(msg.target).or_default().push(msg.clone());
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         } else {
                             let mut queue = msg_stack_queue_cp.lock().await;
@@ -187,7 +187,7 @@ impl InMemoryTransport {
 
     fn send(&self, peer: PeerId, message: Vec<u8>) {
         let send_res = self.network.send(MessageOnTransit {
-            origin: self.interface_peer,
+            origin: self.interface_peer.clone(),
             target: peer,
             data: message,
         });

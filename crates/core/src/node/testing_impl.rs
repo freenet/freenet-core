@@ -191,7 +191,7 @@ impl<S> EventChain<S> {
         let rng = &mut this.rng;
         let labels = &mut this.labels;
         let (_, id) = labels.choose(rng).expect("not empty");
-        *id
+        id.clone()
     }
 
     fn set_choice(self: Pin<&mut Self>, id: PeerId) {
@@ -253,7 +253,7 @@ impl<S: EventSender> futures::stream::Stream for EventChain<S> {
                 }) {
                 std::task::Poll::Ready(_) => {}
                 std::task::Poll::Pending => {
-                    self.as_mut().set_choice(id);
+                    self.as_mut().set_choice(id.clone());
                     return std::task::Poll::Pending;
                 }
             }
@@ -297,10 +297,10 @@ impl<ER: NetEventRegister> Builder<ER> {
         contract_handler_name: String,
         add_noise: bool,
     ) -> Builder<ER> {
-        let peer_key = builder.peer_id;
+        let peer_key = builder.clone().peer_id.unwrap();
         Builder {
             peer_key,
-            config: builder,
+            config: builder.clone(),
             contract_handler_name,
             add_noise,
             event_register,
@@ -476,7 +476,7 @@ impl SimNetwork {
             } in &gateways
             {
                 config.add_gateway(
-                    InitPeerNode::new(*id, *location)
+                    InitPeerNode::new(id.clone(), *location)
                         .listening_ip(Ipv6Addr::LOCALHOST)
                         .listening_port(*port),
                 );
@@ -611,7 +611,7 @@ impl SimNetwork {
             locations_by_node.insert(
                 label.clone(),
                 PeerKeyLocation {
-                    peer: node.peer_key,
+                    peer: node.peer_key.clone(),
                     location: None,
                 },
             );
@@ -620,7 +620,7 @@ impl SimNetwork {
             locations_by_node.insert(
                 config.label.clone(),
                 PeerKeyLocation {
-                    peer: node.peer_key,
+                    peer: node.peer_key.clone(),
                     location: config.location.into(),
                 },
             );
@@ -670,7 +670,7 @@ impl SimNetwork {
     pub fn ring_distribution(&self, scale: i32) -> Vec<(f64, usize)> {
         let mut all_dists = Vec::with_capacity(self.labels.len());
         for (.., key) in &self.labels {
-            all_dists.push(self.event_listener.connections(*key));
+            all_dists.push(self.event_listener.connections(key.clone()));
         }
         let mut dist_buckets = group_locations_in_buckets(
             all_dists.into_iter().flatten().map(|(_, l)| l.as_f64()),
@@ -690,10 +690,10 @@ impl SimNetwork {
         for (label, key) in &self.labels {
             let conns = self
                 .event_listener
-                .connections(*key)
+                .connections(key.clone())
                 .map(|(k, d)| (key_to_label[&k].clone(), d))
                 .collect::<HashMap<_, _>>();
-            peers_connections.insert(label.clone(), (*key, conns));
+            peers_connections.insert(label.clone(), (key.clone(), conns));
         }
         peers_connections
     }
@@ -999,7 +999,7 @@ where
     connect::initial_join_procedure(
         &config.op_manager,
         &mut config.conn_manager,
-        config.peer_key.clone(),
+        config.peer_key.pub_key.clone(),
         &config.gateways,
     )
     .await?;
@@ -1096,7 +1096,7 @@ where
         if let Ok(Either::Left(NetMessage::Aborted(tx))) = msg {
             super::handle_aborted_op(
                 tx,
-                peer_key.clone(),
+                peer_key.pub_key.clone(),
                 &op_manager,
                 &mut conn_manager,
                 &gateways,

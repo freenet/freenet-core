@@ -68,20 +68,19 @@ impl SimPeer {
         let contract_handler = MemoryContractHandler::build(
             ch_channel,
             executor_sender,
-            self.config.peer_id.to_string(),
+            self.config.peer_id.clone().unwrap().to_string(),
         )
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
 
         let conn_manager = InterProcessConnManager::new(event_register.clone(), op_manager.clone());
 
-        GlobalExecutor::spawn(
-            contract::contract_handling(contract_handler)
-                .instrument(tracing::info_span!("contract_handling", peer = %self.config.peer_id)),
-        );
+        GlobalExecutor::spawn(contract::contract_handling(contract_handler).instrument(
+            tracing::info_span!("contract_handling", peer = %self.config.peer_id.clone().unwrap()),
+        ));
 
         let running_node = super::RunnerConfig {
-            peer_key: self.config.peer_id,
+            peer_key: self.config.peer_id.clone().unwrap(),
             op_manager,
             notification_channel,
             conn_manager,

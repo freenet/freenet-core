@@ -215,7 +215,7 @@ impl Operation for PutOp {
                     return_msg = Some(PutMsg::SeekNode {
                         id: *id,
                         sender,
-                        target: *target,
+                        target: target.clone(),
                         value: value.clone(),
                         contract: contract.clone(),
                         related_contracts: related_contracts.clone(),
@@ -306,7 +306,7 @@ impl Operation for PutOp {
                         last_hop,
                         op_manager,
                         self.state,
-                        (broadcast_to, *sender),
+                        (broadcast_to, sender.clone()),
                         key.clone(),
                         (contract.clone(), value.clone()),
                     )
@@ -351,7 +351,7 @@ impl Operation for PutOp {
                         false,
                         op_manager,
                         self.state,
-                        (broadcast_to, *sender),
+                        (broadcast_to, sender.clone()),
                         key.clone(),
                         (contract.clone(), new_value),
                     )
@@ -382,7 +382,7 @@ impl Operation for PutOp {
                             id: *id,
                             key: key.clone(),
                             new_value: new_value.clone(),
-                            sender,
+                            sender: sender.clone(),
                             contract: contract.clone(),
                         };
                         let f = conn_manager.send(&peer.peer, msg.into());
@@ -422,7 +422,7 @@ impl Operation for PutOp {
                     // Subscriber nodes have been notified of the change, the operation is completed
                     return_msg = Some(PutMsg::SuccessfulPut {
                         id: *id,
-                        target: *upstream,
+                        target: upstream.clone(),
                     });
                     new_state = None;
                 }
@@ -431,14 +431,14 @@ impl Operation for PutOp {
                         Some(PutState::AwaitingResponse { key, upstream }) => {
                             let is_subscribed_contract = op_manager.ring.is_seeding_contract(&key);
                             if !is_subscribed_contract && op_manager.ring.should_seed(&key) {
-                                tracing::debug!(tx = %id, %key, peer = %op_manager.ring.peer_key, "Contract not cached @ peer, caching");
+                                tracing::debug!(tx = %id, %key, peer = %op_manager.ring.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
                                 super::start_subscription_request(op_manager, key.clone(), true)
                                     .await;
                             }
                             tracing::info!(
                                 tx = %id,
                                 %key,
-                                this_peer = %op_manager.ring.peer_key,
+                                this_peer = %op_manager.ring.get_peer_key().unwrap(),
                                 "Peer completed contract value put",
                             );
                             new_state = Some(PutState::Finished { key });
@@ -487,7 +487,7 @@ impl Operation for PutOp {
                     // if successful, forward to the next closest peers (if any)
                     let last_hop = if let Some(new_htl) = htl.checked_sub(1) {
                         let mut new_skip_list = skip_list.clone();
-                        new_skip_list.push(sender.peer);
+                        new_skip_list.push(sender.peer.clone());
                         // only hop forward if there are closer peers
                         let put_here = forward_put(
                             op_manager,
@@ -520,7 +520,7 @@ impl Operation for PutOp {
                                             NetMessage::Unsubscribed {
                                                 transaction: Transaction::new::<PutMsg>(),
                                                 key: key.clone(),
-                                                from: op_manager.ring.peer_key,
+                                                from: op_manager.ring.get_peer_key().unwrap(),
                                             },
                                         )
                                         .await?;
@@ -547,7 +547,7 @@ impl Operation for PutOp {
                         last_hop,
                         op_manager,
                         self.state,
-                        (broadcast_to, *sender),
+                        (broadcast_to, sender.clone()),
                         key.clone(),
                         (contract.clone(), new_value.clone()),
                     )

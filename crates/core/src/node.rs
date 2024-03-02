@@ -250,14 +250,14 @@ impl NodeConfig {
     /// Returns all specified gateways for this peer. Returns an error if the peer is not a gateway
     /// and no gateways are specified.
     fn get_gateways(&self) -> Result<Vec<PeerKeyLocation>, anyhow::Error> {
-        let peer = self.peer_id;
+        let peer = self.peer_id.clone();
         let gateways: Vec<_> = self
             .remote_nodes
             .iter()
             .filter_map(|node| {
                 if node.addr.is_some() {
                     Some(PeerKeyLocation {
-                        peer: node.identifier,
+                        peer: node.identifier.clone(),
                         location: Some(node.location),
                     })
                 } else {
@@ -398,9 +398,13 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                     contract,
                     related_contracts,
                 } => {
+                    let peer_id = op_manager
+                        .ring
+                        .get_peer_key()
+                        .expect("Peer id not found at put op, it should be set");
                     // Initialize a put op.
                     tracing::debug!(
-                        this_peer = %op_manager.ring.peer_key,
+                        this_peer = %peer_id,
                         "Received put from user event",
                     );
                     let op = put::start_op(
@@ -419,8 +423,12 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                 }
                 ContractRequest::Update { key, data } => {
                     // FIXME: perform updates
+                    let peer_id = op_manager
+                        .ring
+                        .get_peer_key()
+                        .expect("Peer id not found at update op, it should be set");
                     tracing::debug!(
-                        this_peer = %op_manager.ring.peer_key,
+                        this_peer = %peer_id,
                         "Received update from user event",
                     );
                     let state = match data {
@@ -449,9 +457,13 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                     key,
                     fetch_contract: contract,
                 } => {
+                    let peer_id = op_manager
+                        .ring
+                        .get_peer_key()
+                        .expect("Peer id not found at get op, it should be set");
                     // Initialize a get op.
                     tracing::debug!(
-                        this_peer = %op_manager.ring.peer_key,
+                        this_peer = %peer_id,
                         "Received get from user event",
                     );
                     let op = get::start_op(key, contract);
@@ -575,7 +587,7 @@ async fn report_result(
                         second_trace_lines.join("\n")
                     })
                     .unwrap_or_default();
-                let peer = &op_manager.ring.peer_key;
+                let peer = &op_manager.ring.get_peer_key().expect("Peer key not found");
                 let log = format!(
                     "Transaction ({tx} @ {peer}) error trace:\n {trace} \nstate:\n {state:?}\n"
                 );
@@ -774,7 +786,7 @@ async fn subscribe(op_manager: Arc<OpManager>, key: ContractKey, client_id: Opti
 
 async fn handle_aborted_op<CM>(
     tx: Transaction,
-    this_peer: PeerId,
+    this_peer_pub_key: TransportPublicKey,
     op_manager: &OpManager,
     conn_manager: &mut CM,
     gateways: &[PeerKeyLocation],
@@ -783,7 +795,6 @@ where
     CM: NetworkBridge + Send,
 {
     use crate::util::IterExt;
-    let peer_pub_key = this_peer.clone().pub_key;
     if let TransactionType::Connect = tx.transaction_type() {
         // attempt to establish a connection failed, this could be a fatal error since the node
         // is useless without connecting to the network, we will retry with exponential backoff
@@ -801,7 +812,7 @@ where
                     tracing::warn!("Retry connecting to gateway {}", gateway.peer);
                     connect::join_ring_request(
                         backoff,
-                        peer_pub_key,
+                        this_peer_pub_key,
                         &gateway,
                         op_manager,
                         conn_manager,
@@ -811,17 +822,12 @@ where
             }
             Ok(Some(OpEnum::Connect(_))) => {
                 // if no connections were achieved just fail
-                if op_manager.ring.open_connections() == 0 {
+                if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
                     tracing::warn!("Retrying joining the ring with an other gateway");
-                    if let Some(gateway) = gateways
-                        .iter()
-                        .shuffle()
-                        .next()
-                        .filter(|p| p.peer != this_peer)
-                    {
+                    if let Some(gateway) = gateways.iter().shuffle().next() {
                         connect::join_ring_request(
                             None,
-                            peer_pub_key,
+                            this_peer_pub_key,
                             gateway,
                             op_manager,
                             conn_manager,

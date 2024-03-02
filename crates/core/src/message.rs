@@ -224,7 +224,7 @@ mod sealed_msg_type {
     });
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum NetMessage {
     Connect(ConnectMsg),
     Put(PutMsg),

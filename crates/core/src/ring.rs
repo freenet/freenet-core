@@ -34,6 +34,7 @@ use crate::message::TransactionType;
 use crate::topology::rate::Rate;
 use crate::topology::{Limits, TopologyAdjustment, TopologyManager};
 use crate::tracing::{NetEventLog, NetEventRegister};
+use crate::transport::TransportPublicKey;
 use crate::util::Contains;
 use crate::{
     config::GlobalExecutor,
@@ -183,6 +184,7 @@ pub(crate) struct Ring {
     pub rnd_if_htl_above: usize,
     pub max_hops_to_live: usize,
     peer_key: Mutex<Option<PeerId>>,
+    peer_pub_key: TransportPublicKey,
     pub max_connections: usize,
     pub min_connections: usize,
     router: Arc<RwLock<Router>>,
@@ -256,7 +258,9 @@ impl Ring {
         let (live_tx_tracker, missing_candidate_rx) = LiveTransactionTracker::new();
 
         //FIXME: The config.peer_id field should be optional and only set in the gateways.
-        let peer_key = config.peer_id.clone().unwrap();
+        let peer_key = Mutex::new(config.peer_id.clone());
+
+        let peer_pub_key = config.pub_key.clone();
 
         // for location here consider -1 == None
         let own_location = AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()));
@@ -319,6 +323,7 @@ impl Ring {
             location_for_peer: RwLock::new(BTreeMap::new()),
             own_location,
             peer_key,
+            peer_pub_key,
             subscribers: DashMap::new(),
             seeding_contract: DashMap::new(),
             open_connections: AtomicUsize::new(0),
@@ -352,12 +357,20 @@ impl Ring {
     }
 
     pub fn get_peer_key(&self) -> Option<PeerId> {
-        *self.peer_key.lock()
+        self.peer_key.lock().clone()
     }
 
     pub fn set_peer_key(&self, peer_key: PeerId) {
         // TODO: insert only if is none
         *self.peer_key.lock() = Some(peer_key);
+    }
+
+    pub fn get_peer_pub_key(&self) -> TransportPublicKey {
+        self.peer_pub_key.clone()
+    }
+
+    pub fn is_gateway(&self) -> bool {
+        self.is_gateway
     }
 
     pub fn open_connections(&self) -> usize {
@@ -474,10 +487,8 @@ impl Ring {
         } else {
             Some(Location(location))
         };
-        PeerKeyLocation {
-            peer: self.peer_key,
-            location,
-        }
+        let peer = self.get_peer_key().expect("peer key not set");
+        PeerKeyLocation { peer, location }
     }
 
     /// Whether a node should accept a new node connection or not based
@@ -538,12 +549,12 @@ impl Ring {
         let mut cbl = self.connections_by_location.write();
         cbl.entry(loc).or_default().push(Connection {
             location: PeerKeyLocation {
-                peer,
+                peer: peer.clone(),
                 location: Some(loc),
             },
             open_at: Instant::now(),
         });
-        self.location_for_peer.write().insert(peer, loc);
+        self.location_for_peer.write().insert(peer.clone(), loc);
         std::mem::drop(cbl);
         self.refresh_density_request_cache()
     }
@@ -589,7 +600,7 @@ impl Ring {
         self.topology_manager
             .write()
             .report_outbound_request(event.peer, event.contract_location);
-        self.router.write().add_event(event);
+        self.router.write().add_event(event.clone());
     }
 
     /// Get a random peer from the known ring connections.
@@ -615,7 +626,7 @@ impl Ring {
                 continue;
             } else {
                 return Some(PeerKeyLocation {
-                    peer: *peer,
+                    peer: peer.clone(),
                     location: Some(*loc),
                 });
             }
@@ -706,7 +717,7 @@ impl Ring {
             .range(..location)
             .filter_map(|(_, conns)| {
                 let conn = conns.choose(&mut rand::thread_rng()).unwrap();
-                (!skip_list.contains(&conn.location.peer)).then_some(conn.location)
+                (!skip_list.contains(&conn.location.peer)).then_some(conn.location.clone())
             })
             .next_back()
     }

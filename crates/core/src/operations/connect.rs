@@ -161,13 +161,13 @@ impl Operation for ConnectOp {
                         );
                         if let Some(desirable_peer) = op_manager
                             .ring
-                            .closest_to_location(*ideal_location, &[joiner.peer])
+                            .closest_to_location(*ideal_location, &[joiner.peer.clone()])
                         {
                             let msg = ConnectMsg::Request {
                                 id: *id,
                                 msg: ConnectRequest::Proxy {
                                     sender: own_loc,
-                                    joiner: *joiner,
+                                    joiner: joiner.clone(),
                                     hops_to_live: *max_hops_to_live,
                                     skip_list: vec![*this_peer, joiner.peer],
                                     accepted_by: HashSet::new(),
@@ -178,16 +178,16 @@ impl Operation for ConnectOp {
                                 .await?;
                             return_msg = None;
                             new_state = Some(ConnectState::AwaitingConnectionAcquisition {
-                                joiner: *joiner,
+                                joiner: joiner.clone(),
                             });
                         } else {
                             return_msg = Some(ConnectMsg::Response {
                                 id: *id,
-                                sender: *query_target,
-                                target: *joiner,
+                                sender: query_target.clone(),
+                                target: joiner.clone(),
                                 msg: ConnectResponse::Proxy {
                                     accepted_by: HashSet::new(),
-                                    joiner: joiner.peer,
+                                    joiner: joiner.peer.clone(),
                                 },
                             });
                             new_state = None;
@@ -202,14 +202,14 @@ impl Operation for ConnectOp {
                         );
                         debug_assert_eq!(this_peer, &joiner.peer);
                         new_state = Some(ConnectState::AwaitingNewConnection {
-                            query_target: query_target.peer,
+                            query_target: query_target.peer.clone(),
                         });
                         let msg = ConnectMsg::Request {
                             id: *id,
                             msg: ConnectRequest::FindOptimalPeer {
-                                query_target: *query_target,
+                                query_target: query_target.clone(),
                                 ideal_location: *ideal_location,
-                                joiner: *joiner,
+                                joiner: joiner.clone(),
                                 max_hops_to_live: *max_hops_to_live,
                             },
                         };
@@ -228,6 +228,8 @@ impl Operation for ConnectOp {
                             ..
                         },
                 } => {
+                    let joiner_peer_id = joiner.clone().expect("joiner peer id is missing");
+
                     // likely a gateway which accepts connections
                     // TODO: Add from to the trace
                     tracing::debug!(
@@ -239,28 +241,29 @@ impl Operation for ConnectOp {
 
                     // todo: location should be based on your public IP
                     let new_location = assigned_location.unwrap_or_else(Location::random);
-                    let accepted_by = if op_manager.ring.should_accept(new_location, joiner) {
-                        // TODO: Add joiner to the trace
-                        tracing::debug!(tx = %id, "Accepting connection from");
-                        HashSet::from_iter([*this_peer])
-                    } else {
-                        // TODO: Add joiner to the trace
-                        tracing::debug!(tx = %id, at = %this_peer.peer, "Rejecting connection");
-                        HashSet::new()
-                    };
+                    let accepted_by =
+                        if op_manager.ring.should_accept(new_location, &joiner_peer_id) {
+                            // TODO: Add joiner to the trace
+                            tracing::debug!(tx = %id, "Accepting connection from");
+                            HashSet::from_iter([this_peer.clone()])
+                        } else {
+                            // TODO: Add joiner to the trace
+                            tracing::debug!(tx = %id, at = %this_peer.peer, "Rejecting connection");
+                            HashSet::new()
+                        };
 
                     let new_peer_loc = PeerKeyLocation {
                         location: Some(new_location),
-                        peer: joiner.unwrap(), //FIXME: Fix this unwrap
+                        peer: joiner_peer_id,
                     };
                     if let Some(mut updated_state) = forward_conn(
                         *id,
                         &op_manager.ring,
                         network_bridge,
-                        (new_peer_loc, new_peer_loc),
+                        (new_peer_loc, new_peer_loc.clone()),
                         *hops_to_live,
                         accepted_by.clone(),
-                        vec![this_peer.peer, *joiner.unwrap()], //FIXME: Fix this unwrap
+                        vec![this_peer.peer, joiner.clone().unwrap()], //FIXME: Fix this unwrap
                     )
                     .await?
                     {
@@ -287,14 +290,14 @@ impl Operation for ConnectOp {
                         }
                         return_msg = Some(ConnectMsg::Response {
                             id: *id,
-                            sender: *this_peer,
+                            sender: this_peer.clone(),
                             msg: ConnectResponse::AcceptedBy {
                                 peers: accepted_by,
                                 your_location: new_location,
-                                your_peer_id: *joiner,
+                                your_peer_id: joiner_peer_id.clone(),
                             },
                             target: PeerKeyLocation {
-                                peer: *joiner,
+                                peer: joiner_peer_id.clone(),
                                 location: Some(new_location),
                             },
                         });
@@ -337,12 +340,12 @@ impl Operation for ConnectOp {
                     }
 
                     let mut skip_list = skip_list.clone();
-                    skip_list.push(own_loc.peer);
+                    skip_list.push(own_loc.peer.clone());
                     if let Some(mut updated_state) = forward_conn(
                         *id,
                         &op_manager.ring,
                         network_bridge,
-                        (*sender, *joiner),
+                        (sender.clone(), joiner.clone()),
                         *hops_to_live,
                         accepted_by.clone(),
                         skip_list,
@@ -361,7 +364,7 @@ impl Operation for ConnectOp {
                                     sender,
                                     &own_loc,
                                     accepted_by,
-                                    joiner.peer,
+                                    joiner.peer.clone(),
                                 );
                                 new_state = state;
                                 return_msg = msg;
@@ -397,7 +400,7 @@ impl Operation for ConnectOp {
                     // Set the given location
                     let pk_loc = PeerKeyLocation {
                         location: Some(*your_location),
-                        peer: *your_peer_id,
+                        peer: your_peer_id.clone(),
                     };
 
                     let Some(ConnectState::Connecting(ConnectionInfo { gateway, .. })) = self.state
@@ -418,11 +421,11 @@ impl Operation for ConnectOp {
                             return_msg = Some(ConnectMsg::Response {
                                 id: *id,
                                 msg: ConnectResponse::ReceivedOC {
-                                    by_peer: pk_loc,
-                                    gateway,
+                                    by_peer: pk_loc.clone(),
+                                    gateway: gateway.clone(),
                                 },
-                                sender: pk_loc,
-                                target: gateway,
+                                sender: pk_loc.clone(),
+                                target: gateway.clone(),
                             });
                         } else {
                             return_msg = None;
@@ -439,15 +442,15 @@ impl Operation for ConnectOp {
                             let _ = propagate_oc_to_responding_peers(
                                 network_bridge,
                                 op_manager,
-                                gateway,
+                                gateway.clone(),
                                 other_peer,
                                 ConnectMsg::Response {
                                     id: *id,
-                                    target: *other_peer,
-                                    sender: pk_loc,
+                                    target: other_peer.clone(),
+                                    sender: pk_loc.clone(),
                                     msg: ConnectResponse::ReceivedOC {
-                                        by_peer: pk_loc,
-                                        gateway,
+                                        by_peer: pk_loc.clone(),
+                                        gateway: gateway.clone(),
                                     },
                                 },
                             )
@@ -512,7 +515,7 @@ impl Operation for ConnectOp {
                                 return_msg = Some(ConnectMsg::Response {
                                     id: *id,
                                     target: original_target,
-                                    sender: *target,
+                                    sender: target.clone(),
                                     msg: ConnectResponse::AcceptedBy {
                                         peers: previously_accepted,
                                         your_location: new_location,
@@ -531,10 +534,10 @@ impl Operation for ConnectOp {
                                 return_msg = Some(ConnectMsg::Response {
                                     id: *id,
                                     target: original_target,
-                                    sender: *target,
+                                    sender: target.clone(),
                                     msg: ConnectResponse::Proxy {
                                         accepted_by: previously_accepted,
-                                        joiner: *joiner,
+                                        joiner: joiner.clone(),
                                     },
                                 });
                             }
@@ -543,16 +546,16 @@ impl Operation for ConnectOp {
                             return_msg = Some(ConnectMsg::Response {
                                 id: *id,
                                 target: joiner,
-                                sender: *target,
+                                sender: target.clone(),
                                 msg: ConnectResponse::Proxy {
                                     accepted_by: accepted_by.clone(),
-                                    joiner: joiner.peer,
+                                    joiner: joiner.peer.clone(),
                                 },
                             });
                             new_state = None;
                         }
                         Some(ConnectState::AwaitingNewConnection { query_target }) => {
-                            let joiner = *target;
+                            let joiner = target.clone();
                             if accepted_by.is_empty() {
                                 op_manager
                                     .ring
@@ -566,15 +569,15 @@ impl Operation for ConnectOp {
                                     propagate_oc_to_responding_peers(
                                         network_bridge,
                                         op_manager,
-                                        *sender,
+                                        sender.clone(),
                                         peer,
                                         ConnectMsg::Response {
                                             id: *id,
-                                            sender: joiner,
-                                            target: *peer,
+                                            sender: joiner.clone(),
+                                            target: peer.clone(),
                                             msg: ConnectResponse::ReceivedOC {
-                                                by_peer: joiner,
-                                                gateway: *sender, // irrelevant in this case
+                                                by_peer: joiner.clone(),
+                                                gateway: sender.clone(), // irrelevant in this case
                                             },
                                         },
                                     )
@@ -605,8 +608,8 @@ impl Operation for ConnectOp {
                                 tracing::debug!(tx = %id, from = %by_peer.peer, at = %target.peer, "Acknowledge connected at gateway");
                                 return_msg = Some(ConnectMsg::Connected {
                                     id: *id,
-                                    sender: *target,
-                                    target: *sender,
+                                    sender: target.clone(),
+                                    target: sender.clone(),
                                 });
                                 new_state = Some(ConnectState::Connected);
                             } else {
@@ -627,10 +630,12 @@ impl Operation for ConnectOp {
                         }
                     }
 
-                    network_bridge.try_add_connection(sender.peer).await?;
+                    network_bridge
+                        .try_add_connection(sender.peer.clone())
+                        .await?;
                     op_manager.ring.add_connection(
                         sender.location.ok_or(ConnectionError::LocationUnknown)?,
-                        sender.peer,
+                        sender.peer.clone(),
                     );
                     tracing::debug!(tx = %id, from = %by_peer.peer, "Opened connection with peer");
                     if target != gateway {
@@ -657,10 +662,12 @@ impl Operation for ConnectOp {
                         assigned_location = ?op_manager.ring.own_location().location,
                         "Successfully completed connection",
                     );
-                    network_bridge.try_add_connection(sender.peer).await?;
+                    network_bridge
+                        .try_add_connection(sender.peer.clone())
+                        .await?;
                     op_manager.ring.add_connection(
                         sender.location.ok_or(ConnectionError::LocationUnknown)?,
-                        sender.peer,
+                        sender.peer.clone(),
                     );
                     new_state = None;
                 }
@@ -715,9 +722,9 @@ fn try_returning_proxy_connection(
             accepted_by,
             joiner,
         },
-        sender: *own_loc,
+        sender: own_loc.clone(),
         id: *id,
-        target: *sender,
+        target: sender.clone(),
     });
     (new_state, return_msg)
 }

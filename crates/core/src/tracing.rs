@@ -127,7 +127,7 @@ impl<'a> NetEventLog<'a> {
     pub fn route_event(tx: &'a Transaction, ring: &'a Ring, route_event: &RouteEvent) -> Self {
         NetEventLog {
             tx,
-            peer_id: &ring.peer_key,
+            peer_id: &ring.get_peer_key().unwrap(),
             kind: EventKind::Route(route_event.clone()),
         }
     }
@@ -135,7 +135,7 @@ impl<'a> NetEventLog<'a> {
     pub fn connected(ring: &'a Ring, peer: PeerId, location: Location) -> Self {
         NetEventLog {
             tx: Transaction::NULL,
-            peer_id: &ring.peer_key,
+            peer_id: &ring.get_peer_key().unwrap(),
             kind: EventKind::Connect(ConnectEvent::Connected {
                 this: ring.own_location(),
                 connected: PeerKeyLocation {
@@ -149,7 +149,7 @@ impl<'a> NetEventLog<'a> {
     pub fn disconnected(ring: &'a Ring, from: &'a PeerId) -> Self {
         NetEventLog {
             tx: Transaction::NULL,
-            peer_id: &ring.peer_key,
+            peer_id: &ring.get_peer_key().unwrap(),
             kind: EventKind::Disconnected { from: from.clone() },
         }
     }
@@ -203,7 +203,7 @@ impl<'a> NetEventLog<'a> {
         };
         Either::Left(NetEventLog {
             tx: msg.id(),
-            peer_id: &ring.peer_key,
+            peer_id: &ring.get_peer_key().unwrap(),
             kind,
         })
     }
@@ -222,7 +222,7 @@ impl<'a> NetEventLog<'a> {
                     },
                 ..
             }) => {
-                let this_peer = &op_manager.ring.peer_key;
+                let this_peer = &op_manager.ring.get_peer_key().unwrap();
                 let mut events = peers
                     .iter()
                     .map(|peer| {
@@ -262,7 +262,7 @@ impl<'a> NetEventLog<'a> {
                 })
             }
             NetMessage::Put(PutMsg::SuccessfulPut { .. }) => EventKind::Put(PutEvent::PutSuccess {
-                requester: op_manager.ring.peer_key.clone(),
+                requester: op_manager.ring.get_peer_key().unwrap(),
             }),
             NetMessage::Put(PutMsg::Broadcasting {
                 new_value,
@@ -302,7 +302,7 @@ impl<'a> NetEventLog<'a> {
         };
         Either::Left(NetEventLog {
             tx: msg.id(),
-            peer_id: &op_manager.ring.peer_key,
+            peer_id: &op_manager.ring.get_peer_key().unwrap(),
             kind,
         })
     }

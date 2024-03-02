@@ -84,7 +84,6 @@ impl NetworkBridge for P2pBridge {
         if self.active_net_connections.contains_key(&peer) {
             self.accepted_peers.insert(peer);
         }
-        // Implement typed channel to sent ok if all fine or error if not
         let (result_sender, mut result_receiver) = mpsc::channel(1);
         self.ev_listener_tx
             .send(Right(NodeEvent::AcceptConnection(
@@ -93,7 +92,6 @@ impl NetworkBridge for P2pBridge {
             )))
             .await
             .map_err(|_| ConnectionError::SendNotCompleted)?;
-        // Retrun Ok or ConnectionError depending if reciver recives a ConnAcion::ConnectionAccepted OR NOT
         match result_receiver.recv().await {
             Some(ConnectionResult::Accepted) => Ok(()),
             _ => Err(ConnectionError::SendNotCompleted),
@@ -301,7 +299,7 @@ impl P2pConnManager {
                         NetMessage::Aborted(tx) => {
                             handle_aborted_op(
                                 tx,
-                                op_manager.ring.get_peer_key().clone(),
+                                op_manager.ring.get_peer_pub_key(),
                                 &op_manager,
                                 &mut self.bridge,
                                 &self.gateways,

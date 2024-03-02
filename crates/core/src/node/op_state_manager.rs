@@ -203,11 +203,11 @@ impl OpManager {
         let transaction = msg.id();
         if let (Some(recipient), Some(target)) = (msg.target(), msg.requested_location()) {
             self.ring
-                .record_request(*recipient, target, transaction.transaction_type());
+                .record_request(recipient.clone(), target, transaction.transaction_type());
         }
         self.ring
             .live_tx_tracker
-            .add_transaction(*peer, *transaction);
+            .add_transaction(peer.clone(), *transaction);
     }
 }
 

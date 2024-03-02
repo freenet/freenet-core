@@ -111,7 +111,7 @@ where
             tracing::debug!(
                 "Appended contract {} to peer {}",
                 key,
-                self.op_manager.ring.peer_key
+                self.op_manager.ring.get_peer_key().unwrap()
             );
             if subscription {
                 self.op_manager.ring.seed_contract(key.clone());
