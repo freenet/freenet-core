@@ -4,16 +4,13 @@ use aes_gcm::Aes128Gcm;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::transport::packet_data::MAX_DATA_SIZE;
-
 use super::{
-    packet_data::MAX_PACKET_SIZE, peer_connection::StreamId, MessagePayload, PacketData, PacketId,
+    packet_data::MAX_DATA_SIZE, peer_connection::StreamId, MessagePayload, PacketData, PacketId,
 };
 
 #[serde_as]
 #[derive(Serialize, Deserialize)]
 pub(super) struct SymmetricMessage {
-    // TODO: make sure we handle wrapping around the u32 properly
     pub packet_id: PacketId,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub confirm_receipt: Vec<PacketId>,
@@ -30,19 +27,18 @@ impl SymmetricMessage {
     pub fn ack_error(outbound_sym_key: &Aes128Gcm) -> Result<PacketData, bincode::Error> {
         static SERIALIZED: OnceLock<Box<[u8]>> = OnceLock::new();
         let bytes = SERIALIZED.get_or_init(|| {
-            let mut packet = [0u8; MAX_PACKET_SIZE];
+            let mut packet = [0u8; MAX_DATA_SIZE];
             let size = bincode::serialized_size(&Self::ACK_ERROR).unwrap();
             bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_ERROR).unwrap();
             (&packet[..size as usize]).into()
         });
-        // TODO: we need exact size of this packet so we can return an optimized PacketData
         Ok(PacketData::encrypt_symmetric(bytes, outbound_sym_key))
     }
 
     pub fn ack_ok(outbound_sym_key: &Aes128Gcm) -> Result<PacketData, bincode::Error> {
         static SERIALIZED: OnceLock<Box<[u8]>> = OnceLock::new();
         let bytes = SERIALIZED.get_or_init(move || {
-            let mut packet = [0u8; MAX_PACKET_SIZE];
+            let mut packet = [0u8; MAX_DATA_SIZE];
             let size = bincode::serialized_size(&SymmetricMessage {
                 packet_id: Self::FIRST_PACKET_ID,
                 confirm_receipt: vec![],
@@ -52,7 +48,6 @@ impl SymmetricMessage {
             bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_ERROR).unwrap();
             (&packet[..size as usize]).into()
         });
-        // TODO: we need exact size of this packet so we can return an optimized PacketData
         Ok(PacketData::encrypt_symmetric(bytes, outbound_sym_key))
     }
 
@@ -65,7 +60,7 @@ impl SymmetricMessage {
             confirm_receipt: vec![],
             payload: SymmetricMessagePayload::GatewayConnection { key },
         };
-        let mut packet = [0u8; MAX_PACKET_SIZE];
+        let mut packet = [0u8; MAX_DATA_SIZE];
         let size = bincode::serialized_size(&message)?;
         debug_assert!(size <= MAX_DATA_SIZE as u64);
         bincode::serialize_into(packet.as_mut_slice(), &message)?;
@@ -84,7 +79,7 @@ impl SymmetricMessage {
             confirm_receipt,
             payload: payload.into(),
         };
-        let mut packet = [0u8; MAX_PACKET_SIZE];
+        let mut packet = [0u8; MAX_DATA_SIZE];
         let size = bincode::serialized_size(&message)?;
         debug_assert!(size <= MAX_DATA_SIZE as u64);
         bincode::serialize_into(packet.as_mut_slice(), &message)?;

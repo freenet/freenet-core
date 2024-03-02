@@ -521,10 +521,11 @@ impl Ring {
             .record_request(recipient, target, request_type);
     }
 
-    pub fn add_connection(&self, loc: Location, peer: PeerId) {
-        let mut cbl = self.connections_by_location.write();
+    pub async fn add_connection(&self, loc: Location, peer: PeerId) {
         self.event_register
-            .register_events(Either::Left(NetEventLog::connected(self, peer, loc)));
+            .register_events(Either::Left(NetEventLog::connected(self, peer, loc)))
+            .await;
+        let mut cbl = self.connections_by_location.write();
         cbl.entry(loc).or_default().push(Connection {
             location: PeerKeyLocation {
                 peer,
@@ -654,7 +655,7 @@ impl Ring {
         self.connections_by_location.read().len()
     }
 
-    pub fn prune_connection(&self, peer: PeerId) {
+    pub async fn prune_connection(&self, peer: PeerId) {
         #[cfg(debug_assertions)]
         {
             tracing::info!(%peer, "Removing connection");
@@ -679,7 +680,8 @@ impl Ring {
             });
         }
         self.event_register
-            .register_events(Either::Left(NetEventLog::disconnected(self, &peer)));
+            .register_events(Either::Left(NetEventLog::disconnected(self, &peer)))
+            .await;
         self.open_connections
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }

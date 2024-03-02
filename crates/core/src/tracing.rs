@@ -82,7 +82,7 @@ impl<const N: usize> NetEventRegister for CombinedRegister<N> {
     fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<()> {
         async move {
             for reg in &mut self.0 {
-                reg.notify_of_time_out(tx);
+                reg.notify_of_time_out(tx).await;
             }
         }
         .boxed()

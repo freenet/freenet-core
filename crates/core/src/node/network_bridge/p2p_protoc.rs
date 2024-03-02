@@ -180,7 +180,8 @@ impl NetworkBridge for P2pBridge {
 
     async fn send(&self, target: &FreenetPeerId, msg: NetMessage) -> super::ConnResult<()> {
         self.log_register
-            .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager.ring));
+            .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager.ring))
+            .await;
         self.op_manager.sending_transaction(target, &msg);
         self.ev_listener_tx
             .send(Left((*target, Box::new(msg))))
@@ -488,7 +489,7 @@ impl P2pConnManager {
                 Ok(Right(ConnectionClosed { peer: peer_id }))
                 | Ok(Right(NodeAction(NodeEvent::DropConnection(peer_id)))) => {
                     self.bridge.active_net_connections.remove(&peer_id);
-                    op_manager.ring.prune_connection(peer_id);
+                    op_manager.ring.prune_connection(peer_id).await;
                     // todo: notify the handler, read `disconnect_peer_id` doc
                     let _ = self.swarm.disconnect_peer_id(peer_id.0);
                     tracing::info!("Dropped connection with peer {}", peer_id);

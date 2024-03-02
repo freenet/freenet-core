@@ -26,7 +26,7 @@ use super::{
 };
 use crate::util::time_source::InstantTimeSrc;
 
-type Result<T = ()> = std::result::Result<T, TransportError>;
+type Result<T = (), E = TransportError> = std::result::Result<T, E>;
 
 #[must_use]
 pub(super) struct RemoteConnection {
@@ -56,6 +56,9 @@ impl std::fmt::Display for StreamId {
     }
 }
 
+type InboundStreamFut =
+    Pin<Box<dyn Future<Output = Result<(StreamId, SerializedMessage), StreamId>> + Send>>;
+
 /// The `PeerConnection` struct is responsible for managing the connection with a remote peer.
 /// It provides methods for sending and receiving messages to and from the remote peer.
 ///
@@ -81,8 +84,7 @@ pub(crate) struct PeerConnection {
     remote_conn: RemoteConnection,
     received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
     inbound_streams: HashMap<StreamId, mpsc::Sender<(u32, Vec<u8>)>>,
-    inbound_stream_futures:
-        FuturesUnordered<Pin<Box<dyn Future<Output = Result<SerializedMessage>> + Send>>>,
+    inbound_stream_futures: FuturesUnordered<InboundStreamFut>,
     outbound_stream_futures: FuturesUnordered<Pin<Box<dyn Future<Output = Result> + Send>>>,
 }
 
@@ -120,12 +122,13 @@ impl PeerConnection {
                 inbound = self.remote_conn.inbound_packet_recv.recv() => {
                     let packet_data = inbound.ok_or(TransportError::ConnectionClosed)?;
                     let Ok(decrypted) = packet_data.decrypt(&self.remote_conn.inbound_symmetric_key).map_err(|error| {
-                        tracing::error!(%error, ?self.remote_conn.remote_addr, "Failed to decrypt packet, might be an intro packet");
+                        tracing::debug!(%error, ?self.remote_conn.remote_addr, "Failed to decrypt packet, might be an intro packet or a partial packet");
                     }) else {
                         // just ignore this message
+                        // TODO: maybbe check how frequently this happens and decide to drop a connection based on that
+                        // if it is partial packets being received too often
                         // TODO: this branch should at much happen UdpPacketsListener::NAT_TRAVERSAL_MAX_ATTEMPTS
-                        // since never more intro packets will be sent than this amount,
-                        // after checking that amount of times we should drop the connection if sending corrupt messages
+                        // for intro packets will be sent than this amount, so we could be checking for that initially
                         continue;
                     };
                     let msg = SymmetricMessage::deser(decrypted.data()).unwrap();
@@ -156,7 +159,12 @@ impl PeerConnection {
                         tracing::error!("unexpected no-stream from ongoing_inbound_streams");
                         continue
                     };
-                    return res;
+                    let Ok((stream_id, msg)) = res else {
+                        // TODO: may leave orphan stream recvs hanging around in this case
+                        continue;
+                    };
+                    self.inbound_streams.remove(&stream_id);
+                    return Ok(msg);
                 }
                 outbound_stream = self.outbound_stream_futures.next(), if !self.outbound_stream_futures.is_empty() => {
                     let Some(res) = outbound_stream else {
@@ -212,7 +220,7 @@ impl PeerConnection {
                         .await
                         .map_err(|_| TransportError::ConnectionClosed)?;
                 } else {
-                    let (sender, mut receiver) = mpsc::channel(1);
+                    let (sender, receiver) = mpsc::channel(1);
                     self.inbound_streams.insert(stream_id, sender);
                     let mut stream = inbound_stream::InboundStream::new(total_length_bytes);
                     if let Some(msg) = stream.push_fragment(fragment_number, payload) {
@@ -220,15 +228,8 @@ impl PeerConnection {
                         return Ok(Some(msg));
                     }
                     self.inbound_stream_futures.push(
-                        async move {
-                            while let Some((fragment_number, payload)) = receiver.recv().await {
-                                if let Some(msg) = stream.push_fragment(fragment_number, payload) {
-                                    return Ok(msg);
-                                }
-                            }
-                            Err(TransportError::IncompleteInboundStream(stream_id))
-                        }
-                        .boxed(),
+                        inbound_stream::recv_stream(stream_id, total_length_bytes, receiver)
+                            .boxed(),
                     );
                 }
                 Ok(None)
@@ -314,53 +315,70 @@ async fn packet_sending(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::transport::peer_connection::inbound_stream::InboundStream;
-    use crate::transport::peer_connection::outbound_stream::send_stream;
     use aes_gcm::KeyInit;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use futures::TryFutureExt;
+    use std::net::{Ipv4Addr, SocketAddr};
     use tokio::sync::mpsc;
 
+    use super::{inbound_stream::recv_stream, outbound_stream::send_stream, *};
+
     #[tokio::test]
-    async fn test_inbound_outbound_interaction() {
-        let (sender, mut receiver) = mpsc::channel(100);
-        let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let message = vec![1, 2, 3, 4, 5];
+    async fn test_inbound_outbound_interaction() -> Result<(), Box<dyn std::error::Error>> {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let message: Vec<_> = std::iter::repeat(0)
+            .take(10_000)
+            .map(|_| rand::random::<u8>())
+            .collect();
         let key = rand::random::<[u8; 16]>();
         let cipher = Aes128Gcm::new(&key.into());
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+        println!("starting test");
 
+        let stream_id = StreamId::next();
         // Send a long message using the outbound stream
-        let send_result = send_stream(
-            StreamId::next(),
+        let outbound = tokio::task::spawn(send_stream(
+            stream_id,
             Arc::new(AtomicU32::new(0)),
             sender.clone(),
             remote_addr,
             message.clone(),
             cipher.clone(),
             sent_tracker,
-        )
-        .await;
+        ))
+        .map_err(|e| e.into());
 
-        assert!(send_result.is_ok());
-
-        // Create an inbound stream to receive the message
-        let mut inbound_stream = InboundStream::new(message.len() as u64);
-
-        // Simulate receiving the message
-        while let Some((_, received_message)) = receiver.recv().await {
-            let fragment_number = 0; // This is a simplification, in reality you would need to extract the fragment number from the received message
-            let received_message = (*received_message).to_vec(); // Convert Arc<[u8]> to Vec<u8>
-
-            let result = inbound_stream.push_fragment(fragment_number, received_message);
-
-            if let Some(complete_message) = result {
-                // Check that the received message matches the sent message
-                assert_eq!(complete_message, message);
-                return;
+        let inbound = async {
+            // need to take care of decrypting and deserializing the inbound data before collecting into the message
+            let (tx, rx) = mpsc::channel(1);
+            let inbound_msg = tokio::task::spawn(recv_stream(stream_id, message.len() as u64, rx));
+            while let Some((_, network_packet)) = receiver.recv().await {
+                let decrypted = PacketData::from(&*network_packet)
+                    .decrypt(&cipher)
+                    .map_err(TransportError::PrivateKeyDecryptionError)?;
+                let SymmetricMessage {
+                    payload:
+                        SymmetricMessagePayload::StreamFragment {
+                            fragment_number,
+                            payload,
+                            ..
+                        },
+                    ..
+                } = SymmetricMessage::deser(decrypted.data()).expect("symmetric message")
+                else {
+                    return Err("unexpected message".into());
+                };
+                tx.send((fragment_number, payload)).await?;
             }
-        }
+            let (_, msg) = inbound_msg
+                .await?
+                .map_err(|_| anyhow::anyhow!("stream failed"))?;
+            Ok::<_, Box<dyn std::error::Error>>(msg)
+        };
 
-        panic!("Did not receive complete message");
+        let (out_res, inbound_msg) = tokio::try_join!(outbound, inbound)?;
+        out_res?;
+        assert_eq!(message, inbound_msg);
+        Ok(())
     }
 }

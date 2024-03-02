@@ -1,11 +1,31 @@
+use tokio::sync::mpsc;
+
 use crate::transport::peer_connection::outbound_stream::SerializedStream;
 use std::collections::BTreeMap;
+
+use super::StreamId;
+
+type FragmentIdx = u32;
+
+pub(super) async fn recv_stream(
+    stream_id: StreamId,
+    total_length_bytes: u64,
+    mut receiver: mpsc::Receiver<(FragmentIdx, Vec<u8>)>,
+) -> Result<(StreamId, Vec<u8>), StreamId> {
+    let mut stream = InboundStream::new(total_length_bytes);
+    while let Some((fragment_number, payload)) = receiver.recv().await {
+        if let Some(msg) = stream.push_fragment(fragment_number, payload) {
+            return Ok((stream_id, msg));
+        }
+    }
+    Err(stream_id)
+}
 
 pub(super) struct InboundStream {
     total_length_bytes: u64,
     /// Fragment numbers are 1-indexed
-    last_contiguous_fragment_idx: u32,
-    non_contiguous_fragments: BTreeMap<u32, Vec<u8>>,
+    last_contiguous_fragment_idx: FragmentIdx,
+    non_contiguous_fragments: BTreeMap<FragmentIdx, Vec<u8>>,
     payload: Vec<u8>,
 }
 
@@ -22,7 +42,7 @@ impl InboundStream {
     /// Returns some if the message has been completely streamed, none otherwise.
     pub fn push_fragment(
         &mut self,
-        fragment_number: u32,
+        fragment_number: FragmentIdx,
         mut fragment: SerializedStream,
     ) -> Option<Vec<u8>> {
         if fragment_number == self.last_contiguous_fragment_idx + 1 {

@@ -867,7 +867,7 @@ mod tests {
     }
 
     fn find_worst_peer(
-        peers: &Vec<PeerKeyLocation>,
+        peers: &[PeerKeyLocation],
         bw_usage_by_peer: &[usize],
         requests_per_peer: &[usize],
     ) -> usize {
