@@ -92,10 +92,13 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[tokio::test]
-    async fn test_send_stream_success() {
+    async fn test_send_stream_success() -> Result<(), Box<dyn std::error::Error>> {
         let (outbound_sender, mut outbound_receiver) = mpsc::channel(100);
         let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
-        let message = vec![1, 2, 3, 4, 5];
+        let message: Vec<_> = std::iter::repeat(0)
+            .take(100_000)
+            .map(|_| rand::random::<u8>())
+            .collect();
         let cipher = {
             let key = rand::random::<[u8; 16]>();
             Aes128Gcm::new(&key.into())
@@ -115,13 +118,16 @@ mod tests {
         let mut inbound_bytes = Vec::new();
         while let Some((_, packet)) = outbound_receiver.recv().await {
             let packet_data: PacketData = packet.as_ref().into();
-            let decrypted_packet = packet_data.decrypt(&cipher).unwrap();
+            let decrypted_packet = packet_data
+                .decrypt(&cipher)
+                .map_err(TransportError::PrivateKeyDecryptionError)?;
             inbound_bytes.extend_from_slice(decrypted_packet.data());
         }
 
-        let result = background_task.await.unwrap();
+        let result = background_task.await?;
         assert!(result.is_ok());
         assert_eq!(message, inbound_bytes);
+        Ok(())
     }
 
     // Add more tests here for other scenarios

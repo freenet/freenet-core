@@ -3,10 +3,10 @@
 //!
 //! Please see `docs/architecture/transport.md` for more information.
 //!
-use std::{borrow::Cow, io, net::SocketAddr, time::Duration};
+use std::{borrow::Cow, io, net::SocketAddr};
 
 use futures::Future;
-use tokio::net::{ToSocketAddrs, UdpSocket};
+use tokio::net::UdpSocket;
 
 mod connection_handler;
 mod crypto;
@@ -23,23 +23,6 @@ type MessagePayload = Vec<u8>;
 type PacketId = u32;
 
 use self::{packet_data::PacketData, peer_connection::StreamId};
-
-/// We can wait up to 100ms to confirm a message was received, this allows us to batch
-/// receipts together and send them in a single message.
-const MAX_CONFIRMATION_DELAY: Duration = Duration::from_millis(100);
-
-struct BytesPerSecond(f64);
-
-impl BytesPerSecond {
-    pub fn new(bytes_per_second: f64) -> Self {
-        assert!(bytes_per_second >= 0.0);
-        Self(bytes_per_second)
-    }
-
-    pub fn as_f64(&self) -> f64 {
-        self.0
-    }
-}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TransportError {
@@ -67,20 +50,20 @@ pub(crate) enum TransportError {
 
 /// Make connection handler more testable
 trait Socket: Sized + Send + Sync + 'static {
-    fn bind<A: ToSocketAddrs + Send>(addr: A) -> impl Future<Output = io::Result<Self>> + Send;
+    fn bind(addr: SocketAddr) -> impl Future<Output = io::Result<Self>> + Send;
     fn recv_from(
         &self,
         buf: &mut [u8],
     ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send;
-    fn send_to<A: ToSocketAddrs + Send>(
+    fn send_to(
         &self,
         buf: &[u8],
-        target: A,
+        target: SocketAddr,
     ) -> impl Future<Output = io::Result<usize>> + Send;
 }
 
 impl Socket for UdpSocket {
-    async fn bind<A: ToSocketAddrs + Send>(addr: A) -> io::Result<Self> {
+    async fn bind(addr: SocketAddr) -> io::Result<Self> {
         Self::bind(addr).await
     }
 
@@ -88,7 +71,7 @@ impl Socket for UdpSocket {
         self.recv_from(buf).await
     }
 
-    async fn send_to<A: ToSocketAddrs + Send>(&self, buf: &[u8], target: A) -> io::Result<usize> {
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         self.send_to(buf, target).await
     }
 }

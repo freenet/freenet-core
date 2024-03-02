@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +17,7 @@ use super::{
     peer_connection::{PeerConnection, RemoteConnection},
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
-    BytesPerSecond, PacketData, Socket, TransportError,
+    PacketData, Socket, TransportError,
 };
 
 const PROTOC_VERSION: [u8; 2] = 1u16.to_le_bytes();
@@ -49,7 +49,6 @@ struct OutboundMessage {
 }
 
 pub(crate) struct ConnectionHandler {
-    max_upstream_rate: Arc<arc_swap::ArcSwap<BytesPerSecond>>,
     send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>,
     new_connection_notifier: mpsc::Receiver<PeerConnection>,
 }
@@ -59,16 +58,14 @@ impl ConnectionHandler {
         keypair: TransportKeypair,
         listen_port: u16,
         is_gateway: bool,
-        max_upstream_rate: BytesPerSecond,
     ) -> Result<Self, TransportError> {
         // Bind the UDP socket to the specified port
-        let socket = Arc::new(S::bind(("0.0.0.0", listen_port)).await?);
+        let socket = Arc::new(S::bind((Ipv4Addr::UNSPECIFIED, listen_port).into()).await?);
 
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(100);
 
-        let max_upstream_rate = Arc::new(arc_swap::ArcSwap::from_pointee(max_upstream_rate));
         let (outbound_sender, outbound_recv) = mpsc::channel(1);
         let transport = UdpPacketsListener {
             is_gateway,
@@ -76,7 +73,6 @@ impl ConnectionHandler {
             this_peer_keypair: keypair,
             remote_connections: BTreeMap::new(),
             connection_handler: conn_handler_receiver,
-            max_upstream_rate: max_upstream_rate.clone(),
             new_connection_notifier: new_connection_sender,
             outbound_packets: outbound_sender,
         };
@@ -85,7 +81,6 @@ impl ConnectionHandler {
             outbound_recv,
         );
         let connection_handler = ConnectionHandler {
-            max_upstream_rate,
             send_queue: conn_handler_sender,
             new_connection_notifier,
         };
@@ -121,10 +116,6 @@ impl ConnectionHandler {
     pub async fn next_connection(&mut self) -> Option<PeerConnection> {
         self.new_connection_notifier.recv().await
     }
-
-    fn update_max_upstream_rate(&mut self, max_upstream_rate: BytesPerSecond) {
-        self.max_upstream_rate.store(Arc::new(max_upstream_rate));
-    }
 }
 
 pub enum Message {
@@ -143,7 +134,6 @@ struct UdpPacketsListener<S = UdpSocket> {
     remote_connections: BTreeMap<SocketAddr, InboundRemoteConnection>,
     connection_handler: mpsc::Receiver<(SocketAddr, ConnectionEvent)>,
     this_peer_keypair: TransportKeypair,
-    max_upstream_rate: Arc<arc_swap::ArcSwap<BytesPerSecond>>,
     is_gateway: bool,
     new_connection_notifier: mpsc::Sender<PeerConnection>,
     outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
@@ -680,3 +670,86 @@ impl InboundRemoteConnection {
 // TODO: add test for establishing a connection between two non-gateways (at localhost)
 // it should be already possible to do this with the current code
 // (spawn an other thread for the 2nd peer)
+
+#[cfg(test)]
+mod test {
+    use std::{collections::HashMap, net::Ipv4Addr, sync::OnceLock};
+
+    use tokio::sync::Mutex;
+
+    use super::*;
+
+    #[allow(clippy::type_complexity)]
+    static CHANNELS: OnceLock<Mutex<HashMap<SocketAddr, mpsc::Sender<(SocketAddr, Vec<u8>)>>>> =
+        OnceLock::new();
+
+    struct MockSocket {
+        inbound: Mutex<mpsc::Receiver<(SocketAddr, Vec<u8>)>>,
+    }
+
+    impl Socket for MockSocket {
+        async fn bind(addr: SocketAddr) -> Result<Self, std::io::Error> {
+            let channels = CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
+            let (outbound, inbound) = mpsc::channel(1);
+            channels.lock().await.insert(addr, outbound);
+            Ok(MockSocket {
+                inbound: Mutex::new(inbound),
+            })
+        }
+
+        async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            let Some((remote, packet)) = self.inbound.lock().await.recv().await else {
+                return Err(std::io::ErrorKind::ConnectionAborted.into());
+            };
+            buf.copy_from_slice(&packet[..]);
+            Ok((packet.len(), remote))
+        }
+
+        async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            let channels = CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
+            let channels = channels.lock().await;
+            let Some(sender) = channels.get(&target) else {
+                return Ok(0);
+            };
+            sender
+                .send((target, buf.to_vec()))
+                .await
+                .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
+            Ok(buf.len())
+        }
+    }
+
+    #[tokio::test]
+    async fn simulate_nat_traversal() -> Result<(), Box<dyn std::error::Error>> {
+        let peer_a_keypair = TransportKeypair::new();
+        let peer_a_pub = peer_a_keypair.public.clone();
+        let mut peer_a = ConnectionHandler::new::<MockSocket>(peer_a_keypair, 8080, false)
+            .await
+            .unwrap();
+
+        let peer_b_keypair = TransportKeypair::new();
+        let peer_b_pub = peer_b_keypair.public.clone();
+        let mut peer_b = ConnectionHandler::new::<MockSocket>(peer_b_keypair, 8081, false)
+            .await
+            .unwrap();
+
+        let peer_b = tokio::spawn(async move {
+            let _peer_a_conn = peer_b
+                .connect(peer_a_pub, (Ipv4Addr::LOCALHOST, 8080).into(), false)
+                .await?;
+            Ok::<_, TransportError>(())
+        });
+
+        let peer_a = tokio::spawn(async move {
+            let _peer_b_conn = peer_a
+                .connect(peer_b_pub, (Ipv4Addr::LOCALHOST, 8081).into(), false)
+                .await?;
+            Ok::<_, TransportError>(())
+        });
+
+        let (a, b) = tokio::try_join!(peer_a, peer_b)?;
+        a?;
+        b?;
+        Ok(())
+    }
+}

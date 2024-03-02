@@ -327,7 +327,7 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(1);
         let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
         let message: Vec<_> = std::iter::repeat(0)
-            .take(10_000)
+            .take(100_000)
             .map(|_| rand::random::<u8>())
             .collect();
         let key = rand::random::<[u8; 16]>();

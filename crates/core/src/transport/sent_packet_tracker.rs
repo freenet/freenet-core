@@ -1,10 +1,14 @@
-use super::{PacketId, MAX_CONFIRMATION_DELAY};
+use super::PacketId;
 use crate::util::time_source::{InstantTimeSrc, TimeSource};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const NETWORK_DELAY_ALLOWANCE: Duration = Duration::from_millis(500);
+
+/// We can wait up to 100ms to confirm a message was received, this allows us to batch
+/// receipts together and send them in a single message.
+const MAX_CONFIRMATION_DELAY: Duration = Duration::from_millis(100);
 
 /// If we don't get a receipt for a message within 500ms, we assume the message was lost and
 /// resend it. This must be significantly higher than MAX_CONFIRMATION_DELAY (100ms) to
