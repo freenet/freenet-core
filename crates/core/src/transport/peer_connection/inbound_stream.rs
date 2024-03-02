@@ -1,15 +1,16 @@
 use crate::transport::peer_connection::outbound_stream::SerializedStream;
 use std::collections::BTreeMap;
 
-pub(crate) struct InboundStream {
+pub(super) struct InboundStream {
     total_length_bytes: u64,
+    /// Fragment numbers are 1-indexed
     last_contiguous_fragment_idx: u32,
     non_contiguous_fragments: BTreeMap<u32, Vec<u8>>,
     payload: Vec<u8>,
 }
 
 impl InboundStream {
-    pub(crate) fn new(total_length_bytes: u64) -> Self {
+    pub fn new(total_length_bytes: u64) -> Self {
         Self {
             total_length_bytes,
             last_contiguous_fragment_idx: 0,
@@ -19,7 +20,7 @@ impl InboundStream {
     }
 
     /// Returns some if the message has been completely streamed, none otherwise.
-    pub(crate) fn push_fragment(
+    pub fn push_fragment(
         &mut self,
         fragment_number: u32,
         mut fragment: SerializedStream,
@@ -54,45 +55,43 @@ impl InboundStream {
 
 #[cfg(test)]
 mod tests {
-    mod receiver_stream {
-        use super::super::InboundStream;
+    use super::InboundStream;
 
-        #[test]
-        fn test_simple_sequence() {
-            let mut stream = InboundStream::new(6);
-            assert_eq!(stream.push_fragment(0, vec![1, 2, 3]), None);
-            assert_eq!(
-                stream.push_fragment(1, vec![4, 5, 6]),
-                Some(vec![1, 2, 3, 4, 5, 6])
-            );
-            assert!(stream.non_contiguous_fragments.is_empty());
-            assert!(stream.payload.is_empty());
-        }
+    #[test]
+    fn test_simple_sequence() {
+        let mut stream = InboundStream::new(6);
+        assert_eq!(stream.push_fragment(1, vec![1, 2, 3]), None);
+        assert_eq!(
+            stream.push_fragment(2, vec![4, 5, 6]),
+            Some(vec![1, 2, 3, 4, 5, 6])
+        );
+        assert!(stream.non_contiguous_fragments.is_empty());
+        assert!(stream.payload.is_empty());
+    }
 
-        #[test]
-        fn test_out_of_order_fragment_1() {
-            let mut stream = InboundStream::new(6);
-            assert_eq!(stream.push_fragment(0, vec![1, 2]), None);
-            assert_eq!(stream.push_fragment(2, vec![5, 6]), None);
-            assert_eq!(
-                stream.push_fragment(1, vec![3, 4]),
-                Some(vec![1, 2, 3, 4, 5, 6])
-            );
-            assert!(stream.non_contiguous_fragments.is_empty());
-            assert!(stream.payload.is_empty());
-        }
+    #[test]
+    fn test_out_of_order_fragment_1() {
+        let mut stream = InboundStream::new(6);
+        assert_eq!(stream.push_fragment(1, vec![1, 2]), None);
+        assert_eq!(stream.push_fragment(3, vec![5, 6]), None);
+        assert_eq!(
+            stream.push_fragment(2, vec![3, 4]),
+            Some(vec![1, 2, 3, 4, 5, 6])
+        );
+        assert!(stream.non_contiguous_fragments.is_empty());
+        assert!(stream.payload.is_empty());
+    }
 
-        #[test]
-        fn test_out_of_order_fragment_2() {
-            let mut stream = InboundStream::new(6);
-            assert_eq!(stream.push_fragment(1, vec![3, 4]), None);
-            assert_eq!(stream.push_fragment(2, vec![5, 6]), None);
-            assert_eq!(
-                stream.push_fragment(0, vec![1, 2]),
-                Some(vec![1, 2, 3, 4, 5, 6])
-            );
-            assert!(stream.non_contiguous_fragments.is_empty());
-            assert!(stream.payload.is_empty());
-        }
+    #[test]
+    fn test_out_of_order_fragment_2() {
+        let mut stream = InboundStream::new(6);
+        assert_eq!(stream.push_fragment(2, vec![3, 4]), None);
+        assert_eq!(stream.push_fragment(3, vec![5, 6]), None);
+        assert_eq!(
+            stream.push_fragment(1, vec![1, 2]),
+            Some(vec![1, 2, 3, 4, 5, 6])
+        );
+        assert!(stream.non_contiguous_fragments.is_empty());
+        assert!(stream.payload.is_empty());
     }
 }

@@ -84,7 +84,6 @@ pub(crate) struct PeerConnection {
     inbound_stream_futures:
         FuturesUnordered<Pin<Box<dyn Future<Output = Result<SerializedMessage>> + Send>>>,
     outbound_stream_futures: FuturesUnordered<Pin<Box<dyn Future<Output = Result> + Send>>>,
-    outbound_receipts_notifiers: HashMap<StreamId, mpsc::Sender<u32>>,
 }
 
 impl PeerConnection {
@@ -95,7 +94,6 @@ impl PeerConnection {
             inbound_streams: HashMap::new(),
             inbound_stream_futures: FuturesUnordered::new(),
             outbound_stream_futures: FuturesUnordered::new(),
-            outbound_receipts_notifiers: HashMap::new(),
         }
     }
 
@@ -276,7 +274,6 @@ impl PeerConnection {
     }
 
     async fn outbound_stream(&mut self, data: SerializedMessage) {
-        let (sent_confirm_sender, sent_confirm_recv) = mpsc::channel(1);
         let stream_id = StreamId::next();
         let task = outbound_stream::send_stream(
             stream_id,
@@ -285,12 +282,9 @@ impl PeerConnection {
             self.remote_conn.remote_addr,
             data,
             self.remote_conn.outbound_symmetric_key.clone(),
-            sent_confirm_recv,
             self.remote_conn.sent_tracker.clone(),
         );
         self.outbound_stream_futures.push(task.boxed());
-        self.outbound_receipts_notifiers
-            .insert(stream_id, sent_confirm_sender);
     }
 }
 
@@ -334,7 +328,6 @@ mod tests {
         let message = vec![1, 2, 3, 4, 5];
         let key = rand::random::<[u8; 16]>();
         let cipher = Aes128Gcm::new(&key.into());
-        let (sent_confirmed_send, sent_confirmed_recv) = mpsc::channel(100);
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
 
         // Send a long message using the outbound stream
@@ -345,7 +338,6 @@ mod tests {
             remote_addr,
             message.clone(),
             cipher.clone(),
-            sent_confirmed_recv,
             sent_tracker,
         )
         .await;

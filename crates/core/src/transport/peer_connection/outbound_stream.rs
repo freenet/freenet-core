@@ -1,12 +1,11 @@
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::vec;
 
 use aes_gcm::Aes128Gcm;
 use tokio::sync::mpsc;
 
-use crate::transport::PacketId;
 use crate::{
     transport::{
         packet_data,
@@ -37,7 +36,6 @@ pub(super) async fn send_stream(
     destination_addr: SocketAddr,
     mut stream_to_send: SerializedStream,
     outbound_symmetric_key: Aes128Gcm,
-    mut confirmed_sent_packet_receiver: mpsc::Receiver<PacketId>,
     sent_packet_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
 ) -> Result<(), TransportError> {
     let total_length_bytes = stream_to_send.len() as u32;
@@ -47,66 +45,39 @@ pub(super) async fn send_stream(
     } else {
         1
     };
-    let mut sent_not_confirmed = HashSet::new();
-    let mut sent_confirmed = 0;
-    let mut confirm_receipts = Vec::new();
-    let mut next_fragment_number = 1; // 1-indexed
+    let mut sent_so_far = 0;
+    let mut next_fragment_number = 1; // Fragment numbers are 1-indexed
 
     loop {
-        loop {
-            match confirmed_sent_packet_receiver.try_recv() {
-                Ok(idx) => {
-                    if sent_not_confirmed.remove(&idx) {
-                        sent_confirmed += 1;
-                        confirm_receipts.push(idx);
-                    }
-                }
-                Err(mpsc::error::TryRecvError::Disconnected) if !sent_not_confirmed.is_empty() => {
-                    // the receiver has been dropped, we should stop sending
-                    return Err(TransportError::ConnectionClosed);
-                }
-                _ => break,
-            }
-        }
-
-        let sent_so_far = sent_confirmed + sent_not_confirmed.len();
-        if sent_so_far < total_packets {
-            let mut rest = {
-                if stream_to_send.len() > MAX_DATA_SIZE {
-                    stream_to_send.split_off(MAX_DATA_SIZE)
-                } else {
-                    std::mem::take(&mut stream_to_send)
-                }
-            };
-            std::mem::swap(&mut stream_to_send, &mut rest);
-            next_fragment_number += 1;
-            let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::Release);
-            super::packet_sending(
-                destination_addr,
-                &sender,
-                packet_id,
-                &outbound_symmetric_key,
-                std::mem::take(&mut confirm_receipts),
-                symmetric_message::StreamFragment {
-                    stream_id,
-                    total_length_bytes: total_length_bytes as u64,
-                    fragment_number: next_fragment_number,
-                    payload: rest,
-                },
-                &sent_packet_tracker,
-            )
-            .await?;
-            sent_not_confirmed.insert(packet_id);
-            continue;
-        }
-
-        if stream_to_send.is_empty() && sent_not_confirmed.is_empty() {
+        if sent_so_far == total_packets {
             break;
         }
-
-        // we sent all packets (self.package is empty) but we still need to confirm all were received
-        debug_assert!(stream_to_send.is_empty());
-        debug_assert!(!sent_not_confirmed.is_empty());
+        let mut rest = {
+            if stream_to_send.len() > MAX_DATA_SIZE {
+                stream_to_send.split_off(MAX_DATA_SIZE)
+            } else {
+                std::mem::take(&mut stream_to_send)
+            }
+        };
+        std::mem::swap(&mut stream_to_send, &mut rest);
+        next_fragment_number += 1;
+        let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::Release);
+        super::packet_sending(
+            destination_addr,
+            &sender,
+            packet_id,
+            &outbound_symmetric_key,
+            vec![],
+            symmetric_message::StreamFragment {
+                stream_id,
+                total_length_bytes: total_length_bytes as u64,
+                fragment_number: next_fragment_number,
+                payload: rest,
+            },
+            &sent_packet_tracker,
+        )
+        .await?;
+        sent_so_far += 1;
     }
 
     Ok(())
@@ -117,49 +88,40 @@ mod tests {
     use super::*;
     use crate::transport::packet_data::PacketData;
     use aes_gcm::KeyInit;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::{Ipv4Addr, SocketAddr};
     use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn test_send_stream_success() {
         let (outbound_sender, mut outbound_receiver) = mpsc::channel(100);
-        let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
         let message = vec![1, 2, 3, 4, 5];
-        let message_clone = message.clone();
-        let key = rand::random::<[u8; 16]>();
-        let cipher = Aes128Gcm::new(&key.into());
-        let cipher_clone = cipher.clone();
-        let (sent_confirmed_send, sent_confirmed_recv) = mpsc::channel(100);
+        let cipher = {
+            let key = rand::random::<[u8; 16]>();
+            Aes128Gcm::new(&key.into())
+        };
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
 
-        let background_task = tokio::spawn(async move {
-            let result = send_stream(
-                StreamId::next(),
-                Arc::new(AtomicU32::new(0)),
-                outbound_sender,
-                remote_addr,
-                message.clone(),
-                cipher.clone(),
-                sent_confirmed_recv,
-                sent_tracker,
-            )
-            .await;
-            result
-        });
+        let background_task = tokio::spawn(send_stream(
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            outbound_sender,
+            remote_addr,
+            message.clone(),
+            cipher.clone(),
+            sent_tracker,
+        ));
 
         let mut inbound_bytes = Vec::new();
-        while let Some(packet) = outbound_receiver.recv().await {
-            let packet_data: PacketData = packet.1.as_ref().into();
-
-            let decrypted_packet = packet_data.decrypt(&cipher_clone).unwrap();
-
+        while let Some((_, packet)) = outbound_receiver.recv().await {
+            let packet_data: PacketData = packet.as_ref().into();
+            let decrypted_packet = packet_data.decrypt(&cipher).unwrap();
             inbound_bytes.extend_from_slice(decrypted_packet.data());
         }
 
         let result = background_task.await.unwrap();
-
         assert!(result.is_ok());
-        assert_eq!(message_clone, inbound_bytes);
+        assert_eq!(message, inbound_bytes);
     }
 
     // Add more tests here for other scenarios
