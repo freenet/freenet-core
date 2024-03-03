@@ -271,7 +271,7 @@ impl Operation for PutOp {
                             value.clone(),
                             *id,
                             new_htl,
-                            vec![sender.peer],
+                            vec![sender.peer.clone()],
                         )
                         .await;
                         if put_here && !is_subscribed_contract {

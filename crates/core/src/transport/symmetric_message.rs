@@ -158,7 +158,7 @@ pub(super) enum SymmetricMessagePayload {
         // a gateway acknowledges a connection and returns the private key to use
         // for communication
         key: [u8; 16],
-        remote_addr: SocketAddr,
+        your_address: SocketAddr,
     },
     ShortMessage {
         payload: MessagePayload,
@@ -236,7 +236,7 @@ mod test {
                 result: Err(Cow::Borrowed("error")),
             },
             SymmetricMessagePayload::GatewayConnection {
-                remote_addr: (Ipv4Addr::LOCALHOST, 1234).into(),
+                your_address: (Ipv4Addr::LOCALHOST, 1234).into(),
                 key: [6u8; 16],
             },
             SymmetricMessagePayload::ShortMessage {

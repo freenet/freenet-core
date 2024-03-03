@@ -122,7 +122,7 @@ impl LiveTransactionTracker {
             .tx_per_peer
             .iter()
             .filter(|entry| entry.value().iter().any(|otx| otx == &tx))
-            .map(|entry| *entry.key())
+            .map(|entry| entry.key().clone())
             .collect();
 
         for k in keys_to_remove {
@@ -498,16 +498,20 @@ impl Ring {
     ///
     /// # Panic
     /// Will panic if the node checking for this condition has no location assigned.
-    pub fn should_accept(&self, location: Location, peer: &PeerId) -> bool {
+    pub fn should_accept(&self, location: Location, peer: Option<&PeerId>) -> bool {
         let open_conn = self
             .open_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self.location_for_peer.read().get(peer).is_some() {
-            // avoid connecting mroe than once to the same peer
-            self.open_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            return false;
+
+        if let Some(peer_id) = peer {
+            if self.location_for_peer.read().get(peer_id).is_some() {
+                // avoid connecting mroe than once to the same peer
+                self.open_connections
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                return false;
+            }
         }
+
         let my_location = self
             .own_location()
             .location
@@ -601,8 +605,8 @@ impl Ring {
     pub fn routing_finished(&self, event: crate::router::RouteEvent) {
         self.topology_manager
             .write()
-            .report_outbound_request(event.peer, event.contract_location);
-        self.router.write().add_event(event.clone());
+            .report_outbound_request(event.peer.clone(), event.contract_location.clone());
+        self.router.write().add_event(event);
     }
 
     /// Get a random peer from the known ring connections.

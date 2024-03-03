@@ -247,13 +247,13 @@ impl<S: EventSender> futures::stream::Stream for EventChain<S> {
             let id = self.as_mut().choose_peer();
             match self
                 .user_ev_controller
-                .send(cx, (self.count, id))
+                .send(cx, (self.count, id.clone()))
                 .map_err(|_| {
                     tracing::error!("peer controller should be alive, finishing event chain")
                 }) {
                 std::task::Poll::Ready(_) => {}
                 std::task::Poll::Pending => {
-                    self.as_mut().set_choice(id.clone());
+                    self.as_mut().set_choice(id);
                     return std::task::Poll::Pending;
                 }
             }

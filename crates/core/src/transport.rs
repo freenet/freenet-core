@@ -24,6 +24,12 @@ type PacketId = u32;
 
 use self::{packet_data::PacketData, peer_connection::StreamId};
 
+pub(crate) use self::{
+    connection_handler::ConnectionHandler,
+    crypto::{TransportKeypair, TransportPublicKey},
+    peer_connection::PeerConnection,
+};
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TransportError {
     #[error("transport handler channel closed, socket likely closed")]

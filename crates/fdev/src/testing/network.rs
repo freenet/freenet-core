@@ -232,7 +232,7 @@ pub async fn run_network(
         .get_all_peers()
         .await
         .into_iter()
-        .map(|(label, config)| (label.clone(), config.peer_id))
+        .map(|(label, config)| (label.clone(), config.peer_id.unwrap()))
         .collect();
 
     let events_sender = supervisor.user_ev_controller.lock().await.clone();
@@ -378,11 +378,16 @@ async fn handle_outgoing_messages(
     let mut event_rx = supervisor.event_rx.lock().await;
     while let Some((event, peer_id)) = event_rx.recv().await {
         tracing::info!("Received event {} for peer {}", event, peer_id);
-        let serialized_msg: Vec<u8> = bincode::serialize(&(event, peer_id))
+        let serialized_msg: Vec<u8> = bincode::serialize(&(event, peer_id.clone()))
             .map_err(|e| anyhow!("Failed to serialize message: {}", e))?;
 
         if let Err(e) = sender.send(Message::Binary(serialized_msg)).await {
-            tracing::error!("Failed to send event {} for peer {}: {}", event, peer_id, e);
+            tracing::error!(
+                "Failed to send event {} for peer {}: {}",
+                event,
+                peer_id.clone(),
+                e
+            );
         }
     }
     Ok(())
@@ -491,7 +496,10 @@ impl Supervisor {
         config: &NodeConfig,
     ) -> Result<(), Error> {
         let process = SubProcess::start(cmd_args, label).await?;
-        self.processes.lock().await.insert(config.peer_id, process);
+        self.processes
+            .lock()
+            .await
+            .insert(config.peer_id.clone().unwrap(), process);
         Ok(())
     }
 
@@ -604,9 +612,11 @@ impl Runnable for NetworkPeer {
         let mut receiver_ch = self.receiver_ch.deref().clone();
         receiver_ch.borrow_and_update();
 
+        let peer = self.config.peer_id.unwrap().clone();
+
         let mut memory_event_generator: MemoryEventsGen = MemoryEventsGen::new_with_seed(
             receiver_ch,
-            self.config.peer_id,
+            peer.clone(),
             config.seed.expect("seed should be set for child process"),
         );
         let peer_id_num = NodeLabel::from(peer_id.as_str()).number();
@@ -626,7 +636,7 @@ impl Runnable for NetworkPeer {
         };
 
         let event_generator =
-            NetworkEventGenerator::new(self.config.peer_id, memory_event_generator, ws_client);
+            NetworkEventGenerator::new(peer.clone(), memory_event_generator, ws_client);
 
         // Obtain an identity::Keypair instance for the private_key
         let private_key = Keypair::generate_ed25519();

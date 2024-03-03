@@ -250,8 +250,7 @@ impl NodeConfig {
     /// Returns all specified gateways for this peer. Returns an error if the peer is not a gateway
     /// and no gateways are specified.
     fn get_gateways(&self) -> Result<Vec<PeerKeyLocation>, anyhow::Error> {
-        let peer = self.peer_id.clone();
-        let gateways: Vec<_> = self
+        let gateways: Vec<PeerKeyLocation> = self
             .remote_nodes
             .iter()
             .filter_map(|node| {
@@ -264,13 +263,16 @@ impl NodeConfig {
                     None
                 }
             })
-            // todo: remove unwrap
-            .filter(|pkloc| pkloc.peer != peer.unwrap())
+            .filter(|pkloc| match &self.peer_id {
+                Some(peer_id) => pkloc.peer != *peer_id,
+                None => true,
+            })
             .collect();
+
         if (self.local_ip.is_none() || self.local_port.is_none()) && gateways.is_empty() {
             anyhow::bail!(
-                        "At least one remote gateway is required to join an existing network for non-gateway nodes."
-                    )
+            "At least one remote gateway is required to join an existing network for non-gateway nodes."
+        )
         } else {
             Ok(gateways)
         }
@@ -849,7 +851,7 @@ where
 #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, PartialOrd, Ord)]
 pub struct PeerId {
     addr: SocketAddr,
-    pub_key: TransportPublicKey,
+    pub pub_key: TransportPublicKey,
 }
 
 impl FromStr for PeerId {

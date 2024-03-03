@@ -1,13 +1,14 @@
-use std::future::Future;
+use std::borrow::BorrowMut;
 use std::net::SocketAddr;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
 
-use asynchronous_codec::BytesMut;
+use bs58::encode;
 use dashmap::{DashMap, DashSet};
 use either::{Either, Left, Right};
+use futures::lock::Mutex;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
 use tokio::net::UdpSocket;
@@ -18,9 +19,9 @@ use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::message::ConnectionResult;
 
 use crate::node::PeerId;
-use crate::operations::connect::{ConnectMsg, ConnectRequest};
+use crate::operations::connect::{ConnectMsg, ConnectRequest, ConnectResponse};
 use crate::transport::{
-    BytesPerSecond, ConnectionHandler, PeerConnection, TransportError, TransportKeypair,
+    ConnectionHandler, PeerConnection, TransportError, TransportKeypair, TransportPublicKey,
 };
 use crate::{
     client_events::ClientId,
@@ -82,14 +83,11 @@ impl P2pBridge {
 impl NetworkBridge for P2pBridge {
     async fn try_add_connection(&mut self, peer: FreenetPeerId) -> super::ConnResult<()> {
         if self.active_net_connections.contains_key(&peer) {
-            self.accepted_peers.insert(peer);
+            self.accepted_peers.insert(peer.clone());
         }
         let (result_sender, mut result_receiver) = mpsc::channel(1);
         self.ev_listener_tx
-            .send(Right(NodeEvent::AcceptConnection(
-                peer.clone(),
-                result_sender,
-            )))
+            .send(Right(NodeEvent::AcceptConnection(peer, result_sender)))
             .await
             .map_err(|_| ConnectionError::SendNotCompleted)?;
         match result_receiver.recv().await {
@@ -129,7 +127,7 @@ impl NetworkBridge for P2pBridge {
 type PeerConnChannel = Sender<NetMessage>;
 
 pub(in crate::node) struct P2pConnManager {
-    conn_handler: ConnectionHandler,
+    conn_handler: Arc<Mutex<ConnectionHandler>>,
     pub(in crate::node) gateways: Vec<PeerKeyLocation>,
     pub(in crate::node) bridge: P2pBridge,
     conn_bridge_rx: Receiver<P2pBridgeEvent>,
@@ -138,6 +136,7 @@ pub(in crate::node) struct P2pConnManager {
     listening_addr: Option<SocketAddr>,
     event_listener: Box<dyn NetEventRegister>,
     connection: HashMap<PeerId, PeerConnChannel>,
+    rejected_peers: HashSet<PeerId>,
 }
 
 impl P2pConnManager {
@@ -163,7 +162,6 @@ impl P2pConnManager {
             config.listener_ip,
             listen_port,
             config.is_gateway(),
-            BytesPerSecond::new(0.1),
         )
         .await?;
 
@@ -172,7 +170,7 @@ impl P2pConnManager {
 
         let gateways = config.get_gateways()?;
         Ok(P2pConnManager {
-            conn_handler,
+            conn_handler: Arc::new(Mutex::new(conn_handler)),
             gateways,
             bridge,
             conn_bridge_rx: rx_bridge_cmd,
@@ -180,6 +178,7 @@ impl P2pConnManager {
             listening_addr: private_addr,
             event_listener: Box::new(event_listener),
             connection: HashMap::new(),
+            rejected_peers: HashSet::new(),
         })
     }
 
@@ -200,6 +199,10 @@ impl P2pConnManager {
         let mut tx_to_client: HashMap<Transaction, ClientId> = HashMap::new();
 
         let mut peer_connections = FuturesUnordered::new();
+
+        let conn_handler = self.conn_handler.clone();
+        let conn_bridge = self.bridge.clone();
+
         loop {
             let notification_msg = notification_channel.0.recv().map(|m| match m {
                 None => Ok(Right(ClosedChannel)),
@@ -210,47 +213,20 @@ impl P2pConnManager {
             let bridge_msg = async {
                 match self.conn_bridge_rx.recv().await {
                     Some(msg) => match msg {
-                        Left((peer, msg)) => {
-                            if let NetMessage::Connect(ConnectMsg::Request {
-                                id,
-                                msg:
-                                    ConnectRequest::StartReq {
-                                        target: this_peer,
-                                        joiner_key,
-                                        joiner,
-                                        ..
-                                    },
-                            }) = &*msg
-                            {
-                                match self
-                                    .conn_handler
-                                    .connect(peer.pub_key.clone(), peer.addr, true) // FIXME: propagate if it's a gateway or not from the config
-                                    .await
-                                {
-                                    Ok(peer_conn) => {
-                                        if let Some(my_address) = peer_conn.my_address() {
-                                            let own_peer_id =
-                                                PeerId::new(my_address, joiner_key.clone());
-                                            self.bridge.op_manager.ring.set_peer_key(own_peer_id);
-                                        }
-                                        tracing::debug!(
-                                            "Connection established with peer {}",
-                                            peer.addr.clone()
-                                        );
-                                        Ok(Right(ConnectionEstablished {
-                                            peer: peer.clone(),
-                                            peer_conn,
-                                        }))
-                                    }
-                                    Err(e) => Ok(Right(ClosedChannel)),
-                                }
-                            } else {
-                                tracing::debug!("Message outbound: {:?}", msg);
-                                Ok(Right(SendMessage { peer, msg }))
-                            }
-                        }
+                        Left((peer, msg)) => self.handle_bridge_connection_message(peer, msg).await,
                         Right(action) => Ok(Right(NodeAction(action))),
                     },
+                    None => Ok(Right(ClosedChannel)),
+                }
+            };
+
+            let new_incoming_connection = async {
+                let peer = conn_bridge.op_manager.ring.get_peer_key().unwrap().clone();
+                match conn_handler.lock().await.next_connection().await {
+                    Some(peer_conn) => Ok(Right(ConnectionEstablished {
+                        peer: peer.clone(),
+                        peer_conn,
+                    })),
                     None => Ok(Right(ClosedChannel)),
                 }
             };
@@ -282,6 +258,7 @@ impl P2pConnManager {
                         Ok(Right(ClosedChannel))
                     }
                 }
+                msg = new_incoming_connection => { msg }
                 event_id = client_wait_for_transaction.relay_transaction_result_to_client() => {
                     let (client_id, transaction) = event_id.map_err(|err| anyhow::anyhow!(err))?;
                     tx_to_client.insert(transaction, client_id);
@@ -391,6 +368,8 @@ impl P2pConnManager {
                 | Ok(Right(NodeAction(NodeEvent::DropConnection(peer_id)))) => {
                     self.bridge.active_net_connections.remove(&peer_id);
                     op_manager.ring.prune_connection(peer_id.clone()).await;
+                    self.connection.remove(&peer_id);
+                    self.rejected_peers.insert(peer_id.clone());
                     // todo: notify the handler, read `disconnect_peer_id` doc
                     tracing::info!("Dropped connection with peer {}", peer_id);
                 }
@@ -421,6 +400,136 @@ impl P2pConnManager {
         }
         Ok(())
     }
+
+    async fn handle_bridge_connection_message(
+        &mut self,
+        peer: PeerId,
+        net_msg: Box<NetMessage>,
+    ) -> Result<Either<NetMessage, ConnMngrActions>, ConnectionError> {
+        use ConnMngrActions::*;
+
+        match *net_msg.clone() {
+            NetMessage::Connect(conn_msg) => match conn_msg {
+                ConnectMsg::Request { msg: conn_req, .. } => match conn_req {
+                    ConnectRequest::StartGatewayReq { joiner_key, .. } => {
+                        self.handle_connection_request(&net_msg, &peer, &joiner_key)
+                            .await
+                    }
+                    ConnectRequest::StartRegularReq { joiner, .. } => {
+                        self.handle_connection_request(&net_msg, &peer, &joiner.pub_key)
+                            .await
+                    }
+                    _ => Ok(Right(ClosedChannel)),
+                },
+                ConnectMsg::Response {
+                    msg: conn_response, ..
+                } => match conn_response {
+                    ConnectResponse::AcceptedByGateway {
+                        accepted,
+                        your_location,
+                        your_peer_id,
+                    } => {
+                        if accepted {
+                            tracing::debug!("Connection accepted by gateway");
+                            self.bridge
+                                .op_manager
+                                .ring
+                                .set_peer_key(your_peer_id.clone());
+                            Ok(Right(ConnectionAccepted {
+                                peer: PeerKeyLocation {
+                                    peer: your_peer_id.clone(),
+                                    location: Some(*your_location),
+                                },
+                            }))
+                        } else {
+                            tracing::debug!("Connection rejected by gateway");
+                            Ok(Right(ConnectionClosed {
+                                peer: sender.peer.clone(),
+                            }))
+                        }
+                    }
+                    ConnectResponse::AcceptedByRegularNode {
+                        accepted,
+                        your_location,
+                    } => {
+                        if accepted {
+                            tracing::debug!("Connection accepted by regular node");
+                            Ok(Right(ConnectionAccepted {
+                                peer: PeerKeyLocation {
+                                    peer: your_peer_id.clone(),
+                                    location: Some(*your_location),
+                                },
+                            }))
+                        } else {
+                            tracing::debug!("Connection rejected by regular node");
+                            Ok(Right(ConnectionClosed {
+                                peer: sender.peer.clone(),
+                            }))
+                        }
+                    }
+                    _ => Ok(Right(ClosedChannel)),
+                },
+                _ => Ok(Right(ClosedChannel)),
+            },
+            _ => Ok(Right(ClosedChannel)),
+        }
+    }
+
+    async fn handle_connection_request(
+        &mut self,
+        net_msg: &Box<NetMessage>,
+        peer: &PeerId,
+        joiner_key: &TransportPublicKey,
+    ) -> Result<Either<NetMessage, ConnMngrActions>, ConnectionError> {
+        use ConnMngrActions::*;
+
+        match self
+            .conn_handler
+            .clone()
+            .lock()
+            .await
+            .connect(peer.pub_key.clone(), peer.addr, true)
+            .await
+        {
+            Ok((mut peer_conn, my_address)) => {
+                if self.bridge.op_manager.ring.get_peer_key().is_none() {
+                    let own_peer_id = PeerId::new(my_address, joiner_key.clone());
+                    self.bridge.op_manager.ring.set_peer_key(own_peer_id);
+                }
+                tracing::debug!("Connection established with peer {}", peer.addr.clone());
+
+                if let NetMessage::Connect(ConnectMsg::Request {
+                    msg: ConnectRequest::StartGatewayReq { joiner, .. },
+                    ..
+                }) = &**net_msg
+                {
+                    if joiner.is_none() {
+                        let mut msg = net_msg.clone();
+                        if let NetMessage::Connect(ConnectMsg::Request {
+                            msg: ConnectRequest::StartGatewayReq { ref mut joiner, .. },
+                            ..
+                        }) = &mut *msg
+                        {
+                            let joiner_peer = self.bridge.op_manager.ring.get_peer_key();
+                            *joiner = joiner_peer;
+                        }
+                        return Ok(Left(*msg));
+                    }
+                }
+
+                peer_conn
+                    .send(net_msg.clone())
+                    .await
+                    .map_err(|_| ConnectionError::SendNotCompleted)?;
+
+                Ok(Right(ConnectionEstablished {
+                    peer: peer.clone(),
+                    peer_conn,
+                }))
+            }
+            Err(e) => Err(ConnectionError::SendNotCompleted),
+        }
+    }
 }
 
 enum ConnMngrActions {
@@ -428,6 +537,9 @@ enum ConnMngrActions {
     ConnectionEstablished {
         peer: FreenetPeerId,
         peer_conn: PeerConnection,
+    },
+    ConnectionAccepted {
+        peer: PeerKeyLocation,
     },
     /// Closed a connection with the peer
     ConnectionClosed {

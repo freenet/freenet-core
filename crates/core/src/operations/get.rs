@@ -343,8 +343,8 @@ impl Operation for GetOp {
                     return_msg = Some(GetMsg::SeekNode {
                         key: key.clone(),
                         id: *id,
-                        target: *target,
-                        sender: own_loc,
+                        target: target.clone(),
+                        sender: own_loc.clone(),
                         fetch_contract: *fetch_contract,
                         htl: op_manager.ring.max_hops_to_live,
                         skip_list: vec![own_loc.peer],
@@ -363,10 +363,10 @@ impl Operation for GetOp {
                     let id = *id;
                     let key: ContractKey = key.clone();
                     let fetch_contract = *fetch_contract;
-                    let this_peer = *target;
+                    let this_peer = target.clone();
 
                     if let Some(s) = stats.as_mut() {
-                        s.next_peer = Some(this_peer);
+                        s.next_peer = Some(this_peer.clone());
                     }
 
                     let get_result = op_manager
@@ -390,7 +390,7 @@ impl Operation for GetOp {
                                 id,
                                 key,
                                 (htl, fetch_contract),
-                                (this_peer, *sender),
+                                (this_peer, sender.clone()),
                                 skip_list,
                                 op_manager,
                                 stats,
@@ -413,7 +413,7 @@ impl Operation for GetOp {
                                         state: Some(state),
                                         contract,
                                     },
-                                    sender: *target,
+                                    sender: target.clone(),
                                     target: requester,
                                     skip_list: skip_list.clone(),
                                 });
@@ -437,8 +437,8 @@ impl Operation for GetOp {
                                     state: Some(state),
                                     contract,
                                 },
-                                sender: *target,
-                                target: *sender,
+                                sender: target.clone(),
+                                target: sender.clone(),
                                 skip_list: skip_list.clone(),
                             });
                         }
@@ -474,7 +474,7 @@ impl Operation for GetOp {
                             if retries < MAX_RETRIES {
                                 // no response received from this peer, so skip it in the next iteration
                                 let mut new_skip_list = skip_list.clone();
-                                new_skip_list.push(target.peer);
+                                new_skip_list.push(target.peer.clone());
                                 if let Some(target) = op_manager
                                     .ring
                                     .closest_potentially_caching(key, new_skip_list.as_slice())
@@ -485,7 +485,7 @@ impl Operation for GetOp {
                                         id: *id,
                                         key: key.clone(),
                                         target,
-                                        sender: *this_peer,
+                                        sender: this_peer.clone(),
                                         fetch_contract,
                                         htl: current_hop,
                                         skip_list: new_skip_list.clone(),
@@ -521,8 +521,8 @@ impl Operation for GetOp {
                                     state: None,
                                     contract: None,
                                 },
-                                sender: *sender,
-                                target: *target,
+                                sender: sender.clone(),
+                                target: target.clone(),
                                 skip_list: skip_list.clone(),
                             });
                         }
@@ -561,7 +561,7 @@ impl Operation for GetOp {
                         );
 
                         let mut new_skip_list = skip_list.clone();
-                        new_skip_list.push(sender.peer);
+                        new_skip_list.push(sender.peer.clone());
                         op_manager
                             .notify_op_change(
                                 NetMessage::from(GetMsg::ReturnGet {
@@ -571,8 +571,8 @@ impl Operation for GetOp {
                                         state: None,
                                         contract: None,
                                     },
-                                    sender: *sender,
-                                    target: *target,
+                                    sender: sender.clone(),
+                                    target: target.clone(),
                                     skip_list: new_skip_list,
                                 }),
                                 OpEnum::Get(GetOp {
@@ -627,7 +627,7 @@ impl Operation for GetOp {
                                     return Err(OpError::ExecutorError(err));
                                 } else {
                                     let mut new_skip_list = skip_list.clone();
-                                    new_skip_list.push(sender.peer);
+                                    new_skip_list.push(sender.peer.clone());
 
                                     op_manager
                                         .notify_op_change(
@@ -638,8 +638,8 @@ impl Operation for GetOp {
                                                     state: None,
                                                     contract: None,
                                                 },
-                                                sender: *sender,
-                                                target: *target,
+                                                sender: sender.clone(),
+                                                target: target.clone(),
                                                 skip_list: new_skip_list,
                                             }),
                                             OpEnum::Get(GetOp {
@@ -683,7 +683,7 @@ impl Operation for GetOp {
                                     state: Some(value.clone()),
                                     contract: contract.clone(),
                                 },
-                                sender: *target,
+                                sender: target.clone(),
                                 target: requester,
                                 skip_list: skip_list.clone(),
                             });
@@ -703,8 +703,8 @@ impl Operation for GetOp {
                                     state: Some(value.clone()),
                                     contract: contract.clone(),
                                 },
-                                sender: *target,
-                                target: *sender,
+                                sender: target.clone(),
+                                target: sender.clone(),
                                 skip_list: skip_list.clone(),
                             });
                         }
