@@ -79,7 +79,7 @@ impl SymmetricMessage {
         let message = Self {
             packet_id: Self::FIRST_PACKET_ID,
             confirm_receipt: vec![],
-            payload: SymmetricMessagePayload::GatewayConnection { key, remote_addr },
+            payload: SymmetricMessagePayload::GatewayConnection { key },
         };
         let mut packet = [0u8; MAX_DATA_SIZE];
         let size = bincode::serialized_size(&message)?;
