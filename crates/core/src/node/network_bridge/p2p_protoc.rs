@@ -227,10 +227,12 @@ impl P2pConnManager {
                                     .connect(peer.pub_key.clone(), peer.addr, true) // FIXME: propagate if it's a gateway or not from the config
                                     .await
                                 {
-                                    Ok((peer_conn, your_external_socket)) => {
-                                        let own_peer_id =
-                                            PeerId::new(your_external_socket, joiner_key.clone());
-                                        self.bridge.op_manager.ring.set_peer_key(own_peer_id);
+                                    Ok(peer_conn) => {
+                                        if let Some(my_address) = peer_conn.my_address() {
+                                            let own_peer_id =
+                                                PeerId::new(my_address, joiner_key.clone());
+                                            self.bridge.op_manager.ring.set_peer_key(own_peer_id);
+                                        }
                                         tracing::debug!(
                                             "Connection established with peer {}",
                                             peer.addr.clone()

@@ -361,8 +361,10 @@ impl Ring {
     }
 
     pub fn set_peer_key(&self, peer_key: PeerId) {
-        // TODO: insert only if is none
-        *self.peer_key.lock() = Some(peer_key);
+        let mut this_peer = self.peer_key.lock();
+        if this_peer.is_none() {
+            *this_peer = Some(peer_key);
+        }
     }
 
     pub fn get_peer_pub_key(&self) -> TransportPublicKey {
