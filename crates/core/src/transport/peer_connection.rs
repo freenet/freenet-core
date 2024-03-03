@@ -37,6 +37,7 @@ pub(super) struct RemoteConnection {
     pub last_packet_id: Arc<AtomicU32>,
     pub inbound_packet_recv: mpsc::Receiver<PacketData>,
     pub inbound_symmetric_key: Aes128Gcm,
+    pub my_address: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -197,6 +198,11 @@ impl PeerConnection {
                 }
             }
         }
+    }
+
+    /// Returns the external address of the peer holding this connection.
+    pub fn my_address(&self) -> Option<SocketAddr> {
+        self.remote_conn.my_address
     }
 
     async fn process_inbound(

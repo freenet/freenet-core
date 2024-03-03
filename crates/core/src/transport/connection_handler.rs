@@ -233,8 +233,11 @@ impl<S: Socket> UdpPacketsListener<S> {
 
         let inbound_key_bytes = rand::random::<[u8; 16]>();
         let inbound_key = Aes128Gcm::new(&inbound_key_bytes.into());
-        let outbound_ack_packet =
-            SymmetricMessage::ack_gateway_connection(&outbound_key, inbound_key_bytes)?;
+        let outbound_ack_packet = SymmetricMessage::ack_gateway_connection(
+            &outbound_key,
+            inbound_key_bytes,
+            remote_addr,
+        )?;
 
         let mut buf = [0u8; MAX_PACKET_SIZE];
         let mut waiting_time = INITIAL_INTERVAL;
@@ -295,6 +298,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             last_packet_id: Arc::new(AtomicU32::new(0)),
             inbound_packet_recv: mpsc::channel(100).1,
             inbound_symmetric_key: inbound_key,
+            my_address: None,
         });
 
         self.new_connection_notifier
@@ -387,6 +391,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             last_packet_id: Arc::new(AtomicU32::new(0)),
                             inbound_packet_recv: inbound_recv,
                             inbound_symmetric_key: inbound_sym_key,
+                            my_address: None,
                         },
                         InboundRemoteConnection {
                             inbound_packet_sender: inbound_sender,
@@ -434,7 +439,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     SymmetricMessage::deser(decrypted_packet.data())?;
                                 if remote_is_gateway {
                                     match symmetric_message.payload {
-                                        SymmetricMessagePayload::GatewayConnection { key } => {
+                                        SymmetricMessagePayload::GatewayConnection {
+                                            key,
+                                            remote_addr: my_address,
+                                        } => {
                                             let outbound_sym_key = Aes128Gcm::new_from_slice(&key)
                                                 .map_err(|_| {
                                                     TransportError::ConnectionEstablishmentFailure {
@@ -474,6 +482,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                     last_packet_id: Arc::new(AtomicU32::new(0)),
                                                     inbound_packet_recv: inbound_recv,
                                                     inbound_symmetric_key: inbound_sym_key,
+                                                    my_address: Some(my_address),
                                                 },
                                                 InboundRemoteConnection {
                                                     inbound_packet_sender: inbound_sender,
@@ -584,6 +593,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     last_packet_id: Arc::new(AtomicU32::new(0)),
                                     inbound_packet_recv: inbound_recv,
                                     inbound_symmetric_key: inbound_sym_key,
+                                    my_address: None,
                                 },
                                 InboundRemoteConnection {
                                     inbound_packet_sender: inbound_sender,
@@ -667,15 +677,13 @@ impl InboundRemoteConnection {
     }
 }
 
-// TODO: add test for establishing a connection between two non-gateways (at localhost)
-// it should be already possible to do this with the current code
-// (spawn an other thread for the 2nd peer)
-
 #[cfg(test)]
 mod test {
     use std::{collections::HashMap, net::Ipv4Addr, sync::OnceLock};
 
     use tokio::sync::Mutex;
+
+    use crate::DynError;
 
     use super::*;
 
@@ -720,7 +728,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn simulate_nat_traversal() -> Result<(), Box<dyn std::error::Error>> {
+    async fn simulate_nat_traversal() -> Result<(), DynError> {
         let peer_a_keypair = TransportKeypair::new();
         let peer_a_pub = peer_a_keypair.public.clone();
         let mut peer_a = ConnectionHandler::new::<MockSocket>(peer_a_keypair, 8080, false)
@@ -734,17 +742,15 @@ mod test {
             .unwrap();
 
         let peer_b = tokio::spawn(async move {
-            let _peer_a_conn = peer_b
-                .connect(peer_a_pub, (Ipv4Addr::LOCALHOST, 8080).into(), false)
-                .await?;
-            Ok::<_, TransportError>(())
+            let peer_a_conn = peer_b.connect(peer_a_pub, (Ipv4Addr::LOCALHOST, 8080).into(), false);
+            let _ = tokio::time::timeout(Duration::from_secs(5), peer_a_conn).await??;
+            Ok::<_, DynError>(())
         });
 
         let peer_a = tokio::spawn(async move {
-            let _peer_b_conn = peer_a
-                .connect(peer_b_pub, (Ipv4Addr::LOCALHOST, 8081).into(), false)
-                .await?;
-            Ok::<_, TransportError>(())
+            let peer_b_conn = peer_a.connect(peer_b_pub, (Ipv4Addr::LOCALHOST, 8081).into(), false);
+            let _ = tokio::time::timeout(Duration::from_secs(5), peer_b_conn).await??;
+            Ok::<_, DynError>(())
         });
 
         let (a, b) = tokio::try_join!(peer_a, peer_b)?;
