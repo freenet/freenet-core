@@ -23,6 +23,7 @@ pub enum ContractChange<'a> {
     PutFailure(topology::PutFailure<'a>),
 }
 
+// TODO: Change this to EventWrapper
 pub enum ChangesWrapper<'a> {
     ContractChange(ContractChange<'a>),
     PeerChange(PeerChange<'a>),

@@ -223,10 +223,14 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                 requester,
                 target,
             } => {
+                tracing::debug!(%tx_id, %key, %requester, %target, "sending put request");
                 let msg = ContractChange::put_request_msg(tx_id, key, requester, target);
                 tx.send(Message::Binary(msg)).await?;
             }
-            Change::PutSuccess { tx_id, key, target } => todo!(),
+            Change::PutSuccess { tx_id, key, target } => {
+                let msg = ContractChange::put_success_msg(tx_id, key, target.clone(), target);
+                tx.send(Message::Binary(msg)).await?;
+            }
         }
     }
     Ok(())
