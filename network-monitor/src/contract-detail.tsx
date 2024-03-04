@@ -6,6 +6,7 @@ import {
     TransactionData
 } from "./type_definitions";
 import { PeerId } from "./topology";
+import { another_ring_visualization } from "./ring-visualization";
 
 interface TransactionDetailPeersHistoryInterface {
     tx_peer_list: Array<TransactionPeerInterface>;
@@ -21,7 +22,7 @@ interface FilterDictionaryInterface {
 }
 
 let ring_mock_data = [];
-const TransactionPeersHistory = ({
+const ContractPeersHistory = ({
     tx_peer_list,
 }: TransactionDetailPeersHistoryInterface) => {
     const [filter, set_filter] = useState<FilterDictionaryInterface>({});
@@ -231,34 +232,34 @@ const TransactionPeersHistory = ({
 };
 
 // TODO: use real types
-const TransactionHistory = ({ tx_history }: any) => (
-    <div id="transaction-history" className="block">
+const ContractHistory = ({ contract_history }: any) => (
+    <div id="contract-history" className="block">
         <h2>Transaction History</h2>
         <table
             id="transaction-history"
             className="table is-striped block is-bordered"
         >
-            <thead id="transaction-history-h">
+            <thead id="contract-history-h">
                 <tr>
+                    <th>Contract Key</th>
                     <th>Transaction Id</th>
                     <th>Requester Peer Id</th>
                     <th>Target Peer Id</th>
                     <th>Type</th>
-                    <th>Contract Key</th>
                     {/*<th>Status</th>
                     <th>Started</th>
                     <th>Finalized</th>*/}
                 </tr>
             </thead>
-            <tbody id="transaction-history-b">
-                {tx_history &&
-                    tx_history.map((change: TransactionData) => (
+            <tbody id="contract-history-b">
+                {contract_history &&
+                    contract_history.map((change: TransactionData) => (
                         <tr>
-                            <td>{change.transaction_id}</td>
-                            <td>{change.requester}</td>
-                            <td>{change.target}</td>
+                            <td>{change.contract_id.slice(-8)}</td>
+                            <td>{change.transaction_id.slice(-8)}</td>
+                            <td>{change.requester.slice(-8)}</td>
+                            <td>{change.target.slice(-8)}</td>
                             <td>{change.change_type}</td>
-                            <td>{change.contract_id}</td>
                         </tr>
                     ))}
             </tbody>
@@ -266,7 +267,7 @@ const TransactionHistory = ({ tx_history }: any) => (
     </div>
 );
 
-const TransactionDetail = ({
+export const ContractDetail = ({
     transaction,
     is_displayed,
     close_detail,
@@ -274,7 +275,7 @@ const TransactionDetail = ({
     tx_history,
 }: TransactionDetailInterface) => (
     <div
-        id="transaction-detail"
+        id="contract-detail"
         style={{
             position: "absolute",
             top: 0,
@@ -312,14 +313,14 @@ const TransactionDetail = ({
             </button>
             <h2>Transaction Detail</h2>
             <div id="transaction-detail-contents">
+                <p>Contract Key {transaction.contract_id}</p>
+                <p>Requester {transaction.requester}</p>
+                <p>Target {transaction.target}</p>
                 <p>ID {transaction.transaction_id}</p>
                 <p>Type {transaction.change_type}</p>
                 {/*<p>Status {transaction.status}</p>
                 <p>Started {transaction.started}</p>
                 <p>Finalized {transaction.finalized}</p>*/}
-                <p>Requester {transaction.requester}</p>
-                <p>Target {transaction.target}</p>
-                <p>Contract Key {transaction.contract_id}</p>
             </div>
 
             <div>
@@ -332,68 +333,12 @@ const TransactionDetail = ({
             </div>
 
             {peers_history && (
-                <TransactionPeersHistory tx_peer_list={peers_history} />
+                <ContractPeersHistory tx_peer_list={peers_history} />
             )}
 
-            <TransactionHistory tx_history={tx_history} />
+            <ContractHistory contract_history={tx_history} />
         </div>
     </div>
 );
 
-const another_ring_visualization = () => {
-    // Declare the chart dimensions and margins.
-    const width = 640;
-    const height = 400;
-    const marginTop = 20;
-    const marginRight = 20;
-    const marginBottom = 30;
-    const marginLeft = 40;
 
-    // // Declare the x (horizontal position) scale.
-    // const x = d3
-    //     .scaleUtc()
-    //     .domain([new Date("2023-01-01"), new Date("2024-01-01")])
-    //     .range([marginLeft, width - marginRight]);
-
-    // // Declare the y (vertical position) scale.
-    // const y = d3
-    //     .scaleLinear()
-    //     .domain([0, 100])
-    //     .range([height - marginBottom, marginTop]);
-
-    // // Create the SVG container.
-    // const svg = d3.create("svg").attr("width", width).attr("height", height);
-
-    // // Add the x-axis.
-    // svg.append("g")
-    //     .attr("transform", `translate(0,${height - marginBottom})`)
-    //     .call(d3.axisBottom(x));
-
-    // // Add the y-axis.
-    // svg.append("g")
-    //     .attr("transform", `translate(${marginLeft},0)`)
-    //     .call(d3.axisLeft(y));
-
-    let a = (
-        <svg width={300} height={100}>
-            <path
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.5"
-                d={"20"}
-            />
-            <g fill="white" stroke="currentColor" strokeWidth="1.5">
-                <circle key={"123"} cx={60} cy={50} r="40.5" />
-
-                <circle cx={60} cy={10} r="2.5" />
-                <circle cx={10} cy={50} r="2.5" />
-                <circle cx={110} cy={50} r="2.5" />
-            </g>
-        </svg>
-    );
-
-    // Append the SVG element.
-    return a;
-};
-
-export default TransactionDetail;

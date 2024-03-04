@@ -1,96 +1,38 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import TransactionDetail from "./transaction-detail";
+import { all_tx} from "./transactions-data";
+import {TransactionInterface, TransactionStatus, TransactionType, TransactionData, TxPeersTableInterface, OpState, MessageType, TxTableInterface, TransactionPeerInterface, ChangeType } from "./type_definitions";
 
 
-export interface TransactionInterface {
-    id: string;
-    peer_id: string;
-    type: string;
-    status: string;
-    started: string;
-    finalized: string;
-}
-
-
-export interface TransactionPeerInterface {
-    peer_id: string;
-    location: string;
-    last_state: string;
-    last_message: string;
-    started: string;
-    finalized: string;
-}
-
-export interface TransactionDetailInterface {
-    transaction: TransactionInterface;
-    is_displayed: boolean;
-    close_detail: () => void;
-    peers_history: Array<TransactionPeerInterface>;
-}
-
-interface TxTableInterface {
-    open_tx_detail: (txid: string) => void;
-    tx_list?: Array<TransactionInterface>;
-}
-
-interface TxPeersTableInterface {
-    [tx_id: string]: Array<TransactionPeerInterface>
-}
-
-enum TransactionType {
-    Update = "Update",
-    Put = "Put",
-    Get = "Get",
-}
-
-enum TransactionStatus {
-    Received = "Received",
-    Finalized = "Finalized",
-    Ongoing = "Ongoing",
-}
-
-enum MessageType {
-    RequestUpdate = "RequestUpdate",
-    SeekNode = "SeekNode",
-    BroadcastTo = "BroadcastTo",
-    Broadcasting = "Broadcasting",
-    SuccessfulUpdate = "SuccessfulUpdate",
-    UpdateForward = "UpdateForward",
-}
-
-enum OpState {
-    ReceivedRequest = "ReceivedRequest",
-    AwaitingResponse = "AwaitingResponse",
-    Finished = "Finished",
-    PrepareRequest = "PrepareRequest",
-    BroadcastOngoing = "BroadcastOngoing",
-}
 
 const mock_transaction: Array<TransactionInterface> = [
     {
         id: "123",
         peer_id: "0xabc",
-        type: TransactionType.Update,
+        type: ChangeType.PUT_SUCCESS,
         status: TransactionStatus.Finalized,
         started: "12-01-2024",
         finalized: "13-01-2024",
+        contract_id: "0x123",
     },
     {
         id: "124",
         peer_id: "0xdef",
-        type: TransactionType.Put,
+        type: ChangeType.PUT_SUCCESS,
         status: TransactionStatus.Received,
         started: "12-01-2024",
         finalized: "13-01-2024",
+        contract_id: "0x4892",
     },
     {
         id: "125",
         peer_id: "0xabc",
-        type: TransactionType.Get,
+        type: ChangeType.PUT_REQUEST,
         status: TransactionStatus.Ongoing,
         started: "12-02-2024",
         finalized: "13-02-2024",
+        contract_id: "0x783",
     },
 ];
 
@@ -239,23 +181,27 @@ const TransactionsTable = ({ open_tx_detail, tx_list }: TxTableInterface) => (
         <thead id="transactions-history-h">
             <tr>
                 <th>Transaction Id</th>
-                <th>Peer Id</th>
+                <th>Requester Peer Id</th>
+                <th>Target Peer Id</th>
                 <th>Type</th>
-                <th>Status</th>
+                <th>Contract Key</th>
+                {/*<th>Status</th>
                 <th>Started</th>
-                <th>Finalized</th>
+                <th>Finalized</th>*/}
             </tr>
         </thead>
         <tbody id="transactions-history-b">
             {
                 tx_list?.map((tx) => (
                     <tr>
-                        <td onClick={() => open_tx_detail(tx.id)} style={{cursor: "pointer"}}>{tx.id}</td>
-                        <td>{tx.peer_id}</td>
-                        <td>{tx.type}</td>
-                        <td>{tx.status}</td>
+                        <td onClick={() => open_tx_detail(tx.transaction_id)} style={{cursor: "pointer"}}>{tx.transaction_id.slice(-8)}</td>
+                        <td>{tx.requester.slice(-8)}</td>
+                        <td>{tx.target.slice(-8)}</td>
+                        <td>{tx.change_type}</td>
+                        <td>{tx.contract_id.slice(-8)}</td>
+                        {/*<td>{tx.status}</td>
                         <td>{tx.started}</td>
-                        <td>{tx.finalized}</td>
+                        <td>{tx.finalized}</td>*/}
                     </tr>
                 ))
             }
@@ -263,25 +209,41 @@ const TransactionsTable = ({ open_tx_detail, tx_list }: TxTableInterface) => (
     </table>
 );
 
-function TransactionContainer() {
+export function TransactionContainer() {
     const [is_detail_open, set_is_detail_open] = useState(false);
-    const [transaction, set_transaction] = useState<TransactionInterface | null>(null);
+    const [transaction, set_transaction] = useState<TransactionData | null>(null);
+    const [transaction_history, set_transaction_history] = useState<Array<TransactionData>>([]);
     const [peers_history, set_peers_history] = useState<Array<TransactionPeerInterface>>([]);
+    const [tx_list, set_tx_list] = useState<Array<TransactionData>>([]);
 
     const open_tx_detail = (txid: string) => {
-        let tx = mock_transaction.find((tx) => tx.id === txid);
-        if (!tx) {
+        let tx_history = all_tx.get(txid);
+        if (!tx_history) {
             console.error("Transaction not found");
             return;
         }
-        set_transaction(tx);
-        set_peers_history(mock_peers_in_tx[tx.id]);
+
+        set_transaction(tx_history[0]);
+        set_transaction_history(tx_history);
+        // set_peers_history(mock_peers_in_tx[tx.id]);
         set_is_detail_open(true);
+        document.getElementById("transaction-detail")?.focus();
     };
 
     const close_detail = () => {
         set_is_detail_open(false);
     };
+
+    const load_transaction_list = () => {
+        let updated_tx_list = [];
+        
+        updated_tx_list = Array.from(all_tx.values());
+
+        updated_tx_list = updated_tx_list.flat();
+
+        console.log(updated_tx_list);
+        set_tx_list(updated_tx_list);
+    }
 
     document.addEventListener("keydown", (e: any) => {
         if (e.key === "Escape") {
@@ -289,21 +251,26 @@ function TransactionContainer() {
         }
     });
 
+    useEffect(() => {
+        setInterval(() => {
+            load_transaction_list();
+        }, 3000);
+    }, []);
+
     return (
         <div>
-            <h1>Hello, world</h1>
-            <TransactionsTable open_tx_detail={open_tx_detail} tx_list={mock_transaction} />
+            <TransactionsTable open_tx_detail={open_tx_detail} tx_list={tx_list} />
 
-            {transaction && (
+            {transaction && transaction_history && (
                 <TransactionDetail
                     is_displayed={is_detail_open}
                     close_detail={close_detail}
                     transaction={transaction}
                     peers_history={peers_history}
+                    tx_history={transaction_history}
                 />
             )}
         </div>
     );
 }
 
-export const component = <TransactionContainer />;

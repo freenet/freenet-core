@@ -1,21 +1,116 @@
 import * as flatbuffers from "flatbuffers";
 import * as fbTopology from "./generated/topology";
 import { handleChange } from "./topology";
+import { handlePutRequest, handlePutSuccess } from "./transactions-data";
+import { parse_put_msg_data } from "./utils";
 
 const PEER_CHANGES = new WebSocket(
     "ws://127.0.0.1:55010/pull-stats/peer-changes/"
 );
-PEER_CHANGES.onmessage = handlePeerChanges;
+PEER_CHANGES.onmessage = handleChanges;
 
 // const DELIVER_MESSAGE = new WebSocket("ws://127.0.0.1:55010/pull-stats/network-events/");
 
-function handlePeerChanges(event: MessageEvent) {
+function handleChanges(event: MessageEvent) {
     const data = event.data as Blob;
     convertBlobToUint8Array(data)
         .then((uint8Array) => {
             const buf = new flatbuffers.ByteBuffer(uint8Array);
-            const peerChange = fbTopology.PeerChange.getRootAsPeerChange(buf);
-            handleChange(peerChange);
+
+            try {
+                const contractChange =
+                    fbTopology.ContractChange.getRootAsContractChange(buf);
+
+                console.log(contractChange.changeType());
+
+                if (
+                    contractChange.changeType() ===
+                    fbTopology.ContractChangeType.PutRequest
+                ) {
+                    let {
+                        transaction,
+                        contract_id,
+                        target,
+                        requester,
+                        change_type,
+                    } = parse_put_msg_data(
+                        contractChange,
+                        fbTopology.ContractChangeType.PutRequest
+                    );
+
+                    handlePutRequest(
+                        transaction,
+                        contract_id,
+                        target,
+                        requester,
+                        change_type
+                    );
+
+                    return;
+                }
+
+                if (
+                    contractChange.changeType() ===
+                    fbTopology.ContractChangeType.PutSuccess
+                ) {
+                    let {
+                        transaction,
+                        contract_id,
+                        target,
+                        requester,
+                        change_type,
+                    } = parse_put_msg_data(
+                        contractChange,
+                        fbTopology.ContractChangeType.PutSuccess
+                    );
+
+                    handlePutSuccess(
+                        transaction,
+                        contract_id,
+                        target,
+                        requester,
+                        change_type
+                    );
+
+                    return;
+                }
+
+                if (
+                    contractChange.changeType() ===
+                    fbTopology.ContractChangeType.PutFailure
+                ) {
+                    let {
+                        transaction,
+                        contract_id,
+                        target,
+                        requester,
+                        change_type,
+                    } = parse_put_msg_data(
+                        contractChange,
+                        fbTopology.ContractChangeType.PutFailure
+                    );
+
+                    handlePutSuccess(
+                        transaction,
+                        contract_id,
+                        target,
+                        requester,
+                        change_type
+                    );
+
+                    return;
+                }
+            } catch (e) {
+                console.error(e);
+            }
+
+            try {
+                const peerChange =
+                    fbTopology.PeerChange.getRootAsPeerChange(buf);
+                handleChange(peerChange);
+
+                return;
+            } catch (e) {}
         })
         .catch((error) => {
             console.error("Failed to handle message:", error);

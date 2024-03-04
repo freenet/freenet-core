@@ -2,7 +2,7 @@ import * as fbTopology from "./generated/topology";
 import * as d3 from "d3";
 import { BaseType } from "d3-selection";
 import { createRoot } from "react-dom/client";
-import { component } from "./transactions";
+import { component } from "./react-init";
 
 export let peers: PeerList = {};
 
@@ -86,6 +86,7 @@ export function handleChange(peerChange: fbTopology.PeerChange) {
             ringHistogram(Object.values(peers));
             updateTable();
         }
+        return true;
     }
 }
 
@@ -418,7 +419,7 @@ document.addEventListener("DOMContentLoaded", () => {
             tableSorting(header, index);
         });
 
-    const root = createRoot(document.getElementById("transactions-history")!);
+    const root = createRoot(document.getElementById("react-init-point")!);
     root.render(component);
 
     (window as any).resetPeersTable = function () {
