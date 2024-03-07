@@ -10,6 +10,7 @@ use futures::FutureExt;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
+use crate::transport::packet_data::{AssymetricEncrypted, UnknownEncrypted};
 
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
@@ -151,7 +152,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             let remote_conn = self.remote_connections.remove(&remote_addr);
                             match remote_conn {
                                 Some(remote_conn) => {
-                                    let packet_data = PacketData::from(&buf[..size]);
+                                    let packet_data = PacketData::from_bytes_to_unknown_enc(buf, size);
                                     let _ = remote_conn.inbound_packet_sender.send(packet_data).await;
                                     self.remote_connections.insert(remote_addr, remote_conn);
                                 }
@@ -159,7 +160,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     if self.is_gateway {
                                         tracing::debug!(%remote_addr, "unexpected packet from remote");
                                     }
-                                    let packet_data = PacketData::from(std::mem::replace(&mut buf, [0; MAX_PACKET_SIZE]));
+                                    let packet_data = PacketData::from_bytes_to_asym_enc(std::mem::replace(&mut buf, [0; MAX_PACKET_SIZE]), size);
                                     if let Err(error) = self.gateway_connection(packet_data, remote_addr).await {
                                         tracing::error!(%error, ?remote_addr, "Failed to establish connection");
                                     }
@@ -197,7 +198,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
     async fn gateway_connection(
         &mut self,
-        remote_intro_packet: PacketData,
+        remote_intro_packet: PacketData<AssymetricEncrypted>,
         remote_addr: SocketAddr,
     ) -> Result<(), TransportError> {
         let Ok(decrypted_intro_packet) = self
@@ -254,7 +255,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 tokio::time::timeout(waiting_time, self.socket_listener.recv_from(&mut buf));
             let packet = match timeout.await {
                 Ok(Ok((size, remote))) => {
-                    let packet = PacketData::from(&buf[..size]);
+                    let packet = PacketData::from_bytes_to_sym_enc(buf, size);
                     if remote != remote_addr {
                         if let Some(remote) = self.remote_connections.remove(&remote_addr) {
                             let _ = remote.inbound_packet_sender.send(packet).await;
@@ -329,7 +330,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             /// Initial state of the joinee, at this point NAT has been already traversed
             RemoteInbound {
                 /// Encrypted intro packet for comparison
-                intro_packet: PacketData,
+                intro_packet: PacketData<AssymetricEncrypted>,
             },
             /// Second state of the joiner, acknowledging their connection
             AckConnectionOutbound,
@@ -652,13 +653,13 @@ enum ConnectionEvent {
 }
 
 struct InboundRemoteConnection {
-    inbound_packet_sender: mpsc::Sender<PacketData>,
-    inbound_intro_packet: Option<PacketData>,
+    inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncrypted>>,
+    inbound_intro_packet: Option<PacketData<AssymetricEncrypted>>,
     inbound_checked_times: usize,
 }
 
 impl InboundRemoteConnection {
-    fn check_inbound_packet(&mut self, packet: &PacketData) -> bool {
+    fn check_inbound_packet(&mut self, packet: &PacketData<UnknownEncrypted>) -> bool {
         let mut inbound = false;
         if let Some(inbound_intro_packet) = self.inbound_intro_packet.as_ref() {
             if packet.is_intro_packet(inbound_intro_packet) {
