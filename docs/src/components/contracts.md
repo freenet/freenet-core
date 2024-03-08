@@ -72,7 +72,7 @@ state synchronization comprises the following steps:
 4. **Apply Delta**: PeerA applies this received delta to its state using
    `update_state`.
 
-5. **Reverse Synchronization**: This process is repeated in the opposite.
+5. **Reverse Synchronization**: This process is repeated in the opposite direction.
 
 This approach allows peers to synchronize state over the network while minimizing
 data transfer.
