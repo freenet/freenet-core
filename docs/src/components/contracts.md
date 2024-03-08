@@ -98,7 +98,7 @@ language for writing contracts.
 #### The `ContractInterface` Trait
 
 Rust contracts implement the `ContractInterface` trait, which defines the
-functions that the kernel calls to interact with the contract. This trait is
+functions that the core calls to interact with the contract. This trait is
 defined in the
 [freenet-stdlib](https://github.com/freenet/freenet-core/blob/main/stdlib/rust/src/contract_interface.rs#L424).
 

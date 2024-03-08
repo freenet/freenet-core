@@ -13,14 +13,14 @@ as they occur.
 
 ## Understanding Freenet Peers
 
-A Freenet peer refers to a computer that runs the Freenet kernel software and
+A Freenet peer refers to a computer that runs the Freenet core software and
 participates in the network. The organization of peers follows a ring structure,
 where each position on the ring represents a numerical value ranging from 0.0 to
 1.0. This value signifies the peer's location within the network.
 
 ## Establishing Neighbor Connections
 
-Each Freenet peer, or kernel, establishes bi-directional connections with a
+Each Freenet peer, or core, establishes bi-directional connections with a
 group of other peers known as its "neighbors." These connections rely on the
 User Datagram Protocol (UDP) and may involve techniques to traverse firewalls
 when required.

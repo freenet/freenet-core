@@ -4,8 +4,8 @@ Freenet is a distributed, decentralized alternative to the centralized World
 Wide Web, designed to unleash a new era of innovation and competition, while
 protecting freedom of speech and privacy. 
 
-At the core of Freenet is the Freenet kernel, which runs on users' computers,
-smartphones, or other devices. The kernel is tiny, less than 5 MB, allowing it
+At the core of Freenet is the Freenet core, which runs on users' computers,
+smartphones, or other devices. The core is tiny, less than 5 MB, allowing it
 to be installed in a matter of seconds and is compatible with a wide range of
 hardware.
 
