@@ -5,7 +5,7 @@ Wide Web, designed to unleash a new era of innovation and competition, while
 protecting freedom of speech and privacy. 
 
 The heart of Freenet is the [Core](https://github.com/freenet/freenet-core), 
-which runs on users' computers, smartphones, or other devices. The Core is 
+which runs on users' computer, smartphone, or other devices. The Core is 
 tiny, less than 5 MB, allowing it to be installed in a matter of seconds and 
 is compatible with a wide range of hardware.
 
