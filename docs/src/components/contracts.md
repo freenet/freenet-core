@@ -113,5 +113,5 @@ The `ContractInterface` trait is a low-level "Layer 0" API that provides direct
 access to the contract's state and parameters. This API is useful for contracts
 that require fine-grained control over their state, but can be cumbersome.
 
-We will provide higher-level APIs on top of Layer 0 that will sacrifice
+Soon we will provide higher-level APIs on top of Layer 0 that will sacrifice
 some flexibility for ease of contract implementation.
