@@ -29,7 +29,7 @@ Types](https://en.wikipedia.org/wiki/Conflict-free_replicated_data_type).
 As a very simple example, if the contract's state is a single number, then the
 contract could define the merging of two states as the maximum of the two numbers.
 
-In mathematical jargon, a contract defines a [commutative monoid](https://mathworld.wolfram.com/CommutativeMonoid.html) on the contract's state - but you can ignore this if you're not a mathematician.
+In mathematical terms, a contract defines a [commutative monoid](https://mathworld.wolfram.com/CommutativeMonoid.html) on the contract's state - but you can ignore this if you're not a mathematician.
 
 #### Efficient State Synchronization
 
