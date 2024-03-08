@@ -35,10 +35,9 @@ state - but you can ignore this if you're not a mathematician.
 
 #### Efficient State Synchronization
 
-A naive approach to state synchronization would be to transfer the entire state
-between peers, but this would be inefficient for large states. Instead,
-Freenet contracts utilize a much more efficient and flexible approach to state
-synchronization that transmits only the difference between states.
+Naively we could transfer the entire state between peers, but this would be
+inefficient for larger states. Instead, Freenet transmits only the
+difference between states.
 
 To do this a contract implements three functions:
 
