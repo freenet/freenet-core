@@ -24,8 +24,11 @@ Every Freenet peer, also referred to as a node, forms two-way connections with a
 set of other peers, termed "neighbors." These connections utilize the User
 Datagram Protocol (UDP) and can do [Frewall hole punching](https://en.wikipedia.org/wiki/Hole_punching_(networking)) when necessary. Peers manage their resource usage —
 bandwidth, memory, CPU, and storage — based on limits set by the user.
-They keep track of their neighbor's performance and so learn to prefer faster
+
+## Adaptive behavior
+
+Peers keep track of their neighbor's performance and learn to prefer faster
 connections over time.
 
-Peers can identify bad behavior by other peers like excess resource usage and 
+Peers can also identify bad behavior by other peers like excess resource usage and 
 will disconnect from them.
