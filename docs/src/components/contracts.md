@@ -101,7 +101,7 @@ language for writing contracts.
 Rust contracts implement the `ContractInterface` trait, which defines the
 functions that the core calls to interact with the contract. This trait is
 defined in the
-[freenet-stdlib](https://github.com/freenet/freenet-core/blob/main/stdlib/rust/src/contract_interface.rs#L424).
+[freenet-stdlib](https://github.com/freenet/freenet-stdlib/blob/f28e6716364b4e1c9ae8837344286393a2da4c82/rust/src/contract_interface.rs#L446).
 
 ```rust,no_run,noplayground
 {{#include ../../../stdlib/rust/src/contract_interface.rs:contractifce}}
