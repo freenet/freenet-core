@@ -3,7 +3,8 @@
 Freenet is essentially a global decentralized key-value store where keys are
 WebAssembly code called Contracts. Contracts are stored in the network,
 along with their data or "state". The contract controls what state is permitted
-and how it can be modified.
+and how it can be modified, and also how to efficiently synchronize state
+between peers.
 
 Network users can read a contract's state and subscribe to receive immediate
 updates if the state is modified.
