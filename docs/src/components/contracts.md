@@ -6,6 +6,11 @@ along with their data or "state". The contract controls what state is permitted
 and how it can be modified, and also how to efficiently synchronize state
 between peers.
 
+A contract's state is just a block of bytes, and can be anything from a simple
+number to a complex data structure. The contract's code defines the state's
+formatting. Even the serialization format is up to the contract, so it can be
+anything from JSON to Bincode, or a custom binary format.
+
 Network users can read a contract's state and subscribe to receive immediate
 updates if the state is modified.
 
