@@ -33,9 +33,11 @@ In mathematical jargon, a contract defines a [commutative monoid](https://mathwo
 #### Efficient State Synchronization
 
 A naive approach to state synchronization would be to transfer the entire state
-between peers, but this approach is very inefficient for large states. Instead,
+between peers, but this would be inefficient for large states. Instead,
 Freenet contracts utilize a much more efficient and flexible approach to state
-synchronization by providing an implementation of three functions:
+synchronization that only transmits  the difference between states.
+
+To do this a contract implements three functions:
 
 - `summarize_state` - Returns a concise summary of the contract's
   state.
@@ -46,7 +48,7 @@ synchronization by providing an implementation of three functions:
   bring it in sync with the other state.
 
 Contracts can implement these functions however they wish depending on the
-type of data being synchronized.
+type of data their state contains.
 
 ##### Step-by-step
 
