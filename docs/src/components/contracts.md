@@ -1,14 +1,14 @@
 ## Contracts
 
 Freenet is essentially a global decentralized key-value store where keys are
-WebAssembly code called Contracts. Contracts are stored in the network
+WebAssembly code called Contracts. Contracts are stored in the network,
 along with their data or "state". The contract controls what state is permitted
 and how it can be modified.
 
-Network users can read a contract's state, and subscribe to receive immediate
+Network users can read a contract's state and subscribe to receive immediate
 updates if the state is modified.
 
-Contracts play a similar role in Freenet to databases and realtime
+Contracts play a similar role in Freenet to databases and real-time
 publish-subscribe mechanisms in traditional online services, while being
 entirely decentralized, secure, and scalable.
 
@@ -25,17 +25,17 @@ new state that integrates both. This process ensures the eventual consistency of
 contract states in Freenet, a concept similar to [Conflict-free Replicated Data
 Types](https://en.wikipedia.org/wiki/Conflict-free_replicated_data_type).
 
-As a very simple example, if the contract's state is a single number, then the 
+As a very simple example, if the contract's state is a single number, then the
 contract could define the merging of two states as the maximum of the two numbers.
 
-In mathematical jargon, a contract defines a [commutative monoid](https://mathworld.wolfram.com/CommutativeMonoid.html) on the contract's state - but you can ignore this if you're not a mathematician. 
+In mathematical jargon, a contract defines a [commutative monoid](https://mathworld.wolfram.com/CommutativeMonoid.html) on the contract's state - but you can ignore this if you're not a mathematician.
 
 #### Efficient State Synchronization
 
 A naive approach to state synchronization would be to transfer the entire state
 between peers, but this would be inefficient for large states. Instead,
 Freenet contracts utilize a much more efficient and flexible approach to state
-synchronization that only transmits  the difference between states.
+synchronization that transmits only the difference between states.
 
 To do this a contract implements three functions:
 
@@ -45,7 +45,7 @@ To do this a contract implements three functions:
   another state and returns the difference between the two, the "delta".
 
 - `update_state` - Applies a delta to the contract's state, updating it to
-  bring it in sync with the other state.
+  bring it in sync with the other peer's contract state.
 
 Contracts can implement these functions however they wish depending on the
 type of data their state contains.
@@ -53,7 +53,7 @@ type of data their state contains.
 ##### Step-by-step
 
 PeerA and PeerB need to synchronize their states. The algorithm for efficient
-state synchronization comprises the following steps:
+state synchronization consists of the following steps:
 
 1. **Summarize State by Initiator**: PeerA compiles a concise summary of its
    current state using the `summarize_state` function.
@@ -80,8 +80,8 @@ data transfer.
 ### Blog Use Case
 
 Consider a public blog contract. The state of this contract would be the blog's
-content, including a list of blog posts. The contract's code requires that new
-posts can only be added if they are signed by the blog's owner, the owner's
+content, including blog posts. The contract's code requires that new
+posts can only be added if they are signed by the blog's owner. The owner's
 public key is part of the contract's parameters.
 
 The contract would summarize its state by returning a list of post identifiers,
@@ -113,5 +113,5 @@ The `ContractInterface` trait is a low-level "Layer 0" API that provides direct
 access to the contract's state and parameters. This API is useful for contracts
 that require fine-grained control over their state, but can be cumbersome.
 
-We will provide higher-level APIs on top of Layer 0 that will sacrafice
+We will provide higher-level APIs on top of Layer 0 that will sacrifice
 some flexibility for ease of contract implementation.
