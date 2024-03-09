@@ -62,6 +62,7 @@ impl<const N: usize> PacketData<N> {
         // Encrypt the data in place
         let payload_length = data.len();
         buffer[NONCE_SIZE..NONCE_SIZE + payload_length].copy_from_slice(data);
+
         let tag = cipher
             .encrypt_in_place_detached(
                 &nonce.into(),

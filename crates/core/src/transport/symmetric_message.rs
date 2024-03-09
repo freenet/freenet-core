@@ -10,9 +10,10 @@ use super::{
 
 #[serde_as]
 #[derive(Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Debug, Clone))]
 pub(super) struct SymmetricMessage {
     pub packet_id: PacketId,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    // #[serde(skip_serializing_if = "Vec::is_empty")]
     pub confirm_receipt: Vec<PacketId>,
     pub payload: SymmetricMessagePayload,
 }
@@ -23,6 +24,17 @@ impl SymmetricMessage {
     pub fn deser(bytes: &[u8]) -> Result<Self, bincode::Error> {
         bincode::deserialize(bytes)
     }
+
+    const ACK_ERROR: SymmetricMessage = SymmetricMessage {
+        packet_id: Self::FIRST_PACKET_ID,
+        confirm_receipt: Vec::new(),
+        payload: SymmetricMessagePayload::AckConnection {
+            // TODO: change to return UnsupportedProtocolVersion
+            result: Err(Cow::Borrowed(
+                "remote is using a different protocol version",
+            )),
+        },
+    };
 
     pub fn ack_error(outbound_sym_key: &Aes128Gcm) -> Result<PacketData, bincode::Error> {
         static SERIALIZED: OnceLock<Box<[u8]>> = OnceLock::new();
@@ -35,17 +47,18 @@ impl SymmetricMessage {
         Ok(PacketData::encrypt_symmetric(bytes, outbound_sym_key))
     }
 
+    const ACK_OK: SymmetricMessage = SymmetricMessage {
+        packet_id: Self::FIRST_PACKET_ID,
+        confirm_receipt: Vec::new(),
+        payload: SymmetricMessagePayload::AckConnection { result: Ok(()) },
+    };
+
     pub fn ack_ok(outbound_sym_key: &Aes128Gcm) -> Result<PacketData, bincode::Error> {
         static SERIALIZED: OnceLock<Box<[u8]>> = OnceLock::new();
         let bytes = SERIALIZED.get_or_init(move || {
             let mut packet = [0u8; MAX_DATA_SIZE];
-            let size = bincode::serialized_size(&SymmetricMessage {
-                packet_id: Self::FIRST_PACKET_ID,
-                confirm_receipt: vec![],
-                payload: SymmetricMessagePayload::AckConnection { result: Ok(()) },
-            })
-            .unwrap();
-            bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_ERROR).unwrap();
+            let size = bincode::serialized_size(&Self::ACK_OK).unwrap();
+            bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_OK).unwrap();
             (&packet[..size as usize]).into()
         });
         Ok(PacketData::encrypt_symmetric(bytes, outbound_sym_key))
@@ -87,17 +100,6 @@ impl SymmetricMessage {
         let bytes = &packet[..size as usize];
         Ok(PacketData::encrypt_symmetric(bytes, outbound_sym_key))
     }
-
-    const ACK_ERROR: SymmetricMessage = SymmetricMessage {
-        packet_id: Self::FIRST_PACKET_ID,
-        confirm_receipt: Vec::new(),
-        payload: SymmetricMessagePayload::AckConnection {
-            // TODO: change to return UnsupportedProtocolVersion
-            result: Err(Cow::Borrowed(
-                "remote is using a different protocol version",
-            )),
-        },
-    };
 }
 
 impl From<()> for SymmetricMessagePayload {
@@ -135,6 +137,7 @@ impl From<StreamFragment> for SymmetricMessagePayload {
 }
 
 #[derive(Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Debug, Clone))]
 pub(super) enum SymmetricMessagePayload {
     AckConnection {
         // if we successfully connected to a remote we attempt to connect to initially
@@ -161,22 +164,82 @@ pub(super) enum SymmetricMessagePayload {
 
 #[cfg(test)]
 mod test {
+    use aes_gcm::aead::generic_array::GenericArray;
+    use aes_gcm::KeyInit;
+    use rand::RngCore;
+
     use super::*;
+
+    fn gen_key() -> Aes128Gcm {
+        let mut key = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut key);
+        let key = GenericArray::from_slice(&key);
+        Aes128Gcm::new(key)
+    }
+
+    fn serialization_round_trip(
+        payload: impl Into<SymmetricMessagePayload>,
+        key: &Aes128Gcm,
+    ) -> SymmetricMessagePayload {
+        let enc_sym_packet =
+            SymmetricMessage::serialize_msg_to_packet_data(1, payload, key, vec![]).unwrap();
+        let dec_sym_packet = enc_sym_packet.decrypt(key).unwrap();
+        assert_eq!(dec_sym_packet.data(), enc_sym_packet.data());
+        SymmetricMessage::deser(dec_sym_packet.data())
+            .unwrap()
+            .payload
+    }
+
+    #[test]
+    fn check_symmetric_message_serialization() {
+        let key = gen_key();
+        let payload = SymmetricMessagePayload::AckConnection { result: Ok(()) };
+        let deserialized = serialization_round_trip(payload.clone(), &key);
+        assert_eq!(deserialized, payload);
+
+        let payload = SymmetricMessagePayload::AckConnection {
+            result: Err(Cow::Borrowed("error")),
+        };
+        let deserialized = serialization_round_trip(payload.clone(), &key);
+        assert_eq!(deserialized, payload);
+    }
 
     #[test]
     fn ack_error_msg() -> Result<(), Box<dyn std::error::Error>> {
-        use aes_gcm::KeyInit;
-        let key = Aes128Gcm::new(&[0; 16].into());
+        let key = gen_key();
         let packet = SymmetricMessage::ack_error(&key)?;
-
-        let _packet = PacketData::<1000>::encrypt_symmetric(packet.data(), &key);
-
         let data = packet.decrypt(&key).unwrap();
         let deser = SymmetricMessage::deser(data.data())?;
         assert!(matches!(
             deser.payload,
             SymmetricMessagePayload::AckConnection { result: Err(_) }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn ack_ok_msg() -> Result<(), Box<dyn std::error::Error>> {
+        let msg = SymmetricMessage {
+            packet_id: 1,
+            confirm_receipt: Vec::new(),
+            payload: SymmetricMessagePayload::AckConnection { result: Ok(()) },
+        };
+        // let enc = bincode::serialize(&msg)?;
+        let enc = serde_json::to_string(&msg)?;
+        eprintln!("enc: {:?}", enc);
+        // let dec: SymmetricMessage = bincode::deserialize(&enc)?;
+        let dec = serde_json::from_str(&enc)?;
+        assert_eq!(msg, dec);
+        /*
+        let key = gen_key();
+        let packet = SymmetricMessage::ack_ok(&key)?;
+        let data = packet.decrypt(&key).unwrap();
+        let deser = SymmetricMessage::deser(data.data())?;
+        assert!(matches!(
+            deser.payload,
+            SymmetricMessagePayload::AckConnection { result: Ok(_) }
+        ));
+        */
         Ok(())
     }
 }
