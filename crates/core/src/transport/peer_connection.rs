@@ -42,6 +42,7 @@ pub(super) struct RemoteConnection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(transparent)]
+#[serde(transparent)]
 pub(crate) struct StreamId(u32);
 
 impl StreamId {

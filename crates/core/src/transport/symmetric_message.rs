@@ -219,18 +219,10 @@ mod test {
 
     #[test]
     fn ack_ok_msg() -> Result<(), Box<dyn std::error::Error>> {
-        let msg = SymmetricMessage {
-            packet_id: 1,
-            confirm_receipt: Vec::new(),
-            payload: SymmetricMessagePayload::AckConnection { result: Ok(()) },
-        };
-        // let enc = bincode::serialize(&msg)?;
-        let enc = serde_json::to_string(&msg)?;
-        eprintln!("enc: {:?}", enc);
-        // let dec: SymmetricMessage = bincode::deserialize(&enc)?;
-        let dec = serde_json::from_str(&enc)?;
-        assert_eq!(msg, dec);
-        /*
+        let enc = bincode::serialize(&SymmetricMessage::ACK_OK)?;
+        let dec: SymmetricMessage = bincode::deserialize(&enc)?;
+        assert_eq!(SymmetricMessage::ACK_OK, dec);
+
         let key = gen_key();
         let packet = SymmetricMessage::ack_ok(&key)?;
         let data = packet.decrypt(&key).unwrap();
@@ -239,7 +231,6 @@ mod test {
             deser.payload,
             SymmetricMessagePayload::AckConnection { result: Ok(_) }
         ));
-        */
         Ok(())
     }
 }
