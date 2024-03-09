@@ -133,6 +133,10 @@ impl<const N: usize> PacketData<N> {
         }
         is_intro_packet
     }
+
+    pub(super) fn sent(self) -> Arc<[u8]> {
+        self.data[..self.size].into()
+    }
 }
 
 impl<const N: usize> From<[u8; N]> for PacketData<N> {
@@ -150,12 +154,6 @@ impl<'a> From<&'a [u8]> for PacketData<MAX_PACKET_SIZE> {
             data,
             size: value.len(),
         }
-    }
-}
-
-impl<const N: usize> From<PacketData<N>> for Arc<[u8]> {
-    fn from(packet_data: PacketData<N>) -> Arc<[u8]> {
-        packet_data.data.into()
     }
 }
 

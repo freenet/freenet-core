@@ -311,7 +311,7 @@ async fn packet_sending(
         outbound_sym_key,
         confirm_receipt,
     )?;
-    let packet: Arc<[u8]> = payload.into();
+    let packet: Arc<[u8]> = payload.sent();
     outbound_packets
         .send((remote_addr, packet.clone()))
         .await

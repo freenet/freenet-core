@@ -219,7 +219,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         if protoc != PROTOC_VERSION {
             let packet = SymmetricMessage::ack_error(&outbound_key)?;
             self.outbound_packets
-                .send((remote_addr, packet.into()))
+                .send((remote_addr, packet.sent()))
                 .await
                 .map_err(|_| TransportError::ChannelClosed)?;
             return Err(TransportError::ConnectionEstablishmentFailure {
@@ -245,7 +245,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         const MAX_ATTEMPTS: usize = 20;
         while attempts < MAX_ATTEMPTS {
             self.outbound_packets
-                .send((remote_addr, outbound_ack_packet.clone().into()))
+                .send((remote_addr, outbound_ack_packet.clone().sent()))
                 .await
                 .map_err(|_| TransportError::ChannelClosed)?;
 
@@ -308,7 +308,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
         sent_tracker.lock().report_sent_packet(
             SymmetricMessage::FIRST_PACKET_ID,
-            outbound_ack_packet.into(),
+            outbound_ack_packet.sent(),
         );
 
         Ok(())
@@ -527,7 +527,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 if protocol_version != PROTOC_VERSION {
                                     let packet = SymmetricMessage::ack_error(&key)?;
                                     self.outbound_packets
-                                        .send((remote_addr, packet.into()))
+                                        .send((remote_addr, packet.sent()))
                                         .await
                                         .map_err(|_| TransportError::ChannelClosed)?;
                                     return Err(TransportError::ConnectionEstablishmentFailure {

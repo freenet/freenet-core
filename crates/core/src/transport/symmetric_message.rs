@@ -166,17 +166,13 @@ pub(super) enum SymmetricMessagePayload {
 mod test {
     use std::net::Ipv4Addr;
 
-    use aes_gcm::aead::generic_array::GenericArray;
     use aes_gcm::KeyInit;
-    use rand::RngCore;
 
     use super::*;
 
     fn gen_key() -> Aes128Gcm {
-        let mut key = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut key);
-        let key = GenericArray::from_slice(&key);
-        Aes128Gcm::new(key)
+        let key = rand::random::<[u8; 16]>();
+        Aes128Gcm::new(&key.into())
     }
 
     fn serialization_round_trip(

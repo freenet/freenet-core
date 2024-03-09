@@ -93,9 +93,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_stream_success() -> Result<(), Box<dyn std::error::Error>> {
-        let (outbound_sender, mut outbound_receiver) = mpsc::channel(100);
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(1);
         let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
-        let message: Vec<_> = std::iter::repeat(0)
+        let message: Vec<_> = std::iter::repeat(())
             .take(100_000)
             .map(|_| rand::random::<u8>())
             .collect();
