@@ -164,6 +164,8 @@ pub(super) enum SymmetricMessagePayload {
 
 #[cfg(test)]
 mod test {
+    use std::net::Ipv4Addr;
+
     use aes_gcm::aead::generic_array::GenericArray;
     use aes_gcm::KeyInit;
     use rand::RngCore;
@@ -184,7 +186,6 @@ mod test {
         let enc_sym_packet =
             SymmetricMessage::serialize_msg_to_packet_data(1, payload, key, vec![]).unwrap();
         let dec_sym_packet = enc_sym_packet.decrypt(key).unwrap();
-        assert_eq!(dec_sym_packet.data(), enc_sym_packet.data());
         SymmetricMessage::deser(dec_sym_packet.data())
             .unwrap()
             .payload
@@ -192,16 +193,38 @@ mod test {
 
     #[test]
     fn check_symmetric_message_serialization() {
+        let test_cases = [
+            SymmetricMessagePayload::AckConnection { result: Ok(()) },
+            SymmetricMessagePayload::AckConnection {
+                result: Err(Cow::Borrowed("error")),
+            },
+            SymmetricMessagePayload::GatewayConnection {
+                remote_addr: (Ipv4Addr::LOCALHOST, 1234).into(),
+                key: [6u8; 16],
+            },
+            SymmetricMessagePayload::ShortMessage {
+                payload: std::iter::repeat(())
+                    .take(100)
+                    .map(|_| rand::random::<u8>())
+                    .collect(),
+            },
+            SymmetricMessagePayload::StreamFragment {
+                stream_id: StreamId::next(),
+                total_length_bytes: 100,
+                fragment_number: 1,
+                payload: std::iter::repeat(())
+                    .take(100)
+                    .map(|_| rand::random::<u8>())
+                    .collect(),
+            },
+            SymmetricMessagePayload::NoOp,
+        ];
         let key = gen_key();
-        let payload = SymmetricMessagePayload::AckConnection { result: Ok(()) };
-        let deserialized = serialization_round_trip(payload.clone(), &key);
-        assert_eq!(deserialized, payload);
 
-        let payload = SymmetricMessagePayload::AckConnection {
-            result: Err(Cow::Borrowed("error")),
-        };
-        let deserialized = serialization_round_trip(payload.clone(), &key);
-        assert_eq!(deserialized, payload);
+        for case in test_cases {
+            let deserialized = serialization_round_trip(case.clone(), &key);
+            assert_eq!(deserialized, case);
+        }
     }
 
     #[test]

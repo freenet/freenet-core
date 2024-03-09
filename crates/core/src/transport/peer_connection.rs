@@ -46,7 +46,7 @@ pub(super) struct RemoteConnection {
 pub(crate) struct StreamId(u32);
 
 impl StreamId {
-    fn next() -> Self {
+    pub fn next() -> Self {
         static NEXT_ID: AtomicU32 = AtomicU32::new(0);
         Self(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Release))
     }
