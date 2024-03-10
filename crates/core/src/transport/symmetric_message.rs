@@ -89,7 +89,7 @@ impl SymmetricMessage {
         debug_assert!(size <= MAX_DATA_SIZE as u64);
         bincode::serialize_into(packet.as_mut_slice(), &message)?;
         let bytes = &packet[..size as usize];
-        
+
         let packet = PacketData::new_packet_data(bytes, bytes.len()).with_no_encryption();
         Ok(PacketData::encrypt_symmetric(&packet, outbound_sym_key))
     }
@@ -175,7 +175,7 @@ mod test {
         let key = Aes128Gcm::new(&[0; 16].into());
         let packet = SymmetricMessage::ack_error(&key)?;
 
-        let _packet = PacketData::<Symmetric, 1000>::encrypt_symmetric(packet.data(), &key);
+        let _packet = PacketData::<Symmetric, 1000>::encrypt_symmetric(packet, &key);
 
         let data = packet.decrypt(&key).unwrap();
         let deser = SymmetricMessage::deser(data.data())?;
