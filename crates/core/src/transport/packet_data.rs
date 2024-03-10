@@ -240,7 +240,7 @@ impl<const N: usize> PacketData<Unknown, N> {
     ) -> Result<PacketData<AssymetricRSA, N>, TransportError> {
         let r = key.decrypt(self.data()).map(|decrypted| {
             let mut data = [0; N];
-            data.copy_from_slice(&decrypted[..]);
+            data[..decrypted.len()].copy_from_slice(&decrypted[..]);
             PacketData {
                 size: data.len(),
                 data,

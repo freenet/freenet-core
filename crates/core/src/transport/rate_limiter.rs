@@ -94,7 +94,10 @@ impl<T: TimeSource> PacketRateLimiter<T> {
         for &(size, time) in self.packets.iter() {
             temp_bandwidth -= size;
             if temp_bandwidth + packet_size <= bandwidth_limit {
-                wait_time = Some(self.window_size - (self.time_source.now() - time));
+                wait_time = Some(
+                    self.window_size
+                        .saturating_sub(self.time_source.now() - time),
+                );
                 break;
             }
         }
