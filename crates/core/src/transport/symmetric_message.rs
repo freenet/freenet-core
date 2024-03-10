@@ -47,8 +47,8 @@ impl SymmetricMessage {
             bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_ERROR).unwrap();
             (&packet[..size as usize]).into()
         });
-        let packet = PacketData::from_buf(bytes).with_no_encryption();
-        Ok(PacketData::encrypt_symmetric(&packet, outbound_sym_key))
+        let packet = PacketData::from_buf_plain(bytes);
+        Ok(packet.encrypt_symmetric(outbound_sym_key))
     }
 
     const ACK_OK: SymmetricMessage = SymmetricMessage {
@@ -67,8 +67,8 @@ impl SymmetricMessage {
             bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_OK).unwrap();
             (&packet[..size as usize]).into()
         });
-        let packet = PacketData::from_buf(bytes).with_no_encryption();
-        Ok(PacketData::encrypt_symmetric(&packet, outbound_sym_key))
+        let packet = PacketData::from_buf_plain(bytes);
+        Ok(packet.encrypt_symmetric(outbound_sym_key))
     }
 
     pub fn ack_gateway_connection(
@@ -87,8 +87,8 @@ impl SymmetricMessage {
         bincode::serialize_into(packet.as_mut_slice(), &message)?;
         let bytes = &packet[..size as usize];
 
-        let packet = PacketData::from_buf(bytes).with_no_encryption();
-        Ok(PacketData::encrypt_symmetric(&packet, outbound_sym_key))
+        let packet = PacketData::from_buf_plain(bytes);
+        Ok(packet.encrypt_symmetric(outbound_sym_key))
     }
 
     pub fn serialize_msg_to_packet_data(
@@ -107,8 +107,8 @@ impl SymmetricMessage {
         debug_assert!(size <= MAX_DATA_SIZE as u64);
         bincode::serialize_into(packet.as_mut_slice(), &message)?;
         let bytes = &packet[..size as usize];
-        let packet = PacketData::from_buf(bytes).with_no_encryption();
-        Ok(PacketData::encrypt_symmetric(&packet, outbound_sym_key))
+        let packet = PacketData::from_buf_plain(bytes);
+        Ok(packet.encrypt_symmetric(outbound_sym_key))
     }
 }
 
