@@ -113,7 +113,7 @@ mod tests {
             packets: VecDeque::new(),
             window_size,
             current_bandwidth: 0,
-            outbound_packets: mpsc::channel(0).1,
+            outbound_packets: mpsc::channel(1).1,
             time_source: MockTimeSource::new(Instant::now()),
         }
     }
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn test_adding_packets() {
-        let mut tracker = PacketRateLimiter::new(Duration::from_secs(1), mpsc::channel(0).1);
+        let mut tracker = PacketRateLimiter::new(Duration::from_secs(1), mpsc::channel(1).1);
         verify_bandwidth_match(&tracker);
         tracker.add_packet(1500);
         verify_bandwidth_match(&tracker);
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn test_bandwidth_calculation() {
-        let mut tracker = PacketRateLimiter::new(Duration::from_secs(1), mpsc::channel(0).1);
+        let mut tracker = PacketRateLimiter::new(Duration::from_secs(1), mpsc::channel(1).1);
         tracker.add_packet(1500);
         tracker.add_packet(2500);
         verify_bandwidth_match(&tracker);
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn test_immediate_send() {
-        let mut tracker = PacketRateLimiter::new(Duration::from_millis(10), mpsc::channel(0).1);
+        let mut tracker = PacketRateLimiter::new(Duration::from_millis(10), mpsc::channel(1).1);
         tracker.add_packet(3000);
         assert_eq!(tracker.can_send_packet(10000, 2000), None);
     }

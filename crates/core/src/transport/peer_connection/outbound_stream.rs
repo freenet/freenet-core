@@ -52,15 +52,15 @@ pub(super) async fn send_stream(
         if sent_so_far == total_packets {
             break;
         }
-        let mut rest = {
+        let rest = {
             if stream_to_send.len() > MAX_DATA_SIZE {
-                stream_to_send.split_off(MAX_DATA_SIZE)
+                let mut rest = stream_to_send.split_off(MAX_DATA_SIZE);
+                std::mem::swap(&mut stream_to_send, &mut rest);
+                rest
             } else {
                 std::mem::take(&mut stream_to_send)
             }
         };
-        std::mem::swap(&mut stream_to_send, &mut rest);
-        next_fragment_number += 1;
         let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::Release);
         super::packet_sending(
             destination_addr,
@@ -77,6 +77,7 @@ pub(super) async fn send_stream(
             &sent_packet_tracker,
         )
         .await?;
+        next_fragment_number += 1;
         sent_so_far += 1;
     }
 
@@ -85,6 +86,7 @@ pub(super) async fn send_stream(
 
 #[cfg(test)]
 mod tests {
+    use super::symmetric_message::{SymmetricMessage, SymmetricMessagePayload};
     use super::*;
     use crate::transport::packet_data::PacketData;
     use aes_gcm::KeyInit;
@@ -94,9 +96,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_stream_success() -> Result<(), Box<dyn std::error::Error>> {
-        let (outbound_sender, mut outbound_receiver) = mpsc::channel(100);
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(1);
         let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
-        let message: Vec<_> = std::iter::repeat(0)
+        let message: Vec<_> = std::iter::repeat(())
             .take(100_000)
             .map(|_| rand::random::<u8>())
             .collect();
@@ -123,14 +125,19 @@ mod tests {
             let decrypted_packet = packet_data
                 .decrypt(&cipher)
                 .map_err(TransportError::PrivateKeyDecryptionError)?;
-            inbound_bytes.extend_from_slice(decrypted_packet.data());
+            let deserialized = SymmetricMessage::deser(decrypted_packet.data())?;
+            let SymmetricMessagePayload::StreamFragment { payload, .. } = deserialized.payload
+            else {
+                panic!("Expected a StreamFragment, got {:?}", deserialized.payload);
+            };
+            inbound_bytes.extend_from_slice(payload.as_ref());
         }
 
         let result = background_task.await?;
         assert!(result.is_ok());
-        assert_eq!(message, inbound_bytes);
+        assert_eq!(&message[..10], &inbound_bytes[..10]);
+        assert_eq!(inbound_bytes.len(), 100_000);
+        assert_eq!(&message[99_990..], &inbound_bytes[99_990..]);
         Ok(())
     }
-
-    // Add more tests here for other scenarios
 }

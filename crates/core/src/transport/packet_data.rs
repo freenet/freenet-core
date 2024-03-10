@@ -85,7 +85,7 @@ impl<const N: usize> PacketData<SymmetricAES, N> {
     // TODO: move this to None subtype
     pub(super) fn encrypt_symmetric(packet_data: &PacketData<None, N>, cipher: &Aes128Gcm) -> Self {
         _check_valid_size::<N>();
-        debug_assert!(packet_data.data.len() <= MAX_DATA_SIZE);
+        debug_assert!(packet_data.size <= MAX_DATA_SIZE);
 
         let nonce: [u8; NONCE_SIZE] = RNG.with(|rng| rng.borrow_mut().gen());
 
@@ -93,7 +93,7 @@ impl<const N: usize> PacketData<SymmetricAES, N> {
         buffer[..NONCE_SIZE].copy_from_slice(&nonce);
 
         // Encrypt the data in place
-        let payload_length = packet_data.data.len();
+        let payload_length = packet_data.size;
         buffer[NONCE_SIZE..NONCE_SIZE + payload_length].copy_from_slice(packet_data.data());
         let tag = cipher
             .encrypt_in_place_detached(
@@ -141,7 +141,7 @@ impl<const N: usize> PacketData<AssymetricRSA, N> {
         let encrypted_data: Vec<u8> = remote_key.encrypt(data);
         debug_assert!(encrypted_data.len() <= MAX_PACKET_SIZE);
         let mut data = [0; N];
-        data.copy_from_slice(&encrypted_data[..]);
+        data[..encrypted_data.len()].copy_from_slice(&encrypted_data[..]);
         Self {
             data,
             size: encrypted_data.len(),
@@ -170,6 +170,10 @@ impl<const N: usize> PacketData<Unknown, N> {
         }
         is_intro_packet
     }
+
+    pub(super) fn sent(self) -> Arc<[u8]> {
+        self.data[..self.size].into()
+    }
 }
 
 impl<const N: usize> PacketData<AssymetricRSA, N> {
@@ -183,7 +187,7 @@ impl<const N: usize> PacketData<Unknown, N> {
         let mut data = [0; N];
         let buf = buf.as_ref();
         let size = buf.len();
-        data.copy_from_slice(buf);
+        data[..size].copy_from_slice(buf);
         Self {
             size,
             data,
@@ -285,10 +289,7 @@ mod tests {
         match packet_data.decrypt(cipher) {
             Ok(decrypted_data) => {
                 // Ensure decrypted data matches original
-                assert_eq!(
-                    &decrypted_data.data[..decrypted_data.size],
-                    &original_data.data[..]
-                );
+                assert_eq!(&decrypted_data.data(), &original_data.data());
             }
             Err(e) => panic!("Decryption failed with error: {:?}", e),
         }
