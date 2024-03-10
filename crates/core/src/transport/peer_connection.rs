@@ -326,6 +326,7 @@ mod tests {
     use futures::TryFutureExt;
     use std::net::{Ipv4Addr, SocketAddr};
     use tokio::sync::mpsc;
+    use crate::transport::packet_data::MAX_PACKET_SIZE;
 
     use super::{inbound_stream::recv_stream, outbound_stream::send_stream, *};
 
@@ -360,7 +361,7 @@ mod tests {
             let (tx, rx) = mpsc::channel(1);
             let inbound_msg = tokio::task::spawn(recv_stream(stream_id, message.len() as u64, rx));
             while let Some((_, network_packet)) = receiver.recv().await {
-                let network_packet_slice: [u8] = *network_packet;
+                let network_packet_slice: [u8; MAX_PACKET_SIZE] = network_packet.try_into()?;
                 let decrypted = PacketData::new_packet_data(network_packet_slice, network_packet.len()).with_sym_encryption()
                     .decrypt(&cipher)
                     .map_err(TransportError::PrivateKeyDecryptionError)?;
