@@ -10,7 +10,7 @@ use futures::FutureExt;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
-use crate::transport::packet_data::{AssymetricEncrypted, UnknownEncrypted};
+use crate::transport::packet_data::{Assymetric, Unknown};
 
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
@@ -152,7 +152,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             let remote_conn = self.remote_connections.remove(&remote_addr);
                             match remote_conn {
                                 Some(remote_conn) => {
-                                    let packet_data = PacketData::from_bytes_to_unknown_enc(buf, size);
+                                    let packet_data = PacketData::new_packet_data(buf, size);
                                     let _ = remote_conn.inbound_packet_sender.send(packet_data).await;
                                     self.remote_connections.insert(remote_addr, remote_conn);
                                 }
@@ -198,7 +198,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
     async fn gateway_connection(
         &mut self,
-        remote_intro_packet: PacketData<AssymetricEncrypted>,
+        remote_intro_packet: PacketData<Assymetric>,
         remote_addr: SocketAddr,
     ) -> Result<(), TransportError> {
         let Ok(decrypted_intro_packet) = self
@@ -330,7 +330,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             /// Initial state of the joinee, at this point NAT has been already traversed
             RemoteInbound {
                 /// Encrypted intro packet for comparison
-                intro_packet: PacketData<AssymetricEncrypted>,
+                intro_packet: PacketData<Assymetric>,
             },
             /// Second state of the joiner, acknowledging their connection
             AckConnectionOutbound,
@@ -653,13 +653,13 @@ enum ConnectionEvent {
 }
 
 struct InboundRemoteConnection {
-    inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncrypted>>,
-    inbound_intro_packet: Option<PacketData<AssymetricEncrypted>>,
+    inbound_packet_sender: mpsc::Sender<PacketData<Unknown>>,
+    inbound_intro_packet: Option<PacketData<Assymetric>>,
     inbound_checked_times: usize,
 }
 
 impl InboundRemoteConnection {
-    fn check_inbound_packet(&mut self, packet: &PacketData<UnknownEncrypted>) -> bool {
+    fn check_inbound_packet(&mut self, packet: &PacketData<Unknown>) -> bool {
         let mut inbound = false;
         if let Some(inbound_intro_packet) = self.inbound_intro_packet.as_ref() {
             if packet.is_intro_packet(inbound_intro_packet) {

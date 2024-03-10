@@ -41,47 +41,45 @@ const fn _check_valid_size<const N: usize>() {
 
 // TODO: maybe split this into type for handling inbound (encrypted)/outbound (decrypted) packets for clarity
 #[derive(Clone)]
-pub(super) struct PacketData<DT : DataType, const N: usize = MAX_PACKET_SIZE> {
+pub(super) struct PacketData<DT : Encryption, const N: usize = MAX_PACKET_SIZE> {
     data: [u8; N],
     pub size: usize,
     data_type : PhantomData<DT>,
 }
 
-trait DataType { }
+trait Encryption { }
 
 /// Decrypted packet
-pub(super) struct PlainText;
+pub(super) struct None;
 
 /// Packet is encrypted using symmetric crypto (most packets if not an intro packet)
-pub(super) struct SymmetricEncrypted;
+pub(super) struct Symmetric;
 
 /// Packet is encrypted using assympetric crypto (typically an intro packet)
-pub(super) struct AssymetricEncrypted;
+pub(super) struct Assymetric;
 
 /// This is used when we don't know the encryption type of the packet, perhaps because we
 /// haven't yet determined whether it is an intro packet.
-pub(super) struct UnknownEncrypted;
+pub(super) struct Unknown;
 
-impl DataType for PlainText { }
-impl DataType for SymmetricEncrypted { }
-
-impl DataType for AssymetricEncrypted { }
-
-impl DataType for UnknownEncrypted { }
+impl Encryption for None { }
+impl Encryption for Symmetric { }
+impl Encryption for Assymetric { }
+impl Encryption for Unknown { }
 
 pub(super) const fn packet_size<const DATA_SIZE: usize>() -> usize {
     DATA_SIZE + NONCE_SIZE + TAG_SIZE
 }
  
-impl<DT : DataType, const N: usize> PacketData<DT, N> {
+impl<DT : Encryption, const N: usize> PacketData<DT, N> {
     // TODO: this function will be unnecessary when we guarantee that size = N
     pub(super) fn data(&self) -> &[u8] {
         &self.data[..self.size]
     }
 }
 
-impl<const N: usize> PacketData<SymmetricEncrypted, N> {
-    pub(super) fn encrypt_symmetric(data: &[u8], cipher: &Aes128Gcm) -> Self {
+impl<const N: usize> PacketData<Symmetric, N> {
+    pub(super) fn encrypt_symmetric(data: &PacketData<None, N>, cipher: &Aes128Gcm) -> Self {
         _check_valid_size::<N>();
         debug_assert!(data.len() <= MAX_DATA_SIZE);
 
@@ -132,7 +130,7 @@ impl<const N: usize> PacketData<SymmetricEncrypted, N> {
         })
     }
 }
-impl<const N: usize> PacketData<AssymetricEncrypted, N> {
+impl<const N: usize> PacketData<Assymetric, N> {
     pub(super) fn encrypt_with_pubkey(data: &[u8], remote_key: &TransportPublicKey) -> Self {
         _check_valid_size::<N>();
         let encrypted_data: Vec<u8> = remote_key.encrypt(data);
@@ -147,8 +145,8 @@ impl<const N: usize> PacketData<AssymetricEncrypted, N> {
     }
 }
 
-impl<const N: usize> PacketData<UnknownEncrypted, N> {
-    pub(super) fn is_intro_packet<DT : DataType>(&self, actual_intro_packet: &PacketData<AssymetricEncrypted, N>) -> bool {
+impl<const N: usize> PacketData<Unknown, N> {
+    pub(super) fn is_intro_packet<DT : Encryption>(&self, actual_intro_packet: &PacketData<Assymetric, N>) -> bool {
         if self.size != actual_intro_packet.size {
             return false;
         }
@@ -164,35 +162,9 @@ impl<const N: usize> PacketData<UnknownEncrypted, N> {
         }
         is_intro_packet
     }
-    
-    pub(super) fn convert_to_sym_enc(self) -> PacketData<SymmetricEncrypted, N> {
-        PacketData {
-            data: self.data,
-            size: self.size,
-            data_type: PhantomData,
-        }
-    }
-    
-    pub(super) fn convert_to_asym_enc(self) -> PacketData<AssymetricEncrypted, N> {
-        PacketData {
-            data: self.data,
-            size: self.size,
-            data_type: PhantomData,
-        }
-    }
 }
 
-impl<const N: usize> PacketData<PlainText, N> {
-    pub fn from_bytes_to_plain(data: [u8; N], size : usize) -> Self {
-        Self {
-            data,
-            size,
-            data_type: PhantomData,
-        }
-    }
-}
-
-impl<const N: usize> PacketData<AssymetricEncrypted, N> {
+impl<const N: usize> PacketData<Assymetric, N> {
     pub fn from_bytes_to_asym_enc(data: [u8; N], size : usize) -> Self {
         Self {
             data,
@@ -202,39 +174,41 @@ impl<const N: usize> PacketData<AssymetricEncrypted, N> {
     }
 }
 
-impl<const N: usize> PacketData<SymmetricEncrypted, N> {
-    pub fn from_bytes_to_sym_enc(data: [u8; N], size : usize) -> Self {
+impl<const N: usize> PacketData<Unknown, N> {
+    pub fn new_packet_data(data: [u8; N], size: usize) -> Self {
         Self {
             data,
             size,
             data_type: PhantomData,
         }
     }
-}
-
-impl<const N: usize> PacketData<UnknownEncrypted, N> {
-    pub fn from_bytes_to_unknown_enc(data: [u8; N], size: usize) -> Self {
-        Self {
-            data,
-            size,
+    
+    pub fn with_no_encryption(&self) -> PacketData<None, N> {
+        PacketData {
+            data: self.data,
+            size: self.size,
+            data_type: PhantomData,
+        }
+    }
+    
+    pub fn with_sym_encryption(&self) -> PacketData<Symmetric, N> {
+        PacketData {
+            data: self.data,
+            size: self.size,
+            data_type: PhantomData,
+        }
+    }
+    
+    pub fn with_asym_encryption(&self) -> PacketData<Assymetric, N> {
+        PacketData {
+            data: self.data,
+            size: self.size,
             data_type: PhantomData,
         }
     }
 }
 
-impl<const N: usize> PacketData<PlainText, N> {
-    pub fn from_arc_to_plain(arc: Arc<[u8]>) -> Self {
-        let mut data = [0; N];
-        data.copy_from_slice(&arc);
-        Self {
-            data,
-            size: arc.len(),
-            data_type: PhantomData,
-        }
-    }
-}
-
-impl<const N: usize> PacketData<AssymetricEncrypted, N> {
+impl<const N: usize> PacketData<Assymetric, N> {
     pub fn from_arc_to_asym_enc(arc: Arc<[u8]>) -> Self {
         let mut data = [0; N];
         data.copy_from_slice(&arc);
@@ -246,7 +220,7 @@ impl<const N: usize> PacketData<AssymetricEncrypted, N> {
     }
 }
 
-impl<const N: usize> PacketData<SymmetricEncrypted, N> {
+impl<const N: usize> PacketData<Symmetric, N> {
     pub fn from_arc_to_sym_enc(arc: Arc<[u8]>) -> Self {
         let mut data = [0; N];
         data.copy_from_slice(&arc);
@@ -277,36 +251,16 @@ mod tests {
 
         // Create a new AES-128-GCM instance
         let cipher = Aes128Gcm::new(key);
-        const ORIGINAL_DATA: &[u8] = b"Hello, world!";
-        let packet_data = PacketData::encrypt_symmetric(ORIGINAL_DATA, &cipher);
+        let data : [u8; 13] = b"Hello, world!".into();
+        let unencrypted_packet = PacketData::new_packet_data(data, data.len()).with_no_encryption();
+        let encrypted_packet = PacketData::encrypt_symmetric(&unencrypted_packet, &cipher);
 
         // Ensure data is not plainly visible
-        assert_ne!(packet_data.data[..packet_data.size], *ORIGINAL_DATA);
+        assert_ne!(encrypted_packet.data[..encrypted_packet.size], *data);
 
-        test_decryption(packet_data, &cipher, ORIGINAL_DATA);
-    }
+        let overlap = longest_common_subsequence(&encrypted_packet.data, &data);
 
-    // Test encryption/decryption where message size is the maximum allowed
-    #[test]
-    fn test_encryption_decryption_max_size() {
-        // Generate a random 128-bit (16 bytes) key
-        let mut key = [0u8; 16];
-        OsRng.fill_bytes(&mut key);
-
-        // Create a key object for AES-GCM
-        let key = GenericArray::from_slice(&key);
-
-        // Create a new AES-128-GCM instance
-        let cipher = Aes128Gcm::new(key);
-        const ORIGINAL_DATA: &[u8] = b"Hello, world!";
-        let packet_data =
-            PacketData::encrypt_symmetric(ORIGINAL_DATA, &cipher);
-
-        // Ensure data is not plainly visible
-        let overlap = longest_common_subsequence(&packet_data.data, ORIGINAL_DATA);
-        assert!(overlap < 20);
-
-        test_decryption(packet_data, &cipher, ORIGINAL_DATA);
+        test_decryption(encrypted_packet, &cipher, unencrypted_packet);
     }
 
     // Test detection of packet corruption
@@ -321,23 +275,28 @@ mod tests {
 
         // Create a new AES-128-GCM instance
         let cipher = Aes128Gcm::new(key);
-        const ORIGINAL_DATA: &[u8] = b"Hello, world!";
-        let mut packet_data = PacketData::encrypt_symmetric(ORIGINAL_DATA, &cipher);
+        let data : [u8; 13] = b"Hello, world!".into();
+        let unencrypted_packet = PacketData::new_packet_data(data, data.len()).with_no_encryption();
+        let mut encrypted_packet = PacketData::encrypt_symmetric(&unencrypted_packet, &cipher);
+
+        // Ensure data is not plainly visible
+        assert_ne!(encrypted_packet.data[..encrypted_packet.size], *data);
 
         // Corrupt the packet data
-        packet_data.data[packet_data.size / 2] = 0;
+        encrypted_packet.data[encrypted_packet.size / 2] = 0;
 
         // Ensure decryption fails
-        match packet_data.decrypt(&cipher) {
+        match encrypted_packet.decrypt(&cipher) {
             Ok(_) => panic!("Decryption succeeded when it should have failed"),
             Err(e) => assert_eq!(e, aes_gcm::Error),
         }
+        
     }
 
-    fn test_decryption<const N: usize, T: AsRef<[u8]>>(
-        packet_data: PacketData<SymmetricEncrypted, N>,
+    fn test_decryption<const N: usize>(
+        packet_data: PacketData<Symmetric, N>,
         cipher: &Aes128Gcm,
-        original_data: T,
+        original_data: PacketData<None, N>,
     ) {
         match packet_data.decrypt(cipher) {
             Ok(decrypted_data) => {

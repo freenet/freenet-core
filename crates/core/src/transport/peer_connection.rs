@@ -11,6 +11,7 @@ use futures::{Future, FutureExt, StreamExt};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use crate::transport::packet_data::Unknown;
 
 mod inbound_stream;
 mod outbound_stream;
@@ -35,7 +36,7 @@ pub(super) struct RemoteConnection {
     pub remote_addr: SocketAddr,
     pub sent_tracker: Arc<Mutex<SentPacketTracker<InstantTimeSrc>>>,
     pub last_packet_id: Arc<AtomicU32>,
-    pub inbound_packet_recv: mpsc::Receiver<PacketData>,
+    pub inbound_packet_recv: mpsc::Receiver<PacketData<Unknown>>,
     pub inbound_symmetric_key: Aes128Gcm,
     pub my_address: Option<SocketAddr>,
 }
@@ -121,7 +122,7 @@ impl PeerConnection {
         loop {
             tokio::select! {
                 inbound = self.remote_conn.inbound_packet_recv.recv() => {
-                    let packet_data = inbound.ok_or(TransportError::ConnectionClosed)?;
+                    let packet_data = inbound.ok_or(TransportError::ConnectionClosed)?.with_sym_encryption();
                     let Ok(decrypted) = packet_data.decrypt(&self.remote_conn.inbound_symmetric_key).map_err(|error| {
                         tracing::debug!(%error, ?self.remote_conn.remote_addr, "Failed to decrypt packet, might be an intro packet or a partial packet");
                     }) else {
@@ -359,7 +360,8 @@ mod tests {
             let (tx, rx) = mpsc::channel(1);
             let inbound_msg = tokio::task::spawn(recv_stream(stream_id, message.len() as u64, rx));
             while let Some((_, network_packet)) = receiver.recv().await {
-                let decrypted = PacketData::from(&*network_packet)
+                let network_packet_slice: [u8] = *network_packet;
+                let decrypted = PacketData::new_packet_data(network_packet_slice, network_packet.len()).with_sym_encryption()
                     .decrypt(&cipher)
                     .map_err(TransportError::PrivateKeyDecryptionError)?;
                 let SymmetricMessage {
