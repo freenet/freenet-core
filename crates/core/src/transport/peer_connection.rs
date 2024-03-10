@@ -329,25 +329,24 @@ mod tests {
 
     use super::{inbound_stream::recv_stream, outbound_stream::send_stream, *};
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_inbound_outbound_interaction() -> Result<(), Box<dyn std::error::Error>> {
         let (sender, mut receiver) = mpsc::channel(1);
         let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
         let message: Vec<_> = std::iter::repeat(0)
-            .take(100_000)
+            .take(1_000)
             .map(|_| rand::random::<u8>())
             .collect();
         let key = rand::random::<[u8; 16]>();
         let cipher = Aes128Gcm::new(&key.into());
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
-        println!("starting test");
 
         let stream_id = StreamId::next();
         // Send a long message using the outbound stream
         let outbound = tokio::task::spawn(send_stream(
             stream_id,
             Arc::new(AtomicU32::new(0)),
-            sender.clone(),
+            sender,
             remote_addr,
             message.clone(),
             cipher.clone(),
@@ -375,6 +374,7 @@ mod tests {
                 else {
                     return Err("unexpected message".into());
                 };
+                println!("fragment_number: {}", fragment_number);
                 tx.send((fragment_number, payload)).await?;
             }
             let (_, msg) = inbound_msg

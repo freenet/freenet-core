@@ -61,7 +61,6 @@ pub(super) async fn send_stream(
                 std::mem::take(&mut stream_to_send)
             }
         };
-        next_fragment_number += 1;
         let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::Release);
         super::packet_sending(
             destination_addr,
@@ -78,6 +77,7 @@ pub(super) async fn send_stream(
             &sent_packet_tracker,
         )
         .await?;
+        next_fragment_number += 1;
         sent_so_far += 1;
     }
 
