@@ -31,7 +31,7 @@ type Result<T = (), E = TransportError> = std::result::Result<T, E>;
 
 #[must_use]
 pub(super) struct RemoteConnection {
-    pub outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
+    pub outbound_packets: mpsc::Sender<(SocketAddr, Arc<PacketData<Unknown>>)>,
     pub outbound_symmetric_key: Aes128Gcm,
     pub remote_addr: SocketAddr,
     pub sent_tracker: Arc<Mutex<SentPacketTracker<InstantTimeSrc>>>,
@@ -362,7 +362,7 @@ mod tests {
             let inbound_msg = tokio::task::spawn(recv_stream(stream_id, message.len() as u64, rx));
             while let Some((_, network_packet)) = receiver.recv().await {
                 let network_packet_slice: [u8; MAX_PACKET_SIZE] = network_packet.try_into()?;
-                let decrypted = PacketData::new_packet_data(network_packet_slice, network_packet.len()).with_sym_encryption()
+                let decrypted = PacketData::new(network_packet_slice, network_packet.len()).with_sym_encryption()
                     .decrypt(&cipher)
                     .map_err(TransportError::PrivateKeyDecryptionError)?;
                 let SymmetricMessage {

@@ -10,7 +10,7 @@ use futures::FutureExt;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
-use crate::transport::packet_data::{Assymetric, Unknown};
+use crate::transport::packet_data::{AssymetricRSA, SymmetricAES, Unknown};
 
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
@@ -137,7 +137,7 @@ struct UdpPacketsListener<S = UdpSocket> {
     this_peer_keypair: TransportKeypair,
     is_gateway: bool,
     new_connection_notifier: mpsc::Sender<PeerConnection>,
-    outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
+    outbound_packets: mpsc::Sender<(SocketAddr, Arc<PacketData<Unknown>>)>,
 }
 
 impl<S: Socket> UdpPacketsListener<S> {
@@ -152,7 +152,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             let remote_conn = self.remote_connections.remove(&remote_addr);
                             match remote_conn {
                                 Some(remote_conn) => {
-                                    let packet_data = PacketData::new_packet_data(buf, size);
+                                    let packet_data = PacketData::new(buf, size);
                                     let _ = remote_conn.inbound_packet_sender.send(packet_data).await;
                                     self.remote_connections.insert(remote_addr, remote_conn);
                                 }
@@ -198,7 +198,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
     async fn gateway_connection(
         &mut self,
-        remote_intro_packet: PacketData<Assymetric>,
+        remote_intro_packet: PacketData<AssymetricRSA>,
         remote_addr: SocketAddr,
     ) -> Result<(), TransportError> {
         let Ok(decrypted_intro_packet) = self
@@ -234,11 +234,11 @@ impl<S: Socket> UdpPacketsListener<S> {
 
         let inbound_key_bytes = rand::random::<[u8; 16]>();
         let inbound_key = Aes128Gcm::new(&inbound_key_bytes.into());
-        let outbound_ack_packet = SymmetricMessage::ack_gateway_connection(
+        let outbound_ack_packet = Arc::new(SymmetricMessage::ack_gateway_connection(
             &outbound_key,
             inbound_key_bytes,
             remote_addr,
-        )?;
+        )?);
 
         let mut buf = [0u8; MAX_PACKET_SIZE];
         let mut waiting_time = INITIAL_INTERVAL;
@@ -255,10 +255,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                 tokio::time::timeout(waiting_time, self.socket_listener.recv_from(&mut buf));
             let packet = match timeout.await {
                 Ok(Ok((size, remote))) => {
-                    let packet = PacketData::from_bytes_to_sym_enc(buf, size);
+                    let packet = PacketData::new(buf, size).with_sym_encryption();
                     if remote != remote_addr {
                         if let Some(remote) = self.remote_connections.remove(&remote_addr) {
-                            let _ = remote.inbound_packet_sender.send(packet).await;
+                            let _ = remote.inbound_packet_sender.send(packet.into()).await;
                             self.remote_connections.insert(remote_addr, remote);
                             continue;
                         }
@@ -309,7 +309,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
         sent_tracker.lock().report_sent_packet(
             SymmetricMessage::FIRST_PACKET_ID,
-            outbound_ack_packet.into(),
+            outbound_ack_packet,
         );
 
         Ok(())
@@ -330,7 +330,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             /// Initial state of the joinee, at this point NAT has been already traversed
             RemoteInbound {
                 /// Encrypted intro packet for comparison
-                intro_packet: PacketData<Assymetric>,
+                intro_packet: PacketData<AssymetricRSA>,
             },
             /// Second state of the joiner, acknowledging their connection
             AckConnectionOutbound,
@@ -654,7 +654,7 @@ enum ConnectionEvent {
 
 struct InboundRemoteConnection {
     inbound_packet_sender: mpsc::Sender<PacketData<Unknown>>,
-    inbound_intro_packet: Option<PacketData<Assymetric>>,
+    inbound_intro_packet: Option<PacketData<AssymetricRSA>>,
     inbound_checked_times: usize,
 }
 
