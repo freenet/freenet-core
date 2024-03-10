@@ -4,7 +4,6 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use crate::transport::packet_data::{PacketData, SymmetricAES, Unknown};
 
 use super::Socket;
 use crate::util::time_source::{InstantTimeSrc, TimeSource};
@@ -22,7 +21,7 @@ pub(super) struct PacketRateLimiter<T: TimeSource> {
 impl PacketRateLimiter<InstantTimeSrc> {
     pub(super) fn new(
         window_size: Duration,
-        outbound_packets: mpsc::Receiver<(SocketAddr, Arc<PacketData<Unknown>>)>,
+        outbound_packets: mpsc::Receiver<(SocketAddr, Arc<[u8]>)>,
     ) -> Self {
         PacketRateLimiter {
             packets: VecDeque::new(),

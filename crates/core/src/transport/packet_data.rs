@@ -1,5 +1,5 @@
-use std::{cell::RefCell, sync::Arc};
 use std::marker::PhantomData;
+use std::{cell::RefCell, sync::Arc};
 
 use aes_gcm::{
     aead::{generic_array::GenericArray, rand_core::SeedableRng, AeadInPlace},
@@ -39,45 +39,42 @@ const fn _check_valid_size<const N: usize>() {
     let () = AssertSize::<N>::OK;
 }
 
-// TODO: maybe split this into type for handling inbound (encrypted)/outbound (decrypted) packets for clarity
 #[derive(Clone)]
-pub(super) struct PacketData<DT : Encryption, const N: usize = MAX_PACKET_SIZE> {
+pub(super) struct PacketData<DT: Encryption, const N: usize = MAX_PACKET_SIZE> {
     data: [u8; N],
     pub size: usize,
-    data_type : PhantomData<DT>,
+    data_type: PhantomData<DT>,
 }
 
-impl <DT : Encryption, const N: usize> PacketData<DT, N> {
-    pub(super) fn len(&self) -> usize {
-        self.size
-    }
-}
-
-trait Encryption { }
+pub(super) trait Encryption: Clone {}
 
 /// Decrypted packet
+#[derive(Clone, Copy)]
 pub(super) struct None;
 
 /// Packet is encrypted using symmetric crypto (most packets if not an intro packet)
+#[derive(Clone, Copy)]
 pub(super) struct SymmetricAES;
 
 /// Packet is encrypted using assympetric crypto (typically an intro packet)
+#[derive(Clone, Copy)]
 pub(super) struct AssymetricRSA;
 
 /// This is used when we don't know the encryption type of the packet, perhaps because we
 /// haven't yet determined whether it is an intro packet.
+#[derive(Clone, Copy)]
 pub(super) struct Unknown;
 
-impl Encryption for None { }
-impl Encryption for SymmetricAES { }
-impl Encryption for AssymetricRSA { }
-impl Encryption for Unknown { }
+impl Encryption for None {}
+impl Encryption for SymmetricAES {}
+impl Encryption for AssymetricRSA {}
+impl Encryption for Unknown {}
 
 pub(super) const fn packet_size<const DATA_SIZE: usize>() -> usize {
     DATA_SIZE + NONCE_SIZE + TAG_SIZE
 }
- 
-impl<DT : Encryption, const N: usize> PacketData<DT, N> {
+
+impl<DT: Encryption, const N: usize> PacketData<DT, N> {
     // TODO: this function will be unnecessary when we guarantee that size = N
     pub(super) fn data(&self) -> &[u8] {
         &self.data[..self.size]
@@ -85,9 +82,10 @@ impl<DT : Encryption, const N: usize> PacketData<DT, N> {
 }
 
 impl<const N: usize> PacketData<SymmetricAES, N> {
+    // TODO: move this to None subtype
     pub(super) fn encrypt_symmetric(packet_data: &PacketData<None, N>, cipher: &Aes128Gcm) -> Self {
         _check_valid_size::<N>();
-        debug_assert!(packet_data.len() <= MAX_DATA_SIZE);
+        debug_assert!(packet_data.data.len() <= MAX_DATA_SIZE);
 
         let nonce: [u8; NONCE_SIZE] = RNG.with(|rng| rng.borrow_mut().gen());
 
@@ -95,8 +93,7 @@ impl<const N: usize> PacketData<SymmetricAES, N> {
         buffer[..NONCE_SIZE].copy_from_slice(&nonce);
 
         // Encrypt the data in place
-        let payload_length = packet_data.len();
-        // TODO: Is this efficient? Can we avoid a copy?
+        let payload_length = packet_data.data.len();
         buffer[NONCE_SIZE..NONCE_SIZE + payload_length].copy_from_slice(packet_data.data());
         let tag = cipher
             .encrypt_in_place_detached(
@@ -117,6 +114,7 @@ impl<const N: usize> PacketData<SymmetricAES, N> {
         }
     }
 
+    // TODO: move this to Unknown subtype
     pub(super) fn decrypt(&self, inbound_sym_key: &Aes128Gcm) -> Result<Self, aes_gcm::Error> {
         debug_assert!(self.data.len() >= NONCE_SIZE + TAG_SIZE);
 
@@ -133,7 +131,7 @@ impl<const N: usize> PacketData<SymmetricAES, N> {
         Ok(Self {
             data: buffer,
             size: buffer_len,
-            data_type : PhantomData,
+            data_type: PhantomData,
         })
     }
 }
@@ -147,13 +145,16 @@ impl<const N: usize> PacketData<AssymetricRSA, N> {
         Self {
             data,
             size: encrypted_data.len(),
-            data_type : PhantomData,
+            data_type: PhantomData,
         }
     }
 }
 
 impl<const N: usize> PacketData<Unknown, N> {
-    pub(super) fn is_intro_packet<DT : Encryption>(&self, actual_intro_packet: &PacketData<AssymetricRSA, N>) -> bool {
+    pub(super) fn is_intro_packet(
+        &self,
+        actual_intro_packet: &PacketData<AssymetricRSA, N>,
+    ) -> bool {
         if self.size != actual_intro_packet.size {
             return false;
         }
@@ -172,24 +173,24 @@ impl<const N: usize> PacketData<Unknown, N> {
 }
 
 impl<const N: usize> PacketData<AssymetricRSA, N> {
-    pub fn from_bytes_to_asym_enc(data: [u8; N], size : usize) -> Self {
-        Self {
-            data,
-            size,
-            data_type: PhantomData,
-        }
+    pub fn prepare_send(self) -> Arc<[u8]> {
+        self.data[..self.size].into()
     }
 }
 
 impl<const N: usize> PacketData<Unknown, N> {
-    pub fn new(data: [u8; N], size: usize) -> Self {
+    pub fn from_buf(buf: impl AsRef<[u8]>) -> Self {
+        let mut data = [0; N];
+        let buf = buf.as_ref();
+        let size = buf.len();
+        data.copy_from_slice(buf);
         Self {
-            data,
             size,
+            data,
             data_type: PhantomData,
         }
     }
-    
+
     pub fn with_no_encryption(&self) -> PacketData<None, N> {
         PacketData {
             data: self.data,
@@ -197,7 +198,7 @@ impl<const N: usize> PacketData<Unknown, N> {
             data_type: PhantomData,
         }
     }
-    
+
     pub fn with_sym_encryption(&self) -> PacketData<SymmetricAES, N> {
         PacketData {
             data: self.data,
@@ -205,7 +206,7 @@ impl<const N: usize> PacketData<Unknown, N> {
             data_type: PhantomData,
         }
     }
-    
+
     pub fn with_asym_encryption(&self) -> PacketData<AssymetricRSA, N> {
         PacketData {
             data: self.data,
@@ -215,62 +216,11 @@ impl<const N: usize> PacketData<Unknown, N> {
     }
 }
 
-impl<const N: usize> PacketData<AssymetricRSA, N> {
-    pub fn from_arc_to_asym_enc(arc: Arc<[u8]>) -> Self {
-        let mut data = [0; N];
-        data.copy_from_slice(&arc);
-        Self {
-            data,
-            size: arc.len(),
-            data_type: PhantomData,
-        }
-    }
-}
-
 impl<const N: usize> PacketData<SymmetricAES, N> {
-    pub fn from_arc_to_sym_enc(arc: Arc<[u8]>) -> Self {
-        let mut data = [0; N];
-        data.copy_from_slice(&arc);
-        Self {
-            data,
-            size: arc.len(),
-            data_type: PhantomData,
-        }
+    pub fn send(self) -> Arc<[u8]> {
+        self.data[..self.size].into()
     }
 }
-
-// PacketData with generic type None, AssymetricRSA, or SymmetricAES should all be able to
-// .into() a PacketData with generic type Unknown
-impl<const N: usize> From<PacketData<None, N>> for PacketData<Unknown, N> {
-    fn from(packet: PacketData<None, N>) -> Self {
-        PacketData {
-            data: packet.data,
-            size: packet.size,
-            data_type: PhantomData,
-        }
-    }
-}
-
-impl<const N: usize> From<PacketData<AssymetricRSA, N>> for PacketData<Unknown, N> {
-    fn from(packet: PacketData<AssymetricRSA, N>) -> Self {
-        PacketData {
-            data: packet.data,
-            size: packet.size,
-            data_type: PhantomData,
-        }
-    }
-}
-
-impl<const N: usize> From<PacketData<SymmetricAES, N>> for PacketData<Unknown, N> {
-    fn from(packet: PacketData<SymmetricAES, N>) -> Self {
-        PacketData {
-            data: packet.data,
-            size: packet.size,
-            data_type: PhantomData,
-        }
-    }
-}
-
 
 #[cfg(test)]
 mod tests {
@@ -290,11 +240,12 @@ mod tests {
 
         // Create a new AES-128-GCM instance
         let cipher = Aes128Gcm::new(key);
-        let data : [u8; 13] = b"Hello, world!".into();
-        let unencrypted_packet = PacketData::new(data, data.len()).with_no_encryption();
+        let data = b"Hello, world!";
+        let unencrypted_packet =
+            PacketData::<_, MAX_PACKET_SIZE>::from_buf(data).with_no_encryption();
         let encrypted_packet = PacketData::encrypt_symmetric(&unencrypted_packet, &cipher);
 
-        let overlap = longest_common_subsequence(&encrypted_packet.data, &data);
+        let _overlap = longest_common_subsequence(&encrypted_packet.data, data.as_slice());
 
         test_decryption(encrypted_packet, &cipher, unencrypted_packet);
     }
@@ -311,8 +262,9 @@ mod tests {
 
         // Create a new AES-128-GCM instance
         let cipher = Aes128Gcm::new(key);
-        let data : &[u8; 13] = b"Hello, world!";
-        let unencrypted_packet = PacketData::new(data, data.len()).with_no_encryption();
+        let data: &[u8; 13] = b"Hello, world!";
+        let unencrypted_packet =
+            PacketData::<_, MAX_PACKET_SIZE>::from_buf(data).with_no_encryption();
         let mut encrypted_packet = PacketData::encrypt_symmetric(&unencrypted_packet, &cipher);
 
         // Corrupt the packet data
@@ -323,7 +275,6 @@ mod tests {
             Ok(_) => panic!("Decryption succeeded when it should have failed"),
             Err(e) => assert_eq!(e, aes_gcm::Error),
         }
-        
     }
 
     fn test_decryption<const N: usize>(
@@ -336,7 +287,7 @@ mod tests {
                 // Ensure decrypted data matches original
                 assert_eq!(
                     &decrypted_data.data[..decrypted_data.size],
-                    original_data.as_ref()
+                    &original_data.data[..]
                 );
             }
             Err(e) => panic!("Decryption failed with error: {:?}", e),

@@ -5,13 +5,13 @@ use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::vec::Vec;
 
+use crate::transport::packet_data::Unknown;
 use aes_gcm::Aes128Gcm;
 use futures::stream::FuturesUnordered;
 use futures::{Future, FutureExt, StreamExt};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use crate::transport::packet_data::Unknown;
 
 mod inbound_stream;
 mod outbound_stream;
@@ -31,7 +31,7 @@ type Result<T = (), E = TransportError> = std::result::Result<T, E>;
 
 #[must_use]
 pub(super) struct RemoteConnection {
-    pub outbound_packets: mpsc::Sender<(SocketAddr, Arc<PacketData<Unknown>>)>,
+    pub outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
     pub outbound_symmetric_key: Aes128Gcm,
     pub remote_addr: SocketAddr,
     pub sent_tracker: Arc<Mutex<SentPacketTracker<InstantTimeSrc>>>,
@@ -305,18 +305,19 @@ async fn packet_sending(
     payload: impl Into<SymmetricMessagePayload>,
     sent_tracker: &Mutex<SentPacketTracker<InstantTimeSrc>>,
 ) -> Result<()> {
-    let payload = SymmetricMessage::serialize_msg_to_packet_data(
+    let packet = SymmetricMessage::serialize_msg_to_packet_data(
         packet_id,
         payload,
         outbound_sym_key,
         confirm_receipt,
     )?;
-    let packet: Arc<[u8]> = payload.into();
     outbound_packets
-        .send((remote_addr, packet.clone()))
+        .send((remote_addr, packet.clone().send()))
         .await
         .map_err(|_| TransportError::ConnectionClosed)?;
-    sent_tracker.lock().report_sent_packet(packet_id, packet);
+    sent_tracker
+        .lock()
+        .report_sent_packet(packet_id, packet.send());
     Ok(())
 }
 
@@ -326,6 +327,7 @@ mod tests {
     use futures::TryFutureExt;
     use std::net::{Ipv4Addr, SocketAddr};
     use tokio::sync::mpsc;
+
     use crate::transport::packet_data::MAX_PACKET_SIZE;
 
     use super::{inbound_stream::recv_stream, outbound_stream::send_stream, *};
@@ -361,8 +363,8 @@ mod tests {
             let (tx, rx) = mpsc::channel(1);
             let inbound_msg = tokio::task::spawn(recv_stream(stream_id, message.len() as u64, rx));
             while let Some((_, network_packet)) = receiver.recv().await {
-                let network_packet_slice: [u8; MAX_PACKET_SIZE] = network_packet.try_into()?;
-                let decrypted = PacketData::new(network_packet_slice, network_packet.len()).with_sym_encryption()
+                let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&network_packet)
+                    .with_sym_encryption()
                     .decrypt(&cipher)
                     .map_err(TransportError::PrivateKeyDecryptionError)?;
                 let SymmetricMessage {

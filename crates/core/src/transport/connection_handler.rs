@@ -5,12 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::vec::Vec;
 
+use crate::transport::packet_data::{AssymetricRSA, Unknown};
 use aes_gcm::{Aes128Gcm, KeyInit};
 use futures::FutureExt;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
-use crate::transport::packet_data::{AssymetricRSA, SymmetricAES, Unknown};
 
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
@@ -137,7 +137,7 @@ struct UdpPacketsListener<S = UdpSocket> {
     this_peer_keypair: TransportKeypair,
     is_gateway: bool,
     new_connection_notifier: mpsc::Sender<PeerConnection>,
-    outbound_packets: mpsc::Sender<(SocketAddr, Arc<PacketData<Unknown>>)>,
+    outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
 }
 
 impl<S: Socket> UdpPacketsListener<S> {
@@ -152,7 +152,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             let remote_conn = self.remote_connections.remove(&remote_addr);
                             match remote_conn {
                                 Some(remote_conn) => {
-                                    let packet_data = PacketData::new(buf, size);
+                                    let packet_data = PacketData::from_buf(&buf[..size]);
                                     let _ = remote_conn.inbound_packet_sender.send(packet_data).await;
                                     self.remote_connections.insert(remote_addr, remote_conn);
                                 }
@@ -160,7 +160,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     if self.is_gateway {
                                         tracing::debug!(%remote_addr, "unexpected packet from remote");
                                     }
-                                    let packet_data = PacketData::from_bytes_to_asym_enc(std::mem::replace(&mut buf, [0; MAX_PACKET_SIZE]), size);
+                                    let packet_data = PacketData::from_buf(&buf[..size]).with_asym_encryption();
                                     if let Err(error) = self.gateway_connection(packet_data, remote_addr).await {
                                         tracing::error!(%error, ?remote_addr, "Failed to establish connection");
                                     }
@@ -220,7 +220,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         if protoc != PROTOC_VERSION {
             let packet = SymmetricMessage::ack_error(&outbound_key)?;
             self.outbound_packets
-                .send((remote_addr, packet.into()))
+                .send((remote_addr, packet.send()))
                 .await
                 .map_err(|_| TransportError::ChannelClosed)?;
             return Err(TransportError::ConnectionEstablishmentFailure {
@@ -234,11 +234,11 @@ impl<S: Socket> UdpPacketsListener<S> {
 
         let inbound_key_bytes = rand::random::<[u8; 16]>();
         let inbound_key = Aes128Gcm::new(&inbound_key_bytes.into());
-        let outbound_ack_packet = Arc::new(SymmetricMessage::ack_gateway_connection(
+        let outbound_ack_packet = SymmetricMessage::ack_gateway_connection(
             &outbound_key,
             inbound_key_bytes,
             remote_addr,
-        )?);
+        )?;
 
         let mut buf = [0u8; MAX_PACKET_SIZE];
         let mut waiting_time = INITIAL_INTERVAL;
@@ -246,7 +246,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         const MAX_ATTEMPTS: usize = 20;
         while attempts < MAX_ATTEMPTS {
             self.outbound_packets
-                .send((remote_addr, outbound_ack_packet.clone().into()))
+                .send((remote_addr, outbound_ack_packet.clone().send()))
                 .await
                 .map_err(|_| TransportError::ChannelClosed)?;
 
@@ -255,15 +255,15 @@ impl<S: Socket> UdpPacketsListener<S> {
                 tokio::time::timeout(waiting_time, self.socket_listener.recv_from(&mut buf));
             let packet = match timeout.await {
                 Ok(Ok((size, remote))) => {
-                    let packet = PacketData::new(buf, size).with_sym_encryption();
+                    let packet = PacketData::from_buf(&buf[..size]);
                     if remote != remote_addr {
                         if let Some(remote) = self.remote_connections.remove(&remote_addr) {
-                            let _ = remote.inbound_packet_sender.send(packet.into()).await;
+                            let _ = remote.inbound_packet_sender.send(packet).await;
                             self.remote_connections.insert(remote_addr, remote);
                             continue;
                         }
                     }
-                    packet
+                    packet.with_sym_encryption()
                 }
                 Ok(Err(_)) => {
                     return Err(TransportError::ChannelClosed);
@@ -309,7 +309,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
         sent_tracker.lock().report_sent_packet(
             SymmetricMessage::FIRST_PACKET_ID,
-            outbound_ack_packet,
+            outbound_ack_packet.send(),
         );
 
         Ok(())
@@ -347,14 +347,13 @@ impl<S: Socket> UdpPacketsListener<S> {
 
         let inbound_sym_key_bytes = rand::random::<[u8; 16]>();
         let inbound_sym_key = Aes128Gcm::new(&inbound_sym_key_bytes.into());
-        let mut inbound_intro_packet: Option<PacketData> = None;
 
         let mut outbound_sym_key: Option<Aes128Gcm> = None;
         let outbound_intro_packet = {
             let mut data = [0u8; { 16 + PROTOC_VERSION.len() }];
             data[..PROTOC_VERSION.len()].copy_from_slice(&PROTOC_VERSION);
             data[PROTOC_VERSION.len()..].copy_from_slice(&inbound_sym_key_bytes);
-            PacketData::<MAX_PACKET_SIZE>::encrypt_with_pubkey(&data, &remote_public_key)
+            PacketData::<_, MAX_PACKET_SIZE>::encrypt_with_pubkey(&data, &remote_public_key)
         };
 
         while failures < Self::NAT_TRAVERSAL_MAX_ATTEMPTS {
@@ -396,7 +395,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                         },
                         InboundRemoteConnection {
                             inbound_packet_sender: inbound_sender,
-                            inbound_intro_packet: inbound_intro_packet.take(),
+                            inbound_intro_packet: None,
                             inbound_checked_times: 0,
                         },
                     ));
@@ -421,7 +420,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                         if let Some(remote) = self.remote_connections.remove(&remote_addr) {
                             let _ = remote
                                 .inbound_packet_sender
-                                .send(PacketData::from(&packet[..size]))
+                                .send(PacketData::from_buf(&packet[..size]))
                                 .await;
                             self.remote_connections.insert(remote_addr, remote);
                         }
@@ -434,8 +433,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                             // at this point it's either the remote sending us an intro packet or a symmetric packet
                             // cause is the first packet that passes through the NAT
 
-                            let packet = PacketData::from(&packet[..size]);
-                            if let Ok(decrypted_packet) = packet.decrypt(&inbound_sym_key) {
+                            let packet = PacketData::from_buf(&packet[..size]);
+                            let sym_packet = packet.with_sym_encryption();
+                            if let Ok(decrypted_packet) = sym_packet.decrypt(&inbound_sym_key) {
                                 let symmetric_message =
                                     SymmetricMessage::deser(decrypted_packet.data())?;
                                 if remote_is_gateway {
@@ -528,7 +528,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 if protocol_version != PROTOC_VERSION {
                                     let packet = SymmetricMessage::ack_error(&key)?;
                                     self.outbound_packets
-                                        .send((remote_addr, packet.into()))
+                                        .send((remote_addr, packet.send()))
                                         .await
                                         .map_err(|_| TransportError::ChannelClosed)?;
                                     return Err(TransportError::ConnectionEstablishmentFailure {
@@ -547,8 +547,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
 
                             // probably the first packet to punch through the NAT
+                            let assym_packet = packet.with_asym_encryption();
                             if let Ok(decrypted_intro_packet) =
-                                self.this_peer_keypair.secret.decrypt(packet.data())
+                                self.this_peer_keypair.secret.decrypt(assym_packet.data())
                             {
                                 let protoc = &decrypted_intro_packet[..PROTOC_VERSION.len()];
                                 if protoc != PROTOC_VERSION {
@@ -560,7 +561,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     .expect("correct length");
                                 outbound_sym_key = Some(outbound_key.clone());
                                 state = ConnectionState::RemoteInbound {
-                                    intro_packet: packet,
+                                    intro_packet: assym_packet,
                                 };
                                 continue;
                             }
@@ -576,7 +577,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                         } => {
                             // next packet should be an acknowledgement packet, but might also be a repeated
                             // intro packet so we need to handle that
-                            let packet = PacketData::from(&packet[..size]);
+                            let packet = PacketData::from_buf(&packet[..size]);
                             if packet.is_intro_packet(intro_packet) {
                                 continue;
                             }

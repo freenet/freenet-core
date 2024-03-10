@@ -89,6 +89,7 @@ mod tests {
     use crate::transport::packet_data::PacketData;
     use aes_gcm::KeyInit;
     use std::net::{Ipv4Addr, SocketAddr};
+    use tests::packet_data::MAX_PACKET_SIZE;
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -117,7 +118,8 @@ mod tests {
 
         let mut inbound_bytes = Vec::new();
         while let Some((_, packet)) = outbound_receiver.recv().await {
-            let packet_data: PacketData = packet.as_ref().into();
+            let packet_data =
+                PacketData::<_, MAX_PACKET_SIZE>::from_buf(packet.as_ref()).with_sym_encryption();
             let decrypted_packet = packet_data
                 .decrypt(&cipher)
                 .map_err(TransportError::PrivateKeyDecryptionError)?;

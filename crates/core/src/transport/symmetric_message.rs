@@ -1,9 +1,9 @@
 use std::{borrow::Cow, net::SocketAddr, sync::OnceLock};
 
+use crate::transport::packet_data::SymmetricAES;
 use aes_gcm::Aes128Gcm;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
-use crate::transport::packet_data::SymmetricAES;
 
 use super::{
     packet_data::MAX_DATA_SIZE, peer_connection::StreamId, MessagePayload, PacketData, PacketId,
@@ -25,7 +25,9 @@ impl SymmetricMessage {
         bincode::deserialize(bytes)
     }
 
-    pub fn ack_error(outbound_sym_key: &Aes128Gcm) -> Result<PacketData<SymmetricAES>, bincode::Error> {
+    pub fn ack_error(
+        outbound_sym_key: &Aes128Gcm,
+    ) -> Result<PacketData<SymmetricAES>, bincode::Error> {
         static SERIALIZED: OnceLock<Box<[u8]>> = OnceLock::new();
         let bytes = SERIALIZED.get_or_init(|| {
             let mut packet = [0u8; MAX_DATA_SIZE];
@@ -33,11 +35,13 @@ impl SymmetricMessage {
             bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_ERROR).unwrap();
             (&packet[..size as usize]).into()
         });
-        let packet = PacketData::new(bytes, bytes.len()).with_no_encryption();
+        let packet = PacketData::from_buf(bytes).with_no_encryption();
         Ok(PacketData::encrypt_symmetric(&packet, outbound_sym_key))
     }
 
-    pub fn ack_ok(outbound_sym_key: &Aes128Gcm) -> Result<PacketData<SymmetricAES>, bincode::Error> {
+    pub fn ack_ok(
+        outbound_sym_key: &Aes128Gcm,
+    ) -> Result<PacketData<SymmetricAES>, bincode::Error> {
         static SERIALIZED: OnceLock<Box<[u8]>> = OnceLock::new();
         let bytes = SERIALIZED.get_or_init(move || {
             let mut packet = [0u8; MAX_DATA_SIZE];
@@ -50,7 +54,8 @@ impl SymmetricMessage {
             bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_ERROR).unwrap();
             (&packet[..size as usize]).into()
         });
-        Ok(PacketData::encrypt_symmetric(bytes, outbound_sym_key))
+        let packet = PacketData::from_buf(bytes).with_no_encryption();
+        Ok(PacketData::encrypt_symmetric(&packet, outbound_sym_key))
     }
 
     pub fn ack_gateway_connection(
@@ -69,7 +74,7 @@ impl SymmetricMessage {
         bincode::serialize_into(packet.as_mut_slice(), &message)?;
         let bytes = &packet[..size as usize];
 
-        let packet = PacketData::new(bytes, bytes.len()).with_no_encryption();
+        let packet = PacketData::from_buf(bytes).with_no_encryption();
         Ok(PacketData::encrypt_symmetric(&packet, outbound_sym_key))
     }
 
@@ -90,7 +95,7 @@ impl SymmetricMessage {
         bincode::serialize_into(packet.as_mut_slice(), &message)?;
         let bytes = &packet[..size as usize];
 
-        let packet = PacketData::new(bytes, bytes.len()).with_no_encryption();
+        let packet = PacketData::from_buf(bytes).with_no_encryption();
         Ok(PacketData::encrypt_symmetric(&packet, outbound_sym_key))
     }
 
@@ -174,9 +179,6 @@ mod test {
         use aes_gcm::KeyInit;
         let key = Aes128Gcm::new(&[0; 16].into());
         let packet = SymmetricMessage::ack_error(&key)?;
-
-        let _packet = PacketData::<SymmetricAES, 1000>::encrypt_symmetric(packet, &key);
-
         let data = packet.decrypt(&key).unwrap();
         let deser = SymmetricMessage::deser(data.data())?;
         assert!(matches!(
