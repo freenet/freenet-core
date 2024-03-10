@@ -123,8 +123,8 @@ impl PeerConnection {
         loop {
             tokio::select! {
                 inbound = self.remote_conn.inbound_packet_recv.recv() => {
-                    let packet_data = inbound.ok_or(TransportError::ConnectionClosed)?.with_sym_encryption();
-                    let Ok(decrypted) = packet_data.decrypt(&self.remote_conn.inbound_symmetric_key).map_err(|error| {
+                    let packet_data = inbound.ok_or(TransportError::ConnectionClosed)?;
+                    let Ok(decrypted) = packet_data.try_decrypt_sym(&self.remote_conn.inbound_symmetric_key).map_err(|error| {
                         tracing::debug!(%error, ?self.remote_conn.remote_addr, "Failed to decrypt packet, might be an intro packet or a partial packet");
                     }) else {
                         // just ignore this message
@@ -313,12 +313,12 @@ async fn packet_sending(
         confirm_receipt,
     )?;
     outbound_packets
-        .send((remote_addr, packet.clone().send()))
+        .send((remote_addr, packet.clone().prepared_send()))
         .await
         .map_err(|_| TransportError::ConnectionClosed)?;
     sent_tracker
         .lock()
-        .report_sent_packet(packet_id, packet.send());
+        .report_sent_packet(packet_id, packet.prepared_send());
     Ok(())
 }
 
@@ -364,8 +364,7 @@ mod tests {
             let inbound_msg = tokio::task::spawn(recv_stream(stream_id, message.len() as u64, rx));
             while let Some((_, network_packet)) = receiver.recv().await {
                 let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&network_packet)
-                    .with_sym_encryption()
-                    .decrypt(&cipher)
+                    .try_decrypt_sym(&cipher)
                     .map_err(TransportError::PrivateKeyDecryptionError)?;
                 let SymmetricMessage {
                     payload:

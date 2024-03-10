@@ -160,7 +160,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     if self.is_gateway {
                                         tracing::debug!(%remote_addr, "unexpected packet from remote");
                                     }
-                                    let packet_data = PacketData::from_buf(&buf[..size]).with_asym_encryption();
+                                    let packet_data = PacketData::from_buf(&buf[..size]);
                                     if let Err(error) = self.gateway_connection(packet_data, remote_addr).await {
                                         tracing::error!(%error, ?remote_addr, "Failed to establish connection");
                                     }
@@ -198,7 +198,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
     async fn gateway_connection(
         &mut self,
-        remote_intro_packet: PacketData<AssymetricRSA>,
+        remote_intro_packet: PacketData<Unknown>,
         remote_addr: SocketAddr,
     ) -> Result<(), TransportError> {
         let Ok(decrypted_intro_packet) = self
@@ -220,7 +220,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         if protoc != PROTOC_VERSION {
             let packet = SymmetricMessage::ack_error(&outbound_key)?;
             self.outbound_packets
-                .send((remote_addr, packet.send()))
+                .send((remote_addr, packet.prepared_send()))
                 .await
                 .map_err(|_| TransportError::ChannelClosed)?;
             return Err(TransportError::ConnectionEstablishmentFailure {
@@ -246,14 +246,14 @@ impl<S: Socket> UdpPacketsListener<S> {
         const MAX_ATTEMPTS: usize = 20;
         while attempts < MAX_ATTEMPTS {
             self.outbound_packets
-                .send((remote_addr, outbound_ack_packet.clone().send()))
+                .send((remote_addr, outbound_ack_packet.clone().prepared_send()))
                 .await
                 .map_err(|_| TransportError::ChannelClosed)?;
 
             // wait until the remote sends the ack packet
             let timeout =
                 tokio::time::timeout(waiting_time, self.socket_listener.recv_from(&mut buf));
-            let packet = match timeout.await {
+            match timeout.await {
                 Ok(Ok((size, remote))) => {
                     let packet = PacketData::from_buf(&buf[..size]);
                     if remote != remote_addr {
@@ -263,7 +263,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                             continue;
                         }
                     }
-                    packet.with_sym_encryption()
+                    let _ = packet.try_decrypt_sym(&inbound_key).map_err(|_| {
+                        tracing::debug!(%remote_addr, "Failed to decrypt packet with inbound key");
+                        TransportError::ConnectionEstablishmentFailure {
+                            cause: "invalid symmetric key".into(),
+                        }
+                    })?;
                 }
                 Ok(Err(_)) => {
                     return Err(TransportError::ChannelClosed);
@@ -278,13 +283,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     );
                     continue;
                 }
-            };
-            let Ok(_decrypted_packet) = packet.decrypt(&inbound_key) else {
-                tracing::debug!(%remote_addr, "Failed to decrypt packet with inbound key");
-                return Err(TransportError::ConnectionEstablishmentFailure {
-                    cause: "invalid symmetric key".into(),
-                });
-            };
+            }
             // we know the inbound is successfully connected now and can proceed
             // ignoring this will force them to resend the packet but that is fine and simpler
             break;
@@ -309,7 +308,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
         sent_tracker.lock().report_sent_packet(
             SymmetricMessage::FIRST_PACKET_ID,
-            outbound_ack_packet.send(),
+            outbound_ack_packet.prepared_send(),
         );
 
         Ok(())
@@ -434,8 +433,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                             // cause is the first packet that passes through the NAT
 
                             let packet = PacketData::from_buf(&packet[..size]);
-                            let sym_packet = packet.with_sym_encryption();
-                            if let Ok(decrypted_packet) = sym_packet.decrypt(&inbound_sym_key) {
+                            // let sym_packet = packet.with_sym_encryption();
+                            if let Ok(decrypted_packet) = packet.try_decrypt_sym(&inbound_sym_key) {
                                 let symmetric_message =
                                     SymmetricMessage::deser(decrypted_packet.data())?;
                                 if remote_is_gateway {
@@ -528,7 +527,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 if protocol_version != PROTOC_VERSION {
                                     let packet = SymmetricMessage::ack_error(&key)?;
                                     self.outbound_packets
-                                        .send((remote_addr, packet.send()))
+                                        .send((remote_addr, packet.prepared_send()))
                                         .await
                                         .map_err(|_| TransportError::ChannelClosed)?;
                                     return Err(TransportError::ConnectionEstablishmentFailure {
@@ -547,21 +546,20 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
 
                             // probably the first packet to punch through the NAT
-                            let assym_packet = packet.with_asym_encryption();
                             if let Ok(decrypted_intro_packet) =
-                                self.this_peer_keypair.secret.decrypt(assym_packet.data())
+                                packet.try_decrypt_asym(&self.this_peer_keypair.secret)
                             {
-                                let protoc = &decrypted_intro_packet[..PROTOC_VERSION.len()];
+                                let protoc = &decrypted_intro_packet.data()[..PROTOC_VERSION.len()];
                                 if protoc != PROTOC_VERSION {
                                     todo!("return error");
                                 }
-                                let outbound_key_bytes = &decrypted_intro_packet
+                                let outbound_key_bytes = &decrypted_intro_packet.data()
                                     [PROTOC_VERSION.len()..PROTOC_VERSION.len() + 16];
                                 let outbound_key = Aes128Gcm::new_from_slice(outbound_key_bytes)
                                     .expect("correct length");
                                 outbound_sym_key = Some(outbound_key.clone());
                                 state = ConnectionState::RemoteInbound {
-                                    intro_packet: assym_packet,
+                                    intro_packet: packet.assert_assymetric(),
                                 };
                                 continue;
                             }

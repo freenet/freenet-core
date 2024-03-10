@@ -120,10 +120,8 @@ mod tests {
 
         let mut inbound_bytes = Vec::new();
         while let Some((_, packet)) = outbound_receiver.recv().await {
-            let packet_data =
-                PacketData::<_, MAX_PACKET_SIZE>::from_buf(packet.as_ref()).with_sym_encryption();
-            let decrypted_packet = packet_data
-                .decrypt(&cipher)
+            let decrypted_packet = PacketData::<_, MAX_PACKET_SIZE>::from_buf(packet.as_ref())
+                .try_decrypt_sym(&cipher)
                 .map_err(TransportError::PrivateKeyDecryptionError)?;
             let deserialized = SymmetricMessage::deser(decrypted_packet.data())?;
             let SymmetricMessagePayload::StreamFragment { payload, .. } = deserialized.payload
