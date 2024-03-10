@@ -155,24 +155,21 @@ impl<const N: usize> PacketData<Unknown, N> {
         &self,
         actual_intro_packet: &PacketData<AssymetricRSA, N>,
     ) -> bool {
-        if self.size != actual_intro_packet.size {
-            return false;
-        }
-        let mut is_intro_packet = true;
-        // TODO: how many bytes do we need to check to be sure that it's not the intro packet?
-        // for now we randomly check 64 bytes (intro_packet is 1500 bytes long)
-        for i in (0..64).map(|_| thread_rng().gen_range(0..self.size)) {
-            // TODO: use a fast rng here?
-            if self.data[i] != actual_intro_packet.data[i] {
-                is_intro_packet = false;
-                break;
-            }
-        }
-        is_intro_packet
+        self.size == actual_intro_packet.size
+            && self.data[..self.size] == actual_intro_packet.data[..actual_intro_packet.size]
     }
 
     pub(super) fn sent(self) -> Arc<[u8]> {
         self.data[..self.size].into()
+    }
+}
+
+impl <DT: Encryption, const N: usize> Eq for PacketData<DT, N> { }
+
+impl <DT: Encryption, const N: usize> PartialEq for PacketData<DT, N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.size == other.size 
+            && self.data[..self.size] == other.data[..other.size]
     }
 }
 
