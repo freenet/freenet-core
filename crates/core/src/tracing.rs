@@ -38,6 +38,7 @@ pub(crate) use test::TestEventListener;
 use crate::node::OpManager;
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 struct ListenerLogId(usize);
 
 /// A type that reacts to incoming messages from the network and records information about them.
