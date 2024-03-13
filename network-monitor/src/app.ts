@@ -4,10 +4,29 @@ import { handleChange } from "./topology";
 import { handlePutRequest, handlePutSuccess } from "./transactions-data";
 import { parse_put_msg_data } from "./utils";
 
-const PEER_CHANGES = new WebSocket(
-    "ws://127.0.0.1:55010/pull-stats/peer-changes/"
-);
-PEER_CHANGES.onmessage = handleChanges;
+let connection_established = false;
+
+const ws_connection_interval = setInterval(() => {
+    if (!connection_established) {
+        try {
+            const socket = new WebSocket(
+                "ws://127.0.0.1:55010/pull-stats/peer-changes/"
+            );
+
+            socket.addEventListener("open", () => {
+                connection_established = true;
+                console.log("WS Connection established");
+            });
+
+            socket.addEventListener("message", handleChanges);
+        } catch (e) {
+            console.error(e);
+        }
+    } else {
+        console.log("WS Connection established");
+        clearInterval(ws_connection_interval);
+    }
+}, 5000);
 
 // const DELIVER_MESSAGE = new WebSocket("ws://127.0.0.1:55010/pull-stats/network-events/");
 
