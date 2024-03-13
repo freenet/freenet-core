@@ -56,6 +56,7 @@ impl WebSocketProxy {
 
         let router = server_routing
             .route("/contract/command", get(websocket_commands))
+            .route("/contract/api", get(websocket_api))
             .layer(Extension(WebSocketRequest(proxy_request_sender)))
             .layer(axum::middleware::from_fn(connection_info));
         (
@@ -508,5 +509,119 @@ impl ClientEventsProxy for WebSocketProxy {
             Ok(())
         }
         .boxed()
+    }
+}
+
+
+
+async fn websocket_api(
+    ws: WebSocketUpgrade,
+    Extension(auth_token): Extension<Option<AuthToken>>,
+    Extension(encoding_protoc): Extension<EncodingProtocol>,
+    Extension(rs): Extension<WebSocketRequest>,
+) -> axum::response::Response {
+    let on_upgrade = move |ws: WebSocket| async move {
+        if let Err(error) = websocket_api_interface(rs.clone(), auth_token, encoding_protoc, ws).await {
+            tracing::error!("{error}");
+        }
+    };
+    ws.on_upgrade(on_upgrade)
+}
+
+async fn websocket_api_interface(
+    request_sender: WebSocketRequest,
+    mut auth_token: Option<AuthToken>,
+    encoding_protoc: EncodingProtocol,
+    ws: WebSocket,
+) -> Result<(), DynError> {
+    let (mut response_rx, client_id) = new_client_connection(&request_sender).await?;
+    let (mut tx, mut rx) = ws.split();
+    let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::UnboundedReceiver<HostResult>)>>> =
+        Arc::new(Mutex::new(VecDeque::new()));
+    loop {
+        let contract_updates_cp = contract_updates.clone();
+        let listeners_task = async move {
+            loop {
+                let mut lock = contract_updates_cp.lock().await;
+                let active_listeners = &mut *lock;
+                for _ in 0..active_listeners.len() {
+                    if let Some((key, mut listener)) = active_listeners.pop_front() {
+                        match listener.try_recv() {
+                            Ok(r) => {
+                                active_listeners.push_back((key, listener));
+                                return Ok(r);
+                            }
+                            Err(mpsc::error::TryRecvError::Empty) => {
+                                active_listeners.push_back((key, listener));
+                            }
+                            Err(err @ mpsc::error::TryRecvError::Disconnected) => {
+                                return Err(Box::new(err) as DynError)
+                            }
+                        }
+                    }
+                }
+                std::mem::drop(lock);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+
+        let client_req_task = async {
+            let next_msg = match rx
+                .next()
+                .await
+                .ok_or_else::<ClientError, _>(|| ErrorKind::Disconnect.into())
+            {
+                Err(err) => {
+                    tracing::debug!(err = %err, "client channel error");
+                    return Err(Some(err.into()));
+                }
+                Ok(v) => v,
+            };
+            process_client_request(
+                client_id,
+                next_msg,
+                &request_sender,
+                &mut auth_token,
+                encoding_protoc,
+            )
+            .await
+        };
+
+        tokio::select! { biased;
+            msg = async { process_host_response(response_rx.recv().await, client_id, encoding_protoc, &mut tx).await } => {
+                let active_listeners = contract_updates.clone();
+                if let Some(NewSubscription { key, callback }) = msg? {
+                    tracing::debug!(cli_id = %client_id, contract = %key, "added new notification listener");
+                    let active_listeners = &mut *active_listeners.lock().await;
+                    active_listeners.push_back((key, callback));
+                }
+            }
+            process_client_request = client_req_task => {
+                match process_client_request {
+                    Ok(Some(error)) => {
+                        tx.send(error).await?;
+                    }
+                    Ok(None) => continue,
+                    Err(None) => return Ok(()),
+                    Err(Some(err)) => return Err(err),
+                }
+            }
+            
+            response = listeners_task => {
+                let response = response?;
+                match &response {
+                    Ok(res) => tracing::debug!(response = %res, cli_id = %client_id, "sending notification"),
+                    Err(err) => tracing::debug!(response = %err, cli_id = %client_id, "sending notification error"),
+                }
+                let serialized_res = match encoding_protoc {
+                    EncodingProtocol::Flatbuffers => match response {
+                        Ok(res) => res.into_fbs_bytes()?,
+                        Err(err) => err.into_fbs_bytes()?,
+                    },
+                    EncodingProtocol::Native => bincode::serialize(&response)?,
+                };
+                tx.send(Message::Binary(serialized_res)).await?;
+            }
+        }
     }
 }
