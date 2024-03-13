@@ -765,4 +765,40 @@ mod test {
         b?;
         Ok(())
     }
+    
+    #[tokio::test]
+    async fn simulate_simple_interaction() -> Result<(), DynError>  {
+        crate::config::set_logger();
+        let peer_a_keypair = TransportKeypair::new();
+        let peer_a_pub = peer_a_keypair.public.clone();
+        let mut peer_a = ConnectionHandler::new::<MockSocket>(peer_a_keypair, 8080, false)
+            .await
+            .unwrap();
+
+        let peer_b_keypair = TransportKeypair::new();
+        let peer_b_pub = peer_b_keypair.public.clone();
+        let mut peer_b = ConnectionHandler::new::<MockSocket>(peer_b_keypair, 8081, false)
+            .await
+            .unwrap();
+
+        let peer_b = tokio::spawn(async move {
+            let peer_a_conn =
+                peer_b.connect(peer_a_pub, (Ipv4Addr::UNSPECIFIED, 8080).into(), false);
+            let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+            Ok::<_, DynError>(peer_a_conn)
+        });
+
+        let peer_a = tokio::spawn(async move {
+            let peer_b_conn =
+                peer_a.connect(peer_b_pub, (Ipv4Addr::UNSPECIFIED, 8081).into(), false);
+            let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            Ok::<_, DynError>(peer_b_conn)
+        });
+
+        let (a, b) = tokio::try_join!(peer_a, peer_b)?;
+        let a = a?;
+        let b = b?;
+        
+        Ok(())
+    }
 }
