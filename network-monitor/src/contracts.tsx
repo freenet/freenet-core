@@ -19,8 +19,8 @@ export const ContractsTable = ({ open_tx_detail, tx_list }: TxTableInterface) =>
         </thead>
         <tbody id="contract-history-b">
             {
-                tx_list?.map((tx) => (
-                    <tr>
+                tx_list?.map((tx, index) => (
+                    <tr key={`${tx.contract_id.slice(-8)}-${tx.change_type.slice(-8)}-${index}`}>
                         <td onClick={() => open_tx_detail(tx.contract_id)} style={{cursor: "pointer"}}>{tx.contract_id.slice(-8)}</td>
                         <td>{tx.requester.slice(-8)}</td>
                         <td>{tx.target.slice(-8)}</td>
@@ -45,7 +45,7 @@ export function ContractsContainer() {
     const [peers_history, set_peers_history] = useState<Array<TransactionPeerInterface>>([]);
     const [tx_list, set_tx_list] = useState<Array<TransactionData>>([]);
 
-    const open_detail = (contract_id: string) => {
+    const open_tx_detail = (contract_id: string) => {
         let contract_history = all_contracts.get(contract_id);
         if (!contract_history) {
             console.error("Transaction not found");
@@ -88,7 +88,7 @@ export function ContractsContainer() {
 
     return (
         <div style={{marginBottom: 40}}>
-            <ContractsTable open_tx_detail={open_detail} tx_list={tx_list} />
+            <ContractsTable open_tx_detail={open_tx_detail} tx_list={tx_list} />
 
             {transaction && transaction_history && (
                 <ContractDetail

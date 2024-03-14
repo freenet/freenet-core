@@ -26,7 +26,7 @@ const ws_connection_interval = setInterval(() => {
         console.log("WS Connection established");
         clearInterval(ws_connection_interval);
     }
-}, 5000);
+}, 3000);
 
 // const DELIVER_MESSAGE = new WebSocket("ws://127.0.0.1:55010/pull-stats/network-events/");
 

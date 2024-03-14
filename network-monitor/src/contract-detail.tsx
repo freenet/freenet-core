@@ -9,7 +9,7 @@ import { PeerId } from "./topology";
 import { another_ring_visualization } from "./ring-visualization";
 
 interface TransactionDetailPeersHistoryInterface {
-    tx_peer_list: Array<TransactionPeerInterface>;
+    tx_peer_list: Array<TransactionData>;
 }
 
 interface FilterInterface {
@@ -134,7 +134,7 @@ const ContractPeersHistory = ({
             className="block"
             style={{ marginTop: 20 }}
         >
-            <h2>Transaction Peers History </h2>
+            <h2>Contract Transactions History </h2>
             {Object.keys(filter).length > 0 && (
                 <div>
                     <button onClick={() => clear_all_filters()}>
@@ -149,22 +149,11 @@ const ContractPeersHistory = ({
                 <thead id="transaction-peers-history-h">
                     <tr>
                         <th>
-                            Peer Id
-                            {check_if_contains_filter("peer_id") && (
-                                <button
-                                    onClick={() => clear_one_filter("peer_id")}
-                                >
-                                    Clear filter
-                                </button>
-                            )}
-                        </th>
-                        <th>Localization</th>
-                        <th>
-                            State
-                            {check_if_contains_filter("last_state") && (
+                            Contract Id
+                            {check_if_contains_filter("contract_id") && (
                                 <button
                                     onClick={() =>
-                                        clear_one_filter("last_state")
+                                        clear_one_filter("contract_id")
                                     }
                                 >
                                     Clear filter
@@ -172,19 +161,47 @@ const ContractPeersHistory = ({
                             )}
                         </th>
                         <th>
-                            Message
-                            {check_if_contains_filter("last_message") && (
+                            Transaction Id
+                            {check_if_contains_filter("transaction_id") && (
+                                <button
+                                    onClick={() => clear_one_filter("transaction_id")}
+                                >
+                                    Clear filter
+                                </button>
+                            )}
+                        </th>
+                        <th>
+                            Requester
+                            {check_if_contains_filter("requester") && (
+                                <button
+                                    onClick={() => clear_one_filter("requester")}
+                                >
+                                    Clear filter
+                                </button>
+                            )}
+                        </th>
+                        <th>
+                            Target
+                            {check_if_contains_filter("target") && (
+                                <button
+                                    onClick={() => clear_one_filter("target")}
+                                >
+                                    Clear filter
+                                </button>
+                            )}
+                        </th>
+                        <th>
+                            Change Type
+                            {check_if_contains_filter("change_type") && (
                                 <button
                                     onClick={() =>
-                                        clear_one_filter("last_message")
+                                        clear_one_filter("change_type")
                                     }
                                 >
                                     Clear filter
                                 </button>
                             )}
                         </th>
-                        <th>Started</th>
-                        <th>Finalized</th>
                     </tr>
                 </thead>
                 <tbody id="transaction-peers-history-b">
@@ -192,37 +209,54 @@ const ContractPeersHistory = ({
                         <tr>
                             <td
                                 onClick={() =>
-                                    add_filter("peer_id", tx.peer_id)
+                                    add_filter("contract_id", tx.contract_id)
                                 }
                                 style={{
                                     cursor: "pointer",
                                 }}
                             >
-                                {tx.peer_id}
-                            </td>
-                            <td>{tx.location}</td>
-                            <td
-                                onClick={() =>
-                                    add_filter("last_state", tx.last_state)
-                                }
-                                style={{
-                                    cursor: "pointer",
-                                }}
-                            >
-                                {tx.last_state}
+                                {tx.contract_id.slice(-8)}
                             </td>
                             <td
                                 onClick={() =>
-                                    add_filter("last_message", tx.last_message)
+                                    add_filter("transaction_id", tx.transaction_id)
                                 }
                                 style={{
                                     cursor: "pointer",
                                 }}
                             >
-                                {tx.last_message}
+                                {tx.transaction_id}
                             </td>
-                            <td>{tx.started}</td>
-                            <td>{tx.finalized}</td>
+                            <td
+                                onClick={() =>
+                                    add_filter("requester", tx.requester)
+                                }
+                                style={{
+                                    cursor: "pointer",
+                                }}
+                            >
+                                {tx.requester.slice(-8)}
+                            </td>
+                            <td
+                                onClick={() =>
+                                    add_filter("target", tx.target)
+                                }
+                                style={{
+                                    cursor: "pointer",
+                                }}
+                            >
+                                {tx.target.slice(-8)}
+                            </td>
+                            <td
+                                onClick={() =>
+                                    add_filter("change_type", tx.change_type)
+                                }
+                                style={{
+                                    cursor: "pointer",
+                                }}
+                            >
+                                {tx.change_type}
+                            </td>
                         </tr>
                     ))}
                 </tbody>
@@ -234,7 +268,7 @@ const ContractPeersHistory = ({
 // TODO: use real types
 const ContractHistory = ({ contract_history }: any) => (
     <div id="contract-history" className="block">
-        <h2>Transaction History</h2>
+        <h2>Contract History</h2>
         <table
             id="transaction-history"
             className="table is-striped block is-bordered"
@@ -253,8 +287,8 @@ const ContractHistory = ({ contract_history }: any) => (
             </thead>
             <tbody id="contract-history-b">
                 {contract_history &&
-                    contract_history.map((change: TransactionData) => (
-                        <tr>
+                    contract_history.map((change: TransactionData, index: number) => (
+                        <tr key={`${change.transaction_id.slice(-8)}-${change.change_type.slice(-8)}-${index}`}>
                             <td>{change.contract_id.slice(-8)}</td>
                             <td>{change.transaction_id.slice(-8)}</td>
                             <td>{change.requester.slice(-8)}</td>
@@ -311,13 +345,11 @@ export const ContractDetail = ({
             >
                 X
             </button>
-            <h2>Transaction Detail</h2>
+            <h2>Contract Details</h2>
             <div id="transaction-detail-contents">
                 <p>Contract Key {transaction.contract_id}</p>
                 <p>Requester {transaction.requester}</p>
                 <p>Target {transaction.target}</p>
-                <p>ID {transaction.transaction_id}</p>
-                <p>Type {transaction.change_type}</p>
                 {/*<p>Status {transaction.status}</p>
                 <p>Started {transaction.started}</p>
                 <p>Finalized {transaction.finalized}</p>*/}
@@ -329,14 +361,14 @@ export const ContractDetail = ({
             </div>
 
             <div id="other-peer-conns-graph">
-                {another_ring_visualization()}
+            {/*another_ring_visualization()*/}
             </div>
 
-            {peers_history && (
-                <ContractPeersHistory tx_peer_list={peers_history} />
+            {tx_history && (
+                <ContractPeersHistory tx_peer_list={tx_history} />
             )}
 
-            <ContractHistory contract_history={tx_history} />
+            {/*<ContractHistory contract_history={tx_history} />*/}
         </div>
     </div>
 );

@@ -5,9 +5,9 @@ import {another_ring_visualization} from "./ring-visualization";
 
 function ReactContainer() {
     return (
-        <div><h1>Ale</h1>
+        <div>
 
-        {another_ring_visualization()}
+        {/*another_ring_visualization()*/}
         <ContractsContainer />
         <TransactionContainer />
         

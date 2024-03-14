@@ -31,13 +31,23 @@ export function handlePutRequest(
         status: null,
         started: null,
         finalized: null,
+        unique_id:
+            transaction_id + contract_id + target + requester + change_type,
     } as TransactionData;
+
+    if (
+        all_tx
+            .get(transaction_id)
+            ?.find((obj) => obj.unique_id === obj_data.unique_id)
+    ) {
+        return;
+    }
 
     all_tx.set(transaction_id, [obj_data]);
 
     const this_contract_data = all_contracts.get(contract_id);
     if (!this_contract_data) {
-        all_contracts.set(contract_id, [obj_data]);
+        all_contracts.set(contract_id, []);
     }
     all_contracts.get(contract_id)!.push(obj_data);
 }
@@ -64,13 +74,23 @@ export function handlePutSuccess(
         status: null,
         started: null,
         finalized: null,
+        unique_id:
+            transaction_id + contract_id + target + requester + change_type,
     };
 
-    all_tx.set(transaction_id, [obj_data]);
+    if (
+        all_tx
+            .get(transaction_id)
+            ?.find((obj) => obj.unique_id === obj_data.unique_id)
+    ) {
+        return;
+    }
+
+    all_tx.get(transaction_id)!.push(obj_data);
 
     const this_contract_data = all_contracts.get(contract_id);
     if (!this_contract_data) {
-        all_contracts.set(contract_id, [obj_data]);
+        all_contracts.set(contract_id, []);
     }
     all_contracts.get(contract_id)!.push(obj_data);
 }

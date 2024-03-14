@@ -16,6 +16,7 @@ export type TransactionData = {
     status: string | null;
     started: string | null;
     finalized: string | null;
+    unique_id: string;
 };
 
 export interface TransactionInterface {

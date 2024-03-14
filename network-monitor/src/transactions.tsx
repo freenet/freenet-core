@@ -193,9 +193,9 @@ const TransactionsTable = ({ open_tx_detail, tx_list }: TxTableInterface) => (
         </thead>
         <tbody id="transactions-history-b">
             {
-                tx_list?.map((tx) => (
-                    <tr>
-                        <td onClick={() => open_tx_detail(tx.transaction_id)} style={{cursor: "pointer"}}>{tx.transaction_id.slice(-8)}</td>
+                tx_list?.map((tx, index) => (
+                    <tr key={`${tx.transaction_id.slice(-8)}-${tx.change_type.slice(-8)}-${index}`}>
+                        <td  onClick={() => open_tx_detail(tx.transaction_id)} style={{cursor: "pointer"}}>{tx.transaction_id.slice(-8)}</td>
                         <td>{tx.requester.slice(-8)}</td>
                         <td>{tx.target.slice(-8)}</td>
                         <td>{tx.change_type}</td>
@@ -228,7 +228,7 @@ export function TransactionContainer() {
         set_transaction_history(tx_history);
         // set_peers_history(mock_peers_in_tx[tx.id]);
         set_is_detail_open(true);
-        document.getElementById("transaction-detail")?.focus();
+        window.scrollTo(0, 0);
     };
 
     const close_detail = () => {
