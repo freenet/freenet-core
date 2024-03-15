@@ -7,7 +7,7 @@ function ReactContainer() {
     return (
         <div>
 
-        {/*another_ring_visualization()*/}
+        {another_ring_visualization({peerId: "abc", localization: 0.1}, [{peerId: "0x593b", localization: 0.3}, {peerId: "0x593b", localization: 0.5}, {peerId: "0x593b", localization: 0.7}, {peerId: "0x593b", localization: 0.9}])}
         <ContractsContainer />
         <TransactionContainer />
         
