@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::time::Duration;
 use std::vec::Vec;
 
 use crate::transport::packet_data::Unknown;
@@ -176,7 +177,7 @@ impl PeerConnection {
                     };
                     res?
                }
-                _ = resend_check.take().expect("should be set") => {
+                _ = resend_check.take().unwrap_or(tokio::time::sleep(Duration::from_secs(1))) => {
                     loop {
                         let maybe_resend = self.remote_conn
                             .sent_tracker

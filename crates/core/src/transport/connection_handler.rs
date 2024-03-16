@@ -205,10 +205,10 @@ impl<S: Socket> UdpPacketsListener<S> {
             .this_peer_keypair
             .secret
             .decrypt(remote_intro_packet.data())
-            else {
-                tracing::debug!(%remote_addr, "Failed to decrypt packet with private key");
-                return Ok(());
-            };
+        else {
+            tracing::debug!(%remote_addr, "Failed to decrypt packet with private key");
+            return Ok(());
+        };
         let protoc = &decrypted_intro_packet[..PROTOC_VERSION.len()];
         let outbound_key_bytes =
             &decrypted_intro_packet[PROTOC_VERSION.len()..PROTOC_VERSION.len() + 16];
@@ -228,7 +228,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     "remote is using a different protocol version: {:?}",
                     String::from_utf8_lossy(protoc)
                 )
-                    .into(),
+                .into(),
             });
         }
 
@@ -518,11 +518,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 let key = Aes128Gcm::new_from_slice(
                                     &decrypted_packet.data()[PROTOC_VERSION.len()..],
                                 )
-                                    .map_err(|_| {
-                                        TransportError::ConnectionEstablishmentFailure {
-                                            cause: "invalid symmetric key".into(),
-                                        }
-                                    })?;
+                                .map_err(|_| {
+                                    TransportError::ConnectionEstablishmentFailure {
+                                        cause: "invalid symmetric key".into(),
+                                    }
+                                })?;
                                 let protocol_version =
                                     &decrypted_packet.data()[..PROTOC_VERSION.len()];
                                 if protocol_version != PROTOC_VERSION {
@@ -536,7 +536,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                             "remote is using a different protocol version: {:?}",
                                             String::from_utf8_lossy(protocol_version)
                                         )
-                                            .into(),
+                                        .into(),
                                     });
                                 }
                                 outbound_sym_key = Some(key);
@@ -683,7 +683,7 @@ mod test {
     use std::{collections::HashMap, net::Ipv4Addr, sync::OnceLock};
 
     use tokio::sync::Mutex;
-    use tracing::{info};
+    use tracing::info;
 
     use crate::DynError;
 
@@ -734,7 +734,7 @@ mod test {
 
     #[tokio::test]
     async fn simulate_nat_traversal() -> Result<(), DynError> {
-        crate::config::set_logger();
+        // crate::config::set_logger();
         let peer_a_keypair = TransportKeypair::new();
         let peer_a_pub = peer_a_keypair.public.clone();
         let mut peer_a = ConnectionHandler::new::<MockSocket>(peer_a_keypair, 8080, false)
@@ -769,7 +769,7 @@ mod test {
 
     #[tokio::test]
     async fn simulate_send_short_message() -> Result<(), DynError> {
-        crate::config::set_logger();
+        // crate::config::set_logger();
         let peer_a_keypair = TransportKeypair::new();
         let peer_a_pub = peer_a_keypair.public.clone();
         let mut peer_a = ConnectionHandler::new::<MockSocket>(peer_a_keypair, 8080, false)
@@ -788,15 +788,17 @@ mod test {
             let work = async move {
                 info!("Waiting for connection from peer A");
                 let mut conn = peer_a_conn.await?;
-                info!("Sending message to peer A");
-                conn.send("foo").await?;
-                info!("Waiting for message from peer A");
+
                 let output = conn.recv().await?;
-                
-                let output_as_str : String = bincode::deserialize(output.as_slice())?;
-                
+                let output_as_str: String = bincode::deserialize(output.as_slice())?;
                 info!("Received message {:?} from peer A", output_as_str);
                 assert_eq!(output_as_str, "bar");
+
+                info!("Sending message to peer A");
+                conn.send("foo").await?;
+
+                info!("Waiting for message from peer A");
+
                 Ok::<_, DynError>(())
             };
             tokio::time::timeout(Duration::from_secs(5), work).await??;
@@ -809,16 +811,16 @@ mod test {
             let work = async move {
                 info!("Waiting for connection from peer B");
                 let mut conn = peer_b_conn.await?;
+
                 info!("Sending message to peer B");
                 conn.send("bar").await?;
+
                 info!("Waiting for message from peer B");
                 let output = conn.recv().await?;
-                
-                let output_as_str : String = bincode::deserialize(output.as_slice())?;
-                
+                let output_as_str: String = bincode::deserialize(output.as_slice())?;
                 info!("Received message {:?} from peer B", output_as_str);
-                
                 assert_eq!(output_as_str, "foo");
+
                 Ok::<_, DynError>(())
             };
             tokio::time::timeout(Duration::from_secs(5), work).await??;
@@ -854,10 +856,10 @@ mod test {
                 let mut conn = peer_a_conn.await?;
                 info!("Sending message to peer A");
                 conn.send("foo".repeat(3000)).await?;
+
                 info!("Waiting for message from peer A");
                 let output = conn.recv().await?;
-
-                let output_as_str : String = bincode::deserialize(output.as_slice())?;
+                let output_as_str: String = bincode::deserialize(output.as_slice())?;
 
                 info!("Received message {:?} from peer A", output_as_str);
                 assert_eq!(output_as_str, "bar".repeat(3000));
@@ -878,7 +880,7 @@ mod test {
                 info!("Waiting for message from peer B");
                 let output = conn.recv().await?;
 
-                let output_as_str : String = bincode::deserialize(output.as_slice())?;
+                let output_as_str: String = bincode::deserialize(output.as_slice())?;
 
                 info!("Received message {:?} from peer B", output_as_str);
 
