@@ -10,9 +10,8 @@ use crate::transport::packet_data::Unknown;
 use aes_gcm::Aes128Gcm;
 use futures::stream::FuturesUnordered;
 use futures::{Future, FutureExt, StreamExt};
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 mod inbound_stream;
 mod outbound_stream;
@@ -145,6 +144,7 @@ impl PeerConnection {
                     self.remote_conn
                         .sent_tracker
                         .lock()
+                        .await
                         .report_received_receipts(&confirm_receipt);
                     match self.received_tracker.report_received_packet(packet_id) {
                         ReportResult::Ok => {
@@ -184,6 +184,7 @@ impl PeerConnection {
                         let maybe_resend = self.remote_conn
                             .sent_tracker
                             .lock()
+                            .await
                             .get_resend();
                         match maybe_resend {
                             ResendAction::WaitUntil(wait_until) => {
@@ -196,7 +197,7 @@ impl PeerConnection {
                                     .send((self.remote_conn.remote_addr, packet.clone()))
                                     .await
                                     .map_err(|_| TransportError::ConnectionClosed)?;
-                                self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
+                                self.remote_conn.sent_tracker.lock().await.report_sent_packet(idx, packet);
                             }
                         }
                     }
@@ -324,6 +325,7 @@ async fn packet_sending(
         .map_err(|_| TransportError::ConnectionClosed)?;
     sent_tracker
         .lock()
+        .await
         .report_sent_packet(packet_id, packet.prepared_send());
     Ok(())
 }
@@ -335,13 +337,12 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
     use tokio::sync::mpsc;
 
-    use crate::transport::packet_data::MAX_PACKET_SIZE;
-
     use super::{
         inbound_stream::{recv_stream, InboundStream},
         outbound_stream::send_stream,
         *,
     };
+    use crate::transport::packet_data::MAX_PACKET_SIZE;
 
     #[tokio::test]
     async fn test_inbound_outbound_interaction() -> Result<(), Box<dyn std::error::Error>> {
@@ -354,7 +355,7 @@ mod tests {
             .collect();
         let key = rand::random::<[u8; 16]>();
         let cipher = Aes128Gcm::new(&key.into());
-        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+        let sent_tracker = Arc::new(Mutex::new(SentPacketTracker::new()));
 
         let stream_id = StreamId::next();
         // Send a long message using the outbound stream

@@ -9,7 +9,7 @@ use crate::transport::packet_data::{AssymetricRSA, Unknown};
 use aes_gcm::{Aes128Gcm, KeyInit};
 use futures::FutureExt;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task;
 
 use super::{
@@ -152,7 +152,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             let remote_conn = self.remote_connections.remove(&remote_addr);
                             match remote_conn {
                                 Some(remote_conn) => {
-                                    // tracing::trace!(%remote_addr, "received packet from remote");
+                                    tracing::trace!(%remote_addr, "received packet from remote");
                                     let packet_data = PacketData::from_buf(&buf[..size]);
                                     let _ = remote_conn.inbound_packet_sender.send(packet_data).await;
                                     self.remote_connections.insert(remote_addr, remote_conn);
@@ -291,7 +291,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             break;
         }
 
-        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+        let sent_tracker = Arc::new(Mutex::new(SentPacketTracker::new()));
         let peer_connection = PeerConnection::new(RemoteConnection {
             outbound_packets: self.outbound_packets.clone(),
             outbound_symmetric_key: outbound_key,
@@ -308,7 +308,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             .await
             .map_err(|_| TransportError::ChannelClosed)?;
 
-        sent_tracker.lock().report_sent_packet(
+        sent_tracker.lock().await.report_sent_packet(
             SymmetricMessage::FIRST_PACKET_ID,
             outbound_ack_packet.prepared_send(),
         );
@@ -373,8 +373,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                         .send((remote_addr, acknowledgment.data().into()))
                         .await
                         .map_err(|_| TransportError::ChannelClosed)?;
-                    let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
-                    sent_tracker.lock().report_sent_packet(
+                    let sent_tracker = Arc::new(Mutex::new(SentPacketTracker::new()));
+                    sent_tracker.lock().await.report_sent_packet(
                         SymmetricMessage::FIRST_PACKET_ID,
                         acknowledgment.data().into(),
                     );
@@ -477,11 +477,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                     outbound_packets: self.outbound_packets.clone(),
                                                     outbound_symmetric_key: outbound_sym_key,
                                                     remote_addr,
-                                                    sent_tracker: Arc::new(
-                                                        parking_lot::Mutex::new(
-                                                            SentPacketTracker::new(),
-                                                        ),
-                                                    ),
+                                                    sent_tracker: Arc::new(Mutex::new(
+                                                        SentPacketTracker::new(),
+                                                    )),
                                                     last_packet_id: Arc::new(AtomicU32::new(0)),
                                                     inbound_packet_recv: inbound_recv,
                                                     inbound_symmetric_key: inbound_sym_key,
@@ -590,9 +588,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     outbound_symmetric_key: outbound_sym_key
                                         .expect("should be set at this stage"),
                                     remote_addr,
-                                    sent_tracker: Arc::new(parking_lot::Mutex::new(
-                                        SentPacketTracker::new(),
-                                    )),
+                                    sent_tracker: Arc::new(Mutex::new(SentPacketTracker::new())),
                                     last_packet_id: Arc::new(AtomicU32::new(0)),
                                     inbound_packet_recv: inbound_recv,
                                     inbound_symmetric_key: inbound_sym_key,
@@ -682,18 +678,22 @@ impl InboundRemoteConnection {
 
 #[cfg(test)]
 mod test {
-    use std::{collections::HashMap, net::Ipv4Addr, sync::OnceLock};
+    use std::{
+        collections::HashMap,
+        net::Ipv4Addr,
+        sync::{atomic::AtomicU16, OnceLock},
+    };
 
     use tokio::sync::Mutex;
     use tracing::info;
 
+    use super::*;
     use crate::DynError;
 
-    use super::*;
-
     #[allow(clippy::type_complexity)]
-    static CHANNELS: OnceLock<Mutex<HashMap<SocketAddr, mpsc::Sender<(SocketAddr, Vec<u8>)>>>> =
-        OnceLock::new();
+    static CHANNELS: OnceLock<
+        Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<(SocketAddr, Vec<u8>)>>>>,
+    > = OnceLock::new();
 
     struct MockSocket {
         inbound: Mutex<mpsc::Receiver<(SocketAddr, Vec<u8>)>>,
@@ -702,7 +702,9 @@ mod test {
 
     impl Socket for MockSocket {
         async fn bind(addr: SocketAddr) -> Result<Self, std::io::Error> {
-            let channels = CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
+            let channels = CHANNELS
+                .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+                .clone();
             let (outbound, inbound) = mpsc::channel(1);
             tracing::info!(?addr, "Binding mock socket");
             channels.lock().await.insert(addr, outbound);
@@ -714,51 +716,59 @@ mod test {
 
         async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
             let Some((remote, packet)) = self.inbound.try_lock().unwrap().recv().await else {
+                tracing::error!(this = %self.this, "no packet received");
                 return Err(std::io::ErrorKind::ConnectionAborted.into());
             };
+            tracing::trace!(?remote, "receiving packet from remote");
             buf[..packet.len()].copy_from_slice(&packet[..]);
             Ok((packet.len(), remote))
         }
 
         async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
-            let channels = CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
+            let channels = CHANNELS
+                .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+                .clone();
             let channels = channels.lock().await;
-            let Some(sender) = channels.get(&target) else {
+            let Some(sender) = channels.get(&target).cloned() else {
                 return Ok(0);
             };
+            drop(channels);
+            tracing::trace!(?target, "sending packet to remote");
             sender
                 .send((self.this, buf.to_vec()))
                 .await
                 .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
+            tracing::trace!(?target, "packet sent to remote");
             Ok(buf.len())
         }
+    }
+
+    async fn set_peer_connection(
+    ) -> Result<(TransportPublicKey, ConnectionHandler, SocketAddr), DynError> {
+        static PORT: AtomicU16 = AtomicU16::new(8080);
+        let peer_keypair = TransportKeypair::new();
+        let peer_pub = peer_keypair.public.clone();
+        let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let peer_conn = ConnectionHandler::new::<MockSocket>(peer_keypair, port, false)
+            .await
+            .expect("failed to create peer");
+        Ok((peer_pub, peer_conn, (Ipv4Addr::UNSPECIFIED, port).into()))
     }
 
     #[tokio::test]
     async fn simulate_nat_traversal() -> Result<(), DynError> {
         // crate::config::set_logger();
-        let peer_a_keypair = TransportKeypair::new();
-        let peer_a_pub = peer_a_keypair.public.clone();
-        let mut peer_a = ConnectionHandler::new::<MockSocket>(peer_a_keypair, 8080, false)
-            .await
-            .unwrap();
-
-        let peer_b_keypair = TransportKeypair::new();
-        let peer_b_pub = peer_b_keypair.public.clone();
-        let mut peer_b = ConnectionHandler::new::<MockSocket>(peer_b_keypair, 8081, false)
-            .await
-            .unwrap();
+        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection().await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection().await?;
 
         let peer_b = tokio::spawn(async move {
-            let peer_a_conn =
-                peer_b.connect(peer_a_pub, (Ipv4Addr::UNSPECIFIED, 8080).into(), false);
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false);
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
             Ok::<_, DynError>(())
         });
 
         let peer_a = tokio::spawn(async move {
-            let peer_b_conn =
-                peer_a.connect(peer_b_pub, (Ipv4Addr::UNSPECIFIED, 8081).into(), false);
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false);
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             Ok::<_, DynError>(())
         });
@@ -772,21 +782,11 @@ mod test {
     #[tokio::test]
     async fn simulate_send_short_message() -> Result<(), DynError> {
         // crate::config::set_logger();
-        let peer_a_keypair = TransportKeypair::new();
-        let peer_a_pub = peer_a_keypair.public.clone();
-        let mut peer_a = ConnectionHandler::new::<MockSocket>(peer_a_keypair, 8080, false)
-            .await
-            .unwrap();
-
-        let peer_b_keypair = TransportKeypair::new();
-        let peer_b_pub = peer_b_keypair.public.clone();
-        let mut peer_b = ConnectionHandler::new::<MockSocket>(peer_b_keypair, 8081, false)
-            .await
-            .unwrap();
+        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection().await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection().await?;
 
         let peer_b = tokio::spawn(async move {
-            let peer_a_conn =
-                peer_b.connect(peer_a_pub, (Ipv4Addr::UNSPECIFIED, 8080).into(), false);
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false);
             let work = async move {
                 info!("Waiting for connection from peer A");
                 let mut conn = peer_a_conn.await?;
@@ -808,8 +808,7 @@ mod test {
         });
 
         let peer_a = tokio::spawn(async move {
-            let peer_b_conn =
-                peer_a.connect(peer_b_pub, (Ipv4Addr::UNSPECIFIED, 8081).into(), false);
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false);
             let work = async move {
                 info!("Waiting for connection from peer B");
                 let mut conn = peer_b_conn.await?;
@@ -835,78 +834,61 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    // #[tokio::test]
     async fn simulate_send_streamed_message() -> Result<(), DynError> {
         crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
-        let peer_a_keypair = TransportKeypair::new();
-        let peer_a_pub = peer_a_keypair.public.clone();
-        let mut peer_a = ConnectionHandler::new::<MockSocket>(peer_a_keypair, 8080, false)
-            .await
-            .unwrap();
+        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection().await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection().await?;
 
-        let peer_b_keypair = TransportKeypair::new();
-        let peer_b_pub = peer_b_keypair.public.clone();
-        let mut peer_b = ConnectionHandler::new::<MockSocket>(peer_b_keypair, 8081, false)
-            .await
-            .unwrap();
-
-        let (wait_io_sender, wait_io_recv) = oneshot::channel();
         let peer_b = tokio::spawn(async move {
-            let peer_a_conn =
-                peer_b.connect(peer_a_pub, (Ipv4Addr::UNSPECIFIED, 8080).into(), false);
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false);
             let work = async move {
-                info!("Waiting for connection from peer A");
                 let mut conn = peer_a_conn.await?;
-
-                info!("Sending message to peer A");
-                conn.send("foo".repeat(3000)).await?;
-
-                // info!("Waiting for message from peer A");
-
-                tokio::task::spawn(async move {
-                    // drives execution for sending
-                    loop {
-                        if conn.recv().await.is_err() {
-                            break;
+                let mut messages = vec![];
+                while messages.len() < 10 {
+                    conn.send("foo".repeat(3000)).await?;
+                    match conn.recv().await {
+                        Ok(msg) => {
+                            let output_as_str: String = bincode::deserialize(&msg)?;
+                            messages.push(output_as_str);
+                            info!("{peer_b_addr:?} received {} messages", messages.len());
                         }
+                        Err(e) => return Err(e),
                     }
-                });
-                wait_io_recv.await?;
-
-                // let output_as_str: String = bincode::deserialize(output.as_slice())?;
-                // info!("Received message {:?} from peer A", output_as_str);
-                // assert_eq!(output_as_str, "bar".repeat(3000));
-
-                Ok::<_, DynError>(())
+                }
+                Ok(messages)
             };
-            tokio::time::timeout(Duration::from_secs(5000), work).await??;
-            Ok::<_, DynError>(())
+            let r = tokio::time::timeout(Duration::from_secs(1000), work).await?;
+            Ok::<_, DynError>(r)
         });
 
         let peer_a = tokio::spawn(async move {
-            let peer_b_conn =
-                peer_a.connect(peer_b_pub, (Ipv4Addr::UNSPECIFIED, 8081).into(), false);
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false);
             let work = async move {
-                info!("Waiting for connection from peer B");
                 let mut conn = peer_b_conn.await?;
+                let mut messages = vec![];
 
-                info!("Waiting for message from peer B");
-                let output = conn.recv().await?;
-                let output_as_str: String = bincode::deserialize(output.as_slice())?;
-                info!("Received message {:?} from peer B", output_as_str);
-                assert_eq!(output_as_str, "foo".repeat(3000));
-
-                wait_io_sender.send(()).unwrap();
-
-                Ok::<_, DynError>(())
+                while messages.len() < 10 {
+                    conn.send("bar".repeat(3000)).await?;
+                    match conn.recv().await {
+                        Ok(msg) => {
+                            let output_as_str: String = bincode::deserialize(&msg)?;
+                            messages.push(output_as_str);
+                            info!("{peer_a_addr:?}  received {} messages", messages.len());
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(messages)
             };
-            tokio::time::timeout(Duration::from_secs(5000), work).await??;
-            Ok::<_, DynError>(())
+            let r = tokio::time::timeout(Duration::from_secs(1000), work).await?;
+            Ok::<_, DynError>(r)
         });
 
         let (a, b) = tokio::try_join!(peer_a, peer_b)?;
-        a?;
-        b?;
+        assert_eq!(a??, vec![String::from("foo").repeat(3000); 10]);
+        assert_eq!(b??, vec![String::from("bar").repeat(3000); 10]);
         Ok(())
     }
 }
