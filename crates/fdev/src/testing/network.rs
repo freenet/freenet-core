@@ -158,7 +158,7 @@ async fn start_supervisor(config: &TestConfig) -> anyhow::Result<(), Error> {
 
 async fn start_peer(config: &TestConfig, cmd_config: &NetworkProcessConfig) -> Result<(), Error> {
     std::env::set_var("FREENET_PEER_ID", cmd_config.clone().id.unwrap());
-    freenet::config::set_logger();
+    freenet::config::set_logger(None);
     if let Some(peer_id) = &cmd_config.id {
         let peer = NetworkPeer::new(peer_id.clone()).await?;
         peer.run(config, peer_id.clone()).await?;

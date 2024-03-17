@@ -141,6 +141,7 @@ impl PeerConnection {
                         confirm_receipt,
                         payload,
                     } = msg;
+                    // tracing::trace!(remote = %self.remote_conn.remote_addr, %packet_id, "received inbound packet");
                     self.remote_conn
                         .sent_tracker
                         .lock()
@@ -168,6 +169,7 @@ impl PeerConnection {
                         continue;
                     };
                     self.inbound_streams.remove(&stream_id);
+                    // tracing::trace!(%stream_id, "stream finished");
                     return Ok(msg);
                 }
                 outbound_stream = self.outbound_stream_futures.next(), if !self.outbound_stream_futures.is_empty() => {
@@ -224,22 +226,24 @@ impl PeerConnection {
                 payload,
             } => {
                 if let Some(sender) = self.inbound_streams.get(&stream_id) {
+                    tracing::trace!(%stream_id, %fragment_number, "pushing fragment to existing stream");
                     sender
                         .send((fragment_number, payload))
                         .await
                         .map_err(|_| TransportError::ConnectionClosed)?;
                 } else {
                     let (sender, receiver) = mpsc::channel(1);
+                    tracing::trace!(%stream_id, %fragment_number, "new stream");
                     self.inbound_streams.insert(stream_id, sender);
                     let mut stream = inbound_stream::InboundStream::new(total_length_bytes);
                     if let Some(msg) = stream.push_fragment(fragment_number, payload) {
                         self.inbound_streams.remove(&stream_id);
+                        tracing::trace!(%stream_id, %fragment_number, "stream finished");
                         return Ok(Some(msg));
                     }
-                    self.inbound_stream_futures.push(
-                        inbound_stream::recv_stream(stream_id, total_length_bytes, receiver)
-                            .boxed(),
-                    );
+                    tracing::trace!(%stream_id, "listening for more fragments");
+                    self.inbound_stream_futures
+                        .push(inbound_stream::recv_stream(stream_id, receiver, stream).boxed());
                 }
                 Ok(None)
             }
@@ -307,6 +311,7 @@ async fn packet_sending(
     payload: impl Into<SymmetricMessagePayload>,
     sent_tracker: &Mutex<SentPacketTracker<InstantTimeSrc>>,
 ) -> Result<()> {
+    // tracing::trace!(packet_id, "sending packet");
     let packet = SymmetricMessage::serialize_msg_to_packet_data(
         packet_id,
         payload,
@@ -332,14 +337,19 @@ mod tests {
 
     use crate::transport::packet_data::MAX_PACKET_SIZE;
 
-    use super::{inbound_stream::recv_stream, outbound_stream::send_stream, *};
+    use super::{
+        inbound_stream::{recv_stream, InboundStream},
+        outbound_stream::send_stream,
+        *,
+    };
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn test_inbound_outbound_interaction() -> Result<(), Box<dyn std::error::Error>> {
+        const MSG_LEN: usize = 1000;
         let (sender, mut receiver) = mpsc::channel(1);
         let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
         let message: Vec<_> = std::iter::repeat(0)
-            .take(1_000)
+            .take(MSG_LEN)
             .map(|_| rand::random::<u8>())
             .collect();
         let key = rand::random::<[u8; 16]>();
@@ -362,7 +372,8 @@ mod tests {
         let inbound = async {
             // need to take care of decrypting and deserializing the inbound data before collecting into the message
             let (tx, rx) = mpsc::channel(1);
-            let inbound_msg = tokio::task::spawn(recv_stream(stream_id, message.len() as u64, rx));
+            let stream = InboundStream::new(MSG_LEN as u64);
+            let inbound_msg = tokio::task::spawn(recv_stream(stream_id, rx, stream));
             while let Some((_, network_packet)) = receiver.recv().await {
                 let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&network_packet)
                     .try_decrypt_sym(&cipher)

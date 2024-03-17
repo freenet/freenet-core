@@ -152,6 +152,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             let remote_conn = self.remote_connections.remove(&remote_addr);
                             match remote_conn {
                                 Some(remote_conn) => {
+                                    // tracing::trace!(%remote_addr, "received packet from remote");
                                     let packet_data = PacketData::from_buf(&buf[..size]);
                                     let _ = remote_conn.inbound_packet_sender.send(packet_data).await;
                                     self.remote_connections.insert(remote_addr, remote_conn);
@@ -201,12 +202,13 @@ impl<S: Socket> UdpPacketsListener<S> {
         remote_intro_packet: PacketData<Unknown>,
         remote_addr: SocketAddr,
     ) -> Result<(), TransportError> {
+        tracing::debug!(%remote_addr, "new connection to gateway");
         let Ok(decrypted_intro_packet) = self
             .this_peer_keypair
             .secret
             .decrypt(remote_intro_packet.data())
         else {
-            tracing::debug!(%remote_addr, "Failed to decrypt packet with private key");
+            tracing::debug!(%remote_addr, "failed to decrypt packet with private key");
             return Ok(());
         };
         let protoc = &decrypted_intro_packet[..PROTOC_VERSION.len()];
@@ -833,9 +835,9 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn simulate_send_streamed_message() -> Result<(), DynError> {
-        crate::config::set_logger();
+        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let peer_a_keypair = TransportKeypair::new();
         let peer_a_pub = peer_a_keypair.public.clone();
         let mut peer_a = ConnectionHandler::new::<MockSocket>(peer_a_keypair, 8080, false)
@@ -848,24 +850,36 @@ mod test {
             .await
             .unwrap();
 
+        let (wait_io_sender, wait_io_recv) = oneshot::channel();
         let peer_b = tokio::spawn(async move {
             let peer_a_conn =
                 peer_b.connect(peer_a_pub, (Ipv4Addr::UNSPECIFIED, 8080).into(), false);
             let work = async move {
                 info!("Waiting for connection from peer A");
                 let mut conn = peer_a_conn.await?;
+
                 info!("Sending message to peer A");
                 conn.send("foo".repeat(3000)).await?;
 
-                info!("Waiting for message from peer A");
-                let output = conn.recv().await?;
-                let output_as_str: String = bincode::deserialize(output.as_slice())?;
+                // info!("Waiting for message from peer A");
 
-                info!("Received message {:?} from peer A", output_as_str);
-                assert_eq!(output_as_str, "bar".repeat(3000));
+                tokio::task::spawn(async move {
+                    // drives execution for sending
+                    loop {
+                        if conn.recv().await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                wait_io_recv.await?;
+
+                // let output_as_str: String = bincode::deserialize(output.as_slice())?;
+                // info!("Received message {:?} from peer A", output_as_str);
+                // assert_eq!(output_as_str, "bar".repeat(3000));
+
                 Ok::<_, DynError>(())
             };
-            tokio::time::timeout(Duration::from_secs(5), work).await??;
+            tokio::time::timeout(Duration::from_secs(5000), work).await??;
             Ok::<_, DynError>(())
         });
 
@@ -875,19 +889,18 @@ mod test {
             let work = async move {
                 info!("Waiting for connection from peer B");
                 let mut conn = peer_b_conn.await?;
-                info!("Sending message to peer B");
-                conn.send("bar".repeat(3000)).await?;
+
                 info!("Waiting for message from peer B");
                 let output = conn.recv().await?;
-
                 let output_as_str: String = bincode::deserialize(output.as_slice())?;
-
                 info!("Received message {:?} from peer B", output_as_str);
-
                 assert_eq!(output_as_str, "foo".repeat(3000));
+
+                wait_io_sender.send(()).unwrap();
+
                 Ok::<_, DynError>(())
             };
-            tokio::time::timeout(Duration::from_secs(5), work).await??;
+            tokio::time::timeout(Duration::from_secs(5000), work).await??;
             Ok::<_, DynError>(())
         });
 

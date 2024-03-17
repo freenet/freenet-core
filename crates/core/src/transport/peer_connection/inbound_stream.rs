@@ -9,10 +9,9 @@ type FragmentIdx = u32;
 
 pub(super) async fn recv_stream(
     stream_id: StreamId,
-    total_length_bytes: u64,
     mut receiver: mpsc::Receiver<(FragmentIdx, Vec<u8>)>,
+    mut stream: InboundStream,
 ) -> Result<(StreamId, Vec<u8>), StreamId> {
-    let mut stream = InboundStream::new(total_length_bytes);
     while let Some((fragment_number, payload)) = receiver.recv().await {
         if let Some(msg) = stream.push_fragment(fragment_number, payload) {
             return Ok((stream_id, msg));
@@ -45,10 +44,13 @@ impl InboundStream {
         fragment_number: FragmentIdx,
         mut fragment: SerializedStream,
     ) -> Option<Vec<u8>> {
+        tracing::trace!(%fragment_number, last = %self.last_contiguous_fragment_idx, non_contig = ?self.non_contiguous_fragments.keys().collect::<Vec<_>>(), "received stream fragment");
         if fragment_number == self.last_contiguous_fragment_idx + 1 {
             self.last_contiguous_fragment_idx = fragment_number;
             self.payload.append(&mut fragment);
+            tracing::debug!(%fragment_number, fragment_number = %self.last_contiguous_fragment_idx, "inserting contiguous fragment");
         } else {
+            tracing::debug!(%fragment_number, fragment_number = %self.last_contiguous_fragment_idx, "inserting non-contiguous fragment");
             self.non_contiguous_fragments
                 .insert(fragment_number, fragment);
         }
@@ -66,8 +68,20 @@ impl InboundStream {
 
     fn get_and_clear(&mut self) -> Option<Vec<u8>> {
         if self.payload.len() as u64 == self.total_length_bytes {
+            tracing::trace!(
+                last = %self.last_contiguous_fragment_idx,
+                byted_received = self.payload.len(),
+                total_bytes = self.total_length_bytes,
+                "stream complete"
+            );
             Some(std::mem::take(&mut self.payload))
         } else {
+            tracing::trace!(
+                last = %self.last_contiguous_fragment_idx,
+                byted_received = self.payload.len(),
+                total_bytes = self.total_length_bytes,
+                "stream not complete"
+            );
             None
         }
     }

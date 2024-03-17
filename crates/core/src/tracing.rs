@@ -1149,16 +1149,18 @@ enum PutEvent {
 
 #[cfg(feature = "trace")]
 pub(crate) mod tracer {
+    use tracing::level_filters::LevelFilter;
     use tracing_subscriber::{Layer, Registry};
 
     use crate::DynError;
 
-    pub fn init_tracer() -> Result<(), DynError> {
+    pub fn init_tracer(level: Option<LevelFilter>) -> Result<(), DynError> {
         let default_filter = if cfg!(any(test, debug_assertions)) {
-            tracing_subscriber::filter::LevelFilter::DEBUG
+            LevelFilter::DEBUG
         } else {
-            tracing_subscriber::filter::LevelFilter::INFO
+            LevelFilter::INFO
         };
+        let default_filter = level.unwrap_or(default_filter);
         let filter_layer = tracing_subscriber::EnvFilter::builder()
             .with_default_directive(default_filter.into())
             .from_env_lossy()

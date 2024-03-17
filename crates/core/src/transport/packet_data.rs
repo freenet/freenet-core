@@ -39,7 +39,7 @@ impl<const N: usize> AssertSize<N> {
 // trying to bypass limitations with const generic checks on where clauses
 const fn _check_valid_size<const N: usize>() {
     #[allow(clippy::let_unit_value)]
-        let () = AssertSize::<N>::OK;
+    let () = AssertSize::<N>::OK;
 }
 
 #[derive(Clone)]
@@ -247,12 +247,11 @@ impl<const N: usize> PacketData<Unknown, N> {
     }
 }
 
-impl <DT: Encryption, const N: usize> Eq for PacketData<DT, N> { }
+impl<DT: Encryption, const N: usize> Eq for PacketData<DT, N> {}
 
-impl <DT: Encryption, const N: usize> PartialEq for PacketData<DT, N> {
+impl<DT: Encryption, const N: usize> PartialEq for PacketData<DT, N> {
     fn eq(&self, other: &Self) -> bool {
-        self.size == other.size
-            && self.data[..self.size] == other.data[..other.size]
+        self.size == other.size && self.data[..self.size] == other.data[..other.size]
     }
 }
 

@@ -38,6 +38,7 @@ pub(super) async fn send_stream(
     outbound_symmetric_key: Aes128Gcm,
     sent_packet_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
 ) -> Result<(), TransportError> {
+    tracing::debug!(stream_id = %stream_id.0, length = stream_to_send.len(), "sending stream");
     let total_length_bytes = stream_to_send.len() as u32;
     let mut total_packets = stream_to_send.len() / MAX_DATA_SIZE;
     total_packets += if stream_to_send.len() % MAX_DATA_SIZE == 0 {
@@ -80,6 +81,8 @@ pub(super) async fn send_stream(
         next_fragment_number += 1;
         sent_so_far += 1;
     }
+
+    // tracing::trace!(stream_id = %stream_id.0, total_packets = %sent_so_far, "stream sent");
 
     Ok(())
 }
