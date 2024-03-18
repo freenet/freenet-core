@@ -66,7 +66,7 @@ reqwest = { version = "0.11.23", features = ["json"] }
 # enum-iterator = "1.4.1"
 
 # Tracing deps
-opentelemetry = "0.21.0"
+opentelemetry = "0.22.0"
 opentelemetry-jaeger = { features = ["collector_client", "isahc", "rt-tokio"], optional = true, version = "0.20.0" }
 tracing = { version = "0.1" }
 tracing-opentelemetry = { optional = true, version = "0.22.0" }
