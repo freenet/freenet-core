@@ -2265,7 +2265,7 @@ dependencies = [
  "iana-time-zone-haiku",
  "js-sys",
  "wasm-bindgen",
- "windows-core 0.52.0",
+ "windows-core",
 ]
 
 [[package]]
@@ -4846,9 +4846,9 @@ dependencies = [
 
 [[package]]
 name = "serde_with"
-version = "3.6.0"
+version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b0ed1662c5a68664f45b76d18deb0e234aff37207086803165c961eb695e981"
+checksum = "ee80b0e361bbf88fd2f6e242ccd19cfda072cb0faa6ae694ecee08199938569a"
 dependencies = [
  "base64 0.21.7",
  "chrono",
@@ -4856,6 +4856,7 @@ dependencies = [
  "indexmap 1.9.3",
  "indexmap 2.2.2",
  "serde",
+ "serde_derive",
  "serde_json",
  "serde_with_macros",
  "time",
@@ -4863,9 +4864,9 @@ dependencies = [
 
 [[package]]
 name = "serde_with_macros"
-version = "3.6.0"
+version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "568577ff0ef47b879f736cd66740e022f3672788cdf002a05a4e609ea5a6fb15"
+checksum = "6561dc161a9224638a31d876ccdfefbc1df91d3f3a8342eddb35f055d48c7655"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -6471,7 +6472,7 @@ version = "0.51.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca229916c5ee38c2f2bc1e9d8f04df975b4bd93f9955dc69fabb5d91270045c9"
 dependencies = [
- "windows-core 0.51.1",
+ "windows-core",
  "windows-targets 0.48.5",
 ]
 
@@ -6482,15 +6483,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1f8cf84f35d2db49a46868f947758c7a1138116f7fac3bc844f43ade1292e64"
 dependencies = [
  "windows-targets 0.48.5",
-]
-
-[[package]]
-name = "windows-core"
-version = "0.52.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33ab640c8d7e35bf8ba19b884ba838ceb4fba93a4e8c65a9059d08afcfc683d9"
-dependencies = [
- "windows-targets 0.52.0",
 ]
 
 [[package]]
