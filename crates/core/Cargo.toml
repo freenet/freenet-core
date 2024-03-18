@@ -67,7 +67,7 @@ reqwest = { version = "0.11.23", features = ["json"] }
 
 # Tracing deps
 opentelemetry = "0.21.0"
-opentelemetry-jaeger = { features = ["collector_client", "isahc", "rt-tokio"], optional = true, version = "0.20.0" }
+opentelemetry-jaeger = { features = ["collector_client", "isahc", "rt-tokio"], optional = true, version = "0.21.0" }
 tracing = { version = "0.1" }
 tracing-opentelemetry = { optional = true, version = "0.22.0" }
 tracing-subscriber = { optional = true, version = "0.3.16" }
