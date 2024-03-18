@@ -23,7 +23,7 @@ serde_json = "1"
 serde_with = "3"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-wasmer = "4.2.0"
+wasmer = "4.2.6"
 
 freenet-stdlib = { path = "./stdlib/rust/", features = ["unstable"]   }
 # freenet-stdlib = { version = "0.0.8" }
