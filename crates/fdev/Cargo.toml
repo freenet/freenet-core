@@ -35,7 +35,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 xz2 = "0.1"
 libp2p-identity = { features = ["ed25519", "rand"], version = "0.2.7" }
-reqwest = { version = "0.11.23", features = ["json"] }
+reqwest = { version = "0.11.26", features = ["json"] }
 http = "1.0.0"
 
 # internal
