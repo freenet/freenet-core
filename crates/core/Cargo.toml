@@ -84,7 +84,7 @@ itertools = "0.12"
 pav_regression = "0.4.0"
 pico-args = "0.5"
 statrs = "0.16.0"
-tempfile = "3.8"
+tempfile = "3.10"
 tracing = "0.1"
 
 [features]
