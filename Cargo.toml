@@ -13,7 +13,7 @@ clap = "4"
 crossbeam = "0.8.2"
 ctrlc = { version = "3.4" }
 dashmap = "^5.5"
-either = "1.8"
+either = "1.10"
 fastrand = "2"
 futures = "0.3"
 rand = { version = "0.8" }
