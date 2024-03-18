@@ -74,7 +74,7 @@ tracing-subscriber = { optional = true, version = "0.3.16" }
 
 # internal deps
 freenet-stdlib = { features = ["net"], workspace = true }
-time = "0.3.30"
+time = "0.3.34"
 
 [dev-dependencies]
 arbitrary = { features = ["derive"], version = "1" }
