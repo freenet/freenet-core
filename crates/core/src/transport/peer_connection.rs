@@ -160,7 +160,10 @@ impl PeerConnection {
                     match self.received_tracker.report_received_packet(packet_id) {
                         ReportResult::Ok => {
                         }
-                        ReportResult::AlreadyReceived => {}
+                        ReportResult::AlreadyReceived => {
+                            tracing::trace!(%packet_id, "already received packet");
+                            continue;
+                        }
                         ReportResult::QueueFull => {
                             let receipts = self.received_tracker.get_receipts();
                             self.noop(receipts).await?;
