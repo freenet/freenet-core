@@ -147,7 +147,10 @@ impl PeerConnection {
                     } = msg;
                     #[cfg(test)]
                     {
-                        tracing::trace!(remote = %self.remote_conn.remote_addr, %packet_id, %payload,  "received inbound packet");
+                        tracing::trace!(
+                            remote = %self.remote_conn.remote_addr, %packet_id, %payload, ?confirm_receipt,
+                            "received inbound packet"
+                        );
                     }
                     self.remote_conn
                         .sent_tracker
@@ -156,15 +159,15 @@ impl PeerConnection {
                         .report_received_receipts(&confirm_receipt);
                     match self.received_tracker.report_received_packet(packet_id) {
                         ReportResult::Ok => {
-                            if let Some(msg) = self.process_inbound(payload).await? {
-                                return Ok(msg);
-                            }
                         }
                         ReportResult::AlreadyReceived => {}
                         ReportResult::QueueFull => {
                             let receipts = self.received_tracker.get_receipts();
                             self.noop(receipts).await?;
                         },
+                    }
+                    if let Some(msg) = self.process_inbound(payload).await? {
+                        return Ok(msg);
                     }
                 }
                 inbound_stream = self.inbound_stream_futures.next(), if !self.inbound_stream_futures.is_empty() => {

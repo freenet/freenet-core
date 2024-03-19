@@ -721,7 +721,7 @@ mod test {
                 tracing::error!(this = %self.this, "no packet received");
                 return Err(std::io::ErrorKind::ConnectionAborted.into());
             };
-            // tracing::trace!(?remote, this = %self.this, "receiving packet from remote");
+            tracing::trace!(?remote, this = %self.this, "receiving packet from remote");
             buf[..packet.len()].copy_from_slice(&packet[..]);
             Ok((packet.len(), remote))
         }
@@ -735,7 +735,7 @@ mod test {
                 return Ok(0);
             };
             drop(channels);
-            // tracing::trace!(?target, "sending packet to remote");
+            tracing::trace!(?target, "sending packet to remote");
             sender
                 .send((self.this, buf.to_vec()))
                 .await
