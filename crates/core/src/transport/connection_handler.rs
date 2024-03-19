@@ -158,8 +158,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     self.remote_connections.insert(remote_addr, remote_conn);
                                 }
                                 None => {
-                                    if self.is_gateway {
+                                    if !self.is_gateway {
                                         tracing::debug!(%remote_addr, "unexpected packet from remote");
+                                        continue;
                                     }
                                     let packet_data = PacketData::from_buf(&buf[..size]);
                                     if let Err(error) = self.gateway_connection(packet_data, remote_addr).await {
@@ -705,7 +706,7 @@ mod test {
             let channels = CHANNELS
                 .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
                 .clone();
-            let (outbound, inbound) = mpsc::channel(1);
+            let (outbound, inbound) = mpsc::channel(100);
             tracing::info!(?addr, "Binding mock socket");
             channels.lock().await.insert(addr, outbound);
             Ok(MockSocket {
@@ -715,11 +716,12 @@ mod test {
         }
 
         async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            // tracing::trace!(this = %self.this, "waiting for packet");
             let Some((remote, packet)) = self.inbound.try_lock().unwrap().recv().await else {
                 tracing::error!(this = %self.this, "no packet received");
                 return Err(std::io::ErrorKind::ConnectionAborted.into());
             };
-            tracing::trace!(?remote, "receiving packet from remote");
+            // tracing::trace!(?remote, this = %self.this, "receiving packet from remote");
             buf[..packet.len()].copy_from_slice(&packet[..]);
             Ok((packet.len(), remote))
         }
@@ -733,13 +735,30 @@ mod test {
                 return Ok(0);
             };
             drop(channels);
-            tracing::trace!(?target, "sending packet to remote");
+            // tracing::trace!(?target, "sending packet to remote");
             sender
                 .send((self.this, buf.to_vec()))
                 .await
                 .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
-            tracing::trace!(?target, "packet sent to remote");
+            // tracing::trace!(?target, "packet sent to remote");
             Ok(buf.len())
+        }
+    }
+
+    impl Drop for MockSocket {
+        fn drop(&mut self) {
+            let channels = CHANNELS
+                .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+                .clone();
+            loop {
+                if let Ok(mut channels) = channels.try_lock() {
+                    tracing::info!(?self.this, "Dropping mock socket");
+                    channels.remove(&self.this);
+                    break;
+                }
+            }
+            // unorthodox blocking here but shouldn't be a problem for testing
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -859,7 +878,7 @@ mod test {
                 }
                 Ok(messages)
             };
-            let r = tokio::time::timeout(Duration::from_secs(1000), work).await?;
+            let r = tokio::time::timeout(Duration::from_secs(100), work).await?;
             Ok::<_, DynError>(r)
         });
 
@@ -882,7 +901,7 @@ mod test {
                 }
                 Ok(messages)
             };
-            let r = tokio::time::timeout(Duration::from_secs(1000), work).await?;
+            let r = tokio::time::timeout(Duration::from_secs(100), work).await?;
             Ok::<_, DynError>(r)
         });
 

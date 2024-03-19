@@ -18,7 +18,7 @@ mod outbound_stream;
 
 use super::{
     connection_handler::SerializedMessage,
-    packet_data::{PacketData, MAX_DATA_SIZE},
+    packet_data::{self, PacketData},
     received_packet_tracker::ReceivedPacketTracker,
     received_packet_tracker::ReportResult,
     sent_packet_tracker::{ResendAction, SentPacketTracker},
@@ -28,6 +28,11 @@ use super::{
 use crate::util::time_source::InstantTimeSrc;
 
 type Result<T = (), E = TransportError> = std::result::Result<T, E>;
+
+// TODO: measure the space overhead of SymmetricMessage::ShortMessage since is likely less than 100
+/// The max payload we can send in a single fragment, this MUST be less than packet_data::MAX_DATA_SIZE
+/// since we need to account for the space overhead of SymmetricMessage::LongMessage metadata
+const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 100;
 
 #[must_use]
 pub(super) struct RemoteConnection {
@@ -140,7 +145,10 @@ impl PeerConnection {
                         confirm_receipt,
                         payload,
                     } = msg;
-                    // tracing::trace!(remote = %self.remote_conn.remote_addr, %packet_id, "received inbound packet");
+                    #[cfg(test)]
+                    {
+                        tracing::trace!(remote = %self.remote_conn.remote_addr, %packet_id, %payload,  "received inbound packet");
+                    }
                     self.remote_conn
                         .sent_tracker
                         .lock()
@@ -233,7 +241,7 @@ impl PeerConnection {
                         .await
                         .map_err(|_| TransportError::ConnectionClosed)?;
                 } else {
-                    let (sender, receiver) = mpsc::channel(1);
+                    let (sender, receiver) = mpsc::channel(100);
                     tracing::trace!(%stream_id, %fragment_number, "new stream");
                     self.inbound_streams.insert(stream_id, sender);
                     let mut stream = inbound_stream::InboundStream::new(total_length_bytes);
@@ -312,6 +320,9 @@ async fn packet_sending(
     payload: impl Into<SymmetricMessagePayload>,
     sent_tracker: &Mutex<SentPacketTracker<InstantTimeSrc>>,
 ) -> Result<()> {
+    // FIXME: here ensure that `confirm_receipt` won't make the packet exceed the max data size
+    // if it does, split it to send multiple noop packets with the receipts
+
     // tracing::trace!(packet_id, "sending packet");
     let packet = SymmetricMessage::serialize_msg_to_packet_data(
         packet_id,

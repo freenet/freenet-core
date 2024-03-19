@@ -173,6 +173,37 @@ pub(super) enum SymmetricMessagePayload {
 }
 
 #[cfg(test)]
+impl std::fmt::Display for SymmetricMessagePayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SymmetricMessagePayload::AckConnection { result } => {
+                write!(
+                    f,
+                    "AckConnection: {}",
+                    result.as_ref().map(|_| "Ok").unwrap_or("Err")
+                )
+            }
+            SymmetricMessagePayload::GatewayConnection { remote_addr, .. } => {
+                write!(f, "GatewayConnection {:?}", remote_addr)
+            }
+            SymmetricMessagePayload::ShortMessage { .. } => {
+                write!(f, "ShortMessage")
+            }
+            SymmetricMessagePayload::StreamFragment {
+                stream_id,
+                fragment_number,
+                ..
+            } => write!(
+                f,
+                "StreamFragment: (stream id: {:?}, fragment no: {:?}) ",
+                stream_id, fragment_number
+            ),
+            SymmetricMessagePayload::NoOp => write!(f, "NoOp"),
+        }
+    }
+}
+
+#[cfg(test)]
 mod test {
     use std::net::Ipv4Addr;
 
