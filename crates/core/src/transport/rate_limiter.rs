@@ -44,7 +44,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
                 }
                 self.add_packet(packet.len());
             } else {
-                // tracing::trace!(%socket_addr, "sending packet immediately");
+                tracing::trace!(%socket_addr, "sending packet immediately");
                 if let Err(error) = socket.send_to(&packet, socket_addr).await {
                     tracing::debug!("Error sending packet: {:?}", error);
                 }

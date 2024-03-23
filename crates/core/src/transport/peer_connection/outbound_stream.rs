@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::vec;
 
 use aes_gcm::Aes128Gcm;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
 use crate::{
     transport::{
@@ -36,7 +36,7 @@ pub(super) async fn send_stream(
     destination_addr: SocketAddr,
     mut stream_to_send: SerializedStream,
     outbound_symmetric_key: Aes128Gcm,
-    sent_packet_tracker: Arc<Mutex<SentPacketTracker<InstantTimeSrc>>>,
+    sent_packet_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
 ) -> Result<(), TransportError> {
     tracing::debug!(stream_id = %stream_id.0, length = stream_to_send.len(), "sending stream");
     let total_length_bytes = stream_to_send.len() as u32;
@@ -112,7 +112,7 @@ mod tests {
             let key = rand::random::<[u8; 16]>();
             Aes128Gcm::new(&key.into())
         };
-        let sent_tracker = Arc::new(Mutex::new(SentPacketTracker::new()));
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
 
         let background_task = tokio::spawn(send_stream(
             StreamId::next(),

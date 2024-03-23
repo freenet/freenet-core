@@ -9,7 +9,7 @@ use crate::transport::packet_data::{AssymetricRSA, Unknown};
 use aes_gcm::{Aes128Gcm, KeyInit};
 use futures::FutureExt;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task;
 
 use super::{
@@ -154,7 +154,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 Some(remote_conn) => {
                                     tracing::trace!(%remote_addr, "received packet from remote");
                                     let packet_data = PacketData::from_buf(&buf[..size]);
+                                    tracing::trace!(%remote_addr, "sending packet to remote");
                                     let _ = remote_conn.inbound_packet_sender.send(packet_data).await;
+                                    tracing::trace!(%remote_addr, "packet sent to remote");
                                     self.remote_connections.insert(remote_addr, remote_conn);
                                 }
                                 None => {
@@ -292,7 +294,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             break;
         }
 
-        let sent_tracker = Arc::new(Mutex::new(SentPacketTracker::new()));
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
         let peer_connection = PeerConnection::new(RemoteConnection {
             outbound_packets: self.outbound_packets.clone(),
             outbound_symmetric_key: outbound_key,
@@ -309,7 +311,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             .await
             .map_err(|_| TransportError::ChannelClosed)?;
 
-        sent_tracker.lock().await.report_sent_packet(
+        sent_tracker.lock().report_sent_packet(
             SymmetricMessage::FIRST_PACKET_ID,
             outbound_ack_packet.prepared_send(),
         );
@@ -374,8 +376,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                         .send((remote_addr, acknowledgment.data().into()))
                         .await
                         .map_err(|_| TransportError::ChannelClosed)?;
-                    let sent_tracker = Arc::new(Mutex::new(SentPacketTracker::new()));
-                    sent_tracker.lock().await.report_sent_packet(
+                    let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+                    sent_tracker.lock().report_sent_packet(
                         SymmetricMessage::FIRST_PACKET_ID,
                         acknowledgment.data().into(),
                     );
@@ -478,9 +480,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                     outbound_packets: self.outbound_packets.clone(),
                                                     outbound_symmetric_key: outbound_sym_key,
                                                     remote_addr,
-                                                    sent_tracker: Arc::new(Mutex::new(
-                                                        SentPacketTracker::new(),
-                                                    )),
+                                                    sent_tracker: Arc::new(
+                                                        parking_lot::Mutex::new(
+                                                            SentPacketTracker::new(),
+                                                        ),
+                                                    ),
                                                     last_packet_id: Arc::new(AtomicU32::new(0)),
                                                     inbound_packet_recv: inbound_recv,
                                                     inbound_symmetric_key: inbound_sym_key,
@@ -589,7 +593,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     outbound_symmetric_key: outbound_sym_key
                                         .expect("should be set at this stage"),
                                     remote_addr,
-                                    sent_tracker: Arc::new(Mutex::new(SentPacketTracker::new())),
+                                    sent_tracker: Arc::new(parking_lot::Mutex::new(
+                                        SentPacketTracker::new(),
+                                    )),
                                     last_packet_id: Arc::new(AtomicU32::new(0)),
                                     inbound_packet_recv: inbound_recv,
                                     inbound_symmetric_key: inbound_sym_key,
@@ -693,11 +699,11 @@ mod test {
 
     #[allow(clippy::type_complexity)]
     static CHANNELS: OnceLock<
-        Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<(SocketAddr, Vec<u8>)>>>>,
+        Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>>>,
     > = OnceLock::new();
 
     struct MockSocket {
-        inbound: Mutex<mpsc::Receiver<(SocketAddr, Vec<u8>)>>,
+        inbound: Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>,
         this: SocketAddr,
     }
 
@@ -706,7 +712,7 @@ mod test {
             let channels = CHANNELS
                 .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
                 .clone();
-            let (outbound, inbound) = mpsc::channel(100);
+            let (outbound, inbound) = mpsc::unbounded_channel();
             tracing::info!(?addr, "Binding mock socket");
             channels.lock().await.insert(addr, outbound);
             Ok(MockSocket {
@@ -716,9 +722,9 @@ mod test {
         }
 
         async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-            // tracing::trace!(this = %self.this, "waiting for packet");
+            tracing::trace!(this = %self.this, "waiting for packet");
             let Some((remote, packet)) = self.inbound.try_lock().unwrap().recv().await else {
-                tracing::error!(this = %self.this, "no packet received");
+                tracing::error!(this = %self.this, "connection closed");
                 return Err(std::io::ErrorKind::ConnectionAborted.into());
             };
             tracing::trace!(?remote, this = %self.this, "receiving packet from remote");
@@ -738,9 +744,8 @@ mod test {
             tracing::trace!(?target, "sending packet to remote");
             sender
                 .send((self.this, buf.to_vec()))
-                .await
                 .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
-            // tracing::trace!(?target, "packet sent to remote");
+            tracing::trace!(?target, "packet sent to remote");
             Ok(buf.len())
         }
     }
@@ -873,9 +878,14 @@ mod test {
                             messages.push(output_as_str);
                             info!("{peer_b_addr:?} received {} messages", messages.len());
                         }
-                        Err(e) => return Err(e),
+                        Err(error) => {
+                            tracing::error!(%error, "error receiving message");
+                            return Err(error);
+                        }
                     }
                 }
+                info!("{peer_b_addr:?} sent all messages");
+                let _ = tokio::time::timeout(Duration::from_secs(2), conn.recv()).await;
                 Ok(messages)
             };
             let r = tokio::time::timeout(Duration::from_secs(100), work).await?;
@@ -894,11 +904,16 @@ mod test {
                         Ok(msg) => {
                             let output_as_str: String = bincode::deserialize(&msg)?;
                             messages.push(output_as_str);
-                            info!("{peer_a_addr:?}  received {} messages", messages.len());
+                            info!("{peer_a_addr:?} received {} messages", messages.len());
                         }
-                        Err(e) => return Err(e),
+                        Err(error) => {
+                            tracing::error!(%error, "error receiving message");
+                            return Err(error);
+                        }
                     }
                 }
+                info!("{peer_a_addr:?} sent all messages");
+                let _ = tokio::time::timeout(Duration::from_secs(2), conn.recv()).await;
                 Ok(messages)
             };
             let r = tokio::time::timeout(Duration::from_secs(100), work).await?;
