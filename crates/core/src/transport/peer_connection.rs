@@ -12,6 +12,7 @@ use futures::stream::FuturesUnordered;
 use futures::{Future, FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 mod inbound_stream;
 mod outbound_stream;
@@ -93,7 +94,7 @@ pub(crate) struct PeerConnection {
     received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
     inbound_streams: HashMap<StreamId, mpsc::UnboundedSender<(u32, Vec<u8>)>>,
     inbound_stream_futures: FuturesUnordered<InboundStreamFut>,
-    outbound_stream_futures: FuturesUnordered<Pin<Box<dyn Future<Output = Result> + Send>>>,
+    outbound_stream_futures: FuturesUnordered<JoinHandle<Result>>,
 }
 
 impl PeerConnection {
@@ -199,7 +200,7 @@ impl PeerConnection {
                         tracing::error!("unexpected no-stream from ongoing_outbound_streams");
                         continue
                     };
-                    res?
+                    res.map_err(|e| TransportError::Other(e.into()))??
                 }
                 _ = resend_check.take().unwrap_or(tokio::time::sleep(Duration::from_secs(1))) => {
                     loop {
@@ -319,7 +320,7 @@ impl PeerConnection {
 
     async fn outbound_stream(&mut self, data: SerializedMessage) {
         let stream_id = StreamId::next();
-        let task = outbound_stream::send_stream(
+        let task = tokio::spawn(outbound_stream::send_stream(
             stream_id,
             self.remote_conn.last_packet_id.clone(),
             self.remote_conn.outbound_packets.clone(),
@@ -327,8 +328,8 @@ impl PeerConnection {
             data,
             self.remote_conn.outbound_symmetric_key.clone(),
             self.remote_conn.sent_tracker.clone(),
-        );
-        self.outbound_stream_futures.push(task.boxed());
+        ));
+        self.outbound_stream_futures.push(task);
     }
 }
 
