@@ -858,10 +858,10 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    // #[tokio::test]
+    // #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test]
     async fn simulate_send_streamed_message() -> Result<(), DynError> {
-        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG));
         let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection().await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection().await?;
 
@@ -885,10 +885,10 @@ mod test {
                     }
                 }
                 info!("{peer_b_addr:?} sent all messages");
-                let _ = tokio::time::timeout(Duration::from_secs(2), conn.recv()).await;
+                let _ = tokio::time::timeout(Duration::from_secs(1), conn.recv()).await;
                 Ok(messages)
             };
-            let r = tokio::time::timeout(Duration::from_secs(100), work).await?;
+            let r = tokio::time::timeout(Duration::from_secs(2), work).await?;
             Ok::<_, DynError>(r)
         });
 
@@ -913,10 +913,10 @@ mod test {
                     }
                 }
                 info!("{peer_a_addr:?} sent all messages");
-                let _ = tokio::time::timeout(Duration::from_secs(2), conn.recv()).await;
+                let _ = tokio::time::timeout(Duration::from_secs(1), conn.recv()).await;
                 Ok(messages)
             };
-            let r = tokio::time::timeout(Duration::from_secs(100), work).await?;
+            let r = tokio::time::timeout(Duration::from_secs(2), work).await?;
             Ok::<_, DynError>(r)
         });
 

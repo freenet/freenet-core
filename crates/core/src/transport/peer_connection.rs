@@ -9,7 +9,7 @@ use std::vec::Vec;
 use crate::transport::packet_data::Unknown;
 use aes_gcm::Aes128Gcm;
 use futures::stream::FuturesUnordered;
-use futures::{Future, FutureExt, StreamExt};
+use futures::{Future, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -65,8 +65,8 @@ impl std::fmt::Display for StreamId {
     }
 }
 
-type InboundStreamFut =
-    Pin<Box<dyn Future<Output = Result<(StreamId, SerializedMessage), StreamId>> + Send>>;
+type InboundStreamResult = Result<(StreamId, SerializedMessage), StreamId>;
+type InboundStreamFut = Pin<Box<dyn Future<Output = InboundStreamResult> + Send>>;
 
 /// The `PeerConnection` struct is responsible for managing the connection with a remote peer.
 /// It provides methods for sending and receiving messages to and from the remote peer.
@@ -92,8 +92,8 @@ type InboundStreamFut =
 pub(crate) struct PeerConnection {
     remote_conn: RemoteConnection,
     received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
-    inbound_streams: HashMap<StreamId, mpsc::UnboundedSender<(u32, Vec<u8>)>>,
-    inbound_stream_futures: FuturesUnordered<InboundStreamFut>,
+    inbound_streams: HashMap<StreamId, mpsc::Sender<(u32, Vec<u8>)>>,
+    inbound_stream_futures: FuturesUnordered<JoinHandle<InboundStreamResult>>,
     outbound_stream_futures: FuturesUnordered<JoinHandle<Result>>,
 }
 
@@ -186,13 +186,12 @@ impl PeerConnection {
                         tracing::error!("unexpected no-stream from ongoing_inbound_streams");
                         continue
                     };
-                    let Ok((stream_id, msg)) = res else {
+                    let Ok((stream_id, msg)) = res.map_err(|e| TransportError::Other(e.into()))? else {
                         tracing::error!("unexpected error from ongoing_inbound_streams");
                         // TODO: may leave orphan stream recvs hanging around in this case
                         continue;
                     };
                     self.inbound_streams.remove(&stream_id);
-                    // tracing::trace!(%stream_id, "stream finished");
                     return Ok(msg);
                 }
                 outbound_stream = self.outbound_stream_futures.next(), if !self.outbound_stream_futures.is_empty() => {
@@ -260,10 +259,11 @@ impl PeerConnection {
                     tracing::trace!(%stream_id, %fragment_number, "pushing fragment to existing stream");
                     sender
                         .send((fragment_number, payload))
+                        .await
                         .map_err(|_| TransportError::ConnectionClosed)?;
                     tracing::trace!(%stream_id, %fragment_number, "fragment pushed");
                 } else {
-                    let (sender, receiver) = mpsc::unbounded_channel();
+                    let (sender, receiver) = mpsc::channel(1);
                     tracing::trace!(%stream_id, %fragment_number, "new stream");
                     self.inbound_streams.insert(stream_id, sender);
                     let mut stream = inbound_stream::InboundStream::new(total_length_bytes);
@@ -274,7 +274,9 @@ impl PeerConnection {
                     }
                     tracing::trace!(%stream_id, "listening for more fragments");
                     self.inbound_stream_futures
-                        .push(inbound_stream::recv_stream(stream_id, receiver, stream).boxed());
+                        .push(tokio::spawn(inbound_stream::recv_stream(
+                            stream_id, receiver, stream,
+                        )));
                 }
                 Ok(None)
             }
@@ -404,7 +406,7 @@ mod tests {
 
         let inbound = async {
             // need to take care of decrypting and deserializing the inbound data before collecting into the message
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = mpsc::channel(1);
             let stream = InboundStream::new(MSG_LEN as u64);
             let inbound_msg = tokio::task::spawn(recv_stream(stream_id, rx, stream));
             while let Some((_, network_packet)) = receiver.recv().await {
@@ -424,7 +426,7 @@ mod tests {
                     return Err("unexpected message".into());
                 };
                 println!("fragment_number: {}", fragment_number);
-                tx.send((fragment_number, payload))?;
+                tx.send((fragment_number, payload)).await?;
             }
             let (_, msg) = inbound_msg
                 .await?

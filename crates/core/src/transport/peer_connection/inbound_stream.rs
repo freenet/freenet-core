@@ -9,7 +9,7 @@ type FragmentIdx = u32;
 
 pub(super) async fn recv_stream(
     stream_id: StreamId,
-    mut receiver: mpsc::UnboundedReceiver<(FragmentIdx, Vec<u8>)>,
+    mut receiver: mpsc::Receiver<(FragmentIdx, Vec<u8>)>,
     mut stream: InboundStream,
 ) -> Result<(StreamId, Vec<u8>), StreamId> {
     while let Some((fragment_number, payload)) = receiver.recv().await {
