@@ -691,6 +691,8 @@ mod test {
         sync::{atomic::AtomicU16, OnceLock},
     };
 
+    use futures::{stream::FuturesUnordered, TryStreamExt};
+    use serde::{de::DeserializeOwned, Serialize};
     use tokio::sync::Mutex;
     use tracing::info;
 
@@ -699,11 +701,11 @@ mod test {
 
     #[allow(clippy::type_complexity)]
     static CHANNELS: OnceLock<
-        Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>>>,
+        Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<(SocketAddr, Vec<u8>)>>>>,
     > = OnceLock::new();
 
     struct MockSocket {
-        inbound: Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>,
+        inbound: Mutex<mpsc::Receiver<(SocketAddr, Vec<u8>)>>,
         this: SocketAddr,
     }
 
@@ -712,7 +714,7 @@ mod test {
             let channels = CHANNELS
                 .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
                 .clone();
-            let (outbound, inbound) = mpsc::unbounded_channel();
+            let (outbound, inbound) = mpsc::channel(1);
             tracing::info!(?addr, "Binding mock socket");
             channels.lock().await.insert(addr, outbound);
             Ok(MockSocket {
@@ -744,6 +746,7 @@ mod test {
             tracing::trace!(?target, "sending packet to remote");
             sender
                 .send((self.this, buf.to_vec()))
+                .await
                 .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
             tracing::trace!(?target, "packet sent to remote");
             Ok(buf.len())
@@ -761,9 +764,9 @@ mod test {
                     channels.remove(&self.this);
                     break;
                 }
+                // unorthodox blocking here but shouldn't be a problem for testing
+                std::thread::sleep(Duration::from_millis(1));
             }
-            // unorthodox blocking here but shouldn't be a problem for testing
-            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -777,6 +780,76 @@ mod test {
             .await
             .expect("failed to create peer");
         Ok((peer_pub, peer_conn, (Ipv4Addr::UNSPECIFIED, port).into()))
+    }
+
+    trait TestDataGen: Clone + Send + Sync + 'static {
+        type Message: DeserializeOwned + Serialize + Send + 'static;
+        fn expected_iterations(&self) -> usize;
+        fn gen_msg(&mut self) -> Self::Message;
+        fn assert_message_ok(&self, idx: usize, msg: Self::Message) -> bool;
+    }
+
+    async fn run_test<G: TestDataGen>(peers: usize, generators: Vec<G>) -> Result<(), DynError> {
+        assert_eq!(generators.len(), peers);
+        let mut peer_keys_and_addr = vec![];
+        let mut peer_conns = vec![];
+        for _ in 0..peers {
+            let (peer_pub, peer, peer_addr) = set_peer_connection().await?;
+            peer_keys_and_addr.push((peer_pub, peer_addr));
+            peer_conns.push(peer);
+        }
+
+        let mut tasks = vec![];
+        for (i, (peer, test_generator)) in peer_conns.into_iter().zip(generators).enumerate() {
+            let mut peer_keys_and_addr = peer_keys_and_addr.clone();
+            peer_keys_and_addr.swap_remove(i);
+            let peer = tokio::spawn(async move {
+                let mut peer = peer;
+                let conns = FuturesUnordered::new();
+                for (peer_pub, peer_addr) in peer_keys_and_addr {
+                    let mut peer_conn = peer.connect(peer_pub, peer_addr, false).await?;
+                    let mut test_gen_cp = test_generator.clone();
+                    conns.push(async move {
+                        let mut messages = vec![];
+                        while messages.len() < test_gen_cp.expected_iterations() {
+                            peer_conn.send(test_gen_cp.gen_msg()).await?;
+                            match peer_conn.recv().await {
+                                Ok(msg) => {
+                                    let output_as_str: G::Message = bincode::deserialize(&msg)?;
+                                    messages.push(output_as_str);
+                                    info!("{peer_addr:?} received {} messages", messages.len());
+                                }
+                                Err(error) => {
+                                    tracing::error!(%error, "error receiving message");
+                                    return Err(error);
+                                }
+                            }
+                        }
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(1), peer_conn.recv()).await;
+                        Ok(messages)
+                    });
+                }
+                let results = conns.try_collect::<Vec<_>>().await?;
+                Ok::<_, DynError>((results, test_generator))
+            });
+            tasks.push(peer);
+        }
+
+        let all_results = futures::future::try_join_all(tasks)
+            .await?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        for (peer_results, test_gen) in all_results {
+            for result in peer_results {
+                assert_eq!(result.len(), test_gen.expected_iterations());
+                for (idx, msg) in result.into_iter().enumerate() {
+                    assert!(test_gen.assert_message_ok(idx, msg));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -805,124 +878,60 @@ mod test {
 
     #[tokio::test]
     async fn simulate_send_short_message() -> Result<(), DynError> {
-        // crate::config::set_logger();
-        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection().await?;
-        let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection().await?;
+        #[derive(Clone)]
+        struct TestData(&'static str);
 
-        let peer_b = tokio::spawn(async move {
-            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false);
-            let work = async move {
-                info!("Waiting for connection from peer A");
-                let mut conn = peer_a_conn.await?;
+        impl TestDataGen for TestData {
+            type Message = String;
+            fn expected_iterations(&self) -> usize {
+                10
+            }
 
-                let output = conn.recv().await?;
-                let output_as_str: String = bincode::deserialize(output.as_slice())?;
-                info!("Received message {:?} from peer A", output_as_str);
-                assert_eq!(output_as_str, "bar");
+            fn gen_msg(&mut self) -> Self::Message {
+                self.0.to_string()
+            }
 
-                info!("Sending message to peer A");
-                conn.send("foo").await?;
+            fn assert_message_ok(&self, _: usize, msg: Self::Message) -> bool {
+                if self.0 == "foo" {
+                    msg == "bar"
+                } else {
+                    msg == "foo"
+                }
+            }
+        }
 
-                info!("Waiting for message from peer A");
-
-                Ok::<_, DynError>(())
-            };
-            tokio::time::timeout(Duration::from_secs(5), work).await??;
-            Ok::<_, DynError>(())
-        });
-
-        let peer_a = tokio::spawn(async move {
-            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false);
-            let work = async move {
-                info!("Waiting for connection from peer B");
-                let mut conn = peer_b_conn.await?;
-
-                info!("Sending message to peer B");
-                conn.send("bar").await?;
-
-                info!("Waiting for message from peer B");
-                let output = conn.recv().await?;
-                let output_as_str: String = bincode::deserialize(output.as_slice())?;
-                info!("Received message {:?} from peer B", output_as_str);
-                assert_eq!(output_as_str, "foo");
-
-                Ok::<_, DynError>(())
-            };
-            tokio::time::timeout(Duration::from_secs(5), work).await??;
-            Ok::<_, DynError>(())
-        });
-
-        let (a, b) = tokio::try_join!(peer_a, peer_b)?;
-        a?;
-        b?;
-        Ok(())
+        run_test(2, vec![TestData("foo"), TestData("bar")]).await
     }
 
-    // #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[tokio::test]
     async fn simulate_send_streamed_message() -> Result<(), DynError> {
-        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG));
-        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection().await?;
-        let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection().await?;
+        #[derive(Clone)]
+        struct TestData(&'static str);
 
-        let peer_b = tokio::spawn(async move {
-            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false);
-            let work = async move {
-                let mut conn = peer_a_conn.await?;
-                let mut messages = vec![];
-                while messages.len() < 10 {
-                    conn.send("foo".repeat(3000)).await?;
-                    match conn.recv().await {
-                        Ok(msg) => {
-                            let output_as_str: String = bincode::deserialize(&msg)?;
-                            messages.push(output_as_str);
-                            info!("{peer_b_addr:?} received {} messages", messages.len());
-                        }
-                        Err(error) => {
-                            tracing::error!(%error, "error receiving message");
-                            return Err(error);
-                        }
-                    }
+        impl TestDataGen for TestData {
+            type Message = String;
+            fn expected_iterations(&self) -> usize {
+                10
+            }
+
+            fn gen_msg(&mut self) -> Self::Message {
+                self.0.repeat(3000)
+            }
+
+            fn assert_message_ok(&self, _: usize, msg: Self::Message) -> bool {
+                if self.0 == "foo" {
+                    msg.contains("bar") && msg.len() == "bar".len() * 3000
+                } else {
+                    msg.contains("foo") && msg.len() == "foo".len() * 3000
                 }
-                info!("{peer_b_addr:?} sent all messages");
-                let _ = tokio::time::timeout(Duration::from_secs(1), conn.recv()).await;
-                Ok(messages)
-            };
-            let r = tokio::time::timeout(Duration::from_secs(2), work).await?;
-            Ok::<_, DynError>(r)
-        });
+            }
+        }
 
-        let peer_a = tokio::spawn(async move {
-            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false);
-            let work = async move {
-                let mut conn = peer_b_conn.await?;
-                let mut messages = vec![];
+        run_test(2, vec![TestData("foo"), TestData("bar")]).await
+    }
 
-                while messages.len() < 10 {
-                    conn.send("bar".repeat(3000)).await?;
-                    match conn.recv().await {
-                        Ok(msg) => {
-                            let output_as_str: String = bincode::deserialize(&msg)?;
-                            messages.push(output_as_str);
-                            info!("{peer_a_addr:?} received {} messages", messages.len());
-                        }
-                        Err(error) => {
-                            tracing::error!(%error, "error receiving message");
-                            return Err(error);
-                        }
-                    }
-                }
-                info!("{peer_a_addr:?} sent all messages");
-                let _ = tokio::time::timeout(Duration::from_secs(1), conn.recv()).await;
-                Ok(messages)
-            };
-            let r = tokio::time::timeout(Duration::from_secs(2), work).await?;
-            Ok::<_, DynError>(r)
-        });
-
-        let (a, b) = tokio::try_join!(peer_a, peer_b)?;
-        assert_eq!(a??, vec![String::from("foo").repeat(3000); 10]);
-        assert_eq!(b??, vec![String::from("bar").repeat(3000); 10]);
+    #[tokio::test]
+    async fn packet_dropping() -> Result<(), DynError> {
         Ok(())
     }
 }
