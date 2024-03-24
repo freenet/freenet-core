@@ -36,7 +36,6 @@ dashmap = { workspace = true }
 delegate = "0.12"
 directories = "5"
 either = { features = ["serde"], workspace = true }
-fastrand = { workspace = true }
 flatbuffers = "23.5.26"
 futures = "0.3.21"
 headers = "0.4"

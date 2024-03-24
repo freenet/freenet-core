@@ -691,7 +691,8 @@ mod test {
         sync::{atomic::AtomicU16, OnceLock},
     };
 
-    use futures::{stream::FuturesUnordered, TryStreamExt};
+    use futures::{stream::FuturesOrdered, TryStreamExt};
+    use rand::SeedableRng;
     use serde::{de::DeserializeOwned, Serialize};
     use tokio::sync::Mutex;
     use tracing::info;
@@ -707,6 +708,7 @@ mod test {
     struct MockSocket {
         inbound: Mutex<mpsc::Receiver<(SocketAddr, Vec<u8>)>>,
         this: SocketAddr,
+        rng: rand::rngs::SmallRng,
     }
 
     impl Socket for MockSocket {
@@ -715,11 +717,11 @@ mod test {
                 .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
                 .clone();
             let (outbound, inbound) = mpsc::channel(1);
-            tracing::info!(?addr, "Binding mock socket");
             channels.lock().await.insert(addr, outbound);
             Ok(MockSocket {
                 inbound: Mutex::new(inbound),
                 this: addr,
+                rng: rand::rngs::SmallRng::seed_from_u64(0xfeedbeef),
             })
         }
 
@@ -735,6 +737,7 @@ mod test {
         }
 
         async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            assert!(self.this != target, "cannot send to self");
             let channels = CHANNELS
                 .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
                 .clone();
@@ -743,12 +746,12 @@ mod test {
                 return Ok(0);
             };
             drop(channels);
-            tracing::trace!(?target, "sending packet to remote");
+            tracing::trace!(?target, ?self.this, "sending packet to remote");
             sender
                 .send((self.this, buf.to_vec()))
                 .await
                 .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
-            tracing::trace!(?target, "packet sent to remote");
+            tracing::trace!(?target, ?self.this, "packet sent to remote");
             Ok(buf.len())
         }
     }
@@ -760,7 +763,6 @@ mod test {
                 .clone();
             loop {
                 if let Ok(mut channels) = channels.try_lock() {
-                    tracing::info!(?self.this, "Dropping mock socket");
                     channels.remove(&self.this);
                     break;
                 }
@@ -772,7 +774,7 @@ mod test {
 
     async fn set_peer_connection(
     ) -> Result<(TransportPublicKey, ConnectionHandler, SocketAddr), DynError> {
-        static PORT: AtomicU16 = AtomicU16::new(8080);
+        static PORT: AtomicU16 = AtomicU16::new(25000);
         let peer_keypair = TransportKeypair::new();
         let peer_pub = peer_keypair.public.clone();
         let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -782,14 +784,14 @@ mod test {
         Ok((peer_pub, peer_conn, (Ipv4Addr::UNSPECIFIED, port).into()))
     }
 
-    trait TestDataGen: Clone + Send + Sync + 'static {
+    trait TestFixture: Clone + Send + Sync + 'static {
         type Message: DeserializeOwned + Serialize + Send + 'static;
         fn expected_iterations(&self) -> usize;
         fn gen_msg(&mut self) -> Self::Message;
-        fn assert_message_ok(&self, idx: usize, msg: Self::Message) -> bool;
+        fn assert_message_ok(&self, peer_idx: usize, msg: Self::Message) -> bool;
     }
 
-    async fn run_test<G: TestDataGen>(peers: usize, generators: Vec<G>) -> Result<(), DynError> {
+    async fn run_test<G: TestFixture>(peers: usize, generators: Vec<G>) -> Result<(), DynError> {
         assert_eq!(generators.len(), peers);
         let mut peer_keys_and_addr = vec![];
         let mut peer_conns = vec![];
@@ -802,14 +804,18 @@ mod test {
         let mut tasks = vec![];
         for (i, (peer, test_generator)) in peer_conns.into_iter().zip(generators).enumerate() {
             let mut peer_keys_and_addr = peer_keys_and_addr.clone();
-            peer_keys_and_addr.swap_remove(i);
+            peer_keys_and_addr.remove(i);
             let peer = tokio::spawn(async move {
                 let mut peer = peer;
-                let conns = FuturesUnordered::new();
+                let mut conns = FuturesOrdered::new();
                 for (peer_pub, peer_addr) in peer_keys_and_addr {
-                    let mut peer_conn = peer.connect(peer_pub, peer_addr, false).await?;
                     let mut test_gen_cp = test_generator.clone();
-                    conns.push(async move {
+                    let mut peer_conn = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        peer.connect(peer_pub, peer_addr, false),
+                    )
+                    .await??;
+                    conns.push_back(async move {
                         let mut messages = vec![];
                         while messages.len() < test_gen_cp.expected_iterations() {
                             peer_conn.send(test_gen_cp.gen_msg()).await?;
@@ -830,7 +836,9 @@ mod test {
                         Ok(messages)
                     });
                 }
-                let results = conns.try_collect::<Vec<_>>().await?;
+                let results =
+                    tokio::time::timeout(Duration::from_secs(5), conns.try_collect::<Vec<_>>())
+                        .await??;
                 Ok::<_, DynError>((results, test_generator))
             });
             tasks.push(peer);
@@ -841,9 +849,9 @@ mod test {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
         for (peer_results, test_gen) in all_results {
-            for result in peer_results {
+            for (idx, result) in peer_results.into_iter().enumerate() {
                 assert_eq!(result.len(), test_gen.expected_iterations());
-                for (idx, msg) in result.into_iter().enumerate() {
+                for msg in result {
                     assert!(test_gen.assert_message_ok(idx, msg));
                 }
             }
@@ -878,10 +886,11 @@ mod test {
 
     #[tokio::test]
     async fn simulate_send_short_message() -> Result<(), DynError> {
-        #[derive(Clone)]
-        struct TestData(&'static str);
+        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        #[derive(Clone, Copy)]
+        struct TestData(&'static str, usize);
 
-        impl TestDataGen for TestData {
+        impl TestFixture for TestData {
             type Message = String;
             fn expected_iterations(&self) -> usize {
                 10
@@ -891,24 +900,31 @@ mod test {
                 self.0.to_string()
             }
 
-            fn assert_message_ok(&self, _: usize, msg: Self::Message) -> bool {
-                if self.0 == "foo" {
-                    msg == "bar"
-                } else {
-                    msg == "foo"
-                }
+            fn assert_message_ok(&self, peer_idx: usize, msg: Self::Message) -> bool {
+                let shift_check = if self.1 < 5 { 4 } else { 5 };
+                peer_idx < shift_check && msg == "foo" || peer_idx >= shift_check && msg == "bar"
             }
         }
 
-        run_test(2, vec![TestData("foo"), TestData("bar")]).await
+        run_test(
+            3,
+            vec![TestData("foo", 0), TestData("foo", 1), TestData("foo", 2)],
+            // 10,
+            // Vec::from_iter(
+            //     (0..5)
+            //         .map(|i| TestData("foo", i))
+            //         .chain((0..5).map(|i| TestData("bar", i))),
+            // ),
+        )
+        .await
     }
 
     #[tokio::test]
     async fn simulate_send_streamed_message() -> Result<(), DynError> {
-        #[derive(Clone)]
+        #[derive(Clone, Copy)]
         struct TestData(&'static str);
 
-        impl TestDataGen for TestData {
+        impl TestFixture for TestData {
             type Message = String;
             fn expected_iterations(&self) -> usize {
                 10

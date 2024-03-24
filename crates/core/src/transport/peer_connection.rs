@@ -212,7 +212,7 @@ impl PeerConnection {
                             ResendAction::WaitUntil(wait_until) => {
                                 tracing::trace!(
                                     remote = ?self.remote_conn.remote_addr,
-                                    wait_time = (std::time::Instant::now() - wait_until).as_secs(),
+                                    wait_time_ns = (std::time::Instant::now() - wait_until).as_nanos(),
                                     "waiting for resend"
                                 );
                                 resend_check = Some(tokio::time::sleep_until(wait_until.into()));

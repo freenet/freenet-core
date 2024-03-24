@@ -554,24 +554,6 @@ pub(crate) mod test {
         }
     }
 
-    impl RandomEventGenerator for fastrand::Rng {
-        fn gen_u8(&mut self) -> u8 {
-            self.u8(..u8::MAX)
-        }
-
-        fn gen_range(&mut self, range: std::ops::Range<usize>) -> usize {
-            self.choice(range).expect("non empty")
-        }
-
-        fn choose<'a, T>(&mut self, vec: &'a [T]) -> Option<&'a T> {
-            self.choice(0..vec.len()).and_then(|choice| vec.get(choice))
-        }
-
-        fn seed_from_u64(seed: u64) -> Self {
-            Self::with_seed(seed)
-        }
-    }
-
     #[test]
     fn test_gen_event() {
         const NUM_PEERS: usize = 20;

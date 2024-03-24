@@ -404,7 +404,7 @@ async fn child(
     };
     std::env::set_var("FREENET_PEER_ID", node_config.peer_id.to_string());
     freenet::config::set_logger(None);
-    let mut event_generator = MemoryEventsGen::<fastrand::Rng>::new_with_seed(
+    let mut event_generator: MemoryEventsGen = MemoryEventsGen::new_with_seed(
         receiver_ch.clone(),
         node_config.peer_id,
         test_config

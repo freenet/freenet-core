@@ -604,7 +604,7 @@ impl Runnable for NetworkPeer {
         let mut receiver_ch = self.receiver_ch.deref().clone();
         receiver_ch.borrow_and_update();
 
-        let mut memory_event_generator = MemoryEventsGen::<fastrand::Rng>::new_with_seed(
+        let mut memory_event_generator: MemoryEventsGen = MemoryEventsGen::new_with_seed(
             receiver_ch,
             self.config.peer_id,
             config.seed.expect("seed should be set for child process"),
