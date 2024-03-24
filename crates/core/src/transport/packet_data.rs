@@ -53,7 +53,7 @@ pub(super) trait Encryption: Clone {}
 
 /// Decrypted packet
 #[derive(Clone, Copy)]
-pub(super) struct None;
+pub(super) struct Plaintext;
 
 /// Packet is encrypted using symmetric crypto (most packets if not an intro packet)
 #[derive(Clone, Copy)]
@@ -66,12 +66,12 @@ pub(super) struct AssymetricRSA;
 /// This is used when we don't know the encryption type of the packet, perhaps because we
 /// haven't yet determined whether it is an intro packet.
 #[derive(Clone, Copy)]
-pub(super) struct Unknown;
+pub(super) struct UnknownEncryption;
 
-impl Encryption for None {}
+impl Encryption for Plaintext {}
 impl Encryption for SymmetricAES {}
 impl Encryption for AssymetricRSA {}
-impl Encryption for Unknown {}
+impl Encryption for UnknownEncryption {}
 
 pub(super) const fn packet_size<const DATA_SIZE: usize>() -> usize {
     DATA_SIZE + NONCE_SIZE + TAG_SIZE
@@ -142,7 +142,7 @@ impl<const N: usize> PacketData<AssymetricRSA, N> {
     }
 }
 
-impl<const N: usize> PacketData<None, N> {
+impl<const N: usize> PacketData<Plaintext, N> {
     pub fn from_buf_plain(buf: impl AsRef<[u8]>) -> Self {
         let mut data = [0; N];
         let buf = buf.as_ref();
@@ -187,7 +187,7 @@ impl<const N: usize> PacketData<None, N> {
     }
 }
 
-impl<const N: usize> PacketData<Unknown, N> {
+impl<const N: usize> PacketData<UnknownEncryption, N> {
     pub fn from_buf(buf: impl AsRef<[u8]>) -> Self {
         let mut data = [0; N];
         let buf = buf.as_ref();
@@ -311,7 +311,7 @@ mod tests {
     fn test_decryption<const N: usize>(
         packet_data: PacketData<SymmetricAES, N>,
         cipher: &Aes128Gcm,
-        original_data: PacketData<None, N>,
+        original_data: PacketData<Plaintext, N>,
     ) {
         match packet_data.decrypt(cipher) {
             Ok(decrypted_data) => {

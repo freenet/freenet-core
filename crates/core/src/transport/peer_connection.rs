@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::vec::Vec;
 
-use crate::transport::packet_data::Unknown;
+use crate::transport::packet_data::UnknownEncryption;
 use aes_gcm::Aes128Gcm;
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
@@ -42,7 +42,7 @@ pub(super) struct RemoteConnection {
     pub remote_addr: SocketAddr,
     pub sent_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
     pub last_packet_id: Arc<AtomicU32>,
-    pub inbound_packet_recv: mpsc::Receiver<PacketData<Unknown>>,
+    pub inbound_packet_recv: mpsc::Receiver<PacketData<UnknownEncryption>>,
     pub inbound_symmetric_key: Aes128Gcm,
     pub my_address: Option<SocketAddr>,
 }

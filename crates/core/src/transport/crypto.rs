@@ -35,6 +35,7 @@ impl TransportPublicKey {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct TransportSecretKey(RsaPrivateKey);
 
 impl TransportSecretKey {
