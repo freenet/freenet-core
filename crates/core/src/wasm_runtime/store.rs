@@ -23,7 +23,11 @@ pub(super) struct SafeWriter<S> {
 impl<S: StoreFsManagement> SafeWriter<S> {
     pub fn new(path: &Path, compact: bool) -> Result<Self, io::Error> {
         let file = if compact {
-            OpenOptions::new().create(true).write(true).open(path)?
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(path)?
         } else {
             OpenOptions::new()
                 .create(true)

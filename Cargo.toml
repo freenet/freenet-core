@@ -14,7 +14,6 @@ crossbeam = "0.8.2"
 ctrlc = { version = "3.4" }
 dashmap = "^5.5"
 either = "1.8"
-fastrand = "2"
 futures = "0.3"
 rand = { version = "0.8" }
 semver = { version = "1.0.14",  features = ["serde"] }

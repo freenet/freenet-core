@@ -179,6 +179,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bddcadddf5e9015d310179a59bb28c4d4b9920ad0f11e8e14dbadf654890c9a6"
+
+[[package]]
 name = "arrayref"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1520,7 +1526,6 @@ dependencies = [
  "clap",
  "dashmap",
  "either",
- "fastrand 2.0.1",
  "freenet",
  "freenet-stdlib",
  "futures",
@@ -1623,8 +1628,10 @@ dependencies = [
 name = "freenet"
 version = "0.0.7"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "arbitrary",
+ "arc-swap",
  "async-trait",
  "asynchronous-codec 0.7.0",
  "axum",
@@ -1645,7 +1652,6 @@ dependencies = [
  "delegate",
  "directories",
  "either",
- "fastrand 2.0.1",
  "flatbuffers",
  "freenet-stdlib",
  "futures",
@@ -1664,6 +1670,7 @@ dependencies = [
  "rand",
  "reqwest",
  "rocksdb",
+ "rsa",
  "serde",
  "serde_json",
  "serde_with",
@@ -3481,6 +3488,7 @@ dependencies = [
  "num-iter",
  "num-traits",
  "rand",
+ "serde",
  "smallvec",
  "zeroize",
 ]
@@ -4522,6 +4530,7 @@ dependencies = [
  "pkcs1",
  "pkcs8",
  "rand_core",
+ "serde",
  "signature",
  "spki",
  "subtle",

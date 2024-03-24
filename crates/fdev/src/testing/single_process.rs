@@ -7,7 +7,7 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
     let mut simulated_network = super::config_sim_network(config).await?;
 
     let join_handles = simulated_network
-        .start_with_rand_gen::<fastrand::Rng>(
+        .start_with_rand_gen::<rand::rngs::SmallRng>(
             config.seed(),
             config.max_contract_number.unwrap_or(config.nodes * 10),
             config.events as usize,

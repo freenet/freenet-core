@@ -11,6 +11,7 @@
 
 - [P2P Network](architecture/p2p-network.md)
 - [Intelligent Routing](architecture/irouting.md)
+- [Transport](architecture/transport.md)
 
 # Developer Guide
 

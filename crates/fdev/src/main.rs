@@ -40,7 +40,7 @@ fn main() -> Result<(), anyhow::Error> {
     let config = Config::parse();
     freenet::config::Config::set_op_mode(config.additional.mode);
     if !config.sub_command.is_child() {
-        freenet::config::set_logger();
+        freenet::config::set_logger(None);
     }
     tokio_rt.block_on(async move {
         let cwd = std::env::current_dir()?;

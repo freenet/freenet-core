@@ -158,7 +158,7 @@ async fn start_supervisor(config: &TestConfig) -> anyhow::Result<(), Error> {
 
 async fn start_peer(config: &TestConfig, cmd_config: &NetworkProcessConfig) -> Result<(), Error> {
     std::env::set_var("FREENET_PEER_ID", cmd_config.clone().id.unwrap());
-    freenet::config::set_logger();
+    freenet::config::set_logger(None);
     if let Some(peer_id) = &cmd_config.id {
         let peer = NetworkPeer::new(peer_id.clone()).await?;
         peer.run(config, peer_id.clone()).await?;
@@ -604,7 +604,7 @@ impl Runnable for NetworkPeer {
         let mut receiver_ch = self.receiver_ch.deref().clone();
         receiver_ch.borrow_and_update();
 
-        let mut memory_event_generator = MemoryEventsGen::<fastrand::Rng>::new_with_seed(
+        let mut memory_event_generator: MemoryEventsGen = MemoryEventsGen::new_with_seed(
             receiver_ch,
             self.config.peer_id,
             config.seed.expect("seed should be set for child process"),

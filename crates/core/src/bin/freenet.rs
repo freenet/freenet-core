@@ -21,7 +21,7 @@ async fn run_local(config: PeerCliConfig) -> Result<(), DynError> {
 }
 
 fn main() -> Result<(), DynError> {
-    freenet::config::set_logger();
+    freenet::config::set_logger(None);
     let config = PeerCliConfig::parse();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)

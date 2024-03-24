@@ -342,7 +342,7 @@ impl libp2p::swarm::Executor for GlobalExecutor {
     }
 }
 
-pub fn set_logger() {
+pub fn set_logger(level: Option<tracing::level_filters::LevelFilter>) {
     #[cfg(feature = "trace")]
     {
         static LOGGER_SET: AtomicBool = AtomicBool::new(false);
@@ -358,6 +358,6 @@ pub fn set_logger() {
             return;
         }
 
-        crate::tracing::tracer::init_tracer().expect("failed tracing initialization")
+        crate::tracing::tracer::init_tracer(level).expect("failed tracing initialization")
     }
 }

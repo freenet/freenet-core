@@ -625,10 +625,13 @@ impl Operation for ConnectOp {
                     }
 
                     network_bridge.add_connection(sender.peer).await?;
-                    op_manager.ring.add_connection(
-                        sender.location.ok_or(ConnectionError::LocationUnknown)?,
-                        sender.peer,
-                    );
+                    op_manager
+                        .ring
+                        .add_connection(
+                            sender.location.ok_or(ConnectionError::LocationUnknown)?,
+                            sender.peer,
+                        )
+                        .await;
                     tracing::debug!(tx = %id, from = %by_peer.peer, "Opened connection with peer");
                     if target != gateway {
                         new_state = None;
@@ -655,10 +658,13 @@ impl Operation for ConnectOp {
                         "Successfully completed connection",
                     );
                     network_bridge.add_connection(sender.peer).await?;
-                    op_manager.ring.add_connection(
-                        sender.location.ok_or(ConnectionError::LocationUnknown)?,
-                        sender.peer,
-                    );
+                    op_manager
+                        .ring
+                        .add_connection(
+                            sender.location.ok_or(ConnectionError::LocationUnknown)?,
+                            sender.peer,
+                        )
+                        .await;
                     new_state = None;
                 }
                 _ => return Err(OpError::UnexpectedOpState),
@@ -735,12 +741,15 @@ async fn propagate_oc_to_responding_peers<NB: NetworkBridge>(
     ) {
         tracing::info!(tx = %id, from = %sender.peer, to = %other_peer.peer, "Established connection");
         network_bridge.add_connection(other_peer.peer).await?;
-        op_manager.ring.add_connection(
-            other_peer
-                .location
-                .ok_or(ConnectionError::LocationUnknown)?,
-            other_peer.peer,
-        );
+        op_manager
+            .ring
+            .add_connection(
+                other_peer
+                    .location
+                    .ok_or(ConnectionError::LocationUnknown)?,
+                other_peer.peer,
+            )
+            .await;
         if other_peer.peer != sender.peer {
             // notify all the additional peers which accepted a request;
             // the gateway will be notified in the last message
