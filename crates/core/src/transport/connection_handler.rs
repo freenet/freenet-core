@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,11 +8,11 @@ use std::vec::Vec;
 
 use crate::transport::packet_data::{AssymetricRSA, UnknownEncryption};
 use aes_gcm::{Aes128Gcm, KeyInit};
-use futures::TryFutureExt;
 use futures::{
     stream::{FuturesUnordered, StreamExt},
     Future,
 };
+use futures::{FutureExt, TryFutureExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
@@ -101,9 +102,10 @@ impl ConnectionHandler {
         remote_public_key: TransportPublicKey,
         remote_addr: SocketAddr,
         remote_is_gateway: bool,
-    ) -> Result<PeerConnection, TransportError> {
+    ) -> Pin<Box<dyn Future<Output = Result<PeerConnection, TransportError>> + Send>> {
         let (open_connection, recv_connection) = oneshot::channel();
-        self.send_queue
+        if self
+            .send_queue
             .send((
                 remote_addr,
                 ConnectionEvent::ConnectionStart {
@@ -113,9 +115,19 @@ impl ConnectionHandler {
                 },
             ))
             .await
-            .map_err(|_| TransportError::ChannelClosed)?;
-        let outbound_conn = recv_connection.await.map_err(|e| anyhow::anyhow!(e))??;
-        Ok(PeerConnection::new(outbound_conn))
+            .is_err()
+        {
+            return async { Err(TransportError::ChannelClosed) }.boxed();
+        }
+        recv_connection
+            .map(|res| match res {
+                Ok(Ok(remote_conn)) => Ok(PeerConnection::new(remote_conn)),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(TransportError::ConnectionEstablishmentFailure {
+                    cause: "Failed to establish connection".into(),
+                }),
+            })
+            .boxed()
     }
 
     pub async fn next_connection(&mut self) -> Option<PeerConnection> {
@@ -169,10 +181,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                         Ok((size, remote_addr)) => {
                             let packet_data = PacketData::from_buf(&buf[..size]);
                             if let Some(remote_conn) = self.remote_connections.remove(&remote_addr){
-                                tracing::trace!(%remote_addr, "received packet from remote");
-                                tracing::trace!(%remote_addr, "sending packet to remote");
                                 let _ = remote_conn.inbound_packet_sender.send(packet_data).await;
-                                tracing::trace!(%remote_addr, "packet sent to remote");
                                 self.remote_connections.insert(remote_addr, remote_conn);
                                 continue;
                             }
@@ -210,6 +219,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     };
                     match res.expect("task shouldn't panic") {
                         Ok((outbound_remote_conn, inbound_remote_connection)) => {
+                            tracing::debug!(%outbound_remote_conn.remote_addr, "connection established");
                             if let Some((_, result_sender)) = ongoing_connections.remove(&outbound_remote_conn.remote_addr) {
                                 self.remote_connections.insert(outbound_remote_conn.remote_addr, inbound_remote_connection);
                                 let _ = result_sender.send(Ok(outbound_remote_conn));
@@ -232,7 +242,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                         remote_addr,  remote_public_key, remote_is_gateway
                     );
                     let task = tokio::spawn(ongoing_connection.map_err(move |error| {
-                        tracing::error!(%error, ?remote_addr, "Failed to establish connection");
                         (error, remote_addr)
                     }));
                     connection_tasks.push(task);
@@ -851,21 +860,29 @@ mod test {
 
         let mut tasks = vec![];
         let barrier = Arc::new(tokio::sync::Barrier::new(peers));
-        for (i, (peer, test_generator)) in peer_conns.into_iter().zip(generators).enumerate() {
+        for (i, (mut peer, test_generator)) in peer_conns.into_iter().zip(generators).enumerate() {
             let mut peer_keys_and_addr = peer_keys_and_addr.clone();
             peer_keys_and_addr.remove(i);
             let barrier_cp = barrier.clone();
             let peer = tokio::spawn(async move {
-                let mut peer = peer;
                 let mut conns = FuturesOrdered::new();
-                for (peer_pub, peer_addr) in peer_keys_and_addr {
-                    let mut test_gen_cp = test_generator.clone();
-                    barrier_cp.wait().await;
-                    let mut peer_conn = tokio::time::timeout(
+                let mut establish_conns = Vec::new();
+                barrier_cp.wait().await;
+                for (peer_pub, peer_addr) in &peer_keys_and_addr {
+                    let peer_conn = tokio::time::timeout(
                         Duration::from_secs(10),
-                        peer.connect(peer_pub, peer_addr, false),
-                    )
-                    .await??;
+                        peer.connect(peer_pub.clone(), *peer_addr, false).await,
+                    );
+                    establish_conns.push(peer_conn);
+                }
+                let connections = futures::future::try_join_all(establish_conns)
+                    .await?
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?;
+                for ((_, peer_addr), mut peer_conn) in
+                    peer_keys_and_addr.into_iter().zip(connections)
+                {
+                    let mut test_gen_cp = test_generator.clone();
                     conns.push_back(async move {
                         let mut messages = vec![];
                         while messages.len() < test_gen_cp.expected_iterations() {
@@ -918,13 +935,13 @@ mod test {
         let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection().await?;
 
         let peer_b = tokio::spawn(async move {
-            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false);
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
             Ok::<_, DynError>(())
         });
 
         let peer_a = tokio::spawn(async move {
-            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false);
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             Ok::<_, DynError>(())
         });
