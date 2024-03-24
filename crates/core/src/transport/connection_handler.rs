@@ -954,7 +954,7 @@ mod test {
 
     #[tokio::test]
     async fn simulate_send_short_message() -> Result<(), DynError> {
-        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         #[derive(Clone, Copy)]
         struct TestData(&'static str, usize);
 
@@ -968,23 +968,12 @@ mod test {
                 self.0.to_string()
             }
 
-            fn assert_message_ok(&self, peer_idx: usize, msg: Self::Message) -> bool {
-                let shift_check = if self.1 < 5 { 4 } else { 5 };
-                peer_idx < shift_check && msg == "foo" || peer_idx >= shift_check && msg == "bar"
+            fn assert_message_ok(&self, _peer_idx: usize, msg: Self::Message) -> bool {
+                msg == "foo"
             }
         }
 
-        run_test(
-            3,
-            vec![TestData("foo", 0), TestData("foo", 1), TestData("foo", 2)],
-            // 10,
-            // Vec::from_iter(
-            //     (0..5)
-            //         .map(|i| TestData("foo", i))
-            //         .chain((0..5).map(|i| TestData("bar", i))),
-            // ),
-        )
-        .await
+        run_test(10, Vec::from_iter((0..10).map(|i| TestData("foo", i)))).await
     }
 
     #[tokio::test]
