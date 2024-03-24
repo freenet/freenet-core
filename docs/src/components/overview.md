@@ -9,9 +9,9 @@ the P2P network via contracts.
 
 ![Architectural Primitives Diagram](components.svg)
 
-## Freenet Kernel
+## Freenet Core
 
-The Freenet Kernel is the software that enables a user's computer to connect to
+The Freenet Core is the software that enables a user's computer to connect to
 the Freenet network. Its primary functions are:
 
 * Providing a user-friendly interface to access Freenet via a web browser
@@ -20,6 +20,6 @@ the Freenet network. Its primary functions are:
   network
 * Manage communication between contracts, delegates, and UI components
 
-Built with Rust, the kernel is designed to be compact (ideally under 5 MB),
+Built with Rust, the core is designed to be compact (ideally under 5 MB),
 efficient, and capable of running on a variety of devices such as smartphones,
 desktop computers, and embedded devices.

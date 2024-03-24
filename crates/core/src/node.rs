@@ -21,7 +21,7 @@ use std::{
 use either::Either;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ErrorKind},
-    prelude::ContractKey,
+    prelude::{ContractKey, RelatedContracts, WrappedState},
 };
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId as Libp2pPeerId};
 
@@ -40,7 +40,7 @@ use crate::{
     message::{NetMessage, NodeEvent, Transaction, TransactionType},
     operations::{
         connect::{self, ConnectOp},
-        get, put, subscribe, OpEnum, OpError, OpOutcome,
+        get, put, subscribe, update, OpEnum, OpError, OpOutcome,
     },
     ring::{Location, PeerKeyLocation},
     router::{RouteEvent, RouteOutcome},
@@ -396,15 +396,33 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                         tracing::error!("{}", err);
                     }
                 }
-                ContractRequest::Update {
-                    key: _key,
-                    data: _delta,
-                } => {
+                ContractRequest::Update { key, data } => {
                     // FIXME: perform updates
                     tracing::debug!(
                         this_peer = %op_manager.ring.peer_key,
                         "Received update from user event",
                     );
+                    let state = match data {
+                        freenet_stdlib::prelude::UpdateData::State(s) => s,
+                        _ => {
+                            unreachable!();
+                        }
+                    };
+
+                    let wrapped_state = WrappedState::from(state.into_bytes());
+
+                    let related_contracts = RelatedContracts::default();
+
+                    let op = update::start_op(key, wrapped_state, related_contracts);
+
+                    let _ = op_manager
+                        .ch_outbound
+                        .waiting_for_transaction_result(op.id, client_id)
+                        .await;
+
+                    if let Err(err) = update::request_update(&op_manager, op).await {
+                        tracing::error!("request update error {}", err)
+                    }
                 }
                 ContractRequest::Get {
                     key,
@@ -648,6 +666,22 @@ async fn process_message<CB>(
                 )
                 .await;
             }
+            NetMessage::Update(op) => {
+                let op_result =
+                    handle_op_request::<update::UpdateOp, _>(&op_manager, &mut conn_manager, op)
+                        .await;
+                handle_op_not_available!(op_result);
+                break report_result(
+                    tx,
+                    op_result,
+                    &op_manager,
+                    executor_callback,
+                    cli_req,
+                    &mut *event_listener,
+                )
+                .await;
+            }
+
             NetMessage::Unsubscribed { key, .. } => {
                 subscribe(op_manager, key.clone(), None).await;
                 break;

@@ -111,6 +111,36 @@ where
                         error
                     })?;
             }
+            ContractHandlerEvent::UpdateQuery {
+                key,
+                state,
+                related_contracts,
+            } => {
+                let update_result = contract_handler
+                    .executor()
+                    .upsert_contract_state(
+                        key.clone(),
+                        Either::Left(state.clone()),
+                        related_contracts,
+                        None,
+                    )
+                    .instrument(tracing::info_span!("upsert_contract_state", %key))
+                    .await;
+
+                contract_handler
+                    .channel()
+                    .send_to_sender(
+                        id,
+                        ContractHandlerEvent::UpdateResponse {
+                            new_value: update_result.map_err(Into::into),
+                        },
+                    )
+                    .await
+                    .map_err(|error| {
+                        tracing::debug!(%error, "shutting down contract handler");
+                        error
+                    })?;
+            }
             _ => unreachable!(),
         }
     }

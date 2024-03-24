@@ -2,48 +2,32 @@
 
 ## Small-World Network
 
-Freenet operates as a decentralized peer-to-peer network based on the principles
-of a [small-world network](https://en.wikipedia.org/wiki/Small-world_network).
-This network topology allows Freenet to be resilient against denial-of-service
-attacks, automatically scale to accommodate demand, and provide observable data
-stores. Users can subscribe to specific keys to receive notifications of updates
-as they occur.
+Freenet is structured as a decentralized peer-to-peer network, based on the idea of
+a [small-world network](https://en.wikipedia.org/wiki/Small-world_network). This
+network topology is scalable and efficient, allowing contract state to be found
+quickly and without any reliance on a central authority.
 
 ![Small World Network](p2p-network.svg)
 
-## Understanding Freenet Peers
+## Freenet Peers
 
-A Freenet peer refers to a computer that runs the Freenet kernel software and
-participates in the network. The organization of peers follows a ring structure,
-where each position on the ring represents a numerical value ranging from 0.0 to
-1.0. This value signifies the peer's location within the network.
+In Freenet, a "peer" is any computer running the [Freenet
+Core](https://github.com/freenet/freenet-core) software. The peers are organized
+in a ring-like structure, with each peer assigned a specific numerical value
+between 0.0 and 1.0, indicating its location in the network's topology. This
+location is derived from the peer's public key.
 
 ## Establishing Neighbor Connections
 
-Each Freenet peer, or kernel, establishes bi-directional connections with a
-group of other peers known as its "neighbors." These connections rely on the
-User Datagram Protocol (UDP) and may involve techniques to traverse firewalls
-when required.
+Every Freenet peer, also referred to as a node, forms two-way connections with a
+set of other peers, termed "neighbors." These connections utilize the User
+Datagram Protocol (UDP) and can do [Frewall hole punching](<https://en.wikipedia.org/wiki/Hole_punching_(networking)>) when necessary. Peers manage their resource usage —
+bandwidth, memory, CPU, and storage — based on limits set by the user.
 
-To optimize resource utilization, peers monitor the resources they use while
-responding to neighbor requests, including bandwidth, memory, CPU usage, and
-storage. Peers also track the services offered by their neighbors, measured by
-the number of requests directed to those neighbors.
+## Adaptive behavior
 
-To ensure network efficiency, a peer may sever its connection with a neighbor
-that consumes excessive resources relative to the number of requests it
-receives.
+Peers keep track of their neighbor's performance and learn to prefer faster
+connections over time.
 
-## Implementing Adaptive Routing for Efficient Data Retrieval
-
-When a peer intends to read, create, or modify a contract, it sends a request to
-the peers hosting the contract. The request is directed to the neighbor most
-likely to retrieve the contract quickly. Ideally, this neighbor is the one
-closest to the contract's location, a concept known as "greedy routing."
-However, other factors, such as connection speed, may influence the selection.
-
-Freenet addresses this challenge by monitoring the past performance of peers and
-selecting the one most likely to respond quickly and successfully. This
-selection considers both past performance and proximity to the desired contract.
-The process, known as adaptive routing, employs an algorithm called [isotonic
-regression](https://github.com/sanity/pav.rs).
+Peers can also identify bad behavior by other peers like excess resource usage and
+will disconnect from them.
