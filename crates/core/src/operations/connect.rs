@@ -11,7 +11,7 @@ use crate::dev_tool::Location;
 use crate::transport::TransportPublicKey;
 use crate::{
     message::{InnerMessage, NetMessage, Transaction},
-    node::{ConnectionError, NetworkBridge, OpManager, PeerId},
+    node::{NetworkBridge, OpManager, PeerId},
     operations::OpEnum,
     ring::PeerKeyLocation,
     util::ExponentialBackoff,
@@ -231,6 +231,7 @@ impl Operation for ConnectOp {
                 } => {
                     let assigned_location = Location::random();
                     let should_accept = op_manager.ring.should_accept(assigned_location, None);
+                    let joiner_peer_id = joiner.unwrap();
 
                     tracing::debug!(
                         tx = %id,
@@ -241,23 +242,26 @@ impl Operation for ConnectOp {
                     );
 
                     let new_state = if should_accept {
-                        tracing::debug!(tx = %id, at = %this_peer.peer, "Accepting connection at gateway");
+                        tracing::debug!(tx = %id, at = %this_peer.peer, from = %joiner_peer_id, "Accepting connection at gateway");
                         Some(ConnectState::AcceptedNewConnection)
                     } else {
-                        tracing::debug!(tx = %id, at = %this_peer.peer, "Rejecting connection at gateway");
+                        tracing::debug!(tx = %id, at = %this_peer.peer, from = %joiner_peer_id, "Rejecting connection at gateway");
                         None
                     };
 
                     let response = ConnectResponse::AcceptedByGateway {
                         accepted: should_accept,
                         your_location: assigned_location,
-                        your_peer_id: joiner.unwrap(),
+                        your_peer_id: joiner_peer_id.clone(),
                     };
 
                     let return_msg = Some(ConnectMsg::Response {
                         id: *id,
                         sender: this_peer.clone(),
-                        target: this_peer.clone(), //FIXME: this should be created from assigned location and joiner peerId
+                        target: PeerKeyLocation {
+                            peer: joiner_peer_id,
+                            location: Some(assigned_location),
+                        },
                         msg: response,
                     });
                 }

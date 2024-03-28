@@ -410,7 +410,7 @@ impl P2pConnManager {
         use ConnMngrActions::*;
 
         match *net_msg.clone() {
-            NetMessage::Connect(conn_msg) => match conn_msg {
+            NetMessage::Connect(conn_msg) => match conn_msg.clone() {
                 ConnectMsg::Request { msg: conn_req, .. } => match conn_req {
                     ConnectRequest::StartGatewayReq { joiner_key, .. } => {
                         self.handle_connection_request(&net_msg, &peer, &joiner_key)
@@ -430,6 +430,7 @@ impl P2pConnManager {
                         your_location,
                         your_peer_id,
                     } => {
+                        let sender = conn_msg.sender().unwrap();
                         if accepted {
                             tracing::debug!("Connection accepted by gateway");
                             self.bridge
@@ -439,13 +440,13 @@ impl P2pConnManager {
                             Ok(Right(ConnectionAccepted {
                                 peer: PeerKeyLocation {
                                     peer: your_peer_id.clone(),
-                                    location: Some(*your_location),
+                                    location: Some(your_location),
                                 },
                             }))
                         } else {
                             tracing::debug!("Connection rejected by gateway");
                             Ok(Right(ConnectionClosed {
-                                peer: sender.peer.clone(),
+                                peer: sender.clone(),
                             }))
                         }
                     }
@@ -453,18 +454,20 @@ impl P2pConnManager {
                         accepted,
                         your_location,
                     } => {
+                        let sender = conn_msg.sender().unwrap();
+                        let this_peer = self.bridge.op_manager.ring.get_peer_key().unwrap();
                         if accepted {
                             tracing::debug!("Connection accepted by regular node");
                             Ok(Right(ConnectionAccepted {
                                 peer: PeerKeyLocation {
-                                    peer: your_peer_id.clone(),
-                                    location: Some(*your_location),
+                                    peer: this_peer.clone(),
+                                    location: Some(your_location),
                                 },
                             }))
                         } else {
                             tracing::debug!("Connection rejected by regular node");
                             Ok(Right(ConnectionClosed {
-                                peer: sender.peer.clone(),
+                                peer: sender.clone(),
                             }))
                         }
                     }
