@@ -1,5 +1,6 @@
 use std::borrow::BorrowMut;
 use std::net::SocketAddr;
+use std::ops::Deref;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -483,52 +484,51 @@ impl P2pConnManager {
     ) -> Result<Either<NetMessage, ConnMngrActions>, ConnectionError> {
         use ConnMngrActions::*;
 
-        match self
+        let mut peer_conn = self
             .conn_handler
             .clone()
             .lock()
             .await
             .connect(peer.pub_key.clone(), peer.addr, true)
             .await
-        {
-            Ok((mut peer_conn, my_address)) => {
-                if self.bridge.op_manager.ring.get_peer_key().is_none() {
-                    let own_peer_id = PeerId::new(my_address, joiner_key.clone());
-                    self.bridge.op_manager.ring.set_peer_key(own_peer_id);
-                }
-                tracing::debug!("Connection established with peer {}", peer.addr.clone());
+            .await
+            .map_err(|_| ConnectionError::SendNotCompleted)?;
 
-                if let NetMessage::Connect(ConnectMsg::Request {
-                    msg: ConnectRequest::StartGatewayReq { joiner, .. },
-                    ..
-                }) = &**net_msg
-                {
-                    if joiner.is_none() {
-                        let mut msg = net_msg.clone();
-                        if let NetMessage::Connect(ConnectMsg::Request {
-                            msg: ConnectRequest::StartGatewayReq { ref mut joiner, .. },
-                            ..
-                        }) = &mut *msg
-                        {
-                            let joiner_peer = self.bridge.op_manager.ring.get_peer_key();
-                            *joiner = joiner_peer;
-                        }
-                        return Ok(Left(*msg));
-                    }
-                }
-
-                peer_conn
-                    .send(net_msg.clone())
-                    .await
-                    .map_err(|_| ConnectionError::SendNotCompleted)?;
-
-                Ok(Right(ConnectionEstablished {
-                    peer: peer.clone(),
-                    peer_conn,
-                }))
-            }
-            Err(e) => Err(ConnectionError::SendNotCompleted),
+        let my_address = peer_conn.my_address().unwrap();
+        if self.bridge.op_manager.ring.get_peer_key().is_none() {
+            let own_peer_id = PeerId::new(my_address, joiner_key.clone());
+            self.bridge.op_manager.ring.set_peer_key(own_peer_id);
         }
+        tracing::debug!("Connection established with peer {}", peer.addr.clone());
+
+        if let NetMessage::Connect(ConnectMsg::Request {
+            msg: ConnectRequest::StartGatewayReq { joiner, .. },
+            ..
+        }) = &**net_msg
+        {
+            if joiner.is_none() {
+                let mut msg = net_msg.clone();
+                if let NetMessage::Connect(ConnectMsg::Request {
+                    msg: ConnectRequest::StartGatewayReq { ref mut joiner, .. },
+                    ..
+                }) = &mut *msg
+                {
+                    let joiner_peer = self.bridge.op_manager.ring.get_peer_key();
+                    *joiner = joiner_peer;
+                }
+                return Ok(Left(*msg));
+            }
+        }
+
+        peer_conn
+            .send(net_msg.clone())
+            .await
+            .map_err(|_| ConnectionError::SendNotCompleted)?;
+
+        Ok(Right(ConnectionEstablished {
+            peer: peer.clone(),
+            peer_conn: peer_conn,
+        }))
     }
 }
 
