@@ -2,12 +2,14 @@
 use freenet_stdlib::client_api::HostResponse;
 use futures::future::BoxFuture;
 use futures::{Future, FutureExt};
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::time::Duration;
 
 use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
+use crate::ring::Ring;
 use crate::transport::TransportPublicKey;
 use crate::{
     message::{InnerMessage, NetMessage, Transaction},
@@ -735,6 +737,91 @@ where
         )
         .await?;
     Ok(())
+}
+
+async fn forward_conn<NB>(
+    id: Transaction,
+    ring: &Ring,
+    network_bridge: &mut NB,
+    (req_peer, joiner): (PeerKeyLocation, PeerKeyLocation),
+    left_htl: usize,
+    accepted_by: HashSet<PeerKeyLocation>,
+    skip_list: Vec<PeerId>,
+) -> Result<Option<ConnectState>, OpError>
+where
+    NB: NetworkBridge,
+{
+    if left_htl == 0 {
+        tracing::debug!(
+            tx = %id,
+            joiner = %joiner.peer,
+            "Couldn't forward connect petition, no hops left or enough connections",
+        );
+        return Ok(None);
+    }
+
+    if ring.num_connections() == 0 {
+        tracing::warn!(
+            tx = %id,
+            joiner = %joiner.peer,
+            "Couldn't forward connect petition, not enough connections",
+        );
+        return Ok(None);
+    }
+
+    let forward_to = if left_htl >= ring.rnd_if_htl_above {
+        tracing::debug!(
+            tx = %id,
+            joiner = %joiner.peer,
+            "Randomly selecting peer to forward connect request",
+        );
+        ring.random_peer(|p| !skip_list.contains(p))
+    } else {
+        tracing::debug!(
+            tx = %id,
+            joiner = %joiner.peer,
+            "Selecting close peer to forward request",
+        );
+        // FIXME: target the `desired_location`
+        let desired_location = joiner.location.unwrap();
+        ring.routing(desired_location, Some(&req_peer.peer), skip_list.as_slice())
+            .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))
+    };
+
+    if let Some(forward_to) = forward_to {
+        let forwarded = NetMessage::from(ConnectMsg::Request {
+            id,
+            msg: ConnectRequest::StartRegularReq {
+                target: forward_to.clone(),
+                joiner: joiner.peer.clone(),
+                assigned_location: forward_to.location.unwrap(),
+                hops_to_live: left_htl - 1,
+                max_hops_to_live: left_htl - 1,
+            },
+        });
+        tracing::debug!(
+            tx = %id,
+            sender = %req_peer.peer,
+            forward_target = %forward_to.peer,
+            "Forwarding connect request from sender to other peer",
+        );
+        network_bridge.send(&forward_to.peer, forwarded).await?;
+        // awaiting for responses from forward nodes
+        let new_state = ConnectState::AwaitingNewConnection {
+            query_target: forward_to.peer,
+        };
+        Ok(Some(new_state))
+    } else {
+        if !accepted_by.is_empty() {
+            tracing::warn!(
+                tx = %id,
+                "Unable to forward, will only be connecting to one peer",
+            );
+        } else {
+            tracing::warn!(tx = %id, "Unable to forward or accept any connections");
+        }
+        Ok(None)
+    }
 }
 
 mod messages {
