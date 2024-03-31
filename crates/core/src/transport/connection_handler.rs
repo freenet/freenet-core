@@ -67,7 +67,14 @@ impl ConnectionHandler {
     ) -> Result<Self, TransportError> {
         // Bind the UDP socket to the specified port
         let socket = Arc::new(S::bind((Ipv4Addr::UNSPECIFIED, listen_port).into()).await?);
+        Self::config_listener(socket, keypair, is_gateway)
+    }
 
+    fn config_listener(
+        socket: Arc<impl Socket>,
+        keypair: TransportKeypair,
+        is_gateway: bool,
+    ) -> Result<Self, TransportError> {
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(100);
@@ -95,6 +102,15 @@ impl ConnectionHandler {
         task::spawn(transport.listen());
 
         Ok(connection_handler)
+    }
+
+    #[cfg(test)]
+    fn test_set_up(
+        socket: Arc<impl Socket>,
+        keypair: TransportKeypair,
+        is_gateway: bool,
+    ) -> Result<Self, TransportError> {
+        Self::config_listener(socket, keypair, is_gateway)
     }
 
     pub async fn connect(
@@ -577,6 +593,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         &decrypted_packet.data()[PROTOC_VERSION.len()..],
                                     )
                                     .map_err(|_| {
+                                        tracing::error!(%remote_addr, "invalid symmetric key");
                                         TransportError::ConnectionEstablishmentFailure {
                                             cause: "invalid symmetric key".into(),
                                         }
@@ -745,11 +762,14 @@ mod test {
     use std::{
         collections::HashMap,
         net::Ipv4Addr,
-        sync::{atomic::AtomicU16, OnceLock},
+        sync::{
+            atomic::{AtomicU16, AtomicU64},
+            OnceLock,
+        },
     };
 
     use futures::{stream::FuturesOrdered, TryStreamExt};
-    use rand::SeedableRng;
+    use rand::{Rng, SeedableRng};
     use serde::{de::DeserializeOwned, Serialize};
     use tokio::sync::Mutex;
     use tracing::info;
@@ -765,21 +785,32 @@ mod test {
     struct MockSocket {
         inbound: Mutex<mpsc::Receiver<(SocketAddr, Vec<u8>)>>,
         this: SocketAddr,
-        rng: rand::rngs::SmallRng,
+        packet_loss_factor: Option<f64>,
+        rng: Mutex<rand::rngs::SmallRng>,
     }
 
-    impl Socket for MockSocket {
-        async fn bind(addr: SocketAddr) -> Result<Self, std::io::Error> {
+    impl MockSocket {
+        async fn test_config(packet_loss_factor: Option<f64>, addr: SocketAddr) -> Self {
             let channels = CHANNELS
                 .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
                 .clone();
             let (outbound, inbound) = mpsc::channel(1);
             channels.lock().await.insert(addr, outbound);
-            Ok(MockSocket {
+            static SEED: AtomicU64 = AtomicU64::new(0xfeedbeef);
+            MockSocket {
                 inbound: Mutex::new(inbound),
                 this: addr,
-                rng: rand::rngs::SmallRng::seed_from_u64(0xfeedbeef),
-            })
+                packet_loss_factor,
+                rng: Mutex::new(rand::rngs::SmallRng::seed_from_u64(
+                    SEED.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                )),
+            }
+        }
+    }
+
+    impl Socket for MockSocket {
+        async fn bind(_addr: SocketAddr) -> Result<Self, std::io::Error> {
+            unimplemented!()
         }
 
         async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
@@ -794,6 +825,12 @@ mod test {
         }
 
         async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            if let Some(factor) = self.packet_loss_factor {
+                if factor > self.rng.try_lock().unwrap().gen::<f64>() {
+                    tracing::info!(this = %self.this, "packet loss");
+                    return Ok(buf.len());
+                }
+            }
             assert!(self.this != target, "cannot send to self");
             let channels = CHANNELS
                 .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
@@ -830,15 +867,18 @@ mod test {
     }
 
     async fn set_peer_connection(
+        packet_loss_factor: Option<f64>,
     ) -> Result<(TransportPublicKey, ConnectionHandler, SocketAddr), DynError> {
         static PORT: AtomicU16 = AtomicU16::new(25000);
         let peer_keypair = TransportKeypair::new();
         let peer_pub = peer_keypair.public.clone();
         let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let peer_conn = ConnectionHandler::new::<MockSocket>(peer_keypair, port, false)
-            .await
+        let socket = Arc::new(
+            MockSocket::test_config(packet_loss_factor, (Ipv4Addr::LOCALHOST, port).into()).await,
+        );
+        let peer_conn = ConnectionHandler::test_set_up(socket, peer_keypair, false)
             .expect("failed to create peer");
-        Ok((peer_pub, peer_conn, (Ipv4Addr::UNSPECIFIED, port).into()))
+        Ok((peer_pub, peer_conn, (Ipv4Addr::LOCALHOST, port).into()))
     }
 
     trait TestFixture: Clone + Send + Sync + 'static {
@@ -848,18 +888,27 @@ mod test {
         fn assert_message_ok(&self, peer_idx: usize, msg: Self::Message) -> bool;
     }
 
-    async fn run_test<G: TestFixture>(peers: usize, generators: Vec<G>) -> Result<(), DynError> {
-        assert_eq!(generators.len(), peers);
+    struct TestConfig {
+        packet_loss_factor: Option<f64>,
+        peers: usize,
+    }
+
+    async fn run_test<G: TestFixture>(
+        config: TestConfig,
+        generators: Vec<G>,
+    ) -> Result<(), DynError> {
+        assert_eq!(generators.len(), config.peers);
         let mut peer_keys_and_addr = vec![];
         let mut peer_conns = vec![];
-        for _ in 0..peers {
-            let (peer_pub, peer, peer_addr) = set_peer_connection().await?;
+        for _ in 0..config.peers {
+            let (peer_pub, peer, peer_addr) =
+                set_peer_connection(config.packet_loss_factor).await?;
             peer_keys_and_addr.push((peer_pub, peer_addr));
             peer_conns.push(peer);
         }
 
         let mut tasks = vec![];
-        let barrier = Arc::new(tokio::sync::Barrier::new(peers));
+        let barrier = Arc::new(tokio::sync::Barrier::new(config.peers));
         for (i, (mut peer, test_generator)) in peer_conns.into_iter().zip(generators).enumerate() {
             let mut peer_keys_and_addr = peer_keys_and_addr.clone();
             peer_keys_and_addr.remove(i);
@@ -931,8 +980,8 @@ mod test {
     #[tokio::test]
     async fn simulate_nat_traversal() -> Result<(), DynError> {
         // crate::config::set_logger();
-        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection().await?;
-        let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection().await?;
+        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(None).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection(None).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
@@ -973,7 +1022,14 @@ mod test {
             }
         }
 
-        run_test(10, Vec::from_iter((0..10).map(|i| TestData("foo", i)))).await
+        run_test(
+            TestConfig {
+                packet_loss_factor: None,
+                peers: 10,
+            },
+            Vec::from_iter((0..10).map(|i| TestData("foo", i))),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -1000,11 +1056,54 @@ mod test {
             }
         }
 
-        run_test(2, vec![TestData("foo"), TestData("bar")]).await
+        run_test(
+            TestConfig {
+                packet_loss_factor: None,
+                peers: 2,
+            },
+            vec![TestData("foo"), TestData("bar")],
+        )
+        .await
     }
 
     #[tokio::test]
     async fn packet_dropping() -> Result<(), DynError> {
+        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        #[derive(Clone, Copy)]
+        struct TestData(&'static str);
+
+        impl TestFixture for TestData {
+            type Message = String;
+            fn expected_iterations(&self) -> usize {
+                10
+            }
+
+            fn gen_msg(&mut self) -> Self::Message {
+                self.0.repeat(3000)
+            }
+
+            fn assert_message_ok(&self, _: usize, msg: Self::Message) -> bool {
+                if self.0 == "foo" {
+                    msg.contains("bar") && msg.len() == "bar".len() * 3000
+                } else {
+                    msg.contains("foo") && msg.len() == "foo".len() * 3000
+                }
+            }
+        }
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        for _ in 0..10 {
+            let factor = rng.gen();
+            tracing::info!("packet loss factor: {factor}");
+            run_test(
+                TestConfig {
+                    packet_loss_factor: Some(factor),
+                    peers: 2,
+                },
+                vec![TestData("foo"), TestData("bar")],
+            )
+            .await?
+        }
         Ok(())
     }
 }
