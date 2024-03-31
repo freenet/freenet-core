@@ -1,12 +1,9 @@
-use std::borrow::BorrowMut;
 use std::net::SocketAddr;
-use std::ops::Deref;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
 
-use bs58::encode;
 use dashmap::{DashMap, DashSet};
 use either::{Either, Left, Right};
 use futures::lock::Mutex;
@@ -412,12 +409,8 @@ impl P2pConnManager {
         match *net_msg.clone() {
             NetMessage::Connect(conn_msg) => match conn_msg.clone() {
                 ConnectMsg::Request { msg: conn_req, .. } => match conn_req {
-                    ConnectRequest::StartGatewayReq { joiner_key, .. } => {
+                    ConnectRequest::StartJoinReq { joiner_key, .. } => {
                         self.handle_connection_request(&net_msg, &peer, &joiner_key)
-                            .await
-                    }
-                    ConnectRequest::StartRegularReq { joiner, .. } => {
-                        self.handle_connection_request(&net_msg, &peer, &joiner.pub_key)
                             .await
                     }
                     _ => Ok(Right(ClosedChannel)),
@@ -425,10 +418,11 @@ impl P2pConnManager {
                 ConnectMsg::Response {
                     msg: conn_response, ..
                 } => match conn_response {
-                    ConnectResponse::AcceptedByGateway {
+                    ConnectResponse::AcceptedByTarget {
                         accepted,
                         your_location,
                         your_peer_id,
+                        ..
                     } => {
                         let sender = conn_msg.sender().unwrap();
                         if accepted {
@@ -445,27 +439,6 @@ impl P2pConnManager {
                             }))
                         } else {
                             tracing::debug!("Connection rejected by gateway");
-                            Ok(Right(ConnectionClosed {
-                                peer: sender.clone(),
-                            }))
-                        }
-                    }
-                    ConnectResponse::AcceptedByRegularNode {
-                        accepted,
-                        your_location,
-                    } => {
-                        let sender = conn_msg.sender().unwrap();
-                        let this_peer = self.bridge.op_manager.ring.get_peer_key().unwrap();
-                        if accepted {
-                            tracing::debug!("Connection accepted by regular node");
-                            Ok(Right(ConnectionAccepted {
-                                peer: PeerKeyLocation {
-                                    peer: this_peer.clone(),
-                                    location: Some(your_location),
-                                },
-                            }))
-                        } else {
-                            tracing::debug!("Connection rejected by regular node");
                             Ok(Right(ConnectionClosed {
                                 peer: sender.clone(),
                             }))
@@ -505,14 +478,14 @@ impl P2pConnManager {
         tracing::debug!("Connection established with peer {}", peer.addr.clone());
 
         if let NetMessage::Connect(ConnectMsg::Request {
-            msg: ConnectRequest::StartGatewayReq { joiner, .. },
+            msg: ConnectRequest::StartJoinReq { joiner, .. },
             ..
         }) = &**net_msg
         {
             if joiner.is_none() {
                 let mut msg = net_msg.clone();
                 if let NetMessage::Connect(ConnectMsg::Request {
-                    msg: ConnectRequest::StartGatewayReq { ref mut joiner, .. },
+                    msg: ConnectRequest::StartJoinReq { ref mut joiner, .. },
                     ..
                 }) = &mut *msg
                 {

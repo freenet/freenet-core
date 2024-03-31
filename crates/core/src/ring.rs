@@ -550,7 +550,11 @@ impl Ring {
 
     pub async fn add_connection(&self, loc: Location, peer: PeerId) {
         self.event_register
-            .register_events(Either::Left(NetEventLog::connected(self, peer, loc)))
+            .register_events(Either::Left(NetEventLog::connected(
+                self,
+                peer.clone(),
+                loc,
+            )))
             .await;
         let mut cbl = self.connections_by_location.write();
         cbl.entry(loc).or_default().push(Connection {

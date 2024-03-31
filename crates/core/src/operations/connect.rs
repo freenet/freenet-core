@@ -168,10 +168,10 @@ impl Operation for ConnectOp {
                         {
                             let msg = ConnectMsg::Request {
                                 id: *id,
-                                msg: ConnectRequest::StartRegularReq {
-                                    target: desirable_peer.clone(),
-                                    joiner: joiner.peer.clone(),
-                                    assigned_location: desirable_peer.location.unwrap(),
+                                msg: ConnectRequest::StartJoinReq {
+                                    joiner: Some(joiner.peer.clone()),
+                                    joiner_key: joiner.peer.pub_key().clone(),
+                                    assigned_location: Some(desirable_peer.location.unwrap()),
                                     hops_to_live: *max_hops_to_live,
                                     max_hops_to_live: *max_hops_to_live,
                                 },
@@ -188,9 +188,11 @@ impl Operation for ConnectOp {
                                 id: *id,
                                 sender: query_target.clone(),
                                 target: joiner.clone(),
-                                msg: ConnectResponse::AcceptedByRegularNode {
+                                msg: ConnectResponse::AcceptedByTarget {
                                     accepted: false,
                                     your_location: *ideal_location,
+                                    your_peer_id: joiner.peer.clone(),
+                                    next_target: None,
                                 },
                             });
                             new_state = None;
@@ -223,61 +225,21 @@ impl Operation for ConnectOp {
                 ConnectMsg::Request {
                     id,
                     msg:
-                        ConnectRequest::StartGatewayReq {
+                        ConnectRequest::StartJoinReq {
                             joiner,
-                            target: this_peer,
                             joiner_key,
-                            hops_to_live,
-                            max_hops_to_live,
-                        },
-                } => {
-                    let assigned_location = Location::random();
-                    let should_accept = op_manager.ring.should_accept(assigned_location, None);
-                    let joiner_peer_id = joiner.unwrap();
-
-                    tracing::debug!(
-                        tx = %id,
-                        at = %this_peer.peer,
-                        hops_to_live = %hops_to_live,
-                        accepted = %should_accept,
-                        "Start gateway request received"
-                    );
-
-                    let new_state = if should_accept {
-                        tracing::debug!(tx = %id, at = %this_peer.peer, from = %joiner_peer_id, "Accepting connection at gateway");
-                        Some(ConnectState::AcceptedNewConnection)
-                    } else {
-                        tracing::debug!(tx = %id, at = %this_peer.peer, from = %joiner_peer_id, "Rejecting connection at gateway");
-                        None
-                    };
-
-                    let response = ConnectResponse::AcceptedByGateway {
-                        accepted: should_accept,
-                        your_location: assigned_location,
-                        your_peer_id: joiner_peer_id.clone(),
-                    };
-
-                    let return_msg = Some(ConnectMsg::Response {
-                        id: *id,
-                        sender: this_peer.clone(),
-                        target: PeerKeyLocation {
-                            peer: joiner_peer_id,
-                            location: Some(assigned_location),
-                        },
-                        msg: response,
-                    });
-                }
-                ConnectMsg::Request {
-                    id,
-                    msg:
-                        ConnectRequest::StartRegularReq {
-                            target: this_peer,
-                            joiner,
                             assigned_location,
                             hops_to_live,
                             ..
                         },
                 } => {
+                    let joiner = joiner.unwrap();
+                    let this_peer = op_manager.ring.own_location();
+                    let assigned_location = match assigned_location {
+                        Some(location) => location,
+                        None => &Location::random(),
+                    };
+
                     let should_accept = op_manager
                         .ring
                         .should_accept(*assigned_location, Some(&joiner));
@@ -304,9 +266,13 @@ impl Operation for ConnectOp {
                         peer: joiner.clone(),
                     };
 
-                    let response = ConnectResponse::AcceptedByRegularNode {
+                    let next_target = op_manager.ring.closest_to_location(*assigned_location, &[]);
+
+                    let response = ConnectResponse::AcceptedByTarget {
                         accepted: should_accept,
                         your_location: *assigned_location,
+                        your_peer_id: joiner.clone(),
+                        next_target,
                     };
 
                     let return_msg = Some(ConnectMsg::Response {
@@ -321,10 +287,11 @@ impl Operation for ConnectOp {
                     sender,
                     target,
                     msg:
-                        ConnectResponse::AcceptedByGateway {
+                        ConnectResponse::AcceptedByTarget {
                             accepted,
                             your_location,
                             your_peer_id,
+                            ..
                         },
                 } => {
                     tracing::debug!(
@@ -385,117 +352,6 @@ impl Operation for ConnectOp {
                         return Err(OpError::StatePushed);
                     }
                 }
-                ConnectMsg::Response {
-                    id,
-                    sender,
-                    target,
-                    msg:
-                        ConnectResponse::AcceptedByRegularNode {
-                            accepted,
-                            your_location,
-                        },
-                } => {
-                    tracing::debug!(
-                        tx = %id,
-                        at = %target.peer,
-                        from = %sender.peer,
-                        "Connect response received",
-                    );
-
-                    let this_peer = op_manager.ring.get_peer_key().expect("peer id not found");
-
-                    // Set the given location
-                    let pk_loc = PeerKeyLocation {
-                        location: Some(*your_location),
-                        peer: this_peer.clone(),
-                    };
-
-                    let Some(ConnectState::ConnectingToRegularNode(RegularConnectionInfo {
-                        peer_loc,
-                        ..
-                    })) = self.state
-                    else {
-                        return Err(OpError::invalid_transition(self.id));
-                    };
-                    if *accepted {
-                        tracing::debug!(
-                            tx = %id,
-                            at = %this_peer,
-                            from = %sender.peer,
-                            "Open connections acknowledged at requesting regular peer",
-                        );
-
-                        return_msg = None;
-                        new_state = Some(ConnectState::Connected);
-
-                        tracing::debug!(
-                            tx = %id,
-                            at = %this_peer,
-                            location = %your_location,
-                            "Updating assigned location"
-                        );
-                        op_manager.ring.update_location(Some(*your_location));
-                    } else {
-                        // no connections accepted, failed
-                        tracing::debug!(
-                            tx = %id,
-                            peer = %this_peer,
-                            "Failed to establish any connections, aborting"
-                        );
-                        let op = ConnectOp {
-                            id: *id,
-                            state: None,
-                            gateway: self.gateway,
-                            backoff: self.backoff,
-                        };
-
-                        op_manager
-                            .notify_op_change(NetMessage::Aborted(*id), OpEnum::Connect(op.into()))
-                            .await?;
-                        return Err(OpError::StatePushed);
-                    }
-                }
-                ConnectMsg::Response {
-                    id,
-                    sender,
-                    target,
-                    msg:
-                        ConnectResponse::InformRemoteOfConnection {
-                            target: target_peer,
-                        },
-                } => match self.state {
-                    Some(ConnectState::AwaitingConnectionAcquisition { joiner }) => {
-                        if target.peer == joiner.peer {
-                            tracing::debug!(tx = %id, from = %target.peer, at = %target.peer, "Acknowledge connected at peer");
-                            let max_hops_to_live = op_manager.ring.max_hops_to_live;
-                            let msg = ConnectMsg::Request {
-                                id: *id,
-                                msg: ConnectRequest::StartRegularReq {
-                                    target: target_peer.clone(),
-                                    joiner: joiner.peer.clone(),
-                                    assigned_location: target_peer.location.clone().unwrap(),
-                                    hops_to_live: max_hops_to_live,
-                                    max_hops_to_live,
-                                },
-                            };
-                            network_bridge.send(&target_peer.peer, msg.into()).await?;
-                            return_msg = None;
-                            new_state = Some(ConnectState::AwaitingConnectionAcquisition {
-                                joiner: joiner.clone(),
-                            });
-                        }
-                    }
-                    Some(other_state) => {
-                        return Err(OpError::invalid_transition_with_state(
-                            self.id,
-                            Box::new(other_state),
-                        ))
-                    }
-                    None => {
-                        tracing::error!(tx = %self.id, at =  %target.peer, "completed");
-                        return Err(OpError::invalid_transition(self.id));
-                    }
-                },
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
@@ -711,11 +567,11 @@ where
     conn_bridge.try_add_connection(gateway.peer.clone()).await?;
     let join_req = NetMessage::from(messages::ConnectMsg::Request {
         id: tx,
-        msg: ConnectRequest::StartGatewayReq {
-            target: gateway.clone(),
+        msg: ConnectRequest::StartJoinReq {
             joiner: None,
             joiner_key: peer_pub_key.clone(),
             hops_to_live: max_hops_to_live,
+            assigned_location: None,
             max_hops_to_live,
         },
     });
@@ -791,10 +647,10 @@ where
     if let Some(forward_to) = forward_to {
         let forwarded = NetMessage::from(ConnectMsg::Request {
             id,
-            msg: ConnectRequest::StartRegularReq {
-                target: forward_to.clone(),
-                joiner: joiner.peer.clone(),
-                assigned_location: forward_to.location.unwrap(),
+            msg: ConnectRequest::StartJoinReq {
+                joiner: Some(joiner.peer.clone()),
+                joiner_key: joiner.peer.pub_key().clone(),
+                assigned_location: Some(forward_to.location.unwrap()),
                 hops_to_live: left_htl - 1,
                 max_hops_to_live: left_htl - 1,
             },
@@ -866,9 +722,23 @@ mod messages {
             match self {
                 Response { target, .. } => Some(target),
                 Request {
-                    msg: ConnectRequest::StartGatewayReq { target, .. },
+                    msg:
+                        ConnectRequest::StartJoinReq {
+                            joiner,
+                            assigned_location,
+                            ..
+                        },
                     ..
-                } => Some(target),
+                } => {
+                    if let Some(peer) = joiner {
+                        Some(&PeerKeyLocation {
+                            peer: peer.clone(),
+                            location: assigned_location.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                }
                 Connected { target, .. } => Some(target),
                 _ => None,
             }
@@ -879,10 +749,7 @@ mod messages {
             matches!(
                 self,
                 Response {
-                    msg: ConnectResponse::AcceptedByGateway { .. },
-                    ..
-                } | Response {
-                    msg: ConnectResponse::AcceptedByRegularNode { .. },
+                    msg: ConnectResponse::AcceptedByTarget { .. },
                     ..
                 } | Connected { .. }
             )
@@ -910,15 +777,11 @@ mod messages {
             let id = self.id();
             match self {
                 Self::Request {
-                    msg: ConnectRequest::StartGatewayReq { .. },
+                    msg: ConnectRequest::StartJoinReq { .. },
                     ..
                 } => write!(f, "StartRequest(id: {id})"),
                 Self::Response {
-                    msg: ConnectResponse::AcceptedByGateway { .. },
-                    ..
-                } => write!(f, "RouteValue(id: {id})"),
-                Self::Response {
-                    msg: ConnectResponse::AcceptedByRegularNode { .. },
+                    msg: ConnectResponse::AcceptedByTarget { .. },
                     ..
                 } => write!(f, "RouteValue(id: {id})"),
                 Self::Connected { .. } => write!(f, "Connected(id: {id})"),
@@ -929,23 +792,13 @@ mod messages {
 
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum ConnectRequest {
-        StartGatewayReq {
-            target: PeerKeyLocation,
+        StartJoinReq {
             joiner: Option<PeerId>,
             joiner_key: TransportPublicKey,
+            assigned_location: Option<Location>,
             hops_to_live: usize,
             max_hops_to_live: usize,
         },
-        StartRegularReq {
-            target: PeerKeyLocation,
-            joiner: PeerId,
-            assigned_location: Location,
-            hops_to_live: usize,
-            max_hops_to_live: usize,
-        },
-        /// An external physical connection is going to be attempted to this peer.
-        /// Providing the PeerId of the joiner.
-        InboundNewConnection { inbound_peer_id: PeerId },
         /// Query target should find a good candidate for joiner to join.
         FindOptimalPeer {
             /// Peer whom you are querying new connection about.
@@ -959,17 +812,11 @@ mod messages {
 
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum ConnectResponse {
-        InformRemoteOfConnection {
-            target: PeerKeyLocation,
-        },
-        AcceptedByRegularNode {
-            accepted: bool,
-            your_location: Location,
-        },
-        AcceptedByGateway {
+        AcceptedByTarget {
             accepted: bool,
             your_location: Location,
             your_peer_id: PeerId,
+            next_target: Option<PeerKeyLocation>,
         },
     }
 }
