@@ -40,12 +40,12 @@ impl<T: TimeSource> PacketRateLimiter<T> {
                 tokio::time::sleep(wait_time).await;
                 if let Err(error) = socket.send_to(&packet, socket_addr).await {
                     tracing::debug!("Error sending packet: {:?}", error);
+                } else {
+                    self.add_packet(packet.len());
                 }
-                self.add_packet(packet.len());
+            } else if let Err(error) = socket.send_to(&packet, socket_addr).await {
+                tracing::debug!("Error sending packet: {:?}", error);
             } else {
-                if let Err(error) = socket.send_to(&packet, socket_addr).await {
-                    tracing::debug!("Error sending packet: {:?}", error);
-                }
                 self.add_packet(packet.len());
             }
         }

@@ -464,6 +464,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             };
 
             let mut resend_intro = false;
+            let mut sent_tracker = SentPacketTracker::new();
 
             while failures < Self::NAT_TRAVERSAL_MAX_ATTEMPTS {
                 match state {
@@ -481,9 +482,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             .send((remote_addr, acknowledgment.data().into()))
                             .await
                             .map_err(|_| TransportError::ChannelClosed)?;
-                        let sent_tracker =
-                            Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
-                        sent_tracker.lock().report_sent_packet(
+                        sent_tracker.report_sent_packet(
                             SymmetricMessage::FIRST_PACKET_ID,
                             acknowledgment.data().into(),
                         );
@@ -497,7 +496,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 outbound_symmetric_key: outbound_sym_key
                                     .expect("should be set at this stage"),
                                 remote_addr,
-                                sent_tracker,
+                                sent_tracker: Arc::new(parking_lot::Mutex::new(sent_tracker)),
                                 last_packet_id: Arc::new(AtomicU32::new(0)),
                                 inbound_packet_recv: inbound_recv,
                                 inbound_symmetric_key: inbound_sym_key,
@@ -526,6 +525,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 .send((remote_addr, acknowledgment.data().into()))
                                 .await
                                 .map_err(|_| TransportError::ChannelClosed)?;
+                            sent_tracker.report_sent_packet(
+                                SymmetricMessage::FIRST_PACKET_ID,
+                                acknowledgment.data().into(),
+                            );
                         }
                     }
                 }
@@ -587,9 +590,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                         outbound_symmetric_key: outbound_sym_key,
                                                         remote_addr,
                                                         sent_tracker: Arc::new(
-                                                            parking_lot::Mutex::new(
-                                                                SentPacketTracker::new(),
-                                                            ),
+                                                            parking_lot::Mutex::new(sent_tracker),
                                                         ),
                                                         last_packet_id: Arc::new(AtomicU32::new(0)),
                                                         inbound_packet_recv: inbound_recv,
@@ -849,7 +850,7 @@ mod test {
                 tracing::error!(this = %self.this, "connection closed");
                 return Err(std::io::ErrorKind::ConnectionAborted.into());
             };
-            tracing::trace!(?remote, this = %self.this, "receiving packet from remote");
+            // tracing::trace!(?remote, this = %self.this, "receiving packet from remote");
             buf[..packet.len()].copy_from_slice(&packet[..]);
             Ok((packet.len(), remote))
         }
@@ -870,12 +871,12 @@ mod test {
                 return Ok(0);
             };
             drop(channels);
-            tracing::trace!(?target, ?self.this, "sending packet to remote");
+            // tracing::trace!(?target, ?self.this, "sending packet to remote");
             sender
                 .send((self.this, buf.to_vec()))
                 .await
                 .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
-            tracing::trace!(?target, ?self.this, "packet sent to remote");
+            // tracing::trace!(?target, ?self.this, "packet sent to remote");
             Ok(buf.len())
         }
     }
