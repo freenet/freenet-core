@@ -55,28 +55,45 @@ struct OutboundMessage {
     recv: mpsc::Receiver<SerializedMessage>,
 }
 
-pub(crate) struct ConnectionHandler {
-    send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>,
+pub async fn create_connection_handler<S: Socket>(
+    keypair: TransportKeypair,
+    listen_host: IpAddr,
+    listen_port: u16,
+    is_gateway: bool,
+) -> Result<(OutboundConnectionHandler, InboundConnectionHandler), TransportError> {
+    // Bind the UDP socket to the specified port
+    let socket = S::bind((listen_host, listen_port).into()).await?;
+    let (och, new_connection_notifier) =
+        OutboundConnectionHandler::config_listener(Arc::new(socket), keypair, is_gateway)?;
+    Ok((
+        och,
+        InboundConnectionHandler {
+            new_connection_notifier,
+        },
+    ))
+}
+
+pub(crate) struct InboundConnectionHandler {
     new_connection_notifier: mpsc::Receiver<PeerConnection>,
 }
 
-impl ConnectionHandler {
-    pub async fn new<S: Socket>(
-        keypair: TransportKeypair,
-        listen_host: IpAddr,
-        listen_port: u16,
-        is_gateway: bool,
-    ) -> Result<Self, TransportError> {
-        // Bind the UDP socket to the specified port
-        let socket = S::bind((listen_host, listen_port).into()).await?;
-        Self::config_listener(Arc::new(socket), keypair, is_gateway)
+impl InboundConnectionHandler {
+    pub async fn next_connection(&mut self) -> Option<PeerConnection> {
+        self.new_connection_notifier.recv().await
     }
+}
 
+#[derive(Clone)]
+pub(crate) struct OutboundConnectionHandler {
+    send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>,
+}
+
+impl OutboundConnectionHandler {
     fn config_listener(
         socket: Arc<impl Socket>,
         keypair: TransportKeypair,
         is_gateway: bool,
-    ) -> Result<Self, TransportError> {
+    ) -> Result<(Self, mpsc::Receiver<PeerConnection>), TransportError> {
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(100);
@@ -95,15 +112,14 @@ impl ConnectionHandler {
             DEFAULT_BW_TRACKER_WINDOW_SIZE,
             outbound_recv,
         );
-        let connection_handler = ConnectionHandler {
+        let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
-            new_connection_notifier,
         };
 
         task::spawn(bw_tracker.rate_limiter(BANDWITH_LIMIT, socket));
         task::spawn(transport.listen());
 
-        Ok(connection_handler)
+        Ok((connection_handler, new_connection_notifier))
     }
 
     #[cfg(test)]
@@ -112,7 +128,7 @@ impl ConnectionHandler {
         keypair: TransportKeypair,
         is_gateway: bool,
     ) -> Result<Self, TransportError> {
-        Self::config_listener(socket, keypair, is_gateway)
+        Self::config_listener(socket, keypair, is_gateway).map(|(ocd, _)| ocd)
     }
 
     pub async fn connect(
@@ -146,10 +162,6 @@ impl ConnectionHandler {
                 }),
             })
             .boxed()
-    }
-
-    pub async fn next_connection(&mut self) -> Option<PeerConnection> {
-        self.new_connection_notifier.recv().await
     }
 }
 
@@ -550,7 +562,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         match symmetric_message.payload {
                                             SymmetricMessagePayload::GatewayConnection {
                                                 key,
-                                                remote_addr: my_address,
+                                                your_address: my_address,
                                             } => {
                                                 let outbound_sym_key = Aes128Gcm::new_from_slice(
                                                     &key,
@@ -900,7 +912,7 @@ mod test {
 
     async fn set_peer_connection(
         packet_loss_factor: Option<f64>,
-    ) -> Result<(TransportPublicKey, ConnectionHandler, SocketAddr), DynError> {
+    ) -> Result<(TransportPublicKey, OutboundConnectionHandler, SocketAddr), DynError> {
         static PORT: AtomicU16 = AtomicU16::new(25000);
         let peer_keypair = TransportKeypair::new();
         let peer_pub = peer_keypair.public.clone();
@@ -908,7 +920,7 @@ mod test {
         let socket = Arc::new(
             MockSocket::test_config(packet_loss_factor, (Ipv4Addr::LOCALHOST, port).into()).await,
         );
-        let peer_conn = ConnectionHandler::test_set_up(socket, peer_keypair, false)
+        let peer_conn = OutboundConnectionHandler::test_set_up(socket, peer_keypair, false)
             .expect("failed to create peer");
         Ok((peer_pub, peer_conn, (Ipv4Addr::LOCALHOST, port).into()))
     }

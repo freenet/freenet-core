@@ -174,6 +174,7 @@ impl Operation for ConnectOp {
                                     assigned_location: Some(desirable_peer.location.unwrap()),
                                     hops_to_live: *max_hops_to_live,
                                     max_hops_to_live: *max_hops_to_live,
+                                    skip_list: vec![],
                                 },
                             };
                             network_bridge
@@ -230,10 +231,11 @@ impl Operation for ConnectOp {
                             joiner_key,
                             assigned_location,
                             hops_to_live,
+                            skip_list, //
                             ..
                         },
                 } => {
-                    let joiner = joiner.unwrap();
+                    let joiner = joiner.expect("should be already set at the p2p bridge level");
                     let this_peer = op_manager.ring.own_location();
                     let assigned_location = match assigned_location {
                         Some(location) => location,
@@ -253,9 +255,9 @@ impl Operation for ConnectOp {
                         "Connection request received"
                     );
 
-                    let new_state = if should_accept {
+                    let new_state: Option<ConnectState> = if should_accept {
                         tracing::debug!(tx = %id, "Accepting connection from {:?}", joiner);
-                        Some(ConnectState::AcceptedNewConnection)
+                        None
                     } else {
                         tracing::debug!(tx = %id, at = %this_peer.peer, "Rejecting connection from {:?}", joiner);
                         None
@@ -266,7 +268,11 @@ impl Operation for ConnectOp {
                         peer: joiner.clone(),
                     };
 
-                    let next_target = op_manager.ring.closest_to_location(*assigned_location, &[]);
+                    // let next_target = op_manager.ring.closest_to_location(*assigned_location, &[]);
+                    let next_target =
+                        op_manager
+                            .ring
+                            .routing(*assigned_location, Some(&joiner), [].as_slice());
 
                     let response = ConnectResponse::AcceptedByTarget {
                         accepted: should_accept,
@@ -573,6 +579,7 @@ where
             hops_to_live: max_hops_to_live,
             assigned_location: None,
             max_hops_to_live,
+            skip_list: vec![],
         },
     });
     conn_bridge.send(&gateway.peer, join_req).await?;
@@ -644,6 +651,8 @@ where
             .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))
     };
 
+    let skip_list = vec![req_peer.peer.clone()];
+
     if let Some(forward_to) = forward_to {
         let forwarded = NetMessage::from(ConnectMsg::Request {
             id,
@@ -653,6 +662,7 @@ where
                 assigned_location: Some(forward_to.location.unwrap()),
                 hops_to_live: left_htl - 1,
                 max_hops_to_live: left_htl - 1,
+                skip_list,
             },
         });
         tracing::debug!(
@@ -793,11 +803,15 @@ mod messages {
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum ConnectRequest {
         StartJoinReq {
-            joiner: Option<PeerId>,
+            // The peer who is trying to join, should be set when PeerConnection is established
+            joiner: Option<PeerId>, 
             joiner_key: TransportPublicKey,
+            /// The location assigned to the joiner, initially at gateway connection this is None
             assigned_location: Option<Location>,
             hops_to_live: usize,
             max_hops_to_live: usize,
+            // The list of peers to skip when forwarding the connection request, avoiding loops
+            skip_list: Vec<PeerKeyLocation>,
         },
         /// Query target should find a good candidate for joiner to join.
         FindOptimalPeer {

@@ -36,6 +36,8 @@ pub(crate) enum ConnectionError {
     LocationUnknown,
     #[error("unable to send message")]
     SendNotCompleted,
+    #[error("Unexpected connection req")]
+    UnexpectedReq,
     #[error("error while de/serializing message")]
     #[serde(skip)]
     Serialization(#[from] Option<Box<bincode::ErrorKind>>),
