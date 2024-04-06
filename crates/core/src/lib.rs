@@ -57,5 +57,8 @@ pub mod dev_tool {
     pub use wasm_runtime::{ContractStore, DelegateStore, Runtime, SecretsStore, StateStore};
 }
 
+/// Exports the hight level api for GET, UPDATE, SUBSCRIBE, etc... request from client.
+pub mod client_api;
+
 #[cfg(test)]
 pub mod test_utils;

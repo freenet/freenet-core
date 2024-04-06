@@ -1,0 +1,192 @@
+use std::{fs::File, io::Read, path::PathBuf};
+
+use crate::dev_tool::{
+    ClientId, Config, ContractStore, DelegateStore, Executor, OperationMode, SecretsStore,
+    StateStore, Storage,
+};
+use freenet_stdlib::{
+    client_api::{ClientRequest, ContractRequest, DelegateRequest},
+    prelude::*,
+};
+
+//use crate::api_request::config::{BaseConfig, PutConfig, UpdateConfig};
+
+const MAX_MEM_CACHE: u32 = 10_000_000;
+const DEFAULT_MAX_CONTRACT_SIZE: i64 = 50 * 1024 * 1024;
+const DEFAULT_MAX_DELEGATE_SIZE: i64 = 50 * 1024 * 1024;
+
+#[derive(Debug, Clone, clap::Subcommand)]
+pub(crate) enum PutType {
+    /// Puts a new contract
+    Contract(PutContract),
+    /// Puts a new delegate
+    Delegate(PutDelegate),
+}
+
+#[derive(clap::Parser, Clone, Debug)]
+pub(crate) struct PutContract {
+    /// A path to a JSON file listing the related contracts.
+    #[arg(long)]
+    pub(crate) related_contracts: Option<PathBuf>,
+    /// A path to the initial state for the contract being published.
+    #[arg(long)]
+    pub(crate) state: PathBuf,
+}
+
+#[derive(clap::Parser, Clone, Debug)]
+pub(crate) struct PutDelegate {
+    /// Base58 encoded nonce. If empty the default value will be used, this is only allowed in local mode.
+    #[arg(long, env = "DELEGATE_NONCE", default_value_t = String::new())]
+    pub(crate) nonce: String,
+    /// Base58 encoded cipher. If empty the default value will be used, this is only allowed in local mode.
+    #[arg(long, env = "DELEGATE_CIPHER", default_value_t = String::new())]
+    pub(crate) cipher: String,
+}
+
+
+
+/*
+pub async fn put(config: PutConfig, other: BaseConfig) -> Result<(), anyhow::Error> {
+    if config.release {
+        anyhow::bail!("Cannot publish contracts in the network yet");
+    }
+    let params = if let Some(params) = &config.parameters {
+        let mut buf = vec![];
+        File::open(params)?.read_to_end(&mut buf)?;
+        Parameters::from(buf)
+    } else {
+        Parameters::from(&[] as &[u8])
+    };
+    match &config.package_type {
+        PutType::Contract(contract) => put_contract(&config, contract, other, params).await,
+        PutType::Delegate(delegate) => put_delegate(&config, delegate, other, params).await,
+    }
+}
+*/
+
+
+
+
+/*async fn put_contract(
+    config: &PutConfig,
+    contract_config: &PutContract,
+    other: BaseConfig,
+    params: Parameters<'static>,
+) -> Result<(), anyhow::Error> {
+    let contract = ContractContainer::try_from((config.code.as_path(), params))?;
+    let state = {
+        let mut buf = vec![];
+        File::open(&contract_config.state)?.read_to_end(&mut buf)?;
+        buf.into()
+    };
+    let related_contracts = if let Some(_related) = &contract_config.related_contracts {
+        todo!("use `related` contracts")
+    } else {
+        Default::default()
+    };
+
+    println!("Putting contract {}", contract.key());
+    let request = ContractRequest::Put {
+        contract,
+        state,
+        related_contracts,
+    }
+    .into();
+    execute_command(request, other).await
+}
+
+async fn put_delegate(
+    config: &PutConfig,
+    delegate_config: &PutDelegate,
+    other: BaseConfig,
+    params: Parameters<'static>,
+) -> Result<(), anyhow::Error> {
+    let delegate = DelegateContainer::try_from((config.code.as_path(), params))?;
+
+    let (cipher, nonce) = if delegate_config.cipher.is_empty() && delegate_config.nonce.is_empty() {
+        println!(
+"Using default cipher and nonce. 
+For additional hardening is recommended to use a different cipher and nonce to encrypt secrets in storage.");
+        (
+            ::freenet_stdlib::client_api::DelegateRequest::DEFAULT_CIPHER,
+            ::freenet_stdlib::client_api::DelegateRequest::DEFAULT_NONCE,
+        )
+    } else {
+        let mut cipher = [0; 32];
+        bs58::decode(delegate_config.cipher.as_bytes())
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .onto(&mut cipher)?;
+
+        let mut nonce = [0; 24];
+        bs58::decode(delegate_config.nonce.as_bytes())
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .onto(&mut nonce)?;
+        (cipher, nonce)
+    };
+
+    println!("Putting delegate {} ", delegate.key().encode());
+    let request = DelegateRequest::RegisterDelegate {
+        delegate,
+        cipher,
+        nonce,
+    }
+    .into();
+    execute_command(request, other).await
+}
+*/
+
+/// send Update Request to the contract at `key` contract.
+pub async fn update(
+    key: String,
+    delta: Vec<u8>,
+    contract_data_dir: Option<PathBuf>,
+    delegate_data_dir: Option<PathBuf>,
+    secret_data_dir: Option<PathBuf>,
+    database_dir: Option<PathBuf>
+) -> Result<(), anyhow::Error> {
+    //if config.release {
+        anyhow::bail!("Cannot publish contracts in the network yet");
+    //}
+    let key = ContractInstanceId::try_from(key)?.into();
+    println!("Updating contract {key}");
+    let data = StateDelta::from(delta).into();
+    let request = ContractRequest::Update { key, data }.into();
+    execute_command(request, contract_data_dir, delegate_data_dir, secret_data_dir, database_dir).await
+}
+
+/// Execute a request command of type ClientRequest.
+pub async fn execute_command(
+    request: ClientRequest<'static>,
+    contract_data_dir: Option<PathBuf>,
+    delegate_data_dir: Option<PathBuf>,
+    secret_data_dir: Option<PathBuf>,
+    database_dir: Option<PathBuf>
+) -> Result<(), anyhow::Error> {
+    let contracts_data_path = contract_data_dir
+        .unwrap_or_else(|| Config::conf().contracts_dir());
+    let delegates_data_path = delegate_data_dir
+        .unwrap_or_else(|| Config::conf().delegates_dir());
+    let secrets_data_path = secret_data_dir
+        .unwrap_or_else(|| Config::conf().secrets_dir());
+    let database_path = database_dir
+        .unwrap_or_else(|| Config::conf().db_dir());
+    let contract_store = ContractStore::new(contracts_data_path, DEFAULT_MAX_CONTRACT_SIZE)?;
+    let delegate_store = DelegateStore::new(delegates_data_path, DEFAULT_MAX_DELEGATE_SIZE)?;
+    let secret_store = SecretsStore::new(secrets_data_path)?;
+    let state_store = StateStore::new(Storage::new(Some(&database_path)).await?, MAX_MEM_CACHE)?;
+    let rt =
+        crate::dev_tool::Runtime::build(contract_store, delegate_store, secret_store, false)?;
+    let mut executor = Executor::new(state_store, || Ok(()), OperationMode::Local, rt, None)
+        .await
+        .map_err(|err| anyhow::anyhow!(err))?;
+
+    executor
+        .handle_request(ClientId::FIRST, request, None)
+        .await
+        .map_err(|err| {
+            tracing::error!("{err}");
+            err
+        })?;
+
+    Ok(())
+}
