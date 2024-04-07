@@ -223,8 +223,8 @@ impl PeerConnection {
                                     .send((self.remote_conn.remote_addr, packet.clone()))
                                     .await
                                     .map_err(|_| TransportError::ConnectionClosed)?;
-                                tracing::trace!(%idx, remote = ?self.remote_conn.remote_addr, "packet resent");
                                 self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
+                                tracing::trace!(%idx, remote = ?self.remote_conn.remote_addr, "packet resent");
                             }
                         }
                     }
@@ -254,12 +254,11 @@ impl PeerConnection {
                 payload,
             } => {
                 if let Some(sender) = self.inbound_streams.get(&stream_id) {
-                    tracing::trace!(%stream_id, %fragment_number, "pushing fragment to existing stream");
                     sender
                         .send((fragment_number, payload))
                         .await
                         .map_err(|_| TransportError::ConnectionClosed)?;
-                    tracing::trace!(%stream_id, %fragment_number, "fragment pushed");
+                    tracing::trace!(%stream_id, %fragment_number, "fragment pushed to existing stream");
                 } else {
                     let (sender, receiver) = mpsc::channel(1);
                     tracing::trace!(%stream_id, %fragment_number, "new stream");
@@ -270,7 +269,6 @@ impl PeerConnection {
                         tracing::trace!(%stream_id, %fragment_number, "stream finished");
                         return Ok(Some(msg));
                     }
-                    tracing::trace!(%stream_id, "listening for more fragments");
                     self.inbound_stream_futures
                         .push(tokio::spawn(inbound_stream::recv_stream(
                             stream_id, receiver, stream,

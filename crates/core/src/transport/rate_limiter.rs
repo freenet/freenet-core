@@ -49,7 +49,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
                 self.add_packet(packet.len());
             }
         }
-        tracing::error!("Rate limiter task ended unexpectedly");
+        tracing::debug!("Rate limiter task ended unexpectedly");
     }
 
     /// Report that a packet was sent

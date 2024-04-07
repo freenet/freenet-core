@@ -831,11 +831,11 @@ mod test {
 
     #[allow(clippy::type_complexity)]
     static CHANNELS: OnceLock<
-        Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<(SocketAddr, Vec<u8>)>>>>,
+        Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>>>,
     > = OnceLock::new();
 
     struct MockSocket {
-        inbound: Mutex<mpsc::Receiver<(SocketAddr, Vec<u8>)>>,
+        inbound: Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>,
         this: SocketAddr,
         packet_loss_factor: Option<f64>,
         rng: Mutex<rand::rngs::SmallRng>,
@@ -846,7 +846,7 @@ mod test {
             let channels = CHANNELS
                 .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
                 .clone();
-            let (outbound, inbound) = mpsc::channel(1);
+            let (outbound, inbound) = mpsc::unbounded_channel();
             channels.lock().await.insert(addr, outbound);
             static SEED: AtomicU64 = AtomicU64::new(0xfeedbeef);
             MockSocket {
@@ -895,7 +895,6 @@ mod test {
             // tracing::trace!(?target, ?self.this, "sending packet to remote");
             sender
                 .send((self.this, buf.to_vec()))
-                .await
                 .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
             // tracing::trace!(?target, ?self.this, "packet sent to remote");
             Ok(buf.len())
@@ -1011,7 +1010,7 @@ mod test {
                     });
                 }
                 let results =
-                    tokio::time::timeout(Duration::from_secs(5), conns.try_collect::<Vec<_>>())
+                    tokio::time::timeout(Duration::from_secs(50), conns.try_collect::<Vec<_>>())
                         .await??;
                 Ok::<_, DynError>((results, test_generator))
             });

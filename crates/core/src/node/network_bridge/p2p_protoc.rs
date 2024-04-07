@@ -20,7 +20,6 @@ use libp2p::{
     identify,
     identity::Keypair,
     multiaddr::Protocol,
-    ping,
     swarm::{
         self,
         dial_opts::DialOpts,
@@ -81,8 +80,6 @@ fn config_behaviour(
     )
     .with_agent_version(CURRENT_AGENT_VER.to_string());
 
-    let ping = ping::Behaviour::default();
-
     let peer_id = private_key.public().to_peer_id();
     let auto_nat = {
         let config = autonat::Config {
@@ -97,7 +94,6 @@ fn config_behaviour(
     };
 
     NetBehaviour {
-        ping,
         identify: identify::Behaviour::new(ident_config),
         auto_nat,
         freenet: FreenetBehaviour {
@@ -1192,7 +1188,6 @@ fn decode_msg(buf: BytesMut) -> Result<NetMessage, ConnectionError> {
 #[behaviour(to_swarm = "NetEvent")]
 pub(in crate::node) struct NetBehaviour {
     identify: identify::Behaviour,
-    ping: ping::Behaviour,
     freenet: FreenetBehaviour,
     auto_nat: autonat::Behaviour,
 }
@@ -1201,7 +1196,6 @@ pub(in crate::node) struct NetBehaviour {
 pub(in crate::node) enum NetEvent {
     Freenet(Box<NetMessage>),
     Identify(Box<identify::Event>),
-    Ping(ping::Event),
     Autonat(autonat::Event),
 }
 
@@ -1214,12 +1208,6 @@ impl From<autonat::Event> for NetEvent {
 impl From<identify::Event> for NetEvent {
     fn from(event: identify::Event) -> NetEvent {
         Self::Identify(Box::new(event))
-    }
-}
-
-impl From<ping::Event> for NetEvent {
-    fn from(event: ping::Event) -> NetEvent {
-        Self::Ping(event)
     }
 }
 
