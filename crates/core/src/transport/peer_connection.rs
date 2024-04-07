@@ -209,11 +209,6 @@ impl PeerConnection {
                             .get_resend();
                         match maybe_resend {
                             ResendAction::WaitUntil(wait_until) => {
-                                tracing::trace!(
-                                    remote = ?self.remote_conn.remote_addr,
-                                    wait_time_ns = (std::time::Instant::now() - wait_until).as_nanos(),
-                                    "waiting for resend"
-                                );
                                 resend_check = Some(tokio::time::sleep_until(wait_until.into()));
                                 break;
                             }
@@ -224,7 +219,6 @@ impl PeerConnection {
                                     .await
                                     .map_err(|_| TransportError::ConnectionClosed)?;
                                 self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
-                                tracing::trace!(%idx, remote = ?self.remote_conn.remote_addr, "packet resent");
                             }
                         }
                     }
@@ -421,7 +415,6 @@ mod tests {
                 else {
                     return Err("unexpected message".into());
                 };
-                println!("fragment_number: {}", fragment_number);
                 tx.send((fragment_number, payload)).await?;
             }
             let (_, msg) = inbound_msg

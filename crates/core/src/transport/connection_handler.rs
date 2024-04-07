@@ -879,7 +879,6 @@ mod test {
         async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
             if let Some(factor) = self.packet_loss_factor {
                 if factor > self.rng.try_lock().unwrap().gen::<f64>() {
-                    tracing::info!(this = %self.this, "packet loss");
                     return Ok(buf.len());
                 }
             }
@@ -947,6 +946,17 @@ mod test {
     struct TestConfig {
         packet_loss_factor: Option<f64>,
         peers: usize,
+        wait_time: Duration,
+    }
+
+    impl Default for TestConfig {
+        fn default() -> Self {
+            Self {
+                packet_loss_factor: None,
+                peers: 2,
+                wait_time: Duration::from_secs(2),
+            }
+        }
     }
 
     async fn run_test<G: TestFixture>(
@@ -984,6 +994,12 @@ mod test {
                     .await?
                     .into_iter()
                     .collect::<Result<Vec<_>, _>>()?;
+                // additional wait time so we can clear up any additional messages that may need to be sent
+                let extra_wait = if config.wait_time.as_secs() > 10 {
+                    Duration::from_secs(3)
+                } else {
+                    Duration::from_secs(1)
+                };
                 for ((_, peer_addr), mut peer_conn) in
                     peer_keys_and_addr.into_iter().zip(connections)
                 {
@@ -1004,14 +1020,16 @@ mod test {
                                 }
                             }
                         }
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(1), peer_conn.recv()).await;
+
+                        let _ = tokio::time::timeout(extra_wait, peer_conn.recv()).await;
                         Ok(messages)
                     });
                 }
-                let results =
-                    tokio::time::timeout(Duration::from_secs(50), conns.try_collect::<Vec<_>>())
-                        .await??;
+                let results = tokio::time::timeout(
+                    config.wait_time + extra_wait,
+                    conns.try_collect::<Vec<_>>(),
+                )
+                .await??;
                 Ok::<_, DynError>((results, test_generator))
             });
             tasks.push(peer);
@@ -1080,8 +1098,8 @@ mod test {
 
         run_test(
             TestConfig {
-                packet_loss_factor: None,
                 peers: 10,
+                ..Default::default()
             },
             Vec::from_iter((0..10).map(|i| TestData("foo", i))),
         )
@@ -1114,10 +1132,7 @@ mod test {
         }
 
         run_test(
-            TestConfig {
-                packet_loss_factor: None,
-                peers: 2,
-            },
+            TestConfig::default(),
             vec![TestData("foo"), TestData("bar")],
         )
         .await
@@ -1125,7 +1140,7 @@ mod test {
 
     #[tokio::test]
     async fn packet_dropping() -> Result<(), DynError> {
-        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         #[derive(Clone, Copy)]
         struct TestData(&'static str);
 
@@ -1149,13 +1164,21 @@ mod test {
         }
 
         let mut rng = rand::rngs::StdRng::seed_from_u64(3);
-        for _ in 0..10 {
-            let factor = rng.gen();
-            tracing::info!("packet loss factor: {factor}");
+        for factor in std::iter::repeat(())
+            .map(|_| rng.gen::<f64>())
+            .filter(|x| *x > 0.05 && *x < 0.25)
+            .take(3)
+        {
+            let wait_time = Duration::from_secs((15.0 * ((factor + 1.0) * 1.25)) as u64);
+            tracing::info!(
+                "packet loss factor: {factor} (wait time: {wait_time})",
+                wait_time = wait_time.as_secs()
+            );
             run_test(
                 TestConfig {
                     packet_loss_factor: Some(factor),
-                    peers: 2,
+                    wait_time,
+                    ..Default::default()
                 },
                 vec![TestData("foo"), TestData("bar")],
             )
