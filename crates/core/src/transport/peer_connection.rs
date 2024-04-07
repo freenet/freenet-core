@@ -124,7 +124,6 @@ impl PeerConnection {
     }
 
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
-        tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for incoming messages");
         // listen for incoming messages or receipts or wait until is time to do anything else again
         let mut resend_check = Some(tokio::time::sleep(tokio::time::Duration::from_secs(1)));
         loop {
@@ -136,7 +135,7 @@ impl PeerConnection {
                         tracing::debug!(%error, remote = ?self.remote_conn.remote_addr, "Failed to decrypt packet, might be an intro packet or a partial packet");
                     }) else {
                         // just ignore this message
-                        // TODO: maybbe check how frequently this happens and decide to drop a connection based on that
+                        // TODO: maybe check how frequently this happens and decide to drop a connection based on that
                         // if it is partial packets being received too often
                         // TODO: this branch should at much happen UdpPacketsListener::NAT_TRAVERSAL_MAX_ATTEMPTS
                         // for intro packets will be sent than this amount, so we could be checking for that initially
@@ -160,7 +159,6 @@ impl PeerConnection {
                         .sent_tracker
                         .lock()
                         .report_received_receipts(&confirm_receipt);
-                    tracing::trace!(%packet_id, remote = %self.remote_conn.remote_addr, "received packet");
                     match self.received_tracker.report_received_packet(packet_id) {
                         ReportResult::Ok => {}
                         ReportResult::AlreadyReceived => {
@@ -169,10 +167,10 @@ impl PeerConnection {
                         }
                         ReportResult::QueueFull => {
                             let receipts = self.received_tracker.get_receipts();
+                            tracing::debug!(?receipts, "queue full, reporting receipts");
                             self.noop(receipts).await?;
                         },
                     }
-                    tracing::trace!(%packet_id, "processing inbound packet");
                     if let Some(msg) = self.process_inbound(payload).await.map_err(|error| {
                         tracing::error!(%error, %packet_id, remote = %self.remote_conn.remote_addr, "error processing inbound packet");
                         error
@@ -192,6 +190,7 @@ impl PeerConnection {
                         continue;
                     };
                     self.inbound_streams.remove(&stream_id);
+                    tracing::trace!(%stream_id, "stream finished");
                     return Ok(msg);
                 }
                 outbound_stream = self.outbound_stream_futures.next(), if !self.outbound_stream_futures.is_empty() => {
@@ -219,7 +218,6 @@ impl PeerConnection {
                                 break;
                             }
                             ResendAction::Resend(idx, packet) => {
-                                tracing::trace!(%idx, remote = ?self.remote_conn.remote_addr, "resending packet");
                                 self.remote_conn
                                     .outbound_packets
                                     .send((self.remote_conn.remote_addr, packet.clone()))

@@ -44,11 +44,12 @@ impl<T: TimeSource> PacketRateLimiter<T> {
                     self.add_packet(packet.len());
                 }
             } else if let Err(error) = socket.send_to(&packet, socket_addr).await {
-                tracing::debug!("Error sending packet: {:?}", error);
+                tracing::debug!(%socket_addr, "Error sending packet: {:?}", error);
             } else {
                 self.add_packet(packet.len());
             }
         }
+        tracing::error!("Rate limiter task ended unexpectedly");
     }
 
     /// Report that a packet was sent

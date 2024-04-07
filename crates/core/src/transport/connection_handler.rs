@@ -68,13 +68,20 @@ impl ConnectionHandler {
     ) -> Result<Self, TransportError> {
         // Bind the UDP socket to the specified port
         let socket = Arc::new(S::bind((Ipv4Addr::UNSPECIFIED, listen_port).into()).await?);
-        Self::config_listener(socket, keypair, is_gateway)
+        Self::config_listener(
+            socket,
+            keypair,
+            is_gateway,
+            #[cfg(test)]
+            (Ipv4Addr::UNSPECIFIED, listen_port).into(),
+        )
     }
 
     fn config_listener(
         socket: Arc<impl Socket>,
         keypair: TransportKeypair,
         is_gateway: bool,
+        #[cfg(test)] socket_addr: SocketAddr,
     ) -> Result<Self, TransportError> {
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
@@ -89,6 +96,8 @@ impl ConnectionHandler {
             connection_handler: conn_handler_receiver,
             new_connection_notifier: new_connection_sender,
             outbound_packets: outbound_sender,
+            #[cfg(test)]
+            this_addr: socket_addr,
         };
         let bw_tracker = super::rate_limiter::PacketRateLimiter::new(
             DEFAULT_BW_TRACKER_WINDOW_SIZE,
@@ -107,11 +116,12 @@ impl ConnectionHandler {
 
     #[cfg(test)]
     fn test_set_up(
+        socket_addr: SocketAddr,
         socket: Arc<impl Socket>,
         keypair: TransportKeypair,
         is_gateway: bool,
     ) -> Result<Self, TransportError> {
-        Self::config_listener(socket, keypair, is_gateway)
+        Self::config_listener(socket, keypair, is_gateway, socket_addr)
     }
 
     pub async fn connect(
@@ -171,6 +181,8 @@ struct UdpPacketsListener<S = UdpSocket> {
     is_gateway: bool,
     new_connection_notifier: mpsc::Sender<PeerConnection>,
     outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
+    #[cfg(test)]
+    this_addr: SocketAddr,
 }
 
 type OngoingConnection = (
@@ -184,6 +196,13 @@ type OngoingConnectionResult = Option<
         tokio::task::JoinError,
     >,
 >;
+
+impl<T> Drop for UdpPacketsListener<T> {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        tracing::info!(%self.this_addr, "Dropping UdpPacketsListener");
+    }
+}
 
 impl<S: Socket> UdpPacketsListener<S> {
     async fn listen(mut self) -> Result<(), TransportError> {
@@ -205,9 +224,9 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                             if let Some((packets_sender, open_connection)) = ongoing_connections.remove(&remote_addr) {
                                 if packets_sender.send(packet_data).await.is_err() {
+                                    // it can happen that the connection is established but the channel is closed because the task completed
+                                    // but we still ahven't polled the result future
                                     tracing::debug!(%remote_addr, "failed to send packet to remote");
-                                    let _ = open_connection.send(Err(TransportError::ConnectionClosed));
-                                    continue;
                                 }
                                 ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
                                 continue;
@@ -236,10 +255,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                     };
                     match res.expect("task shouldn't panic") {
                         Ok((outbound_remote_conn, inbound_remote_connection)) => {
-                            tracing::debug!(%outbound_remote_conn.remote_addr, "connection established");
                             if let Some((_, result_sender)) = ongoing_connections.remove(&outbound_remote_conn.remote_addr) {
+                                tracing::debug!(%outbound_remote_conn.remote_addr, "connection established");
                                 self.remote_connections.insert(outbound_remote_conn.remote_addr, inbound_remote_connection);
                                 let _ = result_sender.send(Ok(outbound_remote_conn));
+                            } else {
+                                tracing::error!(%outbound_remote_conn.remote_addr, "connection established but no ongoing connection found");
                             }
                         }
                         Err((error, remote_addr)) => {
@@ -907,8 +928,13 @@ mod test {
         let socket = Arc::new(
             MockSocket::test_config(packet_loss_factor, (Ipv4Addr::LOCALHOST, port).into()).await,
         );
-        let peer_conn = ConnectionHandler::test_set_up(socket, peer_keypair, false)
-            .expect("failed to create peer");
+        let peer_conn = ConnectionHandler::test_set_up(
+            (Ipv4Addr::LOCALHOST, port).into(),
+            socket,
+            peer_keypair,
+            false,
+        )
+        .expect("failed to create peer");
         Ok((peer_pub, peer_conn, (Ipv4Addr::LOCALHOST, port).into()))
     }
 
@@ -1065,6 +1091,7 @@ mod test {
 
     #[tokio::test]
     async fn simulate_send_streamed_message() -> Result<(), DynError> {
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         #[derive(Clone, Copy)]
         struct TestData(&'static str);
 
