@@ -919,7 +919,21 @@ mod test {
     async fn set_peer_connection(
         packet_loss_factor: Option<f64>,
     ) -> Result<(TransportPublicKey, ConnectionHandler, SocketAddr), DynError> {
+        set_peer_connection_in(packet_loss_factor, false).await
+    }
+
+    async fn set_gateway_connection(
+        packet_loss_factor: Option<f64>,
+    ) -> Result<(TransportPublicKey, ConnectionHandler, SocketAddr), DynError> {
+        set_peer_connection_in(packet_loss_factor, true).await
+    }
+
+    async fn set_peer_connection_in(
+        packet_loss_factor: Option<f64>,
+        gateway: bool,
+    ) -> Result<(TransportPublicKey, ConnectionHandler, SocketAddr), DynError> {
         static PORT: AtomicU16 = AtomicU16::new(25000);
+
         let peer_keypair = TransportKeypair::new();
         let peer_pub = peer_keypair.public.clone();
         let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -930,7 +944,7 @@ mod test {
             (Ipv4Addr::LOCALHOST, port).into(),
             socket,
             peer_keypair,
-            false,
+            gateway,
         )
         .expect("failed to create peer");
         Ok((peer_pub, peer_conn, (Ipv4Addr::LOCALHOST, port).into()))
@@ -1056,6 +1070,30 @@ mod test {
         // crate::config::set_logger();
         let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(None).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection(None).await?;
+
+        let peer_b = tokio::spawn(async move {
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
+            let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+            Ok::<_, DynError>(())
+        });
+
+        let peer_a = tokio::spawn(async move {
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false).await;
+            let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            Ok::<_, DynError>(())
+        });
+
+        let (a, b) = tokio::try_join!(peer_a, peer_b)?;
+        a?;
+        b?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simulate_gateway_traversal() -> Result<(), DynError> {
+        // crate::config::set_logger();
+        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(None).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) = set_gateway_connection(None).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
