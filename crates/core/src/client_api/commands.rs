@@ -145,7 +145,7 @@ pub async fn update(
     database_dir: Option<PathBuf>
 ) -> Result<(), anyhow::Error> {
     //if config.release {
-        anyhow::bail!("Cannot publish contracts in the network yet");
+    //    anyhow::bail!("Cannot publish contracts in the network yet");
     //}
     let key = ContractInstanceId::try_from(key)?.into();
     println!("Updating contract {key}");

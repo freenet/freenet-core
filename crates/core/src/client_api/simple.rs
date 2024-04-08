@@ -28,7 +28,7 @@ impl API {
         //    anyhow::bail!("Cannot publish contracts in the network yet");
         //}
         let key = ContractInstanceId::try_from(key)?.into();
-        println!("Updating contract {key}");
+        println!("Updating contract {key:?}");
         let data = StateDelta::from(delta).into();
         let request = ContractRequest::Update { key, data }.into();
         commands::execute_command(request, Some(Config::conf().contracts_dir()), Some(Config::conf().delegates_dir()), Some(Config::conf().secrets_dir()), Some(Config::conf().db_dir())).await
