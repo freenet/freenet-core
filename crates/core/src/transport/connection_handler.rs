@@ -814,8 +814,9 @@ mod test {
     use std::{
         collections::HashMap,
         net::Ipv4Addr,
+        ops::Range,
         sync::{
-            atomic::{AtomicU16, AtomicU64},
+            atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
             OnceLock,
         },
     };
@@ -834,15 +835,27 @@ mod test {
         Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>>>,
     > = OnceLock::new();
 
+    #[derive(Default, Clone)]
+    enum PacketDropPolicy {
+        /// Receive all packets without dropping
+        #[default]
+        ReceiveAll,
+        /// Drop the packets randomly based on the factor
+        Factor(f64),
+        /// Drop packets fall in the given range
+        Range(Range<usize>),
+    }
+
     struct MockSocket {
         inbound: Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>,
         this: SocketAddr,
-        packet_loss_factor: Option<f64>,
+        packet_drop_policy: PacketDropPolicy,
+        num_packets_sent: AtomicUsize,
         rng: Mutex<rand::rngs::SmallRng>,
     }
 
     impl MockSocket {
-        async fn test_config(packet_loss_factor: Option<f64>, addr: SocketAddr) -> Self {
+        async fn test_config(packet_drop_policy: PacketDropPolicy, addr: SocketAddr) -> Self {
             let channels = CHANNELS
                 .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
                 .clone();
@@ -852,7 +865,8 @@ mod test {
             MockSocket {
                 inbound: Mutex::new(inbound),
                 this: addr,
-                packet_loss_factor,
+                packet_drop_policy,
+                num_packets_sent: AtomicUsize::new(0),
                 rng: Mutex::new(rand::rngs::SmallRng::seed_from_u64(
                     SEED.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
                 )),
@@ -877,11 +891,23 @@ mod test {
         }
 
         async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
-            if let Some(factor) = self.packet_loss_factor {
-                if factor > self.rng.try_lock().unwrap().gen::<f64>() {
-                    return Ok(buf.len());
+            let packet_idx = self.num_packets_sent.fetch_add(1, Ordering::Release);
+            match &self.packet_drop_policy {
+                PacketDropPolicy::ReceiveAll => {}
+                PacketDropPolicy::Factor(factor) => {
+                    if *factor > self.rng.try_lock().unwrap().gen::<f64>() {
+                        tracing::trace!(id=%packet_idx, data=?buf, "drop packet");
+                        return Ok(buf.len());
+                    }
+                }
+                PacketDropPolicy::Range(r) => {
+                    if r.contains(&packet_idx) {
+                        tracing::trace!(id=%packet_idx, data=?buf, "drop packet");
+                        return Ok(buf.len());
+                    }
                 }
             }
+
             assert!(self.this != target, "cannot send to self");
             let channels = CHANNELS
                 .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
@@ -917,19 +943,19 @@ mod test {
     }
 
     async fn set_peer_connection(
-        packet_loss_factor: Option<f64>,
+        packet_drop_policy: PacketDropPolicy,
     ) -> Result<(TransportPublicKey, ConnectionHandler, SocketAddr), DynError> {
-        set_peer_connection_in(packet_loss_factor, false).await
+        set_peer_connection_in(packet_drop_policy, false).await
     }
 
     async fn set_gateway_connection(
-        packet_loss_factor: Option<f64>,
+        packet_drop_policy: PacketDropPolicy,
     ) -> Result<(TransportPublicKey, ConnectionHandler, SocketAddr), DynError> {
-        set_peer_connection_in(packet_loss_factor, true).await
+        set_peer_connection_in(packet_drop_policy, true).await
     }
 
     async fn set_peer_connection_in(
-        packet_loss_factor: Option<f64>,
+        packet_drop_policy: PacketDropPolicy,
         gateway: bool,
     ) -> Result<(TransportPublicKey, ConnectionHandler, SocketAddr), DynError> {
         static PORT: AtomicU16 = AtomicU16::new(25000);
@@ -938,7 +964,7 @@ mod test {
         let peer_pub = peer_keypair.public.clone();
         let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let socket = Arc::new(
-            MockSocket::test_config(packet_loss_factor, (Ipv4Addr::LOCALHOST, port).into()).await,
+            MockSocket::test_config(packet_drop_policy, (Ipv4Addr::LOCALHOST, port).into()).await,
         );
         let peer_conn = ConnectionHandler::test_set_up(
             (Ipv4Addr::LOCALHOST, port).into(),
@@ -958,7 +984,7 @@ mod test {
     }
 
     struct TestConfig {
-        packet_loss_factor: Option<f64>,
+        packet_drop_policy: PacketDropPolicy,
         peers: usize,
         wait_time: Duration,
     }
@@ -966,7 +992,7 @@ mod test {
     impl Default for TestConfig {
         fn default() -> Self {
             Self {
-                packet_loss_factor: None,
+                packet_drop_policy: PacketDropPolicy::ReceiveAll,
                 peers: 2,
                 wait_time: Duration::from_secs(2),
             }
@@ -982,7 +1008,7 @@ mod test {
         let mut peer_conns = vec![];
         for _ in 0..config.peers {
             let (peer_pub, peer, peer_addr) =
-                set_peer_connection(config.packet_loss_factor).await?;
+                set_peer_connection(config.packet_drop_policy.clone()).await?;
             peer_keys_and_addr.push((peer_pub, peer_addr));
             peer_conns.push(peer);
         }
@@ -1068,8 +1094,8 @@ mod test {
     #[tokio::test]
     async fn simulate_nat_traversal() -> Result<(), DynError> {
         // crate::config::set_logger();
-        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(None).await?;
-        let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection(None).await?;
+        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection(Default::default()).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
@@ -1092,8 +1118,34 @@ mod test {
     #[tokio::test]
     async fn simulate_gateway_traversal() -> Result<(), DynError> {
         // crate::config::set_logger();
-        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(None).await?;
-        let (peer_b_pub, mut peer_b, peer_b_addr) = set_gateway_connection(None).await?;
+        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) =
+            set_gateway_connection(Default::default()).await?;
+
+        let peer_b = tokio::spawn(async move {
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
+            let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+            Ok::<_, DynError>(())
+        });
+
+        let peer_a = tokio::spawn(async move {
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false).await;
+            let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            Ok::<_, DynError>(())
+        });
+
+        let (a, b) = tokio::try_join!(peer_a, peer_b)?;
+        a?;
+        b?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simulate_gateway_traversal_drop_first_3_packets() -> Result<(), DynError> {
+        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) =
+            set_gateway_connection(PacketDropPolicy::Range(0..3)).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
@@ -1178,7 +1230,7 @@ mod test {
 
     #[tokio::test]
     async fn packet_dropping() -> Result<(), DynError> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         #[derive(Clone, Copy)]
         struct TestData(&'static str);
 
@@ -1214,7 +1266,7 @@ mod test {
             );
             run_test(
                 TestConfig {
-                    packet_loss_factor: Some(factor),
+                    packet_drop_policy: PacketDropPolicy::Factor(factor),
                     wait_time,
                     ..Default::default()
                 },
