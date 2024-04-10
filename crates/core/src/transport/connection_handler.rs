@@ -1140,12 +1140,38 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn simulate_gateway_traversal_drop_first_3_packets() -> Result<(), DynError> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn simulate_gateway_traversal_drop_first_3_packets_of_gateway() -> Result<(), DynError> {
         crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
             set_gateway_connection(PacketDropPolicy::Range(0..3)).await?;
+
+        let peer_b = tokio::spawn(async move {
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
+            let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+            Ok::<_, DynError>(())
+        });
+
+        let peer_a = tokio::spawn(async move {
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false).await;
+            let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            Ok::<_, DynError>(())
+        });
+
+        let (a, b) = tokio::try_join!(peer_a, peer_b)?;
+        a?;
+        b?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn simulate_gateway_traversal_drop_first_3_packets_of_peer() -> Result<(), DynError> {
+        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        let (peer_a_pub, mut peer_a, peer_a_addr) =
+            set_peer_connection(PacketDropPolicy::Range(0..3)).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) =
+            set_gateway_connection(Default::default()).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
