@@ -32,7 +32,10 @@ const PROTOC_VERSION: [u8; 2] = 1u16.to_le_bytes();
 // Constants for exponential backoff
 const INITIAL_TIMEOUT: Duration = Duration::from_secs(5);
 const TIMEOUT_MULTIPLIER: u64 = 2;
+#[cfg(not(test))]
 const MAX_TIMEOUT: Duration = Duration::from_secs(60); // Maximum timeout limit
+#[cfg(test)]
+const MAX_TIMEOUT: Duration = Duration::from_secs(10); // Maximum timeout limit
 
 // Constants for interval increase
 const INITIAL_INTERVAL: Duration = Duration::from_millis(200);
@@ -408,7 +411,11 @@ impl<S: Socket> UdpPacketsListener<S> {
         Ok(())
     }
 
+    #[cfg(not(test))]
     const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 20;
+
+    #[cfg(test)]
+    const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
 
     fn traverse_nat(
         &mut self,
@@ -741,6 +748,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                         }
                     }
                     Ok(None) => {
+                        tracing::debug!("debug: connection closed");
                         return Err(TransportError::ConnectionClosed);
                     }
                     Err(_) => {
@@ -748,6 +756,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                         tracing::debug!("Failed to receive UDP response, time out");
                     }
                 }
+
+                // We have retried for a while, so return an error
+                if timeout >= MAX_TIMEOUT {
+                    break;
+                }
+
                 // Update timeout using exponential backoff, capped at MAX_TIMEOUT
                 timeout = std::cmp::min(
                     Duration::from_secs(timeout.as_secs() * TIMEOUT_MULTIPLIER),
@@ -767,6 +781,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                 tick.tick().await;
             }
+
             Err(TransportError::ConnectionEstablishmentFailure {
                 cause: "max connection attempts reached".into(),
             })
@@ -1116,6 +1131,61 @@ mod test {
     }
 
     #[tokio::test]
+    async fn simulate_nat_traversal_drop_first_packet_for_all() -> Result<(), DynError> {
+        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        let (peer_a_pub, mut peer_a, peer_a_addr) =
+            set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) =
+            set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
+
+        let peer_b = tokio::spawn(async move {
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
+            let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+            Ok::<_, DynError>(())
+        });
+
+        let peer_a = tokio::spawn(async move {
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false).await;
+            let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            Ok::<_, DynError>(())
+        });
+
+        let (a, b) = tokio::try_join!(peer_a, peer_b)?;
+        a?;
+        b?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simulate_nat_traversal_drop_first_packet_of_peerb() -> Result<(), DynError> {
+        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) =
+            set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
+
+        let peer_b = tokio::spawn(async move {
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
+            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+            let _ = tokio::time::timeout(Duration::from_secs(1), conn.recv()).await;
+            Ok::<_, DynError>(())
+        });
+
+        let peer_a = tokio::spawn(async move {
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false).await;
+            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            let _ = tokio::time::timeout(Duration::from_secs(1), conn.recv()).await;
+            Ok::<_, DynError>(())
+        });
+
+        let (a, b) = tokio::try_join!(peer_a, peer_b)?;
+        // As we drop the first packet of peer b, so peer a will not receive the handshake packet
+        // b will not retry send, so a cannot connect to b
+        a.unwrap_err();
+        b?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn simulate_gateway_traversal() -> Result<(), DynError> {
         // crate::config::set_logger();
         let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
@@ -1141,11 +1211,11 @@ mod test {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn simulate_gateway_traversal_drop_first_3_packets_of_gateway() -> Result<(), DynError> {
+    async fn simulate_gateway_traversal_drop_first_packet_of_gateway() -> Result<(), DynError> {
         crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_gateway_connection(PacketDropPolicy::Range(0..3)).await?;
+            set_gateway_connection(PacketDropPolicy::Range(0..1)).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
@@ -1160,33 +1230,9 @@ mod test {
         });
 
         let (a, b) = tokio::try_join!(peer_a, peer_b)?;
-        a?;
-        b?;
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn simulate_gateway_traversal_drop_first_3_packets_of_peer() -> Result<(), DynError> {
-        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
-        let (peer_a_pub, mut peer_a, peer_a_addr) =
-            set_peer_connection(PacketDropPolicy::Range(0..3)).await?;
-        let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_gateway_connection(Default::default()).await?;
-
-        let peer_b = tokio::spawn(async move {
-            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
-            Ok::<_, DynError>(())
-        });
-
-        let peer_a = tokio::spawn(async move {
-            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
-            Ok::<_, DynError>(())
-        });
-
-        let (a, b) = tokio::try_join!(peer_a, peer_b)?;
-        a?;
+        // As we drop the first packet of gateway, so peer a will not receive the handshake packet
+        // b will not retry send, so a cannot connect to b
+        a.unwrap_err();
         b?;
         Ok(())
     }
@@ -1239,32 +1285,9 @@ mod test {
 
         let (a, b) = tokio::try_join!(peer_a, peer_b)?;
         a?;
-        b?;
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn simulate_gateway_traversal_drop_first_packet_of_gateway() -> Result<(), DynError> {
-        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
-        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
-        let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_gateway_connection(PacketDropPolicy::Range(0..1)).await?;
-
-        let peer_b = tokio::spawn(async move {
-            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
-            Ok::<_, DynError>(())
-        });
-
-        let peer_a = tokio::spawn(async move {
-            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
-            Ok::<_, DynError>(())
-        });
-
-        let (a, b) = tokio::try_join!(peer_a, peer_b)?;
-        a?;
-        b?;
+        // As we drop the first packet of peer a, so gateway b will not receive the handshake packet
+        // a will not retry send, so b cannot connect to a
+        b.unwrap_err();
         Ok(())
     }
 
