@@ -136,7 +136,7 @@ impl PeerConnection {
         let mut last_received = std::time::Instant::now();
 
         loop {
-            tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
+            // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
             tokio::select! {
                 inbound = self.remote_conn.inbound_packet_recv.recv() => {
                     let packet_data = inbound.ok_or(TransportError::ConnectionClosed)?;

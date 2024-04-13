@@ -752,7 +752,7 @@ mod test {
     use futures::{stream::FuturesOrdered, TryStreamExt};
     use rand::{Rng, SeedableRng};
     use serde::{de::DeserializeOwned, Serialize};
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, RwLock};
     use tracing::info;
 
     use super::*;
@@ -760,7 +760,7 @@ mod test {
 
     #[allow(clippy::type_complexity)]
     static CHANNELS: OnceLock<
-        Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>>>,
+        Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>>>,
     > = OnceLock::new();
 
     #[derive(Default, Clone)]
@@ -785,10 +785,10 @@ mod test {
     impl MockSocket {
         async fn test_config(packet_drop_policy: PacketDropPolicy, addr: SocketAddr) -> Self {
             let channels = CHANNELS
-                .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+                .get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
                 .clone();
             let (outbound, inbound) = mpsc::unbounded_channel();
-            channels.lock().await.insert(addr, outbound);
+            channels.write().await.insert(addr, outbound);
             static SEED: AtomicU64 = AtomicU64::new(0xfeedbeef);
             MockSocket {
                 inbound: Mutex::new(inbound),
@@ -838,13 +838,12 @@ mod test {
 
             assert!(self.this != target, "cannot send to self");
             let channels = CHANNELS
-                .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+                .get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
                 .clone();
-            let channels = channels.lock().await;
-            let Some(sender) = channels.get(&target).cloned() else {
+            let channels = channels.read().await;
+            let Some(sender) = channels.get(&target) else {
                 return Ok(0);
             };
-            drop(channels);
             // tracing::trace!(?target, ?self.this, "sending packet to remote");
             sender
                 .send((self.this, buf.to_vec()))
@@ -857,10 +856,10 @@ mod test {
     impl Drop for MockSocket {
         fn drop(&mut self) {
             let channels = CHANNELS
-                .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+                .get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
                 .clone();
             loop {
-                if let Ok(mut channels) = channels.try_lock() {
+                if let Ok(mut channels) = channels.try_write() {
                     channels.remove(&self.this);
                     break;
                 }
@@ -974,9 +973,23 @@ mod test {
                     let mut test_gen_cp = test_generator.clone();
                     conns.push_back(async move {
                         let mut messages = vec![];
+                        let mut to = tokio::time::interval(config.wait_time);
+                        to.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        to.tick().await;
+                        let start = std::time::Instant::now();
                         while messages.len() < test_gen_cp.expected_iterations() {
                             peer_conn.send(test_gen_cp.gen_msg()).await?;
-                            match peer_conn.recv().await {
+                            let msg = tokio::select! {
+                                _ = to.tick() => {
+                                    return Err::<_, DynError>(
+                                        format!("timeout waiting for messages, total time: {:.2}", start.elapsed().as_secs_f64()).into()
+                                    );
+                                }
+                                msg = peer_conn.recv() => {
+                                    msg
+                                }
+                            };
+                            match msg {
                                 Ok(msg) => {
                                     let output_as_str: G::Message = bincode::deserialize(&msg)?;
                                     messages.push(output_as_str);
@@ -984,20 +997,17 @@ mod test {
                                 }
                                 Err(error) => {
                                     tracing::error!(%error, "error receiving message");
-                                    return Err(error);
+                                    return Err(error.into());
                                 }
                             }
                         }
 
+                        tracing::info!(%peer_addr, "finished");
                         let _ = tokio::time::timeout(extra_wait, peer_conn.recv()).await;
                         Ok(messages)
                     });
                 }
-                let results = tokio::time::timeout(
-                    config.wait_time + extra_wait,
-                    conns.try_collect::<Vec<_>>(),
-                )
-                .await??;
+                let results = conns.try_collect::<Vec<_>>().await?;
                 Ok::<_, DynError>((results, test_generator))
             });
             tasks.push(peer);
@@ -1071,7 +1081,7 @@ mod test {
 
     #[tokio::test]
     async fn simulate_nat_traversal_drop_first_packets_of_peerb() -> Result<(), DynError> {
-        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
             set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
@@ -1260,11 +1270,11 @@ mod test {
         .await
     }
 
-    #[ignore]
-    // #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[tokio::test]
+    // #[ignore]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
+    // #[tokio::test]
     async fn simulate_packet_dropping() -> Result<(), DynError> {
-        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::INFO));
         #[derive(Clone, Copy)]
         struct TestData(&'static str);
 
@@ -1287,29 +1297,34 @@ mod test {
             }
         }
 
-        let mut tests = FuturesUnordered::new();
+        let mut tests = FuturesOrdered::new();
         let mut rng = rand::rngs::StdRng::seed_from_u64(3);
         for factor in std::iter::repeat(())
             .map(|_| rng.gen::<f64>())
             .filter(|x| *x > 0.05 && *x < 0.25)
-            .take(3)
+            .take(5)
         {
-            let wait_time = Duration::from_secs((15.0 * ((factor + 1.0) * 1.25)) as u64);
+            let wait_time = Duration::from_secs((((factor * 5.0 + 1.0) * 15.0) + 10.0) as u64);
             tracing::info!(
                 "packet loss factor: {factor} (wait time: {wait_time})",
                 wait_time = wait_time.as_secs()
             );
-            tests.push(run_test(
+            tests.push_back(tokio::spawn(run_test(
                 TestConfig {
                     packet_drop_policy: PacketDropPolicy::Factor(factor),
                     wait_time,
                     ..Default::default()
                 },
                 vec![TestData("foo"), TestData("bar")],
-            ));
+            )));
         }
+        let mut test_no = 0;
         while let Some(result) = tests.next().await {
-            result?;
+            result?.map_err(|e| {
+                tracing::error!(%test_no, "error in test");
+                e
+            })?;
+            test_no += 1;
         }
         Ok(())
     }

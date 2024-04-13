@@ -273,7 +273,7 @@ mod test {
                 }),
             },
         })?;
-        let dec: SymmetricMessage = bincode::deserialize(&enc)?;
+        let _dec: SymmetricMessage = bincode::deserialize(&enc)?;
 
         let key = gen_key();
         let packet = SymmetricMessage::ack_ok(&key, [0; 16], (Ipv4Addr::LOCALHOST, 1234).into())?;
