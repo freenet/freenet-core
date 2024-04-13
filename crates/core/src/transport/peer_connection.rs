@@ -17,7 +17,6 @@ use tokio::task::JoinHandle;
 mod inbound_stream;
 mod outbound_stream;
 
-use super::packet_data::AssymetricRSA;
 use super::{
     connection_handler::SerializedMessage,
     packet_data::{self, PacketData},
@@ -45,8 +44,8 @@ pub(super) struct RemoteConnection {
     pub last_packet_id: Arc<AtomicU32>,
     pub inbound_packet_recv: mpsc::Receiver<PacketData<UnknownEncryption>>,
     pub inbound_symmetric_key: Aes128Gcm,
+    pub inbound_symmetric_key_bytes: [u8; 16],
     pub my_address: Option<SocketAddr>,
-    pub my_intro_packet: Option<PacketData<AssymetricRSA>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -93,7 +92,6 @@ type InboundStreamFut = Pin<Box<dyn Future<Output = InboundStreamResult> + Send>
 #[must_use = "call await on the `recv` function to start listening for incoming messages"]
 pub(crate) struct PeerConnection {
     remote_conn: RemoteConnection,
-    this_intro_packet: Option<PacketData<AssymetricRSA>>,
     received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
     inbound_streams: HashMap<StreamId, mpsc::Sender<(u32, Vec<u8>)>>,
     inbound_stream_futures: FuturesUnordered<JoinHandle<InboundStreamResult>>,
@@ -101,13 +99,9 @@ pub(crate) struct PeerConnection {
 }
 
 impl PeerConnection {
-    pub fn new(
-        remote_conn: RemoteConnection,
-        this_intro_packet: Option<PacketData<AssymetricRSA>>,
-    ) -> Self {
+    pub fn new(remote_conn: RemoteConnection) -> Self {
         Self {
             remote_conn,
-            this_intro_packet,
             received_tracker: ReceivedPacketTracker::new(),
             inbound_streams: HashMap::new(),
             inbound_stream_futures: FuturesUnordered::new(),
@@ -266,19 +260,19 @@ impl PeerConnection {
             AckConnection { result: Err(cause) } => {
                 Err(TransportError::ConnectionEstablishmentFailure { cause })
             }
-            AckConnection { result: Ok(false) } => Ok(None),
-            AckConnection { result: Ok(true) } => {
-                if let Some(packet) = self.this_intro_packet.clone() {
-                    // FIXME: need to fix this for gateways
-                    self.remote_conn
-                        .outbound_packets
-                        .send((self.remote_conn.remote_addr, packet.data().into()))
-                        .await
-                        .map_err(|_| TransportError::ConnectionClosed)?;
-                }
+            AckConnection { result: Ok(_) } => {
+                let packet = SymmetricMessage::ack_ok(
+                    &self.remote_conn.outbound_symmetric_key,
+                    self.remote_conn.inbound_symmetric_key_bytes,
+                    self.remote_conn.remote_addr,
+                )?;
+                self.remote_conn
+                    .outbound_packets
+                    .send((self.remote_conn.remote_addr, packet.data().into()))
+                    .await
+                    .map_err(|_| TransportError::ConnectionClosed)?;
                 Ok(None)
             }
-            GatewayConnection { .. } => Ok(None),
             StreamFragment {
                 stream_id,
                 total_length_bytes,
