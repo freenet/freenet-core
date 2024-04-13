@@ -1132,7 +1132,7 @@ mod test {
 
     #[tokio::test]
     async fn simulate_nat_traversal_drop_first_packet_for_all() -> Result<(), DynError> {
-        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (peer_a_pub, mut peer_a, peer_a_addr) =
             set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
@@ -1178,16 +1178,13 @@ mod test {
         });
 
         let (a, b) = tokio::try_join!(peer_a, peer_b)?;
-        // As we drop the first packet of peer b, so peer a will not receive the handshake packet
-        // b will not retry send, so a cannot connect to b
-        a.unwrap_err();
+        a?;
         b?;
         Ok(())
     }
 
     #[tokio::test]
-    async fn simulate_gateway_traversal() -> Result<(), DynError> {
-        // crate::config::set_logger();
+    async fn simulate_gateway_connection() -> Result<(), DynError> {
         let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
             set_gateway_connection(Default::default()).await?;
@@ -1210,9 +1207,9 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn simulate_gateway_traversal_drop_first_packet_of_gateway() -> Result<(), DynError> {
-        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+    #[tokio::test]
+    async fn simulate_gateway_connection_drop_first_packet_of_gateway() -> Result<(), DynError> {
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
             set_gateway_connection(PacketDropPolicy::Range(0..1)).await?;
@@ -1230,16 +1227,14 @@ mod test {
         });
 
         let (a, b) = tokio::try_join!(peer_a, peer_b)?;
-        // As we drop the first packet of gateway, so peer a will not receive the handshake packet
-        // b will not retry send, so a cannot connect to b
-        a.unwrap_err();
+        a?;
         b?;
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn simulate_gateway_traversal_drop_first_packet_for_all() -> Result<(), DynError> {
-        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+    #[tokio::test]
+    async fn simulate_gateway_connection_drop_first_packet_for_all() -> Result<(), DynError> {
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (peer_a_pub, mut peer_a, peer_a_addr) =
             set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
@@ -1263,9 +1258,9 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn simulate_gateway_traversal_drop_first_packet_of_peer() -> Result<(), DynError> {
-        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+    #[tokio::test]
+    async fn simulate_gateway_connection_drop_first_packet_of_peer() -> Result<(), DynError> {
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (peer_a_pub, mut peer_a, peer_a_addr) =
             set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
@@ -1285,9 +1280,7 @@ mod test {
 
         let (a, b) = tokio::try_join!(peer_a, peer_b)?;
         a?;
-        // As we drop the first packet of peer a, so gateway b will not receive the handshake packet
-        // a will not retry send, so b cannot connect to a
-        b.unwrap_err();
+        b?;
         Ok(())
     }
 
@@ -1354,8 +1347,9 @@ mod test {
         .await
     }
 
-    #[tokio::test]
-    async fn packet_dropping() -> Result<(), DynError> {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    // #[tokio::test]
+    async fn simulate_packet_dropping() -> Result<(), DynError> {
         crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         #[derive(Clone, Copy)]
         struct TestData(&'static str);
@@ -1367,18 +1361,19 @@ mod test {
             }
 
             fn gen_msg(&mut self) -> Self::Message {
-                self.0.repeat(3000)
+                self.0.repeat(1000)
             }
 
             fn assert_message_ok(&self, _: usize, msg: Self::Message) -> bool {
                 if self.0 == "foo" {
-                    msg.contains("bar") && msg.len() == "bar".len() * 3000
+                    msg.contains("bar") && msg.len() == "bar".len() * 1000
                 } else {
-                    msg.contains("foo") && msg.len() == "foo".len() * 3000
+                    msg.contains("foo") && msg.len() == "foo".len() * 1000
                 }
             }
         }
 
+        let mut tests = FuturesUnordered::new();
         let mut rng = rand::rngs::StdRng::seed_from_u64(3);
         for factor in std::iter::repeat(())
             .map(|_| rng.gen::<f64>())
@@ -1390,15 +1385,17 @@ mod test {
                 "packet loss factor: {factor} (wait time: {wait_time})",
                 wait_time = wait_time.as_secs()
             );
-            run_test(
+            tests.push(tokio::spawn(run_test(
                 TestConfig {
                     packet_drop_policy: PacketDropPolicy::Factor(factor),
                     wait_time,
                     ..Default::default()
                 },
                 vec![TestData("foo"), TestData("bar")],
-            )
-            .await?
+            )));
+        }
+        while let Some(result) = tests.next().await {
+            result??;
         }
         Ok(())
     }

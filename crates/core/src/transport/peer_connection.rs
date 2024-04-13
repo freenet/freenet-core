@@ -10,7 +10,6 @@ use crate::transport::packet_data::UnknownEncryption;
 use aes_gcm::Aes128Gcm;
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
-use libp2p::swarm::keep_alive;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
