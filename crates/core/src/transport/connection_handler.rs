@@ -86,10 +86,10 @@ impl ConnectionHandler {
         is_gateway: bool,
         #[cfg(test)] socket_addr: SocketAddr,
     ) -> Result<Self, TransportError> {
-        // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(100);
 
+        // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (outbound_sender, outbound_recv) = mpsc::channel(1);
         let transport = UdpPacketsListener {
             is_gateway,
@@ -200,9 +200,9 @@ type OngoingConnectionResult = Option<
     >,
 >;
 
+#[cfg(test)]
 impl<T> Drop for UdpPacketsListener<T> {
     fn drop(&mut self) {
-        #[cfg(test)]
         tracing::info!(%self.this_addr, "Dropping UdpPacketsListener");
     }
 }
@@ -911,13 +911,13 @@ mod test {
                 PacketDropPolicy::ReceiveAll => {}
                 PacketDropPolicy::Factor(factor) => {
                     if *factor > self.rng.try_lock().unwrap().gen::<f64>() {
-                        tracing::trace!(id=%packet_idx, data=?buf, "drop packet");
+                        tracing::trace!(id=%packet_idx, "drop packet");
                         return Ok(buf.len());
                     }
                 }
                 PacketDropPolicy::Range(r) => {
                     if r.contains(&packet_idx) {
-                        tracing::trace!(id=%packet_idx, data=?buf, "drop packet");
+                        tracing::trace!(id=%packet_idx, "drop packet");
                         return Ok(buf.len());
                     }
                 }

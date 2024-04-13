@@ -10,6 +10,7 @@ use crate::transport::packet_data::UnknownEncryption;
 use aes_gcm::Aes128Gcm;
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
+use libp2p::swarm::keep_alive;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -126,11 +127,20 @@ impl PeerConnection {
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
         // listen for incoming messages or receipts or wait until is time to do anything else again
         let mut resend_check = Some(tokio::time::sleep(tokio::time::Duration::from_secs(1)));
+
+        const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+        const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(60);
+        let mut keep_alive = tokio::time::interval(KEEP_ALIVE_INTERVAL);
+        keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        keep_alive.tick().await;
+        let mut last_received = std::time::Instant::now();
+
         loop {
-            tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for incoming messages loop");
+            tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
             tokio::select! {
                 inbound = self.remote_conn.inbound_packet_recv.recv() => {
                     let packet_data = inbound.ok_or(TransportError::ConnectionClosed)?;
+                    last_received = std::time::Instant::now();
                     let Ok(decrypted) = packet_data.try_decrypt_sym(&self.remote_conn.inbound_symmetric_key).map_err(|error| {
                         tracing::debug!(%error, remote = ?self.remote_conn.remote_addr, "Failed to decrypt packet, might be an intro packet or a partial packet");
                     }) else {
@@ -200,7 +210,15 @@ impl PeerConnection {
                     };
                     res.map_err(|e| TransportError::Other(e.into()))??
                 }
-                _ = resend_check.take().unwrap_or(tokio::time::sleep(Duration::from_secs(1))) => {
+                _ = keep_alive.tick() => {
+                    if last_received.elapsed() > KILL_CONNECTION_AFTER {
+                        tracing::warn!(remote = ?self.remote_conn.remote_addr, "connection timed out");
+                        return Err(TransportError::ConnectionClosed);
+                    }
+                    tracing::trace!(remote = ?self.remote_conn.remote_addr, "sending keep-alive");
+                    self.noop(vec![]).await?;
+                }
+                _ = resend_check.take().unwrap_or(tokio::time::sleep(Duration::from_secs(5))) => {
                     loop {
                         tracing::trace!(remote = ?self.remote_conn.remote_addr, "checking for resends");
                         let maybe_resend = self.remote_conn
