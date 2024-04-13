@@ -261,7 +261,7 @@ impl P2pConnManager {
                     Ok(Left(msg))
                 }
                 msg = notification_msg => { msg }
-                msg = bridge_msg => { 
+                msg = bridge_msg => {
                     if let Ok(Right(peer_conn)) = msg {
                         let peer = conn_bridge.op_manager.ring.get_peer_key().expect("Peer key not set");
                         Ok(Right(ConnectionEstablished {
@@ -306,14 +306,15 @@ impl P2pConnManager {
                             )
                             .await?;
                             continue;
-                        },
+                        }
                         NetMessage::Connect(ConnectMsg::Response {
-                            msg: ConnectResponse::AcceptedByTarget {
-                                accepted,
-                                your_location,
-                                your_peer_id,
-                                ..
-                            },
+                            msg:
+                                ConnectResponse::AcceptedByTarget {
+                                    accepted,
+                                    your_location,
+                                    your_peer_id,
+                                    ..
+                                },
                             ..
                         }) => {
                             if accepted {
@@ -325,7 +326,7 @@ impl P2pConnManager {
                                 self.bridge.active_net_connections.remove(&peer_id);
                                 op_manager.ring.prune_connection(peer_id.clone()).await;
                             }
-                        },
+                        }
                         msg => {
                             let executor_callback = pending_from_executor
                                 .remove(msg.id())
@@ -450,23 +451,13 @@ impl P2pConnManager {
         if let Some(conn) = self.connection.get(&peer) {
             conn.send(*net_msg).await;
             Ok(Left(()))
-        } else if let NetMessage::Connect(ConnectMsg::Request {
-            id,
-            msg,
-        }) = *net_msg
-        {
-            self.handle_connection_request(
-                &peer,
-                id,
-                msg,
-                outbound_conn_handler,
-            )
-            .await
+        } else if let NetMessage::Connect(ConnectMsg::Request { id, msg }) = *net_msg {
+            self.handle_connection_request(&peer, id, msg, outbound_conn_handler)
+                .await
         } else {
             Err(ConnectionError::UnexpectedReq)
         }
     }
-
 
     async fn handle_connection_request(
         &mut self,
@@ -475,7 +466,6 @@ impl P2pConnManager {
         msg: ConnectRequest,
         mut outbound_conn_handler: OutboundConnectionHandler,
     ) -> Result<Either<(), PeerConnection>, ConnectionError> {
-
         let (joiner_key, hops_to_live, skip_list) = match msg {
             ConnectRequest::StartJoinReq {
                 joiner_key,
@@ -485,7 +475,7 @@ impl P2pConnManager {
             } => (joiner_key, hops_to_live, skip_list),
             _ => return Err(ConnectionError::UnexpectedReq),
         };
-        
+
         let mut peer_conn = outbound_conn_handler
             .connect(peer.pub_key.clone(), peer.addr, true)
             .await
@@ -521,6 +511,7 @@ impl P2pConnManager {
 
         Ok(Right(peer_conn))
     }
+}
 
 enum ConnMngrActions {
     /// Received a new connection
