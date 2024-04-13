@@ -167,7 +167,6 @@ impl NodeP2P {
 mod test {
     use std::{net::Ipv4Addr, time::Duration};
 
-    use super::super::network_bridge::p2p_protoc::NetEvent;
     use super::*;
     use crate::{
         client_events::test::MemoryEventsGen,
@@ -178,7 +177,6 @@ mod test {
     };
 
     use futures::StreamExt;
-    use libp2p::swarm::SwarmEvent;
     use tokio::sync::watch::channel;
 
     /// Ping test event loop
@@ -189,12 +187,6 @@ mod test {
                 peer.conn_manager.swarm.select_next_some(),
             );
             match ev.await {
-                Ok(SwarmEvent::Behaviour(NetEvent::Ping(ping))) => {
-                    if ping.result.is_ok() {
-                        tracing::info!("ping done @ {}", peer.peer_key);
-                        return Ok(());
-                    }
-                }
                 Ok(other) => {
                     tracing::debug!("{:?}", other)
                 }

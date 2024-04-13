@@ -23,6 +23,8 @@ pub mod server;
 mod topology;
 /// Tracing and loging infrastructure. Includes our custom event log register. Tracing collectors, etc.
 mod tracing;
+/// Code for communicating with other peers over UDP, handles hole-punching, error handling, etc.
+mod transport;
 pub mod util;
 /// WASM code execution runtime, tailored for the contract and delegate APIs.
 mod wasm_runtime;

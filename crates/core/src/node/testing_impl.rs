@@ -1099,10 +1099,13 @@ where
                 NodeEvent::ShutdownNode => break Ok(()),
                 NodeEvent::DropConnection(peer) => {
                     tracing::info!("Dropping connection to {peer}");
-                    event_register.register_events(Either::Left(
-                        crate::tracing::NetEventLog::disconnected(&op_manager.ring, &peer),
-                    ));
-                    op_manager.ring.prune_connection(peer);
+                    event_register
+                        .register_events(Either::Left(crate::tracing::NetEventLog::disconnected(
+                            &op_manager.ring,
+                            &peer,
+                        )))
+                        .await;
+                    op_manager.ring.prune_connection(peer).await;
                     continue;
                 }
                 NodeEvent::Disconnect { cause: Some(cause) } => {

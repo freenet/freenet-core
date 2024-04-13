@@ -546,7 +546,7 @@ mod tests {
         // Simulate a bunch of random requests clustered around 0.35
         for _ in 0..NUM_REQUESTS {
             let requested_location = random_location(&random_location(&this_peer_location));
-            // FIXME: Is PeerKeyLocation unimportant for this test?
+            // todo: Is PeerKeyLocation unimportant for this test?
             topology_manager.record_request(
                 PeerKeyLocation::random(),
                 requested_location,
@@ -867,7 +867,7 @@ mod tests {
     }
 
     fn find_worst_peer(
-        peers: &Vec<PeerKeyLocation>,
+        peers: &[PeerKeyLocation],
         bw_usage_by_peer: &[usize],
         requests_per_peer: &[usize],
     ) -> usize {
