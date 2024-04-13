@@ -51,22 +51,42 @@ impl SymmetricMessage {
         Ok(packet.encrypt_symmetric(outbound_sym_key))
     }
 
-    const ACK_OK: SymmetricMessage = SymmetricMessage {
+    const ACK_OK_NOT_RESEND: SymmetricMessage = SymmetricMessage {
         packet_id: Self::FIRST_PACKET_ID,
         confirm_receipt: Vec::new(),
-        payload: SymmetricMessagePayload::AckConnection { result: Ok(()) },
+        payload: SymmetricMessagePayload::AckConnection { result: Ok(false) },
+    };
+    const ACK_OK_RESEND: SymmetricMessage = SymmetricMessage {
+        packet_id: Self::FIRST_PACKET_ID,
+        confirm_receipt: Vec::new(),
+        payload: SymmetricMessagePayload::AckConnection { result: Ok(false) },
     };
 
     pub fn ack_ok(
         outbound_sym_key: &Aes128Gcm,
+        resend_key: bool,
     ) -> Result<PacketData<SymmetricAES>, bincode::Error> {
         static SERIALIZED: OnceLock<Box<[u8]>> = OnceLock::new();
-        let bytes = SERIALIZED.get_or_init(move || {
-            let mut packet = [0u8; MAX_DATA_SIZE];
-            let size = bincode::serialized_size(&Self::ACK_OK).unwrap();
-            bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_OK).unwrap();
-            (&packet[..size as usize]).into()
-        });
+        let bytes = resend_key
+            .then(|| {
+                SERIALIZED.get_or_init(move || {
+                    let mut packet = [0u8; MAX_DATA_SIZE];
+                    let size = bincode::serialized_size(&Self::ACK_OK_NOT_RESEND).unwrap();
+
+                    bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_OK_NOT_RESEND)
+                        .unwrap();
+                    (&packet[..size as usize]).into()
+                })
+            })
+            .unwrap_or_else(|| {
+                SERIALIZED.get_or_init(move || {
+                    let mut packet = [0u8; MAX_DATA_SIZE];
+                    let size = bincode::serialized_size(&Self::ACK_OK_RESEND).unwrap();
+
+                    bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_OK_RESEND).unwrap();
+                    (&packet[..size as usize]).into()
+                })
+            });
         let packet = PacketData::from_buf_plain(bytes);
         Ok(packet.encrypt_symmetric(outbound_sym_key))
     }
@@ -146,13 +166,15 @@ impl From<StreamFragment> for SymmetricMessagePayload {
     }
 }
 
+type RequestKey = bool;
+
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, Debug, Clone))]
 pub(super) enum SymmetricMessagePayload {
     AckConnection {
         // if we successfully connected to a remote we attempt to connect to initially
         // then we return our TransportPublicKey so they can enroute other peers to us
-        result: Result<(), Cow<'static, str>>,
+        result: Result<RequestKey, Cow<'static, str>>,
     },
     GatewayConnection {
         // a gateway acknowledges a connection and returns the private key to use
@@ -231,7 +253,7 @@ mod test {
     #[test]
     fn check_symmetric_message_serialization() {
         let test_cases = [
-            SymmetricMessagePayload::AckConnection { result: Ok(()) },
+            SymmetricMessagePayload::AckConnection { result: Ok(false) },
             SymmetricMessagePayload::AckConnection {
                 result: Err(Cow::Borrowed("error")),
             },
@@ -279,12 +301,12 @@ mod test {
 
     #[test]
     fn ack_ok_msg() -> Result<(), Box<dyn std::error::Error>> {
-        let enc = bincode::serialize(&SymmetricMessage::ACK_OK)?;
+        let enc = bincode::serialize(&SymmetricMessage::ACK_OK_NOT_RESEND)?;
         let dec: SymmetricMessage = bincode::deserialize(&enc)?;
-        assert_eq!(SymmetricMessage::ACK_OK, dec);
+        assert_eq!(SymmetricMessage::ACK_OK_NOT_RESEND, dec);
 
         let key = gen_key();
-        let packet = SymmetricMessage::ack_ok(&key)?;
+        let packet = SymmetricMessage::ack_ok(&key, false)?;
         let data = packet.decrypt(&key).unwrap();
         let deser = SymmetricMessage::deser(data.data())?;
         assert!(matches!(

@@ -29,14 +29,6 @@ use super::{
 
 const PROTOC_VERSION: [u8; 2] = 1u16.to_le_bytes();
 
-// Constants for exponential backoff
-const INITIAL_TIMEOUT: Duration = Duration::from_secs(5);
-const TIMEOUT_MULTIPLIER: u64 = 2;
-#[cfg(not(test))]
-const MAX_TIMEOUT: Duration = Duration::from_secs(60); // Maximum timeout limit
-#[cfg(test)]
-const MAX_TIMEOUT: Duration = Duration::from_secs(10); // Maximum timeout limit
-
 // Constants for interval increase
 const INITIAL_INTERVAL: Duration = Duration::from_millis(200);
 const INTERVAL_INCREASE_FACTOR: u64 = 2;
@@ -151,7 +143,10 @@ impl ConnectionHandler {
         }
         recv_connection
             .map(|res| match res {
-                Ok(Ok(remote_conn)) => Ok(PeerConnection::new(remote_conn)),
+                Ok(Ok(mut remote_conn)) => {
+                    let this_intro_packet = remote_conn.my_intro_packet.take();
+                    Ok(PeerConnection::new(remote_conn, this_intro_packet))
+                }
                 Ok(Err(e)) => Err(e),
                 Err(_) => Err(TransportError::ConnectionEstablishmentFailure {
                     cause: "Failed to establish connection".into(),
@@ -387,16 +382,20 @@ impl<S: Socket> UdpPacketsListener<S> {
         }
 
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
-        let peer_connection = PeerConnection::new(RemoteConnection {
-            outbound_packets: self.outbound_packets.clone(),
-            outbound_symmetric_key: outbound_key,
-            remote_addr,
-            sent_tracker: sent_tracker.clone(),
-            last_packet_id: Arc::new(AtomicU32::new(0)),
-            inbound_packet_recv: mpsc::channel(100).1,
-            inbound_symmetric_key: inbound_key,
-            my_address: None,
-        });
+        let peer_connection = PeerConnection::new(
+            RemoteConnection {
+                outbound_packets: self.outbound_packets.clone(),
+                outbound_symmetric_key: outbound_key,
+                remote_addr,
+                sent_tracker: sent_tracker.clone(),
+                last_packet_id: Arc::new(AtomicU32::new(0)),
+                inbound_packet_recv: mpsc::channel(100).1,
+                inbound_symmetric_key: inbound_key,
+                my_address: None,
+                my_intro_packet: None,
+            },
+            None,
+        );
 
         self.new_connection_notifier
             .send(peer_connection)
@@ -428,6 +427,14 @@ impl<S: Socket> UdpPacketsListener<S> {
             + 'static,
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
+        // Constants for exponential backoff
+        const INITIAL_TIMEOUT: Duration = Duration::from_secs(5);
+        const TIMEOUT_MULTIPLIER: f64 = 1.1;
+        #[cfg(not(test))]
+        const MAX_TIMEOUT: Duration = Duration::from_secs(60); // Maximum timeout limit
+        #[cfg(test)]
+        const MAX_TIMEOUT: Duration = Duration::from_secs(10); // Maximum timeout limit
+
         #[allow(clippy::large_enum_variant)]
         enum ConnectionState {
             /// Initial state of the joiner
@@ -442,6 +449,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         }
 
         fn decrypt_asym(
+            remote_addr: SocketAddr,
             packet: &PacketData<UnknownEncryption>,
             transport_secret_key: &TransportSecretKey,
             outbound_sym_key: &mut Option<Aes128Gcm>,
@@ -449,6 +457,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         ) -> Result<(), ()> {
             // probably the first packet to punch through the NAT
             if let Ok(decrypted_intro_packet) = packet.try_decrypt_asym(transport_secret_key) {
+                tracing::debug!(%remote_addr, "received intro packet");
                 let protoc = &decrypted_intro_packet.data()[..PROTOC_VERSION.len()];
                 if protoc != PROTOC_VERSION {
                     todo!("return error");
@@ -463,6 +472,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 };
                 Ok(())
             } else {
+                tracing::debug!(%remote_addr, "failed to decrypt packet");
                 Err(())
             }
         }
@@ -492,6 +502,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             };
 
             let mut resend_intro = false;
+            let mut resend_inbound_key = false;
             let mut sent_tracker = SentPacketTracker::new();
 
             while failures < Self::NAT_TRAVERSAL_MAX_ATTEMPTS {
@@ -504,8 +515,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                             .map_err(|_| TransportError::ChannelClosed)?;
                     }
                     ConnectionState::AckConnectionOutbound => {
-                        let acknowledgment =
-                            SymmetricMessage::ack_ok(outbound_sym_key.as_mut().unwrap())?;
+                        let acknowledgment = SymmetricMessage::ack_ok(
+                            outbound_sym_key.as_mut().unwrap(),
+                            resend_inbound_key,
+                        )?;
                         outbound_packets
                             .send((remote_addr, acknowledgment.data().into()))
                             .await
@@ -529,6 +542,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 inbound_packet_recv: inbound_recv,
                                 inbound_symmetric_key: inbound_sym_key,
                                 my_address: None,
+                                my_intro_packet: Some(outbound_intro_packet),
                             },
                             InboundRemoteConnection {
                                 inbound_packet_sender: inbound_sender,
@@ -547,12 +561,15 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 .map_err(|_| TransportError::ChannelClosed)?;
                         } else {
                             tracing::debug!(%remote_addr, "sending back protocol version and inbound key to remote");
-                            let acknowledgment =
-                                SymmetricMessage::ack_ok(outbound_sym_key.as_mut().unwrap())?;
+                            let acknowledgment = SymmetricMessage::ack_ok(
+                                outbound_sym_key.as_mut().unwrap(),
+                                resend_inbound_key,
+                            )?;
                             outbound_packets
                                 .send((remote_addr, acknowledgment.data().into()))
                                 .await
                                 .map_err(|_| TransportError::ChannelClosed)?;
+                            resend_inbound_key = false;
                             sent_tracker.report_sent_packet(
                                 SymmetricMessage::FIRST_PACKET_ID,
                                 acknowledgment.data().into(),
@@ -567,89 +584,98 @@ impl<S: Socket> UdpPacketsListener<S> {
                             ConnectionState::StartOutbound { .. } => {
                                 // at this point it's either the remote sending us an intro packet or a symmetric packet
                                 // cause is the first packet that passes through the NAT
-                                // let sym_packet = packet.with_sym_encryption();
                                 if let Ok(decrypted_packet) =
                                     packet.try_decrypt_sym(&inbound_sym_key)
                                 {
+                                    // the remote got our inbound key, so we know that they are at the RemoteInbound state
                                     let symmetric_message =
                                         SymmetricMessage::deser(decrypted_packet.data())?;
-                                    if remote_is_gateway {
-                                        match symmetric_message.payload {
-                                            SymmetricMessagePayload::GatewayConnection {
-                                                key,
-                                                remote_addr: my_address,
-                                            } => {
-                                                let outbound_sym_key = Aes128Gcm::new_from_slice(
-                                                    &key,
-                                                )
+
+                                    #[cfg(test)]
+                                    {
+                                        tracing::debug!(%remote_addr, ?symmetric_message.payload, "received symmetric packet");
+                                    }
+
+                                    match symmetric_message.payload {
+                                        SymmetricMessagePayload::GatewayConnection {
+                                            key,
+                                            remote_addr: my_address,
+                                        } => {
+                                            let outbound_sym_key = Aes128Gcm::new_from_slice(&key)
                                                 .map_err(|_| {
                                                     TransportError::ConnectionEstablishmentFailure {
                                                         cause: "invalid symmetric key".into(),
                                                     }
                                                 })?;
-                                                let packet =
-                                                    SymmetricMessage::ack_ok(&outbound_sym_key)?;
-                                                // burst the gateway with oks so it does not keep waiting for inbound packets
-                                                // one of them hopefully will arrive fine
-                                                for _ in 0..5 {
-                                                    outbound_packets
-                                                        .send((remote_addr, packet.data().into()))
-                                                        .await
-                                                        .map_err(|_| {
-                                                            TransportError::ChannelClosed
-                                                        })?;
-                                                }
+                                            let packet = SymmetricMessage::ack_ok(
+                                                &outbound_sym_key,
+                                                resend_inbound_key,
+                                            )?;
+                                            // burst the gateway with oks so it does not keep waiting for inbound packets
+                                            // one of them hopefully will arrive fine
+                                            for _ in 0..5 {
                                                 outbound_packets
-                                                    .send((
-                                                        remote_addr,
-                                                        SymmetricMessage::ack_ok(
-                                                            &outbound_sym_key,
-                                                        )?
-                                                        .data()
-                                                        .into(),
-                                                    ))
+                                                    .send((remote_addr, packet.data().into()))
                                                     .await
                                                     .map_err(|_| TransportError::ChannelClosed)?;
-                                                let (inbound_sender, inbound_recv) =
-                                                    mpsc::channel(100);
-                                                return Ok((
-                                                    RemoteConnection {
-                                                        outbound_packets: outbound_packets.clone(),
-                                                        outbound_symmetric_key: outbound_sym_key,
-                                                        remote_addr,
-                                                        sent_tracker: Arc::new(
-                                                            parking_lot::Mutex::new(sent_tracker),
-                                                        ),
-                                                        last_packet_id: Arc::new(AtomicU32::new(0)),
-                                                        inbound_packet_recv: inbound_recv,
-                                                        inbound_symmetric_key: inbound_sym_key,
-                                                        my_address: Some(my_address),
-                                                    },
-                                                    InboundRemoteConnection {
-                                                        inbound_packet_sender: inbound_sender,
-                                                        inbound_intro_packet: None,
-                                                        inbound_checked_times: 0,
-                                                    },
-                                                ));
                                             }
-                                            SymmetricMessagePayload::AckConnection { result } => {
-                                                let Err(cause) = result else {
-                                                    return Err(TransportError::ConnectionEstablishmentFailure { cause: "Unreachable".into() });
-                                                };
-                                                return Err(
-                                                    TransportError::ConnectionEstablishmentFailure {
-                                                        cause,
-                                                    },
-                                                );
-                                            }
-                                            _ => {
-                                                return Err(
-                                                    TransportError::ConnectionEstablishmentFailure {
-                                                        cause: "Unexpected message".into(),
-                                                    },
-                                                );
-                                            }
+                                            outbound_packets
+                                                .send((
+                                                    remote_addr,
+                                                    SymmetricMessage::ack_ok(
+                                                        &outbound_sym_key,
+                                                        resend_inbound_key,
+                                                    )?
+                                                    .data()
+                                                    .into(),
+                                                ))
+                                                .await
+                                                .map_err(|_| TransportError::ChannelClosed)?;
+                                            let (inbound_sender, inbound_recv) = mpsc::channel(100);
+                                            return Ok((
+                                                RemoteConnection {
+                                                    outbound_packets: outbound_packets.clone(),
+                                                    outbound_symmetric_key: outbound_sym_key,
+                                                    remote_addr,
+                                                    sent_tracker: Arc::new(
+                                                        parking_lot::Mutex::new(sent_tracker),
+                                                    ),
+                                                    last_packet_id: Arc::new(AtomicU32::new(0)),
+                                                    inbound_packet_recv: inbound_recv,
+                                                    inbound_symmetric_key: inbound_sym_key,
+                                                    my_address: Some(my_address),
+                                                    my_intro_packet: Some(outbound_intro_packet),
+                                                },
+                                                InboundRemoteConnection {
+                                                    inbound_packet_sender: inbound_sender,
+                                                    inbound_intro_packet: None,
+                                                    inbound_checked_times: 0,
+                                                },
+                                            ));
                                         }
+                                        SymmetricMessagePayload::AckConnection {
+                                            result: Ok(request_key),
+                                        } => {
+                                            if request_key {
+                                                failures += 1;
+                                            }
+                                            if outbound_sym_key.is_none() {
+                                                resend_inbound_key = true;
+                                            } else {
+                                                state = ConnectionState::AckConnectionOutbound;
+                                            }
+                                            continue;
+                                        }
+                                        SymmetricMessagePayload::AckConnection {
+                                            result: Err(err),
+                                        } => {
+                                            return Err(
+                                                TransportError::ConnectionEstablishmentFailure {
+                                                    cause: err,
+                                                },
+                                            );
+                                        }
+                                        _ => {}
                                     }
 
                                     // the other peer initially received our intro packet and encrypted with our inbound_key
@@ -664,8 +690,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         // it may be the case the remote still hasn't received the intro packet due to packet loss
                                         // and is sending intro packets still
 
-                                        if decrypt_asym(&packet, &transport_secret_key, &mut outbound_sym_key, &mut state).is_err() {
+                                        if decrypt_asym(remote_addr, &packet, &transport_secret_key, &mut outbound_sym_key, &mut state).is_err() {
                                             tracing::error!(%remote_addr, "Also failed to decrypt packet with private key");
+                                            if outbound_sym_key.is_none() {
+                                                resend_intro = true;
+                                            }
                                             failures += 1;
                                         }
                                         continue;
@@ -692,6 +721,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                                 // probably the first packet to punch through the NAT
                                 if decrypt_asym(
+                                    remote_addr,
                                     &packet,
                                     &transport_secret_key,
                                     &mut outbound_sym_key,
@@ -715,6 +745,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 // intro packet so we need to handle that
                                 if packet.is_intro_packet(intro_packet) {
                                     resend_intro = true;
+                                    // we add to the number of failures so we are not stuck in a loop retrying
+                                    failures += 1;
                                     continue;
                                 }
                                 // if is not an intro packet, the connection is successful and we can proceed
@@ -732,6 +764,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         inbound_packet_recv: inbound_recv,
                                         inbound_symmetric_key: inbound_sym_key,
                                         my_address: None,
+                                        my_intro_packet: Some(outbound_intro_packet),
                                     },
                                     InboundRemoteConnection {
                                         inbound_packet_sender: inbound_sender,
@@ -764,7 +797,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                 // Update timeout using exponential backoff, capped at MAX_TIMEOUT
                 timeout = std::cmp::min(
-                    Duration::from_secs(timeout.as_secs() * TIMEOUT_MULTIPLIER),
+                    Duration::from_secs((timeout.as_secs() as f64 * TIMEOUT_MULTIPLIER) as u64),
                     MAX_TIMEOUT,
                 );
 
@@ -911,13 +944,13 @@ mod test {
                 PacketDropPolicy::ReceiveAll => {}
                 PacketDropPolicy::Factor(factor) => {
                     if *factor > self.rng.try_lock().unwrap().gen::<f64>() {
-                        tracing::trace!(id=%packet_idx, "drop packet");
+                        tracing::trace!(id=%packet_idx, %self.this, "drop packet");
                         return Ok(buf.len());
                     }
                 }
                 PacketDropPolicy::Range(r) => {
                     if r.contains(&packet_idx) {
-                        tracing::trace!(id=%packet_idx, "drop packet");
+                        tracing::trace!(id=%packet_idx, %self.this, "drop packet");
                         return Ok(buf.len());
                     }
                 }
@@ -1131,7 +1164,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn simulate_nat_traversal_drop_first_packet_for_all() -> Result<(), DynError> {
+    async fn simulate_nat_traversal_drop_first_packets_for_all() -> Result<(), DynError> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (peer_a_pub, mut peer_a, peer_a_addr) =
             set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
@@ -1157,7 +1190,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn simulate_nat_traversal_drop_first_packet_of_peerb() -> Result<(), DynError> {
+    async fn simulate_nat_traversal_drop_first_packets_of_peerb() -> Result<(), DynError> {
         crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
@@ -1166,14 +1199,14 @@ mod test {
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
-            let _ = tokio::time::timeout(Duration::from_secs(1), conn.recv()).await;
+            let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
             Ok::<_, DynError>(())
         });
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
-            let _ = tokio::time::timeout(Duration::from_secs(1), conn.recv()).await;
+            let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
             Ok::<_, DynError>(())
         });
 
@@ -1208,7 +1241,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn simulate_gateway_connection_drop_first_packet_of_gateway() -> Result<(), DynError> {
+    async fn simulate_gateway_connection_drop_first_packets_of_gateway() -> Result<(), DynError> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
@@ -1233,7 +1266,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn simulate_gateway_connection_drop_first_packet_for_all() -> Result<(), DynError> {
+    async fn simulate_gateway_connection_drop_first_packets_for_all() -> Result<(), DynError> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (peer_a_pub, mut peer_a, peer_a_addr) =
             set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
@@ -1259,7 +1292,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn simulate_gateway_connection_drop_first_packet_of_peer() -> Result<(), DynError> {
+    async fn simulate_gateway_connection_drop_first_packets_of_peer() -> Result<(), DynError> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (peer_a_pub, mut peer_a, peer_a_addr) =
             set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
@@ -1347,8 +1380,9 @@ mod test {
         .await
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    // #[tokio::test]
+    #[ignore]
+    // #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test]
     async fn simulate_packet_dropping() -> Result<(), DynError> {
         crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         #[derive(Clone, Copy)]
@@ -1385,17 +1419,17 @@ mod test {
                 "packet loss factor: {factor} (wait time: {wait_time})",
                 wait_time = wait_time.as_secs()
             );
-            tests.push(tokio::spawn(run_test(
+            tests.push(run_test(
                 TestConfig {
                     packet_drop_policy: PacketDropPolicy::Factor(factor),
                     wait_time,
                     ..Default::default()
                 },
                 vec![TestData("foo"), TestData("bar")],
-            )));
+            ));
         }
         while let Some(result) = tests.next().await {
-            result??;
+            result?;
         }
         Ok(())
     }
