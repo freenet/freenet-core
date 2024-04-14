@@ -498,8 +498,7 @@ impl<R> Executor<R> {
         let static_conf = crate::config::Config::conf();
 
         let db_path = crate::config::Config::conf().db_dir();
-        let state_store =
-            StateStore::new(Storage::new(Some(&db_path)).await?, MAX_MEM_CACHE).unwrap();
+        let state_store = StateStore::new(Storage::new(&db_path).await?, MAX_MEM_CACHE).unwrap();
 
         let contract_dir = config
             .node_data_dir

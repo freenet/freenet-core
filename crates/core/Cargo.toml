@@ -48,7 +48,7 @@ ordered-float = "4.2"
 pav_regression = "0.4.0"
 parking_lot = "0.12"
 rand = { features = ["small_rng"], workspace = true }
-rocksdb = { default-features = false, optional = true, version = "0.22" }
+redb = { optional = true, version = "2" }
 serde = { features = ["derive", "rc"], workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true }
@@ -90,10 +90,9 @@ tempfile = "3.8"
 tracing = "0.1"
 
 [features]
-default = ["sqlite", "trace", "websocket"]
+default = ["redb", "trace", "websocket"]
 local-mode = []
 network-mode = []
-rocks_db = ["rocksdb"]
 sqlite = ["sqlx"]
 trace = ["tracing-subscriber"]
 trace-ot = ["opentelemetry-jaeger", "trace", "tracing-opentelemetry", "opentelemetry-otlp"]
