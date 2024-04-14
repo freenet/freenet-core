@@ -5,7 +5,8 @@ use redb::{Database, TableDefinition};
 
 use crate::wasm_runtime::StateStorage;
 
-const CONTRACT_PARAMS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("contract");
+const CONTRACT_PARAMS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("contract_params");
 const STATE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state");
 
 pub struct ReDb(Database);
