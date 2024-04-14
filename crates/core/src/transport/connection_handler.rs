@@ -269,10 +269,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                 // Handling of connection events
                 connection_event = self.connection_handler.recv() => {
                     let Some((remote_addr, event)) = connection_event else { return Ok(()); };
-                    let ConnectionEvent::ConnectionStart { remote_public_key, remote_is_gateway, open_connection } = event;
+                    let ConnectionEvent::ConnectionStart { remote_public_key, open_connection, .. } = event;
                     tracing::debug!(%remote_addr, "attempting to establish connection");
                     let (ongoing_connection, packets_sender) = self.traverse_nat(
-                        remote_addr,  remote_public_key, remote_is_gateway
+                        remote_addr,  remote_public_key,
                     );
                     let task = tokio::spawn(ongoing_connection.map_err(move |error| {
                         (error, remote_addr)
@@ -412,7 +412,6 @@ impl<S: Socket> UdpPacketsListener<S> {
         &mut self,
         remote_addr: SocketAddr,
         remote_public_key: TransportPublicKey,
-        _remote_is_gateway: bool,
     ) -> (
         impl Future<Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>>
             + Send
