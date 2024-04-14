@@ -123,7 +123,6 @@ impl ConnectionHandler {
         &mut self,
         remote_public_key: TransportPublicKey,
         remote_addr: SocketAddr,
-        remote_is_gateway: bool,
     ) -> Pin<Box<dyn Future<Output = Result<PeerConnection, TransportError>> + Send>> {
         let (open_connection, recv_connection) = oneshot::channel();
         if self
@@ -132,7 +131,6 @@ impl ConnectionHandler {
                 remote_addr,
                 ConnectionEvent::ConnectionStart {
                     remote_public_key,
-                    remote_is_gateway,
                     open_connection,
                 },
             ))
@@ -269,10 +267,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                 // Handling of connection events
                 connection_event = self.connection_handler.recv() => {
                     let Some((remote_addr, event)) = connection_event else { return Ok(()); };
-                    let ConnectionEvent::ConnectionStart { remote_public_key, remote_is_gateway, open_connection } = event;
+                    let ConnectionEvent::ConnectionStart { remote_public_key, open_connection } = event;
                     tracing::debug!(%remote_addr, "attempting to establish connection");
                     let (ongoing_connection, packets_sender) = self.traverse_nat(
-                        remote_addr,  remote_public_key, remote_is_gateway
+                        remote_addr,  remote_public_key,
                     );
                     let task = tokio::spawn(ongoing_connection.map_err(move |error| {
                         (error, remote_addr)
@@ -412,7 +410,6 @@ impl<S: Socket> UdpPacketsListener<S> {
         &mut self,
         remote_addr: SocketAddr,
         remote_public_key: TransportPublicKey,
-        _remote_is_gateway: bool,
     ) -> (
         impl Future<Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>>
             + Send
@@ -705,7 +702,6 @@ impl<S: Socket> UdpPacketsListener<S> {
 enum ConnectionEvent {
     ConnectionStart {
         remote_public_key: TransportPublicKey,
-        remote_is_gateway: bool,
         open_connection: oneshot::Sender<Result<RemoteConnection, TransportError>>,
     },
 }
@@ -951,7 +947,7 @@ mod test {
                 for (peer_pub, peer_addr) in &peer_keys_and_addr {
                     let peer_conn = tokio::time::timeout(
                         Duration::from_secs(10),
-                        peer.connect(peer_pub.clone(), *peer_addr, false).await,
+                        peer.connect(peer_pub.clone(), *peer_addr).await,
                     );
                     establish_conns.push(peer_conn);
                 }
@@ -1034,13 +1030,13 @@ mod test {
         let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection(Default::default()).await?;
 
         let peer_b = tokio::spawn(async move {
-            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
             Ok::<_, DynError>(())
         });
 
         let peer_a = tokio::spawn(async move {
-            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false).await;
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             Ok::<_, DynError>(())
         });
@@ -1060,13 +1056,13 @@ mod test {
             set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
 
         let peer_b = tokio::spawn(async move {
-            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
             Ok::<_, DynError>(())
         });
 
         let peer_a = tokio::spawn(async move {
-            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false).await;
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             Ok::<_, DynError>(())
         });
@@ -1085,14 +1081,14 @@ mod test {
             set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
 
         let peer_b = tokio::spawn(async move {
-            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
             let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
             Ok::<_, DynError>(())
         });
 
         let peer_a = tokio::spawn(async move {
-            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false).await;
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
             Ok::<_, DynError>(())
@@ -1111,13 +1107,13 @@ mod test {
             set_gateway_connection(Default::default()).await?;
 
         let peer_b = tokio::spawn(async move {
-            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
             Ok::<_, DynError>(())
         });
 
         let peer_a = tokio::spawn(async move {
-            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false).await;
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             Ok::<_, DynError>(())
         });
@@ -1136,13 +1132,13 @@ mod test {
             set_gateway_connection(PacketDropPolicy::Range(0..1)).await?;
 
         let peer_b = tokio::spawn(async move {
-            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
             Ok::<_, DynError>(())
         });
 
         let peer_a = tokio::spawn(async move {
-            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false).await;
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             Ok::<_, DynError>(())
         });
@@ -1162,13 +1158,13 @@ mod test {
             set_gateway_connection(PacketDropPolicy::Range(0..1)).await?;
 
         let peer_b = tokio::spawn(async move {
-            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
             Ok::<_, DynError>(())
         });
 
         let peer_a = tokio::spawn(async move {
-            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false).await;
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             Ok::<_, DynError>(())
         });
@@ -1188,13 +1184,13 @@ mod test {
             set_gateway_connection(Default::default()).await?;
 
         let peer_b = tokio::spawn(async move {
-            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr, false).await;
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
             Ok::<_, DynError>(())
         });
 
         let peer_a = tokio::spawn(async move {
-            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr, false).await;
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             Ok::<_, DynError>(())
         });
