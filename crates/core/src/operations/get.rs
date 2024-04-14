@@ -835,8 +835,6 @@ mod messages {
 
     use serde::{Deserialize, Serialize};
 
-    use crate::{contract::StoreResponse, message::InnerMessage};
-
     use super::*;
 
     #[derive(Debug, Serialize, Deserialize)]

@@ -4,7 +4,6 @@ use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
-use std::vec::Vec;
 
 use crate::transport::crypto::TransportSecretKey;
 use crate::transport::packet_data::{AssymetricRSA, UnknownEncryption};
@@ -413,7 +412,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         &mut self,
         remote_addr: SocketAddr,
         remote_public_key: TransportPublicKey,
-        remote_is_gateway: bool,
+        _remote_is_gateway: bool,
     ) -> (
         impl Future<Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>>
             + Send
@@ -741,7 +740,6 @@ impl InboundRemoteConnection {
 mod test {
     use std::{
         collections::HashMap,
-        net::Ipv4Addr,
         ops::Range,
         sync::{
             atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},

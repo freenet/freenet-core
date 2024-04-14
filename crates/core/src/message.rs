@@ -155,8 +155,6 @@ where
 }
 
 mod sealed_msg_type {
-    use crate::operations::update::UpdateMsg;
-
     use super::*;
 
     pub(crate) trait SealedTxType {

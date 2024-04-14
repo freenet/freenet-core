@@ -63,8 +63,7 @@ impl<S: StoreFsManagement> SafeWriter<S> {
             }
         }
         traversed += 1 + 32; // key + type marker
-        self.file
-            .write_u32::<BigEndian>(value.as_ref().len() as u32)?;
+        self.file.write_u32::<BigEndian>(value.len() as u32)?;
         traversed += std::mem::size_of::<u32>();
         self.file.write_all(value)?;
         traversed += value.len();

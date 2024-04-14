@@ -1,5 +1,4 @@
 use std::{
-    convert::TryFrom,
     fs::{self, File},
     future::Future,
     io::Read,

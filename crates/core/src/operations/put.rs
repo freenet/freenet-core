@@ -860,7 +860,6 @@ mod messages {
 
     use super::*;
 
-    use crate::message::InnerMessage;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Serialize, Deserialize)]

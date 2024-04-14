@@ -521,10 +521,6 @@ pub(crate) enum ConnectionAcquisitionStrategy {
 
 #[cfg(test)]
 mod tests {
-    use super::{Limits, TopologyManager};
-    use crate::topology::rate::Rate;
-    use crate::{message::TransactionType, ring::Location};
-
     #[test]
     fn test_topology() {
         const NUM_REQUESTS: usize = 1_000;
@@ -608,7 +604,7 @@ mod tests {
     use super::*;
     use crate::ring::Distance;
     use crate::test_utils::with_tracing;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     #[test]
     fn test_resource_manager_report() {

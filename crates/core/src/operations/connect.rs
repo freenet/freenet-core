@@ -1066,9 +1066,7 @@ mod messages {
     use std::fmt::Display;
 
     use super::*;
-    use crate::ring::{Location, PeerKeyLocation};
 
-    use crate::message::InnerMessage;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Serialize, Deserialize)]

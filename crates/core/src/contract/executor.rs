@@ -418,6 +418,7 @@ pub(crate) trait ContractExecutor: Send + 'static {
         key: ContractKey,
         fetch_contract: bool,
     ) -> Result<(WrappedState, Option<ContractContainer>), ExecutorError>;
+
     async fn store_contract(&mut self, contract: ContractContainer) -> Result<(), ExecutorError>;
 
     async fn upsert_contract_state(
