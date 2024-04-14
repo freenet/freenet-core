@@ -5,7 +5,7 @@ use redb::{Database, TableDefinition};
 
 use crate::wasm_runtime::StateStorage;
 
-const CONTRACT_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("contract");
+const CONTRACT_PARAMS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("contract");
 const STATE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state");
 
 pub struct ReDb(Database);
@@ -18,11 +18,6 @@ impl ReDb {
     }
 }
 
-impl ReDb {
-    const STATE_SUFFIX: &'static [u8] = "_key".as_bytes();
-    const PARAMS_SUFFIX: &'static [u8] = "_params".as_bytes();
-}
-
 impl StateStorage for ReDb {
     type Error = redb::Error;
 
@@ -31,10 +26,7 @@ impl StateStorage for ReDb {
 
         {
             let mut tbl = txn.open_table(STATE_TABLE)?;
-            tbl.insert(
-                [key.as_bytes(), Self::STATE_SUFFIX].concat().as_slice(),
-                state.as_ref(),
-            )?;
+            tbl.insert(key.as_bytes(), state.as_ref())?;
         }
         txn.commit().map_err(Into::into)
     }
@@ -44,7 +36,7 @@ impl StateStorage for ReDb {
 
         let val = {
             let tbl = txn.open_table(STATE_TABLE)?;
-            tbl.get([key.as_bytes(), Self::STATE_SUFFIX].concat().as_slice())?
+            tbl.get(key.as_bytes())?
         };
 
         match val {
@@ -61,11 +53,8 @@ impl StateStorage for ReDb {
         let txn = self.0.begin_write()?;
 
         {
-            let mut tbl = txn.open_table(CONTRACT_TABLE)?;
-            tbl.insert(
-                [key.as_bytes(), Self::PARAMS_SUFFIX].concat().as_slice(),
-                params.as_ref(),
-            )?;
+            let mut tbl = txn.open_table(CONTRACT_PARAMS_TABLE)?;
+            tbl.insert(key.as_bytes(), params.as_ref())?;
         }
         txn.commit().map_err(Into::into)
     }
@@ -77,8 +66,8 @@ impl StateStorage for ReDb {
         let txn = self.0.begin_read()?;
 
         let val = {
-            let tbl = txn.open_table(CONTRACT_TABLE)?;
-            tbl.get([key.as_bytes(), Self::PARAMS_SUFFIX].concat().as_slice())?
+            let tbl = txn.open_table(CONTRACT_PARAMS_TABLE)?;
+            tbl.get(key.as_bytes())?
         };
 
         match val {
