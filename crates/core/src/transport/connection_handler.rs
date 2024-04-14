@@ -1102,23 +1102,25 @@ mod test {
 
     #[tokio::test]
     async fn simulate_gateway_connection() -> Result<(), DynError> {
-        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
-        let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_gateway_connection(Default::default()).await?;
+        let (_peer_a_pub, mut peer_a, _peer_a_addr) =
+            set_peer_connection(Default::default()).await?;
+        let (gw_pub, mut gw_conn, gw_addr) = set_gateway_connection(Default::default()).await?;
 
-        let peer_b = tokio::spawn(async move {
-            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+        let gw = tokio::spawn(async move {
+            let gw_conn = gw_conn.next_connection();
+            let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
+                .await?
+                .ok_or("no connection")?;
             Ok::<_, DynError>(())
         });
 
         let peer_a = tokio::spawn(async move {
-            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
+            let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             Ok::<_, DynError>(())
         });
 
-        let (a, b) = tokio::try_join!(peer_a, peer_b)?;
+        let (a, b) = tokio::try_join!(peer_a, gw)?;
         a?;
         b?;
         Ok(())
@@ -1127,23 +1129,26 @@ mod test {
     #[tokio::test]
     async fn simulate_gateway_connection_drop_first_packets_of_gateway() -> Result<(), DynError> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
-        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
-        let (peer_b_pub, mut peer_b, peer_b_addr) =
+        let (_peer_a_pub, mut peer_a, _peer_a_addr) =
+            set_peer_connection(Default::default()).await?;
+        let (gw_pub, mut gw_conn, gw_addr) =
             set_gateway_connection(PacketDropPolicy::Range(0..1)).await?;
 
-        let peer_b = tokio::spawn(async move {
-            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+        let gw = tokio::spawn(async move {
+            let gw_conn = gw_conn.next_connection();
+            let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
+                .await?
+                .ok_or("no connection")?;
             Ok::<_, DynError>(())
         });
 
         let peer_a = tokio::spawn(async move {
-            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
+            let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             Ok::<_, DynError>(())
         });
 
-        let (a, b) = tokio::try_join!(peer_a, peer_b)?;
+        let (a, b) = tokio::try_join!(peer_a, gw)?;
         a?;
         b?;
         Ok(())
@@ -1152,24 +1157,26 @@ mod test {
     #[tokio::test]
     async fn simulate_gateway_connection_drop_first_packets_for_all() -> Result<(), DynError> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
-        let (peer_a_pub, mut peer_a, peer_a_addr) =
+        let (_peer_a_pub, mut peer_a, _peer_a_addr) =
             set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
-        let (peer_b_pub, mut peer_b, peer_b_addr) =
+        let (gw_pub, mut gw_conn, gw_addr) =
             set_gateway_connection(PacketDropPolicy::Range(0..1)).await?;
 
-        let peer_b = tokio::spawn(async move {
-            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+        let gw = tokio::spawn(async move {
+            let gw_conn = gw_conn.next_connection();
+            let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
+                .await?
+                .ok_or("no connection")?;
             Ok::<_, DynError>(())
         });
 
         let peer_a = tokio::spawn(async move {
-            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
+            let _ = tokio::time::timeout(Duration::from_secs(10), peer_b_conn).await??;
             Ok::<_, DynError>(())
         });
 
-        let (a, b) = tokio::try_join!(peer_a, peer_b)?;
+        let (a, b) = tokio::try_join!(peer_a, gw)?;
         a?;
         b?;
         Ok(())
@@ -1178,24 +1185,25 @@ mod test {
     #[tokio::test]
     async fn simulate_gateway_connection_drop_first_packets_of_peer() -> Result<(), DynError> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
-        let (peer_a_pub, mut peer_a, peer_a_addr) =
+        let (_peer_a_pub, mut peer_a, _peer_a_addr) =
             set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
-        let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_gateway_connection(Default::default()).await?;
+        let (gw_pub, mut gw_conn, gw_addr) = set_gateway_connection(Default::default()).await?;
 
-        let peer_b = tokio::spawn(async move {
-            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+        let gw = tokio::spawn(async move {
+            let gw_conn = gw_conn.next_connection();
+            let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
+                .await?
+                .ok_or("no connection")?;
             Ok::<_, DynError>(())
         });
 
         let peer_a = tokio::spawn(async move {
-            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
+            let _ = tokio::time::timeout(Duration::from_secs(10), peer_b_conn).await??;
             Ok::<_, DynError>(())
         });
 
-        let (a, b) = tokio::try_join!(peer_a, peer_b)?;
+        let (a, b) = tokio::try_join!(peer_a, gw)?;
         a?;
         b?;
         Ok(())
