@@ -1,3 +1,4 @@
+use core::future::Future;
 use freenet_stdlib::prelude::*;
 use stretto::AsyncCache;
 
@@ -22,21 +23,26 @@ impl From<StateStoreError> for crate::wasm_runtime::ContractError {
     }
 }
 
-#[async_trait::async_trait]
-#[allow(clippy::type_complexity)]
 pub trait StateStorage {
     type Error;
-    async fn store(&mut self, key: ContractKey, state: WrappedState) -> Result<(), Self::Error>;
-    async fn store_params(
+    fn store(
+        &mut self,
+        key: ContractKey,
+        state: WrappedState,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn store_params(
         &mut self,
         key: ContractKey,
         state: Parameters<'static>,
-    ) -> Result<(), Self::Error>;
-    async fn get(&self, key: &ContractKey) -> Result<Option<WrappedState>, Self::Error>;
-    async fn get_params<'a>(
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn get(
+        &self,
+        key: &ContractKey,
+    ) -> impl Future<Output = Result<Option<WrappedState>, Self::Error>> + Send;
+    fn get_params<'a>(
         &'a self,
         key: &'a ContractKey,
-    ) -> Result<Option<Parameters<'static>>, Self::Error>;
+    ) -> impl Future<Output = Result<Option<Parameters<'static>>, Self::Error>> + Send + 'a;
 }
 
 pub struct StateStore<S: StateStorage> {

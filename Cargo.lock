@@ -1785,6 +1785,7 @@ dependencies = [
  "pav_regression",
  "pico-args",
  "rand",
+ "redb",
  "reqwest",
  "rocksdb",
  "rsa",
@@ -4463,6 +4464,15 @@ dependencies = [
  "ring 0.16.20",
  "time",
  "yasna",
+]
+
+[[package]]
+name = "redb"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1100a056c5dcdd4e5513d5333385223b26ef1bf92f31eb38f407e8c20549256"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

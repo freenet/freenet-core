@@ -31,7 +31,7 @@ impl AppState {
         )?;
         let secrets_store = SecretsStore::new(Config::conf().secrets_dir())?;
         let state_store = StateStore::new(
-            Storage::new(Some(&Config::conf().db_dir())).await?,
+            Storage::new(&Config::conf().db_dir()).await?,
             Self::MAX_MEM_CACHE,
         )?;
         let rt = freenet::dev_tool::Runtime::build(

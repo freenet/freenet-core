@@ -27,7 +27,6 @@ impl RocksDb {
     const PARAMS_SUFFIX: &'static [u8] = "_params".as_bytes();
 }
 
-#[async_trait::async_trait]
 impl StateStorage for RocksDb {
     type Error = rocksdb::Error;
 

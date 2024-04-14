@@ -17,8 +17,7 @@ impl Executor<MockRuntime> {
 
         let db_path = data_dir.join("db");
         std::fs::create_dir_all(&db_path).expect("directory created");
-        let state_store =
-            StateStore::new(Storage::new(Some(&db_path)).await?, u16::MAX as u32).unwrap();
+        let state_store = StateStore::new(Storage::new(&db_path).await?, u16::MAX as u32).unwrap();
 
         let executor = Executor::new(
             state_store,
@@ -125,8 +124,10 @@ mod test {
         const MAX_SIZE: i64 = 10 * 1024 * 1024;
         const MAX_MEM_CACHE: u32 = 10_000_000;
         let tmp_dir = tempfile::tempdir()?;
+        let state_store_path = tmp_dir.path().join("state_store");
         let contract_store = ContractStore::new(tmp_dir.path().join("executor-test"), MAX_SIZE)?;
-        let state_store = StateStore::new(Storage::new(None).await?, MAX_MEM_CACHE).unwrap();
+        let state_store =
+            StateStore::new(Storage::new(&state_store_path).await?, MAX_MEM_CACHE).unwrap();
         let mut counter = 0;
         Executor::new(
             state_store,
