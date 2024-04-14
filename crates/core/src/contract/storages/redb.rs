@@ -5,7 +5,8 @@ use redb::{Database, TableDefinition};
 
 use crate::wasm_runtime::StateStorage;
 
-const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("contract");
+const CONTRACT_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("contract");
+const STATE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state");
 
 pub struct ReDb(Database);
 
@@ -29,7 +30,7 @@ impl StateStorage for ReDb {
         let txn = self.0.begin_write()?;
 
         {
-            let mut tbl = txn.open_table(TABLE)?;
+            let mut tbl = txn.open_table(STATE_TABLE)?;
             tbl.insert(
                 [key.as_bytes(), Self::STATE_SUFFIX].concat().as_slice(),
                 state.as_ref(),
@@ -42,7 +43,7 @@ impl StateStorage for ReDb {
         let txn = self.0.begin_read()?;
 
         let val = {
-            let tbl = txn.open_table(TABLE)?;
+            let tbl = txn.open_table(STATE_TABLE)?;
             tbl.get([key.as_bytes(), Self::STATE_SUFFIX].concat().as_slice())?
         };
 
@@ -60,7 +61,7 @@ impl StateStorage for ReDb {
         let txn = self.0.begin_write()?;
 
         {
-            let mut tbl = txn.open_table(TABLE)?;
+            let mut tbl = txn.open_table(CONTRACT_TABLE)?;
             tbl.insert(
                 [key.as_bytes(), Self::PARAMS_SUFFIX].concat().as_slice(),
                 params.as_ref(),
@@ -76,7 +77,7 @@ impl StateStorage for ReDb {
         let txn = self.0.begin_read()?;
 
         let val = {
-            let tbl = txn.open_table(TABLE)?;
+            let tbl = txn.open_table(CONTRACT_TABLE)?;
             tbl.get([key.as_bytes(), Self::PARAMS_SUFFIX].concat().as_slice())?
         };
 
