@@ -48,7 +48,6 @@ ordered-float = "4.2"
 pav_regression = "0.4.0"
 parking_lot = "0.12"
 rand = { features = ["small_rng"], workspace = true }
-rocksdb = { default-features = false, optional = true, version = "0.22" }
 redb = { optional = true, version = "2" }
 serde = { features = ["derive", "rc"], workspace = true }
 serde_json = { workspace = true }
