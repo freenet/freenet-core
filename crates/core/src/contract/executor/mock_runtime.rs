@@ -119,7 +119,6 @@ impl ContractExecutor for Executor<MockRuntime> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::wasm_runtime::{ContractStore, StateStore};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn local_node_handle() -> Result<(), Box<dyn std::error::Error>> {

@@ -245,7 +245,7 @@ impl SecretsStore {
 #[cfg(test)]
 mod test {
     use super::*;
-    use chacha20poly1305::aead::{AeadCore, KeyInit, OsRng};
+    use chacha20poly1305::aead::{AeadCore, OsRng};
 
     #[test]
     fn store_and_load() -> Result<(), Box<dyn std::error::Error>> {

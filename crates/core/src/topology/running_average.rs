@@ -49,8 +49,6 @@ impl RunningAverage {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
-
     use super::*;
 
     #[test]

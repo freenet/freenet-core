@@ -3,7 +3,6 @@ use std::path::Path;
 use freenet_stdlib::prelude::*;
 use rocksdb::{Options, DB};
 
-use crate::contract::ContractKey;
 use crate::wasm_runtime::StateStorage;
 
 pub struct RocksDb(DB);

@@ -424,7 +424,6 @@ fn build_op_result(
 }
 
 mod messages {
-    use crate::message::InnerMessage;
     use std::fmt::Display;
 
     use super::*;

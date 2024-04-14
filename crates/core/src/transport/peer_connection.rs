@@ -4,7 +4,6 @@ use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
-use std::vec::Vec;
 
 use crate::transport::packet_data::UnknownEncryption;
 use aes_gcm::Aes128Gcm;
@@ -390,8 +389,7 @@ async fn packet_sending(
 mod tests {
     use aes_gcm::KeyInit;
     use futures::TryFutureExt;
-    use std::net::{Ipv4Addr, SocketAddr};
-    use tokio::sync::mpsc;
+    use std::net::Ipv4Addr;
 
     use super::{
         inbound_stream::{recv_stream, InboundStream},
