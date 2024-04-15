@@ -1,5 +1,5 @@
 //! Operation which seeks new connections in the ring.
-use dashmap::Map;
+use aes_gcm::aead::generic_array::sequence::Shorten;
 use freenet_stdlib::client_api::HostResponse;
 use futures::future::BoxFuture;
 use futures::{Future, FutureExt};
@@ -167,9 +167,10 @@ impl Operation for ConnectOp {
                             let msg = ConnectMsg::Request {
                                 id: *id,
                                 msg: ConnectRequest::CheckConnectivity {
-                                    requester: own_loc.clone(),
+                                    sender: own_loc.clone(),
                                     joiner: joiner.clone(),
                                     hops_to_live: *max_hops_to_live,
+                                    max_hops_to_live: *max_hops_to_live,
                                     skip_list: vec![],
                                 },
                             };
@@ -260,16 +261,17 @@ impl Operation for ConnectOp {
                     };
 
                     let actual_state = self.state;
+                    let should_accept = !accepted_by.is_empty();
 
                     if let Some(mut updated_state) = forward_conn(
                         *id,
                         &op_manager.ring,
                         actual_state,
                         network_bridge,
-                        (*sender, *joiner),
+                        (new_peer_loc, new_peer_loc),
                         *hops_to_live,
                         accepted_by.clone(),
-                        skip_list,
+                        *skip_list,
                     )
                     .await?
                     {
@@ -359,7 +361,7 @@ impl Operation for ConnectOp {
                         (*sender, *joiner),
                         *hops_to_live,
                         accepted_by.clone(),
-                        skip_list,
+                        *skip_list,
                     )
                     .await?
                     {
@@ -413,11 +415,10 @@ impl Operation for ConnectOp {
                         "Connect response received",
                     );
 
-                    let your_peer_id = op_manager.ring.get_peer_key().expect("peer id not found");
+                    let this_peer_id = op_manager.ring.get_peer_key().expect("peer id not found");
                     let your_location = joiner.location.expect("location not found");
 
-                    let Some(ConnectState::ConnectingToNode(ConnectionInfo { gateway, .. })) =
-                        self.state
+                    let Some(ConnectState::ConnectingToNode(ConnectionInfo { .. })) = self.state
                     else {
                         return Err(OpError::invalid_transition(self.id));
                     };
@@ -505,7 +506,6 @@ struct ConnectivityInfo {
 
 #[derive(Debug, Clone)]
 struct ConnectionInfo {
-    peer_loc: PeerKeyLocation,
     this_peer: Option<PeerId>,
     peer_pub_key: TransportPublicKey,
     max_hops_to_live: usize,
@@ -612,7 +612,6 @@ fn initial_request(
 ) -> ConnectOp {
     const MAX_JOIN_RETRIES: usize = usize::MAX;
     let state = ConnectState::ConnectingToNode(ConnectionInfo {
-        gateway: gateway.clone(),
         this_peer: None,
         peer_pub_key: peer_pub_key.clone(),
         max_hops_to_live,
@@ -679,8 +678,7 @@ where
             tx,
             OpEnum::Connect(Box::new(ConnectOp {
                 id,
-                state: Some(ConnectState::ConnectingToGateway(GatewayConnectionInfo {
-                    gateway: gateway.clone(),
+                state: Some(ConnectState::ConnectingToNode(ConnectionInfo {
                     this_peer: None,
                     peer_pub_key,
                     max_hops_to_live,
@@ -700,7 +698,7 @@ async fn forward_conn<NB>(
     network_bridge: &mut NB,
     (req_peer, joiner): (PeerKeyLocation, PeerKeyLocation),
     left_htl: usize,
-    accepted_by: HashSet<PeerKeyLocation>,
+    accepted_by: HashSet<PeerId>,
     skip_list: Vec<PeerId>,
 ) -> Result<Option<ConnectState>, OpError>
 where
@@ -724,7 +722,33 @@ where
         return Ok(None);
     }
 
-    let forward_to = if left_htl >= ring.rnd_if_htl_above {
+    let target_peer = select_forward_target(id, ring, &req_peer, &joiner, left_htl, &skip_list);
+    match target_peer {
+        Some(target_peer) => {
+            let forward_msg = create_forward_message(
+                id,
+                &req_peer,
+                &joiner,
+                left_htl - 1,
+                &[req_peer.peer.clone()],
+            );
+            tracing::debug!(target: "network", "Forwarding connection request to {:?}", target_peer);
+            network_bridge.send(&target_peer.peer, forward_msg).await?;
+            update_state_with_forward_info(state, &joiner, target_peer)
+        }
+        None => handle_unforwardable_connection(id, &accepted_by),
+    }
+}
+
+fn select_forward_target(
+    id: Transaction,
+    ring: &Ring,
+    request_peer: &PeerKeyLocation,
+    joiner: &PeerKeyLocation,
+    left_htl: usize,
+    skip_list: &[PeerId],
+) -> Option<PeerKeyLocation> {
+    if left_htl >= ring.rnd_if_htl_above {
         tracing::debug!(
             tx = %id,
             joiner = %joiner.peer,
@@ -737,70 +761,81 @@ where
             joiner = %joiner.peer,
             "Selecting close peer to forward request",
         );
-        // FIXME: target the `desired_location`
-        let desired_location = joiner.location.unwrap();
-        ring.routing(desired_location, Some(&req_peer.peer), skip_list.as_slice())
-            .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))
-    };
-
-    let skip_list = vec![req_peer.peer.clone()];
-
-    if let Some(forward_to) = forward_to {
-        let forwarded = NetMessage::from(ConnectMsg::Request {
-            id,
-            msg: ConnectRequest::CheckConnectivity {
-                sender: req_peer.clone(),
-                joiner: joiner.clone(),
-                hops_to_live: left_htl - 1,
-                max_hops_to_live: left_htl - 1,
-                skip_list,
-            },
-        });
-        tracing::debug!(
-            tx = %id,
-            sender = %req_peer.peer,
-            forward_target = %forward_to.peer,
-            "Forwarding connect request from sender to other peer",
-        );
-        network_bridge.send(&forward_to.peer, forwarded).await?;
-
-        let new_state = match state {
-            Some(ConnectState::AwaitingConnectivity(conn_info)) => {
-                let mut waiting_peers = conn_info.waiting_for.clone();
-                if let Some(peers) = waiting_peers.get_mut(&joiner.peer.clone()) {
-                    peers.insert(forward_to.peer.clone());
-                } else {
-                    waiting_peers.insert(
-                        joiner.peer.clone(),
-                        HashSet::from([forward_to.peer.clone()]),
-                    );
-                };
-                let conn_info = ConnectivityInfo {
-                    waiting_for: waiting_peers,
-                };
-                ConnectState::AwaitingConnectivity(conn_info)
-            }
-            Some(s) => s,
-            None => ConnectState::AwaitingConnectivity(ConnectivityInfo {
-                waiting_for: HashMap::from_iter([(
-                    joiner.peer.clone(),
-                    HashSet::from([forward_to.peer.clone()]),
-                )]),
-            }),
-        };
-
-        Ok(Some(new_state))
-    } else {
-        if !accepted_by.is_empty() {
-            tracing::warn!(
-                tx = %id,
-                "Unable to forward, will only be connecting to one peer",
-            );
-        } else {
-            tracing::warn!(tx = %id, "Unable to forward or accept any connections");
-        }
-        Ok(None)
+        ring.routing(
+            joiner.location.unwrap(),
+            Some(&request_peer.peer),
+            skip_list,
+        )
+        .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))
     }
+}
+
+fn create_forward_message(
+    id: Transaction,
+    request_peer: &PeerKeyLocation,
+    joiner: &PeerKeyLocation,
+    hops_to_live: usize,
+    skip_list: &[PeerId],
+) -> NetMessage {
+    NetMessage::from(ConnectMsg::Request {
+        id,
+        msg: ConnectRequest::CheckConnectivity {
+            sender: request_peer.clone(),
+            joiner: joiner.clone(),
+            hops_to_live,
+            max_hops_to_live: hops_to_live,
+            skip_list: skip_list.to_vec(),
+        },
+    })
+}
+
+fn update_state_with_forward_info(
+    state: Option<ConnectState>,
+    joiner: &PeerKeyLocation,
+    forward_to: PeerKeyLocation,
+) -> Result<Option<ConnectState>, OpError> {
+    let new_state = match state {
+        Some(ConnectState::AwaitingConnectivity(conn_info)) => {
+            update_connectivity_info(conn_info, joiner, forward_to)
+        }
+        _ => ConnectState::AwaitingConnectivity(ConnectivityInfo {
+            waiting_for: HashMap::from_iter([(
+                joiner.peer.clone(),
+                HashSet::from([forward_to.peer.clone()]),
+            )]),
+        }),
+    };
+    Ok(Some(new_state))
+}
+
+fn handle_unforwardable_connection(
+    id: Transaction,
+    accepted_by: &HashSet<PeerId>,
+) -> Result<Option<ConnectState>, OpError> {
+    if !accepted_by.is_empty() {
+        tracing::warn!(
+            tx = %id,
+            "Unable to forward, will only be connecting to one peer",
+        );
+    } else {
+        tracing::warn!(tx = %id, "Unable to forward or accept any connections");
+    }
+    Ok(None)
+}
+
+fn update_connectivity_info(
+    mut conn_info: ConnectivityInfo,
+    joiner: &PeerKeyLocation,
+    forward_to: PeerKeyLocation,
+) -> ConnectState {
+    let mut waiting_peers = conn_info.waiting_for.clone();
+    waiting_peers
+        .entry(joiner.peer.clone())
+        .or_insert_with(HashSet::new)
+        .insert(forward_to.peer.clone());
+    ConnectState::AwaitingConnectivity(ConnectivityInfo {
+        waiting_for: waiting_peers,
+    })
 }
 
 mod messages {
