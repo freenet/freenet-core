@@ -1,6 +1,5 @@
 use std::sync::{Arc, OnceLock};
 
-use futures::{future::BoxFuture, FutureExt};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufWriter, Stdout},
     sync::{
@@ -71,21 +70,17 @@ impl InterProcessConnManager {
 }
 
 impl NetworkBridgeExt for InterProcessConnManager {
-    fn recv(&mut self) -> BoxFuture<Result<NetMessage, ConnectionError>> {
-        async {
-            self.recv
-                .changed()
-                .await
-                .map_err(|_| ConnectionError::Timeout)?;
-            let data = &*self.recv.borrow();
-            let deser = bincode::deserialize(data)?;
-            Ok(deser)
-        }
-        .boxed()
+    async fn recv(&mut self) -> Result<NetMessage, ConnectionError> {
+        self.recv
+            .changed()
+            .await
+            .map_err(|_| ConnectionError::Timeout)?;
+        let data = &*self.recv.borrow();
+        let deser = bincode::deserialize(data)?;
+        Ok(deser)
     }
 }
 
-#[async_trait::async_trait]
 impl NetworkBridge for InterProcessConnManager {
     async fn send(&self, target: &PeerId, msg: NetMessage) -> super::ConnResult<()> {
         tracing::debug!(%target, ?msg, "sending network message out");

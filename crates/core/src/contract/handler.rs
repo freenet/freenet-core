@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::Duration;
 
 use freenet_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use freenet_stdlib::prelude::*;
-use futures::{future::BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -59,7 +59,7 @@ pub(crate) trait ContractHandler {
         contract_handler_channel: ContractHandlerChannel<ContractHandlerHalve>,
         executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
         builder: Self::Builder,
-    ) -> BoxFuture<'static, Result<Self, DynError>>
+    ) -> impl Future<Output = Result<Self, DynError>>
     where
         Self: Sized + 'static;
 
@@ -72,7 +72,7 @@ pub(crate) trait ContractHandler {
         req: ClientRequest<'a>,
         client_id: ClientId,
         updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
-    ) -> BoxFuture<'a, Result<HostResponse, DynError>>;
+    ) -> impl Future<Output = Result<HostResponse, DynError>> + 'a;
 
     fn executor(&mut self) -> &mut Self::ContractExecutor;
 }
@@ -86,39 +86,33 @@ impl ContractHandler for NetworkContractHandler<Runtime> {
     type Builder = PeerCliConfig;
     type ContractExecutor = Executor<Runtime>;
 
-    fn build(
+    async fn build(
         channel: ContractHandlerChannel<ContractHandlerHalve>,
         executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
         config: Self::Builder,
-    ) -> BoxFuture<'static, Result<Self, DynError>>
+    ) -> Result<Self, DynError>
     where
         Self: Sized + 'static,
     {
-        async {
-            let executor = Executor::from_config(config, Some(executor_request_sender)).await?;
-            Ok(Self { executor, channel })
-        }
-        .boxed()
+        let executor = Executor::from_config(config, Some(executor_request_sender)).await?;
+        Ok(Self { executor, channel })
     }
 
     fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve> {
         &mut self.channel
     }
 
-    fn handle_request<'a, 's: 'a>(
+    async fn handle_request<'a, 's: 'a>(
         &'s mut self,
         req: ClientRequest<'a>,
         client_id: ClientId,
         updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
-    ) -> BoxFuture<'a, Result<HostResponse, DynError>> {
-        async move {
-            let res = self
-                .executor
-                .handle_request(client_id, req, updates)
-                .await?;
-            Ok(res)
-        }
-        .boxed()
+    ) -> Result<HostResponse, DynError> {
+        let res = self
+            .executor
+            .handle_request(client_id, req, updates)
+            .await?;
+        Ok(res)
     }
 
     fn executor(&mut self) -> &mut Self::ContractExecutor {
@@ -131,39 +125,33 @@ impl ContractHandler for NetworkContractHandler<super::MockRuntime> {
     type Builder = String;
     type ContractExecutor = Executor<super::MockRuntime>;
 
-    fn build(
+    async fn build(
         channel: ContractHandlerChannel<ContractHandlerHalve>,
         executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
         identifier: Self::Builder,
-    ) -> BoxFuture<'static, Result<Self, DynError>>
+    ) -> Result<Self, DynError>
     where
         Self: Sized + 'static,
     {
-        async move {
-            let executor = Executor::new_mock(&identifier, executor_request_sender).await?;
-            Ok(Self { executor, channel })
-        }
-        .boxed()
+        let executor = Executor::new_mock(&identifier, executor_request_sender).await?;
+        Ok(Self { executor, channel })
     }
 
     fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve> {
         &mut self.channel
     }
 
-    fn handle_request<'a, 's: 'a>(
+    async fn handle_request<'a, 's: 'a>(
         &'s mut self,
         req: ClientRequest<'a>,
         client_id: ClientId,
         updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
-    ) -> BoxFuture<'a, Result<HostResponse, DynError>> {
-        async move {
-            let res = self
-                .executor
-                .handle_request(client_id, req, updates)
-                .await?;
-            Ok(res)
-        }
-        .boxed()
+    ) -> Result<HostResponse, DynError> {
+        let res = self
+            .executor
+            .handle_request(client_id, req, updates)
+            .await?;
+        Ok(res)
     }
 
     fn executor(&mut self) -> &mut Self::ContractExecutor {
@@ -484,7 +472,6 @@ pub mod test {
 pub(super) mod in_memory {
     use crate::client_events::ClientId;
     use freenet_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
-    use futures::{future::BoxFuture, FutureExt};
     use tokio::sync::mpsc::UnboundedSender;
 
     use super::{
@@ -520,30 +507,27 @@ pub(super) mod in_memory {
         type Builder = String;
         type ContractExecutor = Executor<MockRuntime>;
 
-        fn build(
+        async fn build(
             channel: ContractHandlerChannel<ContractHandlerHalve>,
             executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
             identifier: Self::Builder,
-        ) -> BoxFuture<'static, Result<Self, DynError>>
+        ) -> Result<Self, DynError>
         where
             Self: Sized + 'static,
         {
-            async move {
-                Ok(MemoryContractHandler::new(channel, executor_request_sender, &identifier).await)
-            }
-            .boxed()
+            Ok(MemoryContractHandler::new(channel, executor_request_sender, &identifier).await)
         }
 
         fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve> {
             &mut self.channel
         }
 
-        fn handle_request<'a, 's: 'a>(
+        async fn handle_request<'a, 's: 'a>(
             &'s mut self,
             _req: ClientRequest<'a>,
             _client_id: ClientId,
             _updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
-        ) -> BoxFuture<'static, Result<HostResponse, DynError>> {
+        ) -> Result<HostResponse, DynError> {
             unreachable!()
         }
 

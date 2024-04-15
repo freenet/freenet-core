@@ -9,7 +9,7 @@ use std::{
 
 use either::Either;
 use freenet_stdlib::prelude::*;
-use futures::{future::BoxFuture, Future};
+use futures::Future;
 use itertools::Itertools;
 use libp2p::{identity, PeerId as Libp2pPeerId};
 use rand::{seq::SliceRandom, Rng};
@@ -965,7 +965,7 @@ use super::op_state_manager::OpManager;
 use crate::client_events::ClientEventsProxy;
 
 pub(super) trait NetworkBridgeExt: Clone + 'static {
-    fn recv(&mut self) -> BoxFuture<Result<NetMessage, ConnectionError>>;
+    fn recv(&mut self) -> impl Future<Output = Result<NetMessage, ConnectionError>> + Send;
 }
 
 struct RunnerConfig<NB, UsrEv>

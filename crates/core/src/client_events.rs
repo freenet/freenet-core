@@ -139,6 +139,10 @@ impl<'a> OpenRequest<'a> {
     }
 }
 
+// TODO(al8n): we may cannot remove BoxFuture here, but it requires more changes,
+// as async fn in trait will make this trait not Object Safe, so in other places
+// we cannot use BoxedClient. We may need to reference the AsyncRead/AsyncWrite trait
+// to make the trait object safe.
 pub trait ClientEventsProxy {
     /// # Cancellation Safety
     /// This future must be safe to cancel.

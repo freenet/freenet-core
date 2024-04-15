@@ -146,7 +146,6 @@ impl P2pBridge {
     }
 }
 
-#[async_trait::async_trait]
 impl NetworkBridge for P2pBridge {
     async fn add_connection(&mut self, peer: FreenetPeerId) -> super::ConnResult<()> {
         if self.active_net_connections.contains_key(&peer) {

@@ -3,7 +3,7 @@ use std::backtrace::Backtrace as StdTrace;
 use std::{pin::Pin, time::Duration};
 
 use freenet_stdlib::prelude::ContractKey;
-use futures::{future::BoxFuture, Future};
+use futures::Future;
 use tokio::sync::mpsc::error::SendError;
 
 use crate::{
@@ -31,7 +31,7 @@ where
     fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
-    ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>>;
+    ) -> impl Future<Output = Result<OpInitialization<Self>, OpError>> + 'a;
 
     fn id(&self) -> &Transaction;
 
