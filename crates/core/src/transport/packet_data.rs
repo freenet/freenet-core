@@ -259,7 +259,7 @@ impl<DT: Encryption, const N: usize> PartialEq for PacketData<DT, N> {
 mod tests {
     use super::*;
     use aes_gcm::aead::rand_core::RngCore;
-    use aes_gcm::{Aes128Gcm, KeyInit};
+    use aes_gcm::KeyInit;
     use rand::rngs::OsRng;
 
     #[test]

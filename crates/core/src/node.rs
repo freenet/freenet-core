@@ -130,7 +130,7 @@ pub struct NodeConfig {
 
 impl NodeConfig {
     pub fn new() -> NodeConfig {
-        let key_pair = TransportKeypair::random();
+        let key_pair = TransportKeypair::new();
         NodeConfig {
             should_connect: true,
             pub_key: key_pair.public,

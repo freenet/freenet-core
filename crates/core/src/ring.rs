@@ -8,7 +8,6 @@ use std::hash::Hash;
 use std::{
     cmp::Reverse,
     collections::BTreeMap,
-    convert::TryFrom,
     fmt::Display,
     hash::Hasher,
     ops::Add,

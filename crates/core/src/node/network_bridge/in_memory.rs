@@ -7,7 +7,6 @@ use std::{
 };
 
 use crossbeam::channel::{self, Receiver, Sender};
-use futures::{future::BoxFuture, FutureExt};
 use once_cell::sync::OnceCell;
 use rand::{prelude::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use tokio::sync::Mutex;
@@ -61,7 +60,6 @@ impl MemoryConnManager {
     }
 }
 
-#[async_trait::async_trait]
 impl NetworkBridge for MemoryConnManager {
     async fn send(&self, target: &PeerId, msg: NetMessage) -> super::ConnResult<()> {
         self.log_register
@@ -83,19 +81,16 @@ impl NetworkBridge for MemoryConnManager {
 }
 
 impl NetworkBridgeExt for MemoryConnManager {
-    fn recv(&mut self) -> BoxFuture<'_, Result<NetMessage, ConnectionError>> {
-        async {
-            loop {
-                let mut queue = self.msg_queue.lock().await;
-                let Some(msg) = queue.pop() else {
-                    std::mem::drop(queue);
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    continue;
-                };
-                return Ok(msg);
-            }
+    async fn recv(&mut self) -> Result<NetMessage, ConnectionError> {
+        loop {
+            let mut queue = self.msg_queue.lock().await;
+            let Some(msg) = queue.pop() else {
+                std::mem::drop(queue);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            };
+            return Ok(msg);
         }
-        .boxed()
     }
 }
 

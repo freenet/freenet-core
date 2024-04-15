@@ -9,7 +9,7 @@ use std::{
 
 use either::Either;
 use freenet_stdlib::prelude::*;
-use futures::{future::BoxFuture, Future};
+use futures::Future;
 use itertools::Itertools;
 use rand::{seq::SliceRandom, Rng};
 use tokio::sync::{mpsc, watch};
@@ -388,7 +388,7 @@ impl SimNetwork {
         let mut configs = Vec::with_capacity(num);
         for node_no in 0..num {
             let label = NodeLabel::gateway(node_no);
-            let pair = TransportKeypair::random();
+            let pair = TransportKeypair::new();
             let id = todo!();
             let port = get_free_port().unwrap();
             let location = Location::random();
@@ -970,7 +970,7 @@ use super::op_state_manager::OpManager;
 use crate::client_events::ClientEventsProxy;
 
 pub(super) trait NetworkBridgeExt: Clone + 'static {
-    fn recv(&mut self) -> BoxFuture<Result<NetMessage, ConnectionError>>;
+    fn recv(&mut self) -> impl Future<Output = Result<NetMessage, ConnectionError>> + Send;
 }
 
 struct RunnerConfig<NB, UsrEv>

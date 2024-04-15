@@ -5,7 +5,6 @@ use freenet_stdlib::{
     client_api::{ErrorKind, HostResponse},
     prelude::*,
 };
-use futures::{future::BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
 
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
@@ -140,43 +139,40 @@ impl Operation for SubscribeOp {
     type Message = SubscribeMsg;
     type Result = SubscribeResult;
 
-    fn load_or_init<'a>(
+    async fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
-    ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>> {
-        async move {
-            let mut sender: Option<PeerId> = None;
-            if let Some(peer_key_loc) = msg.sender().cloned() {
-                sender = Some(peer_key_loc.peer);
-            };
-            let id = *msg.id();
+    ) -> Result<OpInitialization<Self>, OpError> {
+        let mut sender: Option<PeerId> = None;
+        if let Some(peer_key_loc) = msg.sender().cloned() {
+            sender = Some(peer_key_loc.peer);
+        };
+        let id = *msg.id();
 
-            match op_manager.pop(msg.id()) {
-                Ok(Some(OpEnum::Subscribe(subscribe_op))) => {
-                    // was an existing operation, the other peer messaged back
-                    Ok(OpInitialization {
-                        op: subscribe_op,
-                        sender,
-                    })
-                }
-                Ok(Some(op)) => {
-                    let _ = op_manager.push(id, op).await;
-                    Err(OpError::OpNotPresent(id))
-                }
-                Ok(None) => {
-                    // new request to subcribe to a contract, initialize the machine
-                    Ok(OpInitialization {
-                        op: Self {
-                            state: Some(SubscribeState::ReceivedRequest),
-                            id,
-                        },
-                        sender,
-                    })
-                }
-                Err(err) => Err(err.into()),
+        match op_manager.pop(msg.id()) {
+            Ok(Some(OpEnum::Subscribe(subscribe_op))) => {
+                // was an existing operation, the other peer messaged back
+                Ok(OpInitialization {
+                    op: subscribe_op,
+                    sender,
+                })
             }
+            Ok(Some(op)) => {
+                let _ = op_manager.push(id, op).await;
+                Err(OpError::OpNotPresent(id))
+            }
+            Ok(None) => {
+                // new request to subcribe to a contract, initialize the machine
+                Ok(OpInitialization {
+                    op: Self {
+                        state: Some(SubscribeState::ReceivedRequest),
+                        id,
+                    },
+                    sender,
+                })
+            }
+            Err(err) => Err(err.into()),
         }
-        .boxed()
     }
 
     fn id(&self) -> &Transaction {
@@ -428,7 +424,6 @@ fn build_op_result(
 }
 
 mod messages {
-    use crate::message::InnerMessage;
     use std::fmt::Display;
 
     use super::*;

@@ -20,8 +20,6 @@ fn compute_ptr<T>(ptr: i64, start_ptr: i64) -> *mut T {
 }
 
 pub(crate) mod log {
-    use wasmer::Function;
-
     use super::*;
 
     pub(crate) fn prepare_export(store: &mut wasmer::Store, imports: &mut Imports) {

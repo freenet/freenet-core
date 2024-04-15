@@ -1227,16 +1227,11 @@ pub(crate) mod tracer {
 }
 
 pub(super) mod test {
+    use dashmap::DashMap;
     use std::{
         collections::HashMap,
-        sync::{
-            atomic::{AtomicUsize, Ordering::SeqCst},
-            Arc,
-        },
+        sync::atomic::{AtomicUsize, Ordering::SeqCst},
     };
-
-    use dashmap::DashMap;
-    use tokio_tungstenite::WebSocketStream;
 
     use super::*;
     use crate::{node::testing_impl::NodeLabel, ring::Distance};

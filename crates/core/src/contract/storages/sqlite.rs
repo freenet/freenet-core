@@ -6,10 +6,7 @@ use sqlx::{
     ConnectOptions, Row, SqlitePool,
 };
 
-use crate::{
-    contract::ContractKey,
-    wasm_runtime::{ContractError, StateStorage, StateStoreError},
-};
+use crate::wasm_runtime::{ContractError, StateStorage, StateStoreError};
 
 async fn create_contracts_table(pool: &SqlitePool) -> Result<(), SqlDbError> {
     sqlx::query(
@@ -28,6 +25,7 @@ async fn create_contracts_table(pool: &SqlitePool) -> Result<(), SqlDbError> {
 pub struct Pool(SqlitePool);
 
 impl Pool {
+    #[cfg_attr(feature = "redb", allow(unused))]
     pub async fn new(db_dir: Option<&Path>) -> Result<Self, SqlDbError> {
         let opts = if let Some(db_dir) = db_dir {
             let file = db_dir.join("freenet.db");
@@ -49,7 +47,6 @@ impl Pool {
     }
 }
 
-#[async_trait::async_trait]
 impl StateStorage for Pool {
     type Error = SqlDbError;
 

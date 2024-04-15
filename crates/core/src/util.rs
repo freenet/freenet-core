@@ -159,7 +159,6 @@ impl<T> IterExt for T where T: Iterator {}
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
-    use rand::Rng;
 
     #[test]
     fn randomize_iter() {
@@ -240,12 +239,6 @@ impl<'x> Contains<PeerId> for &'x [&PeerId] {
 }
 
 impl<'x> Contains<PeerId> for &'x Vec<&PeerId> {
-    fn has_element(&self, target: &PeerId) -> bool {
-        self.contains(&target)
-    }
-}
-
-impl<'x> Contains<PeerId> for &'x Vec<PeerId> {
     fn has_element(&self, target: &PeerId) -> bool {
         self.contains(&target)
     }

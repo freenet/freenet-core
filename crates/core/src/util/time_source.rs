@@ -127,7 +127,6 @@ impl TimeSource for MockTimeSource {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn test_instant_is_updated() {

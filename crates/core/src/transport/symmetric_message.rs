@@ -51,35 +51,20 @@ impl SymmetricMessage {
         Ok(packet.encrypt_symmetric(outbound_sym_key))
     }
 
-    const ACK_OK: SymmetricMessage = SymmetricMessage {
-        packet_id: Self::FIRST_PACKET_ID,
-        confirm_receipt: Vec::new(),
-        payload: SymmetricMessagePayload::AckConnection { result: Ok(()) },
-    };
-
     pub fn ack_ok(
         outbound_sym_key: &Aes128Gcm,
-    ) -> Result<PacketData<SymmetricAES>, bincode::Error> {
-        static SERIALIZED: OnceLock<Box<[u8]>> = OnceLock::new();
-        let bytes = SERIALIZED.get_or_init(move || {
-            let mut packet = [0u8; MAX_DATA_SIZE];
-            let size = bincode::serialized_size(&Self::ACK_OK).unwrap();
-            bincode::serialize_into(packet.as_mut_slice(), &Self::ACK_OK).unwrap();
-            (&packet[..size as usize]).into()
-        });
-        let packet = PacketData::from_buf_plain(bytes);
-        Ok(packet.encrypt_symmetric(outbound_sym_key))
-    }
-
-    pub fn ack_gateway_connection(
-        outbound_sym_key: &Aes128Gcm,
-        key: [u8; 16],
+        our_inbound_key: [u8; 16],
         remote_addr: SocketAddr,
     ) -> Result<PacketData<SymmetricAES>, bincode::Error> {
         let message = Self {
             packet_id: Self::FIRST_PACKET_ID,
             confirm_receipt: vec![],
-            payload: SymmetricMessagePayload::GatewayConnection { key },
+            payload: SymmetricMessagePayload::AckConnection {
+                result: Ok(OutboundConnection {
+                    key: our_inbound_key,
+                    remote_addr,
+                }),
+            },
         };
         let mut packet = [0u8; MAX_DATA_SIZE];
         let size = bincode::serialized_size(&message)?;
@@ -148,17 +133,18 @@ impl From<StreamFragment> for SymmetricMessagePayload {
 
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, Debug, Clone))]
+pub(super) struct OutboundConnection {
+    pub key: [u8; 16],
+    pub remote_addr: SocketAddr,
+}
+
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Debug, Clone))]
 pub(super) enum SymmetricMessagePayload {
     AckConnection {
-        // if we successfully connected to a remote we attempt to connect to initially
-        // then we return our TransportPublicKey so they can enroute other peers to us
-        result: Result<(), Cow<'static, str>>,
-    },
-    GatewayConnection {
-        // a gateway acknowledges a connection and returns the private key to use
-        // for communication
-        key: [u8; 16],
-        your_address: SocketAddr,
+        // a remote acknowledges a connection and returns the private key to use
+        // for communication and the remote address
+        result: Result<OutboundConnection, Cow<'static, str>>,
     },
     ShortMessage {
         payload: MessagePayload,
@@ -182,9 +168,6 @@ impl std::fmt::Display for SymmetricMessagePayload {
                     "AckConnection: {}",
                     result.as_ref().map(|_| "Ok").unwrap_or("Err")
                 )
-            }
-            SymmetricMessagePayload::GatewayConnection { remote_addr, .. } => {
-                write!(f, "GatewayConnection {:?}", remote_addr)
             }
             SymmetricMessagePayload::ShortMessage { .. } => {
                 write!(f, "ShortMessage")
@@ -231,13 +214,14 @@ mod test {
     #[test]
     fn check_symmetric_message_serialization() {
         let test_cases = [
-            SymmetricMessagePayload::AckConnection { result: Ok(()) },
+            SymmetricMessagePayload::AckConnection {
+                result: Ok(OutboundConnection {
+                    key: [0; 16],
+                    remote_addr: (Ipv4Addr::LOCALHOST, 1234).into(),
+                }),
+            },
             SymmetricMessagePayload::AckConnection {
                 result: Err(Cow::Borrowed("error")),
-            },
-            SymmetricMessagePayload::GatewayConnection {
-                your_address: (Ipv4Addr::LOCALHOST, 1234).into(),
-                key: [6u8; 16],
             },
             SymmetricMessagePayload::ShortMessage {
                 payload: std::iter::repeat(())
@@ -279,12 +263,20 @@ mod test {
 
     #[test]
     fn ack_ok_msg() -> Result<(), Box<dyn std::error::Error>> {
-        let enc = bincode::serialize(&SymmetricMessage::ACK_OK)?;
-        let dec: SymmetricMessage = bincode::deserialize(&enc)?;
-        assert_eq!(SymmetricMessage::ACK_OK, dec);
+        let enc = bincode::serialize(&SymmetricMessage {
+            packet_id: SymmetricMessage::FIRST_PACKET_ID,
+            confirm_receipt: vec![],
+            payload: SymmetricMessagePayload::AckConnection {
+                result: Ok(OutboundConnection {
+                    key: [0; 16],
+                    remote_addr: (Ipv4Addr::LOCALHOST, 1234).into(),
+                }),
+            },
+        })?;
+        let _dec: SymmetricMessage = bincode::deserialize(&enc)?;
 
         let key = gen_key();
-        let packet = SymmetricMessage::ack_ok(&key)?;
+        let packet = SymmetricMessage::ack_ok(&key, [0; 16], (Ipv4Addr::LOCALHOST, 1234).into())?;
         let data = packet.decrypt(&key).unwrap();
         let deser = SymmetricMessage::deser(data.data())?;
         assert!(matches!(

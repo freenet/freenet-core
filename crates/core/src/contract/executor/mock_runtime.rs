@@ -17,8 +17,7 @@ impl Executor<MockRuntime> {
 
         let db_path = data_dir.join("db");
         std::fs::create_dir_all(&db_path).expect("directory created");
-        let state_store =
-            StateStore::new(Storage::new(Some(&db_path)).await?, u16::MAX as u32).unwrap();
+        let state_store = StateStore::new(Storage::new(&db_path).await?, u16::MAX as u32).unwrap();
 
         let executor = Executor::new(
             state_store,
@@ -41,7 +40,6 @@ impl Executor<MockRuntime> {
     }
 }
 
-#[async_trait::async_trait]
 impl ContractExecutor for Executor<MockRuntime> {
     async fn fetch_contract(
         &mut self,
@@ -100,7 +98,7 @@ impl ContractExecutor for Executor<MockRuntime> {
                     .store(key, incoming_state.clone(), contract.params().into_owned())
                     .await
                     .map_err(ExecutorError::other)?;
-                return Ok(incoming_state);
+                Ok(incoming_state)
             }
             (Either::Left(incoming_state), None) => {
                 // update case
@@ -109,7 +107,7 @@ impl ContractExecutor for Executor<MockRuntime> {
                     .update(&key, incoming_state.clone())
                     .await
                     .map_err(ExecutorError::other)?;
-                return Ok(incoming_state);
+                Ok(incoming_state)
             }
             (update, contract) => unreachable!("{update:?}, {contract:?}"),
         }
@@ -119,15 +117,16 @@ impl ContractExecutor for Executor<MockRuntime> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::wasm_runtime::{ContractStore, StateStore};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn local_node_handle() -> Result<(), Box<dyn std::error::Error>> {
         const MAX_SIZE: i64 = 10 * 1024 * 1024;
         const MAX_MEM_CACHE: u32 = 10_000_000;
         let tmp_dir = tempfile::tempdir()?;
+        let state_store_path = tmp_dir.path().join("state_store");
         let contract_store = ContractStore::new(tmp_dir.path().join("executor-test"), MAX_SIZE)?;
-        let state_store = StateStore::new(Storage::new(None).await?, MAX_MEM_CACHE).unwrap();
+        let state_store =
+            StateStore::new(Storage::new(&state_store_path).await?, MAX_MEM_CACHE).unwrap();
         let mut counter = 0;
         Executor::new(
             state_store,

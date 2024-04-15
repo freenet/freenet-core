@@ -4,7 +4,6 @@ use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
-use std::vec::Vec;
 
 use crate::transport::packet_data::UnknownEncryption;
 use aes_gcm::Aes128Gcm;
@@ -44,6 +43,7 @@ pub(super) struct RemoteConnection {
     pub last_packet_id: Arc<AtomicU32>,
     pub inbound_packet_recv: mpsc::Receiver<PacketData<UnknownEncryption>>,
     pub inbound_symmetric_key: Aes128Gcm,
+    pub inbound_symmetric_key_bytes: [u8; 16],
     pub my_address: Option<SocketAddr>,
 }
 
@@ -124,19 +124,27 @@ impl PeerConnection {
     }
 
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
-        tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for incoming messages");
         // listen for incoming messages or receipts or wait until is time to do anything else again
         let mut resend_check = Some(tokio::time::sleep(tokio::time::Duration::from_secs(1)));
+
+        const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+        const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(60);
+        let mut keep_alive = tokio::time::interval(KEEP_ALIVE_INTERVAL);
+        keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        keep_alive.tick().await;
+        let mut last_received = std::time::Instant::now();
+
         loop {
-            tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for incoming messages loop");
+            // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
             tokio::select! {
                 inbound = self.remote_conn.inbound_packet_recv.recv() => {
                     let packet_data = inbound.ok_or(TransportError::ConnectionClosed)?;
+                    last_received = std::time::Instant::now();
                     let Ok(decrypted) = packet_data.try_decrypt_sym(&self.remote_conn.inbound_symmetric_key).map_err(|error| {
                         tracing::debug!(%error, remote = ?self.remote_conn.remote_addr, "Failed to decrypt packet, might be an intro packet or a partial packet");
                     }) else {
                         // just ignore this message
-                        // TODO: maybbe check how frequently this happens and decide to drop a connection based on that
+                        // TODO: maybe check how frequently this happens and decide to drop a connection based on that
                         // if it is partial packets being received too often
                         // TODO: this branch should at much happen UdpPacketsListener::NAT_TRAVERSAL_MAX_ATTEMPTS
                         // for intro packets will be sent than this amount, so we could be checking for that initially
@@ -160,7 +168,6 @@ impl PeerConnection {
                         .sent_tracker
                         .lock()
                         .report_received_receipts(&confirm_receipt);
-                    tracing::trace!(%packet_id, remote = %self.remote_conn.remote_addr, "received packet");
                     match self.received_tracker.report_received_packet(packet_id) {
                         ReportResult::Ok => {}
                         ReportResult::AlreadyReceived => {
@@ -169,10 +176,10 @@ impl PeerConnection {
                         }
                         ReportResult::QueueFull => {
                             let receipts = self.received_tracker.get_receipts();
+                            tracing::debug!(?receipts, "queue full, reporting receipts");
                             self.noop(receipts).await?;
                         },
                     }
-                    tracing::trace!(%packet_id, "processing inbound packet");
                     if let Some(msg) = self.process_inbound(payload).await.map_err(|error| {
                         tracing::error!(%error, %packet_id, remote = %self.remote_conn.remote_addr, "error processing inbound packet");
                         error
@@ -192,6 +199,7 @@ impl PeerConnection {
                         continue;
                     };
                     self.inbound_streams.remove(&stream_id);
+                    tracing::trace!(%stream_id, "stream finished");
                     return Ok(msg);
                 }
                 outbound_stream = self.outbound_stream_futures.next(), if !self.outbound_stream_futures.is_empty() => {
@@ -201,7 +209,15 @@ impl PeerConnection {
                     };
                     res.map_err(|e| TransportError::Other(e.into()))??
                 }
-                _ = resend_check.take().unwrap_or(tokio::time::sleep(Duration::from_secs(1))) => {
+                _ = keep_alive.tick() => {
+                    if last_received.elapsed() > KILL_CONNECTION_AFTER {
+                        tracing::warn!(remote = ?self.remote_conn.remote_addr, "connection timed out");
+                        return Err(TransportError::ConnectionClosed);
+                    }
+                    tracing::trace!(remote = ?self.remote_conn.remote_addr, "sending keep-alive");
+                    self.noop(vec![]).await?;
+                }
+                _ = resend_check.take().unwrap_or(tokio::time::sleep(Duration::from_secs(5))) => {
                     loop {
                         tracing::trace!(remote = ?self.remote_conn.remote_addr, "checking for resends");
                         let maybe_resend = self.remote_conn
@@ -210,22 +226,15 @@ impl PeerConnection {
                             .get_resend();
                         match maybe_resend {
                             ResendAction::WaitUntil(wait_until) => {
-                                tracing::trace!(
-                                    remote = ?self.remote_conn.remote_addr,
-                                    wait_time_ns = (std::time::Instant::now() - wait_until).as_nanos(),
-                                    "waiting for resend"
-                                );
                                 resend_check = Some(tokio::time::sleep_until(wait_until.into()));
                                 break;
                             }
                             ResendAction::Resend(idx, packet) => {
-                                tracing::trace!(%idx, remote = ?self.remote_conn.remote_addr, "resending packet");
                                 self.remote_conn
                                     .outbound_packets
                                     .send((self.remote_conn.remote_addr, packet.clone()))
                                     .await
                                     .map_err(|_| TransportError::ConnectionClosed)?;
-                                tracing::trace!(%idx, remote = ?self.remote_conn.remote_addr, "packet resent");
                                 self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
                             }
                         }
@@ -247,8 +256,22 @@ impl PeerConnection {
         use SymmetricMessagePayload::*;
         match payload {
             ShortMessage { payload } => Ok(Some(payload)),
-            AckConnection { .. } => Ok(None),
-            GatewayConnection { .. } => Ok(None),
+            AckConnection { result: Err(cause) } => {
+                Err(TransportError::ConnectionEstablishmentFailure { cause })
+            }
+            AckConnection { result: Ok(_) } => {
+                let packet = SymmetricMessage::ack_ok(
+                    &self.remote_conn.outbound_symmetric_key,
+                    self.remote_conn.inbound_symmetric_key_bytes,
+                    self.remote_conn.remote_addr,
+                )?;
+                self.remote_conn
+                    .outbound_packets
+                    .send((self.remote_conn.remote_addr, packet.data().into()))
+                    .await
+                    .map_err(|_| TransportError::ConnectionClosed)?;
+                Ok(None)
+            }
             StreamFragment {
                 stream_id,
                 total_length_bytes,
@@ -256,12 +279,11 @@ impl PeerConnection {
                 payload,
             } => {
                 if let Some(sender) = self.inbound_streams.get(&stream_id) {
-                    tracing::trace!(%stream_id, %fragment_number, "pushing fragment to existing stream");
                     sender
                         .send((fragment_number, payload))
                         .await
                         .map_err(|_| TransportError::ConnectionClosed)?;
-                    tracing::trace!(%stream_id, %fragment_number, "fragment pushed");
+                    tracing::trace!(%stream_id, %fragment_number, "fragment pushed to existing stream");
                 } else {
                     let (sender, receiver) = mpsc::channel(1);
                     tracing::trace!(%stream_id, %fragment_number, "new stream");
@@ -272,7 +294,6 @@ impl PeerConnection {
                         tracing::trace!(%stream_id, %fragment_number, "stream finished");
                         return Ok(Some(msg));
                     }
-                    tracing::trace!(%stream_id, "listening for more fragments");
                     self.inbound_stream_futures
                         .push(tokio::spawn(inbound_stream::recv_stream(
                             stream_id, receiver, stream,
@@ -368,8 +389,7 @@ async fn packet_sending(
 mod tests {
     use aes_gcm::KeyInit;
     use futures::TryFutureExt;
-    use std::net::{Ipv4Addr, SocketAddr};
-    use tokio::sync::mpsc;
+    use std::net::Ipv4Addr;
 
     use super::{
         inbound_stream::{recv_stream, InboundStream},
@@ -425,7 +445,6 @@ mod tests {
                 else {
                     return Err("unexpected message".into());
                 };
-                println!("fragment_number: {}", fragment_number);
                 tx.send((fragment_number, payload)).await?;
             }
             let (_, msg) = inbound_msg

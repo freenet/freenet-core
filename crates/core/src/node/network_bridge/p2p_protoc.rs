@@ -79,7 +79,6 @@ impl P2pBridge {
     }
 }
 
-#[async_trait::async_trait]
 impl NetworkBridge for P2pBridge {
     async fn try_add_connection(&mut self, peer: FreenetPeerId) -> super::ConnResult<()> {
         if self.active_net_connections.contains_key(&peer) {
@@ -477,7 +476,7 @@ impl P2pConnManager {
         };
 
         let mut peer_conn = outbound_conn_handler
-            .connect(peer.pub_key.clone(), peer.addr, true)
+            .connect(peer.pub_key.clone(), peer.addr)
             .await
             .await
             .map_err(|_| ConnectionError::SendNotCompleted)?;

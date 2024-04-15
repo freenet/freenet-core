@@ -3,8 +3,6 @@ use std::{future::Future, time::Instant};
 
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
-use futures::future::BoxFuture;
-use futures::FutureExt;
 
 use crate::client_events::HostResult;
 use crate::{
@@ -265,41 +263,38 @@ impl Operation for GetOp {
     type Message = GetMsg;
     type Result = GetResult;
 
-    fn load_or_init<'a>(
+    async fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
-    ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>> {
-        async move {
-            let mut sender: Option<PeerId> = None;
-            if let Some(peer_key_loc) = msg.sender().cloned() {
-                sender = Some(peer_key_loc.peer);
-            };
-            let tx = *msg.id();
-            match op_manager.pop(msg.id()) {
-                Ok(Some(OpEnum::Get(get_op))) => {
-                    Ok(OpInitialization { op: get_op, sender })
-                    // was an existing operation, other peer messaged back
-                }
-                Ok(Some(op)) => {
-                    let _ = op_manager.push(tx, op).await;
-                    Err(OpError::OpNotPresent(tx))
-                }
-                Ok(None) => {
-                    // new request to get a value for a contract, initialize the machine
-                    Ok(OpInitialization {
-                        op: Self {
-                            state: Some(GetState::ReceivedRequest),
-                            id: tx,
-                            result: None,
-                            stats: None, // don't care about stats in target peers
-                        },
-                        sender,
-                    })
-                }
-                Err(err) => Err(err.into()),
+    ) -> Result<OpInitialization<Self>, OpError> {
+        let mut sender: Option<PeerId> = None;
+        if let Some(peer_key_loc) = msg.sender().cloned() {
+            sender = Some(peer_key_loc.peer);
+        };
+        let tx = *msg.id();
+        match op_manager.pop(msg.id()) {
+            Ok(Some(OpEnum::Get(get_op))) => {
+                Ok(OpInitialization { op: get_op, sender })
+                // was an existing operation, other peer messaged back
             }
+            Ok(Some(op)) => {
+                let _ = op_manager.push(tx, op).await;
+                Err(OpError::OpNotPresent(tx))
+            }
+            Ok(None) => {
+                // new request to get a value for a contract, initialize the machine
+                Ok(OpInitialization {
+                    op: Self {
+                        state: Some(GetState::ReceivedRequest),
+                        id: tx,
+                        result: None,
+                        stats: None, // don't care about stats in target peers
+                    },
+                    sender,
+                })
+            }
+            Err(err) => Err(err.into()),
         }
-        .boxed()
     }
 
     fn id(&self) -> &Transaction {
@@ -834,8 +829,6 @@ mod messages {
     use std::fmt::Display;
 
     use serde::{Deserialize, Serialize};
-
-    use crate::{contract::StoreResponse, message::InnerMessage};
 
     use super::*;
 

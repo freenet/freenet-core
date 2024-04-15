@@ -9,7 +9,7 @@ pub(crate) struct TransportKeypair {
 }
 
 impl TransportKeypair {
-    pub fn random() -> Self {
+    pub fn new() -> Self {
         let mut rng = OsRng;
         // Key size, can be adjusted
         const BITS: usize = 2048;
@@ -51,7 +51,7 @@ impl TransportPublicKey {
 }
 
 #[derive(Clone)]
-pub(super) struct TransportSecretKey(RsaPrivateKey);
+pub(crate) struct TransportSecretKey(RsaPrivateKey);
 
 impl TransportSecretKey {
     pub fn decrypt(&self, data: &[u8]) -> rsa::Result<Vec<u8>> {
@@ -63,7 +63,7 @@ impl TransportSecretKey {
 #[cfg(test)]
 #[test]
 fn key_sizes_and_decryption() {
-    let pair = TransportKeypair::random();
+    let pair = TransportKeypair::new();
     let sym_key_bytes = rand::random::<[u8; 16]>();
     // use aes_gcm::KeyInit;
     // let _sym_key = aes_gcm::aes::Aes128::new(&sym_key_bytes.into());

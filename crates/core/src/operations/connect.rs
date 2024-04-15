@@ -66,60 +66,57 @@ impl Operation for ConnectOp {
     type Message = ConnectMsg;
     type Result = ConnectResult;
 
-    fn load_or_init<'a>(
+    async fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
-    ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>> {
-        async move {
-            let sender;
-            let tx = *msg.id();
-            match op_manager.pop(msg.id()) {
-                Ok(Some(OpEnum::Connect(connect_op))) => {
-                    sender = msg.sender().cloned();
-                    // was an existing operation, the other peer messaged back
-                    Ok(OpInitialization {
-                        op: *connect_op,
-                        sender,
-                    })
-                }
-                Ok(Some(op)) => {
-                    let _ = op_manager.push(tx, op).await;
-                    Err(OpError::OpNotPresent(tx))
-                }
-                Ok(None) => {
-                    let gateway = if !matches!(
-                        msg,
-                        ConnectMsg::Request {
-                            msg: ConnectRequest::FindOptimalPeer { .. },
-                            ..
-                        }
-                    ) {
-                        Some(Box::new(op_manager.ring.own_location()))
-                    } else {
-                        None
-                    };
-                    // new request to join this node, initialize the state
-                    Ok(OpInitialization {
-                        op: Self {
-                            id: tx,
-                            state: Some(ConnectState::Initializing),
-                            backoff: None,
-                            gateway,
-                        },
-                        sender: None,
-                    })
-                }
-                Err(err) => {
-                    #[cfg(debug_assertions)]
-                    if matches!(err, crate::node::OpNotAvailable::Completed) {
-                        let target = msg.target();
-                        tracing::warn!(%tx, peer = ?target, "filtered");
+    ) -> Result<OpInitialization<Self>, OpError> {
+        let sender;
+        let tx = *msg.id();
+        match op_manager.pop(msg.id()) {
+            Ok(Some(OpEnum::Connect(connect_op))) => {
+                sender = msg.sender().cloned();
+                // was an existing operation, the other peer messaged back
+                Ok(OpInitialization {
+                    op: *connect_op,
+                    sender,
+                })
+            }
+            Ok(Some(op)) => {
+                let _ = op_manager.push(tx, op).await;
+                Err(OpError::OpNotPresent(tx))
+            }
+            Ok(None) => {
+                let gateway = if !matches!(
+                    msg,
+                    ConnectMsg::Request {
+                        msg: ConnectRequest::FindOptimalPeer { .. },
+                        ..
                     }
-                    Err(err.into())
+                ) {
+                    Some(Box::new(op_manager.ring.own_location()))
+                } else {
+                    None
+                };
+                // new request to join this node, initialize the state
+                Ok(OpInitialization {
+                    op: Self {
+                        id: tx,
+                        state: Some(ConnectState::Initializing),
+                        backoff: None,
+                        gateway,
+                    },
+                    sender: None,
+                })
+            }
+            Err(err) => {
+                #[cfg(debug_assertions)]
+                if matches!(err, crate::node::OpNotAvailable::Completed) {
+                    let target = msg.target();
+                    tracing::warn!(%tx, peer = ?target, "filtered");
                 }
+                Err(err.into())
             }
         }
-        .boxed()
     }
 
     fn id(&self) -> &Transaction {
@@ -810,9 +807,7 @@ mod messages {
     use std::fmt::Display;
 
     use super::*;
-    use crate::ring::{Location, PeerKeyLocation};
 
-    use crate::message::InnerMessage;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Serialize, Deserialize, Clone)]

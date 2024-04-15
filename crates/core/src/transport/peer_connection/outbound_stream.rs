@@ -90,9 +90,8 @@ pub(super) async fn send_stream(
 #[cfg(test)]
 mod tests {
     use aes_gcm::KeyInit;
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::net::Ipv4Addr;
     use tests::packet_data::MAX_PACKET_SIZE;
-    use tokio::sync::mpsc;
 
     use super::{
         symmetric_message::{SymmetricMessage, SymmetricMessagePayload},

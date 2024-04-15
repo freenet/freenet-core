@@ -131,7 +131,6 @@ mod test {
     use super::*;
     use crate::{
         client_events::test::MemoryEventsGen,
-        config::GlobalExecutor,
         contract::MemoryContractHandler,
         node::{testing_impl::get_free_port, InitPeerNode},
         ring::Location,
