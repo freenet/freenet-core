@@ -59,7 +59,7 @@ pub(crate) trait ContractHandler {
         contract_handler_channel: ContractHandlerChannel<ContractHandlerHalve>,
         executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
         builder: Self::Builder,
-    ) -> impl Future<Output = Result<Self, DynError>>
+    ) -> impl Future<Output = Result<Self, DynError>> + Send
     where
         Self: Sized + 'static;
 
@@ -72,7 +72,7 @@ pub(crate) trait ContractHandler {
         req: ClientRequest<'a>,
         client_id: ClientId,
         updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
-    ) -> impl Future<Output = Result<HostResponse, DynError>> + 'a;
+    ) -> impl Future<Output = Result<HostResponse, DynError>> + Send + 'a;
 
     fn executor(&mut self) -> &mut Self::ContractExecutor;
 }
