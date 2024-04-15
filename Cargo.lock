@@ -1549,7 +1549,6 @@ dependencies = [
  "futures",
  "headers",
  "itertools",
- "libp2p-identity",
  "notify",
  "once_cell",
  "opentelemetry",

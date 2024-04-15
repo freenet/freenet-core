@@ -374,7 +374,7 @@ impl Operation for UpdateOp {
                             tracing::debug!(
                                 tx = %id,
                                 %key,
-                                this_peer = %op_manager.ring.peer_key,
+                                this_peer = ?op_manager.ring.get_peer_key(),
                                 "Peer completed contract value update - SuccessfulUpdate",
                             );
 
@@ -503,7 +503,7 @@ impl OpManager {
                 subs.value()
                     .iter()
                     .filter(|pk| &pk.peer != sender)
-                    .copied()
+                    .cloned()
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -623,7 +623,7 @@ pub(crate) async fn request_update(
     } else {
         let closest = op_manager
             .ring
-            .closest_potentially_caching(key, [sender.peer].as_slice())
+            .closest_potentially_caching(key, [sender.peer.clone()].as_slice())
             .into_iter()
             .next()
             .ok_or_else(|| RingError::EmptyRing)?;
@@ -638,7 +638,7 @@ pub(crate) async fn request_update(
 
     let id = update_op.id;
     if let Some(stats) = &mut update_op.stats {
-        stats.target = Some(target);
+        stats.target = Some(target.clone());
     }
 
     match update_op.state {

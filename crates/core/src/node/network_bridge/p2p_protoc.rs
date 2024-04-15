@@ -1,4 +1,3 @@
-use std::f64::consts::E;
 use std::net::{IpAddr, SocketAddr};
 use std::{
     collections::{HashMap, HashSet},
@@ -9,7 +8,6 @@ use dashmap::{DashMap, DashSet};
 use either::{Either, Left, Right};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
-use itertools::traits::HomogeneousTuple;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::Instrument;
@@ -21,7 +19,7 @@ use crate::node::PeerId;
 use crate::operations::connect::{ConnectMsg, ConnectRequest, ConnectResponse};
 use crate::transport::{
     create_connection_handler, OutboundConnectionHandler, PeerConnection, TransportError,
-    TransportKeypair, TransportPublicKey,
+    TransportKeypair,
 };
 use crate::{
     client_events::ClientId,
@@ -193,7 +191,7 @@ impl P2pConnManager {
     ) -> Result<(), anyhow::Error> {
         use ConnMngrActions::*;
 
-        let (outbound_conn_handler, mut inbound_conn_handler) =
+        let (mut outbound_conn_handler, mut inbound_conn_handler) =
             create_connection_handler::<UdpSocket>(
                 self.private_key.clone(),
                 self.listener_ip,
@@ -217,16 +215,26 @@ impl P2pConnManager {
                 Some(Right(action)) => Ok(Right(NodeAction(action))),
             });
 
-            let och = outbound_conn_handler.clone();
             let bridge_msg = async {
-                match self.conn_bridge_rx.recv().await {
-                    Some(msg) => match msg {
-                        Left((peer, msg)) => {
-                            self.handle_bridge_connection_message(peer, msg, och).await
-                        }
-                        Right(action) => Ok(Right(NodeAction(action))),
-                    },
-                    None => Ok(Right(ClosedChannel)),
+                loop {
+                    match self.conn_bridge_rx.recv().await {
+                        Some(msg) => match msg {
+                            Left((peer, msg)) => {
+                                if let Right(new_conn) = self
+                                    .handle_bridge_connection_message(
+                                        peer,
+                                        msg,
+                                        &mut outbound_conn_handler,
+                                    )
+                                    .await?
+                                {
+                                    break Ok::<_, anyhow::Error>(Left(new_conn));
+                                }
+                            }
+                            Right(action) => break Ok(Right(NodeAction(action))),
+                        },
+                        None => break Ok(Right(ClosedChannel)),
+                    }
                 }
             };
 
@@ -261,14 +269,15 @@ impl P2pConnManager {
                 }
                 msg = notification_msg => { msg }
                 msg = bridge_msg => {
-                    if let Ok(Right(peer_conn)) = msg {
-                        let peer = conn_bridge.op_manager.ring.get_peer_key().expect("Peer key not set");
-                        Ok(Right(ConnectionEstablished {
-                            peer,
-                            peer_conn,
-                        }))
-                    } else {
-                        msg
+                    match msg? {
+                        Left(peer_conn) => {
+                            let peer = conn_bridge.op_manager.ring.get_peer_key().expect("Peer key not set");
+                            Ok(Right(ConnectionEstablished {
+                                peer,
+                                peer_conn,
+                            }))
+                        }
+                        Right(action) => Ok(Right(action)),
                     }
                 }
                 msg = node_controller.recv() => {
@@ -280,12 +289,12 @@ impl P2pConnManager {
                 }
                 msg = new_incoming_connection => { msg }
                 event_id = client_wait_for_transaction.relay_transaction_result_to_client() => {
-                    let (client_id, transaction) = event_id.map_err(|err| anyhow::anyhow!(err))?;
+                    let (client_id, transaction) = event_id.map_err(|err| anyhow::Error::msg(err))?;
                     tx_to_client.insert(transaction, client_id);
                     continue;
                 }
                 id = executor_listener.transaction_from_executor() => {
-                    let id = id.map_err(|err| anyhow::anyhow!(err))?;
+                    let id = id.map_err(|err| anyhow::Error::msg(err))?;
                     pending_from_executor.insert(id);
                     continue;
                 }
@@ -308,18 +317,16 @@ impl P2pConnManager {
                         }
                         NetMessage::Connect(ConnectMsg::Response {
                             msg:
-                                ConnectResponse::AcceptedByTarget {
-                                    accepted,
-                                    your_location,
-                                    your_peer_id,
-                                    ..
+                                ConnectResponse::AcceptedBy {
+                                    accepted, joiner, ..
                                 },
                             ..
                         }) => {
                             if accepted {
                                 tracing::debug!("Connection accepted by target");
                             } else {
-                                tracing::debug!("Connection rejected by target");
+                                let peer_id = &joiner.peer;
+                                tracing::debug!(remote = %joiner.peer, "Connection rejected by target");
                                 self.connection.remove(&peer_id);
                                 self.rejected_peers.insert(peer_id.clone());
                                 self.bridge.active_net_connections.remove(&peer_id);
@@ -445,7 +452,7 @@ impl P2pConnManager {
         &mut self,
         peer: PeerId,
         net_msg: Box<NetMessage>,
-        outbound_conn_handler: OutboundConnectionHandler,
+        outbound_conn_handler: &mut OutboundConnectionHandler,
     ) -> Result<Either<(), PeerConnection>, ConnectionError> {
         if let Some(conn) = self.connection.get(&peer) {
             conn.send(*net_msg).await;
@@ -463,7 +470,7 @@ impl P2pConnManager {
         peer: &PeerId,
         id: Transaction,
         msg: ConnectRequest,
-        mut outbound_conn_handler: OutboundConnectionHandler,
+        outbound_conn_handler: &mut OutboundConnectionHandler,
     ) -> Result<Either<(), PeerConnection>, ConnectionError> {
         let (joiner_key, hops_to_live, skip_list) = match msg {
             ConnectRequest::StartJoinReq {

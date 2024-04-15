@@ -6,7 +6,6 @@ use crate::tracing::EventRegister;
 use crate::transport::TransportKeypair;
 use anyhow::Error;
 use futures::SinkExt;
-use libp2p_identity::Keypair;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::net::TcpStream;

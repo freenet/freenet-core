@@ -161,12 +161,7 @@ impl<'a> NetEventLog<'a> {
         let peer_id = ring.get_peer_key().unwrap();
         let kind = match msg {
             NetMessage::Connect(connect::ConnectMsg::Response {
-                msg:
-                    connect::ConnectResponse::AcceptedByRegularNode {
-                        accepted,
-                        your_location,
-                        your_peer_id,
-                    },
+                msg: connect::ConnectResponse::AcceptedBy { accepted, joiner },
                 ..
             }) => {
                 let this_peer = ring.own_location();
@@ -174,30 +169,8 @@ impl<'a> NetEventLog<'a> {
                     EventKind::Connect(ConnectEvent::Connected {
                         this: this_peer,
                         connected: PeerKeyLocation {
-                            peer: your_peer_id.clone(),
-                            location: Some(*your_location),
-                        },
-                    })
-                } else {
-                    EventKind::Ignored
-                }
-            }
-            NetMessage::Connect(connect::ConnectMsg::Response {
-                msg:
-                    connect::ConnectResponse::AcceptedByGateway {
-                        accepted,
-                        your_location,
-                        your_peer_id,
-                    },
-                ..
-            }) => {
-                let this_peer = ring.own_location();
-                if *accepted {
-                    EventKind::Connect(ConnectEvent::Connected {
-                        this: this_peer,
-                        connected: PeerKeyLocation {
-                            peer: your_peer_id.clone(),
-                            location: None,
+                            peer: joiner.peer.clone(),
+                            location: joiner.location.clone(),
                         },
                     })
                 } else {
@@ -219,32 +192,18 @@ impl<'a> NetEventLog<'a> {
     ) -> Either<Self, Vec<Self>> {
         let kind = match msg {
             NetMessage::Connect(connect::ConnectMsg::Response {
-                msg:
-                    connect::ConnectResponse::AcceptedByGateway {
-                        accepted,
-                        your_location,
-                        your_peer_id,
-                    },
-                ..
-            })
-            | NetMessage::Connect(connect::ConnectMsg::Response {
-                msg:
-                    connect::ConnectResponse::AcceptedByRegularNode {
-                        accepted,
-                        your_location,
-                        your_peer_id,
-                    },
+                msg: connect::ConnectResponse::AcceptedBy { accepted, joiner },
                 ..
             }) => {
                 let this_peer = &op_manager.ring.get_peer_key().unwrap();
                 let mut events = vec![];
-                if accepted {
+                if *accepted {
                     events.push(NetEventLog {
                         tx: msg.id(),
                         peer_id: this_peer.clone(),
                         kind: EventKind::Connect(ConnectEvent::Finished {
-                            initiator: your_peer_id.clone(),
-                            location: *your_location,
+                            initiator: joiner.peer.clone(),
+                            location: joiner.location.unwrap(),
                         }),
                     });
                 }
