@@ -1693,7 +1693,6 @@ dependencies = [
  "anyhow",
  "arbitrary",
  "arc-swap",
- "async-trait",
  "asynchronous-codec 0.7.0",
  "axum 0.7.5",
  "bincode",

@@ -40,7 +40,6 @@ impl Executor<MockRuntime> {
     }
 }
 
-#[async_trait::async_trait]
 impl ContractExecutor for Executor<MockRuntime> {
     async fn fetch_contract(
         &mut self,
@@ -99,7 +98,7 @@ impl ContractExecutor for Executor<MockRuntime> {
                     .store(key, incoming_state.clone(), contract.params().into_owned())
                     .await
                     .map_err(ExecutorError::other)?;
-                return Ok(incoming_state);
+                Ok(incoming_state)
             }
             (Either::Left(incoming_state), None) => {
                 // update case
@@ -108,7 +107,7 @@ impl ContractExecutor for Executor<MockRuntime> {
                     .update(&key, incoming_state.clone())
                     .await
                     .map_err(ExecutorError::other)?;
-                return Ok(incoming_state);
+                Ok(incoming_state)
             }
             (update, contract) => unreachable!("{update:?}, {contract:?}"),
         }

@@ -11,8 +11,6 @@ use freenet_stdlib::{
     client_api::{ErrorKind, HostResponse},
     prelude::*,
 };
-use futures::future::BoxFuture;
-use futures::FutureExt;
 
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::{
@@ -140,41 +138,38 @@ impl Operation for PutOp {
     type Message = PutMsg;
     type Result = PutResult;
 
-    fn load_or_init<'a>(
+    async fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
-    ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>> {
-        async move {
-            let mut sender: Option<PeerId> = None;
-            if let Some(peer_key_loc) = msg.sender().cloned() {
-                sender = Some(peer_key_loc.peer);
-            };
+    ) -> Result<OpInitialization<Self>, OpError> {
+        let mut sender: Option<PeerId> = None;
+        if let Some(peer_key_loc) = msg.sender().cloned() {
+            sender = Some(peer_key_loc.peer);
+        };
 
-            let tx = *msg.id();
-            match op_manager.pop(msg.id()) {
-                Ok(Some(OpEnum::Put(put_op))) => {
-                    // was an existing operation, the other peer messaged back
-                    Ok(OpInitialization { op: put_op, sender })
-                }
-                Ok(Some(op)) => {
-                    let _ = op_manager.push(tx, op).await;
-                    Err(OpError::OpNotPresent(tx))
-                }
-                Ok(None) => {
-                    // new request to put a new value for a contract, initialize the machine
-                    Ok(OpInitialization {
-                        op: Self {
-                            state: Some(PutState::ReceivedRequest),
-                            stats: None, // don't care for stats in the target peers
-                            id: tx,
-                        },
-                        sender,
-                    })
-                }
-                Err(err) => Err(err.into()),
+        let tx = *msg.id();
+        match op_manager.pop(msg.id()) {
+            Ok(Some(OpEnum::Put(put_op))) => {
+                // was an existing operation, the other peer messaged back
+                Ok(OpInitialization { op: put_op, sender })
             }
+            Ok(Some(op)) => {
+                let _ = op_manager.push(tx, op).await;
+                Err(OpError::OpNotPresent(tx))
+            }
+            Ok(None) => {
+                // new request to put a new value for a contract, initialize the machine
+                Ok(OpInitialization {
+                    op: Self {
+                        state: Some(PutState::ReceivedRequest),
+                        stats: None, // don't care for stats in the target peers
+                        id: tx,
+                    },
+                    sender,
+                })
+            }
+            Err(err) => Err(err.into()),
         }
-        .boxed()
     }
 
     fn id(&self) -> &Transaction {

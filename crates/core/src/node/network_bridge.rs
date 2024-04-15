@@ -1,5 +1,6 @@
 //! Types and definitions to handle all inter-peer communication.
 
+use std::future::Future;
 use std::ops::{Deref, DerefMut};
 
 use either::Either;
@@ -22,13 +23,13 @@ pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 
 /// Allows handling of connections to the network as well as sending messages
 /// to other peers in the network with whom connection has been established.
-#[async_trait::async_trait]
 pub(crate) trait NetworkBridge: Send + Sync {
-    async fn add_connection(&mut self, peer: PeerId) -> ConnResult<()>;
+    fn add_connection(&mut self, peer: PeerId) -> impl Future<Output = ConnResult<()>> + Send;
 
-    async fn drop_connection(&mut self, peer: &PeerId) -> ConnResult<()>;
+    fn drop_connection(&mut self, peer: &PeerId) -> impl Future<Output = ConnResult<()>> + Send;
 
-    async fn send(&self, target: &PeerId, msg: NetMessage) -> ConnResult<()>;
+    fn send(&self, target: &PeerId, msg: NetMessage)
+        -> impl Future<Output = ConnResult<()>> + Send;
 }
 
 #[derive(Debug, thiserror::Error, Serialize, Deserialize)]

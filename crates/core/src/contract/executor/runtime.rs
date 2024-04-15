@@ -1,6 +1,5 @@
 use super::*;
 
-#[async_trait::async_trait]
 impl ContractExecutor for Executor<Runtime> {
     async fn fetch_contract(
         &mut self,
