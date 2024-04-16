@@ -358,15 +358,14 @@ impl Operation for ConnectOp {
                         &op_manager.ring,
                         actual_state,
                         network_bridge,
-                        (*sender, *joiner),
+                        (sender.clone(), joiner.clone()),
                         *hops_to_live,
                         accepted_by.clone(),
-                        *skip_list,
+                        skip_list.clone(),
                     )
                     .await?
                     {
                         new_state = Some(updated_state);
-                        return_msg = None;
                     } else {
                         tracing::debug!(tx = %id, at = %this_peer.peer, "Rejecting connection from {:?}", joiner);
                         new_state = None
@@ -395,7 +394,7 @@ impl Operation for ConnectOp {
                         joiner: joiner.clone(),
                     };
 
-                    let return_msg = Some(ConnectMsg::Response {
+                    return_msg = Some(ConnectMsg::Response {
                         id: *id,
                         sender: this_peer.clone(),
                         msg: response,
@@ -418,32 +417,43 @@ impl Operation for ConnectOp {
                     let this_peer_id = op_manager.ring.get_peer_key().expect("peer id not found");
                     let your_location = joiner.location.expect("location not found");
 
-                    let Some(ConnectState::ConnectingToNode(ConnectionInfo { .. })) = self.state
-                    else {
-                        return Err(OpError::invalid_transition(self.id));
-                    };
-                    if *accepted {
+                    if this_peer_id == joiner.peer && *accepted {
                         tracing::debug!(
                             tx = %id,
-                            at = %your_peer_id,
+                            at = %this_peer_id,
                             from = %sender.peer,
                             "Open connections acknowledged at requesting gateway peer",
                         );
                         return_msg = None;
                         new_state = Some(ConnectState::AcceptedNewConnection);
-
                         tracing::debug!(
                             tx = %id,
-                            at = %your_peer_id,
+                            at = %this_peer_id,
                             location = %your_location,
                             "Updating assigned location"
                         );
                         op_manager.ring.update_location(joiner.location);
+                    } else if let Some(ConnectState::AwaitingConnectivity(ConnectivityInfo {
+                        waiting_for,
+                    })) = self.state
+                    {
+                        if waiting_for.contains_key(&joiner) {
+                            let next_peer = waiting_for.get(&joiner).expect("No next peer found");
+                            let response = ConnectResponse::AcceptedBy {
+                                accepted: *accepted,
+                                joiner: joiner.clone(),
+                            };
+                            return_msg = Some(ConnectMsg::Response {
+                                id: *id,
+                                sender: target.clone(),
+                                msg: response,
+                                target: next_peer.clone(),
+                            });
+                        }
                     } else {
-                        // no connections accepted, failed
                         tracing::debug!(
                             tx = %id,
-                            peer = %your_peer_id,
+                            peer = %this_peer_id,
                             "Failed to establish any connections, aborting"
                         );
                         let op = ConnectOp {
@@ -485,8 +495,8 @@ fn build_op_result(
     })
 }
 
-type Joiner = PeerId;
-type Target = PeerId;
+type Joiner = PeerKeyLocation;
+type Target = PeerKeyLocation;
 
 #[derive(Debug)]
 enum ConnectState {
@@ -501,7 +511,7 @@ enum ConnectState {
 
 #[derive(Debug, Clone)]
 struct ConnectivityInfo {
-    waiting_for: HashMap<Joiner, HashSet<Target>>,
+    waiting_for: HashMap<Joiner, Target>,
 }
 
 #[derive(Debug, Clone)]
@@ -799,10 +809,7 @@ fn update_state_with_forward_info(
             update_connectivity_info(conn_info, joiner, forward_to)
         }
         _ => ConnectState::AwaitingConnectivity(ConnectivityInfo {
-            waiting_for: HashMap::from_iter([(
-                joiner.peer.clone(),
-                HashSet::from([forward_to.peer.clone()]),
-            )]),
+            waiting_for: HashMap::from_iter([(joiner.clone(), forward_to.clone())]),
         }),
     };
     Ok(Some(new_state))
@@ -830,9 +837,8 @@ fn update_connectivity_info(
 ) -> ConnectState {
     let mut waiting_peers = conn_info.waiting_for.clone();
     waiting_peers
-        .entry(joiner.peer.clone())
-        .or_insert_with(HashSet::new)
-        .insert(forward_to.peer.clone());
+        .entry(joiner.clone())
+        .or_insert_with(|| forward_to.clone());
     ConnectState::AwaitingConnectivity(ConnectivityInfo {
         waiting_for: waiting_peers,
     })
