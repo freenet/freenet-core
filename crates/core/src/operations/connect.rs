@@ -388,7 +388,7 @@ impl Operation for ConnectOp {
                             "Open connections acknowledged at requesting gateway peer",
                         );
                         return_msg = None;
-                        new_state = Some(ConnectState::AcceptedNewConnection);
+                        new_state = Some(ConnectState::Connected);
                         tracing::debug!(
                             tx = %id,
                             at = %this_peer_id,
@@ -473,7 +473,6 @@ enum ConnectState {
     AwaitingConnectivity(ConnectivityInfo),
     AwaitingConnectionAcquisition { joiner: PeerKeyLocation },
     AwaitingNewConnection { query_target: PeerId },
-    AcceptedNewConnection,
     Connected,
 }
 
