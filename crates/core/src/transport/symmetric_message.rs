@@ -242,8 +242,8 @@ impl std::fmt::Display for SymmetricMessagePayload {
                     result.as_ref().map(|_| "Ok").unwrap_or("Err")
                 )
             }
-            SymmetricMessagePayload::ShortMessage { .. } => {
-                write!(f, "ShortMessage")
+            SymmetricMessagePayload::ShortMessage { payload } => {
+                write!(f, "ShortMessage({payload:?})")
             }
             SymmetricMessagePayload::StreamFragment {
                 stream_id,

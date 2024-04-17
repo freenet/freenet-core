@@ -127,7 +127,11 @@ impl PeerConnection {
         // listen for incoming messages or receipts or wait until is time to do anything else again
         let mut resend_check = Some(tokio::time::sleep(tokio::time::Duration::from_secs(1)));
 
+        #[cfg(not(test))]
         const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+        #[cfg(test)]
+        const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(2500);
+
         #[cfg(not(test))]
         const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(60);
         #[cfg(test)]
@@ -223,11 +227,11 @@ impl PeerConnection {
                 }
                 _ = resend_check.take().unwrap_or(tokio::time::sleep(Duration::from_secs(5))) => {
                     loop {
-                        tracing::trace!(remote = ?self.remote_conn.remote_addr, "checking for resends");
                         let maybe_resend = self.remote_conn
                             .sent_tracker
                             .lock()
                             .get_resend();
+                        tracing::trace!(local = ?self.remote_conn.my_address, remote = ?self.remote_conn.remote_addr, ?maybe_resend, "checking for resends");
                         match maybe_resend {
                             ResendAction::WaitUntil(wait_until) => {
                                 resend_check = Some(tokio::time::sleep_until(wait_until.into()));

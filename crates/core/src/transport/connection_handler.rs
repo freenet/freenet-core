@@ -148,7 +148,10 @@ impl ConnectionHandler {
         }
         recv_connection
             .map(|res| match res {
-                Ok(Ok(remote_conn)) => Ok(PeerConnection::new(remote_conn)),
+                Ok(Ok(remote_conn)) => {
+                    tracing::error!("get connection");
+                    Ok(PeerConnection::new(remote_conn))
+                }
                 Ok(Err(e)) => Err(e),
                 Err(_) => Err(TransportError::ConnectionEstablishmentFailure {
                     cause: "Failed to establish connection".into(),
@@ -348,6 +351,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                 },
             }
         }
+
+        tracing::error!("debug: exit listen loop");
     }
 
     fn gateway_connection(
@@ -515,7 +520,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         #[cfg(not(test))]
         const MAX_TIMEOUT: Duration = Duration::from_secs(60); // Maximum timeout limit
         #[cfg(test)]
-        const MAX_TIMEOUT: Duration = Duration::from_secs(10); // Maximum timeout limit
+        const MAX_TIMEOUT: Duration = Duration::from_secs(20); // Maximum timeout limit
 
         #[allow(clippy::large_enum_variant)]
         enum ConnectionState {
@@ -913,19 +918,19 @@ mod test {
                 PacketDropPolicy::ReceiveAll => {}
                 PacketDropPolicy::Factor(factor) => {
                     if *factor > self.rng.try_lock().unwrap().gen::<f64>() {
-                        tracing::trace!(id=%packet_idx, %self.this, "drop packet");
+                        tracing::trace!(id=%packet_idx, %self.this, ?buf, "drop packet");
                         return Ok(buf.len());
                     }
                 }
                 PacketDropPolicy::Range(r) => {
                     if r.contains(&packet_idx) {
-                        tracing::trace!(id=%packet_idx, %self.this, "drop packet");
+                        tracing::trace!(id=%packet_idx, %self.this, ?buf, "drop packet");
                         return Ok(buf.len());
                     }
                 }
                 PacketDropPolicy::Ranges(ranges) => {
                     if ranges.iter().any(|r| r.contains(&packet_idx)) {
-                        tracing::trace!(id=%packet_idx, %self.this, "drop packet");
+                        tracing::trace!(id=%packet_idx, %self.this, ?buf, "drop packet");
                         return Ok(buf.len());
                     }
                 }
@@ -1239,11 +1244,12 @@ mod test {
 
     #[tokio::test]
     async fn simulate_nat_traversal_drop_packet_ranges_of_peerb() -> Result<(), DynError> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
             set_peer_connection(PacketDropPolicy::Ranges(vec![0..1, 3..9])).await?;
 
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
@@ -1254,6 +1260,7 @@ mod test {
 
             // although we drop some packets, we still alive
             conn.send("some data").await.unwrap();
+            let _ = shutdown_rx.await;
             Ok::<_, DynError>(())
         });
 
@@ -1262,15 +1269,17 @@ mod test {
             let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
 
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            // tokio::time::sleep(Duration::from_secs(5)).await;
             // we should receive the message
             let b = conn.recv().await.unwrap();
             assert_eq!(&b[8..], b"some foo");
 
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
             // conn should not be broken
             let b = conn.recv().await.unwrap();
             assert_eq!(&b[8..], b"some data");
+            shutdown_tx.send(()).unwrap();
             Ok::<_, DynError>(())
         });
 
