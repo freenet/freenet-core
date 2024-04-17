@@ -1,7 +1,8 @@
 # Introduction
 
-This tutorial will show you how to build decentralized software on Freenet. For an example
-application please see [apps/freenet-email-app](https://github.com/freenet/freenet-core/tree/main/apps/freenet-email-app).
+This tutorial will show you how to build decentralized software on Freenet. For a practical 
+reference, please see the example application at [apps/freenet-email-app](https://github.com/freenet/freenet-core/tree/main/apps/freenet-email-app).
+
 
 <!-- toc -->
 
@@ -9,8 +10,9 @@ application please see [apps/freenet-email-app](https://github.com/freenet/freen
 
 ### Rust and Cargo
 
-This will install a Rust development environment including cargo on Linux or a
-Mac (for Windows see [here](https://rustup.rs)):
+To install a Rust development environment, including Cargo, on Linux or macOS
+(for Windows installation, refer to [this guide](https://rustup.rs)), use the
+following command:
 
 ```bash
 curl https://sh.rustup.rs -sSf | sh
@@ -18,13 +20,14 @@ curl https://sh.rustup.rs -sSf | sh
 
 #### Note for MacOS install
 
-The brew version of Rust will cause problems with `fdev`, we recommend installing Rust
-using `rustup` as described above.
+Note: The Homebrew installation of Rust may interfere with `fdev`. It is
+recommended to use `rustup`, as shown above, to avoid these issues.
 
 ### Installing Freenet and fdev
 
-Once you have a working installation of Cargo you can install `freenet` and `fdev`, a 
-command-line development tool:
+After setting up Cargo, install `freenet` and `fdev` with the following command.
+This installs `fdev` (the Freenet development tool) and a local Freenet peer
+for development purposes:
 
 ```bash
 cargo install freenet fdev
