@@ -374,17 +374,26 @@ impl<S: Socket> UdpPacketsListener<S> {
         }
 
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+
+        let (inbound_packet_tx, inbound_packet_rx) = mpsc::channel(100);
         let peer_connection = PeerConnection::new(RemoteConnection {
             outbound_packets: self.outbound_packets.clone(),
             outbound_symmetric_key: outbound_key,
             remote_addr,
             sent_tracker: sent_tracker.clone(),
             last_packet_id: Arc::new(AtomicU32::new(0)),
-            inbound_packet_recv: mpsc::channel(100).1,
+            inbound_packet_recv: inbound_packet_rx,
             inbound_symmetric_key: inbound_key,
             inbound_symmetric_key_bytes: inbound_key_bytes,
             my_address: None,
         });
+
+        let inbound_conn = InboundRemoteConnection {
+            inbound_packet_sender: inbound_packet_tx,
+            inbound_intro_packet: None,
+            inbound_checked_times: 0,
+        };
+        self.remote_connections.insert(remote_addr, inbound_conn);
 
         self.new_connection_notifier
             .send(peer_connection)
