@@ -1486,7 +1486,7 @@ pub(super) mod test {
             |(other, location)| {
                 listener.register_events(Either::Left(NetEventLog {
                     tx: &tx,
-                    peer_id,
+                    peer_id: peer_id.clone(),
                     kind: EventKind::Connect(ConnectEvent::Connected {
                         this: PeerKeyLocation {
                             peer: peer_id.clone(),

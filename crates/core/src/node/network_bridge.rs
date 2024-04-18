@@ -70,6 +70,7 @@ impl Clone for ConnectionError {
             Self::Timeout => Self::Timeout,
             Self::Upgrade(err) => Self::Upgrade(err.clone()),
             Self::NegotiationFailed => Self::NegotiationFailed,
+            Self::UnexpectedReq => Self::UnexpectedReq,
         }
     }
 }

@@ -184,7 +184,7 @@ impl Operation for UpdateOp {
                     return_msg = Some(UpdateMsg::SeekNode {
                         id: *id,
                         sender,
-                        target: *target,
+                        target: target.clone(),
                         value: value.clone(),
                         key: key.clone(),
                         related_contracts: related_contracts.clone(),
@@ -237,7 +237,7 @@ impl Operation for UpdateOp {
                         true,
                         op_manager,
                         self.state,
-                        (broadcast_to, *sender),
+                        (broadcast_to, sender.clone()),
                         key.clone(),
                         value.clone(),
                         false,
@@ -287,7 +287,7 @@ impl Operation for UpdateOp {
                         false,
                         op_manager,
                         self.state,
-                        (broadcast_to, *sender),
+                        (broadcast_to, sender.clone()),
                         key.clone(),
                         new_value,
                         true,
@@ -319,7 +319,7 @@ impl Operation for UpdateOp {
                             id: *id,
                             key: key.clone(),
                             new_value: new_value.clone(),
-                            sender,
+                            sender: sender.clone(),
                         };
                         let f = conn_manager.send(&peer.peer, msg.into());
                         broadcasting.push(f);
@@ -362,7 +362,7 @@ impl Operation for UpdateOp {
                     // Subscriber nodes have been notified of the change, the operation is complete
                     return_msg = Some(UpdateMsg::SuccessfulUpdate {
                         id: *id,
-                        target: *upstream,
+                        target: upstream.clone(),
                         summary,
                     });
 
