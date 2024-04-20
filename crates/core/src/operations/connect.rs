@@ -187,7 +187,7 @@ impl Operation for ConnectOp {
                                 target: joiner.clone(),
                                 msg: ConnectResponse::AcceptedBy {
                                     accepted: false,
-                                    joiner: joiner.clone(),
+                                    target: query_target.clone(),
                                 },
                             });
                             new_state = None;
@@ -386,8 +386,19 @@ impl Operation for ConnectOp {
                                     tx = %id,
                                     at = %this_peer_id,
                                     from = %sender.peer,
-                                    "All connections established",
+                                    "All available connections established",
                                 );
+
+                                let your_location: Location =
+                                    target.location.expect("location not found");
+                                tracing::debug!(
+                                    tx = %id,
+                                    at = %this_peer_id,
+                                    location = %your_location,
+                                    "Updating assigned location"
+                                );
+                                op_manager.ring.update_location(target.location);
+
                                 new_state = Some(ConnectState::Connected);
                             } else {
                                 new_state = Some(ConnectState::ConnectingToNode(ConnectionInfo {
