@@ -302,20 +302,6 @@ impl InitPeerNode {
         }
     }
 
-    /// Given a byte array decode into a PeerId data type.
-    ///
-    /// # Panic
-    /// Will panic if is not a valid representation.
-    pub fn decode_peer_id<T: AsMut<[u8]>>(mut bytes: T) -> SocketAddr {
-        // let mut bytes = bytes.as_mut();
-        // let len = bytes.len();
-        // let port = u16::from_be_bytes([bytes[len - 2], bytes[len - 1]]);
-        // bytes.truncate(len - 2);
-        // let ip = Ipv4Addr::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        // SocketAddr::new(ip.into(), port)
-        todo!()
-    }
-
     /// IP which will be assigned to this node.
     pub fn listening_ip<T: Into<IpAddr>>(mut self, ip: T) -> Self {
         if let Some(addr) = &mut self.addr {
@@ -848,10 +834,22 @@ where
 - Cuando es un gateway: se define desde el inicio del nodo
 - Cuando es un peer regular: se define en el momento de la conexión con el gateway
 */
-#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone)]
 pub struct PeerId {
     addr: SocketAddr,
     pub pub_key: TransportPublicKey,
+}
+
+impl Ord for PeerId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.addr.cmp(&other.addr)
+    }
+}
+
+impl PartialOrd for PeerId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl FromStr for PeerId {
@@ -879,19 +877,26 @@ impl PeerId {
 #[cfg(test)]
 impl<'a> arbitrary::Arbitrary<'a> for PeerId {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        // let addr = u.arbitrary()?;
-        // let pub_key = TransportPublicKey::arbitrary(u)?;
-        // Ok(Self { addr, pub_key })
-        todo!()
+        let addr: ([u8; 4], u16) = u.arbitrary()?;
+        let pub_key = TransportKeypair::new().public; // FIXME: impl arbitrary for TransportPublicKey
+        Ok(Self {
+            addr: addr.into(),
+            pub_key,
+        })
     }
 }
 
 impl PeerId {
     pub fn random() -> Self {
-        let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
-        // let pub_key = TransportPublicKey::random();
-        // Self { addr, pub_key }
-        todo!()
+        use rand::Rng;
+        let mut addr = [0; 4];
+        rand::thread_rng().fill(&mut addr[..]);
+        let port = rand::random::<u16>();
+        let pub_key = TransportKeypair::new().public;
+        Self {
+            addr: (addr, port).into(),
+            pub_key,
+        }
     }
 
     #[cfg(test)]

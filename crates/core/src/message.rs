@@ -1,7 +1,7 @@
 //! Network messaging between peers.
 
 use std::{
-    borrow::Cow,
+    borrow::{Borrow, Cow},
     fmt::Display,
     time::{Duration, SystemTime},
 };
@@ -241,7 +241,7 @@ pub(crate) enum NetMessage {
 pub(crate) trait InnerMessage: Into<NetMessage> {
     fn id(&self) -> &Transaction;
 
-    fn target(&self) -> Option<&PeerKeyLocation>;
+    fn target(&self) -> Option<impl Borrow<PeerKeyLocation>>;
 
     fn terminal(&self) -> bool;
 
@@ -304,14 +304,14 @@ impl NetMessage {
         }
     }
 
-    pub fn target(&self) -> Option<&PeerKeyLocation> {
+    pub fn target(&self) -> Option<PeerKeyLocation> {
         use NetMessage::*;
         match self {
             Connect(op) => op.target(),
-            Put(op) => op.target(),
-            Get(op) => op.target(),
-            Subscribe(op) => op.target(),
-            Update(op) => op.target(),
+            Put(op) => op.target().cloned(),
+            Get(op) => op.target().cloned(),
+            Subscribe(op) => op.target().cloned(),
+            Update(op) => op.target().cloned(),
             Aborted(_) => None,
             Unsubscribed { .. } => None,
         }

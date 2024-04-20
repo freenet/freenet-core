@@ -233,13 +233,13 @@ impl Operation for ConnectOp {
                         .expect("should be already set at the p2p bridge level");
                     let this_peer = op_manager.ring.own_location();
                     let assigned_location = match assigned_location {
-                        Some(location) => location,
-                        None => &Location::random(),
+                        Some(location) => *location,
+                        None => Location::random(),
                     };
 
                     let mut should_accept = if op_manager
                         .ring
-                        .should_accept(*assigned_location, Some(&joiner))
+                        .should_accept(assigned_location, Some(&joiner))
                     {
                         tracing::debug!(
                             tx = %id,
@@ -256,7 +256,7 @@ impl Operation for ConnectOp {
                     };
 
                     let new_peer_loc = PeerKeyLocation {
-                        location: Some(*assigned_location),
+                        location: Some(assigned_location),
                         peer: joiner.clone(),
                     };
 
@@ -849,10 +849,10 @@ mod messages {
             }
         }
 
-        fn target(&self) -> Option<&PeerKeyLocation> {
+        fn target(&self) -> Option<PeerKeyLocation> {
             use ConnectMsg::*;
             match self {
-                Response { target, .. } => Some(target),
+                Response { target, .. } => Some(target.clone()),
                 Request {
                     msg:
                         ConnectRequest::StartJoinReq {
@@ -863,7 +863,7 @@ mod messages {
                     ..
                 } => {
                     if let Some(peer) = joiner {
-                        Some(&PeerKeyLocation {
+                        Some(PeerKeyLocation {
                             peer: peer.clone(),
                             location: assigned_location.clone(),
                         })
@@ -871,7 +871,7 @@ mod messages {
                         None
                     }
                 }
-                Connected { target, .. } => Some(target),
+                Connected { target, .. } => Some(target.clone()),
                 _ => None,
             }
         }

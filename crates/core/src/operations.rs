@@ -108,7 +108,7 @@ where
         }) => {
             // updated op
             let id = *msg.id();
-            if let Some(target) = msg.target().cloned() {
+            if let Some(target) = msg.target() {
                 network_bridge.send(&target.peer, msg).await?;
             }
             op_manager.push(id, updated_state).await?;
@@ -137,7 +137,7 @@ where
             op_manager.completed(tx_id);
             // finished the operation at this node, informing back
 
-            if let Some(target) = msg.target().cloned() {
+            if let Some(target) = msg.target() {
                 network_bridge.send(&target.peer, msg).await?;
             }
         }

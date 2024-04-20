@@ -26,20 +26,6 @@ impl TransportKeypair {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Hash)]
 pub(crate) struct TransportPublicKey(RsaPublicKey);
 
-impl PartialOrd for TransportPublicKey {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        // Some(self.0.n().cmp(other.0.n()))
-        todo!()
-    }
-}
-
-impl Ord for TransportPublicKey {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // self.0.n().cmp(other.0.n())
-        todo!()
-    }
-}
-
 impl TransportPublicKey {
     pub fn encrypt(&self, data: &[u8]) -> Vec<u8> {
         let mut rng = OsRng;
