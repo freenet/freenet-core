@@ -14,7 +14,6 @@ use std::{
     io::Write,
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
-    str::FromStr,
     sync::Arc,
     time::Duration,
 };
@@ -72,7 +71,7 @@ pub struct PeerCliConfig {
     #[arg(long, short, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
     pub address: IpAddr,
 
-    /// Port to expose api on
+    /// Port to expose the websocket API on
     #[arg(long, short, default_value_t = 50509)]
     pub port: u16,
 }
@@ -101,19 +100,16 @@ pub struct NodeConfig {
     /// Determines if an initial connection should be attempted.
     /// Only true for an initial gateway/node. If false, the gateway will be disconnected unless other peers connect through it.
     pub should_connect: bool,
-    /// Public key of the peer. A path can optionally be passed. If not specified, a key is generated and used when creating the node.
-    pub pub_key: TransportPublicKey,
-    /// public identifier for the peer
-    pub peer_id: Option<PeerId>,
-    pub listener_ip: IpAddr,
+    /// If not specified, a key is generated and used when creating the node.
+    pub key_pair: Option<TransportKeypair>,
     // optional local info, in case this is an initial bootstrap node
-    /// IP to bind to the listener
+    /// IP to bind to the network listener.
     pub local_ip: Option<IpAddr>,
-    /// socket port to bind to the listener
+    /// socket port to bind to the network listener.
     pub local_port: Option<u16>,
-    /// IP dialers should connect to
+    /// IP dialers should connect to, only set on gateways
     pub(crate) public_ip: Option<IpAddr>,
-    /// socket port dialers should connect to
+    /// socket port dialers should connect to, only set on gateways
     pub(crate) public_port: Option<u16>,
     /// At least an other running listener node is required for joining the network.
     /// Not necessary if this is an initial node.
@@ -130,12 +126,9 @@ pub struct NodeConfig {
 
 impl NodeConfig {
     pub fn new() -> NodeConfig {
-        let key_pair = TransportKeypair::new();
         NodeConfig {
             should_connect: true,
-            pub_key: key_pair.public,
-            peer_id: None,
-            listener_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            key_pair: None,
             remote_nodes: Vec::with_capacity(1),
             local_ip: None,
             local_port: None,
@@ -151,8 +144,8 @@ impl NodeConfig {
         }
     }
 
-    pub fn with_pub_key(&mut self, key: TransportPublicKey) -> &mut Self {
-        self.pub_key = key;
+    pub fn with_key_pair(&mut self, key_pair: TransportKeypair) -> &mut Self {
+        self.key_pair = Some(key_pair);
         self
     }
 
@@ -188,13 +181,6 @@ impl NodeConfig {
 
     pub fn with_ip<T: Into<IpAddr>>(&mut self, ip: T) -> &mut Self {
         self.local_ip = Some(ip.into());
-        self
-    }
-
-    /// Optional identity key of this node.
-    /// If not provided it will be either obtained from the configuration or freshly generated.
-    pub fn with_key(&mut self, key: PeerId) -> &mut Self {
-        self.peer_id = Some(key);
         self
     }
 
@@ -247,6 +233,15 @@ impl NodeConfig {
         !self.should_connect
     }
 
+    pub fn get_peer_id(&self) -> Option<PeerId> {
+        match (self.key_pair.as_ref(), self.local_ip, self.local_port) {
+            (Some(kp), Some(ip), Some(port)) => {
+                Some(PeerId::new(SocketAddr::new(ip, port), kp.public.clone()))
+            }
+            _ => None,
+        }
+    }
+
     /// Returns all specified gateways for this peer. Returns an error if the peer is not a gateway
     /// and no gateways are specified.
     fn get_gateways(&self) -> Result<Vec<PeerKeyLocation>, anyhow::Error> {
@@ -263,10 +258,11 @@ impl NodeConfig {
                     None
                 }
             })
-            .filter(|pkloc| match &self.peer_id {
-                Some(peer_id) => pkloc.peer != *peer_id,
-                None => true,
-            })
+            // FIXME: filter again, can build the id if enough fields are set
+            // .filter(|pkloc| match &self.peer_id {
+            //     Some(peer_id) => pkloc.peer != *peer_id,
+            //     None => true,
+            // })
             .collect();
 
         if (self.local_ip.is_none() || self.local_port.is_none()) && gateways.is_empty() {
@@ -410,7 +406,6 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                     }
                 }
                 ContractRequest::Update { key, data } => {
-                    // FIXME: perform updates
                     let peer_id = op_manager
                         .ring
                         .get_peer_key()
@@ -852,13 +847,15 @@ impl PartialOrd for PeerId {
     }
 }
 
-impl FromStr for PeerId {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        todo!()
-    }
-}
+// impl FromStr for PeerId {
+//     type Err = anyhow::Error;
+//     fn from_str(s: &str) -> Result<Self, Self::Err> {
+//         Ok(Self {
+//             addr: s.parse()?,
+//             pub_key: TransportKeypair::new().public,
+//         })
+//     }
+// }
 
 impl PeerId {
     pub fn new(addr: SocketAddr, pub_key: TransportPublicKey) -> Self {
@@ -891,7 +888,7 @@ impl PeerId {
         use rand::Rng;
         let mut addr = [0; 4];
         rand::thread_rng().fill(&mut addr[..]);
-        let port = rand::random::<u16>();
+        let port = crate::util::get_free_port().unwrap();
         let pub_key = TransportKeypair::new().public;
         Self {
             addr: (addr, port).into(),

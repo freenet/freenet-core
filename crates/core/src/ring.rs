@@ -256,10 +256,12 @@ impl Ring {
     ) -> Result<Arc<Self>, anyhow::Error> {
         let (live_tx_tracker, missing_candidate_rx) = LiveTransactionTracker::new();
 
-        //FIXME: The config.peer_id field should be optional and only set in the gateways.
-        let peer_key = Mutex::new(config.peer_id.clone());
-
-        let peer_pub_key = config.pub_key.clone();
+        let peer_pub_key = config
+            .key_pair
+            .as_ref()
+            .map(|kp| kp.public.clone())
+            .ok_or(anyhow::anyhow!("Key pair should be set at this point"))?;
+        let peer_key = config.get_peer_id();
 
         // for location here consider -1 == None
         let own_location = AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()));
@@ -321,7 +323,7 @@ impl Ring {
             connections_by_location: RwLock::new(BTreeMap::new()),
             location_for_peer: RwLock::new(BTreeMap::new()),
             own_location,
-            peer_key,
+            peer_key: Mutex::new(peer_key),
             peer_pub_key,
             subscribers: DashMap::new(),
             seeding_contract: DashMap::new(),

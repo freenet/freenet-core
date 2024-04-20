@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
+    net::Ipv6Addr,
     pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
@@ -11,7 +11,7 @@ use either::Either;
 use freenet_stdlib::prelude::*;
 use futures::Future;
 use itertools::Itertools;
-use rand::{seq::SliceRandom, Rng};
+use rand::seq::SliceRandom;
 use tokio::sync::{mpsc, watch};
 use tracing::{info, Instrument};
 
@@ -29,7 +29,6 @@ use crate::{
     operations::connect,
     ring::{Distance, Location, PeerKeyLocation},
     tracing::TestEventListener,
-    transport::TransportKeypair,
 };
 
 mod in_memory;
@@ -42,25 +41,6 @@ pub use self::network::{NetworkPeer, PeerMessage, PeerStatus};
 use super::{
     network_bridge::EventLoopNotificationsReceiver, ConnectionError, NetworkBridge, PeerId,
 };
-
-pub fn get_free_port() -> Result<u16, ()> {
-    let mut port;
-    for _ in 0..100 {
-        port = get_dynamic_port();
-        let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-        if let Ok(conn) = TcpListener::bind(bind_addr) {
-            std::mem::drop(conn);
-            return Ok(port);
-        }
-    }
-    Err(())
-}
-
-fn get_dynamic_port() -> u16 {
-    const FIRST_DYNAMIC_PORT: u16 = 49152;
-    const LAST_DYNAMIC_PORT: u16 = 65535;
-    rand::thread_rng().gen_range(FIRST_DYNAMIC_PORT..LAST_DYNAMIC_PORT)
-}
 
 pub(crate) type EventId = u32;
 
@@ -297,7 +277,7 @@ impl<ER: NetEventRegister> Builder<ER> {
         contract_handler_name: String,
         add_noise: bool,
     ) -> Builder<ER> {
-        let peer_key = builder.clone().peer_id.unwrap();
+        let peer_key = builder.get_peer_id().unwrap();
         Builder {
             peer_key,
             config: builder.clone(),
@@ -388,24 +368,21 @@ impl SimNetwork {
         let mut configs = Vec::with_capacity(num);
         for node_no in 0..num {
             let label = NodeLabel::gateway(node_no);
-            let pair = TransportKeypair::new();
-            let id = todo!();
-            let port = get_free_port().unwrap();
+            let id = PeerId::random();
+            let port = crate::util::get_free_port().unwrap();
             let location = Location::random();
 
             let mut config = NodeConfig::new();
             config
                 .with_ip(Ipv6Addr::LOCALHOST)
                 .with_port(port)
-                // .with_key(pair.public().into()) // FIXME
                 .with_location(location)
                 .max_hops_to_live(self.ring_max_htl)
                 .max_number_of_connections(self.max_connections)
                 .min_number_of_connections(self.min_connections)
                 .rnd_if_htl_above(self.rnd_if_htl_above);
 
-            self.event_listener
-                .add_node(label.clone(), PeerId::from(id));
+            self.event_listener.add_node(label.clone(), id.clone());
             configs.push((
                 config,
                 GatewayConfig {
@@ -466,9 +443,7 @@ impl SimNetwork {
 
         for node_no in self.number_of_gateways..num + self.number_of_gateways {
             let label = NodeLabel::node(node_no);
-            // let pair = identity::Keypair::generate_ed25519();
-            // let id = pair.public().to_peer_id();
-            let (pair, id): (TransportKeypair, PeerId) = { todo!() };
+            let id = PeerId::random();
 
             let mut config = NodeConfig::new();
             for GatewayConfig {
@@ -485,9 +460,8 @@ impl SimNetwork {
                 .max_hops_to_live(self.ring_max_htl)
                 .rnd_if_htl_above(self.rnd_if_htl_above)
                 .max_number_of_connections(self.max_connections)
-                // .with_key(pair.public().into()) // FIXME
                 .with_ip(Ipv6Addr::LOCALHOST)
-                .with_port(get_free_port().unwrap());
+                .with_port(crate::util::get_free_port().unwrap());
 
             let peer = PeerId::from(id);
             self.event_listener.add_node(label.clone(), peer);

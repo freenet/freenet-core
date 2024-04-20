@@ -51,7 +51,7 @@ impl NetworkPeer {
         tracing::debug!(peer_config = ?peer_config, "Received peer config");
 
         let (user_ev_controller, receiver_ch): (PeerEventSender, PeerEventReceiver) =
-            tokio::sync::watch::channel((0, peer_config.peer_id.clone().unwrap()));
+            tokio::sync::watch::channel((0, peer_config.get_peer_id().unwrap()));
 
         Ok(NetworkPeer {
             id: peer_id,

@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::anyhow;
 use dashmap::{DashMap, DashSet};
 use either::{Either, Left, Right};
 use futures::stream::FuturesUnordered;
@@ -128,15 +129,13 @@ pub(in crate::node) struct P2pConnManager {
     pub(in crate::node) gateways: Vec<PeerKeyLocation>,
     pub(in crate::node) bridge: P2pBridge,
     conn_bridge_rx: Receiver<P2pBridgeEvent>,
-    /// last valid observed public address
-    public_addr: Option<SocketAddr>,
     listening_addr: Option<SocketAddr>,
     event_listener: Box<dyn NetEventRegister>,
     connection: HashMap<PeerId, PeerConnChannel>,
     rejected_peers: HashSet<PeerId>,
-    private_key: TransportKeypair,
-    listener_ip: IpAddr,
-    listen_port: u16,
+    key_pair: TransportKeypair,
+    listening_ip: IpAddr,
+    listening_port: u16,
     is_gateway: bool,
 }
 
@@ -149,11 +148,15 @@ impl P2pConnManager {
     ) -> Result<Self, anyhow::Error> {
         let listen_port = config
             .local_port
-            .ok_or_else(|| anyhow::anyhow!("private_addr does not contain a port"))?;
+            .ok_or_else(|| anyhow::anyhow!("network listener port does not contain a port"))?;
+
+        let listener_ip = config
+            .local_ip
+            .ok_or(anyhow!("network listener IP not set"))?;
 
         let private_addr = if let Some(conn) = config.local_ip.zip(config.local_port) {
-            let public_addr = SocketAddr::from(conn);
-            Some(public_addr)
+            let addr = SocketAddr::from(conn);
+            Some(addr)
         } else {
             None
         };
@@ -163,18 +166,16 @@ impl P2pConnManager {
 
         let gateways = config.get_gateways()?;
         Ok(P2pConnManager {
-            // conn_handler: Arc::new(Mutex::new(conn_handler)),
             gateways,
             bridge,
             conn_bridge_rx: rx_bridge_cmd,
-            public_addr: None,
             listening_addr: private_addr,
             event_listener: Box::new(event_listener),
             connection: HashMap::new(),
             rejected_peers: HashSet::new(),
-            private_key,
-            listener_ip: config.listener_ip,
-            listen_port,
+            key_pair: private_key,
+            listening_ip: listener_ip,
+            listening_port: listen_port,
             is_gateway: config.is_gateway(),
         })
     }
@@ -193,9 +194,9 @@ impl P2pConnManager {
 
         let (mut outbound_conn_handler, mut inbound_conn_handler) =
             create_connection_handler::<UdpSocket>(
-                self.private_key.clone(),
-                self.listener_ip,
-                self.listen_port,
+                self.key_pair.clone(),
+                self.listening_ip,
+                self.listening_port,
                 self.is_gateway,
             )
             .await?;
@@ -420,9 +421,6 @@ impl P2pConnManager {
                     // todo: notify the handler, read `disconnect_peer_id` doc
                     tracing::info!("Dropped connection with peer {}", peer_id);
                 }
-                Ok(Right(UpdatePublicAddr(address))) => {
-                    self.public_addr = Some(address);
-                }
                 Ok(Right(IsPrivatePeer(_peer))) => {
                     todo!("this peer is private, attempt hole punching")
                 }
@@ -537,8 +535,6 @@ enum ConnMngrActions {
         peer: FreenetPeerId,
         msg: Box<NetMessage>,
     },
-    /// Update self own public address, useful when communicating for first time
-    UpdatePublicAddr(SocketAddr),
     /// This is private, so when establishing connections hole-punching should be performed
     IsPrivatePeer(SocketAddr),
     NodeAction(NodeEvent),

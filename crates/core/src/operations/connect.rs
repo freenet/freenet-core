@@ -1,7 +1,7 @@
 //! Operation which seeks new connections in the ring.
 use freenet_stdlib::client_api::HostResponse;
 use futures::Future;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -129,7 +129,7 @@ impl Operation for ConnectOp {
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let return_msg;
-            let mut new_state;
+            let new_state;
 
             match input {
                 ConnectMsg::Request {
@@ -221,7 +221,6 @@ impl Operation for ConnectOp {
                     msg:
                         ConnectRequest::StartJoinReq {
                             joiner,
-                            joiner_key,
                             assigned_location,
                             hops_to_live,
                             skip_list, //
@@ -262,7 +261,7 @@ impl Operation for ConnectOp {
 
                     let actual_state = self.state;
 
-                    if let Some(mut updated_state) = forward_conn(
+                    if let Some(updated_state) = forward_conn(
                         *id,
                         &op_manager.ring,
                         actual_state,
@@ -334,7 +333,7 @@ impl Operation for ConnectOp {
 
                     let actual_state = self.state;
 
-                    if let Some(mut updated_state) = forward_conn(
+                    if let Some(updated_state) = forward_conn(
                         *id,
                         &op_manager.ring,
                         actual_state,
@@ -801,7 +800,7 @@ fn handle_unforwardable_connection(
 }
 
 fn update_connectivity_info(
-    mut conn_info: ConnectivityInfo,
+    conn_info: ConnectivityInfo,
     joiner: &PeerKeyLocation,
     forward_to: PeerKeyLocation,
 ) -> ConnectState {
@@ -899,7 +898,6 @@ mod messages {
                 Response { sender, .. } => Some(&sender.peer),
                 Connected { sender, .. } => Some(&sender.peer),
                 Request { .. } => None,
-                _ => None,
             }
         }
     }

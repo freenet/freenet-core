@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::anyhow;
 use directories::ProjectDirs;
 use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
@@ -46,10 +47,8 @@ const ORGANIZATION: &str = "The Freenet Project Inc";
 const APPLICATION: &str = "Freenet";
 
 pub struct Config {
-    pub bootstrap_ip: IpAddr,
-    pub bootstrap_port: u16,
-    pub bootstrap_id: Option<PeerId>,
-    pub local_peer_keypair: TransportKeypair,
+    pub(crate) bootstrap_id: Option<PeerId>,
+    pub transport_keypair: TransportKeypair,
     pub log_level: tracing::log::LevelFilter,
     config_paths: ConfigPaths,
     local_mode: AtomicBool,
@@ -220,12 +219,13 @@ impl Config {
         })
     }
 
-    fn load_conf() -> std::io::Result<Config> {
+    fn load_conf() -> anyhow::Result<Config> {
         let settings: config::Config = config::Config::builder()
             .add_source(config::Environment::with_prefix("FREENET"))
             .build()
             .unwrap();
-        let local_peer_keypair = if let Ok(path_to_key) = settings
+
+        let transport_keypair: Option<TransportKeypair> = if let Ok(path_to_key) = settings
             .get_string("local_peer_key_file")
             .map(PathBuf::from)
         {
@@ -237,17 +237,22 @@ impl Config {
             });
             let mut buf = Vec::new();
             key_file.read_to_end(&mut buf).unwrap();
-            todo!()
+            todo!("get an rsa private key from the file and create a TransportKeypair")
         } else {
             None
         };
+
         let log_level = settings
             .get_string("log")
             .map(|lvl| lvl.parse().ok())
             .ok()
             .flatten()
             .unwrap_or(tracing::log::LevelFilter::Info);
-        let (bootstrap_ip, bootstrap_port, bootstrap_id) = Config::get_bootstrap_host(&settings)?;
+        let bootstrap_id = if let Some(transport_keypair) = transport_keypair.as_ref() {
+            Config::get_bootstrap_host(&settings, transport_keypair)?
+        } else {
+            None
+        };
 
         let data_dir = settings.get_string("data_dir").ok().map(PathBuf::from);
         let config_paths = ConfigPaths::new(data_dir)?;
@@ -255,10 +260,8 @@ impl Config {
         let local_mode = settings.get_string("network_mode").is_err();
 
         Ok(Config {
-            bootstrap_ip,
-            bootstrap_port,
             bootstrap_id,
-            local_peer_keypair: local_peer_keypair.unwrap_or_else(|| todo!()),
+            transport_keypair: transport_keypair.unwrap_or_else(|| TransportKeypair::new()),
             log_level,
             config_paths,
             local_mode: AtomicBool::new(local_mode),
@@ -269,32 +272,28 @@ impl Config {
 
     fn get_bootstrap_host(
         settings: &config::Config,
-    ) -> std::io::Result<(IpAddr, u16, Option<PeerId>)> {
-        let bootstrap_ip = IpAddr::from_str(
-            &settings
-                .get_string("bootstrap_host")
-                .unwrap_or_else(|_| format!("{}", Ipv4Addr::LOCALHOST)),
-        )
-        .map_err(|_err| std::io::ErrorKind::InvalidInput)?;
-
-        let bootstrap_port = settings
-            .get_int("bootstrap_port")
-            .ok()
-            .map(u16::try_from)
-            .unwrap_or(Ok(DEFAULT_BOOTSTRAP_PORT))
-            .map_err(|_err| std::io::ErrorKind::InvalidInput)?;
-
-        let id_str = if let Some(id_str) = settings
-            .get_string("bootstrap_id")
-            .ok()
-            .map(|id| id.parse().map_err(|_err| std::io::ErrorKind::InvalidInput))
-        {
-            Some(id_str?)
-        } else {
-            None
+        peer_keypair: &TransportKeypair,
+    ) -> anyhow::Result<Option<PeerId>> {
+        let Some(bootstrap_port) = settings.get_int("bootstrap_port").ok().map(u16::try_from)
+        else {
+            tracing::warn!("No bootstrap port provided, skipping creation of a bootstrap peer id.");
+            return Ok(None);
         };
 
-        Ok((bootstrap_ip, bootstrap_port, id_str))
+        let bootstrap_ip =
+            IpAddr::from_str(&settings.get_string("bootstrap_host").unwrap_or_else(|_| {
+                tracing::warn!("boostrap host missing, using unspecified IP address");
+                format!("{}", Ipv4Addr::UNSPECIFIED)
+            }))
+            .map_err(|err| anyhow!(err))?;
+
+        let bootstrap_port = bootstrap_port.map_err(|err| anyhow!(err))?;
+
+        let bootstrap_id = PeerId::new(
+            (bootstrap_ip, bootstrap_port).into(),
+            peer_keypair.public.clone(),
+        );
+        Ok(Some(bootstrap_id))
     }
 }
 
