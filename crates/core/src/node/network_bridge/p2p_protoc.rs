@@ -319,15 +319,17 @@ impl P2pConnManager {
                         NetMessage::Connect(ConnectMsg::Response {
                             msg:
                                 ConnectResponse::AcceptedBy {
-                                    accepted, joiner, ..
+                                    accepted, target, ..
                                 },
                             ..
                         }) => {
                             if accepted {
+                                //FIXME: handle thhe different cases
                                 tracing::debug!("Connection accepted by target");
                             } else {
-                                let peer_id = &joiner.peer;
-                                tracing::debug!(remote = %joiner.peer, "Connection rejected by target");
+                                //FIXME: handle thhe different cases
+                                let peer_id = &target.peer;
+                                tracing::debug!(remote = %target.peer, "Connection rejected by target");
                                 self.connection.remove(&peer_id);
                                 self.rejected_peers.insert(peer_id.clone());
                                 self.bridge.active_net_connections.remove(&peer_id);
@@ -501,7 +503,6 @@ impl P2pConnManager {
             msg: ConnectRequest::StartJoinReq {
                 joiner: None,
                 joiner_key: joiner_key.clone(),
-                assigned_location: None,
                 hops_to_live,
                 max_hops_to_live: hops_to_live,
                 skip_list,
