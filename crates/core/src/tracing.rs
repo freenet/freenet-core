@@ -161,7 +161,7 @@ impl<'a> NetEventLog<'a> {
         let peer_id = ring.get_peer_key().unwrap();
         let kind = match msg {
             NetMessage::Connect(connect::ConnectMsg::Response {
-                msg: connect::ConnectResponse::AcceptedBy { accepted, joiner },
+                msg: connect::ConnectResponse::AcceptedBy { accepted, acceptor },
                 ..
             }) => {
                 let this_peer = ring.own_location();
@@ -169,8 +169,8 @@ impl<'a> NetEventLog<'a> {
                     EventKind::Connect(ConnectEvent::Connected {
                         this: this_peer,
                         connected: PeerKeyLocation {
-                            peer: joiner.peer.clone(),
-                            location: joiner.location.clone(),
+                            peer: acceptor.peer.clone(),
+                            location: acceptor.location.clone(),
                         },
                     })
                 } else {
@@ -192,7 +192,7 @@ impl<'a> NetEventLog<'a> {
     ) -> Either<Self, Vec<Self>> {
         let kind = match msg {
             NetMessage::Connect(connect::ConnectMsg::Response {
-                msg: connect::ConnectResponse::AcceptedBy { accepted, joiner },
+                msg: connect::ConnectResponse::AcceptedBy { acceptor, accepted },
                 ..
             }) => {
                 let this_peer = &op_manager.ring.get_peer_key().unwrap();
@@ -202,8 +202,8 @@ impl<'a> NetEventLog<'a> {
                         tx: msg.id(),
                         peer_id: this_peer.clone(),
                         kind: EventKind::Connect(ConnectEvent::Finished {
-                            initiator: joiner.peer.clone(),
-                            location: joiner.location.unwrap(),
+                            initiator: acceptor.peer.clone(), // FIXME
+                            location: acceptor.location.unwrap(),
                         }),
                     });
                 }

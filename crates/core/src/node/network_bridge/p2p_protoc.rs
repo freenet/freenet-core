@@ -282,9 +282,7 @@ impl P2pConnManager {
                 msg = notification_msg => { msg }
                 msg = bridge_msg => {
                     match msg? {
-                        Left(peer_conn) => {
-                            // FIXME: this is wrong, it shoud be the inbound peer (not this same peer)
-                            let peer = conn_bridge.op_manager.ring.get_peer_key().expect("Peer key not set");
+                        Left((peer, peer_conn)) => {
                             Ok(Right(ConnectionEstablished {
                                 peer,
                                 peer_conn,
@@ -332,7 +330,7 @@ impl P2pConnManager {
                             if let NetMessage::Connect(ConnectMsg::Response {
                                 msg:
                                     ConnectResponse::AcceptedBy {
-                                        accepted, target, ..
+                                        accepted, acceptor, ..
                                     },
                                 ..
                             }) = &msg
@@ -342,12 +340,12 @@ impl P2pConnManager {
                                 // check handle_bridge_connection_message
                                 if *accepted {
                                     tracing::debug!("Connection accepted by target");
-                                    if waiting_connection.remove(&target.peer).is_none() {
+                                    if waiting_connection.remove(&acceptor.peer).is_none() {
                                         // this shouldn't happen for non-gateways
                                     }
                                 } else {
-                                    let peer_id = &target.peer;
-                                    tracing::debug!(remote = %target.peer, "Connection rejected by target");
+                                    let peer_id = &acceptor.peer;
+                                    tracing::debug!(remote = %acceptor.peer, "Connection rejected by target");
                                     self.connection.remove(&peer_id);
                                     self.rejected_peers.insert(peer_id.clone());
                                     self.bridge.active_net_connections.remove(&peer_id);
@@ -466,30 +464,38 @@ impl P2pConnManager {
     }
 
     // FIXME: rework this function implementation
-    /*
-    what should happen here is:
-    if is an outbound AcceptedBy response then we must attempt connecting to the target
-    if we accepted the connection
-    */
+    /// Outbound message from bridge handler
     async fn handle_bridge_connection_message(
         &mut self,
         peer: PeerId,
         net_msg: Box<NetMessage>,
         outbound_conn_handler: &mut OutboundConnectionHandler,
         waiting_connection: &DashSet<PeerId>,
-    ) -> Result<Either<(), PeerConnection>, ConnectionError> {
+    ) -> Result<Either<(), (PeerId, PeerConnection)>, ConnectionError> {
         if let Some(conn) = self.connection.get(&peer) {
-            conn.send(*net_msg).await;
+            conn.send(*net_msg)
+                .await
+                .map_err(|_| ConnectionError::SendNotCompleted)?;
             Ok(Left(()))
-        } else if let NetMessage::Connect(ConnectMsg::Request { id, msg }) = *net_msg {
-            let (joiner_key, hops_to_live, skip_list) = match msg {
-                ConnectRequest::StartJoinReq {
-                    joiner_key,
-                    hops_to_live,
-                    skip_list,
-                    ..
-                } => (joiner_key, hops_to_live, skip_list),
-                _ => return Err(ConnectionError::UnexpectedReq),
+        } else if let NetMessage::Connect(ConnectMsg::Response {
+            id,
+            sender,
+            target,
+            msg,
+        }) = *net_msg
+        {
+            let joiner = match msg {
+                ConnectResponse::AcceptedBy {
+                    accepted,
+                    acceptor,
+                    joiner,
+                } => {
+                    if !accepted {
+                        return Ok(Left(()));
+                    }
+                    joiner
+                }
+                _ => return Err(ConnectionError::UnexpectedReq), // FIXME: all outbound messages comes through here, we just have to send them
             };
 
             waiting_connection.insert(peer.clone());
@@ -526,7 +532,7 @@ impl P2pConnManager {
                 .await
                 .map_err(|_| ConnectionError::SendNotCompleted)?;
 
-            Ok(Right(peer_conn))
+            Ok(Right((peer, peer_conn)))
         } else {
             Err(ConnectionError::UnexpectedReq)
         }

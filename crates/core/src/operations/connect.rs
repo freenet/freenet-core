@@ -1,14 +1,13 @@
 //! Operation which seeks new connections in the ring.
 use freenet_stdlib::client_api::HostResponse;
 use futures::Future;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::time::Duration;
 
 use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
-use crate::operations::connect;
 use crate::ring::Ring;
 use crate::transport::TransportPublicKey;
 use crate::{
@@ -187,7 +186,8 @@ impl Operation for ConnectOp {
                                 target: joiner.clone(),
                                 msg: ConnectResponse::AcceptedBy {
                                     accepted: false,
-                                    target: query_target.clone(),
+                                    acceptor: query_target.clone(),
+                                    joiner: joiner.peer,
                                 },
                             });
                             new_state = None;
@@ -222,7 +222,6 @@ impl Operation for ConnectOp {
                     msg:
                         ConnectRequest::StartJoinReq {
                             joiner,
-                            joiner_key,
                             hops_to_live,
                             skip_list, //
                             ..
@@ -241,9 +240,9 @@ impl Operation for ConnectOp {
 
                     let actual_state = self.state;
 
-                    let accepted = true; // gateway always accept the first connection
+                    let mut accepted = true; // gateway always accept the first connection
 
-                    if let Some(mut updated_state) = forward_conn(
+                    if let Some(updated_state) = forward_conn(
                         *id,
                         &op_manager.ring,
                         actual_state,
@@ -321,7 +320,8 @@ impl Operation for ConnectOp {
 
                     let response = ConnectResponse::AcceptedBy {
                         accepted: should_accept,
-                        target: this_peer,
+                        acceptor: this_peer.clone(),
+                        joiner: joiner.peer,
                     };
 
                     return_msg = Some(ConnectMsg::Response {
@@ -338,7 +338,8 @@ impl Operation for ConnectOp {
                     msg:
                         ConnectResponse::AcceptedBy {
                             accepted,
-                            target: accepter,
+                            acceptor,
+                            joiner,
                         },
                 } => {
                     tracing::debug!(
@@ -424,7 +425,7 @@ impl Operation for ConnectOp {
                                     tx = %id,
                                     at = %this_peer_id,
                                     from = %sender.peer,
-                                    accecpted_by = %accepter.peer,
+                                    accecpted_by = %acceptor.peer,
                                     "Connectivity check accepted",
                                 );
                             } else {
@@ -432,7 +433,7 @@ impl Operation for ConnectOp {
                                     tx = %id,
                                     at = %this_peer_id,
                                     from = %sender.peer,
-                                    rejected_by = %accepter.peer,
+                                    rejected_by = %acceptor.peer,
                                     "Connectivity check rejected",
                                 );
                             }
@@ -448,12 +449,13 @@ impl Operation for ConnectOp {
                                 new_state =
                                     Some(ConnectState::AwaitingConnectivity(ConnectivityInfo {
                                         remaining_checks,
-                                        requester,
+                                        requester: requester.clone(),
                                     }));
                             }
                             let response = ConnectResponse::AcceptedBy {
                                 accepted: *accepted,
-                                target: accepter.clone(),
+                                acceptor: acceptor.clone(),
+                                joiner: joiner.clone(),
                             };
                             return_msg = Some(ConnectMsg::Response {
                                 id: *id,
@@ -976,7 +978,8 @@ mod messages {
     pub(crate) enum ConnectResponse {
         AcceptedBy {
             accepted: bool,
-            target: PeerKeyLocation,
+            acceptor: PeerKeyLocation,
+            joiner: PeerId,
         },
     }
 }
