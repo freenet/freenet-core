@@ -23,6 +23,7 @@ pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 /// Allows handling of connections to the network as well as sending messages
 /// to other peers in the network with whom connection has been established.
 pub(crate) trait NetworkBridge: Send + Sync {
+    /// Function used when first trying to establish a connection to a gateway.
     async fn try_add_connection(&mut self, peer: PeerId) -> ConnResult<()>;
 
     fn drop_connection(&mut self, peer: &PeerId) -> impl Future<Output = ConnResult<()>> + Send;
@@ -42,21 +43,25 @@ pub(crate) enum ConnectionError {
     #[error("error while de/serializing message")]
     #[serde(skip)]
     Serialization(#[from] Option<Box<bincode::ErrorKind>>),
+    #[error("{0}")]
+    TransportError(String),
 
     // errors produced while handling the connection:
     #[error("IO error: {0}")]
     IOError(String),
-    #[error("timeout error while opening a connectio.")]
+    #[error("timeout error while waiting for a message")]
     Timeout,
-    #[error("no protocols could be agreed upon")]
-    NegotiationFailed,
-    #[error("protocol upgrade error: {0}")]
-    Upgrade(String),
 }
 
 impl From<std::io::Error> for ConnectionError {
     fn from(err: std::io::Error) -> Self {
         Self::IOError(format!("{err}"))
+    }
+}
+
+impl From<crate::transport::TransportError> for ConnectionError {
+    fn from(err: crate::transport::TransportError) -> Self {
+        Self::TransportError(err.to_string())
     }
 }
 
@@ -68,9 +73,8 @@ impl Clone for ConnectionError {
             Self::SendNotCompleted => Self::SendNotCompleted,
             Self::IOError(err) => Self::IOError(err.clone()),
             Self::Timeout => Self::Timeout,
-            Self::Upgrade(err) => Self::Upgrade(err.clone()),
-            Self::NegotiationFailed => Self::NegotiationFailed,
             Self::UnexpectedReq => Self::UnexpectedReq,
+            Self::TransportError(err) => Self::TransportError(err.clone()),
         }
     }
 }

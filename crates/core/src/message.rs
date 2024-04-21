@@ -253,10 +253,10 @@ pub(crate) trait InnerMessage: Into<NetMessage> {
 pub(crate) enum NodeEvent {
     /// For unspecified reasons the node is gracefully shutting down.
     ShutdownNode,
-    /// Received a confirmation from a peer that a physical connection was established.
-    ConfirmedInbound,
     /// Drop the given peer connection.
     DropConnection(PeerId),
+    // FIXME: review the usage of this variant and the try_add_connection function
+    // in the connbridge trait since all this is likely wrong
     /// Accept the connections from the given peer.
     #[serde(skip)]
     AcceptConnection(PeerId, Sender<ConnectionResult>),
@@ -272,7 +272,6 @@ impl Display for NodeEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NodeEvent::ShutdownNode => f.write_str("ShutdownNode"),
-            NodeEvent::ConfirmedInbound => f.write_str("ConfirmedInbound"),
             NodeEvent::DropConnection(peer) => {
                 write!(f, "DropConnection (from {peer})")
             }
