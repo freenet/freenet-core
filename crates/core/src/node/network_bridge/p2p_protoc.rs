@@ -17,7 +17,7 @@ use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::message::ConnectionResult;
 
 use crate::node::PeerId;
-use crate::operations::connect::{ConnectMsg, ConnectResponse};
+use crate::operations::connect::{ConnectMsg, ConnectRequest, ConnectResponse};
 use crate::transport::{
     create_connection_handler, OutboundConnectionHandler, PeerConnection, TransportError,
     TransportKeypair,
@@ -209,15 +209,15 @@ impl P2pConnManager {
         let mut pending_from_executor = HashSet::new();
         let mut tx_to_client: HashMap<Transaction, ClientId> = HashMap::new();
 
-        let conn_bridge = self.bridge.clone();
         let mut peer_connections = FuturesUnordered::new();
         let mut outbound_conn_handler_2 = outbound_conn_handler.clone();
         let mut pending_outbound_conns = FuturesUnordered::new();
+        let mut pending_inbound_gw_conns = HashMap::new();
 
         loop {
             let notification_msg = notification_channel.0.recv().map(|m| match m {
                 None => Ok(Right(ClosedChannel)),
-                Some(Left(msg)) => Ok(Left(msg)),
+                Some(Left(msg)) => Ok(Left((msg, None))),
                 Some(Right(action)) => Ok(Right(NodeAction(action))),
             });
 
@@ -245,15 +245,12 @@ impl P2pConnManager {
             };
 
             let new_incoming_connection = async {
-                // FIXME: is not really this peer, is the inbound peer; we somehow need to get their
-                //        peer id from the connection, introduce the necessry changes in the transport
-                let peer = conn_bridge.op_manager.ring.get_peer_key().unwrap().clone();
                 // TODO: add a separate code path for gateways for handling connection liveness
                 // we must ensure that the peer stays connected long enough so an other peer has forwarded
                 // or accepted a connection
                 match inbound_conn_handler.next_connection().await {
-                    Some(peer_conn) => Ok(Right(ConnectionEstablished {
-                        peer: peer.clone(),
+                    Some(peer_conn) => Ok(Right(GatewayConnection {
+                        remote_addr: peer_conn.remote_addr(),
                         peer_conn,
                     })),
                     None => Ok(Right(ClosedChannel)),
@@ -274,9 +271,10 @@ impl P2pConnManager {
                             continue;
                         }
                     };
+                    let remote_addr = conn.remote_addr();
                     let task = peer_connection_listener(rx, conn).boxed();
                     peer_connections.push(task);
-                    Ok(Left(msg))
+                    Ok(Left((msg, Some(remote_addr))))
                 }
                 msg = pending_outbound_conns.next(), if !pending_outbound_conns.is_empty() => {
                     match msg {
@@ -300,16 +298,6 @@ impl P2pConnManager {
                             continue;
                         }
                     }
-                    // match msg {
-                    //     Some(Ok((peer_conn, peer_id))) => Ok(Right(ConnectionEstablished {
-                    //         peer: peer_id,
-                    //         peer_conn,
-                    //     })),
-                    //     Some(Err(err)) => {
-                    //         tracing::error!("Error in peer connection: {err}");
-                    //         continue;
-                    //     }
-                    // }
                 }
                 msg = notification_msg => { msg }
                 msg = bridge_msg => {
@@ -345,7 +333,7 @@ impl P2pConnManager {
 
             match msg {
                 // This are either inbound messages or fast tracked by the event notifier
-                Ok(Left(msg)) => {
+                Ok(Left((msg, maybe_socket))) => {
                     let cb = self.bridge.clone();
                     match msg {
                         NetMessage::Aborted(tx) => {
@@ -359,7 +347,7 @@ impl P2pConnManager {
                             .await?;
                             continue;
                         }
-                        msg => {
+                        mut msg => {
                             if let NetMessage::Connect(ConnectMsg::Response {
                                 msg:
                                     ConnectResponse::AcceptedBy {
@@ -372,13 +360,11 @@ impl P2pConnManager {
                             {
                                 // this is the inbound response from the peer we want to connect to
                                 // for the other peer returning this response, check handle_bridge_connection_message
-                                if *accepted
-                                    && joiner
-                                        == &op_manager
-                                            .ring
-                                            .get_peer_key()
-                                            .expect("should be set at this point")
-                                {
+                                let this_peer_id = op_manager
+                                    .ring
+                                    .set_peer_key(joiner.clone())
+                                    .unwrap_or_else(|| joiner.clone());
+                                if *accepted && &this_peer_id == joiner {
                                     tracing::debug!(remote = %acceptor.peer, "Connection accepted by target, attempting connection");
                                     // we need to start the process of connecting to the other peer
                                     let remote_peer = acceptor.peer.clone();
@@ -389,6 +375,54 @@ impl P2pConnManager {
                                     pending_outbound_conns.push(conn_fut);
                                 }
                             }
+
+                            if let NetMessage::Connect(ConnectMsg::Request {
+                                msg:
+                                    ConnectRequest::StartJoinReq {
+                                        joiner,
+                                        joiner_key,
+                                        hops_to_live,
+                                        max_hops_to_live,
+                                        ..
+                                    },
+                                ..
+                            }) = &mut msg
+                            {
+                                // this is a gateway forwarding a connection request
+                                // in this case a real connection already exists and we just need to maintain it alive
+                                // long enough so the request is forwarded
+                                // this should be the first hop:
+                                debug_assert_eq!(hops_to_live, max_hops_to_live);
+                                // at this point the joiner is probably not yet set, so we need to update it
+                                if let Some(remote_addr) = maybe_socket {
+                                    if let Some(peer_conn) =
+                                        pending_inbound_gw_conns.remove(&remote_addr)
+                                    {
+                                        let peer_id = PeerId::new(remote_addr, joiner_key.clone());
+
+                                        tracing::debug!(
+                                            %remote_addr,
+                                            "Established connection with peer",
+                                        );
+                                        self.bridge
+                                            .active_net_connections
+                                            .insert(peer_id.clone(), remote_addr);
+
+                                        let (tx, rx) = mpsc::channel(10);
+                                        self.connection.insert(peer_id.clone(), tx);
+
+                                        // Spawn a task to handle the connection messages (inbound and outbound)
+                                        let task = peer_connection_listener(rx, peer_conn).boxed();
+                                        peer_connections.push(task);
+                                    } else if joiner.is_none() {
+                                        tracing::error!(
+                                            "Joiner unexpectedly not set for connection request."
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+
                             let executor_callback = pending_from_executor
                                 .remove(msg.id())
                                 .then(|| executor_listener.callback());
@@ -441,6 +475,12 @@ impl P2pConnManager {
                     self.connection.remove(&peer_id);
                     self.rejected_peers.insert(peer_id.clone());
                     tracing::info!("Dropped connection with peer {}", peer_id);
+                }
+                Ok(Right(GatewayConnection {
+                    remote_addr,
+                    peer_conn,
+                })) => {
+                    pending_inbound_gw_conns.insert(remote_addr, peer_conn);
                 }
                 Ok(Right(ConnectionEstablished { peer, peer_conn })) => {
                     let addr = peer.addr.clone();
@@ -514,11 +554,11 @@ impl P2pConnManager {
                         .connect(joiner.pub_key.clone(), joiner.addr)
                         .await
                         .await?;
-                    let my_address = peer_conn.my_address().unwrap();
-                    if self.bridge.op_manager.ring.get_peer_key().is_none() {
-                        let own_peer_id = PeerId::new(my_address, joiner.pub_key.clone());
-                        self.bridge.op_manager.ring.set_peer_key(own_peer_id);
-                    }
+                    // let my_address = peer_conn.my_address().unwrap();
+                    // if self.bridge.op_manager.ring.get_peer_key().is_none() {
+                    //     let own_peer_id = PeerId::new(my_address, joiner.pub_key.clone());
+                    //     self.bridge.op_manager.ring.set_peer_key(own_peer_id);
+                    // }
                     tracing::debug!("Connection established with peer {}", joiner.addr.clone());
                     connection = Some((peer.clone(), peer_conn));
                 }
@@ -540,6 +580,11 @@ impl P2pConnManager {
 }
 
 enum ConnMngrActions {
+    /// Gateway connection
+    GatewayConnection {
+        remote_addr: SocketAddr,
+        peer_conn: PeerConnection,
+    },
     /// Received a new connection
     ConnectionEstablished {
         peer: FreenetPeerId,

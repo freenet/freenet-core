@@ -249,6 +249,10 @@ impl PeerConnection {
         self.remote_conn.my_address
     }
 
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.remote_conn.remote_addr
+    }
+
     async fn process_inbound(
         &mut self,
         payload: SymmetricMessagePayload,

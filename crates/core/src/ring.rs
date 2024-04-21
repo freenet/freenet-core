@@ -361,10 +361,14 @@ impl Ring {
         self.peer_key.lock().clone()
     }
 
-    pub fn set_peer_key(&self, peer_key: PeerId) {
+    /// Sets the peer id if is not already set, or returns the current peer id.
+    pub fn set_peer_key(&self, peer_key: PeerId) -> Option<PeerId> {
         let mut this_peer = self.peer_key.lock();
         if this_peer.is_none() {
             *this_peer = Some(peer_key);
+            None
+        } else {
+            this_peer.clone()
         }
     }
 
