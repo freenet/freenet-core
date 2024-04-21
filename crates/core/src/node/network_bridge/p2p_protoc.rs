@@ -209,9 +209,10 @@ impl P2pConnManager {
         let mut pending_from_executor = HashSet::new();
         let mut tx_to_client: HashMap<Transaction, ClientId> = HashMap::new();
 
-        let mut peer_connections = FuturesUnordered::new();
-
         let conn_bridge = self.bridge.clone();
+        let mut peer_connections = FuturesUnordered::new();
+        let mut outbound_conn_handler_2 = outbound_conn_handler.clone();
+        let mut pending_outbound_conns = FuturesUnordered::new();
 
         loop {
             let notification_msg = notification_channel.0.recv().map(|m| match m {
@@ -277,6 +278,39 @@ impl P2pConnManager {
                     peer_connections.push(task);
                     Ok(Left(msg))
                 }
+                msg = pending_outbound_conns.next(), if !pending_outbound_conns.is_empty() => {
+                    match msg {
+                        Some((peer_conn, peer_id)) => {
+                            match peer_conn {
+                                Ok(peer_conn) => Ok(Right(ConnectionEstablished {
+                                    peer: peer_id,
+                                    peer_conn,
+                                })),
+                                Err(err) => {
+                                    tracing::error!(remote = %peer_id, "Error while attempting connection: {err}");
+                                    // in this case although theoretically the Connect request would have added a new connection
+                                    // it failed, so we must free a spot reserved for this connection
+                                    op_manager.ring.prune_connection(peer_id.clone()).await;
+                                    continue;
+                                }
+                            }
+                        },
+                        None => {
+                            tracing::error!("All outbound peer connections closed");
+                            continue;
+                        }
+                    }
+                    // match msg {
+                    //     Some(Ok((peer_conn, peer_id))) => Ok(Right(ConnectionEstablished {
+                    //         peer: peer_id,
+                    //         peer_conn,
+                    //     })),
+                    //     Some(Err(err)) => {
+                    //         tracing::error!("Error in peer connection: {err}");
+                    //         continue;
+                    //     }
+                    // }
+                }
                 msg = notification_msg => { msg }
                 msg = bridge_msg => {
                     match msg? {
@@ -329,23 +363,30 @@ impl P2pConnManager {
                             if let NetMessage::Connect(ConnectMsg::Response {
                                 msg:
                                     ConnectResponse::AcceptedBy {
-                                        accepted, acceptor, ..
+                                        accepted,
+                                        acceptor,
+                                        joiner,
                                     },
                                 ..
                             }) = &msg
                             {
                                 // this is the inbound response from the peer we want to connect to
-                                // for the other peer returning this response,
-                                // check handle_bridge_connection_message
-                                if *accepted {
-                                    tracing::debug!("Connection accepted by target");
-                                } else {
-                                    let peer_id = &acceptor.peer;
-                                    tracing::debug!(remote = %acceptor.peer, "Connection rejected by target");
-                                    self.connection.remove(&peer_id);
-                                    self.rejected_peers.insert(peer_id.clone());
-                                    self.bridge.active_net_connections.remove(&peer_id);
-                                    op_manager.ring.prune_connection(peer_id.clone()).await;
+                                // for the other peer returning this response, check handle_bridge_connection_message
+                                if *accepted
+                                    && joiner
+                                        == &op_manager
+                                            .ring
+                                            .get_peer_key()
+                                            .expect("should be set at this point")
+                                {
+                                    tracing::debug!(remote = %acceptor.peer, "Connection accepted by target, attempting connection");
+                                    // we need to start the process of connecting to the other peer
+                                    let remote_peer = acceptor.peer.clone();
+                                    let conn_fut = outbound_conn_handler_2
+                                        .connect(acceptor.peer.pub_key.clone(), acceptor.peer.addr)
+                                        .await
+                                        .map(|peer_conn| (peer_conn, remote_peer));
+                                    pending_outbound_conns.push(conn_fut);
                                 }
                             }
                             let executor_callback = pending_from_executor
