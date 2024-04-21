@@ -8,6 +8,7 @@ use std::time::Duration;
 use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
+use crate::message::NetMessageV1;
 use crate::ring::Ring;
 use crate::transport::TransportPublicKey;
 use crate::{
@@ -478,7 +479,7 @@ impl Operation for ConnectOp {
                             };
                             op_manager
                                 .notify_op_change(
-                                    NetMessage::Aborted(*id),
+                                    NetMessage::V1(NetMessageV1::Aborted(*id)),
                                     OpEnum::Connect(op.into()),
                                 )
                                 .await?;

@@ -24,7 +24,7 @@ use crate::{
         self, ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
         WaitingResolution,
     },
-    message::{NetMessage, NodeEvent, Transaction},
+    message::{NetMessage, NetMessageV1, NodeEvent, Transaction},
     node::{InitPeerNode, NetEventRegister, NodeConfig},
     operations::connect,
     ring::{Distance, Location, PeerKeyLocation},
@@ -1067,7 +1067,7 @@ where
             }
         };
 
-        if let Ok(Either::Left(NetMessage::Aborted(tx))) = msg {
+        if let Ok(Either::Left(NetMessage::V1(NetMessageV1::Aborted(tx)))) = msg {
             super::handle_aborted_op(
                 tx,
                 peer_key.pub_key.clone(),

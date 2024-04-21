@@ -23,7 +23,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use crate::{
     config::GlobalExecutor,
     contract::StoreResponse,
-    message::{NetMessage, Transaction},
+    message::{NetMessage, NetMessageV1, Transaction},
     node::PeerId,
     operations::{connect, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg},
     ring::{Location, PeerKeyLocation, Ring},
@@ -160,10 +160,13 @@ impl<'a> NetEventLog<'a> {
     pub fn from_outbound_msg(msg: &'a NetMessage, ring: &'a Ring) -> Either<Self, Vec<Self>> {
         let peer_id = ring.get_peer_key().unwrap();
         let kind = match msg {
-            NetMessage::Connect(connect::ConnectMsg::Response {
-                msg: connect::ConnectResponse::AcceptedBy { accepted, acceptor },
+            NetMessage::V1(NetMessageV1::Connect(connect::ConnectMsg::Response {
+                msg:
+                    connect::ConnectResponse::AcceptedBy {
+                        accepted, acceptor, ..
+                    },
                 ..
-            }) => {
+            })) => {
                 let this_peer = ring.own_location();
                 if *accepted {
                     EventKind::Connect(ConnectEvent::Connected {
@@ -186,13 +189,16 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
-    pub fn from_inbound_msg(
-        msg: &'a NetMessage,
+    pub fn from_inbound_msg_v1(
+        msg: &'a NetMessageV1,
         op_manager: &'a OpManager,
     ) -> Either<Self, Vec<Self>> {
         let kind = match msg {
-            NetMessage::Connect(connect::ConnectMsg::Response {
-                msg: connect::ConnectResponse::AcceptedBy { acceptor, accepted },
+            NetMessageV1::Connect(connect::ConnectMsg::Response {
+                msg:
+                    connect::ConnectResponse::AcceptedBy {
+                        acceptor, accepted, ..
+                    },
                 ..
             }) => {
                 let this_peer = &op_manager.ring.get_peer_key().unwrap();
@@ -209,7 +215,7 @@ impl<'a> NetEventLog<'a> {
                 }
                 return Either::Right(events);
             }
-            NetMessage::Put(PutMsg::RequestPut {
+            NetMessageV1::Put(PutMsg::RequestPut {
                 contract, target, ..
             }) => {
                 let key = contract.key();
@@ -218,10 +224,12 @@ impl<'a> NetEventLog<'a> {
                     key,
                 })
             }
-            NetMessage::Put(PutMsg::SuccessfulPut { .. }) => EventKind::Put(PutEvent::PutSuccess {
-                requester: op_manager.ring.get_peer_key().unwrap(),
-            }),
-            NetMessage::Put(PutMsg::Broadcasting {
+            NetMessageV1::Put(PutMsg::SuccessfulPut { .. }) => {
+                EventKind::Put(PutEvent::PutSuccess {
+                    requester: op_manager.ring.get_peer_key().unwrap(),
+                })
+            }
+            NetMessageV1::Put(PutMsg::Broadcasting {
                 new_value,
                 broadcast_to,
                 key,
@@ -231,7 +239,7 @@ impl<'a> NetEventLog<'a> {
                 key: key.clone(),
                 value: new_value.clone(),
             }),
-            NetMessage::Put(PutMsg::BroadcastTo {
+            NetMessageV1::Put(PutMsg::BroadcastTo {
                 sender,
                 new_value,
                 key,
@@ -241,12 +249,12 @@ impl<'a> NetEventLog<'a> {
                 key: key.clone(),
                 value: new_value.clone(),
             }),
-            NetMessage::Get(GetMsg::ReturnGet {
+            NetMessageV1::Get(GetMsg::ReturnGet {
                 key,
                 value: StoreResponse { state: Some(_), .. },
                 ..
             }) => EventKind::Get { key: key.clone() },
-            NetMessage::Subscribe(SubscribeMsg::ReturnSub {
+            NetMessageV1::Subscribe(SubscribeMsg::ReturnSub {
                 subscribed: true,
                 key,
                 sender,

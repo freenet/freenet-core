@@ -14,7 +14,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::Instrument;
 
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
-use crate::message::ConnectionResult;
+use crate::message::{ConnectionResult, NetMessageV1};
 
 use crate::node::PeerId;
 use crate::operations::connect::{ConnectMsg, ConnectRequest, ConnectResponse};
@@ -336,7 +336,7 @@ impl P2pConnManager {
                 Ok(Left((msg, maybe_socket))) => {
                     let cb = self.bridge.clone();
                     match msg {
-                        NetMessage::Aborted(tx) => {
+                        NetMessage::V1(NetMessageV1::Aborted(tx)) => {
                             handle_aborted_op(
                                 tx,
                                 op_manager.ring.get_peer_pub_key(),
@@ -348,7 +348,7 @@ impl P2pConnManager {
                             continue;
                         }
                         mut msg => {
-                            if let NetMessage::Connect(ConnectMsg::Response {
+                            if let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
                                 msg:
                                     ConnectResponse::AcceptedBy {
                                         accepted,
@@ -356,7 +356,7 @@ impl P2pConnManager {
                                         joiner,
                                     },
                                 ..
-                            }) = &msg
+                            })) = &msg
                             {
                                 // this is the inbound response from the peer we want to connect to
                                 // for the other peer returning this response, check handle_bridge_connection_message
@@ -376,7 +376,7 @@ impl P2pConnManager {
                                 }
                             }
 
-                            if let NetMessage::Connect(ConnectMsg::Request {
+                            if let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
                                 msg:
                                     ConnectRequest::StartJoinReq {
                                         joiner,
@@ -386,7 +386,7 @@ impl P2pConnManager {
                                         ..
                                     },
                                 ..
-                            }) = &mut msg
+                            })) = &mut msg
                             {
                                 // this is a gateway forwarding a connection request
                                 // in this case a real connection already exists and we just need to maintain it alive
@@ -528,7 +528,7 @@ impl P2pConnManager {
         outbound_conn_handler: &mut OutboundConnectionHandler,
     ) -> Result<Either<(), (PeerId, PeerConnection)>, ConnectionError> {
         let mut connection = None;
-        if let NetMessage::Connect(ConnectMsg::Response {
+        if let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
             msg:
                 ConnectResponse::AcceptedBy {
                     accepted: true,
@@ -536,7 +536,7 @@ impl P2pConnManager {
                     joiner,
                 },
             ..
-        }) = &*net_msg
+        })) = &*net_msg
         {
             if acceptor.peer
                 == self

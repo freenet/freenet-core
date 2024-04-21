@@ -16,7 +16,7 @@ use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationRe
 use crate::{
     client_events::HostResult,
     contract::ContractHandlerEvent,
-    message::{InnerMessage, NetMessage, Transaction},
+    message::{InnerMessage, NetMessage, NetMessageV1, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
 };
@@ -512,11 +512,11 @@ impl Operation for PutOp {
                                     conn_manager
                                         .send(
                                             &subscriber.peer,
-                                            NetMessage::Unsubscribed {
+                                            NetMessage::V1(NetMessageV1::Unsubscribed {
                                                 transaction: Transaction::new::<PutMsg>(),
                                                 key: key.clone(),
                                                 from: op_manager.ring.get_peer_key().unwrap(),
-                                            },
+                                            }),
                                         )
                                         .await?;
                                 }

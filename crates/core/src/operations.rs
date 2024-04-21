@@ -9,7 +9,7 @@ use tokio::sync::mpsc::error::SendError;
 use crate::{
     client_events::HostResult,
     contract::{ContractError, ExecutorError},
-    message::{InnerMessage, NetMessage, Transaction, TransactionType},
+    message::{InnerMessage, NetMessage, NetMessageV1, Transaction, TransactionType},
     node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
 };
@@ -97,7 +97,7 @@ where
         Err(err) => {
             if let Some(sender) = sender {
                 network_bridge
-                    .send(&sender, NetMessage::Aborted(tx_id))
+                    .send(&sender, NetMessage::V1(NetMessageV1::Aborted(tx_id)))
                     .await?;
             }
             return Err(err);

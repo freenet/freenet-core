@@ -37,6 +37,7 @@ directories = "5"
 either = { features = ["serde"], workspace = true }
 flatbuffers = "24.3"
 futures = "0.3"
+semver = { version = "1.0.14",  features = ["serde"] }
 headers = "0.4"
 itertools = "0.12"
 notify = "6"

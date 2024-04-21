@@ -6,7 +6,6 @@
 use std::{borrow::Cow, io, net::SocketAddr};
 
 use futures::Future;
-use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 
 mod connection_handler;

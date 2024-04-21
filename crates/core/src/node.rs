@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use self::p2p_impl::NodeP2P;
+use crate::message::NetMessageV1;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
     config::GlobalExecutor,
@@ -601,6 +602,36 @@ macro_rules! handle_op_not_available {
 async fn process_message<CB>(
     msg: NetMessage,
     op_manager: Arc<OpManager>,
+    conn_manager: CB,
+    event_listener: Box<dyn NetEventRegister>,
+    executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
+    client_req_handler_callback: Option<ClientResponsesSender>,
+    client_id: Option<ClientId>,
+) where
+    CB: NetworkBridge,
+{
+    let tx = Some(*msg.id());
+    match msg {
+        NetMessage::V1(msg_v1) => {
+            process_message_v1(
+                tx,
+                msg_v1,
+                op_manager,
+                conn_manager,
+                event_listener,
+                executor_callback,
+                client_req_handler_callback,
+                client_id,
+            )
+            .await
+        }
+    }
+}
+
+async fn process_message_v1<CB>(
+    tx: Option<Transaction>,
+    msg: NetMessageV1,
+    op_manager: Arc<OpManager>,
     mut conn_manager: CB,
     mut event_listener: Box<dyn NetEventRegister>,
     executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
@@ -610,15 +641,13 @@ async fn process_message<CB>(
     CB: NetworkBridge,
 {
     let cli_req = client_id.zip(client_req_handler_callback);
-
-    let tx = Some(*msg.id());
     event_listener
-        .register_events(NetEventLog::from_inbound_msg(&msg, &op_manager))
+        .register_events(NetEventLog::from_inbound_msg_v1(&msg, &op_manager))
         .await;
+
     loop {
-        match &msg {
-            NetMessage::Connect(op) => {
-                // log_handling_msg!("join", op.id(), op_manager);
+        match msg {
+            NetMessageV1::Connect(ref op) => {
                 let op_result =
                     handle_op_request::<connect::ConnectOp, _>(&op_manager, &mut conn_manager, op)
                         .await;
@@ -633,8 +662,7 @@ async fn process_message<CB>(
                 )
                 .await;
             }
-            NetMessage::Put(op) => {
-                // log_handling_msg!("put", *op.id(), op_manager);
+            NetMessageV1::Put(ref op) => {
                 let op_result =
                     handle_op_request::<put::PutOp, _>(&op_manager, &mut conn_manager, op).await;
                 handle_op_not_available!(op_result);
@@ -648,8 +676,7 @@ async fn process_message<CB>(
                 )
                 .await;
             }
-            NetMessage::Get(op) => {
-                // log_handling_msg!("get", op.id(), op_manager);
+            NetMessageV1::Get(ref op) => {
                 let op_result =
                     handle_op_request::<get::GetOp, _>(&op_manager, &mut conn_manager, op).await;
                 handle_op_not_available!(op_result);
@@ -663,8 +690,7 @@ async fn process_message<CB>(
                 )
                 .await;
             }
-            NetMessage::Subscribe(op) => {
-                // log_handling_msg!("subscribe", op.id(), op_manager);
+            NetMessageV1::Subscribe(ref op) => {
                 let op_result = handle_op_request::<subscribe::SubscribeOp, _>(
                     &op_manager,
                     &mut conn_manager,
@@ -682,7 +708,7 @@ async fn process_message<CB>(
                 )
                 .await;
             }
-            NetMessage::Update(op) => {
+            NetMessageV1::Update(ref op) => {
                 let op_result =
                     handle_op_request::<update::UpdateOp, _>(&op_manager, &mut conn_manager, op)
                         .await;
@@ -697,12 +723,11 @@ async fn process_message<CB>(
                 )
                 .await;
             }
-
-            NetMessage::Unsubscribed { key, .. } => {
+            NetMessageV1::Unsubscribed { ref key, .. } => {
                 subscribe(op_manager, key.clone(), None).await;
                 break;
             }
-            _ => break,
+            _ => break, // Exit the loop if no applicable message type is found
         }
     }
 }
