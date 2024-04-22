@@ -15,7 +15,6 @@
 
 # Developer Guide
 
-- [Tutorial: test locally a web app](install.md)
 - [Tutorial: Create an App](tutorial.md)
 - [Contract interfaces](contract-interface.md)
 - [freenet.toml format](manifest.md)
