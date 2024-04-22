@@ -38,18 +38,36 @@ impl SymmetricMessage {
         },
     };
 
-    pub(crate) fn max_num_of_confirm_receipts_of_noop_message() -> usize {
-        static MAX_NUM_CONFIRM_RECEIPTS: Lazy<usize> = Lazy::new(|| {
-            // try to find the maximum number of confirm_receipts that can be serialized within the MAX_DATA_SIZE
+    pub(crate) fn short_message_overhead() -> usize {
+        static OVERHEAD: Lazy<usize> = Lazy::new(|| {
+            let blank = SymmetricMessage {
+                packet_id: u32::MAX,
+                confirm_receipt: vec![],
+                payload: SymmetricMessagePayload::ShortMessage { payload: vec![] },
+            };
+            bincode::serialized_size(&blank).unwrap() as usize
+        });
+
+        *OVERHEAD
+    }
+
+    pub(crate) fn noop_message_overhead() -> usize {
+        static OVERHEAD: Lazy<usize> = Lazy::new(|| {
             let blank = SymmetricMessage {
                 packet_id: u32::MAX,
                 confirm_receipt: vec![],
                 payload: SymmetricMessagePayload::NoOp,
             };
-            let overhead = bincode::serialized_size(&blank).unwrap();
+            bincode::serialized_size(&blank).unwrap() as usize
+        });
 
+        *OVERHEAD
+    }
+
+    pub(crate) fn max_num_of_confirm_receipts_of_noop_message() -> usize {
+        static MAX_NUM_CONFIRM_RECEIPTS: Lazy<usize> = Lazy::new(|| {
+            let overhead = SymmetricMessage::noop_message_overhead() as u64;
             let max_elems = (MAX_DATA_SIZE as u64 - overhead) / core::mem::size_of::<u32>() as u64;
-
             max_elems as usize
         });
 
@@ -352,5 +370,17 @@ mod test {
         };
         let size = bincode::serialized_size(&msg).unwrap();
         assert!(size <= MAX_DATA_SIZE as u64);
+    }
+
+    #[test]
+    fn short_message_overhead() {
+        let overhead = SymmetricMessage::short_message_overhead();
+        println!("overhead: {}", overhead);
+    }
+
+    #[test]
+    fn noop_message_overhead() {
+        let overhead = SymmetricMessage::noop_message_overhead();
+        println!("overhead: {}", overhead);
     }
 }
