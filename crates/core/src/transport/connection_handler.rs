@@ -254,7 +254,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 continue;
                             }
                             let packet_data = PacketData::from_buf(&buf[..size]);
-                            let gw_ongoing_connection = self.gateway_connection(packet_data, remote_addr, gw_outbound_tx.clone()).await;
+                            let gw_ongoing_connection = self.gateway_connection(packet_data, remote_addr, gw_outbound_tx.clone());
                             let task = tokio::spawn(gw_ongoing_connection.map_err(move |error| {
                                 (error, remote_addr)
                             }));
@@ -350,7 +350,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         }
     }
 
-    async fn gateway_connection(
+    fn gateway_connection(
         &mut self,
         remote_intro_packet: PacketData<UnknownEncryption>,
         remote_addr: SocketAddr,
