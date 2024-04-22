@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 mod inbound_stream;
 mod outbound_stream;
 
-use super::packet_data::{Plaintext, SymmetricAES};
+use super::packet_data::SymmetricAES;
 use super::{
     connection_handler::SerializedMessage,
     packet_data::{self, PacketData},

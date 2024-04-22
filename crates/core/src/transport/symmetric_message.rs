@@ -6,9 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use super::{
-    packet_data::{Plaintext, MAX_DATA_SIZE},
-    peer_connection::StreamId,
-    MessagePayload, PacketData, PacketId,
+    packet_data::MAX_DATA_SIZE, peer_connection::StreamId, MessagePayload, PacketData, PacketId,
 };
 
 #[serde_as]
