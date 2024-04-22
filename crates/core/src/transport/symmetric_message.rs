@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use super::{
-    packet_data::MAX_DATA_SIZE, peer_connection::StreamId, MessagePayload, PacketData, PacketId,
+    packet_data::{Plaintext, MAX_DATA_SIZE},
+    peer_connection::StreamId,
+    MessagePayload, PacketData, PacketId,
 };
 
 #[serde_as]
@@ -79,6 +81,7 @@ impl SymmetricMessage {
     pub fn try_serialize_msg_to_packet_data(
         packet_id: PacketId,
         payload: impl Into<SymmetricMessagePayload>,
+        outbound_sym_key: &Aes128Gcm,
         confirm_receipt: Vec<u32>,
     ) -> Result<
         either::Either<PacketData<SymmetricAES>, (SymmetricMessagePayload, Vec<u32>)>,
@@ -96,7 +99,7 @@ impl SymmetricMessage {
             bincode::serialize_into(packet.as_mut_slice(), &msg)?;
             let bytes = &packet[..size as usize];
             let packet = PacketData::from_buf_plain(bytes);
-            Ok(either::Left(packet))
+            Ok(either::Left(packet.encrypt_symmetric(outbound_sym_key)))
         } else {
             Ok(either::Right((msg.payload, msg.confirm_receipt)))
         }
@@ -113,10 +116,18 @@ impl SymmetricMessage {
             confirm_receipt,
             payload: payload.into(),
         };
+
+        message.to_packet_data(outbound_sym_key)
+    }
+
+    pub(crate) fn to_packet_data(
+        &self,
+        outbound_sym_key: &Aes128Gcm,
+    ) -> Result<PacketData<SymmetricAES>, bincode::Error> {
         let mut packet = [0u8; MAX_DATA_SIZE];
-        let size = bincode::serialized_size(&message)?;
+        let size = bincode::serialized_size(self)?;
         debug_assert!(size <= MAX_DATA_SIZE as u64);
-        bincode::serialize_into(packet.as_mut_slice(), &message)?;
+        bincode::serialize_into(packet.as_mut_slice(), self)?;
         let bytes = &packet[..size as usize];
         let packet = PacketData::from_buf_plain(bytes);
         Ok(packet.encrypt_symmetric(outbound_sym_key))

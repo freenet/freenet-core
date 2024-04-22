@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 mod inbound_stream;
 mod outbound_stream;
 
-use super::packet_data::Plaintext;
+use super::packet_data::{Plaintext, SymmetricAES};
 use super::{
     connection_handler::SerializedMessage,
     packet_data::{self, PacketData},
@@ -366,7 +366,12 @@ async fn packet_sending(
     payload: impl Into<SymmetricMessagePayload>,
     sent_tracker: &parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>,
 ) -> Result<()> {
-    match SymmetricMessage::try_serialize_msg_to_packet_data(packet_id, payload, confirm_receipt)? {
+    match SymmetricMessage::try_serialize_msg_to_packet_data(
+        packet_id,
+        payload,
+        outbound_sym_key,
+        confirm_receipt,
+    )? {
         either::Either::Left(packet) => {
             outbound_packets
                 .send((remote_addr, packet.clone().prepared_send()))
@@ -375,10 +380,11 @@ async fn packet_sending(
             sent_tracker
                 .lock()
                 .report_sent_packet(packet_id, packet.prepared_send());
-            return Ok(());
+            Ok(())
         }
         either::Either::Right((payload, confirm_receipt)) => {
             // FIXME: how to split confirm_receipt into multiple msgs efficiently?
+            let mut packets = Vec::with_capacity(8);
 
             let packet = SymmetricMessage::serialize_msg_to_packet_data(
                 packet_id,
@@ -386,6 +392,10 @@ async fn packet_sending(
                 outbound_sym_key,
                 vec![],
             )?;
+
+            split_confirm_receipt(packet_id, confirm_receipt, outbound_sym_key, &mut packets)?;
+
+            // Sent the main packet first
             outbound_packets
                 .send((remote_addr, packet.clone().prepared_send()))
                 .await
@@ -393,9 +403,57 @@ async fn packet_sending(
             sent_tracker
                 .lock()
                 .report_sent_packet(packet_id, packet.prepared_send());
-            return Ok(());
+
+            // send confirm receipt packets in parallel
+            let mut futs = packets
+                .into_iter()
+                .map(|packet| async {
+                    outbound_packets
+                        .send((remote_addr, packet.clone().prepared_send()))
+                        .await
+                        .map_err(|_| TransportError::ConnectionClosed)?;
+                    sent_tracker
+                        .lock()
+                        .report_sent_packet(packet_id, packet.prepared_send());
+                    core::result::Result::<(), TransportError>::Ok(())
+                })
+                .collect::<FuturesUnordered<_>>();
+
+            while futs.next().await.is_some() {}
+            Ok(())
         }
     }
+}
+
+fn split_confirm_receipt(
+    packet_id: u32,
+    confirm_receipt: Vec<u32>,
+    outbound_sym_key: &Aes128Gcm,
+    packets: &mut Vec<PacketData<SymmetricAES>>,
+) -> Result<()> {
+    match SymmetricMessage::try_serialize_msg_to_packet_data(
+        packet_id,
+        SymmetricMessagePayload::NoOp,
+        outbound_sym_key,
+        confirm_receipt,
+    )? {
+        either::Either::Left(packet) => {
+            packets.push(packet);
+        }
+        either::Either::Right((_, mut confirm_receipt)) => {
+            let mid = confirm_receipt.len() / 2;
+            let other = confirm_receipt.split_off(mid);
+
+            if !confirm_receipt.is_empty() {
+                split_confirm_receipt(packet_id, confirm_receipt, outbound_sym_key, packets)?;
+            }
+
+            if !other.is_empty() {
+                split_confirm_receipt(packet_id, other, outbound_sym_key, packets)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
