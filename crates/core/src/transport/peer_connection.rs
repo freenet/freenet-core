@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 mod inbound_stream;
 mod outbound_stream;
 
+use super::packet_data::Plaintext;
 use super::{
     connection_handler::SerializedMessage,
     packet_data::{self, PacketData},
@@ -365,27 +366,36 @@ async fn packet_sending(
     payload: impl Into<SymmetricMessagePayload>,
     sent_tracker: &parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>,
 ) -> Result<()> {
-    // FIXME: here ensure that `confirm_receipt` won't make the packet exceed the max data size
-    // if it does, split it to send multiple noop packets with the receipts
-    if !confirm_receipt.is_empty() {
-        // Check if the the serialized is too large to fit in one packet
-    }
+    match SymmetricMessage::try_serialize_msg_to_packet_data(packet_id, payload, confirm_receipt)? {
+        either::Either::Left(packet) => {
+            outbound_packets
+                .send((remote_addr, packet.clone().prepared_send()))
+                .await
+                .map_err(|_| TransportError::ConnectionClosed)?;
+            sent_tracker
+                .lock()
+                .report_sent_packet(packet_id, packet.prepared_send());
+            return Ok(());
+        }
+        either::Either::Right((payload, confirm_receipt)) => {
+            // FIXME: how to split confirm_receipt into multiple msgs efficiently?
 
-    // tracing::trace!(packet_id, "sending packet");
-    let packet = SymmetricMessage::serialize_msg_to_packet_data(
-        packet_id,
-        payload,
-        outbound_sym_key,
-        confirm_receipt,
-    )?;
-    outbound_packets
-        .send((remote_addr, packet.clone().prepared_send()))
-        .await
-        .map_err(|_| TransportError::ConnectionClosed)?;
-    sent_tracker
-        .lock()
-        .report_sent_packet(packet_id, packet.prepared_send());
-    Ok(())
+            let packet = SymmetricMessage::serialize_msg_to_packet_data(
+                packet_id,
+                payload,
+                outbound_sym_key,
+                vec![],
+            )?;
+            outbound_packets
+                .send((remote_addr, packet.clone().prepared_send()))
+                .await
+                .map_err(|_| TransportError::ConnectionClosed)?;
+            sent_tracker
+                .lock()
+                .report_sent_packet(packet_id, packet.prepared_send());
+            return Ok(());
+        }
+    }
 }
 
 #[cfg(test)]

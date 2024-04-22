@@ -76,6 +76,32 @@ impl SymmetricMessage {
         Ok(packet.encrypt_symmetric(outbound_sym_key))
     }
 
+    pub fn try_serialize_msg_to_packet_data(
+        packet_id: PacketId,
+        payload: impl Into<SymmetricMessagePayload>,
+        confirm_receipt: Vec<u32>,
+    ) -> Result<
+        either::Either<PacketData<SymmetricAES>, (SymmetricMessagePayload, Vec<u32>)>,
+        bincode::Error,
+    > {
+        let msg = Self {
+            packet_id,
+            confirm_receipt,
+            payload: payload.into(),
+        };
+
+        let size = bincode::serialized_size(&msg)?;
+        if size <= MAX_DATA_SIZE as u64 {
+            let mut packet = [0u8; MAX_DATA_SIZE];
+            bincode::serialize_into(packet.as_mut_slice(), &msg)?;
+            let bytes = &packet[..size as usize];
+            let packet = PacketData::from_buf_plain(bytes);
+            Ok(either::Left(packet))
+        } else {
+            Ok(either::Right((msg.payload, msg.confirm_receipt)))
+        }
+    }
+
     pub fn serialize_msg_to_packet_data(
         packet_id: PacketId,
         payload: impl Into<SymmetricMessagePayload>,
