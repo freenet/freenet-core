@@ -367,6 +367,9 @@ async fn packet_sending(
 ) -> Result<()> {
     // FIXME: here ensure that `confirm_receipt` won't make the packet exceed the max data size
     // if it does, split it to send multiple noop packets with the receipts
+    if !confirm_receipt.is_empty() {
+        // Check if the the serialized is too large to fit in one packet
+    }
 
     // tracing::trace!(packet_id, "sending packet");
     let packet = SymmetricMessage::serialize_msg_to_packet_data(
