@@ -23,7 +23,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use crate::{
     config::GlobalExecutor,
     contract::StoreResponse,
-    message::{NetMessage, NetMessageV1, Transaction},
+    message::{MessageStats, NetMessage, NetMessageV1, Transaction},
     node::PeerId,
     operations::{connect, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg},
     ring::{Location, PeerKeyLocation, Ring},

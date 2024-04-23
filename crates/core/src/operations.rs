@@ -9,7 +9,7 @@ use tokio::sync::mpsc::error::SendError;
 use crate::{
     client_events::HostResult,
     contract::{ContractError, ExecutorError},
-    message::{InnerMessage, NetMessage, NetMessageV1, Transaction, TransactionType},
+    message::{InnerMessage, MessageStats, NetMessage, NetMessageV1, Transaction, TransactionType},
     node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
 };

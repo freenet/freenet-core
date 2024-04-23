@@ -222,7 +222,7 @@ mod sealed_msg_type {
     });
 }
 
-pub(crate) trait MessageInformer {
+pub(crate) trait MessageStats {
     fn id(&self) -> &Transaction;
 
     fn target(&self) -> Option<PeerKeyLocation>;
@@ -337,7 +337,7 @@ impl Display for NodeEvent {
     }
 }
 
-impl MessageInformer for NetMessage {
+impl MessageStats for NetMessage {
     fn id(&self) -> &Transaction {
         match self {
             NetMessage::V1(msg) => msg.id(),
@@ -369,7 +369,7 @@ impl MessageInformer for NetMessage {
     }
 }
 
-impl MessageInformer for NetMessageV1 {
+impl MessageStats for NetMessageV1 {
     fn id(&self) -> &Transaction {
         match self {
             NetMessageV1::Connect(op) => op.id(),

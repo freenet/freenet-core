@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use self::p2p_impl::NodeP2P;
-use crate::message::NetMessageV1;
+use crate::message::{MessageStats, NetMessageV1};
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
     config::GlobalExecutor,

@@ -7,7 +7,7 @@ use tracing::Instrument;
 use crate::{
     config::GlobalExecutor,
     contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent, SenderHalve},
-    message::{NetMessage, Transaction, TransactionType},
+    message::{MessageStats, NetMessage, Transaction, TransactionType},
     operations::{
         connect::ConnectOp, get::GetOp, put::PutOp, subscribe::SubscribeOp, update::UpdateOp,
         OpEnum, OpError,

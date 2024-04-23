@@ -29,7 +29,7 @@ use crate::{
         ClientResponsesSender, ContractHandlerChannel, ExecutorToEventLoopChannel,
         NetworkEventListenerHalve, WaitingResolution,
     },
-    message::{NetMessage, NodeEvent, Transaction},
+    message::{MessageStats, NetMessage, NodeEvent, Transaction},
     node::{
         handle_aborted_op, process_message, NetEventRegister, NodeConfig, OpManager,
         PeerId as FreenetPeerId,

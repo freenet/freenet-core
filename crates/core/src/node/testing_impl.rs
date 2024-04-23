@@ -24,7 +24,7 @@ use crate::{
         self, ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
         WaitingResolution,
     },
-    message::{NetMessage, NetMessageV1, NodeEvent, Transaction},
+    message::{MessageStats, NetMessage, NetMessageV1, NodeEvent, Transaction},
     node::{InitPeerNode, NetEventRegister, NodeConfig},
     operations::connect,
     ring::{Distance, Location, PeerKeyLocation},
