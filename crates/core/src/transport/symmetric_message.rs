@@ -2,6 +2,7 @@ use std::{borrow::Cow, net::SocketAddr, sync::OnceLock};
 
 use crate::transport::packet_data::SymmetricAES;
 use aes_gcm::Aes128Gcm;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
@@ -36,6 +37,38 @@ impl SymmetricMessage {
             )),
         },
     };
+
+    pub(crate) fn max_num_of_confirm_receipts_of_noop_message() -> usize {
+        static MAX_NUM_CONFIRM_RECEIPTS: Lazy<usize> = Lazy::new(|| {
+            // try to find the maximum number of confirm_receipts that can be serialized within the MAX_DATA_SIZE
+            let mut msg = SymmetricMessage {
+                packet_id: u32::MAX,
+                confirm_receipt: vec![u32::MAX, u32::MAX],
+                payload: SymmetricMessagePayload::NoOp,
+            };
+            let two = bincode::serialized_size(&msg).unwrap();
+            msg.confirm_receipt.pop();
+            let one = bincode::serialized_size(&msg).unwrap();
+
+            let elem_overhead = two - one;
+            let max_elems = (MAX_DATA_SIZE as u64 - one) / elem_overhead;
+
+            let confirm_receipt = vec![u32::MAX; max_elems as usize];
+
+            let msg = SymmetricMessage {
+                packet_id: u32::MAX,
+                confirm_receipt,
+                payload: SymmetricMessagePayload::NoOp,
+            };
+
+            let size = bincode::serialized_size(&msg).unwrap();
+            assert!(size <= MAX_DATA_SIZE as u64);
+
+            max_elems as usize
+        });
+
+        *MAX_NUM_CONFIRM_RECEIPTS
+    }
 
     pub fn ack_error(
         outbound_sym_key: &Aes128Gcm,
