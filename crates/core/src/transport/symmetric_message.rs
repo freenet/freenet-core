@@ -369,18 +369,21 @@ mod test {
             payload: SymmetricMessagePayload::NoOp,
         };
         let size = bincode::serialized_size(&msg).unwrap();
-        assert!(size <= MAX_DATA_SIZE as u64);
+        assert_eq!(size, MAX_DATA_SIZE as u64);
     }
 
     #[test]
-    fn short_message_overhead() {
+    fn max_short_message() {
         let overhead = SymmetricMessage::short_message_overhead();
-        println!("overhead: {}", overhead);
-    }
 
-    #[test]
-    fn noop_message_overhead() {
-        let overhead = SymmetricMessage::noop_message_overhead();
-        println!("overhead: {}", overhead);
+        let msg = SymmetricMessage {
+            packet_id: u32::MAX,
+            confirm_receipt: vec![],
+            payload: SymmetricMessagePayload::ShortMessage {
+                payload: vec![0; MAX_DATA_SIZE - overhead],
+            },
+        };
+        let size = bincode::serialized_size(&msg).unwrap();
+        assert_eq!(size, MAX_DATA_SIZE as u64);
     }
 }
