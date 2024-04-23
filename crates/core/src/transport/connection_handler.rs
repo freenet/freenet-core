@@ -1333,19 +1333,22 @@ mod test {
         .await
     }
 
+    /// This one is the maximum size (1324 currently) of a short message from user side
+    /// by using public send API can be directly sent
     #[tokio::test]
     async fn simulate_send_max_short_message() -> Result<(), DynError> {
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::ERROR));
         let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection(Default::default()).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
-            let data = vec![0u8; 1432];
+            let data = vec![0u8; 1324];
             let data = tokio::task::spawn_blocking(move || bincode::serialize(&data).unwrap())
                 .await
                 .unwrap();
-            conn.outbound_short_message(data).await?;
+            conn.send(data).await?;
             Ok::<_, DynError>(())
         });
 
@@ -1366,6 +1369,7 @@ mod test {
     #[test]
     #[should_panic]
     fn simulate_send_max_short_message_plus_1() {
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::ERROR));
         tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(async move {

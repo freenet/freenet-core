@@ -115,7 +115,7 @@ impl PeerConnection {
         let data = tokio::task::spawn_blocking(move || bincode::serialize(&data).unwrap())
             .await
             .unwrap();
-        if data.len() > MAX_DATA_SIZE {
+        if data.len() + SymmetricMessage::short_message_overhead() > MAX_DATA_SIZE {
             self.outbound_stream(data).await;
         } else {
             self.outbound_short_message(data).await?;
