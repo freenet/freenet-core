@@ -843,7 +843,7 @@ mod test {
     use tracing::info;
 
     use super::*;
-    use crate::DynError;
+    use crate::{transport::packet_data::MAX_DATA_SIZE, DynError};
 
     #[allow(clippy::type_complexity)]
     static CHANNELS: OnceLock<
@@ -1331,6 +1331,77 @@ mod test {
             Vec::from_iter((0..10).map(|i| TestData("foo", i))),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn simulate_send_max_short_message() -> Result<(), DynError> {
+        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection(Default::default()).await?;
+
+        let peer_b = tokio::spawn(async move {
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
+            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+            let data = vec![0u8; 1432];
+            let data = tokio::task::spawn_blocking(move || bincode::serialize(&data).unwrap())
+                .await
+                .unwrap();
+            conn.outbound_short_message(data).await?;
+            Ok::<_, DynError>(())
+        });
+
+        let peer_a = tokio::spawn(async move {
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
+            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            let msg = conn.recv().await?;
+            assert!(msg.len() <= MAX_DATA_SIZE);
+            Ok::<_, DynError>(())
+        });
+
+        let (a, b) = tokio::try_join!(peer_a, peer_b)?;
+        a?;
+        b?;
+        Ok(())
+    }
+
+    #[test]
+    #[should_panic]
+    fn simulate_send_max_short_message_plus_1() {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                let (peer_a_pub, mut peer_a, peer_a_addr) =
+                    set_peer_connection(Default::default()).await?;
+                let (peer_b_pub, mut peer_b, peer_b_addr) =
+                    set_peer_connection(Default::default()).await?;
+
+                let peer_b = tokio::spawn(async move {
+                    let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
+                    let mut conn =
+                        tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+                    let data = vec![0u8; 1433];
+                    let data =
+                        tokio::task::spawn_blocking(move || bincode::serialize(&data).unwrap())
+                            .await
+                            .unwrap();
+                    conn.outbound_short_message(data).await?;
+                    Ok::<_, DynError>(())
+                });
+
+                let peer_a = tokio::spawn(async move {
+                    let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
+                    let mut conn =
+                        tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+                    let msg = conn.recv().await?;
+                    assert!(msg.len() <= MAX_DATA_SIZE);
+                    Ok::<_, DynError>(())
+                });
+
+                let (a, b) = tokio::try_join!(peer_a, peer_b)?;
+                a?;
+                b?;
+                Result::<(), DynError>::Ok(())
+            })
+            .unwrap();
     }
 
     #[tokio::test]
