@@ -322,7 +322,7 @@ impl PeerConnection {
     }
 
     #[inline]
-    async fn outbound_short_message(&mut self, data: SerializedMessage) -> Result<()> {
+    pub(crate) async fn outbound_short_message(&mut self, data: SerializedMessage) -> Result<()> {
         let receipts = self.received_tracker.get_receipts();
         let packet_id = self
             .remote_conn
