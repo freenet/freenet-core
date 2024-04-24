@@ -195,7 +195,6 @@ pub mod network_node {
     pub async fn run_network_node(
         config: PeerCliConfig,
         socket: SocketAddr,
-        peer_id: String,
     ) -> Result<(), DynError> {
         let (gw, gw_router) = HttpGateway::as_router(&socket);
         let (ws_proxy, ws_router) = WebSocketProxy::as_router(gw_router);
@@ -214,9 +213,9 @@ pub mod network_node {
         match node.run().await {
             Ok(_) => {
                 if is_gateway {
-                    tracing::info!("Gateway {} finished", peer_id);
+                    tracing::info!("Gateway finished");
                 } else {
-                    tracing::info!("Node {} finished", peer_id);
+                    tracing::info!("Node finished");
                 }
 
                 Ok(())
