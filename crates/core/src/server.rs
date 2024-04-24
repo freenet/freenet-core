@@ -220,7 +220,10 @@ pub mod network_node {
 
                 Ok(())
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                tracing::error!("{e}");
+                Err(e)
+            }
         }
     }
 }
