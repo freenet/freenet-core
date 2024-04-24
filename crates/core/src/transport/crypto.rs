@@ -3,9 +3,9 @@ use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct TransportKeypair {
-    pub public: TransportPublicKey,
-    pub secret: TransportSecretKey,
+pub struct TransportKeypair {
+    pub(crate) public: TransportPublicKey,
+    pub(crate) secret: TransportSecretKey,
 }
 
 impl TransportKeypair {

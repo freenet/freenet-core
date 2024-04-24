@@ -55,7 +55,7 @@ pub(crate) enum TransportError {
 }
 
 /// Make connection handler more testable
-trait Socket: Sized + Send + Sync + 'static {
+pub(crate) trait Socket: Sized + Send + Sync + 'static {
     fn bind(addr: SocketAddr) -> impl Future<Output = io::Result<Self>> + Send;
     fn recv_from(
         &self,

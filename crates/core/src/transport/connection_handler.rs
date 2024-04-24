@@ -57,7 +57,7 @@ struct GatewayMessage {
     resp_tx: oneshot::Sender<bool>,
 }
 
-pub async fn create_connection_handler<S: Socket>(
+pub(crate) async fn create_connection_handler<S: Socket>(
     keypair: TransportKeypair,
     listen_host: IpAddr,
     listen_port: u16,

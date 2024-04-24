@@ -38,16 +38,6 @@ use crate::{
     tracing::NetEventLog,
 };
 
-type EncodedNetMessage = Vec<u8>;
-
-/// The default maximum size for a varint length-delimited packet.
-pub const DEFAULT_MAX_PACKET_SIZE: usize = 16 * 1024;
-
-const CURRENT_AGENT_VER: &str = "/freenet/agent/0.1.0";
-const CURRENT_PROTOC_VER: &str = "/freenet/0.1.0";
-const CURRENT_PROTOC_VER_STR: &str = "/freenet/0.1.0";
-const CURRENT_IDENTIFY_PROTOC_VER: &str = "/id/1.0.0";
-
 type P2pBridgeEvent = Either<(FreenetPeerId, Box<NetMessage>), NodeEvent>;
 
 #[derive(Clone)]
@@ -129,7 +119,6 @@ impl NetworkBridge for P2pBridge {
 type PeerConnChannel = Sender<NetMessage>;
 
 pub(in crate::node) struct P2pConnManager {
-    // conn_handler: Arc<Mutex<OutbountConnectionHandler>>,
     pub(in crate::node) gateways: Vec<PeerKeyLocation>,
     pub(in crate::node) bridge: P2pBridge,
     conn_bridge_rx: Receiver<P2pBridgeEvent>,
@@ -593,14 +582,6 @@ enum ConnMngrActions {
     NodeAction(NodeEvent),
     ClosedChannel,
     NoAction,
-}
-
-type UniqConnId = usize;
-
-#[derive(Debug)]
-pub(in crate::node) enum HandlerEvent {
-    Inbound(Either<NetMessage, NodeEvent>),
-    Outbound(Either<NetMessage, NodeEvent>),
 }
 
 #[allow(dead_code)]
