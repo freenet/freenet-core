@@ -115,7 +115,7 @@ impl PeerConnection {
         let data = tokio::task::spawn_blocking(move || bincode::serialize(&data).unwrap())
             .await
             .unwrap();
-        if data.len() > MAX_DATA_SIZE {
+        if data.len() + SymmetricMessage::short_message_overhead() > MAX_DATA_SIZE {
             self.outbound_stream(data).await;
         } else {
             self.outbound_short_message(data).await?;
@@ -326,7 +326,7 @@ impl PeerConnection {
     }
 
     #[inline]
-    async fn outbound_short_message(&mut self, data: SerializedMessage) -> Result<()> {
+    pub(crate) async fn outbound_short_message(&mut self, data: SerializedMessage) -> Result<()> {
         let receipts = self.received_tracker.get_receipts();
         let packet_id = self
             .remote_conn
@@ -369,24 +369,89 @@ async fn packet_sending(
     payload: impl Into<SymmetricMessagePayload>,
     sent_tracker: &parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>,
 ) -> Result<()> {
-    // FIXME: here ensure that `confirm_receipt` won't make the packet exceed the max data size
-    // if it does, split it to send multiple noop packets with the receipts
-
-    // tracing::trace!(packet_id, "sending packet");
-    let packet = SymmetricMessage::serialize_msg_to_packet_data(
+    match SymmetricMessage::try_serialize_msg_to_packet_data(
         packet_id,
         payload,
         outbound_sym_key,
         confirm_receipt,
-    )?;
-    outbound_packets
-        .send((remote_addr, packet.clone().prepared_send()))
-        .await
-        .map_err(|_| TransportError::ConnectionClosed)?;
-    sent_tracker
-        .lock()
-        .report_sent_packet(packet_id, packet.prepared_send());
-    Ok(())
+    )? {
+        either::Either::Left(packet) => {
+            outbound_packets
+                .send((remote_addr, packet.clone().prepared_send()))
+                .await
+                .map_err(|_| TransportError::ConnectionClosed)?;
+            sent_tracker
+                .lock()
+                .report_sent_packet(packet_id, packet.prepared_send());
+            Ok(())
+        }
+        either::Either::Right((payload, mut confirm_receipt)) => {
+            macro_rules! send {
+                ($packets:ident) => {{
+                    for packet in $packets {
+                        outbound_packets
+                            .send((remote_addr, packet.clone().prepared_send()))
+                            .await
+                            .map_err(|_| TransportError::ConnectionClosed)?;
+                        sent_tracker
+                            .lock()
+                            .report_sent_packet(packet_id, packet.prepared_send());
+                    }
+                }};
+            }
+
+            let max_num = SymmetricMessage::max_num_of_confirm_receipts_of_noop_message();
+            let packet = SymmetricMessage::serialize_msg_to_packet_data(
+                packet_id,
+                payload,
+                outbound_sym_key,
+                vec![],
+            )?;
+
+            if max_num > confirm_receipt.len() {
+                let packets = [
+                    packet,
+                    SymmetricMessage::serialize_msg_to_packet_data(
+                        packet_id,
+                        SymmetricMessagePayload::NoOp,
+                        outbound_sym_key,
+                        confirm_receipt,
+                    )?,
+                ];
+
+                send!(packets);
+                return Ok(());
+            }
+
+            let mut packets = Vec::with_capacity(8);
+            packets.push(packet);
+
+            while !confirm_receipt.is_empty() {
+                let len = confirm_receipt.len();
+
+                if len <= max_num {
+                    packets.push(SymmetricMessage::serialize_msg_to_packet_data(
+                        packet_id,
+                        SymmetricMessagePayload::NoOp,
+                        outbound_sym_key,
+                        confirm_receipt,
+                    )?);
+                    break;
+                }
+
+                let receipts = confirm_receipt.split_off(max_num);
+                packets.push(SymmetricMessage::serialize_msg_to_packet_data(
+                    packet_id,
+                    SymmetricMessagePayload::NoOp,
+                    outbound_sym_key,
+                    receipts,
+                )?);
+            }
+
+            send!(packets);
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]

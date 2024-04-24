@@ -2,6 +2,7 @@ use std::{borrow::Cow, net::SocketAddr, sync::OnceLock};
 
 use crate::transport::packet_data::SymmetricAES;
 use aes_gcm::Aes128Gcm;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
@@ -36,6 +37,42 @@ impl SymmetricMessage {
             )),
         },
     };
+
+    pub(crate) fn short_message_overhead() -> usize {
+        static OVERHEAD: Lazy<usize> = Lazy::new(|| {
+            let blank = SymmetricMessage {
+                packet_id: u32::MAX,
+                confirm_receipt: vec![],
+                payload: SymmetricMessagePayload::ShortMessage { payload: vec![] },
+            };
+            bincode::serialized_size(&blank).unwrap() as usize
+        });
+
+        *OVERHEAD
+    }
+
+    pub(crate) fn noop_message_overhead() -> usize {
+        static OVERHEAD: Lazy<usize> = Lazy::new(|| {
+            let blank = SymmetricMessage {
+                packet_id: u32::MAX,
+                confirm_receipt: vec![],
+                payload: SymmetricMessagePayload::NoOp,
+            };
+            bincode::serialized_size(&blank).unwrap() as usize
+        });
+
+        *OVERHEAD
+    }
+
+    pub(crate) fn max_num_of_confirm_receipts_of_noop_message() -> usize {
+        static MAX_NUM_CONFIRM_RECEIPTS: Lazy<usize> = Lazy::new(|| {
+            let overhead = SymmetricMessage::noop_message_overhead() as u64;
+            let max_elems = (MAX_DATA_SIZE as u64 - overhead) / core::mem::size_of::<u32>() as u64;
+            max_elems as usize
+        });
+
+        *MAX_NUM_CONFIRM_RECEIPTS
+    }
 
     pub fn ack_error(
         outbound_sym_key: &Aes128Gcm,
@@ -76,6 +113,34 @@ impl SymmetricMessage {
         Ok(packet.encrypt_symmetric(outbound_sym_key))
     }
 
+    #[allow(clippy::type_complexity)]
+    pub fn try_serialize_msg_to_packet_data(
+        packet_id: PacketId,
+        payload: impl Into<SymmetricMessagePayload>,
+        outbound_sym_key: &Aes128Gcm,
+        confirm_receipt: Vec<u32>,
+    ) -> Result<
+        either::Either<PacketData<SymmetricAES>, (SymmetricMessagePayload, Vec<u32>)>,
+        bincode::Error,
+    > {
+        let msg = Self {
+            packet_id,
+            confirm_receipt,
+            payload: payload.into(),
+        };
+
+        let size = bincode::serialized_size(&msg)?;
+        if size <= MAX_DATA_SIZE as u64 {
+            let mut packet = [0u8; MAX_DATA_SIZE];
+            bincode::serialize_into(packet.as_mut_slice(), &msg)?;
+            let bytes = &packet[..size as usize];
+            let packet = PacketData::from_buf_plain(bytes);
+            Ok(either::Left(packet.encrypt_symmetric(outbound_sym_key)))
+        } else {
+            Ok(either::Right((msg.payload, msg.confirm_receipt)))
+        }
+    }
+
     pub fn serialize_msg_to_packet_data(
         packet_id: PacketId,
         payload: impl Into<SymmetricMessagePayload>,
@@ -87,10 +152,18 @@ impl SymmetricMessage {
             confirm_receipt,
             payload: payload.into(),
         };
+
+        message.to_packet_data(outbound_sym_key)
+    }
+
+    pub(crate) fn to_packet_data(
+        &self,
+        outbound_sym_key: &Aes128Gcm,
+    ) -> Result<PacketData<SymmetricAES>, bincode::Error> {
         let mut packet = [0u8; MAX_DATA_SIZE];
-        let size = bincode::serialized_size(&message)?;
+        let size = bincode::serialized_size(self)?;
         debug_assert!(size <= MAX_DATA_SIZE as u64);
-        bincode::serialize_into(packet.as_mut_slice(), &message)?;
+        bincode::serialize_into(packet.as_mut_slice(), self)?;
         let bytes = &packet[..size as usize];
         let packet = PacketData::from_buf_plain(bytes);
         Ok(packet.encrypt_symmetric(outbound_sym_key))
@@ -284,5 +357,33 @@ mod test {
             SymmetricMessagePayload::AckConnection { result: Ok(_) }
         ));
         Ok(())
+    }
+
+    #[test]
+    fn max_confirm_receipts_of_noop_message() {
+        let num = SymmetricMessage::max_num_of_confirm_receipts_of_noop_message();
+
+        let msg = SymmetricMessage {
+            packet_id: u32::MAX,
+            confirm_receipt: vec![u32::MAX; num],
+            payload: SymmetricMessagePayload::NoOp,
+        };
+        let size = bincode::serialized_size(&msg).unwrap();
+        assert_eq!(size, MAX_DATA_SIZE as u64);
+    }
+
+    #[test]
+    fn max_short_message() {
+        let overhead = SymmetricMessage::short_message_overhead();
+
+        let msg = SymmetricMessage {
+            packet_id: u32::MAX,
+            confirm_receipt: vec![],
+            payload: SymmetricMessagePayload::ShortMessage {
+                payload: vec![0; MAX_DATA_SIZE - overhead],
+            },
+        };
+        let size = bincode::serialized_size(&msg).unwrap();
+        assert_eq!(size, MAX_DATA_SIZE as u64);
     }
 }
