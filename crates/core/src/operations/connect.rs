@@ -188,7 +188,7 @@ impl Operation for ConnectOp {
                                 msg: ConnectResponse::AcceptedBy {
                                     accepted: false,
                                     acceptor: query_target.clone(),
-                                    joiner: joiner.peer,
+                                    joiner: joiner.peer.clone(),
                                 },
                             });
                             new_state = None;
@@ -322,7 +322,7 @@ impl Operation for ConnectOp {
                     let response = ConnectResponse::AcceptedBy {
                         accepted: should_accept,
                         acceptor: this_peer.clone(),
-                        joiner: joiner.peer,
+                        joiner: joiner.peer.clone(),
                     };
 
                     return_msg = Some(ConnectMsg::Response {
