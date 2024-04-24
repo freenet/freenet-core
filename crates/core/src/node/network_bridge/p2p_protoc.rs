@@ -14,7 +14,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::Instrument;
 
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
-use crate::message::{ConnectionResult, NetMessageV1};
+use crate::message::NetMessageV1;
 
 use crate::node::PeerId;
 use crate::operations::connect::{ConnectMsg, ConnectRequest, ConnectResponse};
@@ -319,7 +319,6 @@ impl P2pConnManager {
                                         accepted,
                                         acceptor,
                                         joiner,
-                                        is_gateway,
                                     },
                                 ..
                             })) = &msg
@@ -496,7 +495,6 @@ impl P2pConnManager {
                     accepted: true,
                     acceptor,
                     joiner,
-                    is_gateway,
                 },
             ..
         })) = &*net_msg
