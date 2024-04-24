@@ -28,8 +28,7 @@ async fn run_network(config: PeerCliConfig) -> Result<(), DynError> {
     let ip = config.address;
     freenet::config::Config::set_op_mode(OperationMode::Network);
 
-    // TODO: Get the peer id from somewhere
-    run_network_node(config, (ip, port).into(), panic!("")).await
+    run_network_node(config, (ip, port).into()).await
 }
 
 fn main() -> Result<(), DynError> {
