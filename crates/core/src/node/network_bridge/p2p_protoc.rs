@@ -73,21 +73,6 @@ impl P2pBridge {
 }
 
 impl NetworkBridge for P2pBridge {
-    async fn try_add_connection(&mut self, peer: FreenetPeerId) -> super::ConnResult<()> {
-        if self.active_net_connections.contains_key(&peer) {
-            self.accepted_peers.insert(peer.clone());
-        }
-        let (result_sender, mut result_receiver) = mpsc::channel(1);
-        self.ev_listener_tx
-            .send(Right(NodeEvent::AcceptConnection(peer, result_sender)))
-            .await
-            .map_err(|_| ConnectionError::SendNotCompleted)?;
-        match result_receiver.recv().await {
-            Some(ConnectionResult::Accepted) => Ok(()),
-            _ => Err(ConnectionError::SendNotCompleted),
-        }
-    }
-
     async fn drop_connection(&mut self, peer: &FreenetPeerId) -> super::ConnResult<()> {
         self.accepted_peers.remove(peer);
         self.ev_listener_tx
@@ -334,6 +319,7 @@ impl P2pConnManager {
                                         accepted,
                                         acceptor,
                                         joiner,
+                                        is_gateway,
                                     },
                                 ..
                             })) = &msg
@@ -491,9 +477,6 @@ impl P2pConnManager {
                     )
                     .await;
                 }
-                Ok(Right(NodeAction(NodeEvent::AcceptConnection(_, _)))) => {
-                    todo!("is this even relevant, fixme")
-                }
             }
         }
         Ok(())
@@ -513,6 +496,7 @@ impl P2pConnManager {
                     accepted: true,
                     acceptor,
                     joiner,
+                    is_gateway,
                 },
             ..
         })) = &*net_msg

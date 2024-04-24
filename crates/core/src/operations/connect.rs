@@ -189,6 +189,7 @@ impl Operation for ConnectOp {
                                     accepted: false,
                                     acceptor: query_target.clone(),
                                     joiner: joiner.peer.clone(),
+                                    is_gateway: op_manager.ring.is_gateway(),
                                 },
                             });
                             new_state = None;
@@ -323,6 +324,7 @@ impl Operation for ConnectOp {
                         accepted: should_accept,
                         acceptor: this_peer.clone(),
                         joiner: joiner.peer.clone(),
+                        is_gateway: op_manager.ring.is_gateway(),
                     };
 
                     return_msg = Some(ConnectMsg::Response {
@@ -341,6 +343,7 @@ impl Operation for ConnectOp {
                             accepted,
                             acceptor,
                             joiner,
+                            is_gateway,
                         },
                 } => {
                     tracing::debug!(
@@ -457,6 +460,7 @@ impl Operation for ConnectOp {
                                 accepted: *accepted,
                                 acceptor: acceptor.clone(),
                                 joiner: joiner.clone(),
+                                is_gateway: *is_gateway,
                             };
                             return_msg = Some(ConnectMsg::Response {
                                 id: *id,
@@ -705,7 +709,6 @@ where
         "Connecting to gateway",
     );
 
-    conn_bridge.try_add_connection(gateway.peer.clone()).await?;
     let join_req = NetMessage::from(messages::ConnectMsg::Request {
         id: tx,
         msg: ConnectRequest::StartJoinReq {
@@ -981,6 +984,7 @@ mod messages {
             accepted: bool,
             acceptor: PeerKeyLocation,
             joiner: PeerId,
+            is_gateway: bool,
         },
     }
 }

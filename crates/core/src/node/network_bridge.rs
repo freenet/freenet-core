@@ -23,9 +23,6 @@ pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 /// Allows handling of connections to the network as well as sending messages
 /// to other peers in the network with whom connection has been established.
 pub(crate) trait NetworkBridge: Send + Sync {
-    /// Function used when first trying to establish a connection to a gateway.
-    async fn try_add_connection(&mut self, peer: PeerId) -> ConnResult<()>;
-
     fn drop_connection(&mut self, peer: &PeerId) -> impl Future<Output = ConnResult<()>> + Send;
 
     fn send(&self, target: &PeerId, msg: NetMessage)

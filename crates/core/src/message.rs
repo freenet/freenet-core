@@ -303,11 +303,6 @@ pub(crate) enum NodeEvent {
     ShutdownNode,
     /// Drop the given peer connection.
     DropConnection(PeerId),
-    // FIXME: review the usage of this variant and the try_add_connection function
-    // in the connbridge trait since all this is likely wrong
-    /// Accept the connections from the given peer.
-    #[serde(skip)]
-    AcceptConnection(PeerId, Sender<ConnectionResult>),
     /// Error while sending a message by the connection bridge from within the ops.
     #[serde(skip)]
     Error(ConnectionError),
@@ -322,9 +317,6 @@ impl Display for NodeEvent {
             NodeEvent::ShutdownNode => f.write_str("ShutdownNode"),
             NodeEvent::DropConnection(peer) => {
                 write!(f, "DropConnection (from {peer})")
-            }
-            NodeEvent::AcceptConnection(peer, _) => {
-                write!(f, "AcceptConnection (from {peer})")
             }
             NodeEvent::Error(err) => write!(f, "{err}"),
             NodeEvent::Disconnect { cause: Some(cause) } => {
