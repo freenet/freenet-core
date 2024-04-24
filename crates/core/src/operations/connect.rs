@@ -1,4 +1,5 @@
 //! Operation which seeks new connections in the ring.
+use blake3::Hash;
 use freenet_stdlib::client_api::HostResponse;
 use futures::Future;
 use std::collections::HashSet;
@@ -8,6 +9,7 @@ use std::time::Duration;
 use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
+use crate::generated::topology::Ok;
 use crate::message::NetMessageV1;
 use crate::ring::Ring;
 use crate::transport::TransportPublicKey;
@@ -355,6 +357,7 @@ impl Operation for ConnectOp {
                     match self.state {
                         Some(ConnectState::ConnectingToNode(ConnectionInfo {
                             gateway,
+                            gateway_accecpted,
                             this_peer,
                             peer_pub_key,
                             max_hops_to_live,
@@ -369,16 +372,30 @@ impl Operation for ConnectOp {
                                     tx = %id,
                                     at = %this_peer_id,
                                     from = %sender.peer,
-                                    connectect_to = %target.peer,
+                                    connectect_to = %acceptor.peer,
                                     "Open connection acknowledged at requesting joiner peer",
                                 );
-                                let accepted_by = accecpted_by.insert(target.clone());
+                                let accepted_by = accecpted_by.insert(acceptor.clone());
                             } else {
+                                let actual_state = self.state;
+                                if let Some(updated_state) = try_to_clean_gw_connection(
+                                    id.clone(),
+                                    network_bridge,
+                                    actual_state,
+                                    target.clone(),
+                                    acceptor.peer.clone(),
+                                )
+                                .await?
+                                {
+                                    new_state = Some(updated_state);
+                                } else {
+                                    new_state = actual_state;
+                                }
                                 tracing::debug!(
                                     tx = %id,
                                     at = %this_peer_id,
                                     from = %sender.peer,
-                                    rejected_peer = %target.peer,
+                                    rejected_peer = %acceptor.peer,
                                     "Connection rejected",
                                 );
                             }
@@ -405,6 +422,7 @@ impl Operation for ConnectOp {
                             } else {
                                 new_state = Some(ConnectState::ConnectingToNode(ConnectionInfo {
                                     gateway,
+                                    gateway_accecpted,
                                     this_peer,
                                     peer_pub_key,
                                     max_hops_to_live,
@@ -514,6 +532,52 @@ fn build_op_result(
     })
 }
 
+async fn try_to_clean_gw_connection<NB>(
+    id: Transaction,
+    conn_bridge: &mut NB,
+    state: Option<ConnectState>,
+    joiner: PeerKeyLocation,
+    accepter: PeerId,
+) -> Result<Option<ConnectState>, OpError>
+where
+    NB: NetworkBridge,
+{
+    match state {
+        Some(ConnectState::ConnectingToNode(ConnectionInfo {
+            gateway,
+            this_peer,
+            peer_pub_key,
+            max_hops_to_live,
+            accecpted_by,
+            ..
+        })) => {
+            let accepter_is_gateway = accepter == gateway.peer;
+            let other_peers_accepted = accecpted_by.iter().any(|pkloc| pkloc.peer != gateway.peer);
+
+            if accepter_is_gateway && other_peers_accepted {
+                let msg = ConnectMsg::Request {
+                    id,
+                    msg: ConnectRequest::CleanConnection { joiner },
+                };
+                conn_bridge.send(&gateway.peer, msg.into()).await?;
+            }
+
+            let new_state = Some(ConnectState::ConnectingToNode(ConnectionInfo {
+                gateway,
+                gateway_accecpted: false,
+                this_peer,
+                peer_pub_key,
+                max_hops_to_live,
+                accecpted_by,
+                remaining_connetions: 0,
+            }));
+
+            Ok(new_state)
+        }
+        _ => Err(OpError::UnexpectedOpState),
+    }
+}
+
 type Requester = PeerKeyLocation;
 type Target = PeerKeyLocation;
 
@@ -545,6 +609,7 @@ impl ConnectivityInfo {
 #[derive(Debug, Clone)]
 struct ConnectionInfo {
     gateway: PeerKeyLocation,
+    gateway_accecpted: bool,
     this_peer: Option<PeerId>,
     peer_pub_key: TransportPublicKey,
     max_hops_to_live: usize,
@@ -654,6 +719,7 @@ fn initial_request(
     const MAX_JOIN_RETRIES: usize = usize::MAX;
     let state = ConnectState::ConnectingToNode(ConnectionInfo {
         gateway: gateway.clone(),
+        gateway_accecpted: true,
         this_peer: None,
         peer_pub_key: peer_pub_key.clone(),
         max_hops_to_live,
@@ -723,6 +789,7 @@ where
                 id,
                 state: Some(ConnectState::ConnectingToNode(ConnectionInfo {
                     gateway: gateway.clone(),
+                    gateway_accecpted: true,
                     this_peer: None,
                     peer_pub_key,
                     max_hops_to_live,
@@ -971,6 +1038,9 @@ mod messages {
             max_hops_to_live: usize,
             // The list of peers to skip when forwarding the connection request, avoiding loops
             skip_list: Vec<PeerId>,
+        },
+        CleanConnection {
+            joiner: PeerKeyLocation,
         },
     }
 
