@@ -3,6 +3,8 @@ pub(crate) mod errors;
 mod http_gateway;
 pub(crate) mod path_handlers;
 
+use std::net::SocketAddr;
+
 use freenet_stdlib::{
     client_api::{ClientError, ClientRequest, HostResponse},
     prelude::*,
@@ -42,11 +44,19 @@ pub(crate) enum HostCallbackResult {
     },
 }
 
-pub mod local_node {
-    use std::net::{IpAddr, SocketAddr};
+fn serve(socket: SocketAddr, router: axum::Router) {
+    tokio::spawn(async move {
+        tracing::info!("listening on {}", socket);
+        let listener = tokio::net::TcpListener::bind(socket).await.unwrap();
+        axum::serve(listener, router).await.map_err(|e| {
+            tracing::error!("Error while running HTTP gateway server: {e}");
+        })
+    });
+}
 
-    use axum::Router;
+pub mod local_node {
     use freenet_stdlib::client_api::{ClientRequest, ErrorKind};
+    use std::net::{IpAddr, SocketAddr};
     use tower_http::trace::TraceLayer;
 
     use crate::{
@@ -55,17 +65,7 @@ pub mod local_node {
         DynError,
     };
 
-    use super::http_gateway::HttpGateway;
-
-    fn serve(socket: SocketAddr, router: Router) {
-        tokio::spawn(async move {
-            tracing::info!("listening on {}", socket);
-            let listener = tokio::net::TcpListener::bind(socket).await.unwrap();
-            axum::serve(listener, router).await.map_err(|e| {
-                tracing::error!("Error while running HTTP gateway server: {e}");
-            })
-        });
-    }
+    use super::{http_gateway::HttpGateway, serve};
 
     pub async fn run_local_node(
         mut executor: Executor,
@@ -174,6 +174,55 @@ pub mod local_node {
                         }
                     };
                 }
+            }
+        }
+    }
+}
+
+pub mod network_node {
+    use std::net::SocketAddr;
+
+    use libp2p_identity::Keypair;
+    use tower_http::trace::TraceLayer;
+
+    use crate::{
+        client_events::websocket::WebSocketProxy, dev_tool::NodeConfig, local_node::PeerCliConfig,
+        DynError,
+    };
+
+    use super::{http_gateway::HttpGateway, serve};
+
+    pub async fn run_network_node(
+        config: PeerCliConfig,
+        socket: SocketAddr,
+    ) -> Result<(), DynError> {
+        let (gw, gw_router) = HttpGateway::as_router(&socket);
+        let (ws_proxy, ws_router) = WebSocketProxy::as_router(gw_router);
+        serve(socket, ws_router.layer(TraceLayer::new_for_http()));
+
+        let mut node_config = NodeConfig::new();
+        node_config.with_ip(socket.ip()).with_port(socket.port());
+
+        let private_key = Keypair::generate_ed25519();
+
+        let is_gateway = node_config.is_gateway();
+        let node = node_config
+            .build(config, [Box::new(gw), Box::new(ws_proxy)], private_key)
+            .await?;
+
+        match node.run().await {
+            Ok(_) => {
+                if is_gateway {
+                    tracing::info!("Gateway finished");
+                } else {
+                    tracing::info!("Node finished");
+                }
+
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!("{e}");
+                Err(e)
             }
         }
     }
