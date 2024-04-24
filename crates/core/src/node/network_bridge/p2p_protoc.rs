@@ -122,7 +122,6 @@ pub(in crate::node) struct P2pConnManager {
     pub(in crate::node) gateways: Vec<PeerKeyLocation>,
     pub(in crate::node) bridge: P2pBridge,
     conn_bridge_rx: Receiver<P2pBridgeEvent>,
-    listening_addr: Option<SocketAddr>,
     event_listener: Box<dyn NetEventRegister>,
     connection: HashMap<PeerId, PeerConnChannel>,
     rejected_peers: HashSet<PeerId>, // TODO: what's the point of this set?
@@ -147,13 +146,6 @@ impl P2pConnManager {
             .local_ip
             .ok_or(anyhow!("network listener IP not set"))?;
 
-        let private_addr = if let Some(conn) = config.local_ip.zip(config.local_port) {
-            let addr = SocketAddr::from(conn);
-            Some(addr)
-        } else {
-            None
-        };
-
         let (tx_bridge_cmd, rx_bridge_cmd) = mpsc::channel(100);
         let bridge = P2pBridge::new(tx_bridge_cmd, op_manager, event_listener.clone());
 
@@ -162,7 +154,6 @@ impl P2pConnManager {
             gateways,
             bridge,
             conn_bridge_rx: rx_bridge_cmd,
-            listening_addr: private_addr,
             event_listener: Box::new(event_listener),
             connection: HashMap::new(),
             rejected_peers: HashSet::new(),
@@ -500,7 +491,6 @@ impl P2pConnManager {
                     )
                     .await;
                 }
-                Ok(Right(NoAction)) => {}
                 Ok(Right(NodeAction(NodeEvent::AcceptConnection(_, _)))) => {
                     todo!("is this even relevant, fixme")
                 }
@@ -581,7 +571,6 @@ enum ConnMngrActions {
     },
     NodeAction(NodeEvent),
     ClosedChannel,
-    NoAction,
 }
 
 #[allow(dead_code)]
@@ -618,11 +607,6 @@ async fn peer_connection_listener(
             }
         }
     }
-}
-
-#[inline(always)]
-fn encode_msg(msg: NetMessage) -> Result<Vec<u8>, ConnectionError> {
-    bincode::serialize(&msg).map_err(|err| ConnectionError::Serialization(Some(err)))
 }
 
 #[inline(always)]
