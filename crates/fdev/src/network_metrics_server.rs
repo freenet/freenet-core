@@ -150,7 +150,7 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     Ok(ContractChange::PutFailure(err)) => {
                         // FIXME: handle put failure
                         tracing::error!(error = "Failed to put contract");
-                    },
+                    }
                     Ok(change) => {
                         if let Err(err) = state.save_record(ChangesWrapper::ContractChange(change))
                         {
@@ -374,7 +374,9 @@ impl ServerState {
                 let target = change.target().to_string();
 
                 if self.transactions_data.get_mut(&tx_id).is_some() {
-                    unreachable!("found an already included in logs transaction when it should create it.");
+                    unreachable!(
+                        "found an already included in logs transaction when it should create it."
+                    );
                 } else {
                     self.transactions_data.insert(
                         tx_id.clone(),
