@@ -147,7 +147,7 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     }
                 }
                 match ContractChange::try_decode_fbs(&msg) {
-                    Ok(ContractChange::PutFailure(err)) => {
+                    Ok(ContractChange::PutFailure(_err)) => {
                         // FIXME: handle put failure
                         tracing::error!(error = "Failed to put contract");
                     }
