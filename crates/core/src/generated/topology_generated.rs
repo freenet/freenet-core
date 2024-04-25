@@ -215,6 +215,123 @@ pub mod topology {
     impl flatbuffers::SimpleToVerifyInSlice for Response {}
     pub struct ResponseUnionTableOffset {}
 
+    #[deprecated(
+        since = "2.0.0",
+        note = "Use associated constants instead. This will no longer be generated in 2021."
+    )]
+    pub const ENUM_MIN_CONTRACT_CHANGE_TYPE: u8 = 0;
+    #[deprecated(
+        since = "2.0.0",
+        note = "Use associated constants instead. This will no longer be generated in 2021."
+    )]
+    pub const ENUM_MAX_CONTRACT_CHANGE_TYPE: u8 = 6;
+    #[deprecated(
+        since = "2.0.0",
+        note = "Use associated constants instead. This will no longer be generated in 2021."
+    )]
+    #[allow(non_camel_case_types)]
+    pub const ENUM_VALUES_CONTRACT_CHANGE_TYPE: [ContractChangeType; 7] = [
+        ContractChangeType::NONE,
+        ContractChangeType::PutRequest,
+        ContractChangeType::PutSuccess,
+        ContractChangeType::PutFailure,
+        ContractChangeType::UpdateRequest,
+        ContractChangeType::UpdateSuccess,
+        ContractChangeType::UpdateFailure,
+    ];
+
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+    #[repr(transparent)]
+    pub struct ContractChangeType(pub u8);
+    #[allow(non_upper_case_globals)]
+    impl ContractChangeType {
+        pub const NONE: Self = Self(0);
+        pub const PutRequest: Self = Self(1);
+        pub const PutSuccess: Self = Self(2);
+        pub const PutFailure: Self = Self(3);
+        pub const UpdateRequest: Self = Self(4);
+        pub const UpdateSuccess: Self = Self(5);
+        pub const UpdateFailure: Self = Self(6);
+
+        pub const ENUM_MIN: u8 = 0;
+        pub const ENUM_MAX: u8 = 6;
+        pub const ENUM_VALUES: &'static [Self] = &[
+            Self::NONE,
+            Self::PutRequest,
+            Self::PutSuccess,
+            Self::PutFailure,
+            Self::UpdateRequest,
+            Self::UpdateSuccess,
+            Self::UpdateFailure,
+        ];
+        /// Returns the variant's name or "" if unknown.
+        pub fn variant_name(self) -> Option<&'static str> {
+            match self {
+                Self::NONE => Some("NONE"),
+                Self::PutRequest => Some("PutRequest"),
+                Self::PutSuccess => Some("PutSuccess"),
+                Self::PutFailure => Some("PutFailure"),
+                Self::UpdateRequest => Some("UpdateRequest"),
+                Self::UpdateSuccess => Some("UpdateSuccess"),
+                Self::UpdateFailure => Some("UpdateFailure"),
+                _ => None,
+            }
+        }
+    }
+    impl core::fmt::Debug for ContractChangeType {
+        fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+            if let Some(name) = self.variant_name() {
+                f.write_str(name)
+            } else {
+                f.write_fmt(format_args!("<UNKNOWN {:?}>", self.0))
+            }
+        }
+    }
+    impl<'a> flatbuffers::Follow<'a> for ContractChangeType {
+        type Inner = Self;
+        #[inline]
+        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+            let b = flatbuffers::read_scalar_at::<u8>(buf, loc);
+            Self(b)
+        }
+    }
+
+    impl flatbuffers::Push for ContractChangeType {
+        type Output = ContractChangeType;
+        #[inline]
+        unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
+            flatbuffers::emplace_scalar::<u8>(dst, self.0);
+        }
+    }
+
+    impl flatbuffers::EndianScalar for ContractChangeType {
+        type Scalar = u8;
+        #[inline]
+        fn to_little_endian(self) -> u8 {
+            self.0.to_le()
+        }
+        #[inline]
+        #[allow(clippy::wrong_self_convention)]
+        fn from_little_endian(v: u8) -> Self {
+            let b = u8::from_le(v);
+            Self(b)
+        }
+    }
+
+    impl<'a> flatbuffers::Verifiable for ContractChangeType {
+        #[inline]
+        fn run_verifier(
+            v: &mut flatbuffers::Verifier,
+            pos: usize,
+        ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+            use self::flatbuffers::Verifiable;
+            u8::run_verifier(v, pos)
+        }
+    }
+
+    impl flatbuffers::SimpleToVerifyInSlice for ContractChangeType {}
+    pub struct ContractChangeTypeUnionTableOffset {}
+
     pub enum AddedConnectionOffset {}
     #[derive(Copy, Clone, PartialEq)]
 
@@ -1239,6 +1356,1541 @@ pub mod topology {
                 _ => {
                     let x: Option<()> = None;
                     ds.field("response", &x)
+                }
+            };
+            ds.finish()
+        }
+    }
+    pub enum PutRequestOffset {}
+    #[derive(Copy, Clone, PartialEq)]
+
+    pub struct PutRequest<'a> {
+        pub _tab: flatbuffers::Table<'a>,
+    }
+
+    impl<'a> flatbuffers::Follow<'a> for PutRequest<'a> {
+        type Inner = PutRequest<'a>;
+        #[inline]
+        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+            Self {
+                _tab: flatbuffers::Table::new(buf, loc),
+            }
+        }
+    }
+
+    impl<'a> PutRequest<'a> {
+        pub const VT_TRANSACTION: flatbuffers::VOffsetT = 4;
+        pub const VT_KEY: flatbuffers::VOffsetT = 6;
+        pub const VT_REQUESTER: flatbuffers::VOffsetT = 8;
+        pub const VT_TARGET: flatbuffers::VOffsetT = 10;
+
+        #[inline]
+        pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+            PutRequest { _tab: table }
+        }
+        #[allow(unused_mut)]
+        pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+            _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+            args: &'args PutRequestArgs<'args>,
+        ) -> flatbuffers::WIPOffset<PutRequest<'bldr>> {
+            let mut builder = PutRequestBuilder::new(_fbb);
+            if let Some(x) = args.target {
+                builder.add_target(x);
+            }
+            if let Some(x) = args.requester {
+                builder.add_requester(x);
+            }
+            if let Some(x) = args.key {
+                builder.add_key(x);
+            }
+            if let Some(x) = args.transaction {
+                builder.add_transaction(x);
+            }
+            builder.finish()
+        }
+
+        #[inline]
+        pub fn transaction(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(PutRequest::VT_TRANSACTION, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn key(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(PutRequest::VT_KEY, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn requester(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(PutRequest::VT_REQUESTER, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn target(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(PutRequest::VT_TARGET, None)
+                    .unwrap()
+            }
+        }
+    }
+
+    impl flatbuffers::Verifiable for PutRequest<'_> {
+        #[inline]
+        fn run_verifier(
+            v: &mut flatbuffers::Verifier,
+            pos: usize,
+        ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+            use self::flatbuffers::Verifiable;
+            v.visit_table(pos)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "transaction",
+                    Self::VT_TRANSACTION,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("key", Self::VT_KEY, true)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "requester",
+                    Self::VT_REQUESTER,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("target", Self::VT_TARGET, true)?
+                .finish();
+            Ok(())
+        }
+    }
+    pub struct PutRequestArgs<'a> {
+        pub transaction: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub key: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub requester: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub target: Option<flatbuffers::WIPOffset<&'a str>>,
+    }
+    impl<'a> Default for PutRequestArgs<'a> {
+        #[inline]
+        fn default() -> Self {
+            PutRequestArgs {
+                transaction: None, // required field
+                key: None,         // required field
+                requester: None,   // required field
+                target: None,      // required field
+            }
+        }
+    }
+
+    pub struct PutRequestBuilder<'a: 'b, 'b> {
+        fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+        start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+    }
+    impl<'a: 'b, 'b> PutRequestBuilder<'a, 'b> {
+        #[inline]
+        pub fn add_transaction(&mut self, transaction: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                PutRequest::VT_TRANSACTION,
+                transaction,
+            );
+        }
+        #[inline]
+        pub fn add_key(&mut self, key: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(PutRequest::VT_KEY, key);
+        }
+        #[inline]
+        pub fn add_requester(&mut self, requester: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(PutRequest::VT_REQUESTER, requester);
+        }
+        #[inline]
+        pub fn add_target(&mut self, target: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(PutRequest::VT_TARGET, target);
+        }
+        #[inline]
+        pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> PutRequestBuilder<'a, 'b> {
+            let start = _fbb.start_table();
+            PutRequestBuilder {
+                fbb_: _fbb,
+                start_: start,
+            }
+        }
+        #[inline]
+        pub fn finish(self) -> flatbuffers::WIPOffset<PutRequest<'a>> {
+            let o = self.fbb_.end_table(self.start_);
+            self.fbb_
+                .required(o, PutRequest::VT_TRANSACTION, "transaction");
+            self.fbb_.required(o, PutRequest::VT_KEY, "key");
+            self.fbb_.required(o, PutRequest::VT_REQUESTER, "requester");
+            self.fbb_.required(o, PutRequest::VT_TARGET, "target");
+            flatbuffers::WIPOffset::new(o.value())
+        }
+    }
+
+    impl core::fmt::Debug for PutRequest<'_> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let mut ds = f.debug_struct("PutRequest");
+            ds.field("transaction", &self.transaction());
+            ds.field("key", &self.key());
+            ds.field("requester", &self.requester());
+            ds.field("target", &self.target());
+            ds.finish()
+        }
+    }
+    pub enum UpdateRequestOffset {}
+    #[derive(Copy, Clone, PartialEq)]
+
+    pub struct UpdateRequest<'a> {
+        pub _tab: flatbuffers::Table<'a>,
+    }
+
+    impl<'a> flatbuffers::Follow<'a> for UpdateRequest<'a> {
+        type Inner = UpdateRequest<'a>;
+        #[inline]
+        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+            Self {
+                _tab: flatbuffers::Table::new(buf, loc),
+            }
+        }
+    }
+
+    impl<'a> UpdateRequest<'a> {
+        pub const VT_TRANSACTION: flatbuffers::VOffsetT = 4;
+        pub const VT_KEY: flatbuffers::VOffsetT = 6;
+        pub const VT_REQUESTER: flatbuffers::VOffsetT = 8;
+        pub const VT_TARGET: flatbuffers::VOffsetT = 10;
+
+        #[inline]
+        pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+            UpdateRequest { _tab: table }
+        }
+        #[allow(unused_mut)]
+        pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+            _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+            args: &'args UpdateRequestArgs<'args>,
+        ) -> flatbuffers::WIPOffset<UpdateRequest<'bldr>> {
+            let mut builder = UpdateRequestBuilder::new(_fbb);
+            if let Some(x) = args.target {
+                builder.add_target(x);
+            }
+            if let Some(x) = args.requester {
+                builder.add_requester(x);
+            }
+            if let Some(x) = args.key {
+                builder.add_key(x);
+            }
+            if let Some(x) = args.transaction {
+                builder.add_transaction(x);
+            }
+            builder.finish()
+        }
+
+        #[inline]
+        pub fn transaction(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(UpdateRequest::VT_TRANSACTION, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn key(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(UpdateRequest::VT_KEY, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn requester(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(UpdateRequest::VT_REQUESTER, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn target(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(UpdateRequest::VT_TARGET, None)
+                    .unwrap()
+            }
+        }
+    }
+
+    impl flatbuffers::Verifiable for UpdateRequest<'_> {
+        #[inline]
+        fn run_verifier(
+            v: &mut flatbuffers::Verifier,
+            pos: usize,
+        ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+            use self::flatbuffers::Verifiable;
+            v.visit_table(pos)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "transaction",
+                    Self::VT_TRANSACTION,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("key", Self::VT_KEY, true)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "requester",
+                    Self::VT_REQUESTER,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("target", Self::VT_TARGET, true)?
+                .finish();
+            Ok(())
+        }
+    }
+    pub struct UpdateRequestArgs<'a> {
+        pub transaction: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub key: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub requester: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub target: Option<flatbuffers::WIPOffset<&'a str>>,
+    }
+    impl<'a> Default for UpdateRequestArgs<'a> {
+        #[inline]
+        fn default() -> Self {
+            UpdateRequestArgs {
+                transaction: None, // required field
+                key: None,         // required field
+                requester: None,   // required field
+                target: None,      // required field
+            }
+        }
+    }
+
+    pub struct UpdateRequestBuilder<'a: 'b, 'b> {
+        fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+        start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+    }
+    impl<'a: 'b, 'b> UpdateRequestBuilder<'a, 'b> {
+        #[inline]
+        pub fn add_transaction(&mut self, transaction: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                UpdateRequest::VT_TRANSACTION,
+                transaction,
+            );
+        }
+        #[inline]
+        pub fn add_key(&mut self, key: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(UpdateRequest::VT_KEY, key);
+        }
+        #[inline]
+        pub fn add_requester(&mut self, requester: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                UpdateRequest::VT_REQUESTER,
+                requester,
+            );
+        }
+        #[inline]
+        pub fn add_target(&mut self, target: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(UpdateRequest::VT_TARGET, target);
+        }
+        #[inline]
+        pub fn new(
+            _fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+        ) -> UpdateRequestBuilder<'a, 'b> {
+            let start = _fbb.start_table();
+            UpdateRequestBuilder {
+                fbb_: _fbb,
+                start_: start,
+            }
+        }
+        #[inline]
+        pub fn finish(self) -> flatbuffers::WIPOffset<UpdateRequest<'a>> {
+            let o = self.fbb_.end_table(self.start_);
+            self.fbb_
+                .required(o, UpdateRequest::VT_TRANSACTION, "transaction");
+            self.fbb_.required(o, UpdateRequest::VT_KEY, "key");
+            self.fbb_
+                .required(o, UpdateRequest::VT_REQUESTER, "requester");
+            self.fbb_.required(o, UpdateRequest::VT_TARGET, "target");
+            flatbuffers::WIPOffset::new(o.value())
+        }
+    }
+
+    impl core::fmt::Debug for UpdateRequest<'_> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let mut ds = f.debug_struct("UpdateRequest");
+            ds.field("transaction", &self.transaction());
+            ds.field("key", &self.key());
+            ds.field("requester", &self.requester());
+            ds.field("target", &self.target());
+            ds.finish()
+        }
+    }
+    pub enum PutSuccessOffset {}
+    #[derive(Copy, Clone, PartialEq)]
+
+    pub struct PutSuccess<'a> {
+        pub _tab: flatbuffers::Table<'a>,
+    }
+
+    impl<'a> flatbuffers::Follow<'a> for PutSuccess<'a> {
+        type Inner = PutSuccess<'a>;
+        #[inline]
+        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+            Self {
+                _tab: flatbuffers::Table::new(buf, loc),
+            }
+        }
+    }
+
+    impl<'a> PutSuccess<'a> {
+        pub const VT_TRANSACTION: flatbuffers::VOffsetT = 4;
+        pub const VT_REQUESTER: flatbuffers::VOffsetT = 6;
+        pub const VT_TARGET: flatbuffers::VOffsetT = 8;
+        pub const VT_KEY: flatbuffers::VOffsetT = 10;
+
+        #[inline]
+        pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+            PutSuccess { _tab: table }
+        }
+        #[allow(unused_mut)]
+        pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+            _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+            args: &'args PutSuccessArgs<'args>,
+        ) -> flatbuffers::WIPOffset<PutSuccess<'bldr>> {
+            let mut builder = PutSuccessBuilder::new(_fbb);
+            if let Some(x) = args.key {
+                builder.add_key(x);
+            }
+            if let Some(x) = args.target {
+                builder.add_target(x);
+            }
+            if let Some(x) = args.requester {
+                builder.add_requester(x);
+            }
+            if let Some(x) = args.transaction {
+                builder.add_transaction(x);
+            }
+            builder.finish()
+        }
+
+        #[inline]
+        pub fn transaction(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(PutSuccess::VT_TRANSACTION, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn requester(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(PutSuccess::VT_REQUESTER, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn target(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(PutSuccess::VT_TARGET, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn key(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(PutSuccess::VT_KEY, None)
+                    .unwrap()
+            }
+        }
+    }
+
+    impl flatbuffers::Verifiable for PutSuccess<'_> {
+        #[inline]
+        fn run_verifier(
+            v: &mut flatbuffers::Verifier,
+            pos: usize,
+        ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+            use self::flatbuffers::Verifiable;
+            v.visit_table(pos)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "transaction",
+                    Self::VT_TRANSACTION,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "requester",
+                    Self::VT_REQUESTER,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("target", Self::VT_TARGET, true)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("key", Self::VT_KEY, true)?
+                .finish();
+            Ok(())
+        }
+    }
+    pub struct PutSuccessArgs<'a> {
+        pub transaction: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub requester: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub target: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub key: Option<flatbuffers::WIPOffset<&'a str>>,
+    }
+    impl<'a> Default for PutSuccessArgs<'a> {
+        #[inline]
+        fn default() -> Self {
+            PutSuccessArgs {
+                transaction: None, // required field
+                requester: None,   // required field
+                target: None,      // required field
+                key: None,         // required field
+            }
+        }
+    }
+
+    pub struct PutSuccessBuilder<'a: 'b, 'b> {
+        fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+        start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+    }
+    impl<'a: 'b, 'b> PutSuccessBuilder<'a, 'b> {
+        #[inline]
+        pub fn add_transaction(&mut self, transaction: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                PutSuccess::VT_TRANSACTION,
+                transaction,
+            );
+        }
+        #[inline]
+        pub fn add_requester(&mut self, requester: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(PutSuccess::VT_REQUESTER, requester);
+        }
+        #[inline]
+        pub fn add_target(&mut self, target: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(PutSuccess::VT_TARGET, target);
+        }
+        #[inline]
+        pub fn add_key(&mut self, key: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(PutSuccess::VT_KEY, key);
+        }
+        #[inline]
+        pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> PutSuccessBuilder<'a, 'b> {
+            let start = _fbb.start_table();
+            PutSuccessBuilder {
+                fbb_: _fbb,
+                start_: start,
+            }
+        }
+        #[inline]
+        pub fn finish(self) -> flatbuffers::WIPOffset<PutSuccess<'a>> {
+            let o = self.fbb_.end_table(self.start_);
+            self.fbb_
+                .required(o, PutSuccess::VT_TRANSACTION, "transaction");
+            self.fbb_.required(o, PutSuccess::VT_REQUESTER, "requester");
+            self.fbb_.required(o, PutSuccess::VT_TARGET, "target");
+            self.fbb_.required(o, PutSuccess::VT_KEY, "key");
+            flatbuffers::WIPOffset::new(o.value())
+        }
+    }
+
+    impl core::fmt::Debug for PutSuccess<'_> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let mut ds = f.debug_struct("PutSuccess");
+            ds.field("transaction", &self.transaction());
+            ds.field("requester", &self.requester());
+            ds.field("target", &self.target());
+            ds.field("key", &self.key());
+            ds.finish()
+        }
+    }
+    pub enum PutFailureOffset {}
+    #[derive(Copy, Clone, PartialEq)]
+
+    pub struct PutFailure<'a> {
+        pub _tab: flatbuffers::Table<'a>,
+    }
+
+    impl<'a> flatbuffers::Follow<'a> for PutFailure<'a> {
+        type Inner = PutFailure<'a>;
+        #[inline]
+        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+            Self {
+                _tab: flatbuffers::Table::new(buf, loc),
+            }
+        }
+    }
+
+    impl<'a> PutFailure<'a> {
+        pub const VT_TRANSACTION: flatbuffers::VOffsetT = 4;
+        pub const VT_REQUESTER: flatbuffers::VOffsetT = 6;
+        pub const VT_TARGET: flatbuffers::VOffsetT = 8;
+        pub const VT_KEY: flatbuffers::VOffsetT = 10;
+
+        #[inline]
+        pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+            PutFailure { _tab: table }
+        }
+        #[allow(unused_mut)]
+        pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+            _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+            args: &'args PutFailureArgs<'args>,
+        ) -> flatbuffers::WIPOffset<PutFailure<'bldr>> {
+            let mut builder = PutFailureBuilder::new(_fbb);
+            if let Some(x) = args.key {
+                builder.add_key(x);
+            }
+            if let Some(x) = args.target {
+                builder.add_target(x);
+            }
+            if let Some(x) = args.requester {
+                builder.add_requester(x);
+            }
+            if let Some(x) = args.transaction {
+                builder.add_transaction(x);
+            }
+            builder.finish()
+        }
+
+        #[inline]
+        pub fn transaction(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(PutFailure::VT_TRANSACTION, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn requester(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(PutFailure::VT_REQUESTER, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn target(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(PutFailure::VT_TARGET, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn key(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(PutFailure::VT_KEY, None)
+                    .unwrap()
+            }
+        }
+    }
+
+    impl flatbuffers::Verifiable for PutFailure<'_> {
+        #[inline]
+        fn run_verifier(
+            v: &mut flatbuffers::Verifier,
+            pos: usize,
+        ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+            use self::flatbuffers::Verifiable;
+            v.visit_table(pos)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "transaction",
+                    Self::VT_TRANSACTION,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "requester",
+                    Self::VT_REQUESTER,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("target", Self::VT_TARGET, true)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("key", Self::VT_KEY, true)?
+                .finish();
+            Ok(())
+        }
+    }
+    pub struct PutFailureArgs<'a> {
+        pub transaction: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub requester: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub target: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub key: Option<flatbuffers::WIPOffset<&'a str>>,
+    }
+    impl<'a> Default for PutFailureArgs<'a> {
+        #[inline]
+        fn default() -> Self {
+            PutFailureArgs {
+                transaction: None, // required field
+                requester: None,   // required field
+                target: None,      // required field
+                key: None,         // required field
+            }
+        }
+    }
+
+    pub struct PutFailureBuilder<'a: 'b, 'b> {
+        fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+        start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+    }
+    impl<'a: 'b, 'b> PutFailureBuilder<'a, 'b> {
+        #[inline]
+        pub fn add_transaction(&mut self, transaction: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                PutFailure::VT_TRANSACTION,
+                transaction,
+            );
+        }
+        #[inline]
+        pub fn add_requester(&mut self, requester: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(PutFailure::VT_REQUESTER, requester);
+        }
+        #[inline]
+        pub fn add_target(&mut self, target: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(PutFailure::VT_TARGET, target);
+        }
+        #[inline]
+        pub fn add_key(&mut self, key: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(PutFailure::VT_KEY, key);
+        }
+        #[inline]
+        pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> PutFailureBuilder<'a, 'b> {
+            let start = _fbb.start_table();
+            PutFailureBuilder {
+                fbb_: _fbb,
+                start_: start,
+            }
+        }
+        #[inline]
+        pub fn finish(self) -> flatbuffers::WIPOffset<PutFailure<'a>> {
+            let o = self.fbb_.end_table(self.start_);
+            self.fbb_
+                .required(o, PutFailure::VT_TRANSACTION, "transaction");
+            self.fbb_.required(o, PutFailure::VT_REQUESTER, "requester");
+            self.fbb_.required(o, PutFailure::VT_TARGET, "target");
+            self.fbb_.required(o, PutFailure::VT_KEY, "key");
+            flatbuffers::WIPOffset::new(o.value())
+        }
+    }
+
+    impl core::fmt::Debug for PutFailure<'_> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let mut ds = f.debug_struct("PutFailure");
+            ds.field("transaction", &self.transaction());
+            ds.field("requester", &self.requester());
+            ds.field("target", &self.target());
+            ds.field("key", &self.key());
+            ds.finish()
+        }
+    }
+    pub enum UpdateSuccessOffset {}
+    #[derive(Copy, Clone, PartialEq)]
+
+    pub struct UpdateSuccess<'a> {
+        pub _tab: flatbuffers::Table<'a>,
+    }
+
+    impl<'a> flatbuffers::Follow<'a> for UpdateSuccess<'a> {
+        type Inner = UpdateSuccess<'a>;
+        #[inline]
+        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+            Self {
+                _tab: flatbuffers::Table::new(buf, loc),
+            }
+        }
+    }
+
+    impl<'a> UpdateSuccess<'a> {
+        pub const VT_TRANSACTION: flatbuffers::VOffsetT = 4;
+        pub const VT_REQUESTER: flatbuffers::VOffsetT = 6;
+        pub const VT_TARGET: flatbuffers::VOffsetT = 8;
+        pub const VT_KEY: flatbuffers::VOffsetT = 10;
+
+        #[inline]
+        pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+            UpdateSuccess { _tab: table }
+        }
+        #[allow(unused_mut)]
+        pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+            _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+            args: &'args UpdateSuccessArgs<'args>,
+        ) -> flatbuffers::WIPOffset<UpdateSuccess<'bldr>> {
+            let mut builder = UpdateSuccessBuilder::new(_fbb);
+            if let Some(x) = args.key {
+                builder.add_key(x);
+            }
+            if let Some(x) = args.target {
+                builder.add_target(x);
+            }
+            if let Some(x) = args.requester {
+                builder.add_requester(x);
+            }
+            if let Some(x) = args.transaction {
+                builder.add_transaction(x);
+            }
+            builder.finish()
+        }
+
+        #[inline]
+        pub fn transaction(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(UpdateSuccess::VT_TRANSACTION, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn requester(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(UpdateSuccess::VT_REQUESTER, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn target(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(UpdateSuccess::VT_TARGET, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn key(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(UpdateSuccess::VT_KEY, None)
+                    .unwrap()
+            }
+        }
+    }
+
+    impl flatbuffers::Verifiable for UpdateSuccess<'_> {
+        #[inline]
+        fn run_verifier(
+            v: &mut flatbuffers::Verifier,
+            pos: usize,
+        ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+            use self::flatbuffers::Verifiable;
+            v.visit_table(pos)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "transaction",
+                    Self::VT_TRANSACTION,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "requester",
+                    Self::VT_REQUESTER,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("target", Self::VT_TARGET, true)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("key", Self::VT_KEY, true)?
+                .finish();
+            Ok(())
+        }
+    }
+    pub struct UpdateSuccessArgs<'a> {
+        pub transaction: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub requester: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub target: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub key: Option<flatbuffers::WIPOffset<&'a str>>,
+    }
+    impl<'a> Default for UpdateSuccessArgs<'a> {
+        #[inline]
+        fn default() -> Self {
+            UpdateSuccessArgs {
+                transaction: None, // required field
+                requester: None,   // required field
+                target: None,      // required field
+                key: None,         // required field
+            }
+        }
+    }
+
+    pub struct UpdateSuccessBuilder<'a: 'b, 'b> {
+        fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+        start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+    }
+    impl<'a: 'b, 'b> UpdateSuccessBuilder<'a, 'b> {
+        #[inline]
+        pub fn add_transaction(&mut self, transaction: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                UpdateSuccess::VT_TRANSACTION,
+                transaction,
+            );
+        }
+        #[inline]
+        pub fn add_requester(&mut self, requester: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                UpdateSuccess::VT_REQUESTER,
+                requester,
+            );
+        }
+        #[inline]
+        pub fn add_target(&mut self, target: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(UpdateSuccess::VT_TARGET, target);
+        }
+        #[inline]
+        pub fn add_key(&mut self, key: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(UpdateSuccess::VT_KEY, key);
+        }
+        #[inline]
+        pub fn new(
+            _fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+        ) -> UpdateSuccessBuilder<'a, 'b> {
+            let start = _fbb.start_table();
+            UpdateSuccessBuilder {
+                fbb_: _fbb,
+                start_: start,
+            }
+        }
+        #[inline]
+        pub fn finish(self) -> flatbuffers::WIPOffset<UpdateSuccess<'a>> {
+            let o = self.fbb_.end_table(self.start_);
+            self.fbb_
+                .required(o, UpdateSuccess::VT_TRANSACTION, "transaction");
+            self.fbb_
+                .required(o, UpdateSuccess::VT_REQUESTER, "requester");
+            self.fbb_.required(o, UpdateSuccess::VT_TARGET, "target");
+            self.fbb_.required(o, UpdateSuccess::VT_KEY, "key");
+            flatbuffers::WIPOffset::new(o.value())
+        }
+    }
+
+    impl core::fmt::Debug for UpdateSuccess<'_> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let mut ds = f.debug_struct("UpdateSuccess");
+            ds.field("transaction", &self.transaction());
+            ds.field("requester", &self.requester());
+            ds.field("target", &self.target());
+            ds.field("key", &self.key());
+            ds.finish()
+        }
+    }
+    pub enum UpdateFailureOffset {}
+    #[derive(Copy, Clone, PartialEq)]
+
+    pub struct UpdateFailure<'a> {
+        pub _tab: flatbuffers::Table<'a>,
+    }
+
+    impl<'a> flatbuffers::Follow<'a> for UpdateFailure<'a> {
+        type Inner = UpdateFailure<'a>;
+        #[inline]
+        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+            Self {
+                _tab: flatbuffers::Table::new(buf, loc),
+            }
+        }
+    }
+
+    impl<'a> UpdateFailure<'a> {
+        pub const VT_TRANSACTION: flatbuffers::VOffsetT = 4;
+        pub const VT_REQUESTER: flatbuffers::VOffsetT = 6;
+        pub const VT_TARGET: flatbuffers::VOffsetT = 8;
+        pub const VT_KEY: flatbuffers::VOffsetT = 10;
+
+        #[inline]
+        pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+            UpdateFailure { _tab: table }
+        }
+        #[allow(unused_mut)]
+        pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+            _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+            args: &'args UpdateFailureArgs<'args>,
+        ) -> flatbuffers::WIPOffset<UpdateFailure<'bldr>> {
+            let mut builder = UpdateFailureBuilder::new(_fbb);
+            if let Some(x) = args.key {
+                builder.add_key(x);
+            }
+            if let Some(x) = args.target {
+                builder.add_target(x);
+            }
+            if let Some(x) = args.requester {
+                builder.add_requester(x);
+            }
+            if let Some(x) = args.transaction {
+                builder.add_transaction(x);
+            }
+            builder.finish()
+        }
+
+        #[inline]
+        pub fn transaction(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(UpdateFailure::VT_TRANSACTION, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn requester(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(UpdateFailure::VT_REQUESTER, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn target(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(UpdateFailure::VT_TARGET, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn key(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(UpdateFailure::VT_KEY, None)
+                    .unwrap()
+            }
+        }
+    }
+
+    impl flatbuffers::Verifiable for UpdateFailure<'_> {
+        #[inline]
+        fn run_verifier(
+            v: &mut flatbuffers::Verifier,
+            pos: usize,
+        ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+            use self::flatbuffers::Verifiable;
+            v.visit_table(pos)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "transaction",
+                    Self::VT_TRANSACTION,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "requester",
+                    Self::VT_REQUESTER,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("target", Self::VT_TARGET, true)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("key", Self::VT_KEY, true)?
+                .finish();
+            Ok(())
+        }
+    }
+    pub struct UpdateFailureArgs<'a> {
+        pub transaction: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub requester: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub target: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub key: Option<flatbuffers::WIPOffset<&'a str>>,
+    }
+    impl<'a> Default for UpdateFailureArgs<'a> {
+        #[inline]
+        fn default() -> Self {
+            UpdateFailureArgs {
+                transaction: None, // required field
+                requester: None,   // required field
+                target: None,      // required field
+                key: None,         // required field
+            }
+        }
+    }
+
+    pub struct UpdateFailureBuilder<'a: 'b, 'b> {
+        fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+        start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+    }
+    impl<'a: 'b, 'b> UpdateFailureBuilder<'a, 'b> {
+        #[inline]
+        pub fn add_transaction(&mut self, transaction: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                UpdateFailure::VT_TRANSACTION,
+                transaction,
+            );
+        }
+        #[inline]
+        pub fn add_requester(&mut self, requester: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                UpdateFailure::VT_REQUESTER,
+                requester,
+            );
+        }
+        #[inline]
+        pub fn add_target(&mut self, target: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(UpdateFailure::VT_TARGET, target);
+        }
+        #[inline]
+        pub fn add_key(&mut self, key: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(UpdateFailure::VT_KEY, key);
+        }
+        #[inline]
+        pub fn new(
+            _fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+        ) -> UpdateFailureBuilder<'a, 'b> {
+            let start = _fbb.start_table();
+            UpdateFailureBuilder {
+                fbb_: _fbb,
+                start_: start,
+            }
+        }
+        #[inline]
+        pub fn finish(self) -> flatbuffers::WIPOffset<UpdateFailure<'a>> {
+            let o = self.fbb_.end_table(self.start_);
+            self.fbb_
+                .required(o, UpdateFailure::VT_TRANSACTION, "transaction");
+            self.fbb_
+                .required(o, UpdateFailure::VT_REQUESTER, "requester");
+            self.fbb_.required(o, UpdateFailure::VT_TARGET, "target");
+            self.fbb_.required(o, UpdateFailure::VT_KEY, "key");
+            flatbuffers::WIPOffset::new(o.value())
+        }
+    }
+
+    impl core::fmt::Debug for UpdateFailure<'_> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let mut ds = f.debug_struct("UpdateFailure");
+            ds.field("transaction", &self.transaction());
+            ds.field("requester", &self.requester());
+            ds.field("target", &self.target());
+            ds.field("key", &self.key());
+            ds.finish()
+        }
+    }
+    pub enum ContractChangeOffset {}
+    #[derive(Copy, Clone, PartialEq)]
+
+    pub struct ContractChange<'a> {
+        pub _tab: flatbuffers::Table<'a>,
+    }
+
+    impl<'a> flatbuffers::Follow<'a> for ContractChange<'a> {
+        type Inner = ContractChange<'a>;
+        #[inline]
+        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+            Self {
+                _tab: flatbuffers::Table::new(buf, loc),
+            }
+        }
+    }
+
+    impl<'a> ContractChange<'a> {
+        pub const VT_CONTRACT_ID: flatbuffers::VOffsetT = 4;
+        pub const VT_CHANGE_TYPE: flatbuffers::VOffsetT = 6;
+        pub const VT_CHANGE: flatbuffers::VOffsetT = 8;
+
+        #[inline]
+        pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+            ContractChange { _tab: table }
+        }
+        #[allow(unused_mut)]
+        pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+            _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+            args: &'args ContractChangeArgs<'args>,
+        ) -> flatbuffers::WIPOffset<ContractChange<'bldr>> {
+            let mut builder = ContractChangeBuilder::new(_fbb);
+            if let Some(x) = args.change {
+                builder.add_change(x);
+            }
+            if let Some(x) = args.contract_id {
+                builder.add_contract_id(x);
+            }
+            builder.add_change_type(args.change_type);
+            builder.finish()
+        }
+
+        #[inline]
+        pub fn contract_id(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(ContractChange::VT_CONTRACT_ID, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn change_type(&self) -> ContractChangeType {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<ContractChangeType>(
+                        ContractChange::VT_CHANGE_TYPE,
+                        Some(ContractChangeType::NONE),
+                    )
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn change(&self) -> Option<flatbuffers::Table<'a>> {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<flatbuffers::Table<'a>>>(
+                        ContractChange::VT_CHANGE,
+                        None,
+                    )
+            }
+        }
+        #[inline]
+        #[allow(non_snake_case)]
+        pub fn change_as_put_request(&self) -> Option<PutRequest<'a>> {
+            if self.change_type() == ContractChangeType::PutRequest {
+                self.change().map(|t| {
+                    // Safety:
+                    // Created from a valid Table for this object
+                    // Which contains a valid union in this slot
+                    unsafe { PutRequest::init_from_table(t) }
+                })
+            } else {
+                None
+            }
+        }
+
+        #[inline]
+        #[allow(non_snake_case)]
+        pub fn change_as_put_success(&self) -> Option<PutSuccess<'a>> {
+            if self.change_type() == ContractChangeType::PutSuccess {
+                self.change().map(|t| {
+                    // Safety:
+                    // Created from a valid Table for this object
+                    // Which contains a valid union in this slot
+                    unsafe { PutSuccess::init_from_table(t) }
+                })
+            } else {
+                None
+            }
+        }
+
+        #[inline]
+        #[allow(non_snake_case)]
+        pub fn change_as_put_failure(&self) -> Option<PutFailure<'a>> {
+            if self.change_type() == ContractChangeType::PutFailure {
+                self.change().map(|t| {
+                    // Safety:
+                    // Created from a valid Table for this object
+                    // Which contains a valid union in this slot
+                    unsafe { PutFailure::init_from_table(t) }
+                })
+            } else {
+                None
+            }
+        }
+
+        #[inline]
+        #[allow(non_snake_case)]
+        pub fn change_as_update_request(&self) -> Option<UpdateRequest<'a>> {
+            if self.change_type() == ContractChangeType::UpdateRequest {
+                self.change().map(|t| {
+                    // Safety:
+                    // Created from a valid Table for this object
+                    // Which contains a valid union in this slot
+                    unsafe { UpdateRequest::init_from_table(t) }
+                })
+            } else {
+                None
+            }
+        }
+
+        #[inline]
+        #[allow(non_snake_case)]
+        pub fn change_as_update_success(&self) -> Option<UpdateSuccess<'a>> {
+            if self.change_type() == ContractChangeType::UpdateSuccess {
+                self.change().map(|t| {
+                    // Safety:
+                    // Created from a valid Table for this object
+                    // Which contains a valid union in this slot
+                    unsafe { UpdateSuccess::init_from_table(t) }
+                })
+            } else {
+                None
+            }
+        }
+
+        #[inline]
+        #[allow(non_snake_case)]
+        pub fn change_as_update_failure(&self) -> Option<UpdateFailure<'a>> {
+            if self.change_type() == ContractChangeType::UpdateFailure {
+                self.change().map(|t| {
+                    // Safety:
+                    // Created from a valid Table for this object
+                    // Which contains a valid union in this slot
+                    unsafe { UpdateFailure::init_from_table(t) }
+                })
+            } else {
+                None
+            }
+        }
+    }
+
+    impl flatbuffers::Verifiable for ContractChange<'_> {
+        #[inline]
+        fn run_verifier(
+            v: &mut flatbuffers::Verifier,
+            pos: usize,
+        ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+            use self::flatbuffers::Verifiable;
+            v.visit_table(pos)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "contract_id",
+                    Self::VT_CONTRACT_ID,
+                    true,
+                )?
+                .visit_union::<ContractChangeType, _>(
+                    "change_type",
+                    Self::VT_CHANGE_TYPE,
+                    "change",
+                    Self::VT_CHANGE,
+                    false,
+                    |key, v, pos| match key {
+                        ContractChangeType::PutRequest => v
+                            .verify_union_variant::<flatbuffers::ForwardsUOffset<PutRequest>>(
+                                "ContractChangeType::PutRequest",
+                                pos,
+                            ),
+                        ContractChangeType::PutSuccess => v
+                            .verify_union_variant::<flatbuffers::ForwardsUOffset<PutSuccess>>(
+                                "ContractChangeType::PutSuccess",
+                                pos,
+                            ),
+                        ContractChangeType::PutFailure => v
+                            .verify_union_variant::<flatbuffers::ForwardsUOffset<PutFailure>>(
+                                "ContractChangeType::PutFailure",
+                                pos,
+                            ),
+                        ContractChangeType::UpdateRequest => v
+                            .verify_union_variant::<flatbuffers::ForwardsUOffset<UpdateRequest>>(
+                                "ContractChangeType::UpdateRequest",
+                                pos,
+                            ),
+                        ContractChangeType::UpdateSuccess => v
+                            .verify_union_variant::<flatbuffers::ForwardsUOffset<UpdateSuccess>>(
+                                "ContractChangeType::UpdateSuccess",
+                                pos,
+                            ),
+                        ContractChangeType::UpdateFailure => v
+                            .verify_union_variant::<flatbuffers::ForwardsUOffset<UpdateFailure>>(
+                                "ContractChangeType::UpdateFailure",
+                                pos,
+                            ),
+                        _ => Ok(()),
+                    },
+                )?
+                .finish();
+            Ok(())
+        }
+    }
+    pub struct ContractChangeArgs<'a> {
+        pub contract_id: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub change_type: ContractChangeType,
+        pub change: Option<flatbuffers::WIPOffset<flatbuffers::UnionWIPOffset>>,
+    }
+    impl<'a> Default for ContractChangeArgs<'a> {
+        #[inline]
+        fn default() -> Self {
+            ContractChangeArgs {
+                contract_id: None, // required field
+                change_type: ContractChangeType::NONE,
+                change: None,
+            }
+        }
+    }
+
+    pub struct ContractChangeBuilder<'a: 'b, 'b> {
+        fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+        start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+    }
+    impl<'a: 'b, 'b> ContractChangeBuilder<'a, 'b> {
+        #[inline]
+        pub fn add_contract_id(&mut self, contract_id: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                ContractChange::VT_CONTRACT_ID,
+                contract_id,
+            );
+        }
+        #[inline]
+        pub fn add_change_type(&mut self, change_type: ContractChangeType) {
+            self.fbb_.push_slot::<ContractChangeType>(
+                ContractChange::VT_CHANGE_TYPE,
+                change_type,
+                ContractChangeType::NONE,
+            );
+        }
+        #[inline]
+        pub fn add_change(&mut self, change: flatbuffers::WIPOffset<flatbuffers::UnionWIPOffset>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(ContractChange::VT_CHANGE, change);
+        }
+        #[inline]
+        pub fn new(
+            _fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+        ) -> ContractChangeBuilder<'a, 'b> {
+            let start = _fbb.start_table();
+            ContractChangeBuilder {
+                fbb_: _fbb,
+                start_: start,
+            }
+        }
+        #[inline]
+        pub fn finish(self) -> flatbuffers::WIPOffset<ContractChange<'a>> {
+            let o = self.fbb_.end_table(self.start_);
+            self.fbb_
+                .required(o, ContractChange::VT_CONTRACT_ID, "contract_id");
+            flatbuffers::WIPOffset::new(o.value())
+        }
+    }
+
+    impl core::fmt::Debug for ContractChange<'_> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let mut ds = f.debug_struct("ContractChange");
+            ds.field("contract_id", &self.contract_id());
+            ds.field("change_type", &self.change_type());
+            match self.change_type() {
+                ContractChangeType::PutRequest => {
+                    if let Some(x) = self.change_as_put_request() {
+                        ds.field("change", &x)
+                    } else {
+                        ds.field(
+                            "change",
+                            &"InvalidFlatbuffer: Union discriminant does not match value.",
+                        )
+                    }
+                }
+                ContractChangeType::PutSuccess => {
+                    if let Some(x) = self.change_as_put_success() {
+                        ds.field("change", &x)
+                    } else {
+                        ds.field(
+                            "change",
+                            &"InvalidFlatbuffer: Union discriminant does not match value.",
+                        )
+                    }
+                }
+                ContractChangeType::PutFailure => {
+                    if let Some(x) = self.change_as_put_failure() {
+                        ds.field("change", &x)
+                    } else {
+                        ds.field(
+                            "change",
+                            &"InvalidFlatbuffer: Union discriminant does not match value.",
+                        )
+                    }
+                }
+                ContractChangeType::UpdateRequest => {
+                    if let Some(x) = self.change_as_update_request() {
+                        ds.field("change", &x)
+                    } else {
+                        ds.field(
+                            "change",
+                            &"InvalidFlatbuffer: Union discriminant does not match value.",
+                        )
+                    }
+                }
+                ContractChangeType::UpdateSuccess => {
+                    if let Some(x) = self.change_as_update_success() {
+                        ds.field("change", &x)
+                    } else {
+                        ds.field(
+                            "change",
+                            &"InvalidFlatbuffer: Union discriminant does not match value.",
+                        )
+                    }
+                }
+                ContractChangeType::UpdateFailure => {
+                    if let Some(x) = self.change_as_update_failure() {
+                        ds.field("change", &x)
+                    } else {
+                        ds.field(
+                            "change",
+                            &"InvalidFlatbuffer: Union discriminant does not match value.",
+                        )
+                    }
+                }
+                _ => {
+                    let x: Option<()> = None;
+                    ds.field("change", &x)
                 }
             };
             ds.finish()

@@ -23,6 +23,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use crate::{
     config::GlobalExecutor,
     contract::StoreResponse,
+    generated::ContractChange,
     message::{MessageStats, NetMessage, NetMessageV1, Transaction},
     node::PeerId,
     operations::{connect, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg},
@@ -216,17 +217,26 @@ impl<'a> NetEventLog<'a> {
                 return Either::Right(events);
             }
             NetMessageV1::Put(PutMsg::RequestPut {
-                contract, target, ..
+                contract,
+                target,
+                id,
+                ..
             }) => {
+                let this_peer = &op_manager.ring.get_peer_key().unwrap();
                 let key = contract.key();
                 EventKind::Put(PutEvent::Request {
-                    requester: target.peer.clone(),
+                    requester: *this_peer,
+                    target: *target,
                     key,
+                    id: *id,
                 })
             }
-            NetMessageV1::Put(PutMsg::SuccessfulPut { .. }) => {
+            NetMessageV1::Put(PutMsg::SuccessfulPut { id, target, key }) => {
                 EventKind::Put(PutEvent::PutSuccess {
+                    id: *id,
                     requester: op_manager.ring.get_peer_key().unwrap(),
+                    target: *target,
+                    key: key.clone(),
                 })
             }
             NetMessageV1::Put(PutMsg::Broadcasting {
@@ -750,7 +760,34 @@ async fn send_to_metrics_server(
             let msg = PeerChange::removed_connection_msg(from.clone(), send_msg.peer_id.clone());
             ws_stream.send(Message::Binary(msg)).await
         }
-        // todo: send op events too (put, get, update, etc) so we can keep track of transactions
+        EventKind::Put(PutEvent::Request {
+            requester,
+            key,
+            target,
+            ..
+        }) => {
+            let msg = ContractChange::put_request_msg(
+                send_msg.tx.to_string(),
+                key.to_string(),
+                requester.to_string(),
+                target.peer.to_string(),
+            );
+            ws_stream.send(Message::Binary(msg)).await
+        }
+        EventKind::Put(PutEvent::PutSuccess {
+            requester,
+            target,
+            key,
+            ..
+        }) => {
+            let msg = ContractChange::put_success_msg(
+                send_msg.tx.to_string(),
+                key.to_string(),
+                requester.to_string(),
+                target.peer.to_string(),
+            );
+            ws_stream.send(Message::Binary(msg)).await
+        }
         _ => Ok(()),
     };
     if let Err(error) = res {
@@ -1088,11 +1125,16 @@ enum ConnectEvent {
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 enum PutEvent {
     Request {
+        id: Transaction,
         requester: PeerId,
         key: ContractKey,
+        target: PeerKeyLocation,
     },
     PutSuccess {
+        id: Transaction,
         requester: PeerId,
+        target: PeerKeyLocation,
+        key: ContractKey,
     },
     BroadcastEmitted {
         /// subscribed peers
@@ -1306,7 +1348,7 @@ pub(super) mod test {
                         PutEvent::Request { key, .. } if key == for_key => {
                             is_expected_key = true;
                         }
-                        PutEvent::PutSuccess { requester } if requester == peer => {
+                        PutEvent::PutSuccess { requester, .. } if requester == peer => {
                             is_expected_peer = true;
                         }
                         _ => {}

@@ -471,7 +471,22 @@ pub(crate) mod test {
                         }
                         return Some(request.into());
                     }
-                    val if (5..35).contains(&val) => {
+                    val if (5..20).contains(&val) => {
+                        if let Some(contract) = self.choose(&state.existing_contracts) {
+                            if !for_this_peer {
+                                continue;
+                            }
+
+                            let request = ContractRequest::Put {
+                                contract: contract.clone(),
+                                state: WrappedState::new(self.random_byte_vec()),
+                                related_contracts: RelatedContracts::new(),
+                            };
+
+                            return Some(request.into());
+                        }
+                    }
+                    val if (20..35).contains(&val) => {
                         if let Some(contract) = self.choose(&state.existing_contracts) {
                             if !for_this_peer {
                                 continue;
