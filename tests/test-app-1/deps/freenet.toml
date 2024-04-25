@@ -1,0 +1,5 @@
+[contract]
+lang = "rust"
+
+[state]
+files = ["initial_state.json"]

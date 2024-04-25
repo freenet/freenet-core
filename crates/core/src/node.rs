@@ -19,8 +19,12 @@ use std::{
 };
 
 use either::Either;
-use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ErrorKind};
+use freenet_stdlib::{
+    client_api::{ClientRequest, ContractRequest, ErrorKind},
+    prelude::{ContractKey, RelatedContracts, WrappedState},
+};
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId as Libp2pPeerId};
+
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
@@ -36,7 +40,7 @@ use crate::{
     message::{NetMessage, NodeEvent, Transaction, TransactionType},
     operations::{
         connect::{self, ConnectOp},
-        get, put, subscribe, OpEnum, OpError, OpOutcome,
+        get, put, subscribe, update, OpEnum, OpError, OpOutcome,
     },
     ring::{Location, PeerKeyLocation},
     router::{RouteEvent, RouteOutcome},
@@ -48,6 +52,7 @@ use crate::operations::handle_op_request;
 pub use network_bridge::inter_process::InterProcessConnManager;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
 
+use crate::topology::rate::Rate;
 pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
 mod network_bridge;
@@ -91,15 +96,15 @@ impl Node {
 ///
 /// If both are provided but also additional peers are added via the [`Self::add_gateway()`] method, this node will
 /// be listening but also try to connect to an existing peer.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NodeConfig {
     /// public identifier for the peer
     pub peer_id: PeerId,
     // optional local info, in case this is an initial bootstrap node
     /// IP to bind to the listener
-    pub(crate) local_ip: Option<IpAddr>,
+    pub local_ip: Option<IpAddr>,
     /// socket port to bind to the listener
-    pub(crate) local_port: Option<u16>,
+    pub local_port: Option<u16>,
     /// IP dialers should connect to
     pub(crate) public_ip: Option<IpAddr>,
     /// socket port dialers should connect to
@@ -113,6 +118,8 @@ pub struct NodeConfig {
     pub(crate) rnd_if_htl_above: Option<usize>,
     pub(crate) max_number_conn: Option<usize>,
     pub(crate) min_number_conn: Option<usize>,
+    pub(crate) max_upstream_bandwidth: Option<Rate>,
+    pub(crate) max_downstream_bandwidth: Option<Rate>,
 }
 
 impl NodeConfig {
@@ -130,6 +137,8 @@ impl NodeConfig {
             rnd_if_htl_above: None,
             max_number_conn: None,
             min_number_conn: None,
+            max_upstream_bandwidth: None,
+            max_downstream_bandwidth: None,
         }
     }
 
@@ -255,7 +264,7 @@ impl Default for NodeConfig {
 }
 
 /// Gateway node to bootstrap the network.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct InitPeerNode {
     addr: Option<Multiaddr>,
     identifier: PeerId,
@@ -277,10 +286,9 @@ impl InitPeerNode {
     /// Will panic if is not a valid representation.
     pub fn decode_peer_id<T: AsMut<[u8]>>(mut bytes: T) -> Libp2pPeerId {
         Libp2pPeerId::from_public_key(
-            &identity::Keypair::try_from(
+            &identity::Keypair::from(
                 identity::ed25519::Keypair::try_from_bytes(bytes.as_mut()).unwrap(),
             )
-            .unwrap()
             .public(),
         )
     }
@@ -388,15 +396,33 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                         tracing::error!("{}", err);
                     }
                 }
-                ContractRequest::Update {
-                    key: _key,
-                    data: _delta,
-                } => {
+                ContractRequest::Update { key, data } => {
                     // FIXME: perform updates
                     tracing::debug!(
                         this_peer = %op_manager.ring.peer_key,
                         "Received update from user event",
                     );
+                    let state = match data {
+                        freenet_stdlib::prelude::UpdateData::State(s) => s,
+                        _ => {
+                            unreachable!();
+                        }
+                    };
+
+                    let wrapped_state = WrappedState::from(state.into_bytes());
+
+                    let related_contracts = RelatedContracts::default();
+
+                    let op = update::start_op(key, wrapped_state, related_contracts);
+
+                    let _ = op_manager
+                        .ch_outbound
+                        .waiting_for_transaction_result(op.id, client_id)
+                        .await;
+
+                    if let Err(err) = update::request_update(&op_manager, op).await {
+                        tracing::error!("request update error {}", err)
+                    }
                 }
                 ContractRequest::Get {
                     key,
@@ -417,61 +443,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                     }
                 }
                 ContractRequest::Subscribe { key, .. } => {
-                    const TIMEOUT: Duration = Duration::from_secs(30);
-                    let mut missing_contract = false;
-                    let timeout = tokio::time::timeout(TIMEOUT, async {
-                        // Initialize a subscribe op.
-                        loop {
-                            let op = subscribe::start_op(key.clone());
-                            let _ = op_manager
-                                .ch_outbound
-                                .waiting_for_transaction_result(op.id, client_id)
-                                .await;
-                            match subscribe::request_subscribe(&op_manager, op).await {
-                                Err(OpError::ContractError(ContractError::ContractNotFound(
-                                    key,
-                                ))) if !missing_contract => {
-                                    tracing::info!(%key, "Trying to subscribe to a contract not present, requesting it first");
-                                    missing_contract = true;
-                                    let get_op = get::start_op(key.clone(), true);
-                                    if let Err(error) = get::request_get(&op_manager, get_op).await
-                                    {
-                                        tracing::error!(%key, %error, "Failed getting the contract while previously trying to subscribe; bailing");
-                                        break Err(error);
-                                    }
-                                    continue;
-                                }
-                                Err(OpError::ContractError(ContractError::ContractNotFound(_))) => {
-                                    tracing::warn!("Still waiting for {key} contract");
-                                    tokio::time::sleep(Duration::from_secs(2)).await
-                                }
-                                Err(err) => {
-                                    tracing::error!("{}", err);
-                                    break Err(err);
-                                }
-                                Ok(()) => {
-                                    if missing_contract {
-                                        tracing::debug!(%key,
-                                            "Got back the missing contract while subscribing"
-                                        );
-                                    }
-                                    tracing::debug!(%key, "Starting subscribe request");
-                                    break Ok(());
-                                }
-                            }
-                        }
-                    });
-                    match timeout.await {
-                        Err(_) => {
-                            tracing::error!(%key, "Timeout while waiting for contract to start subscription");
-                        }
-                        Ok(Err(error)) => {
-                            tracing::error!(%key, %error, "Error while subscribing to contract");
-                        }
-                        Ok(Ok(_)) => {
-                            tracing::debug!(%key, "Started subscription to contract");
-                        }
-                    }
+                    subscribe(op_manager, key, Some(client_id)).await;
                 }
                 _ => {
                     tracing::error!("Op not supported");
@@ -694,7 +666,87 @@ async fn process_message<CB>(
                 )
                 .await;
             }
+            NetMessage::Update(op) => {
+                let op_result =
+                    handle_op_request::<update::UpdateOp, _>(&op_manager, &mut conn_manager, op)
+                        .await;
+                handle_op_not_available!(op_result);
+                break report_result(
+                    tx,
+                    op_result,
+                    &op_manager,
+                    executor_callback,
+                    cli_req,
+                    &mut *event_listener,
+                )
+                .await;
+            }
+
+            NetMessage::Unsubscribed { key, .. } => {
+                subscribe(op_manager, key.clone(), None).await;
+                break;
+            }
             _ => break,
+        }
+    }
+}
+
+/// Attempts to subscribe to a contract
+async fn subscribe(op_manager: Arc<OpManager>, key: ContractKey, client_id: Option<ClientId>) {
+    const TIMEOUT: Duration = Duration::from_secs(30);
+    let mut missing_contract = false;
+    let timeout = tokio::time::timeout(TIMEOUT, async {
+        // Initialize a subscribe op.
+        loop {
+            let op = subscribe::start_op(key.clone());
+            if let Some(client_id) = client_id {
+                let _ = op_manager
+                    .ch_outbound
+                    .waiting_for_transaction_result(op.id, client_id)
+                    .await;
+            }
+            match subscribe::request_subscribe(&op_manager, op).await {
+                Err(OpError::ContractError(ContractError::ContractNotFound(key)))
+                    if !missing_contract =>
+                {
+                    tracing::info!(%key, "Trying to subscribe to a contract not present, requesting it first");
+                    missing_contract = true;
+                    let get_op = get::start_op(key.clone(), true);
+                    if let Err(error) = get::request_get(&op_manager, get_op).await {
+                        tracing::error!(%key, %error, "Failed getting the contract while previously trying to subscribe; bailing");
+                        break Err(error);
+                    }
+                    continue;
+                }
+                Err(OpError::ContractError(ContractError::ContractNotFound(_))) => {
+                    tracing::warn!("Still waiting for {key} contract");
+                    tokio::time::sleep(Duration::from_secs(2)).await
+                }
+                Err(err) => {
+                    tracing::error!("{}", err);
+                    break Err(err);
+                }
+                Ok(()) => {
+                    if missing_contract {
+                        tracing::debug!(%key,
+                            "Got back the missing contract while subscribing"
+                        );
+                    }
+                    tracing::debug!(%key, "Starting subscribe request");
+                    break Ok(());
+                }
+            }
+        }
+    });
+    match timeout.await {
+        Err(_) => {
+            tracing::error!(%key, "Timeout while waiting for contract to start subscription");
+        }
+        Ok(Err(error)) => {
+            tracing::error!(%key, %error, "Error while subscribing to contract");
+        }
+        Ok(Ok(_)) => {
+            tracing::debug!(%key, "Started subscription to contract");
         }
     }
 }

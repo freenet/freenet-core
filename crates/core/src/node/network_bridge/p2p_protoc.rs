@@ -20,7 +20,6 @@ use libp2p::{
     identify,
     identity::Keypair,
     multiaddr::Protocol,
-    ping,
     swarm::{
         self,
         dial_opts::DialOpts,
@@ -81,8 +80,6 @@ fn config_behaviour(
     )
     .with_agent_version(CURRENT_AGENT_VER.to_string());
 
-    let ping = ping::Behaviour::default();
-
     let peer_id = private_key.public().to_peer_id();
     let auto_nat = {
         let config = autonat::Config {
@@ -97,7 +94,6 @@ fn config_behaviour(
     };
 
     NetBehaviour {
-        ping,
         identify: identify::Behaviour::new(ident_config),
         auto_nat,
         freenet: FreenetBehaviour {
@@ -150,7 +146,6 @@ impl P2pBridge {
     }
 }
 
-#[async_trait::async_trait]
 impl NetworkBridge for P2pBridge {
     async fn add_connection(&mut self, peer: FreenetPeerId) -> super::ConnResult<()> {
         if self.active_net_connections.contains_key(&peer) {
@@ -180,7 +175,8 @@ impl NetworkBridge for P2pBridge {
 
     async fn send(&self, target: &FreenetPeerId, msg: NetMessage) -> super::ConnResult<()> {
         self.log_register
-            .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager.ring));
+            .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager.ring))
+            .await;
         self.op_manager.sending_transaction(target, &msg);
         self.ev_listener_tx
             .send(Left((*target, Box::new(msg))))
@@ -267,7 +263,7 @@ impl P2pConnManager {
         Ok(())
     }
 
-    #[tracing::instrument(name = "network_event_listener", skip_all)]
+    #[tracing::instrument(name = "network_event_listener", fields(peer = %self.bridge.op_manager.ring.peer_key), skip_all)]
     pub async fn run_event_listener(
         mut self,
         op_manager: Arc<OpManager>,
@@ -488,7 +484,7 @@ impl P2pConnManager {
                 Ok(Right(ConnectionClosed { peer: peer_id }))
                 | Ok(Right(NodeAction(NodeEvent::DropConnection(peer_id)))) => {
                     self.bridge.active_net_connections.remove(&peer_id);
-                    op_manager.ring.prune_connection(peer_id);
+                    op_manager.ring.prune_connection(peer_id).await;
                     // todo: notify the handler, read `disconnect_peer_id` doc
                     let _ = self.swarm.disconnect_peer_id(peer_id.0);
                     tracing::info!("Dropped connection with peer {}", peer_id);
@@ -1191,7 +1187,6 @@ fn decode_msg(buf: BytesMut) -> Result<NetMessage, ConnectionError> {
 #[behaviour(to_swarm = "NetEvent")]
 pub(in crate::node) struct NetBehaviour {
     identify: identify::Behaviour,
-    ping: ping::Behaviour,
     freenet: FreenetBehaviour,
     auto_nat: autonat::Behaviour,
 }
@@ -1200,7 +1195,6 @@ pub(in crate::node) struct NetBehaviour {
 pub(in crate::node) enum NetEvent {
     Freenet(Box<NetMessage>),
     Identify(Box<identify::Event>),
-    Ping(ping::Event),
     Autonat(autonat::Event),
 }
 
@@ -1213,12 +1207,6 @@ impl From<autonat::Event> for NetEvent {
 impl From<identify::Event> for NetEvent {
     fn from(event: identify::Event) -> NetEvent {
         Self::Identify(Box::new(event))
-    }
-}
-
-impl From<ping::Event> for NetEvent {
-    fn from(event: ping::Event) -> NetEvent {
-        Self::Ping(event)
     }
 }
 

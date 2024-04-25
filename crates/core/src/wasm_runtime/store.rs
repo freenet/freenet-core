@@ -23,7 +23,11 @@ pub(super) struct SafeWriter<S> {
 impl<S: StoreFsManagement> SafeWriter<S> {
     pub fn new(path: &Path, compact: bool) -> Result<Self, io::Error> {
         let file = if compact {
-            OpenOptions::new().create(true).write(true).open(path)?
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(path)?
         } else {
             OpenOptions::new()
                 .create(true)
@@ -59,8 +63,7 @@ impl<S: StoreFsManagement> SafeWriter<S> {
             }
         }
         traversed += 1 + 32; // key + type marker
-        self.file
-            .write_u32::<BigEndian>(value.as_ref().len() as u32)?;
+        self.file.write_u32::<BigEndian>(value.len() as u32)?;
         traversed += std::mem::size_of::<u32>();
         self.file.write_all(value)?;
         traversed += value.len();

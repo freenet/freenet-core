@@ -39,6 +39,7 @@ pub(crate) use test::TestEventListener;
 use crate::node::OpManager;
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 struct ListenerLogId(usize);
 
 /// A type that reacts to incoming messages from the network and records information about them.
@@ -83,7 +84,7 @@ impl<const N: usize> NetEventRegister for CombinedRegister<N> {
     fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<()> {
         async move {
             for reg in &mut self.0 {
-                reg.notify_of_time_out(tx);
+                reg.notify_of_time_out(tx).await;
             }
         }
         .boxed()
@@ -1192,16 +1193,18 @@ enum PutEvent {
 
 #[cfg(feature = "trace")]
 pub(crate) mod tracer {
+    use tracing::level_filters::LevelFilter;
     use tracing_subscriber::{Layer, Registry};
 
     use crate::DynError;
 
-    pub fn init_tracer() -> Result<(), DynError> {
+    pub fn init_tracer(level: Option<LevelFilter>) -> Result<(), DynError> {
         let default_filter = if cfg!(any(test, debug_assertions)) {
-            tracing_subscriber::filter::LevelFilter::DEBUG
+            LevelFilter::DEBUG
         } else {
-            tracing_subscriber::filter::LevelFilter::INFO
+            LevelFilter::INFO
         };
+        let default_filter = level.unwrap_or(default_filter);
         let filter_layer = tracing_subscriber::EnvFilter::builder()
             .with_default_directive(default_filter.into())
             .from_env_lossy()
@@ -1270,16 +1273,11 @@ pub(crate) mod tracer {
 }
 
 pub(super) mod test {
+    use dashmap::DashMap;
     use std::{
         collections::HashMap,
-        sync::{
-            atomic::{AtomicUsize, Ordering::SeqCst},
-            Arc,
-        },
+        sync::atomic::{AtomicUsize, Ordering::SeqCst},
     };
-
-    use dashmap::DashMap;
-    use tokio_tungstenite::WebSocketStream;
 
     use super::*;
     use crate::{node::testing_impl::NodeLabel, ring::Distance};

@@ -3,7 +3,7 @@ use std::backtrace::Backtrace as StdTrace;
 use std::{pin::Pin, time::Duration};
 
 use freenet_stdlib::prelude::ContractKey;
-use futures::{future::BoxFuture, Future};
+use futures::Future;
 use tokio::sync::mpsc::error::SendError;
 
 use crate::{
@@ -31,7 +31,7 @@ where
     fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
-    ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>>;
+    ) -> impl Future<Output = Result<OpInitialization<Self>, OpError>> + 'a;
 
     fn id(&self) -> &Transaction;
 
@@ -73,6 +73,7 @@ where
         sender = s;
         op.process_message(network_bridge, op_manager, msg).await
     };
+
     handle_op_result(op_manager, network_bridge, result, tx, sender).await
 }
 
@@ -90,6 +91,7 @@ where
     match result {
         Err(OpError::StatePushed) => {
             // do nothing and continue, the operation will just continue later on
+            tracing::debug!("entered in state pushed to continue with op");
             return Ok(None);
         }
         Err(err) => {
@@ -134,6 +136,7 @@ where
         }) => {
             op_manager.completed(tx_id);
             // finished the operation at this node, informing back
+
             if let Some(target) = msg.target().cloned() {
                 network_bridge.send(&target.peer, msg).await?;
             }

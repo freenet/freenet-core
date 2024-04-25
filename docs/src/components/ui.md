@@ -5,7 +5,7 @@ will download the Gmail user interface which then runs in their browser and conn
 
 On Freenet the user interface is downloaded from a Freenet contract, and it
 [interacts](overview.md) with contracts and delegates by sending messages
-through the Freenet kernel.
+through the Freenet core.
 
 ![Delegate, Contrat, and UI Diagram](ui_delegate_contract.svg)
 

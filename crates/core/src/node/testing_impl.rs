@@ -9,7 +9,7 @@ use std::{
 
 use either::Either;
 use freenet_stdlib::prelude::*;
-use futures::{future::BoxFuture, Future};
+use futures::Future;
 use itertools::Itertools;
 use libp2p::{identity, PeerId as Libp2pPeerId};
 use rand::{seq::SliceRandom, Rng};
@@ -34,8 +34,10 @@ use crate::{
 
 mod in_memory;
 mod inter_process;
+mod network;
 
 pub use self::inter_process::SimPeer;
+pub use self::network::{NetworkPeer, PeerMessage, PeerStatus};
 
 use super::{
     network_bridge::EventLoopNotificationsReceiver, ConnectionError, NetworkBridge, PeerId,
@@ -127,7 +129,7 @@ impl<'a> From<&'a str> for NodeLabel {
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct NodeSpecification {
-    pub owned_contracts: Vec<(ContractContainer, WrappedState, Option<PeerKeyLocation>)>,
+    pub owned_contracts: Vec<(ContractContainer, WrappedState, bool)>,
     pub events_to_generate: HashMap<EventId, freenet_stdlib::client_api::ClientRequest<'static>>,
     pub contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
 }
@@ -283,7 +285,7 @@ pub(super) struct Builder<ER> {
     contract_handler_name: String,
     add_noise: bool,
     event_register: ER,
-    contracts: Vec<(ContractContainer, WrappedState, Option<PeerKeyLocation>)>,
+    contracts: Vec<(ContractContainer, WrappedState, bool)>,
     contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
 }
 
@@ -482,7 +484,9 @@ impl SimNetwork {
                 .max_hops_to_live(self.ring_max_htl)
                 .rnd_if_htl_above(self.rnd_if_htl_above)
                 .max_number_of_connections(self.max_connections)
-                .with_key(pair.public().into());
+                .with_key(pair.public().into())
+                .with_ip(Ipv6Addr::LOCALHOST)
+                .with_port(get_free_port().unwrap());
 
             let peer = PeerId::from(id);
             self.event_listener.add_node(label.clone(), peer);
@@ -961,7 +965,7 @@ use super::op_state_manager::OpManager;
 use crate::client_events::ClientEventsProxy;
 
 pub(super) trait NetworkBridgeExt: Clone + 'static {
-    fn recv(&mut self) -> BoxFuture<Result<NetMessage, ConnectionError>>;
+    fn recv(&mut self) -> impl Future<Output = Result<NetMessage, ConnectionError>> + Send;
 }
 
 struct RunnerConfig<NB, UsrEv>
@@ -1095,10 +1099,13 @@ where
                 NodeEvent::ShutdownNode => break Ok(()),
                 NodeEvent::DropConnection(peer) => {
                     tracing::info!("Dropping connection to {peer}");
-                    event_register.register_events(Either::Left(
-                        crate::tracing::NetEventLog::disconnected(&op_manager.ring, &peer),
-                    ));
-                    op_manager.ring.prune_connection(peer);
+                    event_register
+                        .register_events(Either::Left(crate::tracing::NetEventLog::disconnected(
+                            &op_manager.ring,
+                            &peer,
+                        )))
+                        .await;
+                    op_manager.ring.prune_connection(peer).await;
                     continue;
                 }
                 NodeEvent::Disconnect { cause: Some(cause) } => {

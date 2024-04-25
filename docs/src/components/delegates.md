@@ -1,11 +1,10 @@
 # Delegates
 
-In Freenet, Delegates act like advanced representatives, similar to a human
-delegate, performing actions on Freenet on your behalf. Think of them as a more
-sophisticated version of a web browser's local storage, with similarities to
-Unix "Daemons". Operating within the Freenet kernel on your device, Delegates
-are a secure and flexible mechanism for managing private data, such as
-cryptographic keys, tokens, and passwords, and executing complex tasks.
+In Freenet, Delegates are software components that can act on the user's behalf. 
+Think of them as a more sophisticated version of a web browser's local storage, 
+with similarities to Unix "Daemons". Operating within the Freenet core on your 
+device, Delegates are a secure and flexible mechanism for managing private data, 
+such as cryptographic keys, tokens, and passwords, and executing complex tasks.
 
 Delegates interact with various components within Freenet, including Contracts,
 User Interfaces, and other Delegates. They can also communicate directly with
@@ -18,11 +17,11 @@ securely on your devices.
 
 ## Actor Model and Message Passing
 
-Delegates utilize a message passing system similar to the [actor
-model](https://en.wikipedia.org/wiki/Actor_model) to interact with Contracts,
-other Delegates, and Applications.
+Delegates communicate with Contracts, other Delegates, and UIs by passing
+messages, similar to the [actor
+model](https://en.wikipedia.org/wiki/Actor_model).
 
-The Freenet kernel makes sure that for any incoming message, whether it's from
+The Freenet Core makes sure that for any incoming message, whether it's from
 another Delegate, a User Interface, or a Contract update, the receiver knows who
 the sender is. This allows delegates to verify the behavior of any component
 they interact with, and decide if they can be trusted.

@@ -1,3 +1,5 @@
+pub(crate) mod time_source;
+
 use std::{
     collections::{BTreeMap, HashSet},
     time::Duration,
@@ -157,7 +159,6 @@ impl<T> IterExt for T where T: Iterator {}
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
-    use rand::Rng;
 
     #[test]
     fn randomize_iter() {
@@ -244,8 +245,7 @@ impl<'x> Contains<PeerId> for &'x Vec<&PeerId> {
 }
 
 #[cfg(test)]
-pub mod tests {
-
+pub(crate) mod tests {
     use tempfile::TempDir;
 
     /// Use this to guarantee unique directory names in case you are running multiple tests in parallel.

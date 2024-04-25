@@ -15,11 +15,11 @@ jobs:
           fetch-depth: 0
           submodules: true
       - name: Setup Rust
-        uses: ATiltedTree/setup-rust@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rust-version: stable
       - name: Cache Dependencies
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ~/.cargo
           key: cargo-cache-${{ hashFiles('Cargo.lock') }}

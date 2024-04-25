@@ -201,9 +201,9 @@ impl OpManager {
     /// Notify the operation manager that a transaction is being transacted over the network.
     pub fn sending_transaction(&self, peer: &PeerId, msg: &NetMessage) {
         let transaction = msg.id();
-        if let Some(loc) = msg.requested_location() {
+        if let (Some(recipient), Some(target)) = (msg.target(), msg.requested_location()) {
             self.ring
-                .record_request(loc, transaction.transaction_type());
+                .record_request(*recipient, target, transaction.transaction_type());
         }
         self.ring
             .live_tx_tracker
@@ -223,65 +223,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
 
     let mut ttl_set = BTreeSet::new();
 
-    let mut remove_old = move |ttl_set: &mut BTreeSet<Reverse<Transaction>>,
-                               delayed: &mut Vec<Transaction>| {
-        let mut old_missing = std::mem::replace(delayed, Vec::with_capacity(200));
-        for tx in old_missing.drain(..) {
-            if let Some(tx) = ops.completed.remove(&tx) {
-                if cfg!(feature = "trace-ot") {
-                    event_register.notify_of_time_out(tx);
-                } else {
-                    _ = tx;
-                }
-                continue;
-            }
-            let still_waiting = match tx.transaction_type() {
-                TransactionType::Connect => ops.connect.remove(&tx).is_none(),
-                TransactionType::Put => ops.put.remove(&tx).is_none(),
-                TransactionType::Get => ops.get.remove(&tx).is_none(),
-                TransactionType::Subscribe => ops.subscribe.remove(&tx).is_none(),
-                TransactionType::Update => ops.update.remove(&tx).is_none(),
-            };
-            let timed_out = tx.timed_out();
-            if still_waiting && !timed_out {
-                delayed.push(tx);
-            } else {
-                if still_waiting && timed_out {
-                    ops.under_progress.remove(&tx);
-                    ops.completed.remove(&tx);
-                }
-                live_tx_tracker.remove_finished_transaction(tx);
-            }
-        }
-
-        // notice the use of reverse so the older transactions are removed instead of the newer ones
-        let older_than: Reverse<Transaction> = Reverse(Transaction::ttl_transaction());
-        for Reverse(tx) in ttl_set.split_off(&older_than).into_iter() {
-            if ops.under_progress.contains(&tx) {
-                delayed.push(tx);
-                continue;
-            }
-            if let Some(tx) = ops.completed.remove(&tx) {
-                if cfg!(feature = "trace-ot") {
-                    event_register.notify_of_time_out(tx);
-                } else {
-                    _ = tx;
-                }
-                continue;
-            }
-            let removed = match tx.transaction_type() {
-                TransactionType::Connect => ops.connect.remove(&tx).is_some(),
-                TransactionType::Put => ops.put.remove(&tx).is_some(),
-                TransactionType::Get => ops.get.remove(&tx).is_some(),
-                TransactionType::Subscribe => ops.subscribe.remove(&tx).is_some(),
-                TransactionType::Update => ops.update.remove(&tx).is_some(),
-            };
-            if removed {
-                live_tx_tracker.remove_finished_transaction(tx);
-            }
-        }
-    };
-
     let mut delayed = vec![];
     loop {
         tokio::select! {
@@ -291,7 +232,61 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 }
             }
             _ = tick.tick() => {
-                remove_old(&mut ttl_set, &mut delayed);
+                let mut old_missing = std::mem::replace(&mut delayed, Vec::with_capacity(200));
+                for tx in old_missing.drain(..) {
+                    if let Some(tx) = ops.completed.remove(&tx) {
+                        if cfg!(feature = "trace-ot") {
+                            event_register.notify_of_time_out(tx).await;
+                        } else {
+                            _ = tx;
+                        }
+                        continue;
+                    }
+                    let still_waiting = match tx.transaction_type() {
+                        TransactionType::Connect => ops.connect.remove(&tx).is_none(),
+                        TransactionType::Put => ops.put.remove(&tx).is_none(),
+                        TransactionType::Get => ops.get.remove(&tx).is_none(),
+                        TransactionType::Subscribe => ops.subscribe.remove(&tx).is_none(),
+                        TransactionType::Update => ops.update.remove(&tx).is_none(),
+                    };
+                    let timed_out = tx.timed_out();
+                    if still_waiting && !timed_out {
+                        delayed.push(tx);
+                    } else {
+                        if still_waiting && timed_out {
+                            ops.under_progress.remove(&tx);
+                            ops.completed.remove(&tx);
+                        }
+                        live_tx_tracker.remove_finished_transaction(tx);
+                    }
+                }
+
+                // notice the use of reverse so the older transactions are removed instead of the newer ones
+                let older_than: Reverse<Transaction> = Reverse(Transaction::ttl_transaction());
+                for Reverse(tx) in ttl_set.split_off(&older_than).into_iter() {
+                    if ops.under_progress.contains(&tx) {
+                        delayed.push(tx);
+                        continue;
+                    }
+                    if let Some(tx) = ops.completed.remove(&tx) {
+                        if cfg!(feature = "trace-ot") {
+                            event_register.notify_of_time_out(tx).await;
+                        } else {
+                            _ = tx;
+                        }
+                        continue;
+                    }
+                    let removed = match tx.transaction_type() {
+                        TransactionType::Connect => ops.connect.remove(&tx).is_some(),
+                        TransactionType::Put => ops.put.remove(&tx).is_some(),
+                        TransactionType::Get => ops.get.remove(&tx).is_some(),
+                        TransactionType::Subscribe => ops.subscribe.remove(&tx).is_some(),
+                        TransactionType::Update => ops.update.remove(&tx).is_some(),
+                    };
+                    if removed {
+                        live_tx_tracker.remove_finished_transaction(tx);
+                    }
+                }
             }
         }
     }

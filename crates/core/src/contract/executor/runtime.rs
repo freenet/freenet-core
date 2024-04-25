@@ -1,6 +1,5 @@
 use super::*;
 
-#[async_trait::async_trait]
 impl ContractExecutor for Executor<Runtime> {
     async fn fetch_contract(
         &mut self,
@@ -409,9 +408,6 @@ impl Executor<Runtime> {
         related_contracts: RelatedContracts<'_>,
     ) -> Response {
         let key = contract.key();
-        if self.update_notifications.get(&key).is_none() {
-            return Ok(ContractResponse::PutResponse { key }.into());
-        }
         let params = contract.params();
 
         if self.get_local_contract(key.id()).await.is_ok() {

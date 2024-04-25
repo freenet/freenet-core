@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -314,7 +315,6 @@ mod sealed {
     impl ChannelHalve for Callback {}
 }
 
-#[async_trait::async_trait]
 trait ComposeNetworkMessage<Op>
 where
     Self: Sized,
@@ -322,7 +322,10 @@ where
 {
     fn initiate_op(self, op_manager: &OpManager) -> Op;
 
-    async fn resume_op(op: Op, op_manager: &OpManager) -> Result<(), OpError>;
+    fn resume_op(
+        op: Op,
+        op_manager: &OpManager,
+    ) -> impl Future<Output = Result<(), OpError>> + Send;
 }
 
 #[allow(unused)]
@@ -331,7 +334,6 @@ struct GetContract {
     fetch_contract: bool,
 }
 
-#[async_trait::async_trait]
 impl ComposeNetworkMessage<operations::get::GetOp> for GetContract {
     fn initiate_op(self, _op_manager: &OpManager) -> operations::get::GetOp {
         operations::get::start_op(self.key, self.fetch_contract)
@@ -347,7 +349,6 @@ struct SubscribeContract {
     key: ContractKey,
 }
 
-#[async_trait::async_trait]
 impl ComposeNetworkMessage<operations::subscribe::SubscribeOp> for SubscribeContract {
     fn initiate_op(self, _op_manager: &OpManager) -> operations::subscribe::SubscribeOp {
         operations::subscribe::start_op(self.key)
@@ -368,7 +369,6 @@ struct PutContract {
     related_contracts: RelatedContracts<'static>,
 }
 
-#[async_trait::async_trait]
 impl ComposeNetworkMessage<operations::put::PutOp> for PutContract {
     fn initiate_op(self, op_manager: &OpManager) -> operations::put::PutOp {
         let PutContract {
@@ -395,37 +395,40 @@ struct UpdateContract {
     new_state: WrappedState,
 }
 
-#[async_trait::async_trait]
 impl ComposeNetworkMessage<operations::update::UpdateOp> for UpdateContract {
-    fn initiate_op(self, op_manager: &OpManager) -> operations::update::UpdateOp {
+    fn initiate_op(self, _op_manager: &OpManager) -> operations::update::UpdateOp {
         let UpdateContract { key, new_state } = self;
-        operations::update::start_op(key, new_state, op_manager.ring.max_hops_to_live)
+        let related_contracts = RelatedContracts::default();
+        operations::update::start_op(key, new_state, related_contracts)
     }
 
     async fn resume_op(
         op: operations::update::UpdateOp,
         op_manager: &OpManager,
     ) -> Result<(), OpError> {
-        operations::update::request_update(op_manager, op, None).await
+        operations::update::request_update(op_manager, op).await
     }
 }
 
-#[async_trait::async_trait]
 pub(crate) trait ContractExecutor: Send + 'static {
-    async fn fetch_contract(
+    fn fetch_contract(
         &mut self,
         key: ContractKey,
         fetch_contract: bool,
-    ) -> Result<(WrappedState, Option<ContractContainer>), ExecutorError>;
-    async fn store_contract(&mut self, contract: ContractContainer) -> Result<(), ExecutorError>;
+    ) -> impl Future<Output = Result<(WrappedState, Option<ContractContainer>), ExecutorError>> + Send;
 
-    async fn upsert_contract_state(
+    fn store_contract(
+        &mut self,
+        contract: ContractContainer,
+    ) -> impl Future<Output = Result<(), ExecutorError>> + Send;
+
+    fn upsert_contract_state(
         &mut self,
         key: ContractKey,
         update: Either<WrappedState, StateDelta<'static>>,
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
-    ) -> Result<WrappedState, ExecutorError>;
+    ) -> impl Future<Output = Result<WrappedState, ExecutorError>> + Send;
 }
 
 /// A WASM executor which will run any contracts, delegates, etc. registered.
@@ -496,8 +499,7 @@ impl<R> Executor<R> {
         let static_conf = crate::config::Config::conf();
 
         let db_path = crate::config::Config::conf().db_dir();
-        let state_store =
-            StateStore::new(Storage::new(Some(&db_path)).await?, MAX_MEM_CACHE).unwrap();
+        let state_store = StateStore::new(Storage::new(&db_path).await?, MAX_MEM_CACHE).unwrap();
 
         let contract_dir = config
             .node_data_dir
