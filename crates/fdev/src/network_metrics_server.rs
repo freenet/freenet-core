@@ -389,8 +389,6 @@ impl ServerState {
 
                 tracing::debug!(%tx_id, %key, %requester, %target, "checking values from save_record -- putrequest");
 
-                println!("{:?}", change);
-
                 let _ = self.changes.send(Change::PutRequest {
                     tx_id,
                     key,
@@ -415,8 +413,6 @@ impl ServerState {
                 }
 
                 tracing::debug!(%tx_id, %key, %requester, %target, "checking values from save_record -- putsuccess");
-
-                println!("{:?}", change);
 
                 let _ = self.changes.send(Change::PutSuccess { tx_id, key, target });
             }
