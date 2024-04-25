@@ -367,14 +367,6 @@ impl Operation for ConnectOp {
                                 );
                                 info.accepted_by.insert(acceptor.clone());
                             } else {
-                                try_to_clean_gw_connection(
-                                    id.clone(),
-                                    network_bridge,
-                                    info,
-                                    target.clone(),
-                                    acceptor.peer.clone(),
-                                )
-                                .await?;
                                 tracing::debug!(
                                     tx = %id,
                                     at = %this_peer_id,
@@ -402,12 +394,10 @@ impl Operation for ConnectOp {
                                 );
                                 op_manager.ring.update_location(target.location);
 
-                                let acutal_state = self.state;
-
                                 try_clean_gw_connection(
                                     id.clone(),
                                     network_bridge,
-                                    acutal_state,
+                                    info,
                                     target.clone(),
                                 )
                                 .await?;
@@ -527,25 +517,19 @@ async fn try_clean_gw_connection<NB>(
 where
     NB: NetworkBridge,
 {
-    match state {
-        Some(ConnectState::ConnectingToNode(ConnectionInfo {
-            gateway,
-            accecpted_by,
-            ..
-        })) => {
-            let need_to_clean_gw_conn = accecpted_by.iter().all(|pkloc| pkloc.peer != gateway.peer);
+    let need_to_clean_gw_conn = state
+        .accepted_by
+        .iter()
+        .all(|pkloc| pkloc.peer != state.gateway.peer);
 
-            if need_to_clean_gw_conn {
-                let msg = ConnectMsg::Request {
-                    id,
-                    msg: ConnectRequest::CleanConnection { joiner },
-                };
-                conn_bridge.send(&gateway.peer, msg.into()).await?;
-            }
-            Ok(())
-        }
-        _ => Err(OpError::UnexpectedOpState),
+    if need_to_clean_gw_conn {
+        let msg = ConnectMsg::Request {
+            id,
+            msg: ConnectRequest::CleanConnection { joiner },
+        };
+        conn_bridge.send(&state.gateway.peer, msg.into()).await?;
     }
+    Ok(())
 }
 
 type Requester = PeerKeyLocation;
