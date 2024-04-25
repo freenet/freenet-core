@@ -13,7 +13,7 @@ use axum::{
 };
 use dashmap::DashMap;
 use freenet::{
-    dev_tool::{PeerId, Transaction},
+    dev_tool::PeerId,
     generated::{
         topology::ControllerResponse, ChangesWrapper, ContractChange, PeerChange, TryFromFbs,
     },
@@ -147,7 +147,10 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     }
                 }
                 match ContractChange::try_decode_fbs(&msg) {
-                    Ok(ContractChange::PutFailure(err)) => todo!(),
+                    Ok(ContractChange::PutFailure(err)) => {
+                        // FIXME: handle put failure
+                        tracing::error!(error = "Failed to put contract");
+                    },
                     Ok(change) => {
                         if let Err(err) = state.save_record(ChangesWrapper::ContractChange(change))
                         {
@@ -370,12 +373,8 @@ impl ServerState {
                 let requester = change.requester().to_string();
                 let target = change.target().to_string();
 
-                if let Some(mut entry) = self.transactions_data.get_mut(&tx_id) {
-                    tracing::error!(
-                        "found an already included in logs transaction when it should create it."
-                    );
-
-                    unreachable!();
+                if self.transactions_data.get_mut(&tx_id).is_some() {
+                    unreachable!("found an already included in logs transaction when it should create it.");
                 } else {
                     self.transactions_data.insert(
                         tx_id.clone(),

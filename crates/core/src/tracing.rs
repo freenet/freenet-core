@@ -800,8 +800,8 @@ async fn send_to_metrics_server(
         EventKind::Put(PutEvent::Request {
             requester,
             key,
-            id,
             target,
+            ..
         }) => {
             let msg = ContractChange::put_request_msg(
                 send_msg.tx.to_string(),
@@ -812,10 +812,10 @@ async fn send_to_metrics_server(
             ws_stream.send(Message::Binary(msg)).await
         }
         EventKind::Put(PutEvent::PutSuccess {
-            id,
             requester,
             target,
             key,
+            ..
         }) => {
             let msg = ContractChange::put_success_msg(
                 send_msg.tx.to_string(),
