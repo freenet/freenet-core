@@ -402,6 +402,16 @@ impl Operation for ConnectOp {
                                 );
                                 op_manager.ring.update_location(target.location);
 
+                                let acutal_state = self.state;
+
+                                try_clean_gw_connection(
+                                    id.clone(),
+                                    network_bridge,
+                                    acutal_state,
+                                    target.clone(),
+                                )
+                                .await?;
+
                                 new_state = Some(ConnectState::Connected);
                             } else {
                                 new_state = Some(ConnectState::ConnectingToNode(info.clone()));
@@ -508,34 +518,34 @@ fn build_op_result(
     })
 }
 
-async fn try_to_clean_gw_connection<NB>(
+async fn try_clean_gw_connection<NB>(
     id: Transaction,
     conn_bridge: &mut NB,
     state: &mut ConnectionInfo,
     joiner: PeerKeyLocation,
-    accepter: PeerId,
 ) -> Result<(), OpError>
 where
     NB: NetworkBridge,
 {
-    let accepter_is_gateway = accepter == state.gateway.peer;
-    let other_peers_accepted = state
-        .accepted_by
-        .iter()
-        .any(|pkloc| pkloc.peer != state.gateway.peer);
+    match state {
+        Some(ConnectState::ConnectingToNode(ConnectionInfo {
+            gateway,
+            accecpted_by,
+            ..
+        })) => {
+            let need_to_clean_gw_conn = accecpted_by.iter().all(|pkloc| pkloc.peer != gateway.peer);
 
-    if accepter_is_gateway && other_peers_accepted {
-        let msg = ConnectMsg::Request {
-            id,
-            msg: ConnectRequest::CleanConnection { joiner },
-        };
-        conn_bridge.send(&state.gateway.peer, msg.into()).await?;
+            if need_to_clean_gw_conn {
+                let msg = ConnectMsg::Request {
+                    id,
+                    msg: ConnectRequest::CleanConnection { joiner },
+                };
+                conn_bridge.send(&gateway.peer, msg.into()).await?;
+            }
+            Ok(())
+        }
+        _ => Err(OpError::UnexpectedOpState),
     }
-
-    state.gateway_accepted = false;
-    state.remaining_connetions = 0;
-
-    Ok(())
 }
 
 type Requester = PeerKeyLocation;
@@ -569,7 +579,6 @@ impl ConnectivityInfo {
 #[derive(Debug, Clone)]
 struct ConnectionInfo {
     gateway: PeerKeyLocation,
-    gateway_accepted: bool,
     this_peer: Option<PeerId>,
     peer_pub_key: TransportPublicKey,
     max_hops_to_live: usize,
@@ -679,7 +688,6 @@ fn initial_request(
     const MAX_JOIN_RETRIES: usize = usize::MAX;
     let state = ConnectState::ConnectingToNode(ConnectionInfo {
         gateway: gateway.clone(),
-        gateway_accepted: true,
         this_peer: None,
         peer_pub_key: peer_pub_key.clone(),
         max_hops_to_live,
@@ -749,7 +757,6 @@ where
                 id,
                 state: Some(ConnectState::ConnectingToNode(ConnectionInfo {
                     gateway: gateway.clone(),
-                    gateway_accepted: true,
                     this_peer: None,
                     peer_pub_key,
                     max_hops_to_live,

@@ -388,6 +388,19 @@ impl P2pConnManager {
                                 }
                             }
 
+                            if let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
+                                msg: ConnectRequest::CleanConnection { joiner },
+                                ..
+                            })) = &msg
+                            {
+                                // this is the clean up message for a gw connection that was not accepted
+                                // in this case the joiner is connected to another peers, so we don't need to maintain the
+                                // connection with the rejected gateway
+                                self.bridge.active_net_connections.remove(&joiner.peer);
+                                self.connection.remove(&joiner.peer);
+                                op_manager.ring.prune_connection(joiner.peer.clone()).await;
+                            }
+
                             let executor_callback = pending_from_executor
                                 .remove(msg.id())
                                 .then(|| executor_listener.callback());
