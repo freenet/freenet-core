@@ -49,6 +49,7 @@ pub mod dev_tool {
     };
     pub use contract::{storages::Storage, Executor, OperationMode};
     pub use flatbuffers;
+    pub use message::Transaction;
     pub use node::{
         testing_impl::{
             EventChain, NetworkPeer, NodeLabel, PeerMessage, PeerStatus, SimNetwork, SimPeer,

@@ -418,6 +418,7 @@ impl Operation for PutOp {
                     return_msg = Some(PutMsg::SuccessfulPut {
                         id: *id,
                         target: *upstream,
+                        key: key.clone(),
                     });
                     new_state = None;
                 }
@@ -436,11 +437,12 @@ impl Operation for PutOp {
                                 this_peer = %op_manager.ring.peer_key,
                                 "Peer completed contract value put",
                             );
-                            new_state = Some(PutState::Finished { key });
+                            new_state = Some(PutState::Finished { key: key.clone() });
                             if let Some(upstream) = upstream {
                                 return_msg = Some(PutMsg::SuccessfulPut {
                                     id: *id,
                                     target: upstream,
+                                    key,
                                 });
                             } else {
                                 return_msg = None;
@@ -646,6 +648,7 @@ async fn try_to_broadcast(
                 return_msg = Some(PutMsg::SuccessfulPut {
                     id,
                     target: upstream,
+                    key: key.clone(),
                 });
             }
         }
@@ -886,6 +889,7 @@ mod messages {
         SuccessfulPut {
             id: Transaction,
             target: PeerKeyLocation,
+            key: ContractKey,
         },
         /// Target the node which is closest to the key
         SeekNode {

@@ -11,6 +11,13 @@
       rel="stylesheet"
       href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css"
     />
+    <style>
+      /* stylesheet used for ring visualization */
+      .line:hover {
+        cursor: pointer;
+        color: gray;
+      }
+    </style>
   </head>
   <body>
     <section class="section">
@@ -63,6 +70,8 @@
           </table>
         </div>
         <div class="column" id="peers-histogram"></div>
+      </div>
+      <div id="react-init-point">
       </div>
     </section>
     <script src="./bundle.js"></script>
