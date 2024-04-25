@@ -1,5 +1,4 @@
 //! Operation which seeks new connections in the ring.
-use blake3::Hash;
 use freenet_stdlib::client_api::HostResponse;
 use futures::Future;
 use std::collections::HashSet;
@@ -9,7 +8,6 @@ use std::time::Duration;
 use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
-use crate::generated::topology::Ok;
 use crate::message::NetMessageV1;
 use crate::ring::Ring;
 use crate::transport::TransportPublicKey;
@@ -125,14 +123,14 @@ impl Operation for ConnectOp {
     }
 
     fn process_message<'a, NB: NetworkBridge>(
-        self,
+        mut self,
         network_bridge: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let return_msg;
-            let new_state;
+            let mut new_state;
 
             match input {
                 ConnectMsg::Request {
@@ -354,18 +352,10 @@ impl Operation for ConnectOp {
 
                     let this_peer_id = op_manager.ring.get_peer_key().expect("peer id not found");
 
-                    match self.state {
-                        Some(ConnectState::ConnectingToNode(ConnectionInfo {
-                            gateway,
-                            gateway_accecpted,
-                            this_peer,
-                            peer_pub_key,
-                            max_hops_to_live,
-                            mut accecpted_by,
-                            remaining_connetions,
-                        })) => {
-                            assert!(remaining_connetions > 0);
-                            let remaining_connetions = remaining_connetions.saturating_sub(1);
+                    match self.state.as_mut() {
+                        Some(ConnectState::ConnectingToNode(info)) => {
+                            assert!(info.remaining_connetions > 0);
+                            let remaining_connetions = info.remaining_connetions.saturating_sub(1);
 
                             if *accepted {
                                 tracing::debug!(
@@ -375,22 +365,16 @@ impl Operation for ConnectOp {
                                     connectect_to = %acceptor.peer,
                                     "Open connection acknowledged at requesting joiner peer",
                                 );
-                                let accepted_by = accecpted_by.insert(acceptor.clone());
+                                info.accepted_by.insert(acceptor.clone());
                             } else {
-                                let actual_state = self.state;
-                                if let Some(updated_state) = try_to_clean_gw_connection(
+                                try_to_clean_gw_connection(
                                     id.clone(),
                                     network_bridge,
-                                    actual_state,
+                                    info,
                                     target.clone(),
                                     acceptor.peer.clone(),
                                 )
-                                .await?
-                                {
-                                    new_state = Some(updated_state);
-                                } else {
-                                    new_state = actual_state;
-                                }
+                                .await?;
                                 tracing::debug!(
                                     tx = %id,
                                     at = %this_peer_id,
@@ -420,15 +404,7 @@ impl Operation for ConnectOp {
 
                                 new_state = Some(ConnectState::Connected);
                             } else {
-                                new_state = Some(ConnectState::ConnectingToNode(ConnectionInfo {
-                                    gateway,
-                                    gateway_accecpted,
-                                    this_peer,
-                                    peer_pub_key,
-                                    max_hops_to_live,
-                                    accecpted_by,
-                                    remaining_connetions,
-                                }));
+                                new_state = Some(ConnectState::ConnectingToNode(info.clone()));
                             }
                             return_msg = None;
                         }
@@ -436,7 +412,7 @@ impl Operation for ConnectOp {
                             remaining_checks,
                             requester,
                         })) => {
-                            assert!(remaining_checks > 0);
+                            assert!(*remaining_checks > 0);
                             let remaining_checks = remaining_checks.saturating_sub(1);
 
                             if *accepted {
@@ -535,47 +511,31 @@ fn build_op_result(
 async fn try_to_clean_gw_connection<NB>(
     id: Transaction,
     conn_bridge: &mut NB,
-    state: Option<ConnectState>,
+    state: &mut ConnectionInfo,
     joiner: PeerKeyLocation,
     accepter: PeerId,
-) -> Result<Option<ConnectState>, OpError>
+) -> Result<(), OpError>
 where
     NB: NetworkBridge,
 {
-    match state {
-        Some(ConnectState::ConnectingToNode(ConnectionInfo {
-            gateway,
-            this_peer,
-            peer_pub_key,
-            max_hops_to_live,
-            accecpted_by,
-            ..
-        })) => {
-            let accepter_is_gateway = accepter == gateway.peer;
-            let other_peers_accepted = accecpted_by.iter().any(|pkloc| pkloc.peer != gateway.peer);
+    let accepter_is_gateway = accepter == state.gateway.peer;
+    let other_peers_accepted = state
+        .accepted_by
+        .iter()
+        .any(|pkloc| pkloc.peer != state.gateway.peer);
 
-            if accepter_is_gateway && other_peers_accepted {
-                let msg = ConnectMsg::Request {
-                    id,
-                    msg: ConnectRequest::CleanConnection { joiner },
-                };
-                conn_bridge.send(&gateway.peer, msg.into()).await?;
-            }
-
-            let new_state = Some(ConnectState::ConnectingToNode(ConnectionInfo {
-                gateway,
-                gateway_accecpted: false,
-                this_peer,
-                peer_pub_key,
-                max_hops_to_live,
-                accecpted_by,
-                remaining_connetions: 0,
-            }));
-
-            Ok(new_state)
-        }
-        _ => Err(OpError::UnexpectedOpState),
+    if accepter_is_gateway && other_peers_accepted {
+        let msg = ConnectMsg::Request {
+            id,
+            msg: ConnectRequest::CleanConnection { joiner },
+        };
+        conn_bridge.send(&state.gateway.peer, msg.into()).await?;
     }
+
+    state.gateway_accepted = false;
+    state.remaining_connetions = 0;
+
+    Ok(())
 }
 
 type Requester = PeerKeyLocation;
@@ -609,11 +569,11 @@ impl ConnectivityInfo {
 #[derive(Debug, Clone)]
 struct ConnectionInfo {
     gateway: PeerKeyLocation,
-    gateway_accecpted: bool,
+    gateway_accepted: bool,
     this_peer: Option<PeerId>,
     peer_pub_key: TransportPublicKey,
     max_hops_to_live: usize,
-    accecpted_by: HashSet<PeerKeyLocation>,
+    accepted_by: HashSet<PeerKeyLocation>,
     remaining_connetions: usize,
 }
 
@@ -719,11 +679,11 @@ fn initial_request(
     const MAX_JOIN_RETRIES: usize = usize::MAX;
     let state = ConnectState::ConnectingToNode(ConnectionInfo {
         gateway: gateway.clone(),
-        gateway_accecpted: true,
+        gateway_accepted: true,
         this_peer: None,
         peer_pub_key: peer_pub_key.clone(),
         max_hops_to_live,
-        accecpted_by: HashSet::new(),
+        accepted_by: HashSet::new(),
         remaining_connetions: max_hops_to_live,
     });
     let ceiling = if cfg!(test) {
@@ -789,11 +749,11 @@ where
                 id,
                 state: Some(ConnectState::ConnectingToNode(ConnectionInfo {
                     gateway: gateway.clone(),
-                    gateway_accecpted: true,
+                    gateway_accepted: true,
                     this_peer: None,
                     peer_pub_key,
                     max_hops_to_live,
-                    accecpted_by: HashSet::new(),
+                    accepted_by: HashSet::new(),
                     remaining_connetions: max_hops_to_live,
                 })),
                 gateway: Some(Box::new(gateway)),

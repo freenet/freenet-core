@@ -225,8 +225,8 @@ impl<'a> NetEventLog<'a> {
                 let this_peer = &op_manager.ring.get_peer_key().unwrap();
                 let key = contract.key();
                 EventKind::Put(PutEvent::Request {
-                    requester: *this_peer,
-                    target: *target,
+                    requester: this_peer.clone(),
+                    target: target.clone(),
                     key,
                     id: *id,
                 })
@@ -235,7 +235,7 @@ impl<'a> NetEventLog<'a> {
                 EventKind::Put(PutEvent::PutSuccess {
                     id: *id,
                     requester: op_manager.ring.get_peer_key().unwrap(),
-                    target: *target,
+                    target: target.clone(),
                     key: key.clone(),
                 })
             }

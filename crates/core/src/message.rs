@@ -5,7 +5,6 @@ use std::{
     fmt::Display,
     time::{Duration, SystemTime},
 };
-use tokio::sync::mpsc::Sender;
 
 use freenet_stdlib::prelude::ContractKey;
 use serde::{Deserialize, Serialize};

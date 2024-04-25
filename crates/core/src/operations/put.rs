@@ -417,7 +417,7 @@ impl Operation for PutOp {
                     // Subscriber nodes have been notified of the change, the operation is completed
                     return_msg = Some(PutMsg::SuccessfulPut {
                         id: *id,
-                        target: *upstream,
+                        target: upstream.clone(),
                         key: key.clone(),
                     });
                     new_state = None;
