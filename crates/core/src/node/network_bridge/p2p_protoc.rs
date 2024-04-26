@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::anyhow;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashSet;
 use either::{Either, Left, Right};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -42,11 +42,6 @@ type P2pBridgeEvent = Either<(FreenetPeerId, Box<NetMessage>), NodeEvent>;
 
 #[derive(Clone)]
 pub(crate) struct P2pBridge {
-    /// This map only matters for gateways which are forwarding messages
-    /// for joiners, we only maintain a connection as long as that peer hasn't
-    /// been connected to an other peer, if the gw doesn't want the connection
-    /// it will then be dropped.
-    active_net_connections: Arc<DashMap<FreenetPeerId, SocketAddr>>,
     accepted_peers: Arc<DashSet<FreenetPeerId>>,
     ev_listener_tx: Sender<P2pBridgeEvent>,
     op_manager: Arc<OpManager>,
@@ -63,7 +58,6 @@ impl P2pBridge {
         EL: NetEventRegister,
     {
         Self {
-            active_net_connections: Arc::new(DashMap::new()),
             accepted_peers: Arc::new(DashSet::new()),
             ev_listener_tx: sender,
             op_manager,
@@ -109,7 +103,6 @@ pub(in crate::node) struct P2pConnManager {
     conn_bridge_rx: Receiver<P2pBridgeEvent>,
     event_listener: Box<dyn NetEventRegister>,
     connection: HashMap<PeerId, PeerConnChannel>,
-    rejected_peers: HashSet<PeerId>, // TODO: what's the point of this set?
     key_pair: TransportKeypair,
     listening_ip: IpAddr,
     listening_port: u16,
@@ -141,7 +134,6 @@ impl P2pConnManager {
             conn_bridge_rx: rx_bridge_cmd,
             event_listener: Box::new(event_listener),
             connection: HashMap::new(),
-            rejected_peers: HashSet::new(),
             key_pair: private_key,
             listening_ip: listener_ip,
             listening_port: listen_port,
@@ -178,6 +170,8 @@ impl P2pConnManager {
         let mut outbound_conn_handler_2 = outbound_conn_handler.clone();
         let mut pending_outbound_conns = FuturesUnordered::new();
         let mut pending_inbound_gw_conns = HashMap::new();
+        // TODO: test out if you got multiple instances in a single machine what happens, in theory they should be using multiple sockets
+        let mut active_connections = HashSet::new();
 
         loop {
             let notification_msg = notification_channel.0.recv().map(|m| match m {
@@ -236,6 +230,10 @@ impl P2pConnManager {
                             continue;
                         }
                     };
+                    if !active_connections.contains(&conn.remote_addr()) {
+                        tracing::error!("Connection not found in active connections");
+                        continue;
+                    }
                     let remote_addr = conn.remote_addr();
                     let task = peer_connection_listener(rx, conn).boxed();
                     peer_connections.push(task);
@@ -338,6 +336,8 @@ impl P2pConnManager {
                                         .await
                                         .map(|peer_conn| (peer_conn, remote_peer));
                                     pending_outbound_conns.push(conn_fut);
+                                } else if &this_peer_id == joiner {
+                                    active_connections.remove(&acceptor.peer.addr());
                                 }
                             }
 
@@ -369,9 +369,7 @@ impl P2pConnManager {
                                             %remote_addr,
                                             "Established connection with peer",
                                         );
-                                        self.bridge
-                                            .active_net_connections
-                                            .insert(peer_id.clone(), remote_addr);
+                                        active_connections.insert(remote_addr);
 
                                         let (tx, rx) = mpsc::channel(10);
                                         self.connection.insert(peer_id.clone(), tx);
@@ -396,7 +394,7 @@ impl P2pConnManager {
                                 // this is the clean up message for a gw connection that was not accepted
                                 // in this case the joiner is connected to another peers, so we don't need to maintain the
                                 // connection with the rejected gateway
-                                self.bridge.active_net_connections.remove(&joiner.peer);
+                                active_connections.remove(&joiner.peer.addr());
                                 self.connection.remove(&joiner.peer);
                                 op_manager.ring.prune_connection(joiner.peer.clone()).await;
                             }
@@ -448,10 +446,9 @@ impl P2pConnManager {
                     return Ok(());
                 }
                 Ok(Right(NodeAction(NodeEvent::DropConnection(peer_id)))) => {
-                    self.bridge.active_net_connections.remove(&peer_id);
+                    active_connections.remove(&peer_id.addr());
                     op_manager.ring.prune_connection(peer_id.clone()).await;
                     self.connection.remove(&peer_id);
-                    self.rejected_peers.insert(peer_id.clone());
                     tracing::info!("Dropped connection with peer {}", peer_id);
                 }
                 Ok(Right(GatewayConnection {
@@ -463,9 +460,7 @@ impl P2pConnManager {
                 Ok(Right(ConnectionEstablished { peer, peer_conn })) => {
                     let addr = peer.addr.clone();
                     tracing::debug!("Established connection with peer @ {}", addr);
-                    self.bridge
-                        .active_net_connections
-                        .insert(peer.clone(), addr);
+                    active_connections.insert(addr);
 
                     let (tx, rx) = mpsc::channel(10);
                     self.connection.insert(peer.clone(), tx);
