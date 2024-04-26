@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
-    node::{ConnectionError, PeerId},
+    node::PeerId,
     operations::{
         connect::ConnectMsg, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg, update::UpdateMsg,
     },
@@ -302,9 +302,6 @@ pub(crate) enum NodeEvent {
     ShutdownNode,
     /// Drop the given peer connection.
     DropConnection(PeerId),
-    /// Error while sending a message by the connection bridge from within the ops.
-    #[serde(skip)]
-    Error(ConnectionError),
     Disconnect {
         cause: Option<Cow<'static, str>>,
     },
@@ -317,7 +314,6 @@ impl Display for NodeEvent {
             NodeEvent::DropConnection(peer) => {
                 write!(f, "DropConnection (from {peer})")
             }
-            NodeEvent::Error(err) => write!(f, "{err}"),
             NodeEvent::Disconnect { cause: Some(cause) } => {
                 write!(f, "Disconnect node, reason: {cause}")
             }

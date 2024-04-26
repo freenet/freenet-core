@@ -435,9 +435,6 @@ impl P2pConnManager {
                     tracing::info!("Shutting down message loop gracefully");
                     break;
                 }
-                Ok(Right(NodeAction(NodeEvent::Error(err)))) => {
-                    tracing::error!("Bridge conn error: {err}");
-                }
                 Ok(Right(NodeAction(NodeEvent::Disconnect { cause }))) => {
                     match cause {
                         Some(cause) => tracing::warn!("Shutting down node: {cause}"),

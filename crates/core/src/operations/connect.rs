@@ -198,7 +198,9 @@ impl Operation for ConnectOp {
                             "Querying the query target for new connections",
                         );
                         debug_assert_eq!(this_peer, &joiner.peer);
-                        new_state = Some(ConnectState::AwaitingNewConnection {});
+                        new_state = Some(ConnectState::AwaitingNewConnection(NewConnectionInfo {
+                            remaining_connetions: *max_hops_to_live,
+                        }));
                         let msg = ConnectMsg::Request {
                             id: *id,
                             msg: ConnectRequest::FindOptimalPeer {
@@ -283,6 +285,11 @@ impl Operation for ConnectOp {
                         .should_accept(joiner_loc, Some(&joiner.peer))
                     {
                         tracing::debug!(tx = %id, %joiner, "Accepting connection from");
+                        op_manager
+                            .ring
+                            .add_connection(joiner_loc, joiner.peer.clone())
+                            .await;
+
                         true
                     } else {
                         tracing::debug!(tx = %id, at = %this_peer.peer, from = %joiner, "Rejecting connection");
@@ -410,6 +417,12 @@ impl Operation for ConnectOp {
                                     accecpted_by = %acceptor.peer,
                                     "Connectivity check accepted",
                                 );
+                                let acceptor_loc =
+                                    acceptor.location.expect("location not found for acceptor");
+                                op_manager
+                                    .ring
+                                    .add_connection(acceptor_loc, acceptor.peer.clone())
+                                    .await;
                             } else {
                                 tracing::debug!(
                                     tx = %id,
@@ -445,6 +458,38 @@ impl Operation for ConnectOp {
                                 msg: response,
                                 target: requester.clone(),
                             });
+                        }
+                        Some(ConnectState::AwaitingNewConnection(info)) => {
+                            tracing::debug!(
+                                tx = %id,
+                                at = %this_peer_id,
+                                from = %sender.peer,
+                                "Connection request forwarded",
+                            );
+                            assert!(info.remaining_connetions > 0);
+                            let remaining_connetions = info.remaining_connetions.saturating_sub(1);
+
+                            if remaining_connetions == 0 {
+                                tracing::debug!(
+                                    tx = %id,
+                                    at = %this_peer_id,
+                                    from = %sender.peer,
+                                    "All available connections established",
+                                );
+                                op_manager
+                                    .ring
+                                    .live_tx_tracker
+                                    .missing_candidate_peers(this_peer_id)
+                                    .await;
+                                new_state = None;
+                            } else {
+                                new_state =
+                                    Some(ConnectState::AwaitingNewConnection(NewConnectionInfo {
+                                        remaining_connetions,
+                                    }));
+                            }
+
+                            return_msg = None;
                         }
                         _ => {
                             tracing::debug!(
@@ -527,7 +572,7 @@ enum ConnectState {
     ConnectingToNode(ConnectionInfo),
     AwaitingConnectivity(ConnectivityInfo),
     AwaitingConnectionAcquisition,
-    AwaitingNewConnection,
+    AwaitingNewConnection(NewConnectionInfo),
     Connected,
 }
 
@@ -553,6 +598,11 @@ struct ConnectionInfo {
     peer_pub_key: TransportPublicKey,
     max_hops_to_live: usize,
     accepted_by: HashSet<PeerKeyLocation>,
+    remaining_connetions: usize,
+}
+
+#[derive(Debug, Clone)]
+struct NewConnectionInfo {
     remaining_connetions: usize,
 }
 

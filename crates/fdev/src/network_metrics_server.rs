@@ -195,7 +195,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
     let (mut tx, _) = ws.split();
     for peer in state.peer_data.iter() {
         let msg = PeerChange::current_state_msg(
-            *peer.key(),
+            peer.key().clone(),
             peer.value().location,
             peer.value().connections.iter(),
         );

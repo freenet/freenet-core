@@ -22,7 +22,7 @@ pub(crate) mod update;
 
 pub(crate) trait Operation
 where
-    Self: Sized + TryInto<Self::Result>,
+    Self: Sized,
 {
     type Message: InnerMessage + std::fmt::Display;
 

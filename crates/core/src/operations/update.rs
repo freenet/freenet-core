@@ -1,5 +1,4 @@
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
-use std::time::Instant;
 // TODO: complete update logic in the network
 use freenet_stdlib::prelude::*;
 
@@ -26,12 +25,26 @@ impl UpdateOp {
     }
 
     pub fn finalized(&self) -> bool {
-        self.stats
-            .as_ref()
-            .map(|s| matches!(s.step, RecordingStats::Completed))
-            .unwrap_or(false)
-            || matches!(self.state, Some(UpdateState::Finished { .. }))
+        matches!(self.state, None | Some(UpdateState::Finished { .. }))
     }
+
+    // pub(super) fn record_transfer(&mut self) {
+    //     if let Some(stats) = self.stats.as_mut() {
+    //         match stats.step {
+    //             RecordingStats::Uninitialized => {
+    //                 stats.transfer_time = Some((Instant::now(), None));
+    //                 stats.step = RecordingStats::InitUpdate;
+    //             }
+    //             RecordingStats::InitUpdate => {
+    //                 if let Some((_, e)) = stats.transfer_time.as_mut() {
+    //                     *e = Some(Instant::now());
+    //                 }
+    //                 stats.step = RecordingStats::Completed;
+    //             }
+    //             RecordingStats::Completed => {}
+    //         }
+    //     }
+    // }
 
     pub(super) fn to_host_result(&self) -> HostResult {
         if let Some(UpdateState::Finished { key, summary }) = &self.state {
@@ -52,16 +65,16 @@ impl UpdateOp {
 
 struct UpdateStats {
     target: Option<PeerKeyLocation>,
-    step: RecordingStats,
+    // step: RecordingStats,
 }
 
-/// While timing, at what particular step we are now.
-#[derive(Clone, Copy, Default)]
-enum RecordingStats {
-    #[default]
-    Uninitialized,
-    Completed,
-}
+// /// While timing, at what particular step we are now.
+// #[derive(Clone, Copy, Default)]
+// enum RecordingStats {
+//     #[default]
+//     Uninitialized,
+//     Completed,
+// }
 
 pub(crate) struct UpdateResult {}
 
@@ -69,10 +82,7 @@ impl TryFrom<UpdateOp> for UpdateResult {
     type Error = OpError;
 
     fn try_from(op: UpdateOp) -> Result<Self, Self::Error> {
-        if let Some(true) = op
-            .stats
-            .map(|s| matches!(s.step, RecordingStats::Completed))
-        {
+        if matches!(op.state, None | Some(UpdateState::Finished { .. })) {
             Ok(UpdateResult {})
         } else {
             Err(OpError::UnexpectedOpState)
@@ -563,10 +573,7 @@ pub(crate) fn start_op(
     UpdateOp {
         id,
         state,
-        stats: Some(UpdateStats {
-            target: None,
-            step: Default::default(),
-        }),
+        stats: Some(UpdateStats { target: None }),
     }
 }
 

@@ -4,7 +4,6 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Instant;
 
 pub(crate) use self::messages::PutMsg;
 use freenet_stdlib::{
@@ -58,11 +57,7 @@ impl PutOp {
     }
 
     pub(super) fn finalized(&self) -> bool {
-        self.stats
-            .as_ref()
-            .map(|s| matches!(s.step, RecordingStats::Completed))
-            .unwrap_or(false)
-            || matches!(self.state, Some(PutState::Finished { .. }))
+        self.state.is_none()
     }
 
     pub(super) fn to_host_result(&self) -> HostResult {
@@ -81,33 +76,9 @@ impl PutOp {
 
 struct PutStats {
     target: Option<PeerKeyLocation>,
-    step: RecordingStats,
-}
-
-/// While timing, at what particular step we are now.
-#[derive(Clone, Copy, Default)]
-enum RecordingStats {
-    #[default]
-    Uninitialized,
-    Completed,
 }
 
 pub(crate) struct PutResult {}
-
-impl TryFrom<PutOp> for PutResult {
-    type Error = OpError;
-
-    fn try_from(op: PutOp) -> Result<Self, Self::Error> {
-        if let Some(true) = op
-            .stats
-            .map(|s| matches!(s.step, RecordingStats::Completed))
-        {
-            Ok(PutResult {})
-        } else {
-            Err(OpError::UnexpectedOpState)
-        }
-    }
-}
 
 impl Operation for PutOp {
     type Message = PutMsg;
@@ -655,10 +626,7 @@ pub(crate) fn start_op(
     PutOp {
         id,
         state,
-        stats: Some(PutStats {
-            target: None,
-            step: Default::default(),
-        }),
+        stats: Some(PutStats { target: None }),
     }
 }
 

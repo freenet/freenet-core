@@ -1101,9 +1101,6 @@ where
                     tracing::info!(peer = %peer_key, "Shutting down node");
                     return Ok(());
                 }
-                other => {
-                    unreachable!("event {other:?}, shouldn't happen in the in-memory impl")
-                }
             },
             Err(err) => {
                 super::report_result(
