@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use crate::{
-    config::GlobalExecutor,
+    config::{Config, GlobalExecutor},
     contract::{self, ContractHandler, MemoryContractHandler},
     dev_tool::{ClientEventsProxy, NodeConfig},
     node::{
@@ -21,7 +21,11 @@ pub struct SimPeer {
 }
 
 impl SimPeer {
-    pub async fn start_child<UsrEv>(self, event_generator: UsrEv) -> Result<(), anyhow::Error>
+    pub async fn start_child<UsrEv>(
+        self,
+        config: &Config,
+        event_generator: UsrEv,
+    ) -> Result<(), anyhow::Error>
     where
         UsrEv: ClientEventsProxy + Send + 'static,
     {
@@ -30,15 +34,13 @@ impl SimPeer {
             {
                 use crate::tracing::{CombinedRegister, OTEventRegister};
                 CombinedRegister::new([
-                    Box::new(EventRegister::new(
-                        crate::config::Config::conf().event_log(),
-                    )),
+                    Box::new(EventRegister::new(config.event_log())),
                     Box::new(OTEventRegister::new()),
                 ])
             }
             #[cfg(not(feature = "trace-ot"))]
             {
-                EventRegister::new(crate::config::Config::conf().event_log())
+                EventRegister::new(config.event_log())
             }
         };
         self.run_node(event_generator, event_register).await

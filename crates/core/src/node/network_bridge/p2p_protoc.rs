@@ -37,7 +37,7 @@ use unsigned_varint::codec::UviBytes;
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::{
     client_events::ClientId,
-    config::{self, GlobalExecutor},
+    config::{self, Config, GlobalExecutor},
     contract::{
         ClientResponsesSender, ContractHandlerChannel, ExecutorToEventLoopChannel,
         NetworkEventListenerHalve, WaitingResolution,
@@ -266,6 +266,7 @@ impl P2pConnManager {
     #[tracing::instrument(name = "network_event_listener", fields(peer = %self.bridge.op_manager.ring.peer_key), skip_all)]
     pub async fn run_event_listener(
         mut self,
+        config: &Config,
         op_manager: Arc<OpManager>,
         mut client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
         mut notification_channel: EventLoopNotificationsReceiver,
@@ -279,12 +280,7 @@ impl P2pConnManager {
         let mut pending_from_executor = HashSet::new();
         let mut tx_to_client: HashMap<Transaction, ClientId> = HashMap::new();
 
-        let this_peer = FreenetPeerId::from(
-            crate::config::Config::conf()
-                .local_peer_keypair
-                .public()
-                .to_peer_id(),
-        );
+        let this_peer = FreenetPeerId::from(config.local_peer_keypair().public().to_peer_id());
 
         loop {
             let network_msg = self.swarm.select_next_some().map(|event| match event {

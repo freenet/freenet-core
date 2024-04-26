@@ -20,7 +20,7 @@ use super::{
 };
 use crate::{
     client_events::{combinator::ClientEventsCombinator, BoxedClient},
-    config::{self, GlobalExecutor},
+    config::{self, Config, GlobalExecutor},
     contract::{
         self, ClientResponsesSender, ContractHandler, ContractHandlerChannel,
         ExecutorToEventLoopChannel, NetworkEventListenerHalve, WaitingResolution,
@@ -42,6 +42,7 @@ pub(super) struct NodeP2P {
     cli_response_sender: ClientResponsesSender,
     node_controller: tokio::sync::mpsc::Receiver<NodeEvent>,
     is_gateway: bool,
+    pub(crate) config: Arc<Config>,
 }
 
 impl NodeP2P {
@@ -62,6 +63,7 @@ impl NodeP2P {
         // start the p2p event loop
         self.conn_manager
             .run_event_listener(
+                &self.config,
                 self.op_manager.clone(),
                 self.client_wait_for_transaction,
                 self.notification_channel,
@@ -138,6 +140,7 @@ impl NodeP2P {
             cli_response_sender,
             node_controller: node_controller_rx,
             is_gateway: config.is_gateway(),
+            config: config.config.clone(),
         })
     }
 

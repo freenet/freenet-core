@@ -1,18 +1,19 @@
 use std::{
+    borrow::Cow,
     fs::{self, File},
     future::Future,
     io::Read,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr},
     path::PathBuf,
     pin::Pin,
-    str::FromStr,
     sync::atomic::AtomicBool,
     time::Duration,
 };
 
 use directories::ProjectDirs;
-use libp2p::{identity, PeerId};
+use libp2p::identity;
 use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
 use crate::local_node::OperationMode;
@@ -46,56 +47,139 @@ const QUALIFIER: &str = "";
 const ORGANIZATION: &str = "The Freenet Project Inc";
 const APPLICATION: &str = "Freenet";
 
+#[derive(clap::Parser, Debug, Serialize, Deserialize)]
 pub struct Config {
-    pub bootstrap_ip: IpAddr,
-    pub bootstrap_port: u16,
-    pub bootstrap_id: Option<PeerId>,
-    pub local_peer_keypair: identity::Keypair,
+    /// Node operation mode.
+    #[clap(value_enum, default_value_t = OperationMode::Local)]
+    pub mode: OperationMode,
+
+    /// Overrides the default data directory where Freenet contract files are stored.
+    pub node_data_dir: Option<PathBuf>,
+
+    #[clap(flatten)]
+    #[serde(flatten)]
+    pub gateway: GatewayConfig,
+    // FIXME: how to serialize this?
+    #[clap(value_parser = parse_keypair)]
+    #[serde(skip_serializing, deserialize_with = "deserialize_keypair")]
+    pub local_peer_keypair: Option<identity::Keypair>,
+    #[serde(with = "serde_log_level_filter")]
     pub log_level: tracing::log::LevelFilter,
+    #[clap(flatten)]
+    #[serde(flatten)]
     config_paths: ConfigPaths,
-    local_mode: AtomicBool,
-
-    #[cfg(feature = "websocket")]
-    #[allow(unused)]
-    pub(crate) ws: WebSocketApiConfig,
 }
 
-#[cfg(feature = "websocket")]
-#[derive(Debug, Copy, Clone)]
-pub(crate) struct WebSocketApiConfig {
-    ip: IpAddr,
-    port: u16,
-}
+impl Config {
+    /// Parse the command line arguments and return the configuration.
+    pub fn parse() -> Self {
+        let mut this: Config = clap::Parser::parse();
+        this.local_peer_keypair
+            .get_or_insert_with(identity::Keypair::generate_ed25519);
+        this
+    }
 
-#[cfg(feature = "websocket")]
-impl From<WebSocketApiConfig> for SocketAddr {
-    fn from(val: WebSocketApiConfig) -> Self {
-        (val.ip, val.port).into()
+    /// Returns the local peer keypair.
+    pub fn local_peer_keypair(&self) -> &identity::Keypair {
+        self.local_peer_keypair.as_ref().unwrap()
     }
 }
 
-#[cfg(feature = "websocket")]
-impl WebSocketApiConfig {
-    fn from_config(config: &config::Config) -> Self {
-        WebSocketApiConfig {
-            ip: IpAddr::from_str(
-                &config
-                    .get_string("websocket_api_ip")
-                    .unwrap_or_else(|_| format!("{}", Ipv4Addr::LOCALHOST)),
-            )
-            .map_err(|_err| std::io::ErrorKind::InvalidInput)
-            .unwrap(),
-            port: config
-                .get_int("websocket_api_port")
-                .map(u16::try_from)
-                .unwrap_or(Ok(DEFAULT_WEBSOCKET_API_PORT))
-                .map_err(|_err| std::io::ErrorKind::InvalidInput)
-                .unwrap(),
-        }
+fn parse_keypair(s: &str) -> Result<identity::Keypair, Cow<'static, str>> {
+    // first check if the string is a path to a file
+    let path = std::path::Path::new(s);
+    if path.exists() {
+        let mut key_file =
+            File::open(path).map_err(|e| format!("Failed to open key file {s}: {e}"))?;
+        let mut buf = Vec::new();
+        key_file
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("Failed to read key file {s}: {e}"))?;
+        let keypair = identity::Keypair::from_protobuf_encoding(&buf)
+            .map_err(|e| format!("Failed to parse key file {s}: {e}"))?;
+        return Ok(keypair);
+    }
+
+    // otherwise, try to parse the string as a base64 encoded keypair
+    let keypair =
+        identity::Keypair::from_protobuf_encoding(s.as_bytes()).map_err(|e| format!("{e}"))?;
+    Ok(keypair)
+}
+
+fn deserialize_keypair<'de, D>(deserializer: D) -> Result<Option<identity::Keypair>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = Option::<&str>::deserialize(deserializer)?;
+    match s {
+        Some(s) => parse_keypair(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        None => Ok(None),
     }
 }
 
-#[derive(Debug)]
+mod serde_log_level_filter {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use tracing::log::LevelFilter;
+
+    pub fn serialize<S>(level: &LevelFilter, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let level = match level {
+            LevelFilter::Off => "off",
+            LevelFilter::Error => "error",
+            LevelFilter::Warn => "warn",
+            LevelFilter::Info => "info",
+            LevelFilter::Debug => "debug",
+            LevelFilter::Trace => "trace",
+        };
+        serializer.serialize_str(level)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<LevelFilter, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let level = <&str>::deserialize(deserializer)?;
+
+        Ok(match level.trim() {
+            "off" | "Off" | "OFF" => LevelFilter::Off,
+            "error" | "Error" | "ERROR" => LevelFilter::Error,
+            "warn" | "Warn" | "WARN" => LevelFilter::Warn,
+            "info" | "Info" | "INFO" => LevelFilter::Info,
+            "debug" | "Debug" | "DEBUG" => LevelFilter::Debug,
+            "trace" | "Trace" | "TRACE" => LevelFilter::Trace,
+            s => return Err(serde::de::Error::custom(format!("unknown log level: {s}"))),
+        })
+    }
+}
+
+#[derive(clap::Parser, Debug, Copy, Clone, Serialize, Deserialize)]
+pub(crate) struct GatewayConfig {
+    /// Address to bind to
+    #[arg(long = "gateway-address", default_value_t = default_gateway_address())]
+    #[serde(default = "default_gateway_address", rename = "gateway-address")]
+    pub address: IpAddr,
+
+    /// Port to expose api on
+    #[arg(long = "gateway-port", default_value_t = default_gateway_port())]
+    #[serde(default = "default_gateway_port", rename = "gateway-port")]
+    pub port: u16,
+}
+
+#[inline]
+const fn default_gateway_address() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+}
+
+#[inline]
+const fn default_gateway_port() -> u16 {
+    50509
+}
+
+#[derive(clap::Parser, Debug, Serialize, Deserialize)]
 pub struct ConfigPaths {
     contracts_dir: PathBuf,
     delegates_dir: PathBuf,
@@ -162,145 +246,136 @@ impl ConfigPaths {
 }
 
 impl Config {
-    pub fn set_op_mode(mode: OperationMode) {
-        let local_mode = matches!(mode, OperationMode::Local);
-        Self::conf()
-            .local_mode
-            .store(local_mode, std::sync::atomic::Ordering::SeqCst);
-    }
-
     pub fn db_dir(&self) -> PathBuf {
-        if self.local_mode.load(std::sync::atomic::Ordering::SeqCst) {
-            self.config_paths.db_dir.join("local")
-        } else {
-            self.config_paths.db_dir.to_owned()
+        match self.mode {
+            OperationMode::Local => self.config_paths.db_dir.join("local"),
+            OperationMode::Network => self.config_paths.db_dir.to_owned(),
         }
     }
 
     pub fn contracts_dir(&self) -> PathBuf {
-        if self.local_mode.load(std::sync::atomic::Ordering::SeqCst) {
-            self.config_paths.contracts_dir.join("local")
-        } else {
-            self.config_paths.contracts_dir.to_owned()
+        match self.mode {
+            OperationMode::Local => self.config_paths.contracts_dir.join("local"),
+            OperationMode::Network => self.config_paths.contracts_dir.to_owned(),
         }
     }
 
     pub fn delegates_dir(&self) -> PathBuf {
-        if self.local_mode.load(std::sync::atomic::Ordering::SeqCst) {
-            self.config_paths.delegates_dir.join("local")
-        } else {
-            self.config_paths.delegates_dir.to_owned()
+        match self.mode {
+            OperationMode::Local => self.config_paths.delegates_dir.join("local"),
+            OperationMode::Network => self.config_paths.delegates_dir.to_owned(),
         }
     }
 
     pub fn secrets_dir(&self) -> PathBuf {
-        if self.local_mode.load(std::sync::atomic::Ordering::SeqCst) {
-            self.config_paths.secrets_dir.join("local")
-        } else {
-            self.config_paths.delegates_dir.to_owned()
+        match self.mode {
+            OperationMode::Local => self.config_paths.secrets_dir.join("local"),
+            OperationMode::Network => self.config_paths.secrets_dir.to_owned(),
         }
     }
 
     pub fn event_log(&self) -> PathBuf {
-        if self.local_mode.load(std::sync::atomic::Ordering::SeqCst) {
-            let mut local_file = self.config_paths.event_log.clone();
-            local_file.set_file_name("_EVENT_LOG_LOCAL");
-            local_file
-        } else {
-            self.config_paths.event_log.to_owned()
+        match self.mode {
+            OperationMode::Local => {
+                let mut local_file = self.config_paths.event_log.clone();
+                local_file.set_file_name("_EVENT_LOG_LOCAL");
+                local_file
+            }
+            OperationMode::Network => self.config_paths.event_log.to_owned(),
         }
     }
 
-    pub fn conf() -> &'static Config {
-        CONFIG.get_or_init(|| match Config::load_conf() {
-            Ok(config) => config,
-            Err(err) => {
-                tracing::error!("failed while loading configuration: {err}");
-                panic!("Failed while loading configuration")
-            }
-        })
-    }
+    // pub fn conf() -> &'static Config {
+    //     // CONFIG.get_or_init(|| match Config::load_conf() {
+    //     //     Ok(config) => config,
+    //     //     Err(err) => {
+    //     //         tracing::error!("failed while loading configuration: {err}");
+    //     //         panic!("Failed while loading configuration")
+    //     //     }
+    //     // })
+    //     todo!()
+    // }
 
-    fn load_conf() -> std::io::Result<Config> {
-        let settings: config::Config = config::Config::builder()
-            .add_source(config::Environment::with_prefix("FREENET"))
-            .build()
-            .unwrap();
-        let local_peer_keypair = if let Ok(path_to_key) = settings
-            .get_string("local_peer_key_file")
-            .map(PathBuf::from)
-        {
-            let mut key_file = File::open(&path_to_key).unwrap_or_else(|_| {
-                panic!(
-                    "Failed to open key file: {}",
-                    &path_to_key.to_str().unwrap()
-                )
-            });
-            let mut buf = Vec::new();
-            key_file.read_to_end(&mut buf).unwrap();
-            Some(
-                identity::Keypair::from_protobuf_encoding(&buf)
-                    .map_err(|_| std::io::ErrorKind::InvalidData)?,
-            )
-        } else {
-            None
-        };
-        let log_level = settings
-            .get_string("log")
-            .map(|lvl| lvl.parse().ok())
-            .ok()
-            .flatten()
-            .unwrap_or(tracing::log::LevelFilter::Info);
-        let (bootstrap_ip, bootstrap_port, bootstrap_id) = Config::get_bootstrap_host(&settings)?;
+    // fn load_conf() -> std::io::Result<Config> {
+    //     let settings: config::Config = config::Config::builder()
+    //         .add_source(config::Environment::with_prefix("FREENET"))
+    //         .build()
+    //         .unwrap();
+    //     let local_peer_keypair = if let Ok(path_to_key) = settings
+    //         .get_string("local_peer_key_file")
+    //         .map(PathBuf::from)
+    //     {
+    //         let mut key_file = File::open(&path_to_key).unwrap_or_else(|_| {
+    //             panic!(
+    //                 "Failed to open key file: {}",
+    //                 &path_to_key.to_str().unwrap()
+    //             )
+    //         });
+    //         let mut buf = Vec::new();
+    //         key_file.read_to_end(&mut buf).unwrap();
+    //         Some(
+    //             identity::Keypair::from_protobuf_encoding(&buf)
+    //                 .map_err(|_| std::io::ErrorKind::InvalidData)?,
+    //         )
+    //     } else {
+    //         None
+    //     };
+    //     let log_level = settings
+    //         .get_string("log")
+    //         .map(|lvl| lvl.parse().ok())
+    //         .ok()
+    //         .flatten()
+    //         .unwrap_or(tracing::log::LevelFilter::Info);
+    //     let (bootstrap_ip, bootstrap_port, bootstrap_id) = Config::get_bootstrap_host(&settings)?;
 
-        let data_dir = settings.get_string("data_dir").ok().map(PathBuf::from);
-        let config_paths = ConfigPaths::new(data_dir)?;
+    //     let data_dir = settings.get_string("data_dir").ok().map(PathBuf::from);
+    //     let config_paths = ConfigPaths::new(data_dir)?;
 
-        let local_mode = settings.get_string("network_mode").is_err();
+    //     let local_mode = settings.get_string("network_mode").is_err();
 
-        Ok(Config {
-            bootstrap_ip,
-            bootstrap_port,
-            bootstrap_id,
-            local_peer_keypair: local_peer_keypair
-                .unwrap_or_else(identity::Keypair::generate_ed25519),
-            log_level,
-            config_paths,
-            local_mode: AtomicBool::new(local_mode),
-            #[cfg(feature = "websocket")]
-            ws: WebSocketApiConfig::from_config(&settings),
-        })
-    }
+    //     Ok(Config {
+    //         bootstrap_ip,
+    //         bootstrap_port,
+    //         bootstrap_id,
+    //         local_peer_keypair: local_peer_keypair
+    //             .unwrap_or_else(identity::Keypair::generate_ed25519),
+    //         log_level,
+    //         config_paths,
+    //         local_mode: AtomicBool::new(local_mode),
+    //         #[cfg(feature = "websocket")]
+    //         ws: WebSocketApiConfig::from_config(&settings),
+    //     })
+    // }
 
-    fn get_bootstrap_host(
-        settings: &config::Config,
-    ) -> std::io::Result<(IpAddr, u16, Option<PeerId>)> {
-        let bootstrap_ip = IpAddr::from_str(
-            &settings
-                .get_string("bootstrap_host")
-                .unwrap_or_else(|_| format!("{}", Ipv4Addr::LOCALHOST)),
-        )
-        .map_err(|_err| std::io::ErrorKind::InvalidInput)?;
+    // fn get_bootstrap_host(
+    //     settings: &config::Config,
+    // ) -> std::io::Result<(IpAddr, u16, Option<PeerId>)> {
+    //     let bootstrap_ip = IpAddr::from_str(
+    //         &settings
+    //             .get_string("bootstrap_host")
+    //             .unwrap_or_else(|_| format!("{}", Ipv4Addr::LOCALHOST)),
+    //     )
+    //     .map_err(|_err| std::io::ErrorKind::InvalidInput)?;
 
-        let bootstrap_port = settings
-            .get_int("bootstrap_port")
-            .ok()
-            .map(u16::try_from)
-            .unwrap_or(Ok(DEFAULT_BOOTSTRAP_PORT))
-            .map_err(|_err| std::io::ErrorKind::InvalidInput)?;
+    //     let bootstrap_port = settings
+    //         .get_int("bootstrap_port")
+    //         .ok()
+    //         .map(u16::try_from)
+    //         .unwrap_or(Ok(DEFAULT_BOOTSTRAP_PORT))
+    //         .map_err(|_err| std::io::ErrorKind::InvalidInput)?;
 
-        let id_str = if let Some(id_str) = settings
-            .get_string("bootstrap_id")
-            .ok()
-            .map(|id| id.parse().map_err(|_err| std::io::ErrorKind::InvalidInput))
-        {
-            Some(id_str?)
-        } else {
-            None
-        };
+    //     let id_str = if let Some(id_str) = settings
+    //         .get_string("bootstrap_id")
+    //         .ok()
+    //         .map(|id| id.parse().map_err(|_err| std::io::ErrorKind::InvalidInput))
+    //     {
+    //         Some(id_str?)
+    //     } else {
+    //         None
+    //     };
 
-        Ok((bootstrap_ip, bootstrap_port, id_str))
-    }
+    //     Ok((bootstrap_ip, bootstrap_port, id_str))
+    // }
 }
 
 pub(crate) struct GlobalExecutor;

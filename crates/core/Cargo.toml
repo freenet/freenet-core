@@ -27,7 +27,7 @@ cache-padded = "1.3"
 chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 clap = { features = ["derive", "env"], workspace = true }
-config = { features = ["toml"], version = "0.14" }
+# config = { features = ["toml"], version = "0.14" }
 cookie = "0.18"
 crossbeam = { workspace = true }
 ctrlc = { features = ["termination"], workspace = true }

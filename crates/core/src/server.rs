@@ -186,28 +186,24 @@ pub mod network_node {
     use tower_http::trace::TraceLayer;
 
     use crate::{
-        client_events::websocket::WebSocketProxy, dev_tool::NodeConfig, local_node::PeerCliConfig,
-        DynError,
+        client_events::websocket::WebSocketProxy, config::Config, dev_tool::NodeConfig, DynError,
     };
 
     use super::{http_gateway::HttpGateway, serve};
 
-    pub async fn run_network_node(
-        config: PeerCliConfig,
-        socket: SocketAddr,
-    ) -> Result<(), DynError> {
+    pub async fn run_network_node(config: Config, socket: SocketAddr) -> Result<(), DynError> {
         let (gw, gw_router) = HttpGateway::as_router(&socket);
         let (ws_proxy, ws_router) = WebSocketProxy::as_router(gw_router);
         serve(socket, ws_router.layer(TraceLayer::new_for_http()));
 
-        let mut node_config = NodeConfig::new();
+        let mut node_config = NodeConfig::new(config);
         node_config.with_ip(socket.ip()).with_port(socket.port());
 
         let private_key = Keypair::generate_ed25519();
 
         let is_gateway = node_config.is_gateway();
         let node = node_config
-            .build(config, [Box::new(gw), Box::new(ws_proxy)], private_key)
+            .build([Box::new(gw), Box::new(ws_proxy)], private_key)
             .await?;
 
         match node.run().await {
