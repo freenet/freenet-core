@@ -856,7 +856,7 @@ where
 */
 #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone)]
 pub struct PeerId {
-    addr: SocketAddr,
+    pub addr: SocketAddr,
     pub pub_key: TransportPublicKey,
 }
 
