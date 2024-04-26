@@ -57,6 +57,7 @@ pub mod dev_tool {
         InitPeerNode, InterProcessConnManager, NodeConfig, PeerCliConfig, PeerId,
     };
     pub use ring::Location;
+    pub use transport::TransportKeypair;
     pub use wasm_runtime::{ContractStore, DelegateStore, Runtime, SecretsStore, StateStore};
 }
 

@@ -17,7 +17,6 @@ use freenet::dev_tool::{
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use http::{Response, StatusCode};
-use libp2p_identity::Keypair;
 use std::ops::Deref;
 use std::{
     collections::{HashMap, VecDeque},
@@ -232,7 +231,7 @@ pub async fn run_network(
         .get_all_peers()
         .await
         .into_iter()
-        .map(|(label, config)| (label.clone(), config.peer_id.unwrap()))
+        .map(|(label, config)| (label.clone(), config.get_peer_id().unwrap()))
         .collect();
 
     let events_sender = supervisor.user_ev_controller.lock().await.clone();
@@ -499,7 +498,7 @@ impl Supervisor {
         self.processes
             .lock()
             .await
-            .insert(config.peer_id.clone().unwrap(), process);
+            .insert(config.get_peer_id().unwrap(), process);
         Ok(())
     }
 
@@ -612,7 +611,7 @@ impl Runnable for NetworkPeer {
         let mut receiver_ch = self.receiver_ch.deref().clone();
         receiver_ch.borrow_and_update();
 
-        let peer = self.config.peer_id.unwrap().clone();
+        let peer = self.config.get_peer_id().unwrap();
 
         let mut memory_event_generator: MemoryEventsGen = MemoryEventsGen::new_with_seed(
             receiver_ch,
@@ -638,8 +637,7 @@ impl Runnable for NetworkPeer {
         let event_generator =
             NetworkEventGenerator::new(peer.clone(), memory_event_generator, ws_client);
 
-        // Obtain an identity::Keypair instance for the private_key
-        let private_key = Keypair::generate_ed25519();
+        let private_key = freenet::dev_tool::TransportKeypair::new();
 
         match self
             .build(peer_id.clone(), [Box::new(event_generator)], private_key)
