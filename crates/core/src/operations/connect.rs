@@ -42,8 +42,6 @@ impl ConnectOp {
         matches!(self.state, Some(ConnectState::Connected))
     }
 
-    pub(super) fn record_transfer(&mut self) {}
-
     pub(super) fn to_host_result(&self) -> HostResult {
         // this should't ever be called since clients can't request explicit connects
         Ok(HostResponse::Ok)
@@ -130,7 +128,7 @@ impl Operation for ConnectOp {
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let return_msg;
-            let mut new_state;
+            let new_state;
 
             match input {
                 ConnectMsg::Request {
@@ -177,9 +175,7 @@ impl Operation for ConnectOp {
                                 .send(&desirable_peer.peer, msg.into())
                                 .await?;
                             return_msg = None;
-                            new_state = Some(ConnectState::AwaitingConnectionAcquisition {
-                                joiner: joiner.clone(),
-                            });
+                            new_state = Some(ConnectState::AwaitingConnectionAcquisition {});
                         } else {
                             return_msg = Some(ConnectMsg::Response {
                                 id: *id,
@@ -202,9 +198,7 @@ impl Operation for ConnectOp {
                             "Querying the query target for new connections",
                         );
                         debug_assert_eq!(this_peer, &joiner.peer);
-                        new_state = Some(ConnectState::AwaitingNewConnection {
-                            query_target: query_target.peer.clone(),
-                        });
+                        new_state = Some(ConnectState::AwaitingNewConnection {});
                         let msg = ConnectMsg::Request {
                             id: *id,
                             msg: ConnectRequest::FindOptimalPeer {
@@ -239,14 +233,11 @@ impl Operation for ConnectOp {
                         peer: joiner.clone(),
                     };
 
-                    let actual_state = self.state;
-
-                    let mut accepted = true; // gateway always accept the first connection
+                    let accepted = true; // gateway always accept the first connection
 
                     if let Some(updated_state) = forward_conn(
                         *id,
                         &op_manager.ring,
-                        actual_state,
                         network_bridge,
                         (new_peer_loc.clone(), new_peer_loc.clone()),
                         *hops_to_live,
@@ -259,7 +250,6 @@ impl Operation for ConnectOp {
                     } else {
                         tracing::debug!(tx = %id, at = %this_peer.peer, "Rejecting connection from {:?}", joiner);
                         new_state = None;
-                        accepted = false;
                     }
 
                     return_msg = None;
@@ -271,8 +261,8 @@ impl Operation for ConnectOp {
                             sender,
                             joiner,
                             hops_to_live,
-                            max_hops_to_live,
                             skip_list,
+                            ..
                         },
                 } => {
                     let this_peer = op_manager.ring.own_location();
@@ -299,12 +289,9 @@ impl Operation for ConnectOp {
                         false
                     };
 
-                    let actual_state = self.state;
-
                     if let Some(updated_state) = forward_conn(
                         *id,
                         &op_manager.ring,
-                        actual_state,
                         network_bridge,
                         (sender.clone(), joiner.clone()),
                         *hops_to_live,
@@ -533,15 +520,14 @@ where
 }
 
 type Requester = PeerKeyLocation;
-type Target = PeerKeyLocation;
 
 #[derive(Debug)]
 enum ConnectState {
     Initializing,
     ConnectingToNode(ConnectionInfo),
     AwaitingConnectivity(ConnectivityInfo),
-    AwaitingConnectionAcquisition { joiner: PeerKeyLocation },
-    AwaitingNewConnection { query_target: PeerId },
+    AwaitingConnectionAcquisition,
+    AwaitingNewConnection,
     Connected,
 }
 
@@ -758,7 +744,6 @@ where
 async fn forward_conn<NB>(
     id: Transaction,
     ring: &Ring,
-    state: Option<ConnectState>,
     network_bridge: &mut NB,
     (req_peer, joiner): (PeerKeyLocation, PeerKeyLocation),
     left_htl: usize,
@@ -793,7 +778,7 @@ where
                 create_forward_message(id, &req_peer, &joiner, left_htl, &[req_peer.peer.clone()]);
             tracing::debug!(target: "network", "Forwarding connection request to {:?}", target_peer);
             network_bridge.send(&target_peer.peer, forward_msg).await?;
-            update_state_with_forward_info(state, &req_peer, left_htl)
+            update_state_with_forward_info(&req_peer, left_htl)
         }
         None => handle_unforwardable_connection(id, accepted),
     }
@@ -849,7 +834,6 @@ fn create_forward_message(
 }
 
 fn update_state_with_forward_info(
-    state: Option<ConnectState>,
     requester: &PeerKeyLocation,
     left_htl: usize,
 ) -> Result<Option<ConnectState>, OpError> {

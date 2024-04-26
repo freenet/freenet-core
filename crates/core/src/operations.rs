@@ -172,7 +172,6 @@ impl OpEnum {
             pub fn id(&self) -> &Transaction;
             pub fn outcome(&self) -> OpOutcome;
             pub fn finalized(&self) -> bool;
-            pub fn record_transfer(&mut self);
             pub fn to_host_result(&self) -> HostResult;
         }
     }

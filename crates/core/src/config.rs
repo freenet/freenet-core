@@ -9,12 +9,10 @@ use std::{
     time::Duration,
 };
 
-use anyhow::anyhow;
 use directories::ProjectDirs;
 use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
 
-use crate::node::PeerId;
 use crate::{local_node::OperationMode, transport::TransportKeypair};
 
 /// Default maximum number of connections for the peer.
@@ -31,12 +29,10 @@ pub const DEFAULT_RANDOM_PEER_CONN_THRESHOLD: usize = 7;
 /// Default maximum number of hops to live for any operation
 /// (if it applies, e.g. connect requests).
 pub const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
-const DEFAULT_BOOTSTRAP_PORT: u16 = 7800;
 const DEFAULT_WEBSOCKET_API_PORT: u16 = 55008;
 
 static CONFIG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
 
-pub(crate) const PEER_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const OPERATION_TTL: Duration = Duration::from_secs(60);
 
 // Initialize the executor once.
@@ -47,7 +43,6 @@ const ORGANIZATION: &str = "The Freenet Project Inc";
 const APPLICATION: &str = "Freenet";
 
 pub struct Config {
-    pub(crate) bootstrap_id: Option<PeerId>,
     pub transport_keypair: TransportKeypair,
     pub log_level: tracing::log::LevelFilter,
     config_paths: ConfigPaths,
@@ -248,11 +243,6 @@ impl Config {
             .ok()
             .flatten()
             .unwrap_or(tracing::log::LevelFilter::Info);
-        let bootstrap_id = if let Some(transport_keypair) = transport_keypair.as_ref() {
-            Config::get_bootstrap_host(&settings, transport_keypair)?
-        } else {
-            None
-        };
 
         let data_dir = settings.get_string("data_dir").ok().map(PathBuf::from);
         let config_paths = ConfigPaths::new(data_dir)?;
@@ -260,7 +250,6 @@ impl Config {
         let local_mode = settings.get_string("network_mode").is_err();
 
         Ok(Config {
-            bootstrap_id,
             transport_keypair: transport_keypair.unwrap_or_else(|| TransportKeypair::new()),
             log_level,
             config_paths,
@@ -268,32 +257,6 @@ impl Config {
             #[cfg(feature = "websocket")]
             ws: WebSocketApiConfig::from_config(&settings),
         })
-    }
-
-    fn get_bootstrap_host(
-        settings: &config::Config,
-        peer_keypair: &TransportKeypair,
-    ) -> anyhow::Result<Option<PeerId>> {
-        let Some(bootstrap_port) = settings.get_int("bootstrap_port").ok().map(u16::try_from)
-        else {
-            tracing::warn!("No bootstrap port provided, skipping creation of a bootstrap peer id.");
-            return Ok(None);
-        };
-
-        let bootstrap_ip =
-            IpAddr::from_str(&settings.get_string("bootstrap_host").unwrap_or_else(|_| {
-                tracing::warn!("boostrap host missing, using unspecified IP address");
-                format!("{}", Ipv4Addr::UNSPECIFIED)
-            }))
-            .map_err(|err| anyhow!(err))?;
-
-        let bootstrap_port = bootstrap_port.map_err(|err| anyhow!(err))?;
-
-        let bootstrap_id = PeerId::new(
-            (bootstrap_ip, bootstrap_port).into(),
-            peer_keypair.public.clone(),
-        );
-        Ok(Some(bootstrap_id))
     }
 }
 

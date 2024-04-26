@@ -121,7 +121,6 @@ impl SubscribeOp {
         matches!(self.state, Some(SubscribeState::Completed { .. }))
     }
 
-    pub(super) fn record_transfer(&mut self) {}
 
     pub(super) fn to_host_result(&self) -> HostResult {
         if let Some(SubscribeState::Completed {}) = self.state {

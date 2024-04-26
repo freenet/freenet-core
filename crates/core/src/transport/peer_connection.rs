@@ -98,7 +98,7 @@ pub(crate) struct PeerConnection {
 }
 
 impl PeerConnection {
-    pub fn new(remote_conn: RemoteConnection) -> Self {
+    pub(super) fn new(remote_conn: RemoteConnection) -> Self {
         Self {
             remote_conn,
             received_tracker: ReceivedPacketTracker::new(),

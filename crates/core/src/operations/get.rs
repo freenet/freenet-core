@@ -38,7 +38,6 @@ pub(crate) fn start_op(key: ContractKey, fetch_contract: bool) -> GetOp {
             next_peer: None,
             transfer_time: None,
             first_response_time: None,
-            step: Default::default(),
         }),
     }
 }
@@ -136,18 +135,6 @@ struct GetStats {
     first_response_time: Option<(Instant, Option<Instant>)>,
     /// (start, end)
     transfer_time: Option<(Instant, Option<Instant>)>,
-    step: RecordingStats,
-}
-
-/// While timing, at what particular step we are now.
-#[derive(Clone, Copy, Default)]
-enum RecordingStats {
-    #[default]
-    Uninitialized,
-    InitGet,
-    TransferNotStarted,
-    TransferStarted,
-    Completed,
 }
 
 pub(crate) struct GetResult {
@@ -208,34 +195,6 @@ impl GetOp {
 
     pub(super) fn finalized(&self) -> bool {
         self.result.is_some()
-    }
-
-    pub(super) fn record_transfer(&mut self) {
-        if let Some(stats) = self.stats.as_mut() {
-            match stats.step {
-                RecordingStats::Uninitialized => {
-                    stats.first_response_time = Some((Instant::now(), None));
-                    stats.step = RecordingStats::InitGet;
-                }
-                RecordingStats::InitGet => {
-                    if let Some((_, e)) = stats.first_response_time.as_mut() {
-                        *e = Some(Instant::now());
-                    }
-                    stats.step = RecordingStats::TransferNotStarted;
-                }
-                RecordingStats::TransferNotStarted => {
-                    stats.transfer_time = Some((Instant::now(), None));
-                    stats.step = RecordingStats::TransferStarted;
-                }
-                RecordingStats::TransferStarted => {
-                    if let Some((_, e)) = stats.transfer_time.as_mut() {
-                        *e = Some(Instant::now());
-                    }
-                    stats.step = RecordingStats::Completed;
-                }
-                RecordingStats::Completed => {}
-            }
-        }
     }
 
     pub(super) fn to_host_result(&self) -> HostResult {
@@ -332,7 +291,6 @@ impl Operation for GetOp {
                         next_peer: None,
                         transfer_time: None,
                         first_response_time: None,
-                        step: Default::default(),
                     });
                     let own_loc = op_manager.ring.own_location();
                     return_msg = Some(GetMsg::SeekNode {

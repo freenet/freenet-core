@@ -33,24 +33,6 @@ impl UpdateOp {
             || matches!(self.state, Some(UpdateState::Finished { .. }))
     }
 
-    pub(super) fn record_transfer(&mut self) {
-        if let Some(stats) = self.stats.as_mut() {
-            match stats.step {
-                RecordingStats::Uninitialized => {
-                    stats.transfer_time = Some((Instant::now(), None));
-                    stats.step = RecordingStats::InitUpdate;
-                }
-                RecordingStats::InitUpdate => {
-                    if let Some((_, e)) = stats.transfer_time.as_mut() {
-                        *e = Some(Instant::now());
-                    }
-                    stats.step = RecordingStats::Completed;
-                }
-                RecordingStats::Completed => {}
-            }
-        }
-    }
-
     pub(super) fn to_host_result(&self) -> HostResult {
         if let Some(UpdateState::Finished { key, summary }) = &self.state {
             Ok(HostResponse::ContractResponse(
@@ -69,12 +51,6 @@ impl UpdateOp {
 }
 
 struct UpdateStats {
-    // contract_location: Location,
-    // payload_size: usize,
-    // /// (start, end)
-    // first_response_time: Option<(Instant, Option<Instant>)>,
-    /// (start, end)
-    transfer_time: Option<(Instant, Option<Instant>)>,
     target: Option<PeerKeyLocation>,
     step: RecordingStats,
 }
@@ -84,7 +60,6 @@ struct UpdateStats {
 enum RecordingStats {
     #[default]
     Uninitialized,
-    InitUpdate,
     Completed,
 }
 
@@ -589,11 +564,7 @@ pub(crate) fn start_op(
         id,
         state,
         stats: Some(UpdateStats {
-            // contract_location,
-            // payload_size,
             target: None,
-            // first_response_time: None,
-            transfer_time: None,
             step: Default::default(),
         }),
     }
