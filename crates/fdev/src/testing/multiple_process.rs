@@ -419,12 +419,14 @@ async fn child(
             .unwrap_or(test_config.nodes * 10),
         test_config.events as usize,
     );
-    let config = SimPeer::from(node_config);
+    let config = SimPeer::from(node_config.clone());
     if let Some(backoff) = test_config.peer_start_backoff_ms {
         tokio::time::sleep(Duration::from_millis(backoff)).await;
     }
     tokio::task::spawn(this_child.event_loop());
-    config.start_child(event_generator).await?;
+    config
+        .start_child(node_config.config(), event_generator)
+        .await?;
     Ok(())
 }
 

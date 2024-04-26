@@ -136,6 +136,10 @@ impl NodeConfig {
         }
     }
 
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
     pub fn max_hops_to_live(&mut self, num_hops: usize) -> &mut Self {
         self.max_hops_to_live = Some(num_hops);
         self

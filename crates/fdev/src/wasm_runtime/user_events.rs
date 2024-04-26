@@ -73,7 +73,9 @@ impl StdInput {
             })
             .transpose()?
             .unwrap_or_default();
-        let (contract_code, _ver) = ContractCode::load_versioned_from_path(&config.contract)?;
+        let paths = config.paths.clone().build()?;
+        let (contract_code, _ver) =
+            ContractCode::load_versioned_from_path(&paths.contracts_dir(config.mode))?;
         let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
             Arc::new(contract_code),
             params.into(),

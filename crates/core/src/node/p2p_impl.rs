@@ -173,6 +173,7 @@ mod test {
     use super::*;
     use crate::{
         client_events::test::MemoryEventsGen,
+        config::ConfigArgs,
         contract::MemoryContractHandler,
         node::{testing_impl::get_free_port, InitPeerNode},
         ring::Location,
@@ -218,7 +219,7 @@ mod test {
         // Start up the initial node.
         GlobalExecutor::spawn(async move {
             let user_events = MemoryEventsGen::new(receiver1, FreenetPeerId::from(peer1_id));
-            let mut config = NodeConfig::new();
+            let mut config = NodeConfig::new(ConfigArgs::default().build().unwrap());
             config
                 .with_ip(Ipv4Addr::LOCALHOST)
                 .with_port(peer1_port)
@@ -241,7 +242,7 @@ mod test {
         // Start up the dialing node
         let dialer = GlobalExecutor::spawn(async move {
             let user_events = MemoryEventsGen::new(receiver2, FreenetPeerId::from(peer2_id));
-            let mut config = NodeConfig::new();
+            let mut config = NodeConfig::new(ConfigArgs::default().build().unwrap());
             config
                 .add_gateway(peer1_config.clone())
                 .with_key(peer2_key.public().into());

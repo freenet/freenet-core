@@ -499,30 +499,13 @@ impl<R> Executor<R> {
         const MAX_SIZE: i64 = 10 * 1024 * 1024;
         const MAX_MEM_CACHE: u32 = 10_000_000;
 
-        let db_path = config.db_dir();
+        let state_store =
+            StateStore::new(Storage::new(&config.db_dir()).await?, MAX_MEM_CACHE).unwrap();
+        let contract_store = ContractStore::new(config.contracts_dir(), MAX_SIZE)?;
 
-        let state_store = StateStore::new(Storage::new(&db_path).await?, MAX_MEM_CACHE).unwrap();
+        let delegate_store = DelegateStore::new(config.delegates_dir(), MAX_SIZE)?;
 
-        let contract_dir = config
-            .node_data_dir
-            .as_ref()
-            .map(|d| d.join("contracts"))
-            .unwrap_or_else(|| config.contracts_dir());
-        let contract_store = ContractStore::new(contract_dir, MAX_SIZE)?;
-
-        let delegate_dir = config
-            .node_data_dir
-            .as_ref()
-            .map(|d| d.join("delegates"))
-            .unwrap_or_else(|| config.delegates_dir());
-        let delegate_store = DelegateStore::new(delegate_dir, MAX_SIZE)?;
-
-        let secrets_dir = config
-            .node_data_dir
-            .as_ref()
-            .map(|d| d.join("secrets"))
-            .unwrap_or_else(|| config.secrets_dir());
-        let secret_store = SecretsStore::new(secrets_dir)?;
+        let secret_store = SecretsStore::new(config.secrets_dir())?;
 
         Ok((contract_store, delegate_store, secret_store, state_store))
     }

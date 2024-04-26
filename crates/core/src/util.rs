@@ -16,7 +16,7 @@ pub fn set_cleanup_on_exit() -> Result<(), ctrlc::Error> {
     ctrlc::set_handler(move || {
         tracing::info!("Received Ctrl+C. Cleaning up...");
 
-        let Ok(path) = crate::config::ConfigPaths::app_data_dir() else {
+        let Ok(path) = crate::config::ConfigPathsArgs::app_data_dir() else {
             std::process::exit(0);
         };
         tracing::info!("Removing content stored at {path:?}");

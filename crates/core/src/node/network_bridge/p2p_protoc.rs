@@ -264,6 +264,7 @@ impl P2pConnManager {
     }
 
     #[tracing::instrument(name = "network_event_listener", fields(peer = %self.bridge.op_manager.ring.peer_key), skip_all)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_event_listener(
         mut self,
         config: &Config,

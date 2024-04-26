@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::ArgGroup;
+use freenet::{config::ConfigPathsArgs, dev_tool::OperationMode};
 
 mod commands;
 mod state;
@@ -52,8 +53,11 @@ pub struct ExecutorConfig {
     #[clap(long, requires = "fmt")]
     pub(crate) clean_exit: bool,
     /// Path to the contract to be loaded.
-    #[clap(value_parser)]
-    pub(crate) contract: PathBuf,
+    #[clap(flatten)]
+    pub(crate) paths: ConfigPathsArgs,
+    /// Node operation mode.
+    #[clap(value_enum, default_value_t = OperationMode::Local, env = "MODE")]
+    pub(crate) mode: OperationMode,
     /// Path to the file containing the parameters for this contract. If not set the default parameters will be empty.
     #[clap(long = "parameters", value_parser)]
     pub(crate) params: Option<PathBuf>,

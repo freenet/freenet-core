@@ -32,10 +32,6 @@ pub const DEFAULT_RANDOM_PEER_CONN_THRESHOLD: usize = 7;
 /// Default maximum number of hops to live for any operation
 /// (if it applies, e.g. connect requests).
 pub const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
-const DEFAULT_BOOTSTRAP_PORT: u16 = 7800;
-const DEFAULT_WEBSOCKET_API_PORT: u16 = 55008;
-
-static CONFIG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
 
 pub(crate) const PEER_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const OPERATION_TTL: Duration = Duration::from_secs(60);
@@ -48,40 +44,55 @@ const ORGANIZATION: &str = "The Freenet Project Inc";
 const APPLICATION: &str = "Freenet";
 
 #[derive(clap::Parser, Debug, Serialize, Deserialize)]
-pub struct Config {
+pub struct ConfigArgs {
     /// Node operation mode.
-    #[clap(value_enum, default_value_t = OperationMode::Local)]
+    #[clap(value_enum, default_value_t = OperationMode::Local, env = "MODE")]
     pub mode: OperationMode,
 
     /// Overrides the default data directory where Freenet contract files are stored.
+    #[clap(long, env = "NODE_DATA_DIR")]
     pub node_data_dir: Option<PathBuf>,
 
     #[clap(flatten)]
     #[serde(flatten)]
     pub gateway: GatewayConfig,
-    // FIXME: how to serialize this?
-    #[clap(value_parser = parse_keypair)]
-    #[serde(skip_serializing, deserialize_with = "deserialize_keypair")]
-    pub local_peer_keypair: Option<identity::Keypair>,
+    #[clap(value_parser, env = "LOCAL_PEER_KEYPAIR")]
+    pub local_peer_keypair: Option<PathBuf>,
     #[serde(with = "serde_log_level_filter")]
+    #[clap(long, default_value = "info", env = "INFO")]
     pub log_level: tracing::log::LevelFilter,
     #[clap(flatten)]
     #[serde(flatten)]
-    config_paths: ConfigPaths,
+    config_paths: ConfigPathsArgs,
 }
 
-impl Config {
-    /// Parse the command line arguments and return the configuration.
-    pub fn parse() -> Self {
-        let mut this: Config = clap::Parser::parse();
-        this.local_peer_keypair
-            .get_or_insert_with(identity::Keypair::generate_ed25519);
-        this
+impl Default for ConfigArgs {
+    fn default() -> Self {
+        Self {
+            mode: OperationMode::Local,
+            node_data_dir: None,
+            gateway: Default::default(),
+            local_peer_keypair: None,
+            log_level: tracing::log::LevelFilter::Info,
+            config_paths: Default::default(),
+        }
     }
+}
 
-    /// Returns the local peer keypair.
-    pub fn local_peer_keypair(&self) -> &identity::Keypair {
-        self.local_peer_keypair.as_ref().unwrap()
+impl ConfigArgs {
+    /// Parse the command line arguments and return the configuration.
+    pub fn build(self) -> std::io::Result<Config> {
+        Ok(Config {
+            mode: self.mode,
+            gateway: self.gateway,
+            local_peer_keypair: match self.local_peer_keypair {
+                Some(path) => parse_keypair(path.to_string_lossy().trim())
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+                None => identity::Keypair::generate_ed25519(),
+            },
+            log_level: self.log_level,
+            config_paths: self.config_paths.build()?,
+        })
     }
 }
 
@@ -106,17 +117,11 @@ fn parse_keypair(s: &str) -> Result<identity::Keypair, Cow<'static, str>> {
     Ok(keypair)
 }
 
-fn deserialize_keypair<'de, D>(deserializer: D) -> Result<Option<identity::Keypair>, D::Error>
+fn deserialize_keypair<'de, D>(deserializer: D) -> Result<identity::Keypair, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let s = Option::<&str>::deserialize(deserializer)?;
-    match s {
-        Some(s) => parse_keypair(&s)
-            .map(Some)
-            .map_err(serde::de::Error::custom),
-        None => Ok(None),
-    }
+    parse_keypair(<&str>::deserialize(deserializer)?).map_err(serde::de::Error::custom)
 }
 
 mod serde_log_level_filter {
@@ -156,17 +161,49 @@ mod serde_log_level_filter {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Config {
+    /// Node operation mode.
+    pub mode: OperationMode,
+
+    #[serde(flatten)]
+    pub gateway: GatewayConfig,
+    // FIXME: how to serialize this?
+    /// Path to the local peer keypair file.
+    #[serde(skip_serializing, deserialize_with = "deserialize_keypair")]
+    pub local_peer_keypair: identity::Keypair,
+    #[serde(with = "serde_log_level_filter")]
+    pub log_level: tracing::log::LevelFilter,
+    #[serde(flatten)]
+    config_paths: ConfigPaths,
+}
+
+impl Config {
+    pub fn local_peer_keypair(&self) -> &identity::Keypair {
+        &self.local_peer_keypair
+    }
+}
 #[derive(clap::Parser, Debug, Copy, Clone, Serialize, Deserialize)]
-pub(crate) struct GatewayConfig {
+pub struct GatewayConfig {
     /// Address to bind to
-    #[arg(long = "gateway-address", default_value_t = default_gateway_address())]
+    #[arg(long = "gateway-address", default_value_t = default_gateway_address(), env = "GATEWAY_ADDRESS")]
     #[serde(default = "default_gateway_address", rename = "gateway-address")]
     pub address: IpAddr,
 
     /// Port to expose api on
-    #[arg(long = "gateway-port", default_value_t = default_gateway_port())]
+    #[arg(long = "gateway-port", default_value_t = default_gateway_port(), env = "GATEWAY_PORT")]
     #[serde(default = "default_gateway_port", rename = "gateway-port")]
     pub port: u16,
+}
+
+impl Default for GatewayConfig {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            address: default_gateway_address(),
+            port: default_gateway_port(),
+        }
+    }
 }
 
 #[inline]
@@ -179,16 +216,17 @@ const fn default_gateway_port() -> u16 {
     50509
 }
 
-#[derive(clap::Parser, Debug, Serialize, Deserialize)]
-pub struct ConfigPaths {
-    contracts_dir: PathBuf,
-    delegates_dir: PathBuf,
-    secrets_dir: PathBuf,
-    db_dir: PathBuf,
-    event_log: PathBuf,
+#[derive(clap::Parser, Default, Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigPathsArgs {
+    contracts_dir: Option<PathBuf>,
+    delegates_dir: Option<PathBuf>,
+    secrets_dir: Option<PathBuf>,
+    db_dir: Option<PathBuf>,
+    event_log: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
 }
 
-impl ConfigPaths {
+impl ConfigPathsArgs {
     pub fn app_data_dir() -> std::io::Result<PathBuf> {
         let project_dir = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
             .ok_or(std::io::ErrorKind::NotFound)?;
@@ -200,12 +238,18 @@ impl ConfigPaths {
         Ok(app_data_dir)
     }
 
-    fn new(data_dir: Option<PathBuf>) -> std::io::Result<ConfigPaths> {
-        let app_data_dir = data_dir.map(Ok).unwrap_or_else(Self::app_data_dir)?;
-        let contracts_dir = app_data_dir.join("contracts");
-        let delegates_dir = app_data_dir.join("delegates");
-        let secrets_dir = app_data_dir.join("secrets");
-        let db_dir = app_data_dir.join("db");
+    pub fn build(self) -> std::io::Result<ConfigPaths> {
+        let app_data_dir = self.data_dir.map(Ok).unwrap_or_else(Self::app_data_dir)?;
+        let contracts_dir = self
+            .contracts_dir
+            .unwrap_or_else(|| app_data_dir.join("contracts"));
+        let delegates_dir = self
+            .delegates_dir
+            .unwrap_or_else(|| app_data_dir.join("delegates"));
+        let secrets_dir = self
+            .secrets_dir
+            .unwrap_or_else(|| app_data_dir.join("secrets"));
+        let db_dir = self.db_dir.unwrap_or_else(|| app_data_dir.join("db"));
 
         if !contracts_dir.exists() {
             fs::create_dir_all(&contracts_dir)?;
@@ -235,54 +279,112 @@ impl ConfigPaths {
             fs::write(local_file, [])?;
         }
 
-        Ok(Self {
+        Ok(ConfigPaths {
             contracts_dir,
             delegates_dir,
             secrets_dir,
             db_dir,
+            data_dir: app_data_dir,
             event_log,
         })
     }
 }
 
-impl Config {
-    pub fn db_dir(&self) -> PathBuf {
-        match self.mode {
-            OperationMode::Local => self.config_paths.db_dir.join("local"),
-            OperationMode::Network => self.config_paths.db_dir.to_owned(),
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConfigPaths {
+    contracts_dir: PathBuf,
+    delegates_dir: PathBuf,
+    secrets_dir: PathBuf,
+    db_dir: PathBuf,
+    event_log: PathBuf,
+    data_dir: PathBuf,
+}
+
+impl ConfigPaths {
+    pub fn db_dir(&self, mode: OperationMode) -> PathBuf {
+        match mode {
+            OperationMode::Local => self.db_dir.join("local"),
+            OperationMode::Network => self.db_dir.to_owned(),
         }
     }
 
-    pub fn contracts_dir(&self) -> PathBuf {
-        match self.mode {
-            OperationMode::Local => self.config_paths.contracts_dir.join("local"),
-            OperationMode::Network => self.config_paths.contracts_dir.to_owned(),
+    pub fn with_db_dir(mut self, db_dir: PathBuf) -> Self {
+        self.db_dir = db_dir;
+        self
+    }
+
+    pub fn contracts_dir(&self, mode: OperationMode) -> PathBuf {
+        match mode {
+            OperationMode::Local => self.contracts_dir.join("local"),
+            OperationMode::Network => self.contracts_dir.to_owned(),
         }
     }
 
-    pub fn delegates_dir(&self) -> PathBuf {
-        match self.mode {
-            OperationMode::Local => self.config_paths.delegates_dir.join("local"),
-            OperationMode::Network => self.config_paths.delegates_dir.to_owned(),
+    pub fn with_contract_dir(mut self, contracts_dir: PathBuf) -> Self {
+        self.contracts_dir = contracts_dir;
+        self
+    }
+
+    pub fn delegates_dir(&self, mode: OperationMode) -> PathBuf {
+        match mode {
+            OperationMode::Local => self.delegates_dir.join("local"),
+            OperationMode::Network => self.delegates_dir.to_owned(),
         }
     }
 
-    pub fn secrets_dir(&self) -> PathBuf {
-        match self.mode {
-            OperationMode::Local => self.config_paths.secrets_dir.join("local"),
-            OperationMode::Network => self.config_paths.secrets_dir.to_owned(),
+    pub fn with_delegates_dir(mut self, delegates_dir: PathBuf) -> Self {
+        self.delegates_dir = delegates_dir;
+        self
+    }
+
+    pub fn secrets_dir(&self, mode: OperationMode) -> PathBuf {
+        match mode {
+            OperationMode::Local => self.secrets_dir.join("local"),
+            OperationMode::Network => self.secrets_dir.to_owned(),
         }
     }
 
-    pub fn event_log(&self) -> PathBuf {
-        match self.mode {
+    pub fn with_secrets_dir(mut self, secrets_dir: PathBuf) -> Self {
+        self.secrets_dir = secrets_dir;
+        self
+    }
+
+    pub fn event_log(&self, mode: OperationMode) -> PathBuf {
+        match mode {
             OperationMode::Local => {
-                let mut local_file = self.config_paths.event_log.clone();
+                let mut local_file = self.event_log.clone();
                 local_file.set_file_name("_EVENT_LOG_LOCAL");
                 local_file
             }
-            OperationMode::Network => self.config_paths.event_log.to_owned(),
+            OperationMode::Network => self.event_log.to_owned(),
         }
+    }
+
+    pub fn with_event_log(mut self, event_log: PathBuf) -> Self {
+        self.event_log = event_log;
+        self
+    }
+}
+
+impl Config {
+    pub fn db_dir(&self) -> PathBuf {
+        self.config_paths.db_dir(self.mode)
+    }
+
+    pub fn contracts_dir(&self) -> PathBuf {
+        self.config_paths.contracts_dir(self.mode)
+    }
+
+    pub fn delegates_dir(&self) -> PathBuf {
+        self.config_paths.delegates_dir(self.mode)
+    }
+
+    pub fn secrets_dir(&self) -> PathBuf {
+        self.config_paths.secrets_dir(self.mode)
+    }
+
+    pub fn event_log(&self) -> PathBuf {
+        self.config_paths.event_log(self.mode)
     }
 
     // pub fn conf() -> &'static Config {

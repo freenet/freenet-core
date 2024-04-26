@@ -1,8 +1,8 @@
 use std::{fs::File, io::Read, path::PathBuf};
 
 use freenet::dev_tool::{
-    ClientId, Config, ContractStore, DelegateStore, Executor, OperationMode, SecretsStore,
-    StateStore, Storage,
+    ClientId, ContractStore, DelegateStore, Executor, OperationMode, SecretsStore, StateStore,
+    Storage,
 };
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, DelegateRequest},
@@ -150,22 +150,12 @@ async fn execute_command(
     request: ClientRequest<'static>,
     other: BaseConfig,
 ) -> Result<(), anyhow::Error> {
-    let contracts_data_path = other
-        .contract_data_dir
-        .unwrap_or_else(|| Config::conf().contracts_dir());
-    let delegates_data_path = other
-        .delegate_data_dir
-        .unwrap_or_else(|| Config::conf().delegates_dir());
-    let secrets_data_path = other
-        .secret_data_dir
-        .unwrap_or_else(|| Config::conf().secrets_dir());
-    let database_path = other
-        .database_dir
-        .unwrap_or_else(|| Config::conf().db_dir());
-    let contract_store = ContractStore::new(contracts_data_path, DEFAULT_MAX_CONTRACT_SIZE)?;
-    let delegate_store = DelegateStore::new(delegates_data_path, DEFAULT_MAX_DELEGATE_SIZE)?;
-    let secret_store = SecretsStore::new(secrets_data_path)?;
-    let state_store = StateStore::new(Storage::new(&database_path).await?, MAX_MEM_CACHE)?;
+    let mode = other.mode;
+    let paths = other.paths.build()?;
+    let contract_store = ContractStore::new(paths.contracts_dir(mode), DEFAULT_MAX_CONTRACT_SIZE)?;
+    let delegate_store = DelegateStore::new(paths.delegates_dir(mode), DEFAULT_MAX_DELEGATE_SIZE)?;
+    let secret_store = SecretsStore::new(paths.secrets_dir(mode))?;
+    let state_store = StateStore::new(Storage::new(&paths.db_dir(mode)).await?, MAX_MEM_CACHE)?;
     let rt =
         freenet::dev_tool::Runtime::build(contract_store, delegate_store, secret_store, false)?;
     let mut executor = Executor::new(state_store, || Ok(()), OperationMode::Local, rt, None)

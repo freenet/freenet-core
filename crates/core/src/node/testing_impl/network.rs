@@ -1,5 +1,4 @@
 use crate::client_events::BoxedClient;
-use crate::config::Config;
 use crate::contract::MemoryContractHandler;
 use crate::node::p2p_impl::NodeP2P;
 use crate::node::Node;
@@ -66,7 +65,6 @@ impl NetworkPeer {
     /// Builds a node using the default backend connection manager.
     pub async fn build<const CLIENTS: usize>(
         &self,
-        config: &Config,
         identifier: String,
         clients: [BoxedClient; CLIENTS],
         private_key: Keypair,
@@ -76,13 +74,13 @@ impl NetworkPeer {
             {
                 use crate::tracing::OTEventRegister;
                 crate::tracing::CombinedRegister::new([
-                    Box::new(EventRegister::new(config.event_log())),
+                    Box::new(EventRegister::new(self.config.config.event_log())),
                     Box::new(OTEventRegister::new()),
                 ])
             }
             #[cfg(not(feature = "trace-ot"))]
             {
-                EventRegister::new(config.event_log())
+                EventRegister::new(self.config.config.event_log())
             }
         };
         let node = NodeP2P::build::<MemoryContractHandler, CLIENTS, _>(

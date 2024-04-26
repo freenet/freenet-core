@@ -20,7 +20,7 @@ use tracing::{info, Instrument};
 use crate::tracing::CombinedRegister;
 use crate::{
     client_events::test::{MemoryEventsGen, RandomEventGenerator},
-    config::GlobalExecutor,
+    config::{ConfigArgs, GlobalExecutor},
     contract::{
         self, ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
         WaitingResolution,
@@ -393,7 +393,7 @@ impl SimNetwork {
             let port = get_free_port().unwrap();
             let location = Location::random();
 
-            let mut config = NodeConfig::new();
+            let mut config = NodeConfig::new(ConfigArgs::default().build().unwrap());
             config
                 .with_ip(Ipv6Addr::LOCALHOST)
                 .with_port(port)
@@ -469,7 +469,7 @@ impl SimNetwork {
             let pair = identity::Keypair::generate_ed25519();
             let id = pair.public().to_peer_id();
 
-            let mut config = NodeConfig::new();
+            let mut config = NodeConfig::new(ConfigArgs::default().build().unwrap());
             for GatewayConfig {
                 port, id, location, ..
             } in &gateways
