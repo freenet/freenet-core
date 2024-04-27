@@ -34,11 +34,12 @@ pub(super) struct NodeP2P {
     cli_response_sender: ClientResponsesSender,
     node_controller: tokio::sync::mpsc::Receiver<NodeEvent>,
     is_gateway: bool,
+    should_try_connect: bool,
 }
 
 impl NodeP2P {
     pub(super) async fn run_node(mut self) -> Result<(), anyhow::Error> {
-        if !self.is_gateway {
+        if !self.should_try_connect {
             connect::initial_join_procedure(
                 &self.op_manager,
                 &mut self.conn_manager.bridge,
@@ -124,6 +125,7 @@ impl NodeP2P {
             cli_response_sender,
             node_controller: node_controller_rx,
             is_gateway: config.is_gateway(),
+            should_try_connect: config.should_connect,
         })
     }
 }
