@@ -48,7 +48,7 @@ impl NetworkPeer {
         let response = reqwest::get(&config_url).await?;
         let peer_config = response.json::<crate::node::NodeConfig>().await?;
 
-        tracing::debug!(peer_config = ?peer_config, "Received peer config");
+        tracing::debug!("Received peer config");
 
         let (user_ev_controller, receiver_ch): (PeerEventSender, PeerEventReceiver) =
             tokio::sync::watch::channel((0, peer_config.get_peer_id().unwrap()));

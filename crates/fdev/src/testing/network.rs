@@ -117,9 +117,25 @@ impl SubProcess {
     }
 
     async fn start(cmd_args: &[String], label: &NodeLabel) -> anyhow::Result<Self, Error> {
-        let child = Command::new("fdev")
+        let mut command = if cfg!(debug_assertions) {
+            Command::new("cargo")
+        } else {
+            Command::new("fdev")
+        };
+        #[cfg(debug_assertions)]
+        {
+            let args = ["run", "--"]
+                .into_iter()
+                .chain(cmd_args.iter().map(Deref::deref));
+            command.args(args);
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let args = cmd_args;
+            command.args(args);
+        }
+        let child = command
             .kill_on_drop(true)
-            .args(cmd_args)
             .arg("--id")
             .arg(label.to_string())
             .stdin(Stdio::inherit())
@@ -156,7 +172,10 @@ async fn start_supervisor(config: &TestConfig) -> anyhow::Result<(), Error> {
 }
 
 async fn start_peer(config: &TestConfig, cmd_config: &NetworkProcessConfig) -> Result<(), Error> {
-    std::env::set_var("FREENET_PEER_ID", cmd_config.clone().id.unwrap());
+    std::env::set_var(
+        "FREENET_PEER_ID",
+        cmd_config.clone().id.expect("id should be set"),
+    );
     freenet::config::set_logger(None);
     if let Some(peer_id) = &cmd_config.id {
         let peer = NetworkPeer::new(peer_id.clone()).await?;
@@ -295,6 +314,7 @@ async fn config_handler(
     peers_config: Arc<Mutex<HashMap<NodeLabel, NodeConfig>>>,
     Path(peer_id): Path<String>,
 ) -> axum::response::Response {
+    tracing::debug!("Received config request for peer_id: {}", peer_id);
     let config = peers_config.lock().await;
     let id = NodeLabel::from(peer_id.as_str());
     match config.get(&id) {
