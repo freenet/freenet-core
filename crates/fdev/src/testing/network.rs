@@ -623,15 +623,14 @@ pub trait Runnable {
 
 impl Runnable for NetworkPeer {
     async fn run(&self, config: &TestConfig, peer_id: String) -> anyhow::Result<()> {
+        let peer = self.config.get_peer_id().unwrap();
         if self.config.is_gateway() {
-            tracing::info!("Starting gateway {}", peer_id);
+            tracing::info!(%peer, "Starting gateway {}", peer_id);
         } else {
-            tracing::info!("Starting node {}", peer_id);
+            tracing::info!(%peer, "Starting node {}", peer_id);
         }
         let mut receiver_ch = self.receiver_ch.deref().clone();
         receiver_ch.borrow_and_update();
-
-        let peer = self.config.get_peer_id().unwrap();
 
         let mut memory_event_generator: MemoryEventsGen = MemoryEventsGen::new_with_seed(
             receiver_ch,

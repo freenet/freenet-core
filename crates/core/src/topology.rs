@@ -284,11 +284,16 @@ impl TopologyManager {
         my_location: &Option<Location>,
         at_time: Instant,
     ) -> TopologyAdjustment {
-        debug!(
+        // let mut last_log = Instant::now();
+        // if last_log.elapsed() > Duration::from_secs(10) {
+        // last_log = Instant::now();
+        // TODO: only print periodically
+        tracing::trace!(
             "Adjusting topology at {:?}. Current neighbors: {:?}",
             at_time,
             neighbor_locations.len()
         );
+        // }
 
         if neighbor_locations.len() < self.limits.min_connections {
             let mut locations = Vec::new();
@@ -307,7 +312,7 @@ impl TopologyManager {
                         }
                     }
                 }
-                info!(
+                tracing::trace!(
                     minimum_num_peers_hard_limit = self.limits.min_connections,
                     num_peers = neighbor_locations.len(),
                     to_add = below_threshold,

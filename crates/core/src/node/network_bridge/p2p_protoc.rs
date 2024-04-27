@@ -208,10 +208,16 @@ impl P2pConnManager {
                 // we must ensure that the peer stays connected long enough so an other peer has forwarded
                 // or accepted a connection
                 match inbound_conn_handler.next_connection().await {
-                    Some(peer_conn) => Ok(Right(GatewayConnection {
-                        remote_addr: peer_conn.remote_addr(),
-                        peer_conn,
-                    })),
+                    Some(peer_conn) => {
+                        tracing::debug!(
+                            remote = %peer_conn.remote_addr(),
+                            "New inbound connection at gateway"
+                        );
+                        Ok(Right(GatewayConnection {
+                            remote_addr: peer_conn.remote_addr(),
+                            peer_conn,
+                        }))
+                    }
                     None => Ok(Right(ClosedChannel)),
                 }
             };
@@ -264,7 +270,14 @@ impl P2pConnManager {
                 }
                 msg = notification_msg => { msg }
                 msg = bridge_msg => {
-                    match msg? {
+                    let msg = match msg {
+                        Ok(msg) => msg,
+                        Err(err) => {
+                            tracing::error!("Error in bridge message: {err}");
+                            continue;
+                        }
+                    };
+                    match msg {
                         Left((peer, peer_conn)) => {
                             Ok(Right(ConnectionEstablished {
                                 peer,
@@ -412,7 +425,7 @@ impl P2pConnManager {
                             let span = tracing::info_span!(
                                 parent: parent_span,
                                 "process_network_message",
-                                // peer = %this_peer,
+                                peer = ?self.bridge.op_manager.ring.get_peer_key(),
                                 transaction = %msg.id(),
                                 tx_type = %msg.id().transaction_type()
                             );

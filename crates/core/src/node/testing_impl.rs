@@ -117,7 +117,6 @@ pub(crate) struct NodeSpecification {
 #[derive(Clone)]
 struct GatewayConfig {
     label: NodeLabel,
-    port: u16,
     id: PeerId,
     location: Location,
 }
@@ -368,10 +367,10 @@ impl SimNetwork {
         let mut configs = Vec::with_capacity(num);
         for node_no in 0..num {
             let label = NodeLabel::gateway(node_no);
-            let id = PeerId::random();
             let port = crate::util::get_free_port().unwrap();
-            let location = Location::random();
             let keypair = crate::transport::TransportKeypair::new();
+            let id = PeerId::new((Ipv6Addr::LOCALHOST, port).into(), keypair.public.clone());
+            let location = Location::random();
 
             let mut config = NodeConfig::new();
             config
@@ -390,7 +389,6 @@ impl SimNetwork {
                 GatewayConfig {
                     label,
                     id,
-                    port,
                     location,
                 },
             ));
@@ -398,17 +396,11 @@ impl SimNetwork {
 
         let gateways: Vec<_> = configs.iter().map(|(_, gw)| gw.clone()).collect();
         for (mut this_node, this_config) in configs {
-            for GatewayConfig {
-                port, id, location, ..
-            } in gateways
+            for GatewayConfig { id, location, .. } in gateways
                 .iter()
                 .filter(|config| this_config.label != config.label)
             {
-                this_node.add_gateway(
-                    InitPeerNode::new(id.clone(), *location)
-                        .listening_ip(Ipv6Addr::LOCALHOST)
-                        .listening_port(*port),
-                );
+                this_node.add_gateway(InitPeerNode::new(id.clone(), *location));
             }
             let event_listener = {
                 #[cfg(feature = "trace-ot")]
@@ -449,15 +441,8 @@ impl SimNetwork {
             let keypair = crate::transport::TransportKeypair::new();
 
             let mut config = NodeConfig::new();
-            for GatewayConfig {
-                port, id, location, ..
-            } in &gateways
-            {
-                config.add_gateway(
-                    InitPeerNode::new(id.clone(), *location)
-                        .listening_ip(Ipv6Addr::LOCALHOST)
-                        .listening_port(*port),
-                );
+            for GatewayConfig { id, location, .. } in &gateways {
+                config.add_gateway(InitPeerNode::new(id.clone(), *location));
             }
             config
                 .max_hops_to_live(self.ring_max_htl)

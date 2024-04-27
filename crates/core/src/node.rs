@@ -250,20 +250,11 @@ impl NodeConfig {
             .remote_nodes
             .iter()
             .filter_map(|node| {
-                if node.addr.is_some() {
-                    Some(PeerKeyLocation {
-                        peer: node.identifier.clone(),
-                        location: Some(node.location),
-                    })
-                } else {
-                    None
-                }
+                Some(PeerKeyLocation {
+                    peer: node.peer_id.clone(),
+                    location: Some(node.location),
+                })
             })
-            // FIXME: filter again, can build the id if enough fields are set
-            // .filter(|pkloc| match &self.peer_id {
-            //     Some(peer_id) => pkloc.peer != *peer_id,
-            //     None => true,
-            // })
             .collect();
 
         if (self.local_ip.is_none() || self.local_port.is_none()) && gateways.is_empty() {
@@ -282,42 +273,16 @@ impl Default for NodeConfig {
     }
 }
 
-/// Gateway node to bootstrap the network.
+/// Gateway node to use for joining the network.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct InitPeerNode {
-    addr: Option<SocketAddr>,
-    identifier: PeerId,
+    peer_id: PeerId,
     location: Location,
 }
 
 impl InitPeerNode {
-    pub fn new(identifier: PeerId, location: Location) -> Self {
-        Self {
-            addr: None,
-            identifier,
-            location,
-        }
-    }
-
-    /// IP which will be assigned to this node.
-    pub fn listening_ip<T: Into<IpAddr>>(mut self, ip: T) -> Self {
-        if let Some(addr) = &mut self.addr {
-            addr.set_ip(ip.into());
-        } else {
-            self.addr = Some(SocketAddr::new(ip.into(), 0));
-        }
-        self
-    }
-
-    /// TCP listening port (only required in case of using TCP as transport).
-    /// If not specified port 7800 will be used as default.
-    pub fn listening_port(mut self, port: u16) -> Self {
-        if let Some(addr) = &mut self.addr {
-            addr.set_port(port);
-        } else {
-            self.addr = Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port));
-        }
-        self
+    pub fn new(peer_id: PeerId, location: Location) -> Self {
+        Self { peer_id, location }
     }
 }
 
@@ -648,8 +613,17 @@ async fn process_message_v1<CB>(
     loop {
         match msg {
             NetMessageV1::Connect(ref op) => {
+                let parent_span = tracing::Span::current();
+                let span = tracing::info_span!(
+                    parent: parent_span,
+                    "handle_connect_op_request",
+                    peer = ?op_manager.ring.get_peer_key(),
+                    transaction = %msg.id(),
+                    tx_type = %msg.id().transaction_type()
+                );
                 let op_result =
                     handle_op_request::<connect::ConnectOp, _>(&op_manager, &mut conn_manager, op)
+                        .instrument(span)
                         .await;
                 handle_op_not_available!(op_result);
                 break report_result(

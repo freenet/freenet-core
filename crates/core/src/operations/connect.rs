@@ -594,7 +594,6 @@ impl ConnectivityInfo {
 #[derive(Debug, Clone)]
 struct ConnectionInfo {
     gateway: PeerKeyLocation,
-    this_peer: Option<PeerId>,
     peer_pub_key: TransportPublicKey,
     max_hops_to_live: usize,
     accepted_by: HashSet<PeerKeyLocation>,
@@ -660,6 +659,7 @@ where
     Ok(())
 }
 
+#[tracing::instrument(fields(peer = ?op_manager.ring.get_peer_key()), skip_all)]
 pub(crate) async fn join_ring_request<CM>(
     backoff: Option<ExponentialBackoff>,
     peer_pub_key: TransportPublicKey,
@@ -708,7 +708,6 @@ fn initial_request(
     const MAX_JOIN_RETRIES: usize = usize::MAX;
     let state = ConnectState::ConnectingToNode(ConnectionInfo {
         gateway: gateway.clone(),
-        this_peer: None,
         peer_pub_key: peer_pub_key.clone(),
         max_hops_to_live,
         accepted_by: HashSet::new(),
@@ -746,7 +745,6 @@ where
     } = join_op;
     let ConnectionInfo {
         gateway,
-        this_peer,
         peer_pub_key,
         max_hops_to_live,
         ..
@@ -754,7 +752,6 @@ where
 
     tracing::info!(
         tx = %id,
-        this_peer = %this_peer.unwrap(),
         gateway = %gateway,
         "Connecting to gateway",
     );
@@ -777,7 +774,6 @@ where
                 id,
                 state: Some(ConnectState::ConnectingToNode(ConnectionInfo {
                     gateway: gateway.clone(),
-                    this_peer: None,
                     peer_pub_key,
                     max_hops_to_live,
                     accepted_by: HashSet::new(),
