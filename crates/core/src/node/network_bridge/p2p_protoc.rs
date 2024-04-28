@@ -17,7 +17,7 @@ use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::message::NetMessageV1;
 
 use crate::node::PeerId;
-use crate::operations::connect::{ConnectMsg, ConnectRequest, ConnectResponse};
+use crate::operations::connect::{self, ConnectMsg, ConnectRequest, ConnectResponse};
 use crate::transport::{
     create_connection_handler, OutboundConnectionHandler, PeerConnection, TransportError,
     TransportKeypair,
@@ -507,43 +507,55 @@ impl P2pConnManager {
         outbound_conn_handler: &mut OutboundConnectionHandler,
     ) -> Result<Either<(), (PeerId, PeerConnection)>, ConnectionError> {
         let mut connection = None;
-        if let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
-            msg:
-                ConnectResponse::AcceptedBy {
-                    accepted: true,
-                    acceptor,
-                    joiner,
-                },
-            ..
-        })) = &*net_msg
-        {
-            if acceptor.peer
-                == self
-                    .bridge
-                    .op_manager
-                    .ring
-                    .get_peer_key()
-                    .expect("should be set at this point")
-            {
-                // In this case we are the acceptor, we need to establish a connection with the joiner
-                // this should only happen for the non-first peers in a Connect request, the first one
-                // should already be connected at this point, so check just in case
-                if !self.connection.contains_key(&acceptor.peer) {
+
+        match &*net_msg {
+            NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
+                msg: connect::ConnectRequest::StartJoinReq { .. },
+                ..
+            })) => {
+                if !self.connection.contains_key(&peer) {
                     let peer_conn = outbound_conn_handler
-                        .connect(joiner.pub_key.clone(), joiner.addr)
+                        .connect(peer.pub_key.clone(), peer.addr)
                         .await
                         .await?;
-                    // let my_address = peer_conn.my_address().unwrap();
-                    // if self.bridge.op_manager.ring.get_peer_key().is_none() {
-                    //     let own_peer_id = PeerId::new(my_address, joiner.pub_key.clone());
-                    //     self.bridge.op_manager.ring.set_peer_key(own_peer_id);
-                    // }
-                    tracing::debug!("Connection established with peer {}", joiner.addr.clone());
+                    tracing::debug!("Connection established with peer {}", peer.addr);
                     connection = Some((peer.clone(), peer_conn));
                 }
             }
+            NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
+                msg:
+                    ConnectResponse::AcceptedBy {
+                        accepted: true,
+                        acceptor,
+                        joiner,
+                    },
+                ..
+            })) => {
+                if acceptor.peer
+                    == self
+                        .bridge
+                        .op_manager
+                        .ring
+                        .get_peer_key()
+                        .expect("should be set at this point")
+                {
+                    // In this case we are the acceptor, we need to establish a connection with the joiner
+                    // this should only happen for the non-first peers in a Connect request, the first one
+                    // should already be connected at this point, so check just in case
+                    if !self.connection.contains_key(&acceptor.peer) {
+                        let peer_conn = outbound_conn_handler
+                            .connect(joiner.pub_key.clone(), joiner.addr)
+                            .await
+                            .await?;
+                        tracing::debug!("Connection established with peer {}", joiner.addr.clone());
+                        connection = Some((peer.clone(), peer_conn));
+                    }
+                }
+            }
+            _ => {}
         }
 
+        tracing::debug!(target = %peer, %net_msg, "Sending outbound msg");
         if let Some(conn) = self.connection.get(&peer) {
             conn.send(*net_msg)
                 .await

@@ -272,6 +272,8 @@ pub async fn run_network(
             network_connection_percent * 100.0
         );
         network.check_partial_connectivity(connectivity_timeout, network_connection_percent)?;
+        // FIXME: we are getting connectivity check that is not real since peers are not reporting if they
+        // are connected or not to other peers
         tracing::info!("Network is sufficiently connected, start sending events");
         while events.next().await.is_some() {
             tokio::time::sleep(next_event_wait_time).await;
