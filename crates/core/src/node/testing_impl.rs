@@ -445,8 +445,9 @@ impl SimNetwork {
 
         for node_no in self.number_of_gateways..num + self.number_of_gateways {
             let label = NodeLabel::node(node_no);
-            let id = PeerId::random();
-            let keypair = crate::transport::TransportKeypair::new();
+            let peer = PeerId::random();
+            let keypair: crate::dev_tool::TransportKeypair =
+                crate::transport::TransportKeypair::new();
 
             let mut config = NodeConfig::new();
             for GatewayConfig { id, location, .. } in &gateways {
@@ -460,7 +461,6 @@ impl SimNetwork {
                 .with_ip(Ipv6Addr::LOCALHOST)
                 .with_port(crate::util::get_free_port().unwrap());
 
-            let peer = PeerId::from(id);
             self.event_listener.add_node(label.clone(), peer);
 
             let event_listener = {
@@ -968,8 +968,8 @@ where
     UsrEv: ClientEventsProxy + Send + 'static,
 {
     connect::initial_join_procedure(
-        &config.op_manager,
-        &mut config.conn_manager,
+        config.op_manager.clone(),
+        config.conn_manager.clone(),
         config.peer_key.pub_key.clone(),
         &config.gateways,
     )

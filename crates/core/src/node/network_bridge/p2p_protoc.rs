@@ -558,18 +558,25 @@ impl P2pConnManager {
             _ => {}
         }
 
-        tracing::debug!(target = %peer, %net_msg, "Sending outbound msg");
-        if let Some(conn) = self.connection.get(&peer) {
+        if let Some((_, conn)) = &mut connection {
             conn.send(*net_msg)
                 .await
                 .map_err(|_| ConnectionError::SendNotCompleted)?;
-            Ok(connection
-                .map(|conn| Either::Right(conn))
-                .unwrap_or(Either::Left(())))
         } else {
-            tracing::debug!("Connection likely dropped");
-            Err(ConnectionError::SendNotCompleted)
+            if let Some(conn) = self.connection.get(&peer) {
+                tracing::debug!(target = %peer, %net_msg, "Sending outbound message");
+                conn.send(*net_msg)
+                    .await
+                    .map_err(|_| ConnectionError::SendNotCompleted)?;
+            } else {
+                tracing::error!("Connection likely dropped");
+                return Err(ConnectionError::SendNotCompleted);
+            }
         }
+
+        Ok(connection
+            .map(|conn| Either::Right(conn))
+            .unwrap_or(Either::Left(())))
     }
 }
 

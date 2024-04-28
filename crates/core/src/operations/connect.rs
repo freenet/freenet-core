@@ -1,9 +1,11 @@
 //! Operation which seeks new connections in the ring.
-use freenet_stdlib::client_api::HostResponse;
-use futures::Future;
 use std::collections::HashSet;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
+
+use freenet_stdlib::client_api::HostResponse;
+use futures::Future;
 
 use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::client_events::HostResult;
@@ -623,13 +625,13 @@ impl ConnectState {
 ///
 /// - is_gateway: Whether this peer is a gateway or not.
 pub(crate) async fn initial_join_procedure<CM>(
-    op_manager: &OpManager,
-    conn_manager: &mut CM,
+    op_manager: Arc<OpManager>,
+    mut conn_manager: CM,
     peer_pub_key: TransportPublicKey,
     gateways: &[PeerKeyLocation],
 ) -> Result<(), OpError>
 where
-    CM: NetworkBridge + Send,
+    CM: NetworkBridge + Send + 'static,
 {
     use crate::util::IterExt;
     let number_of_parallel_connections = {
@@ -638,26 +640,31 @@ where
         let needed_to_cover_max = gateways.iter().count() / max_potential_conns_per_gw;
         needed_to_cover_max.max(1)
     };
-    tracing::info!(
-        "Attempting to connect to {} gateways in parallel",
-        number_of_parallel_connections
-    );
-    // FIXME: we are only doing this once, we should keep trying until
-    // we have at least acquired one connection
-    for gateway in gateways
-        .iter()
-        .shuffle()
-        .take(number_of_parallel_connections)
-    {
-        join_ring_request(
-            None,
-            peer_pub_key.clone(),
-            gateway,
-            op_manager,
-            conn_manager,
-        )
-        .await?;
-    }
+    let gateways = gateways.to_vec();
+    tokio::task::spawn(async move {
+        while op_manager.ring.open_connections() == 0 {
+            tracing::info!(
+                "Attempting to connect to {} gateways in parallel",
+                number_of_parallel_connections
+            );
+            for gateway in gateways
+                .iter()
+                .shuffle()
+                .take(number_of_parallel_connections)
+            {
+                join_ring_request(
+                    None,
+                    peer_pub_key.clone(),
+                    gateway,
+                    &*op_manager,
+                    &mut conn_manager,
+                )
+                .await?;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        Ok::<_, OpError>(())
+    });
     Ok(())
 }
 

@@ -37,11 +37,11 @@ pub(super) struct NodeP2P {
 }
 
 impl NodeP2P {
-    pub(super) async fn run_node(mut self) -> Result<(), anyhow::Error> {
+    pub(super) async fn run_node(self) -> Result<(), anyhow::Error> {
         if self.should_try_connect {
             connect::initial_join_procedure(
-                &self.op_manager,
-                &mut self.conn_manager.bridge,
+                self.op_manager.clone(),
+                self.conn_manager.bridge.clone(),
                 self.peer_pub_key,
                 &self.conn_manager.gateways,
             )

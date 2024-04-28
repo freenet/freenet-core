@@ -252,7 +252,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             if let Some((packets_sender, open_connection)) = ongoing_connections.remove(&remote_addr) {
                                 if packets_sender.send(packet_data).await.is_err() {
                                     // it can happen that the connection is established but the channel is closed because the task completed
-                                    // but we still ahven't polled the result future
+                                    // but we still haven't polled the result future
                                     tracing::debug!(%remote_addr, "failed to send packet to remote");
                                 }
                                 ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
@@ -329,7 +329,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                             if let Some((_, result_sender)) = ongoing_connections.remove(&outbound_remote_conn.remote_addr) {
                                 tracing::debug!(%outbound_remote_conn.remote_addr, "connection established");
                                 self.remote_connections.insert(outbound_remote_conn.remote_addr, inbound_remote_connection);
-                                let _ = result_sender.send(Ok(outbound_remote_conn));
+                                let _ = result_sender.send(Ok(outbound_remote_conn)).map_err(|_| {
+                                    tracing::error!("failed sending back peer connection");
+                                });
                             } else {
                                 tracing::error!(%outbound_remote_conn.remote_addr, "connection established but no ongoing connection found");
                             }
@@ -376,13 +378,16 @@ impl<S: Socket> UdpPacketsListener<S> {
         >,
     > + Send
            + 'static {
-        tracing::debug!(%remote_addr, "new connection to gateway");
         let secret = self.this_peer_keypair.secret.clone();
         let outbound_packets = self.outbound_packets.clone();
         let socket_listener = self.socket_listener.clone();
 
         async move {
-            let decrypted_intro_packet = secret.decrypt(remote_intro_packet.data())?;
+            let decrypted_intro_packet =
+                secret.decrypt(remote_intro_packet.data()).map_err(|err| {
+                    tracing::debug!(%remote_addr, %err, "Failed to decrypt intro packet");
+                    err
+                })?;
             let protoc = &decrypted_intro_packet[..PROTOC_VERSION.len()];
             let outbound_key_bytes =
                 &decrypted_intro_packet[PROTOC_VERSION.len()..PROTOC_VERSION.len() + 16];
@@ -498,6 +503,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 inbound_checked_times: 0,
             };
 
+            tracing::debug!("returning connection at gw");
             Ok((remote_conn, inbound_conn, outbound_ack_packet))
         }
     }

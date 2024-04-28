@@ -662,10 +662,10 @@ impl Runnable for NetworkPeer {
         let event_generator =
             NetworkEventGenerator::new(peer.clone(), memory_event_generator, ws_client);
 
-        let private_key = freenet::dev_tool::TransportKeypair::new();
+        let peer_keypair = self.config.key_pair.clone().unwrap();
 
         match self
-            .build(peer_id.clone(), [Box::new(event_generator)], private_key)
+            .build(peer_id.clone(), [Box::new(event_generator)], peer_keypair)
             .await
         {
             Ok(node) => match node.run().await {
