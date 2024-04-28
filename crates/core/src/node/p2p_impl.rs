@@ -33,7 +33,6 @@ pub(super) struct NodeP2P {
     executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
     cli_response_sender: ClientResponsesSender,
     node_controller: tokio::sync::mpsc::Receiver<NodeEvent>,
-    is_gateway: bool,
     should_try_connect: bool,
 }
 
@@ -124,7 +123,6 @@ impl NodeP2P {
             executor_listener,
             cli_response_sender,
             node_controller: node_controller_rx,
-            is_gateway: config.is_gateway(),
             should_try_connect: config.should_connect,
         })
     }

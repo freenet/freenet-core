@@ -101,7 +101,7 @@ pub struct NodeConfig {
     /// Determines if an initial connection should be attempted.
     /// Only true for an initial gateway/node. If false, the gateway will be disconnected unless other peers connect through it.
     pub should_connect: bool,
-    is_gateway: bool,
+    pub is_gateway: bool,
     /// If not specified, a key is generated and used when creating the node.
     pub key_pair: Option<TransportKeypair>,
     // optional local info, in case this is an initial bootstrap node
@@ -145,6 +145,15 @@ impl NodeConfig {
             max_upstream_bandwidth: None,
             max_downstream_bandwidth: None,
         }
+    }
+
+    pub fn is_gateway(&mut self) -> &mut Self {
+        self.is_gateway = true;
+        self
+    }
+
+    pub fn first_gateway(&mut self) {
+        self.should_connect = false;
     }
 
     pub fn with_key_pair(&mut self, key_pair: TransportKeypair) -> &mut Self {
@@ -230,10 +239,6 @@ impl NodeConfig {
         )
         .await?;
         Ok(Node(node))
-    }
-
-    pub fn is_gateway(&self) -> bool {
-        self.is_gateway
     }
 
     pub fn get_peer_id(&self) -> Option<PeerId> {

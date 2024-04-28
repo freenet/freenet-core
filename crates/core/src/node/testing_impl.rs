@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Write,
     net::Ipv6Addr,
+    num::NonZeroUsize,
     pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
@@ -319,7 +320,7 @@ impl SimNetwork {
         max_connections: usize,
         min_connections: usize,
     ) -> Self {
-        assert!(gateways > 0 && nodes > 0);
+        assert!(nodes > 0);
         let (user_ev_controller, mut receiver_ch) = watch::channel((0, PeerId::random()));
         receiver_ch.borrow_and_update();
         let mut net = Self {
@@ -340,7 +341,12 @@ impl SimNetwork {
             start_backoff: Duration::from_millis(1),
             add_noise: false,
         };
-        net.config_gateways(gateways).await;
+        net.config_gateways(
+            gateways
+                .try_into()
+                .expect("should have at least one gateway"),
+        )
+        .await;
         net.config_nodes(nodes).await;
         net
     }
@@ -362,10 +368,10 @@ impl SimNetwork {
         self.clean_up_tmp_dirs = false;
     }
 
-    async fn config_gateways(&mut self, num: usize) {
+    async fn config_gateways(&mut self, num: NonZeroUsize) {
         info!("Building {} gateways", num);
-        let mut configs = Vec::with_capacity(num);
-        for node_no in 0..num {
+        let mut configs = Vec::with_capacity(num.into());
+        for node_no in 0..num.into() {
             let label = NodeLabel::gateway(node_no);
             let port = crate::util::get_free_port().unwrap();
             let keypair = crate::transport::TransportKeypair::new();
@@ -381,6 +387,7 @@ impl SimNetwork {
                 .max_hops_to_live(self.ring_max_htl)
                 .max_number_of_connections(self.max_connections)
                 .min_number_of_connections(self.min_connections)
+                .is_gateway()
                 .rnd_if_htl_above(self.rnd_if_htl_above);
 
             self.event_listener.add_node(label.clone(), id.clone());
@@ -393,6 +400,7 @@ impl SimNetwork {
                 },
             ));
         }
+        configs[0].0.should_connect = false;
 
         let gateways: Vec<_> = configs.iter().map(|(_, gw)| gw.clone()).collect();
         for (mut this_node, this_config) in configs {

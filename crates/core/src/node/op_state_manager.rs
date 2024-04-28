@@ -66,7 +66,7 @@ impl OpManager {
             config,
             notification_channel.clone(),
             event_register.clone(),
-            config.is_gateway(),
+            config.is_gateway,
         )?;
         let ops = Arc::new(Ops::default());
 

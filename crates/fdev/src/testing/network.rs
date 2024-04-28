@@ -535,7 +535,7 @@ impl Supervisor {
             .lock()
             .await
             .iter()
-            .filter(|(_, config)| !config.is_gateway())
+            .filter(|(_, config)| !config.is_gateway)
             .map(|(label, config)| (label.clone(), config.clone()))
             .collect()
     }
@@ -545,7 +545,7 @@ impl Supervisor {
             .lock()
             .await
             .iter()
-            .filter(|(_, config)| config.is_gateway())
+            .filter(|(_, config)| config.is_gateway)
             .map(|(label, config)| (label.clone(), config.clone()))
             .collect()
     }
@@ -579,6 +579,7 @@ impl Supervisor {
 
     pub async fn start_peer_gateways(&self, cmd_args: &[String]) -> Result<(), Error> {
         let nodes: Vec<(NodeLabel, NodeConfig)> = self.get_peer_gateways().await;
+        
         for (label, config) in nodes {
             self.enqueue_gateway(label.number()).await;
             self.start_process(cmd_args, &label, &config).await?;
@@ -624,7 +625,7 @@ pub trait Runnable {
 impl Runnable for NetworkPeer {
     async fn run(&self, config: &TestConfig, peer_id: String) -> anyhow::Result<()> {
         let peer = self.config.get_peer_id().unwrap();
-        if self.config.is_gateway() {
+        if self.config.is_gateway {
             tracing::info!(%peer, "Starting gateway {}", peer_id);
         } else {
             tracing::info!(%peer, "Starting node {}", peer_id);
@@ -664,12 +665,12 @@ impl Runnable for NetworkPeer {
         {
             Ok(node) => match node.run().await {
                 Ok(_) => {
-                    if self.config.is_gateway() {
+                    if self.config.is_gateway {
                         tracing::info!("Gateway {} finished", peer_id);
                     } else {
                         tracing::info!("Node {} finished", peer_id);
                     }
-                    let msg = match self.config.is_gateway() {
+                    let msg = match self.config.is_gateway {
                         true => PeerMessage::Status(PeerStatus::GatewayStarted(peer_id_num)),
                         false => PeerMessage::Status(PeerStatus::PeerStarted(peer_id_num)),
                     };

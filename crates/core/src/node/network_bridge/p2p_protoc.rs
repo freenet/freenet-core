@@ -137,7 +137,7 @@ impl P2pConnManager {
             key_pair: private_key,
             listening_ip: listener_ip,
             listening_port: listen_port,
-            is_gateway: config.is_gateway(),
+            is_gateway: config.is_gateway,
         })
     }
 

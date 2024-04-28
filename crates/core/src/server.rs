@@ -204,7 +204,7 @@ pub mod network_node {
 
         let private_key = TransportKeypair::new();
 
-        let is_gateway = node_config.is_gateway();
+        let is_gateway = node_config.is_gateway;
         let node = node_config
             .build(config, [Box::new(gw), Box::new(ws_proxy)], private_key)
             .await?;
