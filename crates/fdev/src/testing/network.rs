@@ -1,4 +1,13 @@
-use super::{Error, TestConfig};
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt::Display,
+    net::SocketAddr,
+    ops::Deref,
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
+
 use anyhow::anyhow;
 use axum::{
     body::Body,
@@ -14,25 +23,19 @@ use freenet::dev_tool::{
     EventChain, MemoryEventsGen, NetworkEventGenerator, NetworkPeer, NodeConfig, NodeLabel, PeerId,
     PeerMessage, PeerStatus, SimNetwork,
 };
-use futures::stream::{SplitSink, SplitStream};
-use futures::{SinkExt, StreamExt};
-use http::{Response, StatusCode};
-use std::ops::Deref;
-use std::{
-    collections::{HashMap, VecDeque},
-    fmt::Display,
-    net::SocketAddr,
-    process::Stdio,
-    sync::Arc,
-    time::Duration,
+use futures::{
+    stream::{SplitSink, SplitStream},
+    SinkExt, StreamExt,
 };
-
+use http::{Response, StatusCode};
 use thiserror::Error;
-use tokio::task::JoinHandle;
 use tokio::{
     process::Command,
     sync::{oneshot, Mutex},
+    task::JoinHandle,
 };
+
+use super::{Error, TestConfig};
 
 #[derive(Debug, Error)]
 pub enum NetworkSimulationError {
@@ -579,7 +582,7 @@ impl Supervisor {
 
     pub async fn start_peer_gateways(&self, cmd_args: &[String]) -> Result<(), Error> {
         let nodes: Vec<(NodeLabel, NodeConfig)> = self.get_peer_gateways().await;
-        
+
         for (label, config) in nodes {
             self.enqueue_gateway(label.number()).await;
             self.start_process(cmd_args, &label, &config).await?;

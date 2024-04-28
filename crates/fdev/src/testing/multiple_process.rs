@@ -323,10 +323,26 @@ struct SubProcess {
 
 impl SubProcess {
     fn start(cmd_args: &[String], label: &NodeLabel, id: PeerId) -> anyhow::Result<Self, Error> {
+        let mut command = if cfg!(debug_assertions) {
+            Command::new("cargo")
+        } else {
+            Command::new("fdev")
+        };
+        #[cfg(debug_assertions)]
+        {
+            let args = ["run", "--"]
+                .into_iter()
+                .chain(cmd_args.iter().map(std::ops::Deref::deref));
+            command.args(args);
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let args = cmd_args;
+            command.args(args);
+        }
         // the identifier used for multi-process tests is the peer id
-        let child = Command::new("fdev")
+        let child = command
             .kill_on_drop(true)
-            .args(cmd_args)
             .arg("--id")
             .arg(label.number().to_string())
             .stdin(Stdio::piped())
