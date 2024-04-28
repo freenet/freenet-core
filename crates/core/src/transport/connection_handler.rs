@@ -69,7 +69,6 @@ pub(crate) async fn create_connection_handler<S: Socket>(
         Arc::new(socket),
         keypair,
         is_gateway,
-        #[cfg(test)]
         (listen_host, listen_port).into(),
     )?;
     Ok((
@@ -100,7 +99,7 @@ impl OutboundConnectionHandler {
         socket: Arc<impl Socket>,
         keypair: TransportKeypair,
         is_gateway: bool,
-        #[cfg(test)] socket_addr: SocketAddr,
+        socket_addr: SocketAddr,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection>), TransportError> {
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
@@ -116,7 +115,6 @@ impl OutboundConnectionHandler {
             connection_handler: conn_handler_receiver,
             new_connection_notifier: new_connection_sender,
             outbound_packets: outbound_sender,
-            #[cfg(test)]
             this_addr: socket_addr,
         };
         let bw_tracker = super::rate_limiter::PacketRateLimiter::new(
@@ -194,7 +192,6 @@ struct UdpPacketsListener<S = UdpSocket> {
     is_gateway: bool,
     new_connection_notifier: mpsc::Sender<PeerConnection>,
     outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
-    #[cfg(test)]
     this_addr: SocketAddr,
 }
 
@@ -573,6 +570,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         let transport_secret_key = self.this_peer_keypair.secret.clone();
         let (inbound_from_remote, mut next_inbound) =
             mpsc::channel::<PacketData<UnknownEncryption>>(1);
+        let this_addr = self.this_addr;
         let f = async move {
             let mut state = ConnectionState::StartOutbound {};
             // Initialize timeout and interval
@@ -763,12 +761,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                         }
                     }
                     Ok(None) => {
-                        tracing::debug!("debug: connection closed");
+                        tracing::debug!(%this_addr, "debug: connection closed");
                         return Err(TransportError::ConnectionClosed);
                     }
                     Err(_) => {
                         failures += 1;
-                        tracing::debug!("Failed to receive UDP response, time out");
+                        tracing::debug!(%this_addr, "Failed to receive UDP response, time out");
                     }
                 }
 

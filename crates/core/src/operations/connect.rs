@@ -642,6 +642,8 @@ where
         "Attempting to connect to {} gateways in parallel",
         number_of_parallel_connections
     );
+    // FIXME: we are only doing this once, we should keep trying until
+    // we have at least acquired one connection
     for gateway in gateways
         .iter()
         .shuffle()

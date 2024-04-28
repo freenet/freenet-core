@@ -520,6 +520,9 @@ impl P2pConnManager {
                         .await?;
                     tracing::debug!("Connection established with peer {}", peer.addr);
                     connection = Some((peer.clone(), peer_conn));
+                } else {
+                    tracing::error!("Connection already exists with gateway {}", peer.addr);
+                    return Ok(Either::Left(()));
                 }
             }
             NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
