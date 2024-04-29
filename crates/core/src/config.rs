@@ -46,21 +46,26 @@ const APPLICATION: &str = "Freenet";
 #[derive(clap::Parser, Debug, Serialize, Deserialize)]
 pub struct ConfigArgs {
     /// Node operation mode.
-    #[clap(value_enum, default_value_t = OperationMode::Local, env = "MODE")]
-    pub mode: OperationMode,
+    #[clap(value_enum, env = "MODE")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<OperationMode>,
 
-    /// Overrides the default data directory where Freenet contract files are stored.
-    #[clap(long, env = "NODE_DATA_DIR")]
-    pub node_data_dir: Option<PathBuf>,
+    /// Path to the configuration file.
+    #[clap(short, long)]
+    #[serde(skip)]
+    pub config: Option<PathBuf>,
 
     #[clap(flatten)]
     #[serde(flatten)]
-    pub gateway: GatewayConfig,
+    pub gateway: GatewayArgs,
     #[clap(value_parser, env = "LOCAL_PEER_KEYPAIR")]
     pub local_peer_keypair: Option<PathBuf>,
-    #[serde(with = "serde_log_level_filter")]
-    #[clap(long, default_value = "info", env = "INFO")]
-    pub log_level: tracing::log::LevelFilter,
+    #[serde(
+        with = "serde_option_log_level_filter",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[clap(long, env = "LOG_LEVEL")]
+    pub log_level: Option<tracing::log::LevelFilter>,
     #[clap(flatten)]
     #[serde(flatten)]
     config_paths: ConfigPathsArgs,
@@ -69,11 +74,14 @@ pub struct ConfigArgs {
 impl Default for ConfigArgs {
     fn default() -> Self {
         Self {
-            mode: OperationMode::Local,
-            node_data_dir: None,
-            gateway: Default::default(),
+            mode: Some(OperationMode::Local),
+            config: None,
+            gateway: GatewayArgs {
+                address: Some(default_gateway_address()),
+                port: Some(default_gateway_port()),
+            },
             local_peer_keypair: None,
-            log_level: tracing::log::LevelFilter::Info,
+            log_level: Some(tracing::log::LevelFilter::Info),
             config_paths: Default::default(),
         }
     }
@@ -81,16 +89,84 @@ impl Default for ConfigArgs {
 
 impl ConfigArgs {
     /// Parse the command line arguments and return the configuration.
-    pub fn build(self) -> std::io::Result<Config> {
+    pub fn build(mut self) -> std::io::Result<Config> {
+        let cfg = if let Some(path) = self.config.as_ref() {
+            if !path.exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Configuration file not found",
+                ));
+            }
+            match path.extension() {
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Invalid configuration file",
+                    ))
+                }
+                Some(ext) if ext == "toml" => {
+                    let mut file = File::open(path)?;
+                    let mut content = String::new();
+                    file.read_to_string(&mut content)?;
+                    Some(toml::from_str::<Self>(&content).map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                    })?)
+                }
+                Some(ext) if ext == "json" => {
+                    let mut file = File::open(path)?;
+                    Some(serde_json::from_reader::<_, Self>(&mut file)?)
+                }
+                Some(ext) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "Invalid configuration file extension: {}",
+                            ext.to_string_lossy()
+                        ),
+                    ))
+                }
+            }
+        } else {
+            None
+        };
+
+        // merge the configuration from the file with the command line arguments
+        if let Some(cfg) = cfg {
+            if self.local_peer_keypair.is_none() {
+                self.local_peer_keypair = cfg.local_peer_keypair;
+            }
+
+            if self.mode.is_none() {
+                self.mode = cfg.mode;
+            }
+
+            if self.gateway.address.is_none() {
+                self.gateway.address = cfg.gateway.address;
+            }
+
+            if self.gateway.port.is_none() {
+                self.gateway.port = cfg.gateway.port;
+            }
+
+            if self.log_level.is_none() {
+                self.log_level = cfg.log_level;
+            }
+
+            self.config_paths.merge(cfg.config_paths);
+        }
+
         Ok(Config {
-            mode: self.mode,
-            gateway: self.gateway,
+            mode: self.mode.unwrap_or(OperationMode::Local),
+            gateway: GatewayConfig {
+                address: self.gateway.address.unwrap_or(default_gateway_address()),
+                port: self.gateway.port.unwrap_or(default_gateway_port()),
+            },
             local_peer_keypair: match self.local_peer_keypair {
                 Some(path) => parse_keypair(path.to_string_lossy().trim())
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
                 None => identity::Keypair::generate_ed25519(),
             },
-            log_level: self.log_level,
+            log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
             config_paths: self.config_paths.build()?,
         })
     }
@@ -128,6 +204,21 @@ mod serde_log_level_filter {
     use serde::{Deserialize, Deserializer, Serializer};
     use tracing::log::LevelFilter;
 
+    pub fn parse_log_level_str<'a, D>(level: &str) -> Result<LevelFilter, D::Error>
+    where
+        D: serde::Deserializer<'a>,
+    {
+        Ok(match level.trim() {
+            "off" | "Off" | "OFF" => LevelFilter::Off,
+            "error" | "Error" | "ERROR" => LevelFilter::Error,
+            "warn" | "Warn" | "WARN" => LevelFilter::Warn,
+            "info" | "Info" | "INFO" => LevelFilter::Info,
+            "debug" | "Debug" | "DEBUG" => LevelFilter::Debug,
+            "trace" | "Trace" | "TRACE" => LevelFilter::Trace,
+            s => return Err(serde::de::Error::custom(format!("unknown log level: {s}"))),
+        })
+    }
+
     pub fn serialize<S>(level: &LevelFilter, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -148,16 +239,37 @@ mod serde_log_level_filter {
         D: Deserializer<'de>,
     {
         let level = <&str>::deserialize(deserializer)?;
+        parse_log_level_str::<D>(level)
+    }
+}
 
-        Ok(match level.trim() {
-            "off" | "Off" | "OFF" => LevelFilter::Off,
-            "error" | "Error" | "ERROR" => LevelFilter::Error,
-            "warn" | "Warn" | "WARN" => LevelFilter::Warn,
-            "info" | "Info" | "INFO" => LevelFilter::Info,
-            "debug" | "Debug" | "DEBUG" => LevelFilter::Debug,
-            "trace" | "Trace" | "TRACE" => LevelFilter::Trace,
-            s => return Err(serde::de::Error::custom(format!("unknown log level: {s}"))),
-        })
+mod serde_option_log_level_filter {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use tracing::log::LevelFilter;
+
+    pub fn serialize<S>(level: &Option<LevelFilter>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if let Some(level) = level {
+            super::serde_log_level_filter::serialize(level, serializer)
+        } else {
+            serializer.serialize_none()
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<LevelFilter>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let level = <Option<&str>>::deserialize(deserializer)?;
+
+        match level {
+            Some(level) => Ok(Some(
+                super::serde_log_level_filter::parse_log_level_str::<D>(level)?,
+            )),
+            None => Ok(None),
+        }
     }
 }
 
@@ -183,6 +295,20 @@ impl Config {
         &self.local_peer_keypair
     }
 }
+
+#[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]
+pub struct GatewayArgs {
+    /// Address to bind to, default is 0.0.0.0
+    #[arg(long = "gateway-address", env = "GATEWAY_ADDRESS")]
+    #[serde(rename = "gateway-address", skip_serializing_if = "Option::is_none")]
+    pub address: Option<IpAddr>,
+
+    /// Port to expose api on, default is 50509
+    #[arg(long = "gateway-port", env = "GATEWAY_PORT")]
+    #[serde(rename = "gateway-port", skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
 #[derive(clap::Parser, Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
     /// Address to bind to
@@ -227,6 +353,32 @@ pub struct ConfigPathsArgs {
 }
 
 impl ConfigPathsArgs {
+    fn merge(&mut self, other: Self) {
+        if self.contracts_dir.is_none() {
+            self.contracts_dir = other.contracts_dir;
+        }
+
+        if self.delegates_dir.is_none() {
+            self.delegates_dir = other.delegates_dir;
+        }
+
+        if self.secrets_dir.is_none() {
+            self.secrets_dir = other.secrets_dir;
+        }
+
+        if self.db_dir.is_none() {
+            self.db_dir = other.db_dir;
+        }
+
+        if self.event_log.is_none() {
+            self.event_log = other.event_log;
+        }
+
+        if self.data_dir.is_none() {
+            self.data_dir = other.data_dir;
+        }
+    }
+
     pub fn app_data_dir() -> std::io::Result<PathBuf> {
         let project_dir = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
             .ok_or(std::io::ErrorKind::NotFound)?;
@@ -386,98 +538,6 @@ impl Config {
     pub fn event_log(&self) -> PathBuf {
         self.config_paths.event_log(self.mode)
     }
-
-    // pub fn conf() -> &'static Config {
-    //     // CONFIG.get_or_init(|| match Config::load_conf() {
-    //     //     Ok(config) => config,
-    //     //     Err(err) => {
-    //     //         tracing::error!("failed while loading configuration: {err}");
-    //     //         panic!("Failed while loading configuration")
-    //     //     }
-    //     // })
-    //     todo!()
-    // }
-
-    // fn load_conf() -> std::io::Result<Config> {
-    //     let settings: config::Config = config::Config::builder()
-    //         .add_source(config::Environment::with_prefix("FREENET"))
-    //         .build()
-    //         .unwrap();
-    //     let local_peer_keypair = if let Ok(path_to_key) = settings
-    //         .get_string("local_peer_key_file")
-    //         .map(PathBuf::from)
-    //     {
-    //         let mut key_file = File::open(&path_to_key).unwrap_or_else(|_| {
-    //             panic!(
-    //                 "Failed to open key file: {}",
-    //                 &path_to_key.to_str().unwrap()
-    //             )
-    //         });
-    //         let mut buf = Vec::new();
-    //         key_file.read_to_end(&mut buf).unwrap();
-    //         Some(
-    //             identity::Keypair::from_protobuf_encoding(&buf)
-    //                 .map_err(|_| std::io::ErrorKind::InvalidData)?,
-    //         )
-    //     } else {
-    //         None
-    //     };
-    //     let log_level = settings
-    //         .get_string("log")
-    //         .map(|lvl| lvl.parse().ok())
-    //         .ok()
-    //         .flatten()
-    //         .unwrap_or(tracing::log::LevelFilter::Info);
-    //     let (bootstrap_ip, bootstrap_port, bootstrap_id) = Config::get_bootstrap_host(&settings)?;
-
-    //     let data_dir = settings.get_string("data_dir").ok().map(PathBuf::from);
-    //     let config_paths = ConfigPaths::new(data_dir)?;
-
-    //     let local_mode = settings.get_string("network_mode").is_err();
-
-    //     Ok(Config {
-    //         bootstrap_ip,
-    //         bootstrap_port,
-    //         bootstrap_id,
-    //         local_peer_keypair: local_peer_keypair
-    //             .unwrap_or_else(identity::Keypair::generate_ed25519),
-    //         log_level,
-    //         config_paths,
-    //         local_mode: AtomicBool::new(local_mode),
-    //         #[cfg(feature = "websocket")]
-    //         ws: WebSocketApiConfig::from_config(&settings),
-    //     })
-    // }
-
-    // fn get_bootstrap_host(
-    //     settings: &config::Config,
-    // ) -> std::io::Result<(IpAddr, u16, Option<PeerId>)> {
-    //     let bootstrap_ip = IpAddr::from_str(
-    //         &settings
-    //             .get_string("bootstrap_host")
-    //             .unwrap_or_else(|_| format!("{}", Ipv4Addr::LOCALHOST)),
-    //     )
-    //     .map_err(|_err| std::io::ErrorKind::InvalidInput)?;
-
-    //     let bootstrap_port = settings
-    //         .get_int("bootstrap_port")
-    //         .ok()
-    //         .map(u16::try_from)
-    //         .unwrap_or(Ok(DEFAULT_BOOTSTRAP_PORT))
-    //         .map_err(|_err| std::io::ErrorKind::InvalidInput)?;
-
-    //     let id_str = if let Some(id_str) = settings
-    //         .get_string("bootstrap_id")
-    //         .ok()
-    //         .map(|id| id.parse().map_err(|_err| std::io::ErrorKind::InvalidInput))
-    //     {
-    //         Some(id_str?)
-    //     } else {
-    //         None
-    //     };
-
-    //     Ok((bootstrap_ip, bootstrap_port, id_str))
-    // }
 }
 
 pub(crate) struct GlobalExecutor;

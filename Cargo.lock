@@ -1679,6 +1679,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-tungstenite 0.21.0",
+ "toml",
  "tower-http",
  "tracing",
  "tracing-opentelemetry",
