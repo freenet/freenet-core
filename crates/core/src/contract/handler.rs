@@ -498,7 +498,7 @@ pub(super) mod in_memory {
                 channel,
                 runtime: Executor::new_mock(identifier, executor_request_sender)
                     .await
-                    .unwrap(),
+                    .expect("should start mock executor"),
             }
         }
     }

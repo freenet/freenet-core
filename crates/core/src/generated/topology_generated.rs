@@ -393,13 +393,16 @@ pub mod topology {
             }
         }
         #[inline]
-        pub fn from(&self) -> &'a str {
+        pub fn from(&self) -> flatbuffers::Vector<'a, u8> {
             // Safety:
             // Created from valid Table for this object
             // which contains a valid value in this slot
             unsafe {
                 self._tab
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(AddedConnection::VT_FROM, None)
+                    .get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(
+                        AddedConnection::VT_FROM,
+                        None,
+                    )
                     .unwrap()
             }
         }
@@ -415,13 +418,16 @@ pub mod topology {
             }
         }
         #[inline]
-        pub fn to(&self) -> &'a str {
+        pub fn to(&self) -> flatbuffers::Vector<'a, u8> {
             // Safety:
             // Created from valid Table for this object
             // which contains a valid value in this slot
             unsafe {
                 self._tab
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(AddedConnection::VT_TO, None)
+                    .get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(
+                        AddedConnection::VT_TO,
+                        None,
+                    )
                     .unwrap()
             }
         }
@@ -451,9 +457,17 @@ pub mod topology {
                     Self::VT_TRANSACTION,
                     false,
                 )?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("from", Self::VT_FROM, true)?
+                .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>(
+                    "from",
+                    Self::VT_FROM,
+                    true,
+                )?
                 .visit_field::<f64>("from_location", Self::VT_FROM_LOCATION, false)?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("to", Self::VT_TO, true)?
+                .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>(
+                    "to",
+                    Self::VT_TO,
+                    true,
+                )?
                 .visit_field::<f64>("to_location", Self::VT_TO_LOCATION, false)?
                 .finish();
             Ok(())
@@ -461,9 +475,9 @@ pub mod topology {
     }
     pub struct AddedConnectionArgs<'a> {
         pub transaction: Option<flatbuffers::WIPOffset<&'a str>>,
-        pub from: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub from: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
         pub from_location: f64,
-        pub to: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub to: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
         pub to_location: f64,
     }
     impl<'a> Default for AddedConnectionArgs<'a> {
@@ -492,7 +506,7 @@ pub mod topology {
             );
         }
         #[inline]
-        pub fn add_from(&mut self, from: flatbuffers::WIPOffset<&'b str>) {
+        pub fn add_from(&mut self, from: flatbuffers::WIPOffset<flatbuffers::Vector<'b, u8>>) {
             self.fbb_
                 .push_slot_always::<flatbuffers::WIPOffset<_>>(AddedConnection::VT_FROM, from);
         }
@@ -502,7 +516,7 @@ pub mod topology {
                 .push_slot::<f64>(AddedConnection::VT_FROM_LOCATION, from_location, 0.0);
         }
         #[inline]
-        pub fn add_to(&mut self, to: flatbuffers::WIPOffset<&'b str>) {
+        pub fn add_to(&mut self, to: flatbuffers::WIPOffset<flatbuffers::Vector<'b, u8>>) {
             self.fbb_
                 .push_slot_always::<flatbuffers::WIPOffset<_>>(AddedConnection::VT_TO, to);
         }
@@ -582,24 +596,30 @@ pub mod topology {
         }
 
         #[inline]
-        pub fn at(&self) -> &'a str {
+        pub fn at(&self) -> flatbuffers::Vector<'a, u8> {
             // Safety:
             // Created from valid Table for this object
             // which contains a valid value in this slot
             unsafe {
                 self._tab
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(RemovedConnection::VT_AT, None)
+                    .get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(
+                        RemovedConnection::VT_AT,
+                        None,
+                    )
                     .unwrap()
             }
         }
         #[inline]
-        pub fn from(&self) -> &'a str {
+        pub fn from(&self) -> flatbuffers::Vector<'a, u8> {
             // Safety:
             // Created from valid Table for this object
             // which contains a valid value in this slot
             unsafe {
                 self._tab
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(RemovedConnection::VT_FROM, None)
+                    .get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(
+                        RemovedConnection::VT_FROM,
+                        None,
+                    )
                     .unwrap()
             }
         }
@@ -613,15 +633,23 @@ pub mod topology {
         ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
             use self::flatbuffers::Verifiable;
             v.visit_table(pos)?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("at", Self::VT_AT, true)?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("from", Self::VT_FROM, true)?
+                .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>(
+                    "at",
+                    Self::VT_AT,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>(
+                    "from",
+                    Self::VT_FROM,
+                    true,
+                )?
                 .finish();
             Ok(())
         }
     }
     pub struct RemovedConnectionArgs<'a> {
-        pub at: Option<flatbuffers::WIPOffset<&'a str>>,
-        pub from: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub at: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
+        pub from: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
     }
     impl<'a> Default for RemovedConnectionArgs<'a> {
         #[inline]
@@ -639,12 +667,12 @@ pub mod topology {
     }
     impl<'a: 'b, 'b> RemovedConnectionBuilder<'a, 'b> {
         #[inline]
-        pub fn add_at(&mut self, at: flatbuffers::WIPOffset<&'b str>) {
+        pub fn add_at(&mut self, at: flatbuffers::WIPOffset<flatbuffers::Vector<'b, u8>>) {
             self.fbb_
                 .push_slot_always::<flatbuffers::WIPOffset<_>>(RemovedConnection::VT_AT, at);
         }
         #[inline]
-        pub fn add_from(&mut self, from: flatbuffers::WIPOffset<&'b str>) {
+        pub fn add_from(&mut self, from: flatbuffers::WIPOffset<flatbuffers::Vector<'b, u8>>) {
             self.fbb_
                 .push_slot_always::<flatbuffers::WIPOffset<_>>(RemovedConnection::VT_FROM, from);
         }

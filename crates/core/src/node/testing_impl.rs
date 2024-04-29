@@ -1,7 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
+    net::Ipv6Addr,
+    num::NonZeroUsize,
     pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
@@ -11,8 +12,7 @@ use either::Either;
 use freenet_stdlib::prelude::*;
 use futures::Future;
 use itertools::Itertools;
-use libp2p::{identity, PeerId as Libp2pPeerId};
-use rand::{seq::SliceRandom, Rng};
+use rand::seq::SliceRandom;
 use tokio::sync::{mpsc, watch};
 use tracing::{info, Instrument};
 
@@ -25,7 +25,7 @@ use crate::{
         self, ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
         WaitingResolution,
     },
-    message::{NetMessage, NodeEvent, Transaction},
+    message::{MessageStats, NetMessage, NetMessageV1, NodeEvent, Transaction},
     node::{InitPeerNode, NetEventRegister, NodeConfig},
     operations::connect,
     ring::{Distance, Location, PeerKeyLocation},
@@ -42,25 +42,6 @@ pub use self::network::{NetworkPeer, PeerMessage, PeerStatus};
 use super::{
     network_bridge::EventLoopNotificationsReceiver, ConnectionError, NetworkBridge, PeerId,
 };
-
-pub fn get_free_port() -> Result<u16, ()> {
-    let mut port;
-    for _ in 0..100 {
-        port = get_dynamic_port();
-        let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-        if let Ok(conn) = TcpListener::bind(bind_addr) {
-            std::mem::drop(conn);
-            return Ok(port);
-        }
-    }
-    Err(())
-}
-
-fn get_dynamic_port() -> u16 {
-    const FIRST_DYNAMIC_PORT: u16 = 49152;
-    const LAST_DYNAMIC_PORT: u16 = 65535;
-    rand::thread_rng().gen_range(FIRST_DYNAMIC_PORT..LAST_DYNAMIC_PORT)
-}
 
 pub(crate) type EventId = u32;
 
@@ -137,8 +118,7 @@ pub(crate) struct NodeSpecification {
 #[derive(Clone)]
 struct GatewayConfig {
     label: NodeLabel,
-    port: u16,
-    id: Libp2pPeerId,
+    id: PeerId,
     location: Location,
 }
 
@@ -191,7 +171,7 @@ impl<S> EventChain<S> {
         let rng = &mut this.rng;
         let labels = &mut this.labels;
         let (_, id) = labels.choose(rng).expect("not empty");
-        *id
+        id.clone()
     }
 
     fn set_choice(self: Pin<&mut Self>, id: PeerId) {
@@ -247,7 +227,7 @@ impl<S: EventSender> futures::stream::Stream for EventChain<S> {
             let id = self.as_mut().choose_peer();
             match self
                 .user_ev_controller
-                .send(cx, (self.count, id))
+                .send(cx, (self.count, id.clone()))
                 .map_err(|_| {
                     tracing::error!("peer controller should be alive, finishing event chain")
                 }) {
@@ -297,10 +277,10 @@ impl<ER: NetEventRegister> Builder<ER> {
         contract_handler_name: String,
         add_noise: bool,
     ) -> Builder<ER> {
-        let peer_key = builder.peer_id;
+        let peer_key = builder.get_peer_id().unwrap();
         Builder {
             peer_key,
-            config: builder,
+            config: builder.clone(),
             contract_handler_name,
             add_noise,
             event_register,
@@ -340,7 +320,7 @@ impl SimNetwork {
         max_connections: usize,
         min_connections: usize,
     ) -> Self {
-        assert!(gateways > 0 && nodes > 0);
+        assert!(nodes > 0);
         let (user_ev_controller, mut receiver_ch) = watch::channel((0, PeerId::random()));
         receiver_ch.borrow_and_update();
         let mut net = Self {
@@ -361,7 +341,12 @@ impl SimNetwork {
             start_backoff: Duration::from_millis(1),
             add_noise: false,
         };
-        net.config_gateways(gateways).await;
+        net.config_gateways(
+            gateways
+                .try_into()
+                .expect("should have at least one gateway"),
+        )
+        .await;
         net.config_nodes(nodes).await;
         net
     }
@@ -383,53 +368,47 @@ impl SimNetwork {
         self.clean_up_tmp_dirs = false;
     }
 
-    async fn config_gateways(&mut self, num: usize) {
+    async fn config_gateways(&mut self, num: NonZeroUsize) {
         info!("Building {} gateways", num);
-        let mut configs = Vec::with_capacity(num);
-        for node_no in 0..num {
+        let mut configs = Vec::with_capacity(num.into());
+        for node_no in 0..num.into() {
             let label = NodeLabel::gateway(node_no);
-            let pair = identity::Keypair::generate_ed25519();
-            let id = pair.public().to_peer_id();
-            let port = get_free_port().unwrap();
+            let port = crate::util::get_free_port().unwrap();
+            let keypair = crate::transport::TransportKeypair::new();
+            let id = PeerId::new((Ipv6Addr::LOCALHOST, port).into(), keypair.public.clone());
             let location = Location::random();
 
             let mut config = NodeConfig::new(ConfigArgs::default().build().unwrap());
             config
+                .with_key_pair(keypair)
                 .with_ip(Ipv6Addr::LOCALHOST)
                 .with_port(port)
-                .with_key(pair.public().into())
                 .with_location(location)
                 .max_hops_to_live(self.ring_max_htl)
                 .max_number_of_connections(self.max_connections)
                 .min_number_of_connections(self.min_connections)
+                .is_gateway()
                 .rnd_if_htl_above(self.rnd_if_htl_above);
 
-            self.event_listener
-                .add_node(label.clone(), PeerId::from(id));
+            self.event_listener.add_node(label.clone(), id.clone());
             configs.push((
                 config,
                 GatewayConfig {
                     label,
                     id,
-                    port,
                     location,
                 },
             ));
         }
+        configs[0].0.should_connect = false;
 
         let gateways: Vec<_> = configs.iter().map(|(_, gw)| gw.clone()).collect();
         for (mut this_node, this_config) in configs {
-            for GatewayConfig {
-                port, id, location, ..
-            } in gateways
+            for GatewayConfig { id, location, .. } in gateways
                 .iter()
                 .filter(|config| this_config.label != config.label)
             {
-                this_node.add_gateway(
-                    InitPeerNode::new(*id, *location)
-                        .listening_ip(Ipv6Addr::LOCALHOST)
-                        .listening_port(*port),
-                );
+                this_node.add_gateway(InitPeerNode::new(id.clone(), *location));
             }
             let event_listener = {
                 #[cfg(feature = "trace-ot")]
@@ -466,29 +445,22 @@ impl SimNetwork {
 
         for node_no in self.number_of_gateways..num + self.number_of_gateways {
             let label = NodeLabel::node(node_no);
-            let pair = identity::Keypair::generate_ed25519();
-            let id = pair.public().to_peer_id();
+            let peer = PeerId::random();
+            let keypair: crate::dev_tool::TransportKeypair =
+                crate::transport::TransportKeypair::new();
 
             let mut config = NodeConfig::new(ConfigArgs::default().build().unwrap());
-            for GatewayConfig {
-                port, id, location, ..
-            } in &gateways
-            {
-                config.add_gateway(
-                    InitPeerNode::new(*id, *location)
-                        .listening_ip(Ipv6Addr::LOCALHOST)
-                        .listening_port(*port),
-                );
+            for GatewayConfig { id, location, .. } in &gateways {
+                config.add_gateway(InitPeerNode::new(id.clone(), *location));
             }
             config
                 .max_hops_to_live(self.ring_max_htl)
                 .rnd_if_htl_above(self.rnd_if_htl_above)
                 .max_number_of_connections(self.max_connections)
-                .with_key(pair.public().into())
+                .with_key_pair(keypair)
                 .with_ip(Ipv6Addr::LOCALHOST)
-                .with_port(get_free_port().unwrap());
+                .with_port(crate::util::get_free_port().unwrap());
 
-            let peer = PeerId::from(id);
             self.event_listener.add_node(label.clone(), peer);
 
             let event_listener = {
@@ -529,7 +501,8 @@ impl SimNetwork {
         for (mut node, label) in gw.chain(self.nodes.drain(..)).collect::<Vec<_>>() {
             tracing::debug!(peer = %label, "initializing");
             let node_spec = specs.remove(&label);
-            let mut user_events = MemoryEventsGen::new(self.receiver_ch.clone(), node.peer_key);
+            let mut user_events =
+                MemoryEventsGen::new(self.receiver_ch.clone(), node.peer_key.clone());
             if let Some(specs) = node_spec.clone() {
                 user_events.generate_events(specs.events_to_generate);
             }
@@ -541,7 +514,7 @@ impl SimNetwork {
             if let Some(specs) = node_spec {
                 node.append_contracts(specs.owned_contracts, specs.contract_subscribers);
             }
-            self.labels.push((label, node.peer_key));
+            self.labels.push((label, node.peer_key.clone()));
 
             let node_task = async move { node.run_node(user_events, span).await };
             GlobalExecutor::spawn(node_task);
@@ -565,15 +538,18 @@ impl SimNetwork {
         let mut peers = vec![];
         for (node, label) in gw.chain(self.nodes.drain(..)).collect::<Vec<_>>() {
             tracing::debug!(peer = %label, "initializing");
-            let mut user_events =
-                MemoryEventsGen::<R>::new_with_seed(self.receiver_ch.clone(), node.peer_key, seed);
+            let mut user_events = MemoryEventsGen::<R>::new_with_seed(
+                self.receiver_ch.clone(),
+                node.peer_key.clone(),
+                seed,
+            );
             user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
             let span = if label.is_gateway() {
                 tracing::info_span!("in_mem_gateway", %node.peer_key)
             } else {
                 tracing::info_span!("in_mem_node", %node.peer_key)
             };
-            self.labels.push((label, node.peer_key));
+            self.labels.push((label, node.peer_key.clone()));
 
             let node_task = async move { node.run_node(user_events, span).await };
             let handle = GlobalExecutor::spawn(node_task);
@@ -606,7 +582,7 @@ impl SimNetwork {
             locations_by_node.insert(
                 label.clone(),
                 PeerKeyLocation {
-                    peer: node.peer_key,
+                    peer: node.peer_key.clone(),
                     location: None,
                 },
             );
@@ -615,7 +591,7 @@ impl SimNetwork {
             locations_by_node.insert(
                 config.label.clone(),
                 PeerKeyLocation {
-                    peer: node.peer_key,
+                    peer: node.peer_key.clone(),
                     location: config.location.into(),
                 },
             );
@@ -665,7 +641,7 @@ impl SimNetwork {
     pub fn ring_distribution(&self, scale: i32) -> Vec<(f64, usize)> {
         let mut all_dists = Vec::with_capacity(self.labels.len());
         for (.., key) in &self.labels {
-            all_dists.push(self.event_listener.connections(*key));
+            all_dists.push(self.event_listener.connections(key.clone()));
         }
         let mut dist_buckets = group_locations_in_buckets(
             all_dists.into_iter().flatten().map(|(_, l)| l.as_f64()),
@@ -685,10 +661,10 @@ impl SimNetwork {
         for (label, key) in &self.labels {
             let conns = self
                 .event_listener
-                .connections(*key)
+                .connections(key.clone())
                 .map(|(k, d)| (key_to_label[&k].clone(), d))
                 .collect::<HashMap<_, _>>();
-            peers_connections.insert(label.clone(), (*key, conns));
+            peers_connections.insert(label.clone(), (key.clone(), conns));
         }
         peers_connections
     }
@@ -714,7 +690,7 @@ impl SimNetwork {
         self.user_ev_controller
             .as_ref()
             .expect("should be set")
-            .send((event_id, *peer))
+            .send((event_id, peer.clone()))
             .expect("node listeners disconnected");
         if let Some(sleep_time) = await_for {
             tokio::time::sleep(sleep_time).await;
@@ -992,9 +968,9 @@ where
     UsrEv: ClientEventsProxy + Send + 'static,
 {
     connect::initial_join_procedure(
-        &config.op_manager,
-        &mut config.conn_manager,
-        config.peer_key,
+        config.op_manager.clone(),
+        config.conn_manager.clone(),
+        config.peer_key.pub_key.clone(),
         &config.gateways,
     )
     .await?;
@@ -1007,7 +983,7 @@ where
                 tracing::info_span!(
                     parent: parent_span,
                     "client_event_handling",
-                    peer = %config.peer_key
+                    peer = %config.peer_key.clone()
                 )
             })
             .unwrap_or_else(
@@ -1088,9 +1064,15 @@ where
             }
         };
 
-        if let Ok(Either::Left(NetMessage::Aborted(tx))) = msg {
-            super::handle_aborted_op(tx, peer_key, &op_manager, &mut conn_manager, &gateways)
-                .await?;
+        if let Ok(Either::Left(NetMessage::V1(NetMessageV1::Aborted(tx)))) = msg {
+            super::handle_aborted_op(
+                tx,
+                peer_key.pub_key.clone(),
+                &op_manager,
+                &mut conn_manager,
+                &gateways,
+            )
+            .await?;
         }
 
         let msg = match msg {
@@ -1115,9 +1097,6 @@ where
                 NodeEvent::Disconnect { cause: None } => {
                     tracing::info!(peer = %peer_key, "Shutting down node");
                     return Ok(());
-                }
-                other => {
-                    unreachable!("event {other:?}, shouldn't happen in the in-memory impl")
                 }
             },
             Err(err) => {

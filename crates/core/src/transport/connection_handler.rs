@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
@@ -57,34 +57,51 @@ struct GatewayMessage {
     resp_tx: oneshot::Sender<bool>,
 }
 
-pub(crate) struct ConnectionHandler {
-    send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>,
+pub(crate) async fn create_connection_handler<S: Socket>(
+    keypair: TransportKeypair,
+    listen_host: IpAddr,
+    listen_port: u16,
+    is_gateway: bool,
+) -> Result<(OutboundConnectionHandler, InboundConnectionHandler), TransportError> {
+    // Bind the UDP socket to the specified port
+    let socket = S::bind((listen_host, listen_port).into()).await?;
+    let (och, new_connection_notifier) = OutboundConnectionHandler::config_listener(
+        Arc::new(socket),
+        keypair,
+        is_gateway,
+        (listen_host, listen_port).into(),
+    )?;
+    Ok((
+        och,
+        InboundConnectionHandler {
+            new_connection_notifier,
+        },
+    ))
+}
+
+pub(crate) struct InboundConnectionHandler {
     new_connection_notifier: mpsc::Receiver<PeerConnection>,
 }
 
-impl ConnectionHandler {
-    pub async fn new<S: Socket>(
-        keypair: TransportKeypair,
-        listen_port: u16,
-        is_gateway: bool,
-    ) -> Result<Self, TransportError> {
-        // Bind the UDP socket to the specified port
-        let socket = Arc::new(S::bind((Ipv4Addr::UNSPECIFIED, listen_port).into()).await?);
-        Self::config_listener(
-            socket,
-            keypair,
-            is_gateway,
-            #[cfg(test)]
-            (Ipv4Addr::UNSPECIFIED, listen_port).into(),
-        )
+impl InboundConnectionHandler {
+    pub async fn next_connection(&mut self) -> Option<PeerConnection> {
+        self.new_connection_notifier.recv().await
     }
+}
 
+#[derive(Clone)]
+pub(crate) struct OutboundConnectionHandler {
+    send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>,
+}
+
+impl OutboundConnectionHandler {
     fn config_listener(
         socket: Arc<impl Socket>,
         keypair: TransportKeypair,
         is_gateway: bool,
-        #[cfg(test)] socket_addr: SocketAddr,
-    ) -> Result<Self, TransportError> {
+        socket_addr: SocketAddr,
+    ) -> Result<(Self, mpsc::Receiver<PeerConnection>), TransportError> {
+        // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(100);
 
@@ -98,22 +115,20 @@ impl ConnectionHandler {
             connection_handler: conn_handler_receiver,
             new_connection_notifier: new_connection_sender,
             outbound_packets: outbound_sender,
-            #[cfg(test)]
             this_addr: socket_addr,
         };
         let bw_tracker = super::rate_limiter::PacketRateLimiter::new(
             DEFAULT_BW_TRACKER_WINDOW_SIZE,
             outbound_recv,
         );
-        let connection_handler = ConnectionHandler {
+        let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
-            new_connection_notifier,
         };
 
         task::spawn(bw_tracker.rate_limiter(BANDWITH_LIMIT, socket));
         task::spawn(transport.listen());
 
-        Ok(connection_handler)
+        Ok((connection_handler, new_connection_notifier))
     }
 
     #[cfg(test)]
@@ -122,7 +137,7 @@ impl ConnectionHandler {
         socket: Arc<impl Socket>,
         keypair: TransportKeypair,
         is_gateway: bool,
-    ) -> Result<Self, TransportError> {
+    ) -> Result<(Self, mpsc::Receiver<PeerConnection>), TransportError> {
         Self::config_listener(socket, keypair, is_gateway, socket_addr)
     }
 
@@ -156,10 +171,6 @@ impl ConnectionHandler {
             })
             .boxed()
     }
-
-    pub async fn next_connection(&mut self) -> Option<PeerConnection> {
-        self.new_connection_notifier.recv().await
-    }
 }
 
 pub enum Message {
@@ -181,7 +192,6 @@ struct UdpPacketsListener<S = UdpSocket> {
     is_gateway: bool,
     new_connection_notifier: mpsc::Sender<PeerConnection>,
     outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
-    #[cfg(test)]
     this_addr: SocketAddr,
 }
 
@@ -242,7 +252,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             if let Some((packets_sender, open_connection)) = ongoing_connections.remove(&remote_addr) {
                                 if packets_sender.send(packet_data).await.is_err() {
                                     // it can happen that the connection is established but the channel is closed because the task completed
-                                    // but we still ahven't polled the result future
+                                    // but we still haven't polled the result future
                                     tracing::debug!(%remote_addr, "failed to send packet to remote");
                                 }
                                 ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
@@ -319,7 +329,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                             if let Some((_, result_sender)) = ongoing_connections.remove(&outbound_remote_conn.remote_addr) {
                                 tracing::debug!(%outbound_remote_conn.remote_addr, "connection established");
                                 self.remote_connections.insert(outbound_remote_conn.remote_addr, inbound_remote_connection);
-                                let _ = result_sender.send(Ok(outbound_remote_conn));
+                                let _ = result_sender.send(Ok(outbound_remote_conn)).map_err(|_| {
+                                    tracing::error!("failed sending back peer connection");
+                                });
                             } else {
                                 tracing::error!(%outbound_remote_conn.remote_addr, "connection established but no ongoing connection found");
                             }
@@ -366,13 +378,16 @@ impl<S: Socket> UdpPacketsListener<S> {
         >,
     > + Send
            + 'static {
-        tracing::debug!(%remote_addr, "new connection to gateway");
         let secret = self.this_peer_keypair.secret.clone();
         let outbound_packets = self.outbound_packets.clone();
         let socket_listener = self.socket_listener.clone();
 
         async move {
-            let decrypted_intro_packet = secret.decrypt(remote_intro_packet.data())?;
+            let decrypted_intro_packet =
+                secret.decrypt(remote_intro_packet.data()).map_err(|err| {
+                    tracing::debug!(%remote_addr, %err, "Failed to decrypt intro packet");
+                    err
+                })?;
             let protoc = &decrypted_intro_packet[..PROTOC_VERSION.len()];
             let outbound_key_bytes =
                 &decrypted_intro_packet[PROTOC_VERSION.len()..PROTOC_VERSION.len() + 16];
@@ -488,6 +503,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 inbound_checked_times: 0,
             };
 
+            tracing::debug!("returning connection at gw");
             Ok((remote_conn, inbound_conn, outbound_ack_packet))
         }
     }
@@ -560,6 +576,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         let transport_secret_key = self.this_peer_keypair.secret.clone();
         let (inbound_from_remote, mut next_inbound) =
             mpsc::channel::<PacketData<UnknownEncryption>>(1);
+        let this_addr = self.this_addr;
         let f = async move {
             let mut state = ConnectionState::StartOutbound {};
             // Initialize timeout and interval
@@ -750,12 +767,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                         }
                     }
                     Ok(None) => {
-                        tracing::debug!("debug: connection closed");
+                        tracing::debug!(%this_addr, "debug: connection closed");
                         return Err(TransportError::ConnectionClosed);
                     }
                     Err(_) => {
                         failures += 1;
-                        tracing::debug!("Failed to receive UDP response, time out");
+                        tracing::debug!(%this_addr, "Failed to receive UDP response, time out");
                     }
                 }
 
@@ -829,6 +846,7 @@ impl InboundRemoteConnection {
 mod test {
     use std::{
         collections::HashMap,
+        net::Ipv4Addr,
         ops::Range,
         sync::{
             atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
@@ -958,20 +976,38 @@ mod test {
 
     async fn set_peer_connection(
         packet_drop_policy: PacketDropPolicy,
-    ) -> Result<(TransportPublicKey, ConnectionHandler, SocketAddr), DynError> {
-        set_peer_connection_in(packet_drop_policy, false).await
+    ) -> Result<(TransportPublicKey, OutboundConnectionHandler, SocketAddr), DynError> {
+        set_peer_connection_in(packet_drop_policy, false)
+            .await
+            .map(|(pk, (o, _), s)| (pk, o, s))
     }
 
     async fn set_gateway_connection(
         packet_drop_policy: PacketDropPolicy,
-    ) -> Result<(TransportPublicKey, ConnectionHandler, SocketAddr), DynError> {
-        set_peer_connection_in(packet_drop_policy, true).await
+    ) -> Result<
+        (
+            TransportPublicKey,
+            mpsc::Receiver<PeerConnection>,
+            SocketAddr,
+        ),
+        DynError,
+    > {
+        set_peer_connection_in(packet_drop_policy, true)
+            .await
+            .map(|(pk, (_, i), s)| (pk, i, s))
     }
 
     async fn set_peer_connection_in(
         packet_drop_policy: PacketDropPolicy,
         gateway: bool,
-    ) -> Result<(TransportPublicKey, ConnectionHandler, SocketAddr), DynError> {
+    ) -> Result<
+        (
+            TransportPublicKey,
+            (OutboundConnectionHandler, mpsc::Receiver<PeerConnection>),
+            SocketAddr,
+        ),
+        DynError,
+    > {
         static PORT: AtomicU16 = AtomicU16::new(25000);
 
         let peer_keypair = TransportKeypair::new();
@@ -980,14 +1016,18 @@ mod test {
         let socket = Arc::new(
             MockSocket::test_config(packet_drop_policy, (Ipv4Addr::LOCALHOST, port).into()).await,
         );
-        let peer_conn = ConnectionHandler::test_set_up(
+        let (peer_conn, inbound_conn) = OutboundConnectionHandler::test_set_up(
             (Ipv4Addr::LOCALHOST, port).into(),
             socket,
             peer_keypair,
             gateway,
         )
         .expect("failed to create peer");
-        Ok((peer_pub, peer_conn, (Ipv4Addr::LOCALHOST, port).into()))
+        Ok((
+            peer_pub,
+            (peer_conn, inbound_conn),
+            (Ipv4Addr::LOCALHOST, port).into(),
+        ))
     }
 
     trait TestFixture: Clone + Send + Sync + 'static {
@@ -1200,7 +1240,7 @@ mod test {
         let (gw_pub, mut gw_conn, gw_addr) = set_gateway_connection(Default::default()).await?;
 
         let gw = tokio::spawn(async move {
-            let gw_conn = gw_conn.next_connection();
+            let gw_conn = gw_conn.recv();
             let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
                 .ok_or("no connection")?;
@@ -1228,7 +1268,7 @@ mod test {
             set_gateway_connection(PacketDropPolicy::Range(0..1)).await?;
 
         let gw = tokio::spawn(async move {
-            let gw_conn = gw_conn.next_connection();
+            let gw_conn = gw_conn.recv();
             let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
                 .ok_or("no connection")?;
@@ -1256,7 +1296,7 @@ mod test {
             set_gateway_connection(PacketDropPolicy::Range(0..1)).await?;
 
         let gw = tokio::spawn(async move {
-            let gw_conn = gw_conn.next_connection();
+            let gw_conn = gw_conn.recv();
             let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
                 .ok_or("no connection")?;
@@ -1283,7 +1323,7 @@ mod test {
         let (gw_pub, mut gw_conn, gw_addr) = set_gateway_connection(Default::default()).await?;
 
         let gw = tokio::spawn(async move {
-            let gw_conn = gw_conn.next_connection();
+            let gw_conn = gw_conn.recv();
             let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
                 .ok_or("no connection")?;

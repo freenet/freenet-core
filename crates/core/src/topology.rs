@@ -284,11 +284,16 @@ impl TopologyManager {
         my_location: &Option<Location>,
         at_time: Instant,
     ) -> TopologyAdjustment {
-        debug!(
+        // let mut last_log = Instant::now();
+        // if last_log.elapsed() > Duration::from_secs(10) {
+        // last_log = Instant::now();
+        // TODO: only print periodically
+        tracing::trace!(
             "Adjusting topology at {:?}. Current neighbors: {:?}",
             at_time,
             neighbor_locations.len()
         );
+        // }
 
         if neighbor_locations.len() < self.limits.min_connections {
             let mut locations = Vec::new();
@@ -307,7 +312,7 @@ impl TopologyManager {
                         }
                     }
                 }
-                info!(
+                tracing::trace!(
                     minimum_num_peers_hard_limit = self.limits.min_connections,
                     num_peers = neighbor_locations.len(),
                     to_add = below_threshold,
@@ -839,7 +844,7 @@ mod tests {
                     report_time
                 );
                 resource_manager.report_resource_usage(
-                    &AttributionSource::Peer(*peer),
+                    &AttributionSource::Peer(peer.clone()),
                     ResourceType::InboundBandwidthBytes,
                     bw_usage_by_peer[i] as f64,
                     report_time,
@@ -857,7 +862,8 @@ mod tests {
             for _ in 0..*requests {
                 // For simplicity we'll just assume that the target location of the request is the
                 // neighboring peer's own location
-                resource_manager.report_outbound_request(peers[i], peers[i].location.unwrap());
+                resource_manager
+                    .report_outbound_request(peers[i].clone(), peers[i].location.unwrap());
             }
         }
     }
@@ -869,7 +875,7 @@ mod tests {
     ) -> usize {
         let mut values = vec![];
         for ix in 0..peers.len() {
-            let peer = peers[ix];
+            let peer = peers[ix].clone();
             let value = requests_per_peer[ix] as f64 / bw_usage_by_peer[ix] as f64;
             values.push(value);
             debug!(

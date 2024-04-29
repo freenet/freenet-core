@@ -1,4 +1,13 @@
-use super::{Error, TestConfig};
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt::Display,
+    net::SocketAddr,
+    ops::Deref,
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
+
 use anyhow::anyhow;
 use axum::{
     body::Body,
@@ -14,26 +23,19 @@ use freenet::dev_tool::{
     EventChain, MemoryEventsGen, NetworkEventGenerator, NetworkPeer, NodeConfig, NodeLabel, PeerId,
     PeerMessage, PeerStatus, SimNetwork,
 };
-use futures::stream::{SplitSink, SplitStream};
-use futures::{SinkExt, StreamExt};
-use http::{Response, StatusCode};
-use libp2p_identity::Keypair;
-use std::ops::Deref;
-use std::{
-    collections::{HashMap, VecDeque},
-    fmt::Display,
-    net::SocketAddr,
-    process::Stdio,
-    sync::Arc,
-    time::Duration,
+use futures::{
+    stream::{SplitSink, SplitStream},
+    SinkExt, StreamExt,
 };
-
+use http::{Response, StatusCode};
 use thiserror::Error;
-use tokio::task::JoinHandle;
 use tokio::{
     process::Command,
     sync::{oneshot, Mutex},
+    task::JoinHandle,
 };
+
+use super::{Error, TestConfig};
 
 #[derive(Debug, Error)]
 pub enum NetworkSimulationError {
@@ -118,9 +120,25 @@ impl SubProcess {
     }
 
     async fn start(cmd_args: &[String], label: &NodeLabel) -> anyhow::Result<Self, Error> {
-        let child = Command::new("fdev")
+        let mut command = if cfg!(debug_assertions) {
+            Command::new("cargo")
+        } else {
+            Command::new("fdev")
+        };
+        #[cfg(debug_assertions)]
+        {
+            let args = ["run", "--"]
+                .into_iter()
+                .chain(cmd_args.iter().map(Deref::deref));
+            command.args(args);
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let args = cmd_args;
+            command.args(args);
+        }
+        let child = command
             .kill_on_drop(true)
-            .args(cmd_args)
             .arg("--id")
             .arg(label.to_string())
             .stdin(Stdio::inherit())
@@ -157,7 +175,10 @@ async fn start_supervisor(config: &TestConfig) -> anyhow::Result<(), Error> {
 }
 
 async fn start_peer(config: &TestConfig, cmd_config: &NetworkProcessConfig) -> Result<(), Error> {
-    std::env::set_var("FREENET_PEER_ID", cmd_config.clone().id.unwrap());
+    std::env::set_var(
+        "FREENET_PEER_ID",
+        cmd_config.clone().id.expect("id should be set"),
+    );
     freenet::config::set_logger(None);
     if let Some(peer_id) = &cmd_config.id {
         let peer = NetworkPeer::new(peer_id.clone()).await?;
@@ -232,7 +253,7 @@ pub async fn run_network(
         .get_all_peers()
         .await
         .into_iter()
-        .map(|(label, config)| (label.clone(), config.peer_id))
+        .map(|(label, config)| (label.clone(), config.get_peer_id().unwrap()))
         .collect();
 
     let events_sender = supervisor.user_ev_controller.lock().await.clone();
@@ -251,6 +272,8 @@ pub async fn run_network(
             network_connection_percent * 100.0
         );
         network.check_partial_connectivity(connectivity_timeout, network_connection_percent)?;
+        // FIXME: we are getting connectivity check that is not real since peers are not reporting if they
+        // are connected or not to other peers
         tracing::info!("Network is sufficiently connected, start sending events");
         while events.next().await.is_some() {
             tokio::time::sleep(next_event_wait_time).await;
@@ -296,6 +319,7 @@ async fn config_handler(
     peers_config: Arc<Mutex<HashMap<NodeLabel, NodeConfig>>>,
     Path(peer_id): Path<String>,
 ) -> axum::response::Response {
+    tracing::debug!("Received config request for peer_id: {}", peer_id);
     let config = peers_config.lock().await;
     let id = NodeLabel::from(peer_id.as_str());
     match config.get(&id) {
@@ -378,11 +402,16 @@ async fn handle_outgoing_messages(
     let mut event_rx = supervisor.event_rx.lock().await;
     while let Some((event, peer_id)) = event_rx.recv().await {
         tracing::info!("Received event {} for peer {}", event, peer_id);
-        let serialized_msg: Vec<u8> = bincode::serialize(&(event, peer_id))
+        let serialized_msg: Vec<u8> = bincode::serialize(&(event, peer_id.clone()))
             .map_err(|e| anyhow!("Failed to serialize message: {}", e))?;
 
         if let Err(e) = sender.send(Message::Binary(serialized_msg)).await {
-            tracing::error!("Failed to send event {} for peer {}: {}", event, peer_id, e);
+            tracing::error!(
+                "Failed to send event {} for peer {}: {}",
+                event,
+                peer_id.clone(),
+                e
+            );
         }
     }
     Ok(())
@@ -491,7 +520,10 @@ impl Supervisor {
         config: &NodeConfig,
     ) -> Result<(), Error> {
         let process = SubProcess::start(cmd_args, label).await?;
-        self.processes.lock().await.insert(config.peer_id, process);
+        self.processes
+            .lock()
+            .await
+            .insert(config.get_peer_id().unwrap(), process);
         Ok(())
     }
 
@@ -508,7 +540,7 @@ impl Supervisor {
             .lock()
             .await
             .iter()
-            .filter(|(_, config)| !config.is_gateway())
+            .filter(|(_, config)| !config.is_gateway)
             .map(|(label, config)| (label.clone(), config.clone()))
             .collect()
     }
@@ -518,7 +550,7 @@ impl Supervisor {
             .lock()
             .await
             .iter()
-            .filter(|(_, config)| config.is_gateway())
+            .filter(|(_, config)| config.is_gateway)
             .map(|(label, config)| (label.clone(), config.clone()))
             .collect()
     }
@@ -552,6 +584,7 @@ impl Supervisor {
 
     pub async fn start_peer_gateways(&self, cmd_args: &[String]) -> Result<(), Error> {
         let nodes: Vec<(NodeLabel, NodeConfig)> = self.get_peer_gateways().await;
+
         for (label, config) in nodes {
             self.enqueue_gateway(label.number()).await;
             self.start_process(cmd_args, &label, &config).await?;
@@ -596,17 +629,18 @@ pub trait Runnable {
 
 impl Runnable for NetworkPeer {
     async fn run(&self, config: &TestConfig, peer_id: String) -> anyhow::Result<()> {
-        if self.config.is_gateway() {
-            tracing::info!("Starting gateway {}", peer_id);
+        let peer = self.config.get_peer_id().unwrap();
+        if self.config.is_gateway {
+            tracing::info!(%peer, "Starting gateway {}", peer_id);
         } else {
-            tracing::info!("Starting node {}", peer_id);
+            tracing::info!(%peer, "Starting node {}", peer_id);
         }
         let mut receiver_ch = self.receiver_ch.deref().clone();
         receiver_ch.borrow_and_update();
 
         let mut memory_event_generator: MemoryEventsGen = MemoryEventsGen::new_with_seed(
             receiver_ch,
-            self.config.peer_id,
+            peer.clone(),
             config.seed.expect("seed should be set for child process"),
         );
         let peer_id_num = NodeLabel::from(peer_id.as_str()).number();
@@ -626,23 +660,22 @@ impl Runnable for NetworkPeer {
         };
 
         let event_generator =
-            NetworkEventGenerator::new(self.config.peer_id, memory_event_generator, ws_client);
+            NetworkEventGenerator::new(peer.clone(), memory_event_generator, ws_client);
 
-        // Obtain an identity::Keypair instance for the private_key
-        let private_key = Keypair::generate_ed25519();
+        let peer_keypair = self.config.key_pair.clone().unwrap();
 
         match self
-            .build(peer_id.clone(), [Box::new(event_generator)], private_key)
+            .build(peer_id.clone(), [Box::new(event_generator)], peer_keypair)
             .await
         {
             Ok(node) => match node.run().await {
                 Ok(_) => {
-                    if self.config.is_gateway() {
+                    if self.config.is_gateway {
                         tracing::info!("Gateway {} finished", peer_id);
                     } else {
                         tracing::info!("Node {} finished", peer_id);
                     }
-                    let msg = match self.config.is_gateway() {
+                    let msg = match self.config.is_gateway {
                         true => PeerMessage::Status(PeerStatus::GatewayStarted(peer_id_num)),
                         false => PeerMessage::Status(PeerStatus::PeerStarted(peer_id_num)),
                     };

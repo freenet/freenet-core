@@ -1,5 +1,4 @@
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
-use std::time::Instant;
 // TODO: complete update logic in the network
 use freenet_stdlib::prelude::*;
 
@@ -26,30 +25,26 @@ impl UpdateOp {
     }
 
     pub fn finalized(&self) -> bool {
-        self.stats
-            .as_ref()
-            .map(|s| matches!(s.step, RecordingStats::Completed))
-            .unwrap_or(false)
-            || matches!(self.state, Some(UpdateState::Finished { .. }))
+        matches!(self.state, None | Some(UpdateState::Finished { .. }))
     }
 
-    pub(super) fn record_transfer(&mut self) {
-        if let Some(stats) = self.stats.as_mut() {
-            match stats.step {
-                RecordingStats::Uninitialized => {
-                    stats.transfer_time = Some((Instant::now(), None));
-                    stats.step = RecordingStats::InitUpdate;
-                }
-                RecordingStats::InitUpdate => {
-                    if let Some((_, e)) = stats.transfer_time.as_mut() {
-                        *e = Some(Instant::now());
-                    }
-                    stats.step = RecordingStats::Completed;
-                }
-                RecordingStats::Completed => {}
-            }
-        }
-    }
+    // pub(super) fn record_transfer(&mut self) {
+    //     if let Some(stats) = self.stats.as_mut() {
+    //         match stats.step {
+    //             RecordingStats::Uninitialized => {
+    //                 stats.transfer_time = Some((Instant::now(), None));
+    //                 stats.step = RecordingStats::InitUpdate;
+    //             }
+    //             RecordingStats::InitUpdate => {
+    //                 if let Some((_, e)) = stats.transfer_time.as_mut() {
+    //                     *e = Some(Instant::now());
+    //                 }
+    //                 stats.step = RecordingStats::Completed;
+    //             }
+    //             RecordingStats::Completed => {}
+    //         }
+    //     }
+    // }
 
     pub(super) fn to_host_result(&self) -> HostResult {
         if let Some(UpdateState::Finished { key, summary }) = &self.state {
@@ -69,24 +64,17 @@ impl UpdateOp {
 }
 
 struct UpdateStats {
-    // contract_location: Location,
-    // payload_size: usize,
-    // /// (start, end)
-    // first_response_time: Option<(Instant, Option<Instant>)>,
-    /// (start, end)
-    transfer_time: Option<(Instant, Option<Instant>)>,
     target: Option<PeerKeyLocation>,
-    step: RecordingStats,
+    // step: RecordingStats,
 }
 
-/// While timing, at what particular step we are now.
-#[derive(Clone, Copy, Default)]
-enum RecordingStats {
-    #[default]
-    Uninitialized,
-    InitUpdate,
-    Completed,
-}
+// /// While timing, at what particular step we are now.
+// #[derive(Clone, Copy, Default)]
+// enum RecordingStats {
+//     #[default]
+//     Uninitialized,
+//     Completed,
+// }
 
 pub(crate) struct UpdateResult {}
 
@@ -94,10 +82,7 @@ impl TryFrom<UpdateOp> for UpdateResult {
     type Error = OpError;
 
     fn try_from(op: UpdateOp) -> Result<Self, Self::Error> {
-        if let Some(true) = op
-            .stats
-            .map(|s| matches!(s.step, RecordingStats::Completed))
-        {
+        if matches!(op.state, None | Some(UpdateState::Finished { .. })) {
             Ok(UpdateResult {})
         } else {
             Err(OpError::UnexpectedOpState)
@@ -184,7 +169,7 @@ impl Operation for UpdateOp {
                     return_msg = Some(UpdateMsg::SeekNode {
                         id: *id,
                         sender,
-                        target: *target,
+                        target: target.clone(),
                         value: value.clone(),
                         key: key.clone(),
                         related_contracts: related_contracts.clone(),
@@ -237,7 +222,7 @@ impl Operation for UpdateOp {
                         true,
                         op_manager,
                         self.state,
-                        (broadcast_to, *sender),
+                        (broadcast_to, sender.clone()),
                         key.clone(),
                         value.clone(),
                         false,
@@ -287,7 +272,7 @@ impl Operation for UpdateOp {
                         false,
                         op_manager,
                         self.state,
-                        (broadcast_to, *sender),
+                        (broadcast_to, sender.clone()),
                         key.clone(),
                         new_value,
                         true,
@@ -319,7 +304,7 @@ impl Operation for UpdateOp {
                             id: *id,
                             key: key.clone(),
                             new_value: new_value.clone(),
-                            sender,
+                            sender: sender.clone(),
                         };
                         let f = conn_manager.send(&peer.peer, msg.into());
                         broadcasting.push(f);
@@ -362,7 +347,7 @@ impl Operation for UpdateOp {
                     // Subscriber nodes have been notified of the change, the operation is complete
                     return_msg = Some(UpdateMsg::SuccessfulUpdate {
                         id: *id,
-                        target: *upstream,
+                        target: upstream.clone(),
                         summary,
                     });
 
@@ -374,7 +359,7 @@ impl Operation for UpdateOp {
                             tracing::debug!(
                                 tx = %id,
                                 %key,
-                                this_peer = %op_manager.ring.peer_key,
+                                this_peer = ?op_manager.ring.get_peer_key(),
                                 "Peer completed contract value update - SuccessfulUpdate",
                             );
 
@@ -503,7 +488,7 @@ impl OpManager {
                 subs.value()
                     .iter()
                     .filter(|pk| &pk.peer != sender)
-                    .copied()
+                    .cloned()
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -588,14 +573,7 @@ pub(crate) fn start_op(
     UpdateOp {
         id,
         state,
-        stats: Some(UpdateStats {
-            // contract_location,
-            // payload_size,
-            target: None,
-            // first_response_time: None,
-            transfer_time: None,
-            step: Default::default(),
-        }),
+        stats: Some(UpdateStats { target: None }),
     }
 }
 
@@ -623,7 +601,7 @@ pub(crate) async fn request_update(
     } else {
         let closest = op_manager
             .ring
-            .closest_potentially_caching(key, [sender.peer].as_slice())
+            .closest_potentially_caching(key, [sender.peer.clone()].as_slice())
             .into_iter()
             .next()
             .ok_or_else(|| RingError::EmptyRing)?;
@@ -638,7 +616,7 @@ pub(crate) async fn request_update(
 
     let id = update_op.id;
     if let Some(stats) = &mut update_op.stats {
-        stats.target = Some(target);
+        stats.target = Some(target.clone());
     }
 
     match update_op.state {
@@ -676,7 +654,7 @@ pub(crate) async fn request_update(
 }
 
 mod messages {
-    use std::fmt::Display;
+    use std::{borrow::Borrow, fmt::Display};
 
     use freenet_stdlib::prelude::{ContractKey, RelatedContracts, StateSummary, WrappedState};
     use serde::{Deserialize, Serialize};
@@ -746,7 +724,7 @@ mod messages {
             }
         }
 
-        fn target(&self) -> Option<&PeerKeyLocation> {
+        fn target(&self) -> Option<impl Borrow<PeerKeyLocation>> {
             match self {
                 UpdateMsg::RequestUpdate { target, .. } => Some(target),
                 UpdateMsg::SuccessfulUpdate { target, .. } => Some(target),

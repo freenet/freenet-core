@@ -24,7 +24,7 @@ impl Router {
         let failure_outcomes: Vec<IsotonicEvent> = history
             .iter()
             .map(|re| IsotonicEvent {
-                peer: re.peer,
+                peer: re.peer.clone(),
                 contract_location: re.contract_location,
                 result: match re.outcome {
                     RouteOutcome::Success {
@@ -47,7 +47,7 @@ impl Router {
                 } = re.outcome
                 {
                     Some(IsotonicEvent {
-                        peer: re.peer,
+                        peer: re.peer.clone(),
                         contract_location: re.contract_location,
                         result: time_to_response_start.as_secs_f64(),
                     })
@@ -67,7 +67,7 @@ impl Router {
                 } = re.outcome
                 {
                     Some(IsotonicEvent {
-                        peer: re.peer,
+                        peer: re.peer.clone(),
                         contract_location: re.contract_location,
                         result: payload_size as f64 / payload_transfer_time.as_secs_f64(),
                     })
@@ -125,18 +125,18 @@ impl Router {
                 payload_transfer_time,
             } => {
                 self.response_start_time_estimator.add_event(IsotonicEvent {
-                    peer: event.peer,
+                    peer: event.peer.clone(),
                     contract_location: event.contract_location,
                     result: time_to_response_start.as_secs_f64(),
                 });
                 self.failure_estimator.add_event(IsotonicEvent {
-                    peer: event.peer,
+                    peer: event.peer.clone(),
                     contract_location: event.contract_location,
                     result: 0.0,
                 });
                 let transfer_rate_event = IsotonicEvent {
-                    peer: event.peer,
                     contract_location: event.contract_location,
+                    peer: event.peer,
                     result: payload_size as f64 / payload_transfer_time.as_secs_f64(),
                 };
                 self.mean_transfer_size.add(payload_size as f64);
@@ -359,9 +359,10 @@ mod tests {
         let mut events = vec![];
         let mut rng = rand::thread_rng();
         for _ in 0..NUM_EVENTS {
-            let peer = peers[rng.gen_range(0..NUM_PEERS)];
+            let peer = peers[rng.gen_range(0..NUM_PEERS)].clone();
             let contract_location = Location::random();
-            let simulated_prediction = simulate_prediction(&mut rng, peer, contract_location);
+            let simulated_prediction =
+                simulate_prediction(&mut rng, peer.clone(), contract_location);
             let event = RouteEvent {
                 peer,
                 contract_location,
@@ -390,7 +391,7 @@ mod tests {
 
         // Test the router with the testing events.
         for event in testing_events {
-            let truth = simulate_prediction(&mut rng, event.peer, event.contract_location);
+            let truth = simulate_prediction(&mut rng, event.peer.clone(), event.contract_location);
 
             let prediction = router
                 .predict_routing_outcome(&event.peer, event.contract_location)

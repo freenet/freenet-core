@@ -116,14 +116,15 @@ async fn supervisor(config: &super::TestConfig) -> anyhow::Result<(), Error> {
     };
     let cmd_args = config.subprocess_command(seed);
     for (label, node) in &peers {
-        let mut subprocess = SubProcess::start(&cmd_args, label, node.peer_id)?;
+        let peer_id = node.get_peer_id().unwrap();
+        let mut subprocess = SubProcess::start(&cmd_args, label, peer_id.clone())?;
         subprocess.config(node).await?;
-        supervisor.processes.insert(node.peer_id, subprocess);
+        supervisor.processes.insert(peer_id, subprocess);
     }
 
     let peers = peers
         .into_iter()
-        .map(|(label, config)| (label, config.peer_id))
+        .map(|(label, config)| (label, config.get_peer_id().unwrap()))
         .collect();
     let mut events = EventChain::new(peers, user_ev_controller, config.events, true);
     let next_event_wait_time = config
@@ -247,7 +248,7 @@ impl Supervisor {
                             continue;
                         }
                     };
-                    let peer_queue = &mut *self.queued.entry(subprocess.id).or_default();
+                    let peer_queue = &mut *self.queued.entry(subprocess.id.clone()).or_default();
                     if !peer_queue.is_empty() {
                         let n = rand::thread_rng().gen_range(0..=peer_queue.len());
                         let messages = peer_queue.drain(..n).collect::<Vec<_>>();
@@ -261,7 +262,7 @@ impl Supervisor {
                         }.boxed();
                         self.sending.push(task);
                     } else {
-                        self.processes.insert(subprocess.id, subprocess);
+                        self.processes.insert(subprocess.id.clone(), subprocess);
                     }
                 }
                 event = event_rx.recv(), if !finished_events => {
@@ -322,10 +323,26 @@ struct SubProcess {
 
 impl SubProcess {
     fn start(cmd_args: &[String], label: &NodeLabel, id: PeerId) -> anyhow::Result<Self, Error> {
+        let mut command = if cfg!(debug_assertions) {
+            Command::new("cargo")
+        } else {
+            Command::new("fdev")
+        };
+        #[cfg(debug_assertions)]
+        {
+            let args = ["run", "--"]
+                .into_iter()
+                .chain(cmd_args.iter().map(std::ops::Deref::deref));
+            command.args(args);
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let args = cmd_args;
+            command.args(args);
+        }
         // the identifier used for multi-process tests is the peer id
-        let child = Command::new("fdev")
+        let child = command
             .kill_on_drop(true)
-            .args(cmd_args)
             .arg("--id")
             .arg(label.number().to_string())
             .stdin(Stdio::piped())
@@ -397,16 +414,17 @@ async fn child(
     receiver_ch.borrow_and_update();
     let mut input = BufReader::new(tokio::io::stdin());
     let node_config = Child::get_config(&mut input).await?;
+    let peer_id = node_config.get_peer_id().unwrap();
     let this_child = Child {
         input,
         user_ev_controller,
-        peer_id: node_config.peer_id,
+        peer_id: peer_id.clone(),
     };
-    std::env::set_var("FREENET_PEER_ID", node_config.peer_id.to_string());
+    std::env::set_var("FREENET_PEER_ID", peer_id.to_string());
     freenet::config::set_logger(None);
     let mut event_generator: MemoryEventsGen = MemoryEventsGen::new_with_seed(
         receiver_ch.clone(),
-        node_config.peer_id,
+        peer_id,
         test_config
             .seed
             .expect("seed should be set for child process"),
@@ -459,7 +477,7 @@ impl Child {
                     break Err(err);
                 }
                 Ok(IPCMessage::FiredEvent(id)) => {
-                    self.user_ev_controller.send((id, self.peer_id))?;
+                    self.user_ev_controller.send((id, self.peer_id.clone()))?;
                 }
                 Ok(IPCMessage::Data(data)) => {
                     InterProcessConnManager::push_msg(data);

@@ -60,10 +60,6 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
         Box::pin(async {
             let mut futs_opt = [(); N].map(|_| None);
             let pend_futs = &mut self.pend_futs;
-            eprintln!(
-                "pending futs: {}",
-                pend_futs.iter().filter(|a| a.is_some()).count()
-            );
             for (i, pend) in pend_futs.iter_mut().enumerate() {
                 let fut = &mut futs_opt[i];
                 if let Some(pend_fut) = pend.take() {
@@ -216,9 +212,7 @@ impl<Fut: Future + Unpin, const N: usize> Future for SelectAll<Fut, N> {
                         let rest = std::mem::replace(&mut self.inner, [(); N].map(|_| None));
                         return Poll::Ready((res, idx, rest));
                     }
-                    None => {
-                        eprintln!("not found");
-                    }
+                    None => {}
                 }
             };
         }

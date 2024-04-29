@@ -19,7 +19,7 @@ impl OutboundRequestCounter {
     }
 
     pub(crate) fn record_request(&mut self, peer: PeerKeyLocation) {
-        self.request_window.push_back(peer);
+        self.request_window.push_back(peer.clone());
         self.counts_by_peer
             .entry(peer)
             .and_modify(|count| *count += 1)

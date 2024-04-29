@@ -38,7 +38,6 @@ pub(crate) fn start_op(key: ContractKey, fetch_contract: bool) -> GetOp {
             next_peer: None,
             transfer_time: None,
             first_response_time: None,
-            step: Default::default(),
         }),
     }
 }
@@ -85,7 +84,7 @@ pub(crate) async fn request_get(op_manager: &OpManager, get_op: GetOp) -> Result
             let msg = GetMsg::RequestGet {
                 id,
                 key,
-                target,
+                target: target.clone(),
                 fetch_contract,
             };
 
@@ -136,18 +135,6 @@ struct GetStats {
     first_response_time: Option<(Instant, Option<Instant>)>,
     /// (start, end)
     transfer_time: Option<(Instant, Option<Instant>)>,
-    step: RecordingStats,
-}
-
-/// While timing, at what particular step we are now.
-#[derive(Clone, Copy, Default)]
-enum RecordingStats {
-    #[default]
-    Uninitialized,
-    InitGet,
-    TransferNotStarted,
-    TransferStarted,
-    Completed,
 }
 
 pub(crate) struct GetResult {
@@ -208,34 +195,6 @@ impl GetOp {
 
     pub(super) fn finalized(&self) -> bool {
         self.result.is_some()
-    }
-
-    pub(super) fn record_transfer(&mut self) {
-        if let Some(stats) = self.stats.as_mut() {
-            match stats.step {
-                RecordingStats::Uninitialized => {
-                    stats.first_response_time = Some((Instant::now(), None));
-                    stats.step = RecordingStats::InitGet;
-                }
-                RecordingStats::InitGet => {
-                    if let Some((_, e)) = stats.first_response_time.as_mut() {
-                        *e = Some(Instant::now());
-                    }
-                    stats.step = RecordingStats::TransferNotStarted;
-                }
-                RecordingStats::TransferNotStarted => {
-                    stats.transfer_time = Some((Instant::now(), None));
-                    stats.step = RecordingStats::TransferStarted;
-                }
-                RecordingStats::TransferStarted => {
-                    if let Some((_, e)) = stats.transfer_time.as_mut() {
-                        *e = Some(Instant::now());
-                    }
-                    stats.step = RecordingStats::Completed;
-                }
-                RecordingStats::Completed => {}
-            }
-        }
     }
 
     pub(super) fn to_host_result(&self) -> HostResult {
@@ -332,14 +291,13 @@ impl Operation for GetOp {
                         next_peer: None,
                         transfer_time: None,
                         first_response_time: None,
-                        step: Default::default(),
                     });
                     let own_loc = op_manager.ring.own_location();
                     return_msg = Some(GetMsg::SeekNode {
                         key: key.clone(),
                         id: *id,
-                        target: *target,
-                        sender: own_loc,
+                        target: target.clone(),
+                        sender: own_loc.clone(),
                         fetch_contract: *fetch_contract,
                         htl: op_manager.ring.max_hops_to_live,
                         skip_list: vec![own_loc.peer],
@@ -358,10 +316,10 @@ impl Operation for GetOp {
                     let id = *id;
                     let key: ContractKey = key.clone();
                     let fetch_contract = *fetch_contract;
-                    let this_peer = *target;
+                    let this_peer = target.clone();
 
                     if let Some(s) = stats.as_mut() {
-                        s.next_peer = Some(this_peer);
+                        s.next_peer = Some(this_peer.clone());
                     }
 
                     let get_result = op_manager
@@ -385,7 +343,7 @@ impl Operation for GetOp {
                                 id,
                                 key,
                                 (htl, fetch_contract),
-                                (this_peer, *sender),
+                                (this_peer, sender.clone()),
                                 skip_list,
                                 op_manager,
                                 stats,
@@ -408,7 +366,7 @@ impl Operation for GetOp {
                                         state: Some(state),
                                         contract,
                                     },
-                                    sender: *target,
+                                    sender: target.clone(),
                                     target: requester,
                                     skip_list: skip_list.clone(),
                                 });
@@ -432,8 +390,8 @@ impl Operation for GetOp {
                                     state: Some(state),
                                     contract,
                                 },
-                                sender: *target,
-                                target: *sender,
+                                sender: target.clone(),
+                                target: sender.clone(),
                                 skip_list: skip_list.clone(),
                             });
                         }
@@ -469,7 +427,7 @@ impl Operation for GetOp {
                             if retries < MAX_RETRIES {
                                 // no response received from this peer, so skip it in the next iteration
                                 let mut new_skip_list = skip_list.clone();
-                                new_skip_list.push(target.peer);
+                                new_skip_list.push(target.peer.clone());
                                 if let Some(target) = op_manager
                                     .ring
                                     .closest_potentially_caching(key, new_skip_list.as_slice())
@@ -480,7 +438,7 @@ impl Operation for GetOp {
                                         id: *id,
                                         key: key.clone(),
                                         target,
-                                        sender: *this_peer,
+                                        sender: this_peer.clone(),
                                         fetch_contract,
                                         htl: current_hop,
                                         skip_list: new_skip_list.clone(),
@@ -516,8 +474,8 @@ impl Operation for GetOp {
                                     state: None,
                                     contract: None,
                                 },
-                                sender: *sender,
-                                target: *target,
+                                sender: sender.clone(),
+                                target: target.clone(),
                                 skip_list: skip_list.clone(),
                             });
                         }
@@ -556,7 +514,7 @@ impl Operation for GetOp {
                         );
 
                         let mut new_skip_list = skip_list.clone();
-                        new_skip_list.push(sender.peer);
+                        new_skip_list.push(sender.peer.clone());
                         op_manager
                             .notify_op_change(
                                 NetMessage::from(GetMsg::ReturnGet {
@@ -566,8 +524,8 @@ impl Operation for GetOp {
                                         state: None,
                                         contract: None,
                                     },
-                                    sender: *sender,
-                                    target: *target,
+                                    sender: sender.clone(),
+                                    target: target.clone(),
                                     skip_list: new_skip_list,
                                 }),
                                 OpEnum::Get(GetOp {
@@ -605,7 +563,7 @@ impl Operation for GetOp {
                                 let is_subscribed_contract =
                                     op_manager.ring.is_seeding_contract(&key);
                                 if !is_subscribed_contract && should_subscribe {
-                                    tracing::debug!(tx = %id, %key, peer = %op_manager.ring.peer_key, "Contract not cached @ peer, caching");
+                                    tracing::debug!(tx = %id, %key, peer = %op_manager.ring.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
                                     super::start_subscription_request(
                                         op_manager,
                                         key.clone(),
@@ -622,7 +580,7 @@ impl Operation for GetOp {
                                     return Err(OpError::ExecutorError(err));
                                 } else {
                                     let mut new_skip_list = skip_list.clone();
-                                    new_skip_list.push(sender.peer);
+                                    new_skip_list.push(sender.peer.clone());
 
                                     op_manager
                                         .notify_op_change(
@@ -633,8 +591,8 @@ impl Operation for GetOp {
                                                     state: None,
                                                     contract: None,
                                                 },
-                                                sender: *sender,
-                                                target: *target,
+                                                sender: sender.clone(),
+                                                target: target.clone(),
                                                 skip_list: new_skip_list,
                                             }),
                                             OpEnum::Get(GetOp {
@@ -678,7 +636,7 @@ impl Operation for GetOp {
                                     state: Some(value.clone()),
                                     contract: contract.clone(),
                                 },
-                                sender: *target,
+                                sender: target.clone(),
                                 target: requester,
                                 skip_list: skip_list.clone(),
                             });
@@ -698,8 +656,8 @@ impl Operation for GetOp {
                                     state: Some(value.clone()),
                                     contract: contract.clone(),
                                 },
-                                sender: *target,
-                                target: *sender,
+                                sender: target.clone(),
+                                target: sender.clone(),
                                 skip_list: skip_list.clone(),
                             });
                         }
@@ -755,7 +713,7 @@ async fn try_forward_or_return(
     );
 
     let mut new_skip_list = skip_list.to_vec();
-    new_skip_list.push(this_peer.peer);
+    new_skip_list.push(this_peer.peer.clone());
 
     let new_htl = htl - 1;
     if new_htl == 0 {
@@ -826,7 +784,7 @@ async fn try_forward_or_return(
 }
 
 mod messages {
-    use std::fmt::Display;
+    use std::{borrow::Borrow, fmt::Display};
 
     use serde::{Deserialize, Serialize};
 
@@ -868,7 +826,7 @@ mod messages {
             }
         }
 
-        fn target(&self) -> Option<&PeerKeyLocation> {
+        fn target(&self) -> Option<impl Borrow<PeerKeyLocation>> {
             match self {
                 Self::SeekNode { target, .. } => Some(target),
                 Self::RequestGet { target, .. } => Some(target),

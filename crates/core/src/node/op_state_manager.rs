@@ -7,7 +7,7 @@ use tracing::Instrument;
 use crate::{
     config::GlobalExecutor,
     contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent, SenderHalve},
-    message::{NetMessage, Transaction, TransactionType},
+    message::{MessageStats, NetMessage, Transaction, TransactionType},
     operations::{
         connect::ConnectOp, get::GetOp, put::PutOp, subscribe::SubscribeOp, update::UpdateOp,
         OpEnum, OpError,
@@ -66,7 +66,7 @@ impl OpManager {
             config,
             notification_channel.clone(),
             event_register.clone(),
-            config.is_gateway(),
+            config.is_gateway,
         )?;
         let ops = Arc::new(Ops::default());
 
@@ -203,11 +203,11 @@ impl OpManager {
         let transaction = msg.id();
         if let (Some(recipient), Some(target)) = (msg.target(), msg.requested_location()) {
             self.ring
-                .record_request(*recipient, target, transaction.transaction_type());
+                .record_request(recipient.clone(), target, transaction.transaction_type());
         }
         self.ring
             .live_tx_tracker
-            .add_transaction(*peer, *transaction);
+            .add_transaction(peer.clone(), *transaction);
     }
 }
 

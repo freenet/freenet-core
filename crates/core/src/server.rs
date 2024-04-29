@@ -182,11 +182,11 @@ pub mod local_node {
 pub mod network_node {
     use std::net::SocketAddr;
 
-    use libp2p_identity::Keypair;
     use tower_http::trace::TraceLayer;
 
     use crate::{
-        client_events::websocket::WebSocketProxy, config::Config, dev_tool::NodeConfig, DynError,
+        client_events::websocket::WebSocketProxy, config::Config, dev_tool::NodeConfig,
+        transport::TransportKeypair, DynError,
     };
 
     use super::{http_gateway::HttpGateway, serve};
@@ -199,9 +199,9 @@ pub mod network_node {
         let mut node_config = NodeConfig::new(config);
         node_config.with_ip(socket.ip()).with_port(socket.port());
 
-        let private_key = Keypair::generate_ed25519();
+        let private_key = TransportKeypair::new();
 
-        let is_gateway = node_config.is_gateway();
+        let is_gateway = node_config.is_gateway;
         let node = node_config
             .build([Box::new(gw), Box::new(ws_proxy)], private_key)
             .await?;

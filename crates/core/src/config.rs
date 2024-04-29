@@ -1,22 +1,19 @@
 use std::{
-    borrow::Cow,
     fs::{self, File},
     future::Future,
     io::Read,
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
-    pin::Pin,
     sync::atomic::AtomicBool,
     time::Duration,
 };
 
 use directories::ProjectDirs;
-use libp2p::identity;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
-use crate::local_node::OperationMode;
+use crate::{local_node::OperationMode, transport::TransportKeypair};
 
 /// Default maximum number of connections for the peer.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 20;
@@ -33,7 +30,6 @@ pub const DEFAULT_RANDOM_PEER_CONN_THRESHOLD: usize = 7;
 /// (if it applies, e.g. connect requests).
 pub const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
 
-pub(crate) const PEER_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const OPERATION_TTL: Duration = Duration::from_secs(60);
 
 // Initialize the executor once.
@@ -58,8 +54,8 @@ pub struct ConfigArgs {
     #[clap(flatten)]
     #[serde(flatten)]
     pub gateway: GatewayArgs,
-    #[clap(value_parser, env = "LOCAL_PEER_KEYPAIR")]
-    pub local_peer_keypair: Option<PathBuf>,
+    #[clap(value_parser, env = "TRANSPORT_KEYPAIR")]
+    pub transport_keypair: Option<PathBuf>,
     #[serde(
         with = "serde_option_log_level_filter",
         skip_serializing_if = "Option::is_none"
@@ -80,7 +76,7 @@ impl Default for ConfigArgs {
                 address: Some(default_gateway_address()),
                 port: Some(default_gateway_port()),
             },
-            local_peer_keypair: None,
+            transport_keypair: None,
             log_level: Some(tracing::log::LevelFilter::Info),
             config_paths: Default::default(),
         }
@@ -132,8 +128,8 @@ impl ConfigArgs {
 
         // merge the configuration from the file with the command line arguments
         if let Some(cfg) = cfg {
-            if self.local_peer_keypair.is_none() {
-                self.local_peer_keypair = cfg.local_peer_keypair;
+            if self.transport_keypair.is_none() {
+                self.transport_keypair = cfg.transport_keypair;
             }
 
             if self.mode.is_none() {
@@ -161,43 +157,31 @@ impl ConfigArgs {
                 address: self.gateway.address.unwrap_or(default_gateway_address()),
                 port: self.gateway.port.unwrap_or(default_gateway_port()),
             },
-            local_peer_keypair: match self.local_peer_keypair {
-                Some(path) => parse_keypair(path.to_string_lossy().trim())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
-                None => identity::Keypair::generate_ed25519(),
+            transport_keypair: match self.transport_keypair {
+                // Some(path_to_key) => parse_keypair(path.to_string_lossy().trim())
+                // .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+                Some(path_to_key) => {
+                    let mut key_file = File::open(&path_to_key).map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("Failed to open key file {}: {e}", path_to_key.display()),
+                        )
+                    })?;
+                    let mut buf = Vec::new();
+                    key_file.read_to_end(&mut buf).map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("Failed to read key file {}: {e}", path_to_key.display()),
+                        )
+                    })?;
+                    todo!("get an rsa private key from the file and create a TransportKeypair")
+                }
+                None => TransportKeypair::new(),
             },
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
             config_paths: self.config_paths.build()?,
         })
     }
-}
-
-fn parse_keypair(s: &str) -> Result<identity::Keypair, Cow<'static, str>> {
-    // first check if the string is a path to a file
-    let path = std::path::Path::new(s);
-    if path.exists() {
-        let mut key_file =
-            File::open(path).map_err(|e| format!("Failed to open key file {s}: {e}"))?;
-        let mut buf = Vec::new();
-        key_file
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("Failed to read key file {s}: {e}"))?;
-        let keypair = identity::Keypair::from_protobuf_encoding(&buf)
-            .map_err(|e| format!("Failed to parse key file {s}: {e}"))?;
-        return Ok(keypair);
-    }
-
-    // otherwise, try to parse the string as a base64 encoded keypair
-    let keypair =
-        identity::Keypair::from_protobuf_encoding(s.as_bytes()).map_err(|e| format!("{e}"))?;
-    Ok(keypair)
-}
-
-fn deserialize_keypair<'de, D>(deserializer: D) -> Result<identity::Keypair, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    parse_keypair(<&str>::deserialize(deserializer)?).map_err(serde::de::Error::custom)
 }
 
 mod serde_log_level_filter {
@@ -280,10 +264,7 @@ pub struct Config {
 
     #[serde(flatten)]
     pub gateway: GatewayConfig,
-    // FIXME: how to serialize this?
-    /// Path to the local peer keypair file.
-    #[serde(skip_serializing, deserialize_with = "deserialize_keypair")]
-    pub local_peer_keypair: identity::Keypair,
+    pub transport_keypair: TransportKeypair,
     #[serde(with = "serde_log_level_filter")]
     pub log_level: tracing::log::LevelFilter,
     #[serde(flatten)]
@@ -291,8 +272,8 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn local_peer_keypair(&self) -> &identity::Keypair {
-        &self.local_peer_keypair
+    pub fn transport_keypair(&self) -> &TransportKeypair {
+        &self.transport_keypair
     }
 }
 
@@ -538,6 +519,51 @@ impl Config {
     pub fn event_log(&self) -> PathBuf {
         self.config_paths.event_log(self.mode)
     }
+
+    // fn load_conf() -> anyhow::Result<Config> {
+    //     let settings: config::Config = config::Config::builder()
+    //         .add_source(config::Environment::with_prefix("FREENET"))
+    //         .build()
+    //         .unwrap();
+
+    //     let transport_keypair: Option<TransportKeypair> = if let Ok(path_to_key) = settings
+    //         .get_string("local_peer_key_file")
+    //         .map(PathBuf::from)
+    //     {
+    //         let mut key_file = File::open(&path_to_key).unwrap_or_else(|_| {
+    //             panic!(
+    //                 "Failed to open key file: {}",
+    //                 &path_to_key.to_str().unwrap()
+    //             )
+    //         });
+    //         let mut buf = Vec::new();
+    //         key_file.read_to_end(&mut buf).unwrap();
+    //         todo!("get an rsa private key from the file and create a TransportKeypair")
+    //     } else {
+    //         None
+    //     };
+
+    //     let log_level = settings
+    //         .get_string("log")
+    //         .map(|lvl| lvl.parse().ok())
+    //         .ok()
+    //         .flatten()
+    //         .unwrap_or(tracing::log::LevelFilter::Info);
+
+    //     let data_dir = settings.get_string("data_dir").ok().map(PathBuf::from);
+    //     let config_paths = ConfigPaths::new(data_dir)?;
+
+    //     let local_mode = settings.get_string("network_mode").is_err();
+
+    //     Ok(Config {
+    //         transport_keypair: transport_keypair.unwrap_or_else(|| TransportKeypair::new()),
+    //         log_level,
+    //         config_paths,
+    //         local_mode: AtomicBool::new(local_mode),
+    //         #[cfg(feature = "websocket")]
+    //         ws: WebSocketApiConfig::from_config(&settings),
+    //     })
+    // }
 }
 
 pub(crate) struct GlobalExecutor;
@@ -569,12 +595,6 @@ impl GlobalExecutor {
         } else {
             unreachable!("the executor must have been initialized")
         }
-    }
-}
-
-impl libp2p::swarm::Executor for GlobalExecutor {
-    fn exec(&self, future: Pin<Box<dyn Future<Output = ()> + 'static + Send>>) {
-        GlobalExecutor::spawn(future);
     }
 }
 
