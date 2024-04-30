@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["contracts/ping", "web"]
+
+[workspace.dependencies]
+freenet-stdlib = { path = "../../stdlib/rust", features = ["contract"] }
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = true
+opt-level = 's'
+debug = false
+codegen-units = 1
+panic = 'abort'
+strip = true
+
