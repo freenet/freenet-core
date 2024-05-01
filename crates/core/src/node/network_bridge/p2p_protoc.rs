@@ -96,6 +96,7 @@ impl NetworkBridge for P2pBridge {
 }
 
 type PeerConnChannel = Sender<NetMessage>;
+// type Accepted = bool;
 
 pub(in crate::node) struct P2pConnManager {
     pub(in crate::node) gateways: Vec<PeerKeyLocation>,
@@ -170,6 +171,7 @@ impl P2pConnManager {
         let mut outbound_conn_handler_2 = outbound_conn_handler.clone();
         let mut pending_outbound_conns = FuturesUnordered::new();
         let mut pending_inbound_gw_conns = HashMap::new();
+        let mut pending_listening = FuturesUnordered::new();
         // TODO: test out if you got multiple instances in a single machine what happens, in theory they should be using multiple sockets
         let mut active_connections = HashSet::new();
 
@@ -245,6 +247,29 @@ impl P2pConnManager {
                     peer_connections.push(task);
                     Ok(Left((msg, Some(remote_addr))))
                 }
+                msg = pending_listening.next(), if !pending_listening.is_empty() => {
+                    let PeerConnectionInbound { conn, rx, msg } = match msg {
+                        Some(Ok(gw_conn)) => gw_conn,
+                        Some(Err(err)) => {
+                            tracing::error!("Error in gateway connection: {err}");
+                            continue;
+                        }
+                        None => {
+                            tracing::error!("All gateway connections closed");
+                            continue;
+                        }
+                    };
+                    let remote_addr = conn.remote_addr();
+
+                    if !pending_inbound_gw_conns.contains_key(&remote_addr) {
+                        tracing::error!("Connection not found in pending gateway connections");
+                        continue;
+                    }
+                    let remote_addr = conn.remote_addr();
+                    let task = peer_connection_listener(rx, conn).boxed();
+                    peer_connections.push(task);
+                    Ok(Left((msg, Some(remote_addr))))
+                }
                 msg = pending_outbound_conns.next(), if !pending_outbound_conns.is_empty() => {
                     match msg {
                         Some((peer_conn, peer_id)) => {
@@ -294,7 +319,11 @@ impl P2pConnManager {
                         Ok(Right(ClosedChannel))
                     }
                 }
-                msg = new_incoming_connection => { msg }
+                msg = new_incoming_connection => {
+                    // this is an inbound message at the gateway, we need to save the new connection
+                    // TODO: return ConnectionEstablished
+                    msg
+                }
                 event_id = client_wait_for_transaction.relay_transaction_result_to_client() => {
                     let (client_id, transaction) = event_id.map_err(|err| anyhow::Error::msg(err))?;
                     tx_to_client.insert(transaction, client_id);
@@ -366,6 +395,7 @@ impl P2pConnManager {
                                 ..
                             })) = &mut msg
                             {
+                                tracing::debug!(?joiner, "Received connection request from peer",);
                                 // this is a gateway forwarding a connection request
                                 // in this case a real connection already exists and we just need to maintain it alive
                                 // long enough so the request is forwarded
@@ -373,7 +403,7 @@ impl P2pConnManager {
                                 debug_assert_eq!(hops_to_live, max_hops_to_live);
                                 // at this point the joiner is probably not yet set, so we need to update it
                                 if let Some(remote_addr) = maybe_socket {
-                                    if let Some(peer_conn) =
+                                    if let Some(msg_sender) =
                                         pending_inbound_gw_conns.remove(&remote_addr)
                                     {
                                         let peer_id = PeerId::new(remote_addr, joiner_key.clone());
@@ -384,17 +414,11 @@ impl P2pConnManager {
                                         );
                                         active_connections.insert(remote_addr);
 
-                                        let (tx, rx) = mpsc::channel(10);
-                                        self.connection.insert(peer_id.clone(), tx);
-
-                                        // Spawn a task to handle the connection messages (inbound and outbound)
-                                        let task = peer_connection_listener(rx, peer_conn).boxed();
-                                        peer_connections.push(task);
+                                        self.connection.insert(peer_id.clone(), msg_sender);
                                     } else if joiner.is_none() {
                                         tracing::error!(
                                             "Joiner unexpectedly not set for connection request."
                                         );
-                                        continue;
                                     }
                                 }
                             }
@@ -465,7 +489,11 @@ impl P2pConnManager {
                     remote_addr,
                     peer_conn,
                 })) => {
-                    pending_inbound_gw_conns.insert(remote_addr, peer_conn);
+                    active_connections.insert(remote_addr);
+                    let (tx, rx) = mpsc::channel(10);
+                    pending_inbound_gw_conns.insert(remote_addr, tx);
+                    let task = peer_connection_listener(rx, peer_conn).boxed();
+                    pending_listening.push(task);
                 }
                 Ok(Right(ConnectionEstablished { peer, peer_conn })) => {
                     let addr = peer.addr.clone();
@@ -618,6 +646,7 @@ async fn peer_connection_listener(
         tokio::select! {
             msg = rx.recv() => {
                 let Some(msg) = msg else { break Err(TransportError::ConnectionClosed); };
+                tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr() ,"Sending message to peer. Msg: {msg}");
                 conn
                     .send(msg)
                     .await?;
@@ -625,11 +654,41 @@ async fn peer_connection_listener(
             msg = conn.recv() => {
                 let msg = msg.unwrap();
                 let net_message = decode_msg(&msg).unwrap();
+                tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr() ,"Received message from peer. Msg: {net_message}");
                 break Ok(PeerConnectionInbound { conn, rx, msg: net_message });
             }
         }
     }
 }
+
+// async fn gw_conn_listener(
+//     mut msg_receiver: Receiver<NetMessage>,
+//     mut conn: PeerConnection,
+// ) -> Result<PeerConnectionInbound, TransportError> {
+//     loop {
+//         tokio::select! {
+//             msg = acceptations_receiver.recv() => {
+//                 let Some(accepted) = msg else { continue; };
+//                 if !accepted {
+//                     break Err(TransportError::ConnectionClosed);
+//                 };
+//             }
+//             msg = msg_receiver.recv() => {
+//                 let Some(msg) = msg else { break Err(TransportError::ConnectionClosed); };
+//                 tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr() ,"Sending message to peer. Msg: {msg}");
+//                 conn
+//                     .send(msg)
+//                     .await?;
+//             }
+//             msg = conn.recv() => {
+//                 let msg = msg.unwrap();
+//                 let net_message = decode_msg(&msg).unwrap();
+//                 tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr() ,"Received message from peer. Msg: {net_message}");
+//                 break Ok( PeerConnectionInbound { conn, rx: msg_receiver , msg: net_message });
+//             }
+//         }
+//     }
+// }
 
 #[inline(always)]
 fn decode_msg(data: &[u8]) -> Result<NetMessage, ConnectionError> {
