@@ -571,7 +571,7 @@ impl P2pConnManager {
                     *joiner = self.bridge.op_manager.ring.get_peer_key();
                     connection = Some((peer.clone(), peer_conn));
                 } else {
-                    tracing::error!("Connection already exists with gateway {}", peer.addr);
+                    tracing::warn!("Connection already exists with gateway {}", peer.addr);
                     return Ok(Either::Left(()));
                 }
             }
@@ -600,6 +600,9 @@ impl P2pConnManager {
                             Self::establish_connection(outbound_conn_handler, joiner).await?;
                         connection = Some((peer.clone(), peer_conn));
                     }
+                    // FIXME: we accepted,, so we must promote the connection to the active connections
+                    // in case of gateways signaling the temporal task
+                    tracing::debug!(this = %acceptor.peer, %joiner, "Connection accepted");
                 }
             }
             _ => {}

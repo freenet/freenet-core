@@ -510,7 +510,7 @@ impl Ring {
 
         if let Some(peer_id) = peer {
             if self.location_for_peer.read().get(peer_id).is_some() {
-                // avoid connecting mroe than once to the same peer
+                // avoid connecting more than once to the same peer
                 self.open_connections
                     .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 return false;

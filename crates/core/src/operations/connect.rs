@@ -237,7 +237,9 @@ impl Operation for ConnectOp {
                         peer: joiner.clone(),
                     };
 
-                    let accepted = true; // gateway always accept the first connection
+                    let accepted = op_manager
+                        .ring
+                        .should_accept(assigned_location, Some(&joiner));
 
                     if let Some(updated_state) = forward_conn(
                         *id,
@@ -252,11 +254,25 @@ impl Operation for ConnectOp {
                     {
                         new_state = Some(updated_state);
                     } else {
-                        tracing::debug!(tx = %id, at = %this_peer.peer, "Rejecting connection from {:?}", joiner);
                         new_state = None;
                     }
 
-                    return_msg = None;
+                    if accepted {
+                        tracing::debug!(tx = %id, at = %this_peer.peer, "Accepting connection from {:?}", joiner);
+                    } else {
+                        tracing::debug!(tx = %id, at = %this_peer.peer, "Rejecting connection from {:?}", joiner);
+                    }
+
+                    return_msg = Some(ConnectMsg::Response {
+                        id: *id,
+                        sender: this_peer.clone(),
+                        target: new_peer_loc.clone(),
+                        msg: ConnectResponse::AcceptedBy {
+                            accepted,
+                            acceptor: this_peer.clone(),
+                            joiner: joiner.clone(),
+                        },
+                    });
                 }
                 ConnectMsg::Request {
                     id,
