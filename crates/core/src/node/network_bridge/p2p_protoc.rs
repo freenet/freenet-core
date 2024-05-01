@@ -20,7 +20,7 @@ use crate::node::PeerId;
 use crate::operations::connect::{self, ConnectMsg, ConnectRequest, ConnectResponse};
 use crate::transport::{
     create_connection_handler, OutboundConnectionHandler, PeerConnection, TransportError,
-    TransportKeypair, TransportPublicKey,
+    TransportKeypair,
 };
 use crate::{
     client_events::ClientId,
@@ -539,45 +539,22 @@ impl P2pConnManager {
         Ok(peer_conn)
     }
 
-    fn create_new_outbound_msg(
-        id: &Transaction,
-        peer_id: Option<PeerId>,
-        joiner_key: &TransportPublicKey,
-        hops_to_live: &usize,
-        skip_list: &Vec<PeerId>,
-    ) -> NetMessage {
-        NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
-            msg: connect::ConnectRequest::StartJoinReq {
-                joiner: peer_id,
-                joiner_key: joiner_key.clone(),
-                hops_to_live: *hops_to_live,
-                skip_list: skip_list.clone(),
-                max_hops_to_live: *hops_to_live,
-            },
-            id: *id,
-        }))
-    }
-
     /// Outbound message from bridge handler
     async fn handle_bridge_connection_message(
         &mut self,
         peer: PeerId,
-        net_msg: Box<NetMessage>,
+        mut net_msg: Box<NetMessage>,
         outbound_conn_handler: &mut OutboundConnectionHandler,
     ) -> Result<Either<(), (PeerId, PeerConnection)>, ConnectionError> {
         let mut connection = None;
-        let mut new_outbound_msg = None;
 
-        match &*net_msg {
+        match &mut *net_msg {
             NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
                 msg:
                     connect::ConnectRequest::StartJoinReq {
-                        joiner_key,
-                        hops_to_live,
-                        skip_list,
-                        ..
+                        joiner, joiner_key, ..
                     },
-                id,
+                ..
             })) => {
                 if !self.connection.contains_key(&peer) {
                     // Establish a new connection with the peer
@@ -591,13 +568,7 @@ impl P2pConnManager {
                         let own_peer_id = PeerId::new(my_address, joiner_key.clone());
                         self.bridge.op_manager.ring.set_peer_key(own_peer_id);
                     }
-                    new_outbound_msg = Some(Self::create_new_outbound_msg(
-                        id,
-                        self.bridge.op_manager.ring.get_peer_key(),
-                        joiner_key,
-                        hops_to_live,
-                        skip_list,
-                    ));
+                    *joiner = self.bridge.op_manager.ring.get_peer_key();
                     connection = Some((peer.clone(), peer_conn));
                 } else {
                     tracing::error!("Connection already exists with gateway {}", peer.addr);
@@ -634,20 +605,14 @@ impl P2pConnManager {
             _ => {}
         }
 
-        let msg_to_send = if let Some(msg) = new_outbound_msg {
-            msg
-        } else {
-            *net_msg
-        };
-
         if let Some((_, conn)) = &mut connection {
-            conn.send(msg_to_send)
+            conn.send(net_msg)
                 .await
                 .map_err(|_| ConnectionError::SendNotCompleted)?;
         } else {
             if let Some(conn) = self.connection.get(&peer) {
-                tracing::debug!(target = %peer, %msg_to_send, "Sending outbound message");
-                conn.send(msg_to_send)
+                tracing::debug!(target = %peer, %net_msg, "Sending outbound message");
+                conn.send(*net_msg)
                     .await
                     .map_err(|_| ConnectionError::SendNotCompleted)?;
             } else {
