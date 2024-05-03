@@ -379,6 +379,13 @@ impl Operation for ConnectOp {
                                     "Open connection acknowledged at requesting joiner peer",
                                 );
                                 info.accepted_by.insert(acceptor.clone());
+                                op_manager
+                                    .ring
+                                    .add_connection(
+                                        acceptor.location.expect("location not found"),
+                                        acceptor.peer.clone(),
+                                    )
+                                    .await;
                             } else {
                                 tracing::debug!(
                                     tx = %id,
@@ -389,6 +396,16 @@ impl Operation for ConnectOp {
                                 );
                             }
 
+                            let your_location: Location =
+                                target.location.expect("location not found");
+                            tracing::debug!(
+                                tx = %id,
+                                at = %this_peer_id,
+                                location = %your_location,
+                                "Updating assigned location"
+                            );
+                            op_manager.ring.update_location(target.location);
+
                             if remaining_connetions == 0 {
                                 tracing::debug!(
                                     tx = %id,
@@ -396,16 +413,6 @@ impl Operation for ConnectOp {
                                     from = %sender.peer,
                                     "All available connections established",
                                 );
-
-                                let your_location: Location =
-                                    target.location.expect("location not found");
-                                tracing::debug!(
-                                    tx = %id,
-                                    at = %this_peer_id,
-                                    location = %your_location,
-                                    "Updating assigned location"
-                                );
-                                op_manager.ring.update_location(target.location);
 
                                 try_clean_gw_connection(
                                     id.clone(),
@@ -679,7 +686,7 @@ where
                 )
                 .await?;
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(15)).await;
         }
         Ok::<_, OpError>(())
     });

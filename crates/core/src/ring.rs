@@ -554,6 +554,8 @@ impl Ring {
     }
 
     pub async fn add_connection(&self, loc: Location, peer: PeerId) {
+        self.open_connections
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.event_register
             .register_events(Either::Left(NetEventLog::connected(
                 self,
