@@ -95,15 +95,15 @@ impl NetworkBridge for P2pBridge {
     }
 }
 
-type PeerConnChannel = Sender<NetMessage>;
-// type Accepted = bool;
+type PeerConnChannelSender = Sender<Either<NetMessage, ConnMngrActions>>;
+type PeerConnChannelRecv = Receiver<Either<NetMessage, ConnMngrActions>>;
 
 pub(in crate::node) struct P2pConnManager {
     pub(in crate::node) gateways: Vec<PeerKeyLocation>,
     pub(in crate::node) bridge: P2pBridge,
     conn_bridge_rx: Receiver<P2pBridgeEvent>,
     event_listener: Box<dyn NetEventRegister>,
-    connection: HashMap<PeerId, PeerConnChannel>,
+    connection: HashMap<PeerId, PeerConnChannelSender>,
     key_pair: TransportKeypair,
     listening_ip: IpAddr,
     listening_port: u16,
@@ -171,8 +171,7 @@ impl P2pConnManager {
         let mut outbound_conn_handler_2 = outbound_conn_handler.clone();
         let mut pending_outbound_conns = FuturesUnordered::new();
         let mut pending_inbound_gw_conns = HashMap::new();
-        let mut pending_listening = FuturesUnordered::new();
-        // TODO: test out if you got multiple instances in a single machine what happens, in theory they should be using multiple sockets
+        let mut pending_listening_gw_conns = FuturesUnordered::new();
         let mut active_connections = HashSet::new();
 
         loop {
@@ -192,6 +191,7 @@ impl P2pConnManager {
                                         peer,
                                         msg,
                                         &mut outbound_conn_handler,
+                                        &pending_inbound_gw_conns,
                                     )
                                     .await?
                                 {
@@ -205,10 +205,7 @@ impl P2pConnManager {
                 }
             };
 
-            let new_incoming_connection = async {
-                // TODO: add a separate code path for gateways for handling connection liveness
-                // we must ensure that the peer stays connected long enough so an other peer has forwarded
-                // or accepted a connection
+            let new_inbound_connection = async {
                 match inbound_conn_handler.next_connection().await {
                     Some(peer_conn) => {
                         tracing::debug!(
@@ -247,7 +244,7 @@ impl P2pConnManager {
                     peer_connections.push(task);
                     Ok(Left((msg, Some(remote_addr))))
                 }
-                msg = pending_listening.next(), if !pending_listening.is_empty() => {
+                msg = pending_listening_gw_conns.next(), if !pending_listening_gw_conns.is_empty() => {
                     let PeerConnectionInbound { conn, rx, msg } = match msg {
                         Some(Ok(gw_conn)) => gw_conn,
                         Some(Err(err)) => {
@@ -293,7 +290,9 @@ impl P2pConnManager {
                         }
                     }
                 }
-                msg = notification_msg => { msg }
+                msg = notification_msg => {
+                    msg.map(|maybe_net_msg| maybe_net_msg.map_left(|(msg, o)| (Some(msg), o)))
+                }
                 msg = bridge_msg => {
                     let msg = match msg {
                         Ok(msg) => msg,
@@ -319,9 +318,8 @@ impl P2pConnManager {
                         Ok(Right(ClosedChannel))
                     }
                 }
-                msg = new_incoming_connection => {
-                    // this is an inbound message at the gateway, we need to save the new connection
-                    // TODO: return ConnectionEstablished
+                msg = new_inbound_connection => {
+                    // this is an inbound message at the gateway
                     msg
                 }
                 event_id = client_wait_for_transaction.relay_transaction_result_to_client() => {
@@ -338,7 +336,7 @@ impl P2pConnManager {
 
             match msg {
                 // This are either inbound messages or fast tracked by the event notifier
-                Ok(Left((msg, maybe_socket))) => {
+                Ok(Left((Some(msg), maybe_socket))) => {
                     let cb = self.bridge.clone();
                     match msg {
                         NetMessage::V1(NetMessageV1::Aborted(tx)) => {
@@ -493,7 +491,7 @@ impl P2pConnManager {
                     let (tx, rx) = mpsc::channel(10);
                     pending_inbound_gw_conns.insert(remote_addr, tx);
                     let task = peer_connection_listener(rx, peer_conn).boxed();
-                    pending_listening.push(task);
+                    pending_listening_gw_conns.push(task);
                 }
                 Ok(Right(ConnectionEstablished { peer, peer_conn })) => {
                     let addr = peer.addr.clone();
@@ -510,6 +508,13 @@ impl P2pConnManager {
                 Ok(Right(ClosedChannel)) => {
                     tracing::info!("Notification channel closed");
                     break;
+                }
+                Ok(Left((None, _))) => {
+                    // the conn to the gw has been accepted, we can dismiss this
+                    tracing::debug!("Connection accepted by gateway");
+                }
+                Ok(Right(AcceptConnection)) => {
+                    unreachable!()
                 }
                 Err(err) => {
                     super::super::report_result(
@@ -545,6 +550,7 @@ impl P2pConnManager {
         peer: PeerId,
         mut net_msg: Box<NetMessage>,
         outbound_conn_handler: &mut OutboundConnectionHandler,
+        pending_inbound_gw_conns: &HashMap<SocketAddr, PeerConnChannelSender>,
     ) -> Result<Either<(), (PeerId, PeerConnection)>, ConnectionError> {
         let mut connection = None;
 
@@ -600,9 +606,13 @@ impl P2pConnManager {
                             Self::establish_connection(outbound_conn_handler, joiner).await?;
                         connection = Some((peer.clone(), peer_conn));
                     }
-                    // FIXME: we accepted,, so we must promote the connection to the active connections
-                    // in case of gateways signaling the temporal task
                     tracing::debug!(this = %acceptor.peer, %joiner, "Connection accepted");
+                    if let Some(tx) = pending_inbound_gw_conns.get(&peer.addr) {
+                        // if this node is a gateway we need to signal that we accepted the connection
+                        let _ = tx.send(Right(ConnMngrActions::AcceptConnection)).await.map_err(|_| {
+                            tracing::debug!(remote = %peer.addr, "Couldn't signal to the connection that is accepted, likely dropped");
+                        });
+                    }
                 }
             }
             _ => {}
@@ -615,7 +625,7 @@ impl P2pConnManager {
         } else {
             if let Some(conn) = self.connection.get(&peer) {
                 tracing::debug!(target = %peer, %net_msg, "Sending outbound message");
-                conn.send(*net_msg)
+                conn.send(Either::Left(*net_msg))
                     .await
                     .map_err(|_| ConnectionError::SendNotCompleted)?;
             } else {
@@ -641,6 +651,8 @@ enum ConnMngrActions {
         peer: FreenetPeerId,
         peer_conn: PeerConnection,
     },
+    /// Accept connection
+    AcceptConnection,
     NodeAction(NodeEvent),
     ClosedChannel,
 }
@@ -656,28 +668,43 @@ enum ProtocolStatus {
 struct PeerConnectionInbound {
     conn: PeerConnection,
     /// Receiver for inbound messages for the peer connection
-    rx: Receiver<NetMessage>,
-    msg: NetMessage,
+    rx: Receiver<Either<NetMessage, ConnMngrActions>>,
+    msg: Option<NetMessage>,
 }
 
 async fn peer_connection_listener(
-    mut rx: mpsc::Receiver<NetMessage>,
+    mut rx: PeerConnChannelRecv,
     mut conn: PeerConnection,
 ) -> Result<PeerConnectionInbound, TransportError> {
     loop {
         tokio::select! {
             msg = rx.recv() => {
                 let Some(msg) = msg else { break Err(TransportError::ConnectionClosed); };
-                tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr() ,"Sending message to peer. Msg: {msg}");
-                conn
-                    .send(msg)
-                    .await?;
+                match msg {
+                    Left(msg) => {
+                        tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr() ,"Sending message to peer. Msg: {msg}");
+                        conn
+                            .send(msg)
+                            .await?;
+                    }
+                    Right(action) => {
+                        match action {
+                            ConnMngrActions::NodeAction(NodeEvent::DropConnection(_)) => {
+                                break Err(TransportError::ConnectionClosed);
+                            }
+                            ConnMngrActions::AcceptConnection => {
+                                return Ok(PeerConnectionInbound { conn, rx, msg: None });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
             msg = conn.recv() => {
                 let msg = msg.unwrap();
                 let net_message = decode_msg(&msg).unwrap();
                 tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr() ,"Received message from peer. Msg: {net_message}");
-                break Ok(PeerConnectionInbound { conn, rx, msg: net_message });
+                break Ok(PeerConnectionInbound { conn, rx, msg: Some(net_message) });
             }
         }
     }
