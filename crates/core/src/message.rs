@@ -30,7 +30,7 @@ pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
 ///   to sweep any garbage left by a finished (or timed out) transaction.
 ///
 /// A transaction may span different messages sent across the network.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct Transaction {
     id: Ulid,
 }
@@ -123,6 +123,12 @@ impl<'a> arbitrary::Arbitrary<'a> for Transaction {
 }
 
 impl Display for Transaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.id)
+    }
+}
+
+impl std::fmt::Debug for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.id)
     }

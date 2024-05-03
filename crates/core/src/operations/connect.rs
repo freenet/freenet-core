@@ -23,6 +23,7 @@ use crate::{
 
 pub(crate) use self::messages::{ConnectMsg, ConnectRequest, ConnectResponse};
 
+#[derive(Debug)]
 pub(crate) struct ConnectOp {
     id: Transaction,
     state: Option<ConnectState>,
@@ -546,15 +547,16 @@ fn build_op_result(
     gateway: Option<Box<PeerKeyLocation>>,
     backoff: Option<ExponentialBackoff>,
 ) -> Result<OperationResult, OpError> {
-    let output_op = Some(ConnectOp {
+    tracing::debug!(tx = %id, ?msg, "Connect operation result");
+    let output_op = Some(OpEnum::Connect(Box::new(ConnectOp {
         id,
         state,
         gateway,
         backoff,
-    });
+    })));
     Ok(OperationResult {
         return_msg: msg.map(NetMessage::from),
-        state: output_op.map(|op: ConnectOp| OpEnum::Connect(Box::new(op))),
+        state: output_op,
     })
 }
 
