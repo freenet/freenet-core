@@ -284,16 +284,24 @@ impl TopologyManager {
         my_location: &Option<Location>,
         at_time: Instant,
     ) -> TopologyAdjustment {
-        // let mut last_log = Instant::now();
-        // if last_log.elapsed() > Duration::from_secs(10) {
-        // last_log = Instant::now();
-        // TODO: only print periodically
-        tracing::trace!(
-            "Adjusting topology at {:?}. Current neighbors: {:?}",
-            at_time,
-            neighbor_locations.len()
-        );
-        // }
+        #[cfg(debug_assertions)]
+        {
+            thread_local! {
+                static LAST_LOG: std::cell::RefCell<Instant> = std::cell::RefCell::new(Instant::now());
+            }
+            if LAST_LOG
+                .with(|last_log| last_log.borrow().elapsed() > std::time::Duration::from_secs(10))
+            {
+                LAST_LOG.with(|last_log| {
+                    tracing::trace!(
+                        "Adjusting topology at {:?}. Current neighbors: {:?}",
+                        at_time,
+                        neighbor_locations.len()
+                    );
+                    *last_log.borrow_mut() = Instant::now();
+                });
+            }
+        }
 
         if neighbor_locations.len() < self.limits.min_connections {
             let mut locations = Vec::new();
@@ -312,12 +320,25 @@ impl TopologyManager {
                         }
                     }
                 }
-                tracing::trace!(
-                    minimum_num_peers_hard_limit = self.limits.min_connections,
-                    num_peers = neighbor_locations.len(),
-                    to_add = below_threshold,
-                    "Adding peers at random locations to reach minimum number of peers"
-                );
+                #[cfg(debug_assertions)]
+                {
+                    thread_local! {
+                        static LAST_LOG: std::cell::RefCell<Instant> = std::cell::RefCell::new(Instant::now());
+                    }
+                    if LAST_LOG.with(|last_log| {
+                        last_log.borrow().elapsed() > std::time::Duration::from_secs(10)
+                    }) {
+                        LAST_LOG.with(|last_log| {
+                            tracing::trace!(
+                                minimum_num_peers_hard_limit = self.limits.min_connections,
+                                num_peers = neighbor_locations.len(),
+                                to_add = below_threshold,
+                                "Adding peers at random locations to reach minimum number of peers"
+                            );
+                            *last_log.borrow_mut() = Instant::now();
+                        });
+                    }
+                }
             }
             return TopologyAdjustment::AddConnections(locations);
         }

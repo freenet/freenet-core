@@ -554,7 +554,7 @@ impl P2pConnManager {
     ) -> Result<Either<(), (PeerId, PeerConnection)>, ConnectionError> {
         let mut connection = None;
 
-        tracing::debug!(target_peer = %peer, ?net_msg, "Handling bridge connection message");
+        tracing::debug!(target_peer = %peer, %net_msg, "Handling bridge connection message");
         match &mut *net_msg {
             NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
                 msg:
