@@ -127,7 +127,7 @@ impl PeerConnection {
         // listen for incoming messages or receipts or wait until is time to do anything else again
         let mut resend_check = Some(tokio::time::sleep(tokio::time::Duration::from_secs(1)));
 
-        const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+        const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(20);
         const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(60);
         let mut keep_alive = tokio::time::interval(KEEP_ALIVE_INTERVAL);
         keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
