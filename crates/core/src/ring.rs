@@ -513,6 +513,7 @@ impl Ring {
                 // avoid connecting more than once to the same peer
                 self.open_connections
                     .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                tracing::debug!(%peer_id, "Peer already connected");
                 return false;
             }
         }
@@ -520,7 +521,7 @@ impl Ring {
         let my_location = self
             .own_location()
             .location
-            .expect("this node has no location assigned!");
+            .unwrap_or_else(|| /* havent joined the ring yet */ Location::random());
         let accepted = if location == my_location
             || self.connections_by_location.read().contains_key(&location)
         {
@@ -538,6 +539,12 @@ impl Ring {
         if !accepted {
             self.open_connections
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            if let Some(peer_id) = peer {
+                self.location_for_peer
+                    .write()
+                    .insert(peer_id.clone(), location);
+            }
         }
         accepted
     }
@@ -554,8 +561,6 @@ impl Ring {
     }
 
     pub async fn add_connection(&self, loc: Location, peer: PeerId) {
-        self.open_connections
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.event_register
             .register_events(Either::Left(NetEventLog::connected(
                 self,
@@ -580,6 +585,20 @@ impl Ring {
         let cbl = self.connections_by_location.read();
         let topology_manager = &mut self.topology_manager.write();
         let _ = topology_manager.refresh_cache(&cbl);
+    }
+
+    pub fn is_connected<'a>(
+        &self,
+        peers: impl Iterator<Item = &'a PeerKeyLocation>,
+    ) -> impl Iterator<Item = &'a PeerKeyLocation> + Send {
+        let locs = &*self.location_for_peer.read();
+        let mut filtered = Vec::new();
+        for peer in peers {
+            if locs.contains_key(&peer.peer) {
+                filtered.push(peer);
+            }
+        }
+        filtered.into_iter()
     }
 
     /// Return the most optimal peer caching a given contract.

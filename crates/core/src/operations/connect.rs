@@ -11,6 +11,7 @@ use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
 use crate::message::NetMessageV1;
+use crate::node::ConnectionError;
 use crate::ring::Ring;
 use crate::transport::TransportPublicKey;
 use crate::{
@@ -662,33 +663,46 @@ where
     let number_of_parallel_connections = {
         let max_potential_conns_per_gw = op_manager.ring.max_hops_to_live;
         // e.g. 10 gateways and htl 5 -> only need 2 connections in parallel
-        let needed_to_cover_max = gateways.iter().count() / max_potential_conns_per_gw;
-        needed_to_cover_max.max(1)
+        let needed_to_cover_max = op_manager.ring.max_connections / max_potential_conns_per_gw;
+        gateways.iter().take(needed_to_cover_max).count().max(1)
     };
     let gateways = gateways.to_vec();
     tokio::task::spawn(async move {
-        while op_manager.ring.open_connections() == 0 {
-            tracing::info!(
-                "Attempting to connect to {} gateways in parallel",
-                number_of_parallel_connections
-            );
-            for gateway in gateways
-                .iter()
-                .shuffle()
-                .take(number_of_parallel_connections)
-            {
-                join_ring_request(
-                    None,
-                    peer_pub_key.clone(),
-                    gateway,
-                    &*op_manager,
-                    &mut conn_manager,
-                )
-                .await?;
+        loop {
+            if op_manager.ring.open_connections() == 0 {
+                tracing::info!(
+                    "Attempting to connect to {} gateways in parallel",
+                    number_of_parallel_connections
+                );
+                for gateway in gateways
+                    .iter()
+                    .shuffle()
+                    .take(number_of_parallel_connections)
+                {
+                    tracing::info!(%gateway, "Attempting connection to gateway");
+                    // FIXME: because it stays connected after first attempt, even if it fails,
+                    // we won't be ever retrying with the same gateway
+                    // for gateway in op_manager
+                    //     .ring
+                    //     .is_connected(gateways.iter())
+                    //     .shuffle()
+                    //     .take(number_of_parallel_connections)
+                    // {
+                    if let Err(error) = join_ring_request(
+                        None,
+                        peer_pub_key.clone(),
+                        gateway,
+                        &*op_manager,
+                        &mut conn_manager,
+                    )
+                    .await
+                    {
+                        tracing::error!(%error, "Failed while attempting connection to gateway");
+                    }
+                }
             }
             tokio::time::sleep(Duration::from_secs(15)).await;
         }
-        Ok::<_, OpError>(())
     });
     Ok(())
 }
@@ -704,6 +718,13 @@ pub(crate) async fn join_ring_request<CM>(
 where
     CM: NetworkBridge + Send,
 {
+    if !op_manager.ring.should_accept(
+        gateway.location.unwrap_or_else(|| Location::random()),
+        Some(&gateway.peer),
+    ) {
+        // ensure that we still want to connect AND reserve an spot implicitly
+        return Err(OpError::ConnError(ConnectionError::FailedConnectOp));
+    }
     let tx_id = Transaction::new::<ConnectMsg>();
     let mut op = initial_request(
         peer_pub_key,

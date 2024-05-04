@@ -42,6 +42,8 @@ pub(crate) enum ConnectionError {
     Serialization(#[from] Option<Box<bincode::ErrorKind>>),
     #[error("{0}")]
     TransportError(String),
+    #[error("unwanted connection")]
+    FailedConnectOp,
 
     // errors produced while handling the connection:
     #[error("IO error: {0}")]
@@ -72,6 +74,7 @@ impl Clone for ConnectionError {
             Self::Timeout => Self::Timeout,
             Self::UnexpectedReq => Self::UnexpectedReq,
             Self::TransportError(err) => Self::TransportError(err.clone()),
+            Self::FailedConnectOp => Self::FailedConnectOp,
         }
     }
 }
