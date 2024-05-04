@@ -260,9 +260,9 @@ impl Operation for ConnectOp {
                     }
 
                     if accepted {
-                        tracing::debug!(tx = %id, at = %this_peer.peer, "Accepting connection from {:?}", joiner);
+                        tracing::debug!(tx = %id, at = %this_peer.peer, %joiner, "Accepting connection");
                     } else {
-                        tracing::debug!(tx = %id, at = %this_peer.peer, "Rejecting connection from {:?}", joiner);
+                        tracing::debug!(tx = %id, at = %this_peer.peer, %joiner, "Rejecting connection");
                     }
 
                     return_msg = Some(ConnectMsg::Response {

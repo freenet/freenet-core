@@ -859,7 +859,6 @@ impl Ring {
             match adjustment {
                 TopologyAdjustment::AddConnections(target_locs) => {
                     pending_conn_adds.extend(target_locs);
-                    continue;
                 }
                 TopologyAdjustment::RemoveConnections(mut should_disconnect_peers) => {
                     for peer in should_disconnect_peers.drain(..) {
