@@ -938,7 +938,7 @@ fn handle_unforwardable_connection(
 }
 
 mod messages {
-    use std::fmt::{write, Display};
+    use std::fmt::Display;
 
     use super::*;
 
@@ -1021,16 +1021,7 @@ mod messages {
                     ..
                 } => write!(f, "RouteValue(id: {id})"),
                 Self::Connected { .. } => write!(f, "Connected(id: {id})"),
-                ConnectMsg::Request { id, msg } => write!(f, "Request(id: {id}, msg: {msg})"),
-                ConnectMsg::Response {
-                    id,
-                    sender,
-                    target,
-                    msg,
-                } => write!(f, "Response(id: {id}, sender: {sender}, target: {target})"),
-                ConnectMsg::Connected { id, sender, target } => {
-                    write!(f, "Connected(id: {id}, sender: {sender}, target: {target})")
-                }
+                ConnectMsg::Request { id, .. } => write!(f, "Request(id: {id})"),
             }
         }
     }
