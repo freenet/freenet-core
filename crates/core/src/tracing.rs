@@ -1200,6 +1200,7 @@ pub(crate) mod tracer {
                 } else {
                     "freenet-core".to_string()
                 };
+                println!("setting OT collector with identifier: {identifier}");
                 let tracing_ot_layer = {
                     // Connect the Jaeger OT tracer with the tracing middleware
                     let ot_jaeger_tracer =

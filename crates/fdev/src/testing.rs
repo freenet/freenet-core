@@ -4,7 +4,7 @@ use anyhow::Error;
 use freenet::dev_tool::SimNetwork;
 
 mod multiple_process;
-mod network;
+pub(crate) mod network;
 mod single_process;
 
 pub(crate) use multiple_process::Process;

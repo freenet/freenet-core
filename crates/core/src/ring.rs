@@ -594,7 +594,7 @@ impl Ring {
         let locs = &*self.location_for_peer.read();
         let mut filtered = Vec::new();
         for peer in peers {
-            if locs.contains_key(&peer.peer) {
+            if !locs.contains_key(&peer.peer) {
                 filtered.push(peer);
             }
         }
