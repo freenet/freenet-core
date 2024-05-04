@@ -602,12 +602,11 @@ impl P2pConnManager {
                     // In this case we are the acceptor, we need to establish a connection with the joiner
                     // this should only happen for the non-first peers in a Connect request, the first one
                     // should already be connected at this point, so check just in case
-                    // if !self.connection.contains_key(&acceptor.peer) {
-                    // FIXME: only should attempt to connect in case of non-gateways
-                    //     let peer_conn =
-                    //         Self::establish_connection(outbound_conn_handler, joiner).await?;
-                    //     connection = Some((peer.clone(), peer_conn));
-                    // }
+                    if !self.is_gateway && !self.connection.contains_key(&acceptor.peer) {
+                        let peer_conn =
+                            Self::establish_connection(outbound_conn_handler, joiner).await?;
+                        connection = Some((joiner.clone(), peer_conn));
+                    }
                     tracing::debug!(this = %acceptor.peer, %joiner, "Connection accepted");
                     if let Some(tx) = pending_inbound_gw_conns.get(&peer.addr) {
                         // if this node is a gateway we need to signal that we accepted the connection
