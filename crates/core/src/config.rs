@@ -151,15 +151,17 @@ impl ConfigArgs {
             self.config_paths.merge(cfg.config_paths);
         }
 
+        let mode = self.mode.unwrap_or(OperationMode::Local);
         Ok(Config {
-            mode: self.mode.unwrap_or(OperationMode::Local),
+            mode,
             gateway: GatewayConfig {
-                address: self.gateway.address.unwrap_or(default_gateway_address()),
+                address: self.gateway.address.unwrap_or_else(|| match mode {
+                    OperationMode::Local => default_local_gateway_address(),
+                    OperationMode::Network => default_gateway_address(),
+                }),
                 port: self.gateway.port.unwrap_or(default_gateway_port()),
             },
             transport_keypair: match self.transport_keypair {
-                // Some(path_to_key) => parse_keypair(path.to_string_lossy().trim())
-                // .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
                 Some(path_to_key) => {
                     let mut key_file = File::open(&path_to_key).map_err(|e| {
                         std::io::Error::new(
@@ -319,6 +321,11 @@ const fn default_gateway_address() -> IpAddr {
 }
 
 #[inline]
+const fn default_local_gateway_address() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::LOCALHOST)
+}
+
+#[inline]
 const fn default_gateway_port() -> u16 {
     50509
 }
@@ -436,8 +443,8 @@ pub struct ConfigPaths {
 impl ConfigPaths {
     pub fn db_dir(&self, mode: OperationMode) -> PathBuf {
         match mode {
-            OperationMode::Local => self.db_dir.join("local"),
-            OperationMode::Network => self.db_dir.to_owned(),
+            OperationMode::Local => self.db_dir.join("local").join("freenet"),
+            OperationMode::Network => self.db_dir.to_owned().join("freenet"),
         }
     }
 
