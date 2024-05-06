@@ -159,13 +159,7 @@ async fn execute_command(
             }
             SocketAddr::new(address, port)
         }
-        OperationMode::Network => {
-            if address.is_loopback() {
-                return Err(anyhow::anyhow!(
-                    "invalid ip: {address}, expecting a public ip address in network mode"
-                ));
-            }
-
+        OperationMode::Network => { 
             SocketAddr::new(address, port)
         }
     };
