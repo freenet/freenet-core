@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 freenet-stdlib.workspace = true
-serde = { version = "1", features = ["derive"] }
+freenet-ping-types.workspace = true
 serde_json = "1"
 
 [features]

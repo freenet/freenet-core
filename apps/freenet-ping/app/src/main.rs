@@ -1,20 +1,14 @@
-use std::{collections::HashSet, time::Duration};
+use std::time::Duration;
 
 use clap::Parser;
+use freenet_ping_types::Ping;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::{
-        ContractContainer, Parameters, RelatedContracts, StateDelta, UpdateData,
-        WrappedState,
+        ContractContainer, Parameters, RelatedContracts, StateDelta, UpdateData, WrappedState,
     },
 };
 use names::Generator;
-use rand::RngCore;
-
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-struct Ping {
-    from: HashSet<String>,
-}
 
 #[derive(clap::Parser)]
 struct Args {
@@ -22,6 +16,8 @@ struct Args {
     host: String,
     #[clap(long, default_value = "info")]
     log_level: tracing::level_filters::LevelFilter,
+    #[clap(short, long, default_value = "freenet-ping")]
+    parameters: String,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -49,18 +45,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     })?;
     let mut client = WebApi::start(stream);
     // put contract first
-    // Generate a random parameters so that we can add multiple ping contracts to the host.
-    let params = {
-      let mut data = [0u8; 32];
-      rand::thread_rng().fill_bytes(&mut data);
-      Parameters::from(data.to_vec())
-    };
+    let params = Parameters::from(args.parameters.into_bytes());
     let container = ContractContainer::try_from((PING_CODE.to_vec(), &params))?;
     let contract_key = container.key();
     client
         .send(ClientRequest::ContractOp(ContractRequest::Put {
             contract: container,
-            // state: WrappedState::new(serde_json::to_vec(&Ping::default()).unwrap()),
             state: WrappedState::new(vec![]),
             related_contracts: RelatedContracts::new(),
         }))
@@ -76,9 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
           _ = send_tick.tick() => {
             let name = generator.next().unwrap();
 
-            local_state.from.insert(name.clone());
+            local_state.insert(name.clone());
             let mut ping = Ping::default();
-            ping.from.insert(name.clone());
+            ping.insert(name.clone());
             if let Err(e) = client.send(ClientRequest::ContractOp(ContractRequest::Update {
               key: contract_key.clone(),
               data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&ping).unwrap())),
@@ -110,8 +100,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                           }
                         };
 
-                        for name in local_state.from.difference(&ping.from) {
-                          tracing::info!("Hello {}!", name);
+                        if !ping.is_expired() {
+                          for name in local_state.difference(&ping) {
+                            tracing::info!("Hello, {}!", name);
+                          }
                         }
                       }
                     },
@@ -120,19 +112,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                     },
                     ContractResponse::UpdateNotification { .. } => {},
                     ContractResponse::UpdateResponse { summary, key } => {
-                      tracing::info!(key=%key, data=?summary, "received update response!");
-                      let ping = match serde_json::from_slice::<Ping>(&summary) {
-                        Ok(p) => p,
-                        Err(e) => {
-                          tracing::error!(err=%e, "failed to deserialize summary");
-                          continue;
-                        },
-                      };
-
-                      for name in local_state.from.difference(&ping.from) {
-                        tracing::info!("Hello {}!", name);
+                      if contract_key.eq(&key) && !summary.is_empty() {
+                        let ping = match serde_json::from_slice::<Ping>(&summary) {
+                          Ok(p) => p,
+                          Err(e) => {
+                            tracing::error!(err=%e, "failed to deserialize summary");
+                            continue;
+                          },
+                        };
+  
+                        if !ping.is_expired() {
+                          for name in local_state.difference(&ping) {
+                            tracing::info!("Hello, {}!", name);
+                          }
+                          local_state.merge(ping);
+                        }
                       }
-                      local_state.from.extend(ping.from);
                     },
                     _ => {},
                   }

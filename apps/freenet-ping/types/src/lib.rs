@@ -10,6 +10,7 @@ pub struct Ping {
     timestamp: DateTime<Utc>,
 }
 
+#[cfg(feature = "std")]
 impl Default for Ping {
     fn default() -> Self {
         Self {
@@ -34,6 +35,7 @@ impl core::ops::DerefMut for Ping {
 }
 
 impl Ping {
+    #[cfg(feature = "std")]
     pub fn new() -> Self {
         Self::default()
     }
@@ -42,12 +44,21 @@ impl Ping {
         self.timestamp
     }
 
+    #[cfg(feature = "std")]
     pub fn is_expired(&self) -> bool {
         self.timestamp + chrono::Duration::hours(1) < Utc::now()
     }
 
     pub fn merge(&mut self, other: Self) {
         self.from.extend(other.from);
-        self.timestamp = Utc::now();
+        #[cfg(feature = "std")]
+        {
+            self.timestamp = Utc::now();
+        }
+
+        #[cfg(not(feature = "std"))]
+        {
+            self.timestamp = other.timestamp;
+        }
     }
 }
