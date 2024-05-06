@@ -159,9 +159,7 @@ async fn execute_command(
             }
             SocketAddr::new(address, port)
         }
-        OperationMode::Network => { 
-            SocketAddr::new(address, port)
-        }
+        OperationMode::Network => SocketAddr::new(address, port),
     };
 
     let (stream, _) = tokio_tungstenite::connect_async(&format!(
