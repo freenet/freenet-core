@@ -1,4 +1,10 @@
 use freenet_stdlib::prelude::*;
+use std::collections::HashSet;
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct Ping {
+    from: HashSet<String>,
+}
 
 struct Contract;
 
@@ -10,11 +16,9 @@ impl ContractInterface for Contract {
         _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
         let bytes = state.as_ref();
-        if bytes.len() % 3 == 0 {
-            return Ok(ValidateResult::Valid);
-        }
-
-        Ok(ValidateResult::Invalid)
+        let _ = serde_json::from_slice::<Ping>(bytes)
+            .map_err(|e| ContractError::Deser(e.to_string()))?;
+        Ok(ValidateResult::Valid)
     }
 
     fn validate_delta(
@@ -22,30 +26,45 @@ impl ContractInterface for Contract {
         delta: StateDelta<'static>,
     ) -> Result<bool, ContractError> {
         let bytes = delta.as_ref();
-        if bytes.len() % 3 == 0 {
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        let _ = serde_json::from_slice::<HashSet<String>>(bytes)
+            .map_err(|e| ContractError::Deser(e.to_string()))?;
+
+        Ok(true)
     }
 
     fn update_state(
         _parameters: Parameters<'static>,
         state: State<'static>,
-        mut data: Vec<UpdateData<'static>>,
+        data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
-        if let Some(UpdateData::Delta(delta)) = data.pop() {
-            let mut data = state.to_vec();
-            data.extend(delta.as_ref());
-            if data.len() >= 15_000 {
-                data.truncate(15_000);
-                return Ok(UpdateModification::valid(data.into()));
+        let mut ping = serde_json::from_slice::<Ping>(state.as_ref())
+            .map_err(|e| ContractError::Deser(e.to_string()))?;
+        for ud in data {
+            match ud {
+                UpdateData::State(s) => {
+                    let ping_state = serde_json::from_slice::<Ping>(&s)
+                        .map_err(|e| ContractError::Deser(e.to_string()))?;
+                    ping.from.extend(ping_state.from);
+                }
+                UpdateData::Delta(s) => {
+                    let names = serde_json::from_slice::<HashSet<String>>(&s)
+                        .map_err(|e| ContractError::Deser(e.to_string()))?;
+                    ping.from.extend(names);
+                }
+                UpdateData::StateAndDelta { state, delta } => {
+                    let ping_state = serde_json::from_slice::<Ping>(&state)
+                        .map_err(|e| ContractError::Deser(e.to_string()))?;
+                    let names = serde_json::from_slice::<HashSet<String>>(&delta)
+                        .map_err(|e| ContractError::Deser(e.to_string()))?;
+                    ping.from.extend(ping_state.from);
+                    ping.from.extend(names);
+                }
+                _ => return Err(ContractError::InvalidUpdate),
             }
-
-            Ok(UpdateModification::valid(data.into()))
-        } else {
-            Err(ContractError::InvalidUpdate)
         }
+        return Ok(UpdateModification::valid(State::from(
+            serde_json::to_vec(&ping).map_err(|e| ContractError::Other(e.to_string()))?,
+        )));
     }
 
     fn summarize_state(
@@ -53,11 +72,9 @@ impl ContractInterface for Contract {
         state: State<'static>,
     ) -> Result<StateSummary<'static>, ContractError> {
         let state = state.as_ref();
-        if state.len() > 15_000 {
-            Err(ContractError::Other("incorrect data".to_owned()))
-        } else {
-            Ok(StateSummary::from(state.to_vec()))
-        }
+        let _ = serde_json::from_slice::<Ping>(state)
+            .map_err(|e| ContractError::Deser(e.to_string()))?;
+        Ok(StateSummary::from(state.to_vec()))
     }
 
     fn get_state_delta(
@@ -65,32 +82,17 @@ impl ContractInterface for Contract {
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
-        let state = state.as_ref();
-        let len = state.len();
-        if state.len() < 3 {
-            return Ok(StateDelta::from(state.to_vec()));
+        let ping = serde_json::from_slice::<Ping>(state.as_ref())
+            .map_err(|e| ContractError::Deser(e.to_string()))?;
+        let ping_summary = serde_json::from_slice::<Ping>(summary.as_ref())
+            .map_err(|e| ContractError::Deser(e.to_string()))?;
+        let mut delta = HashSet::new();
+        for s in ping.from.difference(&ping_summary.from) {
+            delta.insert(s.clone());
         }
 
-        Ok(StateDelta::from(state[len - 3..len].to_vec()))
+        Ok(StateDelta::from(
+            serde_json::to_vec(&delta).map_err(|e| ContractError::Other(e.to_string()))?,
+        ))
     }
 }
-
-#[test]
-fn validate_test() -> Result<(), Box<dyn std::error::Error>> {
-    let is_valid = Contract::validate_state(
-        Parameters::from([].as_ref()),
-        State::from(vec![0, 0, 0]),
-        Default::default(),
-    )?;
-    assert!(is_valid == ValidateResult::Valid);
-    let not_valid = Contract::validate_state(
-        Parameters::from([].as_ref()),
-        State::from(vec![1, 1, 1, 4]),
-        Default::default(),
-    )?;
-    assert!(matches!(not_valid, ValidateResult::Invalid));
-    Ok(())
-}
-
-#[test]
-fn test_() {}
