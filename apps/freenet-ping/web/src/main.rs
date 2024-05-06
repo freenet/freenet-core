@@ -18,7 +18,7 @@ struct Ping {
 
 #[derive(clap::Parser)]
 struct Args {
-    #[clap(long, default_value = "ws://localhost:50509")]
+    #[clap(long, default_value = "localhost:50509")]
     host: String,
     #[clap(long, default_value = "info")]
     log_level: tracing::level_filters::LevelFilter,
@@ -38,7 +38,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         include_bytes!("../../contracts/ping/build/freenet/freenet_ping_contract");
 
     // create a websocket connection to host.
-    let (stream, _resp) = tokio_tungstenite::connect_async(args.host).await.map_err(|e| {
+    let uri = format!("ws://{}/contract/command?encodingProtocol=native", args.host);
+    let (stream, _resp) = tokio_tungstenite::connect_async(&uri).await.map_err(|e| {
         tracing::error!(err=%e);
         e
     })?;
@@ -71,14 +72,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                 key: contract_key.clone(),
                 data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&HashSet::from([name])).unwrap())),
               })).await {
-                tracing::error!(%e);
+                tracing::error!(err=%e);
               }
             }
           },
           _ = fetch_tick.tick() => {
             if let Some(contract_key) = contract_key.as_ref() {
               if let Err(e) = client.send(ClientRequest::ContractOp(ContractRequest::Get { key: contract_key.clone(), fetch_contract: false })).await {
-                tracing::error!(%e);
+                tracing::error!(err=%e);
               }
             }
           },
@@ -136,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                 _ => unreachable!(),
               },
               Err(e) => {
-                tracing::error!(%e);
+                tracing::error!(err=%e);
               },
             }
           }
