@@ -443,8 +443,8 @@ pub struct ConfigPaths {
 impl ConfigPaths {
     pub fn db_dir(&self, mode: OperationMode) -> PathBuf {
         match mode {
-            OperationMode::Local => self.db_dir.join("local").join("freenet"),
-            OperationMode::Network => self.db_dir.to_owned().join("freenet"),
+            OperationMode::Local => self.db_dir.join("local"),
+            OperationMode::Network => self.db_dir.to_owned(),
         }
     }
 
