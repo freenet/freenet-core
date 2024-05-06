@@ -1307,7 +1307,7 @@ dependencies = [
  "tar",
  "thiserror",
  "tokio",
- "tokio-tungstenite 0.21.0",
+ "tokio-tungstenite 0.20.1",
  "toml",
  "tracing",
  "tracing-subscriber",
