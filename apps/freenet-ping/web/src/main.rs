@@ -18,7 +18,7 @@ struct Ping {
 
 #[derive(clap::Parser)]
 struct Args {
-    #[clap(short, long, default_value = "http://localhost:8080")]
+    #[clap(long, default_value = "ws://localhost:50509")]
     host: String,
     #[clap(long, default_value = "info")]
     log_level: tracing::level_filters::LevelFilter,
@@ -34,9 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         .with_max_level(args.log_level)
         .init();
 
-    // const PING_CODE: &[u8] =
-    //     include_bytes!("../../contracts/ping/build/freenet/freenet_ping_contract");
-    const PING_CODE: &[u8] = &[];
+    const PING_CODE: &[u8] =
+        include_bytes!("../../contracts/ping/build/freenet/freenet_ping_contract");
 
     // create a websocket connection to host.
     let (stream, _resp) = tokio_tungstenite::connect_async(args.host).await?;
@@ -146,3 +145,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     }
     Ok(())
 }
+

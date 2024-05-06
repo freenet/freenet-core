@@ -171,9 +171,9 @@ impl Config {
 
     pub fn db_dir(&self) -> PathBuf {
         if self.local_mode.load(std::sync::atomic::Ordering::SeqCst) {
-            self.config_paths.db_dir.join("local")
+            self.config_paths.db_dir.join("local").join("freenet")
         } else {
-            self.config_paths.db_dir.to_owned()
+            self.config_paths.db_dir.to_owned().join("freenet")
         }
     }
 
