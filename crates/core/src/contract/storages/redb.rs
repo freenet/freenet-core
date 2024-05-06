@@ -13,7 +13,8 @@ pub struct ReDb(Database);
 
 impl ReDb {
     pub async fn new(data_dir: &Path) -> Result<Self, redb::Error> {
-        let db_path = data_dir.join("db");
+        let mut db_path = data_dir.join("freenet");
+        db_path.set_extension("db");
         tracing::info!("loading contract store from {db_path:?}");
         Database::create(db_path).map(Self).map_err(Into::into)
     }
