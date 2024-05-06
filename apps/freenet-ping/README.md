@@ -35,7 +35,7 @@ And every 1.5 seconds, the application will fetch the latest names from host, an
 ## Build contract
 
 ```bash
-cd contracts/ping && CARGO_TARGET_DIR=./target fdev build && cd -
+cd contracts/ping && CARGO_TARGET_DIR=./target fdev build --features contract && cd -
 ```
 
 ## Run freenet locally
