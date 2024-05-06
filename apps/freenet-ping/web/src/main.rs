@@ -38,7 +38,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         include_bytes!("../../contracts/ping/build/freenet/freenet_ping_contract");
 
     // create a websocket connection to host.
-    let (stream, _resp) = tokio_tungstenite::connect_async(args.host).await?;
+    let (stream, _resp) = tokio_tungstenite::connect_async(args.host).await.map_err(|e| {
+        tracing::error!(err=%e);
+        e
+    })?;
     let mut client = WebApi::start(stream);
     // put contract first
     let params = Parameters::from(vec![]);
