@@ -70,6 +70,7 @@ async fn put_contract(
         File::open(state_path)?.read_to_end(&mut buf)?;
         buf.into()
     } else {
+        tracing::warn!("no state provided for contract, if your contract cannot handle empty state correctly, this will always cause an error.");
         vec![].into()
     };
     let related_contracts = if let Some(_related) = &contract_config.related_contracts {
