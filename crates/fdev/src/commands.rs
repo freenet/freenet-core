@@ -1,7 +1,7 @@
 use std::{
     fs::File,
     io::Read,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
 };
 
@@ -145,21 +145,28 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> Result<(), anyho
 async fn execute_command(
     request: ClientRequest<'static>,
     other: BaseConfig,
-    address: Option<IpAddr>,
+    address: IpAddr,
     port: u16,
 ) -> Result<(), anyhow::Error> {
     let mode = other.mode;
 
     let target = match mode {
         OperationMode::Local => {
-            SocketAddr::new(address.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)), port)
+            if !address.is_loopback() {
+                return Err(anyhow::anyhow!(
+                    "invalid ip: {address}, expecting a loopback ip address in local mode"
+                ));
+            }
+            SocketAddr::new(address, port)
         }
         OperationMode::Network => {
-            let Some(ip) = address else {
-                return Err(anyhow::anyhow!("ip address is required in network mode"));
-            };
+            if address.is_loopback() {
+                return Err(anyhow::anyhow!(
+                    "invalid ip: {address}, expecting a public ip address in network mode"
+                ));
+            }
 
-            SocketAddr::new(ip, port)
+            SocketAddr::new(address, port)
         }
     };
 

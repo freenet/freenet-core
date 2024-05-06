@@ -1,4 +1,8 @@
-use std::{fmt::Display, net::IpAddr, path::PathBuf};
+use std::{
+    fmt::Display,
+    net::{IpAddr, Ipv4Addr},
+    path::PathBuf,
+};
 
 use crate::{commands::PutType, wasm_runtime::ExecutorConfig};
 use clap::ValueEnum;
@@ -72,9 +76,9 @@ pub struct UpdateConfig {
     pub(crate) key: String,
     /// The ip address of freenet node to update the contract to. If the node is running in local mode,
     /// The default value is `127.0.0.1`
-    #[arg(short, long)]
-    pub(crate) address: Option<IpAddr>,
-    /// The port of freenet node to update the contract to.
+    #[arg(short, long, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
+    pub(crate) address: IpAddr,
+    /// The port of the running local freenet node.
     #[arg(short, long, default_value = "50509")]
     pub(crate) port: u16,
     /// A path to the update/delta being pushed to the contract.
@@ -95,10 +99,10 @@ pub struct PutConfig {
 
     /// The ip address of freenet node to publish the contract to. If the node is running in local mode,
     /// The default value is `127.0.0.1`.
-    #[arg(short, long)]
-    pub(crate) address: Option<IpAddr>,
+    #[arg(short, long, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
+    pub(crate) address: IpAddr,
 
-    /// The port of freenet node to publish the contract to.
+    /// The port of the running local freenet node.
     #[arg(short, long, default_value = "50509")]
     pub(crate) port: u16,
 
