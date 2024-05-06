@@ -9,6 +9,7 @@ use freenet_stdlib::{
     },
 };
 use names::Generator;
+use rand::RngCore;
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Ping {
@@ -48,7 +49,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     })?;
     let mut client = WebApi::start(stream);
     // put contract first
-    let params = Parameters::from(vec![]);
+    // Generate a random parameters so that we can add multiple ping contracts to the host.
+    let params = {
+      let mut data = [0u8; 32];
+      rand::thread_rng().fill_bytes(&mut data);
+      Parameters::from(data.to_vec())
+    };
     let container = ContractContainer::try_from((PING_CODE.to_vec(), &params))?;
     let contract_key = container.key();
     client

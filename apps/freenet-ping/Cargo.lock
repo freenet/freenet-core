@@ -411,6 +411,7 @@ dependencies = [
  "freenet-stdlib",
  "futures",
  "names",
+ "rand",
  "serde",
  "serde_json",
  "tokio",
