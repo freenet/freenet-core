@@ -4,14 +4,13 @@ use clap::Parser;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::{
-        ContractContainer, ContractKey, Parameters, RelatedContracts, StateDelta, UpdateData,
+        ContractContainer, Parameters, RelatedContracts, StateDelta, UpdateData,
         WrappedState,
     },
 };
 use names::Generator;
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-#[serde(transparent)]
 struct Ping {
     from: HashSet<String>,
 }
@@ -32,13 +31,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         .with_level(true)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_max_level(args.log_level)
+        .with_line_number(true)
         .init();
 
     const PING_CODE: &[u8] =
         include_bytes!("../../contracts/ping/build/freenet/freenet_ping_contract");
 
     // create a websocket connection to host.
-    let uri = format!("ws://{}/contract/command?encodingProtocol=native", args.host);
+    let uri = format!(
+        "ws://{}/contract/command?encodingProtocol=native",
+        args.host
+    );
     let (stream, _resp) = tokio_tungstenite::connect_async(&uri).await.map_err(|e| {
         tracing::error!(err=%e);
         e
@@ -46,9 +49,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     let mut client = WebApi::start(stream);
     // put contract first
     let params = Parameters::from(vec![]);
+    let container = ContractContainer::try_from((PING_CODE.to_vec(), &params))?;
+    let contract_key = container.key();
     client
         .send(ClientRequest::ContractOp(ContractRequest::Put {
-            contract: ContractContainer::try_from((PING_CODE.to_vec(), &params))?,
+            contract: container,
+            // state: WrappedState::new(serde_json::to_vec(&Ping::default()).unwrap()),
             state: WrappedState::new(vec![]),
             related_contracts: RelatedContracts::new(),
         }))
@@ -56,8 +62,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
 
     let mut send_tick = tokio::time::interval(Duration::from_secs(1));
     let mut fetch_tick = tokio::time::interval(Duration::from_secs_f64(1.5));
-    let mut contract_key: Option<ContractKey> = None;
-
     let mut local_state = Ping::default();
 
     let mut generator = Generator::default();
@@ -67,20 +71,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
             let name = generator.next().unwrap();
 
             local_state.from.insert(name.clone());
-            if let Some(contract_key) = contract_key.as_ref() {
-              if let Err(e) = client.send(ClientRequest::ContractOp(ContractRequest::Update {
-                key: contract_key.clone(),
-                data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&HashSet::from([name])).unwrap())),
-              })).await {
-                tracing::error!(err=%e);
-              }
+            let mut ping = Ping::default();
+            ping.from.insert(name.clone());
+            if let Err(e) = client.send(ClientRequest::ContractOp(ContractRequest::Update {
+              key: contract_key.clone(),
+              data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&ping).unwrap())),
+            })).await {
+              tracing::error!(err=%e, "failed to send update request");
             }
           },
           _ = fetch_tick.tick() => {
-            if let Some(contract_key) = contract_key.as_ref() {
-              if let Err(e) = client.send(ClientRequest::ContractOp(ContractRequest::Get { key: contract_key.clone(), fetch_contract: false })).await {
-                tracing::error!(err=%e);
-              }
+            if let Err(e) = client.send(ClientRequest::ContractOp(ContractRequest::Get { key: contract_key.clone(), fetch_contract: false })).await {
+              tracing::error!(err=%e);
             }
           },
           res = client.recv() => {
@@ -89,45 +91,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                 HostResponse::ContractResponse(resp) => {
                   match resp {
                     ContractResponse::GetResponse { key, contract: _, state } => {
-                      match contract_key.as_ref() {
-                        Some(k) if key.eq(k) => {
-                          let ping = match serde_json::from_slice::<Ping>(&state) {
+                      if contract_key.eq(&key) {
+                        let ping = if state.is_empty() {
+                          Ping::default()
+                        } else {
+                          match serde_json::from_slice::<Ping>(&state) {
                             Ok(p) => p,
                             Err(e) => {
-                              tracing::error!(%e);
+                              tracing::error!(err=%e);
                               continue;
                             },
-                          };
-
-                          for name in local_state.from.difference(&ping.from) {
-                            tracing::info!("Hello {}!", name);
                           }
-                        },
-                        _ => continue,
+                        };
+
+                        for name in local_state.from.difference(&ping.from) {
+                          tracing::info!("Hello {}!", name);
+                        }
                       }
                     },
                     ContractResponse::PutResponse { key } => {
-                      contract_key = Some(key);
+                      tracing::info!(key=%key, "Put ping contract successfully!");
                     },
                     ContractResponse::UpdateNotification { .. } => {},
                     ContractResponse::UpdateResponse { summary, key } => {
-                      match contract_key.as_ref() {
-                        Some(k) if key.eq(k) => {
-                          let ping = match serde_json::from_slice::<Ping>(&summary) {
-                            Ok(p) => p,
-                            Err(e) => {
-                              tracing::error!(%e);
-                              continue;
-                            },
-                          };
+                      tracing::info!(key=%key, data=?summary, "received update response!");
+                      let ping = match serde_json::from_slice::<Ping>(&summary) {
+                        Ok(p) => p,
+                        Err(e) => {
+                          tracing::error!(err=%e, "failed to deserialize summary");
+                          continue;
+                        },
+                      };
 
-                          for name in local_state.from.difference(&ping.from) {
-                            tracing::info!("Hello {}!", name);
-                          }
-                          local_state.from.extend(ping.from);
-                        }
-                        _ => continue,
+                      for name in local_state.from.difference(&ping.from) {
+                        tracing::info!("Hello {}!", name);
                       }
+                      local_state.from.extend(ping.from);
                     },
                     _ => {},
                   }
@@ -149,4 +148,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     }
     Ok(())
 }
-

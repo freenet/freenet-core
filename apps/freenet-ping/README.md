@@ -47,5 +47,5 @@ freenet local
 ## Run ping application
 
 ```bash
-cd web && cargo install --path . && freenet-ping
+cd app && cargo install --path . && freenet-ping
 ```
