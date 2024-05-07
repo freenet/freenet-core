@@ -41,10 +41,10 @@ impl ContractInterface for Contract {
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
         let mut ping = if state.is_empty() {
-            None
+            Ping::default()
         } else {
-            Some(serde_json::from_slice::<Ping>(state.as_ref())
-                .map_err(|e| ContractError::Deser(e.to_string()))?)
+            serde_json::from_slice::<Ping>(state.as_ref())
+                .map_err(|e| ContractError::Deser(e.to_string()))?
         };
 
         for ud in data {
@@ -55,10 +55,7 @@ impl ContractInterface for Contract {
                     }
                     let ping_state = serde_json::from_slice::<Ping>(&s)
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
-                    match ping {
-                        Some(ref mut p) => p.merge(ping_state),
-                        None => ping = Some(ping_state),
-                    }
+                    ping.merge(ping_state);
                 }
                 UpdateData::Delta(s) => {
                     if s.is_empty() {
@@ -66,28 +63,19 @@ impl ContractInterface for Contract {
                     }
                     let pd = serde_json::from_slice::<Ping>(&s)
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
-                    match ping {
-                        Some(ref mut p) => p.merge(pd),
-                        None => ping = Some(pd),
-                    }
+                    ping.merge(pd);
                 }
                 UpdateData::StateAndDelta { state, delta } => {
                     if !state.is_empty() {
                         let np = serde_json::from_slice::<Ping>(&state)
                             .map_err(|e| ContractError::Deser(e.to_string()))?;
-                        match ping {
-                            Some(ref mut p) => p.merge(np),
-                            None => ping = Some(np),
-                        }
+                        ping.merge(np);
                     }
 
                     if !delta.is_empty() {
                         let pd = serde_json::from_slice::<Ping>(&delta)
                             .map_err(|e| ContractError::Deser(e.to_string()))?;
-                        match ping {
-                            Some(ref mut p) => p.merge(pd),
-                            None => ping = Some(pd),
-                        }
+                        ping.merge(pd);
                     }
                 }
                 _ => return Err(ContractError::InvalidUpdate),
@@ -116,37 +104,23 @@ impl ContractInterface for Contract {
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
-        let ping = if state.is_empty() {
-            None
+        let mut ping = if state.is_empty() {
+            Ping::default()
         } else {
-            Some(serde_json::from_slice::<Ping>(state.as_ref())
-                .map_err(|e| ContractError::Deser(e.to_string()))?)
+            serde_json::from_slice::<Ping>(state.as_ref())
+                .map_err(|e| ContractError::Deser(e.to_string()))?
         };
         let ping_summary = if summary.is_empty() {
-            None
+            Ping::default()
         } else {
-            Some(serde_json::from_slice::<Ping>(summary.as_ref())
-                .map_err(|e| ContractError::Deser(e.to_string()))?)
+            serde_json::from_slice::<Ping>(summary.as_ref())
+                .map_err(|e| ContractError::Deser(e.to_string()))?
         };
 
-        match (ping, ping_summary) {
-            (None, None) => Ok(StateDelta::from(vec![])),
-            (Some(ping), None) => {
-                Ok(StateDelta::from(
-                    serde_json::to_vec(&ping).map_err(|e| ContractError::Other(e.to_string()))?,
-                ))
-            }
-            (None, Some(ping_summary)) => {
-                Ok(StateDelta::from(
-                    serde_json::to_vec(&ping_summary).map_err(|e| ContractError::Other(e.to_string()))?,
-                ))
-            }
-            (Some(mut p1), Some(p2)) => {
-                p1.merge(p2);
-                Ok(StateDelta::from(
-                    serde_json::to_vec(&p1).map_err(|e| ContractError::Other(e.to_string()))?,
-                ))
-            }
-        }
+        ping.merge(ping_summary);
+        
+        Ok(StateDelta::from(
+            serde_json::to_vec(&ping).map_err(|e| ContractError::Other(e.to_string()))?,
+        ))
     }
 }

@@ -410,6 +410,7 @@ dependencies = [
 name = "freenet-ping"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "freenet-ping-types",
  "freenet-stdlib",

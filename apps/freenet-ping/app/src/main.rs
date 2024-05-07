@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use chrono::Utc;
 use clap::Parser;
 use freenet_ping_types::Ping;
 use freenet_stdlib::{
@@ -65,8 +66,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         tokio::select! {
           _ = send_tick.tick() => {
             let name = generator.next().unwrap();
-
-            local_state.insert(name.clone());
             let mut ping = Ping::default();
             ping.insert(name.clone());
             if let Err(e) = client.send(ClientRequest::ContractOp(ContractRequest::Update {
@@ -87,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                 HostResponse::ContractResponse(resp) => {
                   match resp {
                     ContractResponse::GetResponse { key, contract: _, state } => {
+                      
                       if contract_key.eq(&key) {
                         let ping = if state.is_empty() {
                           Ping::default()
@@ -100,34 +100,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                           }
                         };
 
-                        if !ping.is_expired() {
-                          for name in local_state.difference(&ping) {
+                        for (name, created) in ping.iter() { 
+                          if !local_state.contains_key(name) && (*created + chrono::Duration::hours(1) > Utc::now()) {
                             tracing::info!("Hello, {}!", name);
                           }
                         }
+
+                        local_state.merge(ping);
                       }
                     },
                     ContractResponse::PutResponse { key } => {
-                      tracing::info!(key=%key, "Put ping contract successfully!");
-                    },
-                    ContractResponse::UpdateNotification { .. } => {},
-                    ContractResponse::UpdateResponse { summary, key } => {
-                      if contract_key.eq(&key) && !summary.is_empty() {
-                        let ping = match serde_json::from_slice::<Ping>(&summary) {
-                          Ok(p) => p,
-                          Err(e) => {
-                            tracing::error!(err=%e, "failed to deserialize summary");
-                            continue;
-                          },
-                        };
-  
-                        if !ping.is_expired() {
-                          for name in local_state.difference(&ping) {
-                            tracing::info!("Hello, {}!", name);
-                          }
-                          local_state.merge(ping);
-                        }
-                      }
+                      tracing::info!(key=%key, "put ping contract successfully!");
                     },
                     _ => {},
                   }
@@ -142,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
             }
           }
           _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Shutting down...");
+            tracing::info!("shutting down...");
             break;
           }
         }

@@ -1,27 +1,16 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
 pub use chrono;
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Ping {
-    from: HashSet<String>,
-    timestamp: DateTime<Utc>,
-}
-
-#[cfg(feature = "std")]
-impl Default for Ping {
-    fn default() -> Self {
-        Self {
-            from: HashSet::new(),
-            timestamp: Utc::now(),
-        }
-    }
+    from: HashMap<String, DateTime<Utc>>,
 }
 
 impl core::ops::Deref for Ping {
-    type Target = HashSet<String>;
+    type Target = HashMap<String, DateTime<Utc>>;
 
     fn deref(&self) -> &Self::Target {
         &self.from
@@ -35,30 +24,16 @@ impl core::ops::DerefMut for Ping {
 }
 
 impl Ping {
-    #[cfg(feature = "std")]
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn timestamp(&self) -> DateTime<Utc> {
-        self.timestamp
-    }
-
     #[cfg(feature = "std")]
-    pub fn is_expired(&self) -> bool {
-        self.timestamp + chrono::Duration::hours(1) < Utc::now()
+    pub fn insert(&mut self, name: String) {
+        self.from.insert(name, Utc::now());
     }
 
     pub fn merge(&mut self, other: Self) {
         self.from.extend(other.from);
-        #[cfg(feature = "std")]
-        {
-            self.timestamp = Utc::now();
-        }
-
-        #[cfg(not(feature = "std"))]
-        {
-            self.timestamp = other.timestamp;
-        }
     }
 }
