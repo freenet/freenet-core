@@ -1,23 +1,17 @@
-use std::{fs::File, io::Read, path::PathBuf};
-
-use freenet::dev_tool::{
-    ClientId, ContractStore, DelegateStore, Executor, OperationMode, SecretsStore, StateStore,
-    Storage,
+use std::{
+    fs::File,
+    io::Read,
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
 };
+
+use freenet::dev_tool::OperationMode;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, DelegateRequest},
+    client_api::{ClientRequest, ContractRequest, DelegateRequest, WebApi},
     prelude::*,
 };
-// use freenet_runtime::{
-//     ContractContainer, ContractInstanceId, ContractStore, DelegateContainer, DelegateStore,
-//     Parameters, SecretsStore, StateStore,
-// };
 
 use crate::config::{BaseConfig, PutConfig, UpdateConfig};
-
-const MAX_MEM_CACHE: u32 = 10_000_000;
-const DEFAULT_MAX_CONTRACT_SIZE: i64 = 50 * 1024 * 1024;
-const DEFAULT_MAX_DELEGATE_SIZE: i64 = 50 * 1024 * 1024;
 
 #[derive(Debug, Clone, clap::Subcommand)]
 pub(crate) enum PutType {
@@ -34,7 +28,7 @@ pub(crate) struct PutContract {
     pub(crate) related_contracts: Option<PathBuf>,
     /// A path to the initial state for the contract being published.
     #[arg(long)]
-    pub(crate) state: PathBuf,
+    pub(crate) state: Option<PathBuf>,
 }
 
 #[derive(clap::Parser, Clone, Debug)]
@@ -71,10 +65,13 @@ async fn put_contract(
     params: Parameters<'static>,
 ) -> Result<(), anyhow::Error> {
     let contract = ContractContainer::try_from((config.code.as_path(), params))?;
-    let state = {
+    let state = if let Some(ref state_path) = contract_config.state {
         let mut buf = vec![];
-        File::open(&contract_config.state)?.read_to_end(&mut buf)?;
+        File::open(state_path)?.read_to_end(&mut buf)?;
         buf.into()
+    } else {
+        tracing::warn!("no state provided for contract, if your contract cannot handle empty state correctly, this will always cause an error.");
+        vec![].into()
     };
     let related_contracts = if let Some(_related) = &contract_config.related_contracts {
         todo!("use `related` contracts")
@@ -89,7 +86,7 @@ async fn put_contract(
         related_contracts,
     }
     .into();
-    execute_command(request, other).await
+    execute_command(request, other, config.address, config.port).await
 }
 
 async fn put_delegate(
@@ -128,7 +125,7 @@ For additional hardening is recommended to use a different cipher and nonce to e
         nonce,
     }
     .into();
-    execute_command(request, other).await
+    execute_command(request, other, config.address, config.port).await
 }
 
 pub async fn update(config: UpdateConfig, other: BaseConfig) -> Result<(), anyhow::Error> {
@@ -143,32 +140,41 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> Result<(), anyho
         StateDelta::from(buf).into()
     };
     let request = ContractRequest::Update { key, data }.into();
-    execute_command(request, other).await
+    execute_command(request, other, config.address, config.port).await
 }
 
 async fn execute_command(
     request: ClientRequest<'static>,
     other: BaseConfig,
+    address: IpAddr,
+    port: u16,
 ) -> Result<(), anyhow::Error> {
     let mode = other.mode;
-    let paths = other.paths.build()?;
-    let contract_store = ContractStore::new(paths.contracts_dir(mode), DEFAULT_MAX_CONTRACT_SIZE)?;
-    let delegate_store = DelegateStore::new(paths.delegates_dir(mode), DEFAULT_MAX_DELEGATE_SIZE)?;
-    let secret_store = SecretsStore::new(paths.secrets_dir(mode))?;
-    let state_store = StateStore::new(Storage::new(&paths.db_dir(mode)).await?, MAX_MEM_CACHE)?;
-    let rt =
-        freenet::dev_tool::Runtime::build(contract_store, delegate_store, secret_store, false)?;
-    let mut executor = Executor::new(state_store, || Ok(()), OperationMode::Local, rt, None)
-        .await
-        .map_err(|err| anyhow::anyhow!(err))?;
 
-    executor
-        .handle_request(ClientId::FIRST, request, None)
-        .await
-        .map_err(|err| {
-            tracing::error!("{err}");
-            err
-        })?;
+    let target = match mode {
+        OperationMode::Local => {
+            if !address.is_loopback() {
+                return Err(anyhow::anyhow!(
+                    "invalid ip: {address}, expecting a loopback ip address in local mode"
+                ));
+            }
+            SocketAddr::new(address, port)
+        }
+        OperationMode::Network => SocketAddr::new(address, port),
+    };
 
-    Ok(())
+    let (stream, _) = tokio_tungstenite::connect_async(&format!(
+        "ws://{}/contract/command?encodingProtocol=native",
+        target
+    ))
+    .await
+    .map_err(|e| {
+        tracing::error!(err=%e);
+        anyhow::anyhow!(format!("fail to connect to the host({target}): {e}"))
+    })?;
+
+    WebApi::start(stream)
+        .send(request)
+        .await
+        .map_err(Into::into)
 }

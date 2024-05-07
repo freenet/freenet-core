@@ -9,7 +9,9 @@ use std::{
 use either::Either;
 use freenet::dev_tool::{ClientEventsProxy, ClientId, OpenRequest};
 use freenet_stdlib::{
-    client_api::{ClientError, ClientRequest, ContractRequest, ErrorKind, HostResponse},
+    client_api::{
+        ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse,
+    },
     prelude::*,
 };
 use futures::future::BoxFuture;
@@ -62,6 +64,7 @@ struct StdInput {
 
 impl StdInput {
     fn new(config: ExecutorConfig, app_state: AppState) -> Result<Self, anyhow::Error> {
+        let paths = config.paths.clone().build()?;
         let params = config
             .params
             .as_ref()
@@ -73,7 +76,6 @@ impl StdInput {
             })
             .transpose()?
             .unwrap_or_default();
-        let paths = config.paths.clone().build()?;
         let (contract_code, _ver) =
             ContractCode::load_versioned_from_path(&paths.contracts_dir(config.mode))?;
         let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
@@ -311,25 +313,40 @@ impl ClientEventsProxy for StdInput {
                             ));
                         }
                         Ok(Command::GetParams) => {
-                            let node = &*self.app_state.local_node.read().await;
+                            let node = &mut *self.app_state.local_node.write().await;
                             let key = self.contract.key();
-                            let p = node
-                                .state_store
-                                .get_params(&key)
-                                .await
-                                .map_err(|e| {
-                                    ClientError::from(ErrorKind::Unhandled {
-                                        cause: format!("{e}").into(),
-                                    })
-                                })?
-                                .ok_or_else(|| {
-                                    ClientError::from(ErrorKind::Unhandled {
-                                        cause: format!("missing contract parameters: {key}",)
-                                            .into(),
-                                    })
-                                })?;
-                            if let Err(e) = self.app_state.printout_deser(&p) {
-                                tracing::error!("error printing params: {e}");
+                            node.send(ClientRequest::ContractOp(ContractRequest::Get {
+                                key,
+                                fetch_contract: true,
+                            }))
+                            .await
+                            .map_err(|e| {
+                                ClientError::from(ErrorKind::Unhandled {
+                                    cause: format!("{e}").into(),
+                                })
+                            })?;
+                            let resp = node.recv().await.map_err(|e| {
+                                ClientError::from(ErrorKind::Unhandled {
+                                    cause: format!("{e}").into(),
+                                })
+                            })?;
+
+                            if let HostResponse::ContractResponse(ContractResponse::GetResponse {
+                                contract,
+                                ..
+                            }) = resp
+                            {
+                                if let Some(contract) = contract {
+                                    if let Err(e) =
+                                        self.app_state.printout_deser(&contract.params())
+                                    {
+                                        tracing::error!("error printing params: {e}");
+                                    }
+                                } else {
+                                    return Err(ClientError::from(ErrorKind::Unhandled {
+                                        cause: "missing contract container".into(),
+                                    }));
+                                }
                             }
                         }
                         Ok(cmd) => {
