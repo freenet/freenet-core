@@ -4,18 +4,16 @@ use std::{
     io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
-    pin::Pin,
     str::FromStr,
     sync::atomic::AtomicBool,
     time::Duration,
 };
 
 use directories::ProjectDirs;
-use libp2p::{identity, PeerId};
 use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
 
-use crate::local_node::OperationMode;
+use crate::{local_node::OperationMode, transport::TransportKeypair};
 
 /// Default maximum number of connections for the peer.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 20;
@@ -31,12 +29,10 @@ pub const DEFAULT_RANDOM_PEER_CONN_THRESHOLD: usize = 7;
 /// Default maximum number of hops to live for any operation
 /// (if it applies, e.g. connect requests).
 pub const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
-const DEFAULT_BOOTSTRAP_PORT: u16 = 7800;
 const DEFAULT_WEBSOCKET_API_PORT: u16 = 55008;
 
 static CONFIG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
 
-pub(crate) const PEER_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const OPERATION_TTL: Duration = Duration::from_secs(60);
 
 // Initialize the executor once.
@@ -47,10 +43,7 @@ const ORGANIZATION: &str = "The Freenet Project Inc";
 const APPLICATION: &str = "Freenet";
 
 pub struct Config {
-    pub bootstrap_ip: IpAddr,
-    pub bootstrap_port: u16,
-    pub bootstrap_id: Option<PeerId>,
-    pub local_peer_keypair: identity::Keypair,
+    pub transport_keypair: TransportKeypair,
     pub log_level: tracing::log::LevelFilter,
     config_paths: ConfigPaths,
     local_mode: AtomicBool,
@@ -221,12 +214,13 @@ impl Config {
         })
     }
 
-    fn load_conf() -> std::io::Result<Config> {
+    fn load_conf() -> anyhow::Result<Config> {
         let settings: config::Config = config::Config::builder()
             .add_source(config::Environment::with_prefix("FREENET"))
             .build()
             .unwrap();
-        let local_peer_keypair = if let Ok(path_to_key) = settings
+
+        let transport_keypair: Option<TransportKeypair> = if let Ok(path_to_key) = settings
             .get_string("local_peer_key_file")
             .map(PathBuf::from)
         {
@@ -238,20 +232,17 @@ impl Config {
             });
             let mut buf = Vec::new();
             key_file.read_to_end(&mut buf).unwrap();
-            Some(
-                identity::Keypair::from_protobuf_encoding(&buf)
-                    .map_err(|_| std::io::ErrorKind::InvalidData)?,
-            )
+            todo!("get an rsa private key from the file and create a TransportKeypair")
         } else {
             None
         };
+
         let log_level = settings
             .get_string("log")
             .map(|lvl| lvl.parse().ok())
             .ok()
             .flatten()
             .unwrap_or(tracing::log::LevelFilter::Info);
-        let (bootstrap_ip, bootstrap_port, bootstrap_id) = Config::get_bootstrap_host(&settings)?;
 
         let data_dir = settings.get_string("data_dir").ok().map(PathBuf::from);
         let config_paths = ConfigPaths::new(data_dir)?;
@@ -259,47 +250,13 @@ impl Config {
         let local_mode = settings.get_string("network_mode").is_err();
 
         Ok(Config {
-            bootstrap_ip,
-            bootstrap_port,
-            bootstrap_id,
-            local_peer_keypair: local_peer_keypair
-                .unwrap_or_else(identity::Keypair::generate_ed25519),
+            transport_keypair: transport_keypair.unwrap_or_else(|| TransportKeypair::new()),
             log_level,
             config_paths,
             local_mode: AtomicBool::new(local_mode),
             #[cfg(feature = "websocket")]
             ws: WebSocketApiConfig::from_config(&settings),
         })
-    }
-
-    fn get_bootstrap_host(
-        settings: &config::Config,
-    ) -> std::io::Result<(IpAddr, u16, Option<PeerId>)> {
-        let bootstrap_ip = IpAddr::from_str(
-            &settings
-                .get_string("bootstrap_host")
-                .unwrap_or_else(|_| format!("{}", Ipv4Addr::LOCALHOST)),
-        )
-        .map_err(|_err| std::io::ErrorKind::InvalidInput)?;
-
-        let bootstrap_port = settings
-            .get_int("bootstrap_port")
-            .ok()
-            .map(u16::try_from)
-            .unwrap_or(Ok(DEFAULT_BOOTSTRAP_PORT))
-            .map_err(|_err| std::io::ErrorKind::InvalidInput)?;
-
-        let id_str = if let Some(id_str) = settings
-            .get_string("bootstrap_id")
-            .ok()
-            .map(|id| id.parse().map_err(|_err| std::io::ErrorKind::InvalidInput))
-        {
-            Some(id_str?)
-        } else {
-            None
-        };
-
-        Ok((bootstrap_ip, bootstrap_port, id_str))
     }
 }
 
@@ -332,12 +289,6 @@ impl GlobalExecutor {
         } else {
             unreachable!("the executor must have been initialized")
         }
-    }
-}
-
-impl libp2p::swarm::Executor for GlobalExecutor {
-    fn exec(&self, future: Pin<Box<dyn Future<Output = ()> + 'static + Send>>) {
-        GlobalExecutor::spawn(future);
     }
 }
 

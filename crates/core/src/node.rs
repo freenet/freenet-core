@@ -8,12 +8,12 @@
 //! - in-memory: a simplifying node used for emulation purposes mainly.
 //! - inter-process: similar to in-memory, but can be rana cross multiple processes, closer to the real p2p impl
 
+use std::net::SocketAddr;
 use std::{
     fmt::Display,
     io::Write,
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
-    str::FromStr,
     sync::Arc,
     time::Duration,
 };
@@ -23,15 +23,14 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ErrorKind},
     prelude::{ContractKey, RelatedContracts, WrappedState},
 };
-use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId as Libp2pPeerId};
 
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use self::p2p_impl::NodeP2P;
+use crate::message::{MessageStats, NetMessageV1};
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
-    config::Config,
     config::GlobalExecutor,
     contract::{
         Callback, ClientResponsesReceiver, ClientResponsesSender, ContractError,
@@ -53,6 +52,7 @@ pub use network_bridge::inter_process::InterProcessConnManager;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
 
 use crate::topology::rate::Rate;
+use crate::transport::{TransportKeypair, TransportPublicKey};
 pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
 mod network_bridge;
@@ -72,7 +72,7 @@ pub struct PeerCliConfig {
     #[arg(long, short, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
     pub address: IpAddr,
 
-    /// Port to expose api on
+    /// Port to expose the websocket API on
     #[arg(long, short, default_value_t = 50509)]
     pub port: u16,
 }
@@ -98,16 +98,20 @@ impl Node {
 /// be listening but also try to connect to an existing peer.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NodeConfig {
-    /// public identifier for the peer
-    pub peer_id: PeerId,
+    /// Determines if an initial connection should be attempted.
+    /// Only true for an initial gateway/node. If false, the gateway will be disconnected unless other peers connect through it.
+    pub should_connect: bool,
+    pub is_gateway: bool,
+    /// If not specified, a key is generated and used when creating the node.
+    pub key_pair: Option<TransportKeypair>,
     // optional local info, in case this is an initial bootstrap node
-    /// IP to bind to the listener
+    /// IP to bind to the network listener.
     pub local_ip: Option<IpAddr>,
-    /// socket port to bind to the listener
+    /// socket port to bind to the network listener.
     pub local_port: Option<u16>,
-    /// IP dialers should connect to
+    /// IP dialers should connect to, only set on gateways
     pub(crate) public_ip: Option<IpAddr>,
-    /// socket port dialers should connect to
+    /// socket port dialers should connect to, only set on gateways
     pub(crate) public_port: Option<u16>,
     /// At least an other running listener node is required for joining the network.
     /// Not necessary if this is an initial node.
@@ -124,9 +128,10 @@ pub struct NodeConfig {
 
 impl NodeConfig {
     pub fn new() -> NodeConfig {
-        let local_key = Config::conf().local_peer_keypair.public().into();
         NodeConfig {
-            peer_id: local_key,
+            should_connect: true,
+            is_gateway: false,
+            key_pair: None,
             remote_nodes: Vec::with_capacity(1),
             local_ip: None,
             local_port: None,
@@ -140,6 +145,25 @@ impl NodeConfig {
             max_upstream_bandwidth: None,
             max_downstream_bandwidth: None,
         }
+    }
+
+    pub fn is_gateway(&mut self) -> &mut Self {
+        self.is_gateway = true;
+        self
+    }
+
+    pub fn first_gateway(&mut self) {
+        self.should_connect = false;
+    }
+
+    pub fn with_key_pair(&mut self, key_pair: TransportKeypair) -> &mut Self {
+        self.key_pair = Some(key_pair);
+        self
+    }
+
+    pub fn with_should_connect(&mut self, should_connect: bool) -> &mut Self {
+        self.should_connect = should_connect;
+        self
     }
 
     pub fn max_hops_to_live(&mut self, num_hops: usize) -> &mut Self {
@@ -172,13 +196,6 @@ impl NodeConfig {
         self
     }
 
-    /// Optional identity key of this node.
-    /// If not provided it will be either obtained from the configuration or freshly generated.
-    pub fn with_key(&mut self, key: PeerId) -> &mut Self {
-        self.peer_id = key;
-        self
-    }
-
     pub fn with_location(&mut self, loc: Location) -> &mut Self {
         self.location = Some(loc);
         self
@@ -195,7 +212,7 @@ impl NodeConfig {
         self,
         config: PeerCliConfig,
         clients: [BoxedClient; CLIENTS],
-        private_key: identity::Keypair,
+        private_key: TransportKeypair,
     ) -> Result<Node, anyhow::Error> {
         let event_register = {
             #[cfg(feature = "trace-ot")]
@@ -224,33 +241,33 @@ impl NodeConfig {
         Ok(Node(node))
     }
 
-    pub fn is_gateway(&self) -> bool {
-        self.local_ip.is_some() && self.local_port.is_some() && self.location.is_some()
+    pub fn get_peer_id(&self) -> Option<PeerId> {
+        match (self.key_pair.as_ref(), self.local_ip, self.local_port) {
+            (Some(kp), Some(ip), Some(port)) => {
+                Some(PeerId::new(SocketAddr::new(ip, port), kp.public.clone()))
+            }
+            _ => None,
+        }
     }
 
     /// Returns all specified gateways for this peer. Returns an error if the peer is not a gateway
     /// and no gateways are specified.
     fn get_gateways(&self) -> Result<Vec<PeerKeyLocation>, anyhow::Error> {
-        let peer = self.peer_id;
-        let gateways: Vec<_> = self
+        let gateways: Vec<PeerKeyLocation> = self
             .remote_nodes
             .iter()
             .filter_map(|node| {
-                if node.addr.is_some() {
-                    Some(PeerKeyLocation {
-                        peer: node.identifier,
-                        location: Some(node.location),
-                    })
-                } else {
-                    None
-                }
+                Some(PeerKeyLocation {
+                    peer: node.peer_id.clone(),
+                    location: Some(node.location),
+                })
             })
-            .filter(|pkloc| pkloc.peer != peer)
             .collect();
+
         if (self.local_ip.is_none() || self.local_port.is_none()) && gateways.is_empty() {
             anyhow::bail!(
-                        "At least one remote gateway is required to join an existing network for non-gateway nodes."
-                    )
+            "At least one remote gateway is required to join an existing network for non-gateway nodes."
+        )
         } else {
             Ok(gateways)
         }
@@ -263,55 +280,16 @@ impl Default for NodeConfig {
     }
 }
 
-/// Gateway node to bootstrap the network.
+/// Gateway node to use for joining the network.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct InitPeerNode {
-    addr: Option<Multiaddr>,
-    identifier: PeerId,
+    peer_id: PeerId,
     location: Location,
 }
 
 impl InitPeerNode {
-    pub fn new(identifier: Libp2pPeerId, location: Location) -> Self {
-        Self {
-            addr: None,
-            identifier: PeerId(identifier),
-            location,
-        }
-    }
-
-    /// Given a byte array decode into a PeerId data type.
-    ///
-    /// # Panic
-    /// Will panic if is not a valid representation.
-    pub fn decode_peer_id<T: AsMut<[u8]>>(mut bytes: T) -> Libp2pPeerId {
-        Libp2pPeerId::from_public_key(
-            &identity::Keypair::from(
-                identity::ed25519::Keypair::try_from_bytes(bytes.as_mut()).unwrap(),
-            )
-            .public(),
-        )
-    }
-
-    /// IP which will be assigned to this node.
-    pub fn listening_ip<T: Into<IpAddr>>(mut self, ip: T) -> Self {
-        if let Some(addr) = &mut self.addr {
-            addr.push(Protocol::from(ip.into()));
-        } else {
-            self.addr = Some(Multiaddr::from(ip.into()));
-        }
-        self
-    }
-
-    /// TCP listening port (only required in case of using TCP as transport).
-    /// If not specified port 7800 will be used as default.
-    pub fn listening_port(mut self, port: u16) -> Self {
-        if let Some(addr) = &mut self.addr {
-            addr.push(Protocol::Tcp(port));
-        } else {
-            self.addr = Some(Multiaddr::from(Protocol::Tcp(port)));
-        }
-        self
+    pub fn new(peer_id: PeerId, location: Location) -> Self {
+        Self { peer_id, location }
     }
 }
 
@@ -377,9 +355,13 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                     contract,
                     related_contracts,
                 } => {
+                    let peer_id = op_manager
+                        .ring
+                        .get_peer_key()
+                        .expect("Peer id not found at put op, it should be set");
                     // Initialize a put op.
                     tracing::debug!(
-                        this_peer = %op_manager.ring.peer_key,
+                        this_peer = %peer_id,
                         "Received put from user event",
                     );
                     let op = put::start_op(
@@ -397,9 +379,12 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                     }
                 }
                 ContractRequest::Update { key, data } => {
-                    // FIXME: perform updates
+                    let peer_id = op_manager
+                        .ring
+                        .get_peer_key()
+                        .expect("Peer id not found at update op, it should be set");
                     tracing::debug!(
-                        this_peer = %op_manager.ring.peer_key,
+                        this_peer = %peer_id,
                         "Received update from user event",
                     );
                     let state = match data {
@@ -428,9 +413,13 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                     key,
                     fetch_contract: contract,
                 } => {
+                    let peer_id = op_manager
+                        .ring
+                        .get_peer_key()
+                        .expect("Peer id not found at get op, it should be set");
                     // Initialize a get op.
                     tracing::debug!(
-                        this_peer = %op_manager.ring.peer_key,
+                        this_peer = %peer_id,
                         "Received get from user event",
                     );
                     let op = get::start_op(key, contract);
@@ -497,7 +486,7 @@ async fn report_result(
                     payload_transfer_time,
                 } => {
                     let event = RouteEvent {
-                        peer: *target_peer,
+                        peer: target_peer.clone(),
                         contract_location,
                         outcome: RouteOutcome::Success {
                             time_to_response_start: first_response_time,
@@ -531,7 +520,9 @@ async fn report_result(
                 cb.response(op_res).await;
             }
         }
-        Ok(None) => {}
+        Ok(None) => {
+            tracing::debug!(?tx, "No operation result found, not sending response");
+        }
         Err(err) => {
             // just mark the operation as completed so no redundant messages are processed for this transaction anymore
             if let Some(tx) = tx {
@@ -554,7 +545,7 @@ async fn report_result(
                         second_trace_lines.join("\n")
                     })
                     .unwrap_or_default();
-                let peer = &op_manager.ring.peer_key;
+                let peer = &op_manager.ring.get_peer_key().expect("Peer key not found");
                 let log = format!(
                     "Transaction ({tx} @ {peer}) error trace:\n {trace} \nstate:\n {state:?}\n"
                 );
@@ -573,10 +564,14 @@ macro_rules! handle_op_not_available {
         if let Err(OpError::OpNotAvailable(state)) = &$op_result {
             match state {
                 OpNotAvailable::Running => {
+                    tracing::debug!("Operation still running");
                     tokio::time::sleep(Duration::from_micros(1_000)).await;
                     continue;
                 }
-                OpNotAvailable::Completed => return,
+                OpNotAvailable::Completed => {
+                    tracing::debug!("Operation already completed");
+                    return;
+                }
             }
         }
     };
@@ -584,6 +579,36 @@ macro_rules! handle_op_not_available {
 
 async fn process_message<CB>(
     msg: NetMessage,
+    op_manager: Arc<OpManager>,
+    conn_manager: CB,
+    event_listener: Box<dyn NetEventRegister>,
+    executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
+    client_req_handler_callback: Option<ClientResponsesSender>,
+    client_id: Option<ClientId>,
+) where
+    CB: NetworkBridge,
+{
+    let tx = Some(*msg.id());
+    match msg {
+        NetMessage::V1(msg_v1) => {
+            process_message_v1(
+                tx,
+                msg_v1,
+                op_manager,
+                conn_manager,
+                event_listener,
+                executor_callback,
+                client_req_handler_callback,
+                client_id,
+            )
+            .await
+        }
+    }
+}
+
+async fn process_message_v1<CB>(
+    tx: Option<Transaction>,
+    msg: NetMessageV1,
     op_manager: Arc<OpManager>,
     mut conn_manager: CB,
     mut event_listener: Box<dyn NetEventRegister>,
@@ -594,20 +619,40 @@ async fn process_message<CB>(
     CB: NetworkBridge,
 {
     let cli_req = client_id.zip(client_req_handler_callback);
-
-    let tx = Some(*msg.id());
     event_listener
-        .register_events(NetEventLog::from_inbound_msg(&msg, &op_manager))
+        .register_events(NetEventLog::from_inbound_msg_v1(&msg, &op_manager))
         .await;
-    loop {
-        match &msg {
-            NetMessage::Connect(op) => {
-                // log_handling_msg!("join", op.id(), op_manager);
+
+    for i in 0.. {
+        tracing::debug!(?tx, "Processing operation, iteration: {i}");
+        match msg {
+            NetMessageV1::Connect(ref op) => {
+                let parent_span = tracing::Span::current();
+                let span = tracing::info_span!(
+                    parent: parent_span,
+                    "handle_connect_op_request",
+                    peer = ?op_manager.ring.get_peer_key(),
+                    transaction = %msg.id(),
+                    tx_type = %msg.id().transaction_type()
+                );
                 let op_result =
                     handle_op_request::<connect::ConnectOp, _>(&op_manager, &mut conn_manager, op)
+                        .instrument(span)
                         .await;
                 handle_op_not_available!(op_result);
-                break report_result(
+                match &op_result {
+                    Ok(Some(OpEnum::Connect(op))) => {
+                        tracing::info!(?op, "Connect operation started");
+                    }
+                    Ok(None) => {
+                        tracing::info!("Connect operation not started");
+                    }
+                    Err(err) => {
+                        tracing::error!(%err, "Connect operation failed");
+                    }
+                    _ => {}
+                }
+                return report_result(
                     tx,
                     op_result,
                     &op_manager,
@@ -617,12 +662,11 @@ async fn process_message<CB>(
                 )
                 .await;
             }
-            NetMessage::Put(op) => {
-                // log_handling_msg!("put", *op.id(), op_manager);
+            NetMessageV1::Put(ref op) => {
                 let op_result =
                     handle_op_request::<put::PutOp, _>(&op_manager, &mut conn_manager, op).await;
                 handle_op_not_available!(op_result);
-                break report_result(
+                return report_result(
                     tx,
                     op_result,
                     &op_manager,
@@ -632,12 +676,11 @@ async fn process_message<CB>(
                 )
                 .await;
             }
-            NetMessage::Get(op) => {
-                // log_handling_msg!("get", op.id(), op_manager);
+            NetMessageV1::Get(ref op) => {
                 let op_result =
                     handle_op_request::<get::GetOp, _>(&op_manager, &mut conn_manager, op).await;
                 handle_op_not_available!(op_result);
-                break report_result(
+                return report_result(
                     tx,
                     op_result,
                     &op_manager,
@@ -647,8 +690,7 @@ async fn process_message<CB>(
                 )
                 .await;
             }
-            NetMessage::Subscribe(op) => {
-                // log_handling_msg!("subscribe", op.id(), op_manager);
+            NetMessageV1::Subscribe(ref op) => {
                 let op_result = handle_op_request::<subscribe::SubscribeOp, _>(
                     &op_manager,
                     &mut conn_manager,
@@ -656,7 +698,7 @@ async fn process_message<CB>(
                 )
                 .await;
                 handle_op_not_available!(op_result);
-                break report_result(
+                return report_result(
                     tx,
                     op_result,
                     &op_manager,
@@ -666,12 +708,12 @@ async fn process_message<CB>(
                 )
                 .await;
             }
-            NetMessage::Update(op) => {
+            NetMessageV1::Update(ref op) => {
                 let op_result =
                     handle_op_request::<update::UpdateOp, _>(&op_manager, &mut conn_manager, op)
                         .await;
                 handle_op_not_available!(op_result);
-                break report_result(
+                return report_result(
                     tx,
                     op_result,
                     &op_manager,
@@ -681,12 +723,11 @@ async fn process_message<CB>(
                 )
                 .await;
             }
-
-            NetMessage::Unsubscribed { key, .. } => {
+            NetMessageV1::Unsubscribed { ref key, .. } => {
                 subscribe(op_manager, key.clone(), None).await;
                 break;
             }
-            _ => break,
+            _ => break, // Exit the loop if no applicable message type is found
         }
     }
 }
@@ -753,7 +794,7 @@ async fn subscribe(op_manager: Arc<OpManager>, key: ContractKey, client_id: Opti
 
 async fn handle_aborted_op<CM>(
     tx: Transaction,
-    this_peer: PeerId,
+    this_peer_pub_key: TransportPublicKey,
     op_manager: &OpManager,
     conn_manager: &mut CM,
     gateways: &[PeerKeyLocation],
@@ -779,7 +820,7 @@ where
                     tracing::warn!("Retry connecting to gateway {}", gateway.peer);
                     connect::join_ring_request(
                         backoff,
-                        this_peer,
+                        this_peer_pub_key,
                         &gateway,
                         op_manager,
                         conn_manager,
@@ -789,17 +830,12 @@ where
             }
             Ok(Some(OpEnum::Connect(_))) => {
                 // if no connections were achieved just fail
-                if op_manager.ring.open_connections() == 0 {
+                if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
                     tracing::warn!("Retrying joining the ring with an other gateway");
-                    if let Some(gateway) = gateways
-                        .iter()
-                        .shuffle()
-                        .next()
-                        .filter(|p| p.peer != this_peer)
-                    {
+                    if let Some(gateway) = gateways.iter().shuffle().next() {
                         connect::join_ring_request(
                             None,
-                            this_peer,
+                            this_peer_pub_key,
                             gateway,
                             op_manager,
                             conn_manager,
@@ -814,30 +850,80 @@ where
     Ok(())
 }
 
-#[derive(PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
-pub struct PeerId(Libp2pPeerId);
+/*
+- Cuando es un gateway: se define desde el inicio del nodo
+- Cuando es un peer regular: se define en el momento de la conexión con el gateway
+*/
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone)]
+pub struct PeerId {
+    pub addr: SocketAddr,
+    pub pub_key: TransportPublicKey,
+}
+
+impl Ord for PeerId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.addr.cmp(&other.addr)
+    }
+}
+
+impl PartialOrd for PeerId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+// impl FromStr for PeerId {
+//     type Err = anyhow::Error;
+//     fn from_str(s: &str) -> Result<Self, Self::Err> {
+//         Ok(Self {
+//             addr: s.parse()?,
+//             pub_key: TransportKeypair::new().public,
+//         })
+//     }
+// }
+
+impl PeerId {
+    pub fn new(addr: SocketAddr, pub_key: TransportPublicKey) -> Self {
+        Self { addr, pub_key }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    pub fn pub_key(&self) -> &TransportPublicKey {
+        &self.pub_key
+    }
+}
 
 #[cfg(test)]
 impl<'a> arbitrary::Arbitrary<'a> for PeerId {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let data: [u8; 32] = u.arbitrary()?;
-        let id = Libp2pPeerId::from_multihash(
-            libp2p::multihash::Multihash::wrap(0, data.as_slice()).unwrap(),
-        )
-        .unwrap();
-        Ok(Self(id))
+        let addr: ([u8; 4], u16) = u.arbitrary()?;
+        let pub_key = TransportKeypair::new().public; // FIXME: impl arbitrary for TransportPublicKey
+        Ok(Self {
+            addr: addr.into(),
+            pub_key,
+        })
     }
 }
 
 impl PeerId {
     pub fn random() -> Self {
-        use libp2p::identity::Keypair;
-        PeerId::from(Keypair::generate_ed25519().public())
+        use rand::Rng;
+        let mut addr = [0; 4];
+        rand::thread_rng().fill(&mut addr[..]);
+        let port = crate::util::get_free_port().unwrap();
+        let pub_key = TransportKeypair::new().public;
+        Self {
+            addr: (addr, port).into(),
+            pub_key,
+        }
     }
 
     #[cfg(test)]
     pub fn to_bytes(self) -> Vec<u8> {
-        self.0.to_bytes()
+        bincode::serialize(&self).unwrap()
     }
 }
 
@@ -849,54 +935,6 @@ impl std::fmt::Debug for PeerId {
 
 impl Display for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<identity::PublicKey> for PeerId {
-    fn from(val: identity::PublicKey) -> Self {
-        PeerId(Libp2pPeerId::from(val))
-    }
-}
-
-impl From<Libp2pPeerId> for PeerId {
-    fn from(val: Libp2pPeerId) -> Self {
-        PeerId(val)
-    }
-}
-
-impl FromStr for PeerId {
-    type Err = libp2p_identity::ParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(Libp2pPeerId::from_str(s)?))
-    }
-}
-
-mod serialization {
-    use libp2p::PeerId as Libp2pPeerId;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    use super::PeerId;
-
-    impl Serialize for PeerId {
-        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
-        {
-            serializer.serialize_bytes(&self.0.to_bytes())
-        }
-    }
-
-    impl<'de> Deserialize<'de> for PeerId {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
-            Ok(PeerId(
-                Libp2pPeerId::from_bytes(&bytes).expect("failed deserialization of PeerKey"),
-            ))
-        }
+        write!(f, "{:?}", self.addr)
     }
 }
