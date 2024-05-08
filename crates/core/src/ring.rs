@@ -87,7 +87,7 @@ impl Display for PeerKeyLocation {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct Connection {
     location: PeerKeyLocation,
     open_at: Instant,
@@ -504,6 +504,7 @@ impl Ring {
     /// # Panic
     /// Will panic if the node checking for this condition has no location assigned.
     pub fn should_accept(&self, location: Location, peer: Option<&PeerId>) -> bool {
+        tracing::debug!("Checking if should accept connection");
         let open_conn = self
             .open_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -525,16 +526,21 @@ impl Ring {
         let accepted = if location == my_location
             || self.connections_by_location.read().contains_key(&location)
         {
+            tracing::debug!(
+                "Ring connections {:?}",
+                &*self.connections_by_location.read()
+            );
             false
         } else if open_conn < self.min_connections {
             true
         } else if open_conn >= self.max_connections {
             false
         } else {
+            tracing::debug!("Evaluating new connection");
             self.topology_manager
                 .write()
                 .evaluate_new_connection(location, Instant::now())
-                .unwrap_or(false)
+                .unwrap_or(true)
         };
         if !accepted {
             self.open_connections
@@ -914,6 +920,7 @@ impl Ring {
                 ideal_location,
                 joiner,
                 max_hops_to_live: missing_connections,
+                skip_list: skip_list.iter().map(|p| (*p).clone()).collect(),
             },
         };
         let id = *msg.id();
