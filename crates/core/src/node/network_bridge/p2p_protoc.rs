@@ -110,16 +110,6 @@ pub(in crate::node) struct P2pConnManager {
     is_gateway: bool,
 }
 
-impl Drop for P2pConnManager {
-    fn drop(&mut self) {
-        tracing::info!(
-            "This peer {:?} has active connections with peers: {:?}",
-            self.bridge.op_manager.ring.get_peer_key().unwrap(),
-            self.connection.keys().map(|p| &p.addr)
-        );
-    }
-}
-
 impl P2pConnManager {
     pub async fn build(
         config: &NodeConfig,
