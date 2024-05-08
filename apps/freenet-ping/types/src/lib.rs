@@ -78,3 +78,45 @@ impl Ping {
         self.from.retain(|_, v| now <= *v + ttl);
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_merge_expired() {
+        let mut ping = Ping::new();
+        ping.insert("Alice".to_string());
+        ping.insert("Bob".to_string());
+
+        let mut other = Ping::new();
+        other.from.insert("Alice".to_string(), Utc::now() - Duration::from_secs(6));
+        other.from.insert("Charlie".to_string(), Utc::now() - Duration::from_secs(6));
+
+        ping.merge(other, Duration::from_secs(5));
+
+        assert_eq!(ping.len(), 2);
+        assert!(ping.contains_key("Alice"));
+        assert!(ping.contains_key("Bob"));
+        assert!(!ping.contains_key("Charlie"));
+    }
+
+    #[test]
+    fn test_merge_ok() {
+        let mut ping = Ping::new();
+        ping.insert("Alice".to_string());
+        ping.insert("Bob".to_string());
+
+        let mut other = Ping::new();
+        other.from.insert("Alice".to_string(), Utc::now() - Duration::from_secs(4));
+        other.from.insert("Charlie".to_string(), Utc::now() - Duration::from_secs(4));
+
+        ping.merge(other, Duration::from_secs(5));
+
+        assert_eq!(ping.len(), 3);
+        assert!(ping.contains_key("Alice"));
+        assert!(ping.contains_key("Bob"));
+        assert!(ping.contains_key("Charlie"));
+    }
+}
