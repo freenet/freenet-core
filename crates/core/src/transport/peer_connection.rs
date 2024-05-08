@@ -116,8 +116,10 @@ impl PeerConnection {
             .await
             .unwrap();
         if data.len() + SymmetricMessage::short_message_overhead() > MAX_DATA_SIZE {
+            tracing::debug!("sending as stream");
             self.outbound_stream(data).await;
         } else {
+            tracing::debug!("sending as short message");
             self.outbound_short_message(data).await?;
         }
         Ok(())

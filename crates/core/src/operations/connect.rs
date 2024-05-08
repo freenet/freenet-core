@@ -142,6 +142,7 @@ impl Operation for ConnectOp {
                             ideal_location,
                             joiner,
                             max_hops_to_live,
+                            skip_list,
                         },
                     id,
                 } => {
@@ -153,6 +154,8 @@ impl Operation for ConnectOp {
                     else {
                         return Err(OpError::RingError(crate::ring::RingError::NoLocation));
                     };
+                    let mut skip_list = skip_list.clone();
+                    skip_list.push(query_target.peer.clone());
                     if this_peer == &query_target.peer {
                         // this peer should be the original target queries
                         tracing::debug!(
@@ -178,7 +181,7 @@ impl Operation for ConnectOp {
                                     joiner: joiner.clone(),
                                     hops_to_live: *max_hops_to_live,
                                     max_hops_to_live: *max_hops_to_live,
-                                    skip_list: vec![],
+                                    skip_list,
                                 },
                             };
                             network_bridge
@@ -215,6 +218,7 @@ impl Operation for ConnectOp {
                                 ideal_location: *ideal_location,
                                 joiner: joiner.clone(),
                                 max_hops_to_live: *max_hops_to_live,
+                                skip_list,
                             },
                         };
                         network_bridge.send(&query_target.peer, msg.into()).await?;
@@ -1043,7 +1047,7 @@ mod messages {
                 Self::Response {
                     msg: ConnectResponse::AcceptedBy { .. },
                     ..
-                } => write!(f, "RouteValue(id: {id})"),
+                } => write!(f, "AcceptedBy(id: {id})"),
                 Self::Connected { .. } => write!(f, "Connected(id: {id})"),
                 ConnectMsg::Request { id, .. } => write!(f, "Request(id: {id})"),
             }
@@ -1069,6 +1073,7 @@ mod messages {
             ideal_location: Location,
             joiner: PeerKeyLocation,
             max_hops_to_live: usize,
+            skip_list: Vec<PeerId>,
         },
         CheckConnectivity {
             sender: PeerKeyLocation,
