@@ -1,4 +1,4 @@
-use freenet_ping_types::Ping;
+use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::prelude::*;
 
 struct Contract;
@@ -36,10 +36,12 @@ impl ContractInterface for Contract {
     }
 
     fn update_state(
-        _parameters: Parameters<'static>,
+        parameters: Parameters<'static>,
         state: State<'static>,
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
+        let opts = serde_json::from_slice::<PingContractOptions>(parameters.as_ref())
+            .map_err(|e| ContractError::Deser(e.to_string()))?;
         let mut ping = if state.is_empty() {
             Ping::default()
         } else {
@@ -55,7 +57,7 @@ impl ContractInterface for Contract {
                     }
                     let ping_state = serde_json::from_slice::<Ping>(&s)
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
-                    ping.merge(ping_state);
+                    ping.merge(ping_state, opts.ttl);
                 }
                 UpdateData::Delta(s) => {
                     if s.is_empty() {
@@ -63,19 +65,19 @@ impl ContractInterface for Contract {
                     }
                     let pd = serde_json::from_slice::<Ping>(&s)
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
-                    ping.merge(pd);
+                    ping.merge(pd, opts.ttl);
                 }
                 UpdateData::StateAndDelta { state, delta } => {
                     if !state.is_empty() {
                         let np = serde_json::from_slice::<Ping>(&state)
                             .map_err(|e| ContractError::Deser(e.to_string()))?;
-                        ping.merge(np);
+                        ping.merge(np, opts.ttl);
                     }
 
                     if !delta.is_empty() {
                         let pd = serde_json::from_slice::<Ping>(&delta)
                             .map_err(|e| ContractError::Deser(e.to_string()))?;
-                        ping.merge(pd);
+                        ping.merge(pd, opts.ttl);
                     }
                 }
                 _ => return Err(ContractError::InvalidUpdate),
@@ -100,10 +102,13 @@ impl ContractInterface for Contract {
     }
 
     fn get_state_delta(
-        _parameters: Parameters<'static>,
+        parameters: Parameters<'static>,
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
+        let opts = serde_json::from_slice::<PingContractOptions>(parameters.as_ref())
+            .map_err(|e| ContractError::Deser(e.to_string()))?;
+
         let mut ping = if state.is_empty() {
             Ping::default()
         } else {
@@ -117,8 +122,8 @@ impl ContractInterface for Contract {
                 .map_err(|e| ContractError::Deser(e.to_string()))?
         };
 
-        ping.merge(ping_summary);
-        
+        ping.merge(ping_summary, opts.ttl);
+
         Ok(StateDelta::from(
             serde_json::to_vec(&ping).map_err(|e| ContractError::Other(e.to_string()))?,
         ))

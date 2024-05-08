@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use clap::Parser;
-use freenet_ping_types::Ping;
+use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::{
@@ -17,8 +17,8 @@ struct Args {
     host: String,
     #[clap(long, default_value = "info")]
     log_level: tracing::level_filters::LevelFilter,
-    #[clap(short, long, default_value = "freenet-ping")]
-    parameters: String,
+    #[clap(flatten)]
+    parameters: PingContractOptions,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -45,21 +45,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         e
     })?;
     let mut client = WebApi::start(stream);
-    // put contract first
-    let params = Parameters::from(args.parameters.into_bytes());
+
+    let params = Parameters::from(serde_json::to_vec(&args.parameters).unwrap());
     let container = ContractContainer::try_from((PING_CODE.to_vec(), &params))?;
     let contract_key = container.key();
+
+    // try to fetch the old state from the host.
     client
-        .send(ClientRequest::ContractOp(ContractRequest::Put {
-            contract: container,
-            state: WrappedState::new(vec![]),
-            related_contracts: RelatedContracts::new(),
+        .send(ClientRequest::ContractOp(ContractRequest::Get {
+            key: contract_key.clone(),
+            fetch_contract: false,
         }))
         .await?;
 
+    let resp = client.recv().await;
+
+    let mut local_state = match resp {
+        Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+            key,
+            contract: _,
+            state,
+        })) => {
+            if contract_key != key || state.is_empty() {
+                client
+                    .send(ClientRequest::ContractOp(ContractRequest::Put {
+                        contract: container,
+                        state: WrappedState::new(vec![]),
+                        related_contracts: RelatedContracts::new(),
+                    }))
+                    .await?;
+                Ping::default()
+            } else {
+                let old_ping = serde_json::from_slice::<Ping>(&state)?;
+                let mut ping = Ping::default();
+                ping.merge(old_ping, args.parameters.ttl);
+
+                for name in ping.keys() {
+                    tracing::info!("Hello, {}!", name);
+                }
+
+                ping
+            }
+        }
+        _ => {
+            client
+                .send(ClientRequest::ContractOp(ContractRequest::Put {
+                    contract: container,
+                    state: WrappedState::new(vec![]),
+                    related_contracts: RelatedContracts::new(),
+                }))
+                .await?;
+            Ping::default()
+        }
+    };
+
     let mut send_tick = tokio::time::interval(Duration::from_secs(1));
     let mut fetch_tick = tokio::time::interval(Duration::from_secs_f64(1.5));
-    let mut local_state = Ping::default();
 
     let mut generator = Generator::default();
     loop {
@@ -86,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                 HostResponse::ContractResponse(resp) => {
                   match resp {
                     ContractResponse::GetResponse { key, contract: _, state } => {
-                      
+
                       if contract_key.eq(&key) {
                         let ping = if state.is_empty() {
                           Ping::default()
@@ -100,13 +141,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                           }
                         };
 
-                        for (name, created) in ping.iter() { 
+                        for (name, created) in ping.iter() {
                           if !local_state.contains_key(name) && (*created + chrono::Duration::hours(1) > Utc::now()) {
                             tracing::info!("Hello, {}!", name);
                           }
                         }
 
-                        local_state.merge(ping);
+                        local_state.merge(ping, args.parameters.ttl);
                       }
                     },
                     ContractResponse::PutResponse { key } => {
