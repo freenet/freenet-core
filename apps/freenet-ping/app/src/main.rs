@@ -99,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         }
     };
 
-    let mut send_tick = tokio::time::interval(Duration::from_secs(1));
+    let mut send_tick = tokio::time::interval(args.parameters.frequency);
     let mut fetch_tick = tokio::time::interval(Duration::from_secs_f64(1.5));
 
     let mut generator = Generator::default();
