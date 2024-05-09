@@ -599,20 +599,25 @@ impl P2pConnManager {
                         .get_peer_key()
                         .expect("should be set at this point")
                 {
-                    // In this case we are the acceptor, we need to establish a connection with the joiner
-                    // this should only happen for the non-first peers in a Connect request, the first one
-                    // should already be connected at this point, so check just in case
-                    if !self.is_gateway && !self.connection.contains_key(&acceptor.peer) {
-                        let peer_conn =
-                            Self::establish_connection(outbound_conn_handler, joiner).await?;
-                        connection = Some((joiner.clone(), peer_conn));
-                    }
-                    tracing::debug!(this = %acceptor.peer, %joiner, "Connection accepted");
-                    if let Some(tx) = pending_inbound_gw_conns.get(&peer.addr) {
-                        // if this node is a gateway we need to signal that we accepted the connection
-                        let _ = tx.send(Right(ConnMngrActions::AcceptConnection)).await.map_err(|_| {
-                            tracing::debug!(remote = %peer.addr, "Couldn't signal to the connection that is accepted, likely dropped");
-                        });
+                    if *accepted {
+                        // In this case we are the acceptor, we need to establish a connection with the joiner
+                        // this should only happen for the non-first peers in a Connect request, the first one
+                        // should already be connected at this point, so check just in case
+                        if !self.is_gateway && !self.connection.contains_key(&acceptor.peer) {
+                            let peer_conn =
+                                Self::establish_connection(outbound_conn_handler, joiner).await?;
+                            connection = Some((joiner.clone(), peer_conn));
+                        }
+                        tracing::debug!(this = %acceptor.peer, %joiner, "Connection accepted");
+                        if let Some(tx) = pending_inbound_gw_conns.get(&peer.addr) {
+                            // if this node is a gateway we need to signal that we accepted the connection
+                            let _ = tx.send(Right(ConnMngrActions::AcceptConnection)).await.map_err(|_| {
+                                tracing::debug!(remote = %peer.addr, "Couldn't signal to the connection that is accepted, likely dropped");
+                            });
+                        }
+                        pending_inbound_gw_conns.remove(&peer.addr);
+                    } else {
+                        closing_gw_conn = pending_inbound_gw_conns.remove(&joiner.addr());
                     }
                 }
             }
@@ -625,7 +630,14 @@ impl P2pConnManager {
                 .map_err(|_| ConnectionError::SendNotCompleted)?;
         } else {
             if let Some(conn) = self.connection.get(&peer) {
-                tracing::debug!(target = %peer, %net_msg, "Sending outbound message");
+                match &*net_msg {
+                    NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request { id, msg })) => {
+                        tracing::debug!(id=%id, target = %peer, ?msg, "XXX Sending outbound message");
+                    }
+                    _ => tracing::debug!(target = %peer, %net_msg, "Sending outbound message"),
+                };
+                // trace if conn is closed
+                tracing::debug!(target = %peer, this_peer = %self.bridge.op_manager.ring.get_peer_key().unwrap(), "Connection status: {:?}", conn.is_closed());
                 conn.send(Either::Left(*net_msg))
                     .await
                     .map_err(|_| ConnectionError::SendNotCompleted)?;

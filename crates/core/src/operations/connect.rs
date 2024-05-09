@@ -165,6 +165,12 @@ impl Operation for ConnectOp {
                             .ring
                             .closest_to_location(*ideal_location, &[joiner.peer.clone()])
                         {
+                            tracing::debug!(
+                                tx = %id,
+                                query_target = %query_target.peer,
+                                joiner = %joiner.peer,
+                                "Found a desirable peer to connect to",
+                            );
                             let msg = ConnectMsg::Request {
                                 id: *id,
                                 msg: ConnectRequest::CheckConnectivity {
@@ -181,16 +187,13 @@ impl Operation for ConnectOp {
                             return_msg = None;
                             new_state = Some(ConnectState::AwaitingConnectionAcquisition {});
                         } else {
-                            return_msg = Some(ConnectMsg::Response {
-                                id: *id,
-                                sender: query_target.clone(),
-                                target: joiner.clone(),
-                                msg: ConnectResponse::AcceptedBy {
-                                    accepted: false,
-                                    acceptor: query_target.clone(),
-                                    joiner: joiner.peer.clone(),
-                                },
-                            });
+                            tracing::debug!(
+                                tx = %id,
+                                query_target = %query_target.peer,
+                                joiner = %joiner.peer,
+                                "No desirable peer found to connect to",
+                            );
+                            return_msg = None;
                             new_state = None;
                         }
                     } else {
