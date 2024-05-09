@@ -22,6 +22,7 @@ use anyhow::bail;
 use dashmap::{mapref::one::Ref as DmRef, DashMap};
 use either::Either;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
+use itertools::Itertools;
 use parking_lot::{Mutex, RwLock};
 use rand::seq::SliceRandom;
 use rand::Rng;
@@ -567,6 +568,7 @@ impl Ring {
     }
 
     pub async fn add_connection(&self, loc: Location, peer: PeerId) {
+        tracing::info!(%peer, "Adding connection to peer");
         self.event_register
             .register_events(Either::Left(NetEventLog::connected(
                 self,
@@ -756,12 +758,21 @@ impl Ring {
     ) -> Option<PeerKeyLocation> {
         self.connections_by_location
             .read()
-            .range(..location)
-            .filter_map(|(_, conns)| {
-                let conn = conns.choose(&mut rand::thread_rng()).unwrap();
-                (!skip_list.contains(&conn.location.peer)).then_some(conn.location.clone())
+            .iter()
+            .sorted_by(|(loc_a, _), (loc_b, _)| {
+                loc_a.distance(location).cmp(&loc_b.distance(location))
             })
-            .next_back()
+            .find_map(|(_, conns)| {
+                for _ in 0..conns.len() {
+                    let conn = conns.choose(&mut rand::thread_rng()).unwrap();
+                    let selected =
+                        (!skip_list.contains(&conn.location.peer)).then_some(conn.location.clone());
+                    if selected.is_some() {
+                        return selected;
+                    }
+                }
+                None
+            })
     }
 
     async fn connection_maintenance(

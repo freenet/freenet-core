@@ -664,6 +664,10 @@ impl EventRegister {
             }
         }
 
+        if records.is_empty() {
+            return Ok(vec![]);
+        }
+
         let deserialized_records = tokio::task::spawn_blocking(move || {
             let mut filtered = vec![];
             for buf in records {
@@ -1203,6 +1207,8 @@ pub(crate) mod tracer {
                 println!("setting OT collector with identifier: {identifier}");
                 let tracing_ot_layer = {
                     // Connect the Jaeger OT tracer with the tracing middleware
+                    // FIXME: remove
+                    #[allow(deprecated)]
                     let ot_jaeger_tracer =
                         opentelemetry_jaeger::config::agent::AgentPipeline::default()
                             .with_service_name(identifier)

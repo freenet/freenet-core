@@ -172,6 +172,7 @@ impl Operation for ConnectOp {
                                 tx = %id,
                                 query_target = %query_target.peer,
                                 joiner = %joiner.peer,
+                                desirable_peer = %desirable_peer.peer,
                                 "Found a desirable peer to connect to",
                             );
                             let msg = ConnectMsg::Request {
@@ -267,6 +268,10 @@ impl Operation for ConnectOp {
                     }
 
                     if accepted {
+                        op_manager
+                            .ring
+                            .add_connection(assigned_location, joiner.clone())
+                            .await;
                         tracing::debug!(tx = %id, at = %this_peer.peer, %joiner, "Accepting connection");
                     } else {
                         tracing::debug!(tx = %id, at = %this_peer.peer, %joiner, "Rejecting connection");
