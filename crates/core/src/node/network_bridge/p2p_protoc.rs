@@ -678,8 +678,15 @@ impl P2pConnManager {
                 .await
                 .map_err(|_| ConnectionError::SendNotCompleted)?;
         } else {
-            tracing::error!(target = %peer, "Connection likely dropped");
-            return Err(ConnectionError::SendNotCompleted);
+            if let Some(conn) = self.connection.get(&peer) {
+                tracing::debug!(target = %peer, "Connection status: {}", conn.is_closed().then(|| "closed").unwrap_or("open"));
+                conn.send(Either::Left(*net_msg))
+                    .await
+                    .map_err(|_| ConnectionError::SendNotCompleted)?;
+            } else {
+                tracing::error!(target = %peer, "Connection likely dropped");
+                return Err(ConnectionError::SendNotCompleted);
+            }
         }
 
         Ok(connection.map(Either::Right).unwrap_or(Either::Left(())))
