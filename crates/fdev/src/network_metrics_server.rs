@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{net::Ipv4Addr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -195,7 +195,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
     let (mut tx, _) = ws.split();
     for peer in state.peer_data.iter() {
         let msg = PeerChange::current_state_msg(
-            *peer.key(),
+            peer.key().clone(),
             peer.value().location,
             peer.value().connections.iter(),
         );
@@ -276,23 +276,8 @@ pub(crate) enum Change {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PeerIdHumanReadable(PeerId);
-
-impl Serialize for PeerIdHumanReadable {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for PeerIdHumanReadable {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        Ok(PeerIdHumanReadable(
-            PeerId::from_str(&s).map_err(serde::de::Error::custom)?,
-        ))
-    }
-}
 
 impl From<PeerId> for PeerIdHumanReadable {
     fn from(peer_id: PeerId) -> Self {
@@ -300,41 +285,47 @@ impl From<PeerId> for PeerIdHumanReadable {
     }
 }
 
+impl std::fmt::Display for PeerIdHumanReadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.addr)
+    }
+}
+
 impl ServerState {
     fn save_record(&self, change: ChangesWrapper) -> Result<(), anyhow::Error> {
         match change {
             ChangesWrapper::PeerChange(PeerChange::AddedConnection(added)) => {
-                let from_peer_id = PeerId::from_str(added.from())?;
+                let from_peer_id: PeerId = bincode::deserialize(added.from().bytes())?;
                 let from_loc = added.from_location();
 
-                let to_peer_id = PeerId::from_str(added.to())?;
+                let to_peer_id: PeerId = bincode::deserialize(added.to().bytes())?;
                 let to_loc = added.to_location();
 
-                match self.peer_data.entry(from_peer_id) {
+                match self.peer_data.entry(from_peer_id.clone()) {
                     dashmap::mapref::entry::Entry::Occupied(mut occ) => {
                         let connections = &mut occ.get_mut().connections;
-                        connections.push((to_peer_id, to_loc));
+                        connections.push((to_peer_id.clone(), to_loc));
                         connections.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                         connections.dedup();
                     }
                     dashmap::mapref::entry::Entry::Vacant(vac) => {
                         vac.insert(PeerData {
-                            connections: vec![(to_peer_id, to_loc)],
+                            connections: vec![(to_peer_id.clone(), to_loc)],
                             location: from_loc,
                         });
                     }
                 }
 
-                match self.peer_data.entry(to_peer_id) {
+                match self.peer_data.entry(to_peer_id.clone()) {
                     dashmap::mapref::entry::Entry::Occupied(mut occ) => {
                         let connections = &mut occ.get_mut().connections;
-                        connections.push((from_peer_id, from_loc));
+                        connections.push((from_peer_id.clone(), from_loc));
                         connections.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                         connections.dedup();
                     }
                     dashmap::mapref::entry::Entry::Vacant(vac) => {
                         vac.insert(PeerData {
-                            connections: vec![(from_peer_id, from_loc)],
+                            connections: vec![(from_peer_id.clone(), from_loc)],
                             location: to_loc,
                         });
                     }
@@ -347,8 +338,8 @@ impl ServerState {
                 });
             }
             ChangesWrapper::PeerChange(PeerChange::RemovedConnection(removed)) => {
-                let from_peer_id = PeerId::from_str(removed.from())?;
-                let at_peer_id = PeerId::from_str(removed.at())?;
+                let from_peer_id = bincode::deserialize(removed.from().bytes())?;
+                let at_peer_id = bincode::deserialize(removed.at().bytes())?;
 
                 if let Some(mut entry) = self.peer_data.get_mut(&from_peer_id) {
                     entry

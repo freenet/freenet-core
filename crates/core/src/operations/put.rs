@@ -4,7 +4,6 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Instant;
 
 pub(crate) use self::messages::PutMsg;
 use freenet_stdlib::{
@@ -16,7 +15,7 @@ use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationRe
 use crate::{
     client_events::HostResult,
     contract::ContractHandlerEvent,
-    message::{InnerMessage, NetMessage, Transaction},
+    message::{InnerMessage, NetMessage, NetMessageV1, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
 };
@@ -58,29 +57,7 @@ impl PutOp {
     }
 
     pub(super) fn finalized(&self) -> bool {
-        self.stats
-            .as_ref()
-            .map(|s| matches!(s.step, RecordingStats::Completed))
-            .unwrap_or(false)
-            || matches!(self.state, Some(PutState::Finished { .. }))
-    }
-
-    pub(super) fn record_transfer(&mut self) {
-        if let Some(stats) = self.stats.as_mut() {
-            match stats.step {
-                RecordingStats::Uninitialized => {
-                    stats.transfer_time = Some((Instant::now(), None));
-                    stats.step = RecordingStats::InitPut;
-                }
-                RecordingStats::InitPut => {
-                    if let Some((_, e)) = stats.transfer_time.as_mut() {
-                        *e = Some(Instant::now());
-                    }
-                    stats.step = RecordingStats::Completed;
-                }
-                RecordingStats::Completed => {}
-            }
-        }
+        self.state.is_none()
     }
 
     pub(super) fn to_host_result(&self) -> HostResult {
@@ -98,41 +75,10 @@ impl PutOp {
 }
 
 struct PutStats {
-    // contract_location: Location,
-    // payload_size: usize,
-    // /// (start, end)
-    // first_response_time: Option<(Instant, Option<Instant>)>,
-    /// (start, end)
-    transfer_time: Option<(Instant, Option<Instant>)>,
     target: Option<PeerKeyLocation>,
-    step: RecordingStats,
-}
-
-/// While timing, at what particular step we are now.
-#[derive(Clone, Copy, Default)]
-enum RecordingStats {
-    #[default]
-    Uninitialized,
-    InitPut,
-    Completed,
 }
 
 pub(crate) struct PutResult {}
-
-impl TryFrom<PutOp> for PutResult {
-    type Error = OpError;
-
-    fn try_from(op: PutOp) -> Result<Self, Self::Error> {
-        if let Some(true) = op
-            .stats
-            .map(|s| matches!(s.step, RecordingStats::Completed))
-        {
-            Ok(PutResult {})
-        } else {
-            Err(OpError::UnexpectedOpState)
-        }
-    }
-}
 
 impl Operation for PutOp {
     type Message = PutMsg;
@@ -210,7 +156,7 @@ impl Operation for PutOp {
                     return_msg = Some(PutMsg::SeekNode {
                         id: *id,
                         sender,
-                        target: *target,
+                        target: target.clone(),
                         value: value.clone(),
                         contract: contract.clone(),
                         related_contracts: related_contracts.clone(),
@@ -266,7 +212,7 @@ impl Operation for PutOp {
                             value.clone(),
                             *id,
                             new_htl,
-                            vec![sender.peer],
+                            vec![sender.peer.clone()],
                         )
                         .await;
                         if put_here && !is_subscribed_contract {
@@ -301,7 +247,7 @@ impl Operation for PutOp {
                         last_hop,
                         op_manager,
                         self.state,
-                        (broadcast_to, *sender),
+                        (broadcast_to, sender.clone()),
                         key.clone(),
                         (contract.clone(), value.clone()),
                     )
@@ -346,7 +292,7 @@ impl Operation for PutOp {
                         false,
                         op_manager,
                         self.state,
-                        (broadcast_to, *sender),
+                        (broadcast_to, sender.clone()),
                         key.clone(),
                         (contract.clone(), new_value),
                     )
@@ -377,7 +323,7 @@ impl Operation for PutOp {
                             id: *id,
                             key: key.clone(),
                             new_value: new_value.clone(),
-                            sender,
+                            sender: sender.clone(),
                             contract: contract.clone(),
                         };
                         let f = conn_manager.send(&peer.peer, msg.into());
@@ -417,7 +363,7 @@ impl Operation for PutOp {
                     // Subscriber nodes have been notified of the change, the operation is completed
                     return_msg = Some(PutMsg::SuccessfulPut {
                         id: *id,
-                        target: *upstream,
+                        target: upstream.clone(),
                         key: key.clone(),
                     });
                     new_state = None;
@@ -427,14 +373,14 @@ impl Operation for PutOp {
                         Some(PutState::AwaitingResponse { key, upstream }) => {
                             let is_subscribed_contract = op_manager.ring.is_seeding_contract(&key);
                             if !is_subscribed_contract && op_manager.ring.should_seed(&key) {
-                                tracing::debug!(tx = %id, %key, peer = %op_manager.ring.peer_key, "Contract not cached @ peer, caching");
+                                tracing::debug!(tx = %id, %key, peer = %op_manager.ring.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
                                 super::start_subscription_request(op_manager, key.clone(), true)
                                     .await;
                             }
                             tracing::info!(
                                 tx = %id,
                                 %key,
-                                this_peer = %op_manager.ring.peer_key,
+                                this_peer = %op_manager.ring.get_peer_key().unwrap(),
                                 "Peer completed contract value put",
                             );
                             new_state = Some(PutState::Finished { key: key.clone() });
@@ -484,7 +430,7 @@ impl Operation for PutOp {
                     // if successful, forward to the next closest peers (if any)
                     let last_hop = if let Some(new_htl) = htl.checked_sub(1) {
                         let mut new_skip_list = skip_list.clone();
-                        new_skip_list.push(sender.peer);
+                        new_skip_list.push(sender.peer.clone());
                         // only hop forward if there are closer peers
                         let put_here = forward_put(
                             op_manager,
@@ -514,11 +460,11 @@ impl Operation for PutOp {
                                     conn_manager
                                         .send(
                                             &subscriber.peer,
-                                            NetMessage::Unsubscribed {
+                                            NetMessage::V1(NetMessageV1::Unsubscribed {
                                                 transaction: Transaction::new::<PutMsg>(),
                                                 key: key.clone(),
-                                                from: op_manager.ring.peer_key,
-                                            },
+                                                from: op_manager.ring.get_peer_key().unwrap(),
+                                            }),
                                         )
                                         .await?;
                                 }
@@ -544,7 +490,7 @@ impl Operation for PutOp {
                         last_hop,
                         op_manager,
                         self.state,
-                        (broadcast_to, *sender),
+                        (broadcast_to, sender.clone()),
                         key.clone(),
                         (contract.clone(), new_value.clone()),
                     )
@@ -574,7 +520,7 @@ impl OpManager {
                 subs.value()
                     .iter()
                     .filter(|pk| &pk.peer != sender)
-                    .copied()
+                    .cloned()
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -680,14 +626,7 @@ pub(crate) fn start_op(
     PutOp {
         id,
         state,
-        stats: Some(PutStats {
-            // contract_location,
-            // payload_size,
-            target: None,
-            // first_response_time: None,
-            transfer_time: None,
-            step: Default::default(),
-        }),
+        stats: Some(PutStats { target: None }),
     }
 }
 
@@ -731,7 +670,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
 
     let id = put_op.id;
     if let Some(stats) = &mut put_op.stats {
-        stats.target = Some(target);
+        stats.target = Some(target.clone());
     }
 
     match put_op.state {
@@ -752,7 +691,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
                 related_contracts,
                 value,
                 htl,
-                target,
+                target: target.clone(),
             };
 
             let op = PutOp {
@@ -854,7 +793,7 @@ where
 }
 
 mod messages {
-    use std::fmt::Display;
+    use std::{borrow::Borrow, fmt::Display};
 
     use super::*;
 
@@ -936,7 +875,7 @@ mod messages {
             }
         }
 
-        fn target(&self) -> Option<&PeerKeyLocation> {
+        fn target(&self) -> Option<impl Borrow<PeerKeyLocation>> {
             match self {
                 Self::SeekNode { target, .. } => Some(target),
                 Self::RequestPut { target, .. } => Some(target),

@@ -161,11 +161,11 @@ impl ContractExecutor for Executor<Runtime> {
 
 impl Executor<Runtime> {
     pub async fn from_config(
-        config: PeerCliConfig,
+        config: &Config,
         event_loop_channel: Option<ExecutorToEventLoopChannel<ExecutorHalve>>,
     ) -> Result<Self, DynError> {
         let (contract_store, delegate_store, secret_store, state_store) =
-            Self::get_stores(&config).await?;
+            Self::get_stores(config).await?;
         let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
         Executor::new(
             state_store,

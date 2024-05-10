@@ -67,11 +67,7 @@ impl NetworkBridge for MemoryConnManager {
             .await;
         self.op_manager.sending_transaction(target, &msg);
         let msg = bincode::serialize(&msg)?;
-        self.transport.send(*target, msg);
-        Ok(())
-    }
-
-    async fn add_connection(&mut self, _peer: PeerId) -> super::ConnResult<()> {
+        self.transport.send(target.clone(), msg);
         Ok(())
     }
 
@@ -121,6 +117,7 @@ impl InMemoryTransport {
         // store messages incoming from the network in the msg stack
         let msg_stack_queue_cp = msg_stack_queue.clone();
         let network_tx_cp = network_tx.clone();
+        let ip = interface_peer.clone();
         GlobalExecutor::spawn(async move {
             const MAX_DELAYED_MSG: usize = 10;
             let mut rng = StdRng::from_entropy();
@@ -129,14 +126,17 @@ impl InMemoryTransport {
             let last_drain = Instant::now();
             loop {
                 match network_rx.try_recv() {
-                    Ok(msg) if msg.target == interface_peer => {
+                    Ok(msg) if msg.target == ip => {
                         tracing::trace!(
                             "Inbound message received for peer {} from {}",
-                            interface_peer,
+                            ip,
                             msg.origin
                         );
                         if rng.gen_bool(0.5) && delayed.len() < MAX_DELAYED_MSG && add_noise {
-                            delayed.entry(msg.target).or_default().push(msg);
+                            delayed
+                                .entry(msg.target.clone())
+                                .or_default()
+                                .push(msg.clone());
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         } else {
                             let mut queue = msg_stack_queue_cp.lock().await;
@@ -170,7 +170,7 @@ impl InMemoryTransport {
                     queue.shuffle(&mut rng);
                 }
             }
-            tracing::error!("Stopped receiving messages in {}", interface_peer);
+            tracing::error!("Stopped receiving messages in {ip}");
         });
 
         Self {
@@ -182,7 +182,7 @@ impl InMemoryTransport {
 
     fn send(&self, peer: PeerId, message: Vec<u8>) {
         let send_res = self.network.send(MessageOnTransit {
-            origin: self.interface_peer,
+            origin: self.interface_peer.clone(),
             target: peer,
             data: message,
         });

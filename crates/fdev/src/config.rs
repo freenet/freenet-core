@@ -1,8 +1,12 @@
-use std::{fmt::Display, path::PathBuf};
+use std::{
+    fmt::Display,
+    net::{IpAddr, Ipv4Addr},
+    path::PathBuf,
+};
 
 use crate::{commands::PutType, wasm_runtime::ExecutorConfig};
 use clap::ValueEnum;
-use freenet::dev_tool::OperationMode;
+use freenet::{config::ConfigPathsArgs, dev_tool::OperationMode};
 use semver::Version;
 
 #[derive(clap::Parser, Clone)]
@@ -18,20 +22,10 @@ pub struct Config {
 
 #[derive(clap::Parser, Clone)]
 pub struct BaseConfig {
-    /// Overrides the default data directory where Freenet contract files are stored.
-    #[arg(long)]
-    pub(crate) contract_data_dir: Option<PathBuf>,
-    /// Overrides the default data directory where Freenet delegate files are stored.
-    #[arg(long)]
-    pub(crate) delegate_data_dir: Option<PathBuf>,
-    /// Overrides the default data directory where Freenet secret files are stored.
-    #[arg(long)]
-    pub(crate) secret_data_dir: Option<PathBuf>,
-    /// Overrides the default data directory where Freenet database files are stored.
-    #[arg(long)]
-    pub(crate) database_dir: Option<PathBuf>,
+    #[clap(flatten)]
+    pub(crate) paths: ConfigPathsArgs,
     /// Node operation mode.
-    #[arg(value_enum, default_value_t=OperationMode::Local)]
+    #[arg(value_enum, default_value_t=OperationMode::Local, env = "MODE")]
     pub mode: OperationMode,
 }
 
@@ -80,6 +74,13 @@ pub enum NodeCommand {
 pub struct UpdateConfig {
     /// Contract id of the contract being updated in Base58 format.
     pub(crate) key: String,
+    /// The ip address of freenet node to update the contract to. If the node is running in local mode,
+    /// The default value is `127.0.0.1`
+    #[arg(short, long, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
+    pub(crate) address: IpAddr,
+    /// The port of the running local freenet node.
+    #[arg(short, long, default_value = "50509")]
+    pub(crate) port: u16,
     /// A path to the update/delta being pushed to the contract.
     pub(crate) delta: PathBuf,
     /// Whether this contract will be updated in the network or is just a dry run
@@ -95,6 +96,16 @@ pub struct PutConfig {
     /// (built using the `fdev` tool). Not an arbitrary WASM file.
     #[arg(long)]
     pub(crate) code: PathBuf,
+
+    /// The ip address of freenet node to publish the contract to. If the node is running in local mode,
+    /// The default value is `127.0.0.1`.
+    #[arg(short, long, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
+    pub(crate) address: IpAddr,
+
+    /// The port of the running local freenet node.
+    #[arg(short, long, default_value = "50509")]
+    pub(crate) port: u16,
+
     /// A path to the file parameters for the contract/delegate. If not specified, will be published
     /// with empty parameters.
     #[arg(long)]

@@ -9,7 +9,7 @@ use tokio::sync::mpsc::error::SendError;
 use crate::{
     client_events::HostResult,
     contract::{ContractError, ExecutorError},
-    message::{InnerMessage, NetMessage, Transaction, TransactionType},
+    message::{InnerMessage, MessageStats, NetMessage, NetMessageV1, Transaction, TransactionType},
     node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
 };
@@ -22,7 +22,7 @@ pub(crate) mod update;
 
 pub(crate) trait Operation
 where
-    Self: Sized + TryInto<Self::Result>,
+    Self: Sized,
 {
     type Message: InnerMessage + std::fmt::Display;
 
@@ -97,7 +97,7 @@ where
         Err(err) => {
             if let Some(sender) = sender {
                 network_bridge
-                    .send(&sender, NetMessage::Aborted(tx_id))
+                    .send(&sender, NetMessage::V1(NetMessageV1::Aborted(tx_id)))
                     .await?;
             }
             return Err(err);
@@ -108,7 +108,7 @@ where
         }) => {
             // updated op
             let id = *msg.id();
-            if let Some(target) = msg.target().cloned() {
+            if let Some(target) = msg.target() {
                 network_bridge.send(&target.peer, msg).await?;
             }
             op_manager.push(id, updated_state).await?;
@@ -137,7 +137,7 @@ where
             op_manager.completed(tx_id);
             // finished the operation at this node, informing back
 
-            if let Some(target) = msg.target().cloned() {
+            if let Some(target) = msg.target() {
                 network_bridge.send(&target.peer, msg).await?;
             }
         }
@@ -172,7 +172,6 @@ impl OpEnum {
             pub fn id(&self) -> &Transaction;
             pub fn outcome(&self) -> OpOutcome;
             pub fn finalized(&self) -> bool;
-            pub fn record_transfer(&mut self);
             pub fn to_host_result(&self) -> HostResult;
         }
     }

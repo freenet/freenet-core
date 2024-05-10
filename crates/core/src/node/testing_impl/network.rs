@@ -3,9 +3,9 @@ use crate::contract::MemoryContractHandler;
 use crate::node::p2p_impl::NodeP2P;
 use crate::node::Node;
 use crate::tracing::EventRegister;
+use crate::transport::TransportKeypair;
 use anyhow::Error;
 use futures::SinkExt;
-use libp2p_identity::Keypair;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::net::TcpStream;
@@ -48,10 +48,10 @@ impl NetworkPeer {
         let response = reqwest::get(&config_url).await?;
         let peer_config = response.json::<crate::node::NodeConfig>().await?;
 
-        tracing::debug!(peer_config = ?peer_config, "Received peer config");
+        tracing::debug!("Received peer config");
 
         let (user_ev_controller, receiver_ch): (PeerEventSender, PeerEventReceiver) =
-            tokio::sync::watch::channel((0, peer_config.peer_id));
+            tokio::sync::watch::channel((0, peer_config.get_peer_id().unwrap()));
 
         Ok(NetworkPeer {
             id: peer_id,
@@ -67,22 +67,20 @@ impl NetworkPeer {
         &self,
         identifier: String,
         clients: [BoxedClient; CLIENTS],
-        private_key: Keypair,
+        private_key: TransportKeypair,
     ) -> Result<Node, anyhow::Error> {
         let event_register = {
             #[cfg(feature = "trace-ot")]
             {
                 use crate::tracing::OTEventRegister;
                 crate::tracing::CombinedRegister::new([
-                    Box::new(EventRegister::new(
-                        crate::config::Config::conf().event_log(),
-                    )),
+                    Box::new(EventRegister::new(self.config.config.event_log())),
                     Box::new(OTEventRegister::new()),
                 ])
             }
             #[cfg(not(feature = "trace-ot"))]
             {
-                EventRegister::new(crate::config::Config::conf().event_log())
+                EventRegister::new(self.config.config.event_log())
             }
         };
         let node = NodeP2P::build::<MemoryContractHandler, CLIENTS, _>(

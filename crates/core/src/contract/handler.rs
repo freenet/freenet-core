@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+use std::sync::Arc;
 use std::time::Duration;
 
 use freenet_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
@@ -16,8 +17,9 @@ use super::{
     ContractError,
 };
 use crate::client_events::HostResult;
+use crate::config::Config;
 use crate::message::Transaction;
-use crate::{client_events::ClientId, node::PeerCliConfig, wasm_runtime::Runtime, DynError};
+use crate::{client_events::ClientId, wasm_runtime::Runtime, DynError};
 
 pub(crate) struct ClientResponsesReceiver(UnboundedReceiver<(ClientId, HostResult)>);
 
@@ -83,7 +85,7 @@ pub(crate) struct NetworkContractHandler<R = Runtime> {
 }
 
 impl ContractHandler for NetworkContractHandler<Runtime> {
-    type Builder = PeerCliConfig;
+    type Builder = Arc<Config>;
     type ContractExecutor = Executor<Runtime>;
 
     async fn build(
@@ -94,7 +96,7 @@ impl ContractHandler for NetworkContractHandler<Runtime> {
     where
         Self: Sized + 'static,
     {
-        let executor = Executor::from_config(config, Some(executor_request_sender)).await?;
+        let executor = Executor::from_config(&config, Some(executor_request_sender)).await?;
         Ok(Self { executor, channel })
     }
 
@@ -414,8 +416,6 @@ impl std::fmt::Display for ContractHandlerEvent {
 
 #[cfg(test)]
 pub mod test {
-    use std::sync::Arc;
-
     use freenet_stdlib::prelude::*;
 
     use super::*;
@@ -498,7 +498,7 @@ pub(super) mod in_memory {
                 channel,
                 runtime: Executor::new_mock(identifier, executor_request_sender)
                     .await
-                    .unwrap(),
+                    .expect("should start mock executor"),
             }
         }
     }

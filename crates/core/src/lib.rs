@@ -36,7 +36,6 @@ pub mod local_node {
     use super::*;
     pub use contract::Executor;
     pub use contract::OperationMode;
-    pub use node::PeerCliConfig;
 }
 
 /// Exports for the dev tool.
@@ -54,9 +53,10 @@ pub mod dev_tool {
         testing_impl::{
             EventChain, NetworkPeer, NodeLabel, PeerMessage, PeerStatus, SimNetwork, SimPeer,
         },
-        InitPeerNode, InterProcessConnManager, NodeConfig, PeerCliConfig, PeerId,
+        InitPeerNode, InterProcessConnManager, NodeConfig, PeerId,
     };
     pub use ring::Location;
+    pub use transport::TransportKeypair;
     pub use wasm_runtime::{ContractStore, DelegateStore, Runtime, SecretsStore, StateStore};
 }
 

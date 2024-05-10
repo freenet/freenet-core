@@ -98,7 +98,7 @@ pub(crate) struct PeerConnection {
 }
 
 impl PeerConnection {
-    pub fn new(remote_conn: RemoteConnection) -> Self {
+    pub(super) fn new(remote_conn: RemoteConnection) -> Self {
         Self {
             remote_conn,
             received_tracker: ReceivedPacketTracker::new(),
@@ -247,6 +247,10 @@ impl PeerConnection {
     /// Returns the external address of the peer holding this connection.
     pub fn my_address(&self) -> Option<SocketAddr> {
         self.remote_conn.my_address
+    }
+
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.remote_conn.remote_addr
     }
 
     async fn process_inbound(

@@ -27,7 +27,7 @@ cache-padded = "1.3"
 chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 clap = { features = ["derive", "env"], workspace = true }
-config = { features = ["toml"], version = "0.14" }
+# config = { features = ["toml"], version = "0.14" }
 cookie = "0.18"
 crossbeam = { workspace = true }
 ctrlc = { features = ["termination"], workspace = true }
@@ -37,10 +37,9 @@ directories = "5"
 either = { features = ["serde"], workspace = true }
 flatbuffers = "24.3"
 futures = "0.3"
+semver = { version = "1.0.14",  features = ["serde"] }
 headers = "0.4"
 itertools = "0.12"
-libp2p = { default-features = false, features = ["autonat", "dns", "ed25519", "identify", "macros", "noise", "ping", "tcp", "tokio", "yamux"], version = "0.52.3" }
-libp2p-identity = { features = ["ed25519", "rand"], version = "0.2.7" }
 notify = "6"
 once_cell = "1"
 ordered-float = "4.2"
@@ -50,6 +49,7 @@ rand = { features = ["small_rng"], workspace = true }
 redb = { optional = true, version = "2" }
 serde = { features = ["derive", "rc"], workspace = true }
 serde_json = { workspace = true }
+toml = "0.8"
 serde_with = { workspace = true }
 sqlx = { features = ["runtime-tokio-rustls", "sqlite"], optional = true, version = "0.7" }
 stretto = { features = ["async", "sync"], version = "0.8" }

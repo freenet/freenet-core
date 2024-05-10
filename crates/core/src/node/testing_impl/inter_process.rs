@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use crate::{
-    config::GlobalExecutor,
+    config::{Config, GlobalExecutor},
     contract::{self, ContractHandler, MemoryContractHandler},
     dev_tool::{ClientEventsProxy, NodeConfig},
     node::{
@@ -21,7 +21,11 @@ pub struct SimPeer {
 }
 
 impl SimPeer {
-    pub async fn start_child<UsrEv>(self, event_generator: UsrEv) -> Result<(), anyhow::Error>
+    pub async fn start_child<UsrEv>(
+        self,
+        config: &Config,
+        event_generator: UsrEv,
+    ) -> Result<(), anyhow::Error>
     where
         UsrEv: ClientEventsProxy + Send + 'static,
     {
@@ -30,15 +34,13 @@ impl SimPeer {
             {
                 use crate::tracing::{CombinedRegister, OTEventRegister};
                 CombinedRegister::new([
-                    Box::new(EventRegister::new(
-                        crate::config::Config::conf().event_log(),
-                    )),
+                    Box::new(EventRegister::new(config.event_log())),
                     Box::new(OTEventRegister::new()),
                 ])
             }
             #[cfg(not(feature = "trace-ot"))]
             {
-                EventRegister::new(crate::config::Config::conf().event_log())
+                EventRegister::new(config.event_log())
             }
         };
         self.run_node(event_generator, event_register).await
@@ -68,20 +70,19 @@ impl SimPeer {
         let contract_handler = MemoryContractHandler::build(
             ch_channel,
             executor_sender,
-            self.config.peer_id.to_string(),
+            self.config.get_peer_id().unwrap().to_string(),
         )
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
 
         let conn_manager = InterProcessConnManager::new(event_register.clone(), op_manager.clone());
 
-        GlobalExecutor::spawn(
-            contract::contract_handling(contract_handler)
-                .instrument(tracing::info_span!("contract_handling", peer = %self.config.peer_id)),
-        );
+        GlobalExecutor::spawn(contract::contract_handling(contract_handler).instrument(
+            tracing::info_span!("contract_handling", peer = %self.config.get_peer_id().unwrap()),
+        ));
 
         let running_node = super::RunnerConfig {
-            peer_key: self.config.peer_id,
+            peer_key: self.config.get_peer_id().unwrap(),
             op_manager,
             notification_channel,
             conn_manager,
