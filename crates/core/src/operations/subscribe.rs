@@ -121,8 +121,6 @@ impl SubscribeOp {
         matches!(self.state, Some(SubscribeState::Completed { .. }))
     }
 
-    pub(super) fn record_transfer(&mut self) {}
-
     pub(super) fn to_host_result(&self) -> HostResult {
         if let Some(SubscribeState::Completed {}) = self.state {
             Ok(HostResponse::Ok)
@@ -201,8 +199,8 @@ impl Operation for SubscribeOp {
                     return_msg = Some(SubscribeMsg::SeekNode {
                         id: *id,
                         key: key.clone(),
-                        target: *target,
-                        subscriber: sender,
+                        target: target.clone(),
+                        subscriber: sender.clone(),
                         skip_list: vec![sender.peer],
                         htl: op_manager.ring.max_hops_to_live,
                         retries: 0,
@@ -224,8 +222,8 @@ impl Operation for SubscribeOp {
                                 key: key.clone(),
                                 id: *id,
                                 subscribed: false,
-                                sender: this_peer,
-                                target: *subscriber,
+                                sender: this_peer.clone(),
+                                target: subscriber.clone(),
                             })),
                             state: None,
                         }
@@ -249,7 +247,7 @@ impl Operation for SubscribeOp {
                         }
 
                         let mut new_skip_list = skip_list.clone();
-                        new_skip_list.push(target.peer);
+                        new_skip_list.push(target.peer.clone());
 
                         tracing::debug!(tx = %id, new_target = %new_target.peer, "Forward request to peer");
                         // Retry seek node when the contract to subscribe has not been found in this node
@@ -259,7 +257,7 @@ impl Operation for SubscribeOp {
                                 skip_list: new_skip_list.clone(),
                                 retries: *retries,
                                 current_hop: new_htl,
-                                upstream_subscriber: Some(*subscriber),
+                                upstream_subscriber: Some(subscriber.clone()),
                             }),
                             (SubscribeMsg::SeekNode {
                                 id: *id,
@@ -274,7 +272,11 @@ impl Operation for SubscribeOp {
                         );
                     }
 
-                    if op_manager.ring.add_subscriber(key, *subscriber).is_err() {
+                    if op_manager
+                        .ring
+                        .add_subscriber(key, subscriber.clone())
+                        .is_err()
+                    {
                         tracing::debug!(tx = %id, %key, "Max number of subscribers reached for contract");
                         // max number of subscribers for this contract reached
                         return Ok(return_not_subbed());
@@ -290,8 +292,8 @@ impl Operation for SubscribeOp {
                             );
                             new_state = None;
                             return_msg = Some(SubscribeMsg::ReturnSub {
-                                sender: *target,
-                                target: *subscriber,
+                                sender: target.clone(),
+                                target: subscriber.clone(),
                                 id: *id,
                                 key: key.clone(),
                                 subscribed: true,
@@ -322,7 +324,7 @@ impl Operation for SubscribeOp {
                             current_hop,
                         }) => {
                             if retries < MAX_RETRIES {
-                                skip_list.push(sender.peer);
+                                skip_list.push(sender.peer.clone());
                                 if let Some(target) = op_manager
                                     .ring
                                     .closest_potentially_caching(key, skip_list.as_slice())
@@ -377,14 +379,14 @@ impl Operation for SubscribeOp {
                             provider = %sender.peer,
                             "Subscribed to contract"
                         );
-                        op_manager.ring.register_subscription(key, *sender);
+                        op_manager.ring.register_subscription(key, sender.clone());
 
                         new_state = Some(SubscribeState::Completed {});
                         if let Some(upstream_subscriber) = upstream_subscriber {
                             return_msg = Some(SubscribeMsg::ReturnSub {
                                 id: *id,
                                 key: key.clone(),
-                                sender: *target,
+                                sender: target.clone(),
                                 target: upstream_subscriber,
                                 subscribed: true,
                             });

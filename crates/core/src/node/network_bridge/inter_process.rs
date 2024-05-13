@@ -87,16 +87,12 @@ impl NetworkBridge for InterProcessConnManager {
         self.log_register
             .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager.ring))
             .await;
-        let data = bincode::serialize(&(*target, msg))?;
+        let data = bincode::serialize(&(target, msg))?;
         let output = &mut *self.output.lock().await;
         output.write_all(&(data.len() as u32).to_le_bytes()).await?;
         output.write_all(&data).await?;
         output.flush().await?;
         tracing::debug!(%target, bytes = data.len(), "sent network message out");
-        Ok(())
-    }
-
-    async fn add_connection(&mut self, _peer: PeerId) -> super::ConnResult<()> {
         Ok(())
     }
 

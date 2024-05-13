@@ -4,7 +4,6 @@ use std::future::Future;
 use std::ops::{Deref, DerefMut};
 
 use either::Either;
-use libp2p::swarm::StreamUpgradeError;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
@@ -24,8 +23,6 @@ pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 /// Allows handling of connections to the network as well as sending messages
 /// to other peers in the network with whom connection has been established.
 pub(crate) trait NetworkBridge: Send + Sync {
-    fn add_connection(&mut self, peer: PeerId) -> impl Future<Output = ConnResult<()>> + Send;
-
     fn drop_connection(&mut self, peer: &PeerId) -> impl Future<Output = ConnResult<()>> + Send;
 
     fn send(&self, target: &PeerId, msg: NetMessage)
@@ -38,19 +35,21 @@ pub(crate) enum ConnectionError {
     LocationUnknown,
     #[error("unable to send message")]
     SendNotCompleted,
+    #[error("Unexpected connection req")]
+    UnexpectedReq,
     #[error("error while de/serializing message")]
     #[serde(skip)]
     Serialization(#[from] Option<Box<bincode::ErrorKind>>),
+    #[error("{0}")]
+    TransportError(String),
+    #[error("unwanted connection")]
+    FailedConnectOp,
 
     // errors produced while handling the connection:
     #[error("IO error: {0}")]
     IOError(String),
-    #[error("timeout error while opening a connectio.")]
+    #[error("timeout error while waiting for a message")]
     Timeout,
-    #[error("no protocols could be agreed upon")]
-    NegotiationFailed,
-    #[error("protocol upgrade error: {0}")]
-    Upgrade(String),
 }
 
 impl From<std::io::Error> for ConnectionError {
@@ -59,14 +58,9 @@ impl From<std::io::Error> for ConnectionError {
     }
 }
 
-impl<TUpgrErr: std::error::Error> From<StreamUpgradeError<TUpgrErr>> for ConnectionError {
-    fn from(err: StreamUpgradeError<TUpgrErr>) -> Self {
-        match err {
-            StreamUpgradeError::Timeout => Self::Timeout,
-            StreamUpgradeError::Apply(err) => Self::Upgrade(format!("{err}")),
-            StreamUpgradeError::NegotiationFailed => Self::NegotiationFailed,
-            StreamUpgradeError::Io(err) => Self::IOError(format!("{err}")),
-        }
+impl From<crate::transport::TransportError> for ConnectionError {
+    fn from(err: crate::transport::TransportError) -> Self {
+        Self::TransportError(err.to_string())
     }
 }
 
@@ -78,8 +72,9 @@ impl Clone for ConnectionError {
             Self::SendNotCompleted => Self::SendNotCompleted,
             Self::IOError(err) => Self::IOError(err.clone()),
             Self::Timeout => Self::Timeout,
-            Self::Upgrade(err) => Self::Upgrade(err.clone()),
-            Self::NegotiationFailed => Self::NegotiationFailed,
+            Self::UnexpectedReq => Self::UnexpectedReq,
+            Self::TransportError(err) => Self::TransportError(err.clone()),
+            Self::FailedConnectOp => Self::FailedConnectOp,
         }
     }
 }

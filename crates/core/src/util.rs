@@ -2,6 +2,7 @@ pub(crate) mod time_source;
 
 use std::{
     collections::{BTreeMap, HashSet},
+    net::{Ipv4Addr, SocketAddr, TcpListener},
     time::Duration,
 };
 
@@ -37,6 +38,7 @@ pub fn set_cleanup_on_exit() -> Result<(), ctrlc::Error> {
     })
 }
 
+#[derive(Debug)]
 pub struct ExponentialBackoff {
     attempt: usize,
     max_attempts: usize,
@@ -82,6 +84,25 @@ impl ExponentialBackoff {
         self.attempt += 1;
         delay
     }
+}
+
+pub fn get_free_port() -> Result<u16, ()> {
+    let mut port;
+    for _ in 0..100 {
+        port = get_dynamic_port();
+        let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        if let Ok(conn) = TcpListener::bind(bind_addr) {
+            std::mem::drop(conn);
+            return Ok(port);
+        }
+    }
+    Err(())
+}
+
+fn get_dynamic_port() -> u16 {
+    const FIRST_DYNAMIC_PORT: u16 = 49152;
+    const LAST_DYNAMIC_PORT: u16 = 65535;
+    rand::thread_rng().gen_range(FIRST_DYNAMIC_PORT..LAST_DYNAMIC_PORT)
 }
 
 // This is extremely inefficient for large sizes but is not what

@@ -12,9 +12,9 @@ const STATE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state")
 pub struct ReDb(Database);
 
 impl ReDb {
-    pub async fn new(db_path: &Path) -> Result<Self, redb::Error> {
+    pub async fn new(data_dir: &Path) -> Result<Self, redb::Error> {
+        let db_path = data_dir.join("db");
         tracing::info!("loading contract store from {db_path:?}");
-
         Database::create(db_path).map(Self).map_err(Into::into)
     }
 }

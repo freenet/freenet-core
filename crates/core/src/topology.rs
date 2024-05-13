@@ -284,11 +284,24 @@ impl TopologyManager {
         my_location: &Option<Location>,
         at_time: Instant,
     ) -> TopologyAdjustment {
-        debug!(
-            "Adjusting topology at {:?}. Current neighbors: {:?}",
-            at_time,
-            neighbor_locations.len()
-        );
+        #[cfg(debug_assertions)]
+        {
+            thread_local! {
+                static LAST_LOG: std::cell::RefCell<Instant> = std::cell::RefCell::new(Instant::now());
+            }
+            if LAST_LOG
+                .with(|last_log| last_log.borrow().elapsed() > std::time::Duration::from_secs(10))
+            {
+                LAST_LOG.with(|last_log| {
+                    tracing::trace!(
+                        "Adjusting topology at {:?}. Current neighbors: {:?}",
+                        at_time,
+                        neighbor_locations.len()
+                    );
+                    *last_log.borrow_mut() = Instant::now();
+                });
+            }
+        }
 
         if neighbor_locations.len() < self.limits.min_connections {
             let mut locations = Vec::new();
@@ -307,12 +320,25 @@ impl TopologyManager {
                         }
                     }
                 }
-                info!(
-                    minimum_num_peers_hard_limit = self.limits.min_connections,
-                    num_peers = neighbor_locations.len(),
-                    to_add = below_threshold,
-                    "Adding peers at random locations to reach minimum number of peers"
-                );
+                #[cfg(debug_assertions)]
+                {
+                    thread_local! {
+                        static LAST_LOG: std::cell::RefCell<Instant> = std::cell::RefCell::new(Instant::now());
+                    }
+                    if LAST_LOG.with(|last_log| {
+                        last_log.borrow().elapsed() > std::time::Duration::from_secs(10)
+                    }) {
+                        LAST_LOG.with(|last_log| {
+                            tracing::trace!(
+                                minimum_num_peers_hard_limit = self.limits.min_connections,
+                                num_peers = neighbor_locations.len(),
+                                to_add = below_threshold,
+                                "Adding peers at random locations to reach minimum number of peers"
+                            );
+                            *last_log.borrow_mut() = Instant::now();
+                        });
+                    }
+                }
             }
             return TopologyAdjustment::AddConnections(locations);
         }
@@ -839,7 +865,7 @@ mod tests {
                     report_time
                 );
                 resource_manager.report_resource_usage(
-                    &AttributionSource::Peer(*peer),
+                    &AttributionSource::Peer(peer.clone()),
                     ResourceType::InboundBandwidthBytes,
                     bw_usage_by_peer[i] as f64,
                     report_time,
@@ -857,7 +883,8 @@ mod tests {
             for _ in 0..*requests {
                 // For simplicity we'll just assume that the target location of the request is the
                 // neighboring peer's own location
-                resource_manager.report_outbound_request(peers[i], peers[i].location.unwrap());
+                resource_manager
+                    .report_outbound_request(peers[i].clone(), peers[i].location.unwrap());
             }
         }
     }
@@ -869,7 +896,7 @@ mod tests {
     ) -> usize {
         let mut values = vec![];
         for ix in 0..peers.len() {
-            let peer = peers[ix];
+            let peer = peers[ix].clone();
             let value = requests_per_peer[ix] as f64 / bw_usage_by_peer[ix] as f64;
             values.push(value);
             debug!(

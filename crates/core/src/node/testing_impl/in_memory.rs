@@ -47,7 +47,7 @@ impl<ER> Builder<ER> {
                 .map_err(|e| anyhow::anyhow!(e))?;
 
         let conn_manager = MemoryConnManager::new(
-            self.peer_key,
+            self.peer_key.clone(),
             self.event_register.clone(),
             op_manager.clone(),
             self.add_noise,
@@ -111,7 +111,7 @@ where
             tracing::debug!(
                 "Appended contract {} to peer {}",
                 key,
-                self.op_manager.ring.peer_key
+                self.op_manager.ring.get_peer_key().unwrap()
             );
             if subscription {
                 self.op_manager.ring.seed_contract(key.clone());
@@ -122,7 +122,7 @@ where
                     if self
                         .op_manager
                         .ring
-                        .add_subscriber(&key, *subscriber)
+                        .add_subscriber(&key, subscriber.clone())
                         .is_err()
                     {
                         tracing::warn!("Max subscribers for contract {} reached", key);

@@ -24,6 +24,13 @@ type PacketId = u32;
 
 use self::{packet_data::PacketData, peer_connection::StreamId};
 
+pub use self::crypto::TransportKeypair;
+pub(crate) use self::{
+    connection_handler::{create_connection_handler, OutboundConnectionHandler},
+    crypto::TransportPublicKey,
+    peer_connection::PeerConnection,
+};
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TransportError {
     #[error("transport handler channel closed, socket likely closed")]
@@ -49,7 +56,7 @@ pub(crate) enum TransportError {
 }
 
 /// Make connection handler more testable
-trait Socket: Sized + Send + Sync + 'static {
+pub(crate) trait Socket: Sized + Send + Sync + 'static {
     fn bind(addr: SocketAddr) -> impl Future<Output = io::Result<Self>> + Send;
     fn recv_from(
         &self,
