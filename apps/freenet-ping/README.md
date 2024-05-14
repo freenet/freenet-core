@@ -60,6 +60,7 @@ Ensure you have the following prerequisites installed:
 - Install the Freenet development tool (`fdev`) and the Freenet kernel for local development:
 
   ```bash
+  # You should be in freenet-core/apps/freenet-ping
   cargo install --path ../../crates/core
   cargo install --path ../../crates/fdev
   ```
@@ -77,6 +78,7 @@ Ensure you have the following prerequisites installed:
 - Build the contract using the Freenet development tool:
 
   ```bash
+  # You should be in freenet-core/apps/freenet-ping
   cd contracts/ping
   CARGO_TARGET_DIR=./target fdev build --features contract
   cd -
