@@ -256,11 +256,9 @@ impl NodeConfig {
         let gateways: Vec<PeerKeyLocation> = self
             .remote_nodes
             .iter()
-            .filter_map(|node| {
-                Some(PeerKeyLocation {
-                    peer: node.peer_id.clone(),
-                    location: Some(node.location),
-                })
+            .map(|node| PeerKeyLocation {
+                peer: node.peer_id.clone(),
+                location: Some(node.location),
             })
             .collect();
 
@@ -606,6 +604,7 @@ async fn process_message<CB>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_message_v1<CB>(
     tx: Option<Transaction>,
     msg: NetMessageV1,

@@ -174,7 +174,7 @@ impl<'a> NetEventLog<'a> {
                         this: this_peer,
                         connected: PeerKeyLocation {
                             peer: acceptor.peer.clone(),
-                            location: acceptor.location.clone(),
+                            location: acceptor.location,
                         },
                     })
                 } else {

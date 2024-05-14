@@ -250,7 +250,7 @@ impl Config {
         let local_mode = settings.get_string("network_mode").is_err();
 
         Ok(Config {
-            transport_keypair: transport_keypair.unwrap_or_else(|| TransportKeypair::new()),
+            transport_keypair: transport_keypair.unwrap_or_default(),
             log_level,
             config_paths,
             local_mode: AtomicBool::new(local_mode),

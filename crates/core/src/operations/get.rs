@@ -784,7 +784,7 @@ async fn try_forward_or_return(
 }
 
 mod messages {
-    use std::fmt::Display;
+    use std::{borrow::Borrow, fmt::Display};
 
     use serde::{Deserialize, Serialize};
 
@@ -826,7 +826,7 @@ mod messages {
             }
         }
 
-        fn target(&self) -> Option<&PeerKeyLocation> {
+        fn target(&self) -> Option<impl Borrow<PeerKeyLocation>> {
             match self {
                 Self::SeekNode { target, .. } => Some(target),
                 Self::RequestGet { target, .. } => Some(target),

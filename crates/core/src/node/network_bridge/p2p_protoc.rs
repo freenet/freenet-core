@@ -338,12 +338,12 @@ impl P2pConnManager {
                     msg
                 }
                 event_id = client_wait_for_transaction.relay_transaction_result_to_client() => {
-                    let (client_id, transaction) = event_id.map_err(|err| anyhow::Error::msg(err))?;
+                    let (client_id, transaction) = event_id.map_err(anyhow::Error::msg)?;
                     tx_to_client.insert(transaction, client_id);
                     continue;
                 }
                 id = executor_listener.transaction_from_executor() => {
-                    let id = id.map_err(|err| anyhow::Error::msg(err))?;
+                    let id = id.map_err(anyhow::Error::msg)?;
                     pending_from_executor.insert(id);
                     continue;
                 }
@@ -665,30 +665,24 @@ impl P2pConnManager {
                         tracing::warn!("failed to send closed action");
                     });
             }
-            return Ok(connection
-                .map(|conn| Either::Right(conn))
-                .unwrap_or(Either::Left(())));
+            return Ok(connection.map(Either::Right).unwrap_or(Either::Left(())));
         }
 
         if let Some((_, conn)) = &mut connection {
             conn.send(net_msg)
                 .await
                 .map_err(|_| ConnectionError::SendNotCompleted)?;
+        } else if let Some(conn) = self.connection.get(&peer) {
+            tracing::debug!(target = %peer, "Connection status: {}", if conn.is_closed() { "closed" } else { "open" });
+            conn.send(Either::Left(*net_msg))
+                .await
+                .map_err(|_| ConnectionError::SendNotCompleted)?;
         } else {
-            if let Some(conn) = self.connection.get(&peer) {
-                tracing::debug!(target = %peer, "Connection status: {}", conn.is_closed().then(|| "closed").unwrap_or("open"));
-                conn.send(Either::Left(*net_msg))
-                    .await
-                    .map_err(|_| ConnectionError::SendNotCompleted)?;
-            } else {
-                tracing::error!(target = %peer, "Connection likely dropped");
-                return Err(ConnectionError::SendNotCompleted);
-            }
+            tracing::error!(target = %peer, "Connection likely dropped");
+            return Err(ConnectionError::SendNotCompleted);
         }
 
-        Ok(connection
-            .map(|conn| Either::Right(conn))
-            .unwrap_or(Either::Left(())))
+        Ok(connection.map(Either::Right).unwrap_or(Either::Left(())))
     }
 }
 
