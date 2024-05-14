@@ -51,7 +51,7 @@ Ensure you have the following prerequisites installed:
 - Clone the Freenet Core repository and navigate to the application directory:
 
   ```bash
-  git clone git@github.com:freenet/freenet-core.git
+  git clone https://github.com/freenet/freenet-core.git
   cd freenet-core/apps/freenet-ping
   ```
 
