@@ -198,9 +198,7 @@ pub mod network_node {
 
         let mut node_config = NodeConfig::new(config);
         node_config.with_ip(socket.ip()).with_port(socket.port());
-
-        let private_key = TransportKeypair::new();
-
+        let private_key = node_config.key_pair.unwrap_or_default();
         let is_gateway = node_config.is_gateway;
         let node = node_config
             .build([Box::new(gw), Box::new(ws_proxy)], private_key)
