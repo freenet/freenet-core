@@ -19,10 +19,11 @@ And every 1.5 seconds, the application will fetch the latest names from host, an
   sudo apt-get install libssl-dev libclang-dev pkg-config
   ```
 
-- Ensure you're in the same directory as this file, from the root of the `freenet-core` repository:
+- Clone the [freenet-core](https://github.com/freenet/freenet-core) repository and ensure you're in the same directory as this file:
 
   ```bash
-  cd apps/freenet-ping
+  git clone git@github.com:freenet/freenet-core.git
+  cd freenet-core/apps/freenet-ping
   ```
 
 - Install the Freeenet development tool (fdev) and a working Freenet kernel that can be used for local development. Use cargo to install it:
