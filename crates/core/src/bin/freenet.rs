@@ -16,16 +16,16 @@ async fn run(config: Config) -> Result<(), DynError> {
 }
 
 async fn run_local(config: Config) -> Result<(), DynError> {
-    let port = config.gateway.port;
-    let ip = config.gateway.address;
+    let port = config.http_gateway.port;
+    let ip = config.http_gateway.address;
     let executor = Executor::from_config(&config, None).await?;
     let socket: SocketAddr = (ip, port).into();
     run_local_node(executor, socket).await
 }
 
 async fn run_network(config: Config) -> Result<(), DynError> {
-    let port = config.gateway.port;
-    let ip = config.gateway.address;
+    let port = config.http_gateway.port;
+    let ip = config.http_gateway.address;
     run_network_node(config, (ip, port).into()).await
 }
 

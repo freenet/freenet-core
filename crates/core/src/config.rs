@@ -52,7 +52,7 @@ pub struct ConfigArgs {
 
     #[clap(flatten)]
     #[serde(flatten)]
-    pub gateway: GatewayArgs,
+    pub http_gateway: GatewayArgs,
     #[clap(value_parser, env = "TRANSPORT_KEYPAIR")]
     pub transport_keypair: Option<PathBuf>,
     #[serde(
@@ -71,7 +71,7 @@ impl Default for ConfigArgs {
         Self {
             mode: Some(OperationMode::Local),
             config: None,
-            gateway: GatewayArgs {
+            http_gateway: GatewayArgs {
                 address: Some(default_gateway_address()),
                 port: Some(default_gateway_port()),
             },
@@ -135,12 +135,12 @@ impl ConfigArgs {
                 self.mode = cfg.mode;
             }
 
-            if self.gateway.address.is_none() {
-                self.gateway.address = cfg.gateway.address;
+            if self.http_gateway.address.is_none() {
+                self.http_gateway.address = cfg.http_gateway.address;
             }
 
-            if self.gateway.port.is_none() {
-                self.gateway.port = cfg.gateway.port;
+            if self.http_gateway.port.is_none() {
+                self.http_gateway.port = cfg.http_gateway.port;
             }
 
             if self.log_level.is_none() {
@@ -153,12 +153,12 @@ impl ConfigArgs {
         let mode = self.mode.unwrap_or(OperationMode::Local);
         Ok(Config {
             mode,
-            gateway: GatewayConfig {
-                address: self.gateway.address.unwrap_or_else(|| match mode {
+            http_gateway: GatewayConfig {
+                address: self.http_gateway.address.unwrap_or_else(|| match mode {
                     OperationMode::Local => default_local_gateway_address(),
                     OperationMode::Network => default_gateway_address(),
                 }),
-                port: self.gateway.port.unwrap_or(default_gateway_port()),
+                port: self.http_gateway.port.unwrap_or(default_gateway_port()),
             },
             transport_keypair: match self.transport_keypair {
                 Some(path_to_key) => {
@@ -264,7 +264,7 @@ pub struct Config {
     pub mode: OperationMode,
 
     #[serde(flatten)]
-    pub gateway: GatewayConfig,
+    pub http_gateway: GatewayConfig,
     pub transport_keypair: TransportKeypair,
     #[serde(with = "serde_log_level_filter")]
     pub log_level: tracing::log::LevelFilter,
