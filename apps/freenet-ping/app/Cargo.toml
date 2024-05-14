@@ -1,0 +1,17 @@
+[package]
+name = "freenet-ping"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.21"
+tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+freenet-stdlib = { workspace = true, features = ["net"] }
+names = { version = "0.14.0", default-features = false }
+serde_json = "1"
+freenet-ping-types = { workspace = true, features = ["std", "clap"] }
+chrono = { workspace = true, features = ["default"] }
