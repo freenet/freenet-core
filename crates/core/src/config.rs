@@ -29,7 +29,6 @@ pub const DEFAULT_RANDOM_PEER_CONN_THRESHOLD: usize = 7;
 /// Default maximum number of hops to live for any operation
 /// (if it applies, e.g. connect requests).
 pub const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
-
 pub(crate) const OPERATION_TTL: Duration = Duration::from_secs(60);
 
 // Initialize the executor once.
@@ -526,51 +525,6 @@ impl Config {
     pub fn event_log(&self) -> PathBuf {
         self.config_paths.event_log(self.mode)
     }
-
-    // fn load_conf() -> anyhow::Result<Config> {
-    //     let settings: config::Config = config::Config::builder()
-    //         .add_source(config::Environment::with_prefix("FREENET"))
-    //         .build()
-    //         .unwrap();
-
-    //     let transport_keypair: Option<TransportKeypair> = if let Ok(path_to_key) = settings
-    //         .get_string("local_peer_key_file")
-    //         .map(PathBuf::from)
-    //     {
-    //         let mut key_file = File::open(&path_to_key).unwrap_or_else(|_| {
-    //             panic!(
-    //                 "Failed to open key file: {}",
-    //                 &path_to_key.to_str().unwrap()
-    //             )
-    //         });
-    //         let mut buf = Vec::new();
-    //         key_file.read_to_end(&mut buf).unwrap();
-    //         todo!("get an rsa private key from the file and create a TransportKeypair")
-    //     } else {
-    //         None
-    //     };
-
-    //     let log_level = settings
-    //         .get_string("log")
-    //         .map(|lvl| lvl.parse().ok())
-    //         .ok()
-    //         .flatten()
-    //         .unwrap_or(tracing::log::LevelFilter::Info);
-
-    //     let data_dir = settings.get_string("data_dir").ok().map(PathBuf::from);
-    //     let config_paths = ConfigPaths::new(data_dir)?;
-
-    //     let local_mode = settings.get_string("network_mode").is_err();
-
-    //     Ok(Config {
-    //         transport_keypair: transport_keypair.unwrap_or_else(|| TransportKeypair::new()),
-    //         log_level,
-    //         config_paths,
-    //         local_mode: AtomicBool::new(local_mode),
-    //         #[cfg(feature = "websocket")]
-    //         ws: WebSocketApiConfig::from_config(&settings),
-    //     })
-    // }
 }
 
 pub(crate) struct GlobalExecutor;

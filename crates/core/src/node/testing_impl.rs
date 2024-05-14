@@ -375,7 +375,7 @@ impl SimNetwork {
             let label = NodeLabel::gateway(node_no);
             let port = crate::util::get_free_port().unwrap();
             let keypair = crate::transport::TransportKeypair::new();
-            let id = PeerId::new((Ipv6Addr::LOCALHOST, port).into(), keypair.public.clone());
+            let id = PeerId::new((Ipv6Addr::LOCALHOST, port).into(), keypair.public().clone());
             let location = Location::random();
 
             let mut config = NodeConfig::new(ConfigArgs::default().build().unwrap());

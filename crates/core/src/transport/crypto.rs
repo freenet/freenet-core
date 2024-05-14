@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransportKeypair {
-    pub(crate) public: TransportPublicKey,
-    pub(crate) secret: TransportSecretKey,
+    pub(super) public: TransportPublicKey,
+    pub(super) secret: TransportSecretKey,
 }
 
 impl Default for TransportKeypair {
@@ -26,6 +26,10 @@ impl TransportKeypair {
             public: TransportPublicKey(pub_key),
             secret: TransportSecretKey(priv_key),
         }
+    }
+
+    pub fn public(&self) -> &TransportPublicKey {
+        &self.public
     }
 }
 

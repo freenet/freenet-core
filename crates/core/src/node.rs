@@ -232,7 +232,7 @@ impl NodeConfig {
     pub fn get_peer_id(&self) -> Option<PeerId> {
         match (self.key_pair.as_ref(), self.local_ip, self.local_port) {
             (Some(kp), Some(ip), Some(port)) => {
-                Some(PeerId::new(SocketAddr::new(ip, port), kp.public.clone()))
+                Some(PeerId::new(SocketAddr::new(ip, port), kp.public().clone()))
             }
             _ => None,
         }
@@ -259,13 +259,6 @@ impl NodeConfig {
         }
     }
 }
-
-// /// Gateway node to bootstrap the network.
-// impl Default for NodeConfig {
-//     fn default() -> Self {
-//         Self::new()
-//     }
-// }
 
 /// Gateway node to use for joining the network.
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -507,7 +500,9 @@ async fn report_result(
                 cb.response(op_res).await;
             }
         }
-        Ok(None) => {}
+        Ok(None) => {
+            tracing::debug!(?tx, "No operation result found, not sending response");
+        }
         Err(err) => {
             // just mark the operation as completed so no redundant messages are processed for this transaction anymore
             if let Some(tx) = tx {
@@ -549,10 +544,14 @@ macro_rules! handle_op_not_available {
         if let Err(OpError::OpNotAvailable(state)) = &$op_result {
             match state {
                 OpNotAvailable::Running => {
+                    tracing::debug!("Operation still running");
                     tokio::time::sleep(Duration::from_micros(1_000)).await;
                     continue;
                 }
-                OpNotAvailable::Completed => return,
+                OpNotAvailable::Completed => {
+                    tracing::debug!("Operation already completed");
+                    return;
+                }
             }
         }
     };
@@ -605,7 +604,8 @@ async fn process_message_v1<CB>(
         .register_events(NetEventLog::from_inbound_msg_v1(&msg, &op_manager))
         .await;
 
-    loop {
+    for i in 0.. {
+        tracing::debug!(?tx, "Processing operation, iteration: {i}");
         match msg {
             NetMessageV1::Connect(ref op) => {
                 let parent_span = tracing::Span::current();
@@ -621,7 +621,19 @@ async fn process_message_v1<CB>(
                         .instrument(span)
                         .await;
                 handle_op_not_available!(op_result);
-                break report_result(
+                match &op_result {
+                    Ok(Some(OpEnum::Connect(op))) => {
+                        tracing::info!(?op, "Connect operation started");
+                    }
+                    Ok(None) => {
+                        tracing::info!("Connect operation not started");
+                    }
+                    Err(err) => {
+                        tracing::error!(%err, "Connect operation failed");
+                    }
+                    _ => {}
+                }
+                return report_result(
                     tx,
                     op_result,
                     &op_manager,
@@ -635,7 +647,7 @@ async fn process_message_v1<CB>(
                 let op_result =
                     handle_op_request::<put::PutOp, _>(&op_manager, &mut conn_manager, op).await;
                 handle_op_not_available!(op_result);
-                break report_result(
+                return report_result(
                     tx,
                     op_result,
                     &op_manager,
@@ -649,7 +661,7 @@ async fn process_message_v1<CB>(
                 let op_result =
                     handle_op_request::<get::GetOp, _>(&op_manager, &mut conn_manager, op).await;
                 handle_op_not_available!(op_result);
-                break report_result(
+                return report_result(
                     tx,
                     op_result,
                     &op_manager,
@@ -667,7 +679,7 @@ async fn process_message_v1<CB>(
                 )
                 .await;
                 handle_op_not_available!(op_result);
-                break report_result(
+                return report_result(
                     tx,
                     op_result,
                     &op_manager,
@@ -682,7 +694,7 @@ async fn process_message_v1<CB>(
                     handle_op_request::<update::UpdateOp, _>(&op_manager, &mut conn_manager, op)
                         .await;
                 handle_op_not_available!(op_result);
-                break report_result(
+                return report_result(
                     tx,
                     op_result,
                     &op_manager,
@@ -869,7 +881,7 @@ impl PeerId {
 impl<'a> arbitrary::Arbitrary<'a> for PeerId {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let addr: ([u8; 4], u16) = u.arbitrary()?;
-        let pub_key = TransportKeypair::new().public; // FIXME: impl arbitrary for TransportPublicKey
+        let pub_key = TransportKeypair::new().public().clone(); // FIXME: impl arbitrary for TransportPublicKey
         Ok(Self {
             addr: addr.into(),
             pub_key,
@@ -883,7 +895,7 @@ impl PeerId {
         let mut addr = [0; 4];
         rand::thread_rng().fill(&mut addr[..]);
         let port = crate::util::get_free_port().unwrap();
-        let pub_key = TransportKeypair::new().public;
+        let pub_key = TransportKeypair::new().public().clone();
         Self {
             addr: (addr, port).into(),
             pub_key,

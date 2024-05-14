@@ -38,6 +38,7 @@ pub fn set_cleanup_on_exit() -> Result<(), ctrlc::Error> {
     })
 }
 
+#[derive(Debug)]
 pub struct ExponentialBackoff {
     attempt: usize,
     max_attempts: usize,

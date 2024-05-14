@@ -174,7 +174,7 @@ async fn start_supervisor(config: &TestConfig) -> anyhow::Result<(), Error> {
     Ok(())
 }
 
-async fn start_peer(config: &TestConfig, cmd_config: &NetworkProcessConfig) -> Result<(), Error> {
+async fn start_child(config: &TestConfig, cmd_config: &NetworkProcessConfig) -> Result<(), Error> {
     std::env::set_var(
         "FREENET_PEER_ID",
         cmd_config.clone().id.expect("id should be set"),
@@ -193,7 +193,7 @@ pub(super) async fn run(
 ) -> Result<(), Error> {
     match &cmd_config.mode {
         Process::Supervisor => start_supervisor(config).await,
-        Process::Peer => start_peer(config, cmd_config).await,
+        Process::Peer => start_child(config, cmd_config).await,
     }
 }
 

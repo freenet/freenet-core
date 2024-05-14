@@ -103,18 +103,6 @@ where
             return Err(err);
         }
         Ok(OperationResult {
-            return_msg: Some(msg),
-            state: Some(updated_state),
-        }) => {
-            // updated op
-            let id = *msg.id();
-            if let Some(target) = msg.target() {
-                network_bridge.send(&target.peer, msg).await?;
-            }
-            op_manager.push(id, updated_state).await?;
-        }
-
-        Ok(OperationResult {
             return_msg: None,
             state: Some(final_state),
         }) if final_state.finalized() => {
@@ -122,6 +110,20 @@ where
             op_manager.completed(tx_id);
             return Ok(Some(final_state));
         }
+        Ok(OperationResult {
+            return_msg: Some(msg),
+            state: Some(updated_state),
+        }) => {
+            // updated op
+            let id = *msg.id();
+            tracing::debug!(%id, "updated op state");
+            if let Some(target) = msg.target() {
+                tracing::debug!(%id, "sending updated op state");
+                network_bridge.send(&target.peer, msg).await?;
+            }
+            op_manager.push(id, updated_state).await?;
+        }
+
         Ok(OperationResult {
             return_msg: None,
             state: Some(updated_state),
