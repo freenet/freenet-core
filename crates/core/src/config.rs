@@ -291,15 +291,13 @@ pub struct GatewayArgs {
     pub port: Option<u16>,
 }
 
-#[derive(clap::Parser, Debug, Copy, Clone, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
     /// Address to bind to
-    #[arg(long = "gateway-address", default_value_t = default_gateway_address(), env = "GATEWAY_ADDRESS")]
     #[serde(default = "default_gateway_address", rename = "gateway-address")]
     pub address: IpAddr,
 
     /// Port to expose api on
-    #[arg(long = "gateway-port", default_value_t = default_gateway_port(), env = "GATEWAY_PORT")]
     #[serde(default = "default_gateway_port", rename = "gateway-port")]
     pub port: u16,
 }
