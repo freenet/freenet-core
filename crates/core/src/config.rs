@@ -40,7 +40,7 @@ const APPLICATION: &str = "Freenet";
 
 #[derive(clap::Parser, Debug, Serialize, Deserialize)]
 pub struct ConfigArgs {
-    /// Node operation mode.
+    /// Node operation mode. Default is network mode.
     #[clap(value_enum, env = "MODE")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<OperationMode>,
@@ -69,7 +69,7 @@ pub struct ConfigArgs {
 impl Default for ConfigArgs {
     fn default() -> Self {
         Self {
-            mode: Some(OperationMode::Local),
+            mode: Some(OperationMode::Network),
             config: None,
             http_gateway: GatewayArgs {
                 address: Some(default_gateway_address()),
@@ -150,7 +150,7 @@ impl ConfigArgs {
             self.config_paths.merge(cfg.config_paths);
         }
 
-        let mode = self.mode.unwrap_or(OperationMode::Local);
+        let mode = self.mode.unwrap_or(OperationMode::Network);
         Ok(Config {
             mode,
             http_gateway: GatewayConfig {
