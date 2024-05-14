@@ -43,7 +43,7 @@ Ensure you have the following prerequisites installed:
 - Install the required libraries using Homebrew:
 
   ```bash
-  brew install openssl llvm pkg-config
+  brew install openssl pkg-config
   ```
 
 ### Freenet Core
@@ -118,3 +118,7 @@ Ensure you have the following prerequisites installed:
     ^C2024-05-14T15:33:29.713473Z  INFO freenet_ping: 169: shutting down...
     $ 
   ```
+
+## Feedback
+
+If you encounter any issues please let us know in our [Matrix](https://matrix.to/#/#freenet-locutus:matrix.org) channel or by submitting a [Github Issue](https://github.com/freenet/freenet-core/issues). 
