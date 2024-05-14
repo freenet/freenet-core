@@ -5,7 +5,7 @@ And every 1.5 seconds, the application will fetch the latest names from host, an
 
 ## Prerequisites
 
-- Install the latest version of Rust and Cargo (for Windows
+- If necessary install the latest version of Rust and Cargo (for Windows
   see [here](https://rustup.rs/)):
 
   ```bash
@@ -19,11 +19,17 @@ And every 1.5 seconds, the application will fetch the latest names from host, an
   sudo apt-get install libssl-dev libclang-dev pkg-config
   ```
 
+- Ensure you're in the same directory as this file, from the root of the `freenet-core` repository:
+
+  ```bash
+  cd apps/freenet-ping
+  ```
+
 - Install the Freeenet development tool (fdev) and a working Freenet kernel that can be used for local development. Use cargo to install it:
 
   ```bash
-  cargo install ../../crates/core
-  cargo install ../../crates/fdev
+  cargo install --path ../../crates/core
+  cargo install --path ../../crates/fdev
   ```
 
 - Add WebAssembly target
