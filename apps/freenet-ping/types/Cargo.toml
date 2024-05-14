@@ -1,0 +1,21 @@
+[package]
+name = "freenet-ping-types"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["std"]
+std = ["chrono/default"]
+clap = ["dep:clap"]
+
+[dependencies]
+humantime = "2"
+humantime-serde = "1"
+serde = { version = "1", features = ["derive"] }
+chrono = { workspace = true, features = ["serde"] }
+clap = { version = "4", features = ["derive"], optional = true }
+
+freenet-stdlib.workspace = true
