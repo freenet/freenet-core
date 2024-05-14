@@ -11,7 +11,7 @@ Note: This application is for testing and demonstration purposes only. It does n
 
 ## Code Overview
 
-- **[app/](https://github.com/freenet/freenet-core/blob/main/apps/freenet-ping/app/src/main.rs)**: Command line app that creates the Ping contract, updates it periodically, and reads it periodically.
+- **[app/](https://github.com/freenet/freenet-core/blob/main/apps/freenet-ping/app/src/main.rs)**: Command line app that publishes the Ping contract, updates it periodically, and reads it periodically.
 - **[contracts/](https://github.com/freenet/freenet-core/blob/main/apps/freenet-ping/contracts/ping/src/lib.rs)**: Ping contract implementation.
 - **[types/](https://github.com/freenet/freenet-core/blob/main/apps/freenet-ping/types/src/lib.rs)**: Structs and other types that are shared between the command line app and the contract.
 
