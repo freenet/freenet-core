@@ -1,58 +1,120 @@
+# Freenet Ping Application
+
 ## Introduction
 
-A simple ping application based on freenet. In this application, every 1 second, the application will generate a random name and send a update request to host.
-And every 1.5 seconds, the application will fetch the latest names from host, and log "Hello {name}!" to console.
+This is a simple ping application for Freenet. In this application:
+
+- Every 1 second, the application generates a random name and sends an update request to the host.
+- Every 1.5 seconds, the application fetches the latest names from the host and logs "Hello {name}!" to the console.
+
+Note: This application is for testing and demonstration purposes only. It does not perform any authorization for contract updates.
+
+## Code Overview
+
+- **[app/](https://github.com/freenet/freenet-core/blob/main/apps/freenet-ping/app/src/main.rs)**: Command line app that creates the Ping contract, updates it periodically, and reads it periodically.
+- **[contracts/](https://github.com/freenet/freenet-core/blob/main/apps/freenet-ping/contracts/ping/src/lib.rs)**: Ping contract implementation.
+- **[types/](https://github.com/freenet/freenet-core/blob/main/apps/freenet-ping/types/src/lib.rs)**: Structs and other types that are shared between the command line app and the contract.
 
 ## Prerequisites
 
-- If necessary install the latest version of Rust and Cargo (for Windows
-  see [here](https://rustup.rs/)):
+Ensure you have the following prerequisites installed:
+
+### Rust and Cargo
+
+- Install the latest version of Rust and Cargo:
 
   ```bash
   curl https://sh.rustup.rs -sSf | sh
   ```
 
-- (Ubuntu)
+### Additional Dependencies
+
+#### Ubuntu
+
+- Install the required libraries:
 
   ```bash
   sudo apt-get update
   sudo apt-get install libssl-dev libclang-dev pkg-config
   ```
 
-- Clone the [freenet-core](https://github.com/freenet/freenet-core) repository and ensure you're in the same directory as this file:
+#### macOS
+
+- Install the required libraries using Homebrew:
+
+  ```bash
+  brew install openssl llvm pkg-config
+  ```
+
+### Freenet Core
+
+- Clone the Freenet Core repository and navigate to the application directory:
 
   ```bash
   git clone git@github.com:freenet/freenet-core.git
   cd freenet-core/apps/freenet-ping
   ```
 
-- Install the Freeenet development tool (fdev) and a working Freenet kernel that can be used for local development. Use cargo to install it:
+### Freenet Development Tool and Kernel
+
+- Install the Freenet development tool (`fdev`) and the Freenet kernel for local development:
 
   ```bash
   cargo install --path ../../crates/core
   cargo install --path ../../crates/fdev
   ```
 
-- Add WebAssembly target
+### WebAssembly Target
+
+- Add the WebAssembly target for Rust:
 
   ```bash
   rustup target add wasm32-unknown-unknown
   ```
 
-## Build contract
+## Build Contract
 
-```bash
-cd contracts/ping && CARGO_TARGET_DIR=./target fdev build --features contract && cd -
-```
+- Build the contract using the Freenet development tool:
 
-## Run freenet locally
+  ```bash
+  cd contracts/ping
+  CARGO_TARGET_DIR=./target fdev build --features contract
+  cd -
+  ```
 
-```bash
-freenet local
-```
+## Run Freenet Locally
 
-## Run ping application
+- Start the Freenet network locally:
 
-```bash
-cd app && cargo install --path . && freenet-ping
-```
+  ```bash
+  freenet local
+  ```
+
+## Run Ping Application
+
+- Run the ping application:
+
+  ```bash
+  cd app
+  cargo install --path .
+  freenet-ping
+  ```
+  
+  You will see something like this:
+
+  ```bash
+    $ freenet-ping
+    2024-05-14T15:33:20.685412Z  INFO freenet_ping: 154: put ping contract successfully! key=Cuj4LbFao6vzZ5VtvZAKZ64Y99qNh7MpTUdaCcEkU4oR
+    2024-05-14T15:33:20.729883Z  INFO freenet_ping: 146: Hello, ubiquitous-letters!
+    2024-05-14T15:33:22.154174Z  INFO freenet_ping: 146: Hello, unwieldy-level!
+    2024-05-14T15:33:23.668494Z  INFO freenet_ping: 146: Hello, woozy-pin!
+    2024-05-14T15:33:23.668504Z  INFO freenet_ping: 146: Hello, conscious-crayon!
+    2024-05-14T15:33:25.153814Z  INFO freenet_ping: 146: Hello, unequal-kite!
+    2024-05-14T15:33:26.668615Z  INFO freenet_ping: 146: Hello, absorbed-wren!
+    2024-05-14T15:33:26.668628Z  INFO freenet_ping: 146: Hello, glib-disease!
+    2024-05-14T15:33:28.154082Z  INFO freenet_ping: 146: Hello, secret-floor!
+    2024-05-14T15:33:29.669125Z  INFO freenet_ping: 146: Hello, opposite-border!
+    2024-05-14T15:33:29.669135Z  INFO freenet_ping: 146: Hello, plucky-stretch!
+    ^C2024-05-14T15:33:29.713473Z  INFO freenet_ping: 169: shutting down...
+    $ 
+  ```
