@@ -48,10 +48,10 @@ Ensure you have the following prerequisites installed:
 
 ### Freenet Core
 
-- Clone the Freenet Core repository and navigate to the application directory:
+- Clone the Freenet Core repository and the stdlib submodule, and navigate to the application directory:
 
   ```bash
-  git clone https://github.com/freenet/freenet-core.git
+  git clone --recurse-submodules https://github.com/freenet/freenet-core.git
   cd freenet-core/apps/freenet-ping
   ```
 
