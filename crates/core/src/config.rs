@@ -1,7 +1,7 @@
 use std::{
     fs::{self, File},
     future::Future,
-    io::Read,
+    io::{Read, Write},
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
     sync::atomic::AtomicBool,
@@ -124,8 +124,57 @@ impl ConfigArgs {
                 }
             }
         } else {
-            None
+            // find default application dir to see if there is a config file
+            let dir = ConfigPathsArgs::app_data_dir()?;
+
+            if dir.exists() {
+                let mut dir = std::fs::read_dir(&dir)?;
+                let config_args = dir.find_map(|f| {
+                    if let Ok(f) = f {
+                        let filename = f.file_name().to_string_lossy().into_owned();
+                        let ext = filename.rsplit('.').next().map(|s| s.to_owned());
+
+                        if let Some(ext) = ext {
+                            if filename.starts_with("config") {
+                                match ext.as_str() {
+                                    "toml" => {
+                                        return Some((filename, ext));
+                                    }
+                                    "json" => {
+                                        return Some((filename, ext));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+
+                    None
+                });
+                match config_args {
+                    Some((filename, ext)) => match ext.as_str() {
+                        "toml" => {
+                            let mut file = File::open(&*filename)?;
+                            let mut content = String::new();
+                            file.read_to_string(&mut content)?;
+                            Some(toml::from_str::<Self>(&content).map_err(|e| {
+                                std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                            })?)
+                        }
+                        "json" => {
+                            let mut file = File::open(&*filename)?;
+                            Some(serde_json::from_reader::<_, Self>(&mut file)?)
+                        }
+                        _ => None,
+                    },
+                    None => None,
+                }
+            } else {
+                None
+            }
         };
+
+        let should_persist = cfg.is_none();
 
         // merge the configuration from the file with the command line arguments
         if let Some(cfg) = cfg {
@@ -153,7 +202,8 @@ impl ConfigArgs {
         }
 
         let mode = self.mode.unwrap_or(OperationMode::Network);
-        Ok(Config {
+
+        let this = Config {
             mode,
             http_gateway: GatewayConfig {
                 address: self.http_gateway.address.unwrap_or_else(|| match mode {
@@ -191,7 +241,18 @@ impl ConfigArgs {
             },
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
             config_paths: self.config_paths.build()?,
-        })
+        };
+
+        if should_persist {
+            let mut file = File::create(this.config_paths.data_dir.join("config.toml"))?;
+            file.write_all(
+                toml::to_string(&this)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+                    .as_bytes(),
+            )?;
+        }
+
+        Ok(this)
     }
 }
 
