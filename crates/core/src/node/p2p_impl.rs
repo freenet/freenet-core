@@ -72,10 +72,7 @@ impl NodeP2P {
         CH: ContractHandler + Send + 'static,
         ER: NetEventRegister + Clone,
     {
-        let keypair = config
-            .key_pair
-            .clone()
-            .unwrap_or_else(|| TransportKeypair::new());
+        let keypair = config.key_pair.clone().unwrap_or_default();
         // FIXME: pass downn this keypair to the network listener
         let peer_pub_key = keypair.public.clone();
 

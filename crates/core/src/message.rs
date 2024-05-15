@@ -377,11 +377,11 @@ impl MessageStats for NetMessageV1 {
 
     fn target(&self) -> Option<PeerKeyLocation> {
         match self {
-            NetMessageV1::Connect(op) => op.target(),
-            NetMessageV1::Put(op) => op.target().cloned(),
-            NetMessageV1::Get(op) => op.target().cloned(),
-            NetMessageV1::Subscribe(op) => op.target().cloned(),
-            NetMessageV1::Update(op) => op.target().cloned(),
+            NetMessageV1::Connect(op) => op.target().as_ref().map(|b| b.borrow().clone()),
+            NetMessageV1::Put(op) => op.target().as_ref().map(|b| b.borrow().clone()),
+            NetMessageV1::Get(op) => op.target().as_ref().map(|b| b.borrow().clone()),
+            NetMessageV1::Subscribe(op) => op.target().as_ref().map(|b| b.borrow().clone()),
+            NetMessageV1::Update(op) => op.target().as_ref().map(|b| b.borrow().clone()),
             NetMessageV1::Aborted(_) => None,
             NetMessageV1::Unsubscribed { .. } => None,
         }
@@ -412,12 +412,10 @@ impl MessageStats for NetMessageV1 {
     }
 
     fn track_stats(&self) -> bool {
-        match self {
-            NetMessageV1::Connect(_) | NetMessageV1::Subscribe(_) | NetMessageV1::Aborted(_) => {
-                false
-            }
-            _ => true,
-        }
+        !matches!(
+            self,
+            NetMessageV1::Connect(_) | NetMessageV1::Subscribe(_) | NetMessageV1::Aborted(_)
+        )
     }
 }
 

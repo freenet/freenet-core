@@ -422,7 +422,7 @@ fn build_op_result(
 }
 
 mod messages {
-    use std::fmt::Display;
+    use std::{borrow::Borrow, fmt::Display};
 
     use super::*;
 
@@ -465,7 +465,7 @@ mod messages {
             }
         }
 
-        fn target(&self) -> Option<&PeerKeyLocation> {
+        fn target(&self) -> Option<impl Borrow<PeerKeyLocation>> {
             match self {
                 Self::SeekNode { target, .. } => Some(target),
                 Self::ReturnSub { target, .. } => Some(target),

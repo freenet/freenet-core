@@ -48,10 +48,17 @@ Ensure you have the following prerequisites installed:
 
 ### Freenet Core
 
+<<<<<<< HEAD
+- Clone the Freenet Core repository and navigate to the application directory:
+
+  ```bash
+  git clone git@github.com:freenet/freenet-core.git
+=======
 - Clone the Freenet Core repository and the stdlib submodule, and navigate to the application directory:
 
   ```bash
   git clone --recurse-submodules https://github.com/freenet/freenet-core.git
+>>>>>>> main
   cd freenet-core/apps/freenet-ping
   ```
 
@@ -60,7 +67,10 @@ Ensure you have the following prerequisites installed:
 - Install the Freenet development tool (`fdev`) and the Freenet kernel for local development:
 
   ```bash
+<<<<<<< HEAD
+=======
   # You should be in freenet-core/apps/freenet-ping
+>>>>>>> main
   cargo install --path ../../crates/core
   cargo install --path ../../crates/fdev
   ```
@@ -78,7 +88,10 @@ Ensure you have the following prerequisites installed:
 - Build the contract using the Freenet development tool:
 
   ```bash
+<<<<<<< HEAD
+=======
   # You should be in freenet-core/apps/freenet-ping
+>>>>>>> main
   cd contracts/ping
   CARGO_TARGET_DIR=./target fdev build --features contract
   cd -
