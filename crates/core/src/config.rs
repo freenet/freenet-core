@@ -10,6 +10,7 @@ use std::{
 
 use directories::ProjectDirs;
 use once_cell::sync::Lazy;
+use pkcs1::DecodeRsaPrivateKey;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
@@ -92,6 +93,7 @@ impl ConfigArgs {
                     "Configuration file not found",
                 ));
             }
+
             match path.extension() {
                 None => {
                     return Err(std::io::Error::new(
@@ -168,14 +170,22 @@ impl ConfigArgs {
                             format!("Failed to open key file {}: {e}", path_to_key.display()),
                         )
                     })?;
-                    let mut buf = Vec::new();
-                    key_file.read_to_end(&mut buf).map_err(|e| {
+                    let mut buf = String::new();
+                    key_file.read_to_string(&mut buf).map_err(|e| {
                         std::io::Error::new(
                             e.kind(),
                             format!("Failed to read key file {}: {e}", path_to_key.display()),
                         )
                     })?;
-                    todo!("get an rsa private key from the file and create a TransportKeypair")
+
+                    let pk = rsa::RsaPrivateKey::from_pkcs1_pem(&buf).map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Failed to read key file {}: {e}", path_to_key.display()),
+                        )
+                    })?;
+
+                    TransportKeypair::from_private_key(pk)
                 }
                 None => TransportKeypair::new(),
             },

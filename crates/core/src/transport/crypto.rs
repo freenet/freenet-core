@@ -28,6 +28,13 @@ impl TransportKeypair {
         }
     }
 
+    pub fn from_private_key(priv_key: RsaPrivateKey) -> Self {
+        TransportKeypair {
+            public: TransportPublicKey(RsaPublicKey::from(&priv_key)),
+            secret: TransportSecretKey(priv_key),
+        }
+    }
+
     pub fn public(&self) -> &TransportPublicKey {
         &self.public
     }
