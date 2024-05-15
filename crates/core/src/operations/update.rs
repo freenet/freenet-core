@@ -654,7 +654,7 @@ pub(crate) async fn request_update(
 }
 
 mod messages {
-    use std::{borrow::Borrow, fmt::Display};
+    use std::fmt::Display;
 
     use freenet_stdlib::prelude::{ContractKey, RelatedContracts, StateSummary, WrappedState};
     use serde::{Deserialize, Serialize};
@@ -724,7 +724,7 @@ mod messages {
             }
         }
 
-        fn target(&self) -> Option<impl Borrow<PeerKeyLocation>> {
+        fn target(&self) -> Option<&PeerKeyLocation> {
             match self {
                 UpdateMsg::RequestUpdate { target, .. } => Some(target),
                 UpdateMsg::SuccessfulUpdate { target, .. } => Some(target),

@@ -32,7 +32,7 @@ impl IsotonicEstimator {
         let mut peer_events: HashMap<PeerKeyLocation, Vec<IsotonicEvent>> = HashMap::new();
 
         for event in history {
-            let point = Point::new(event.route_distance().as_f64(), event.result);
+            let point = Point::new(event.route_distance().as_f64(), event.result.clone());
 
             all_points.push(point);
             peer_events
@@ -308,7 +308,12 @@ mod tests {
         peer: PeerKeyLocation,
         contract_location: Location,
     ) -> IsotonicEvent {
-        let distance: f64 = peer.location.unwrap().distance(contract_location).as_f64();
+        let distance: f64 = peer
+            .location
+            .clone()
+            .unwrap()
+            .distance(contract_location)
+            .as_f64();
 
         let result = distance.powf(0.5) + peer.peer.clone().to_bytes()[0] as f64;
         IsotonicEvent {
@@ -322,7 +327,12 @@ mod tests {
         peer: PeerKeyLocation,
         contract_location: Location,
     ) -> IsotonicEvent {
-        let distance: f64 = peer.location.unwrap().distance(contract_location).as_f64();
+        let distance: f64 = peer
+            .location
+            .clone()
+            .unwrap()
+            .distance(contract_location)
+            .as_f64();
 
         let result = (100.0 - distance).powf(0.5) + peer.peer.clone().to_bytes()[0] as f64;
         IsotonicEvent {

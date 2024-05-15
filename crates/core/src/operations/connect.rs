@@ -1,5 +1,4 @@
 //! Operation which seeks new connections in the ring.
-use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -114,7 +113,6 @@ impl Operation for ConnectOp {
                 #[cfg(debug_assertions)]
                 if matches!(err, crate::node::OpNotAvailable::Completed) {
                     let target = msg.target();
-                    let target = target.as_ref().map(|b| b.borrow());
                     tracing::warn!(%tx, peer = ?target, "filtered");
                 }
                 Err(err.into())
@@ -429,8 +427,13 @@ impl Operation for ConnectOp {
                                     "All available connections established",
                                 );
 
-                                try_clean_gw_connection(*id, network_bridge, info, target.clone())
-                                    .await?;
+                                try_clean_gw_connection(
+                                    id.clone(),
+                                    network_bridge,
+                                    info,
+                                    target.clone(),
+                                )
+                                .await?;
 
                                 new_state = Some(ConnectState::Connected);
                             } else {
@@ -701,7 +704,7 @@ where
                         None,
                         peer_pub_key.clone(),
                         gateway,
-                        &op_manager,
+                        &*op_manager,
                         &mut conn_manager,
                     )
                     .await
@@ -728,7 +731,7 @@ where
     CM: NetworkBridge + Send,
 {
     if !op_manager.ring.should_accept(
-        gateway.location.unwrap_or_else(Location::random),
+        gateway.location.unwrap_or_else(|| Location::random()),
         Some(&gateway.peer),
     ) {
         // ensure that we still want to connect AND reserve an spot implicitly
@@ -1002,11 +1005,11 @@ mod messages {
             }
         }
 
-        fn target(&self) -> Option<impl Borrow<PeerKeyLocation>> {
+        fn target(&self) -> Option<PeerKeyLocation> {
             use ConnectMsg::*;
             match self {
-                Response { target, .. } => Some(target),
-                Connected { target, .. } => Some(target),
+                Response { target, .. } => Some(target.clone()),
+                Connected { target, .. } => Some(target.clone()),
                 _ => None,
             }
         }
@@ -1023,7 +1026,7 @@ mod messages {
         }
 
         fn requested_location(&self) -> Option<Location> {
-            self.target().and_then(|pkloc| pkloc.borrow().location)
+            self.target().and_then(|pkloc| pkloc.location)
         }
     }
 

@@ -523,7 +523,7 @@ impl Ring {
         let my_location = self
             .own_location()
             .location
-            .unwrap_or_else(Location::random);
+            .unwrap_or_else(|| /* havent joined the ring yet */ Location::random());
         let accepted = if location == my_location
             || self.connections_by_location.read().contains_key(&location)
         {
@@ -546,10 +546,12 @@ impl Ring {
         if !accepted {
             self.open_connections
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        } else if let Some(peer_id) = peer {
-            self.location_for_peer
-                .write()
-                .insert(peer_id.clone(), location);
+        } else {
+            if let Some(peer_id) = peer {
+                self.location_for_peer
+                    .write()
+                    .insert(peer_id.clone(), location);
+            }
         }
         accepted
     }
@@ -641,7 +643,7 @@ impl Ring {
     pub fn routing_finished(&self, event: crate::router::RouteEvent) {
         self.topology_manager
             .write()
-            .report_outbound_request(event.peer.clone(), event.contract_location);
+            .report_outbound_request(event.peer.clone(), event.contract_location.clone());
         self.router.write().add_event(event);
     }
 
