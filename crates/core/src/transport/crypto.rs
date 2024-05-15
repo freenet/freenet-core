@@ -14,6 +14,12 @@ impl Default for TransportKeypair {
     }
 }
 
+impl Default for TransportKeypair {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TransportKeypair {
     pub fn new() -> Self {
         let mut rng = OsRng;

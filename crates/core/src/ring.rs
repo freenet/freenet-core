@@ -523,7 +523,7 @@ impl Ring {
         let my_location = self
             .own_location()
             .location
-            .unwrap_or_else(|| /* havent joined the ring yet */ Location::random());
+            .unwrap_or_else(Location::random);
         let accepted = if location == my_location
             || self.connections_by_location.read().contains_key(&location)
         {
@@ -641,7 +641,7 @@ impl Ring {
     pub fn routing_finished(&self, event: crate::router::RouteEvent) {
         self.topology_manager
             .write()
-            .report_outbound_request(event.peer.clone(), event.contract_location.clone());
+            .report_outbound_request(event.peer.clone(), event.contract_location);
         self.router.write().add_event(event);
     }
 

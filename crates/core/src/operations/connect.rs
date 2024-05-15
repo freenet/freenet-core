@@ -114,7 +114,8 @@ impl Operation for ConnectOp {
                 #[cfg(debug_assertions)]
                 if matches!(err, crate::node::OpNotAvailable::Completed) {
                     let target = msg.target();
-                    tracing::warn!(%tx, peer = ?target.as_ref().map(|b| b.borrow()), "filtered");
+                    let target = target.as_ref().map(|b| b.borrow());
+                    tracing::warn!(%tx, peer = ?target, "filtered");
                 }
                 Err(err.into())
             }
