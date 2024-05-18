@@ -30,19 +30,16 @@ use crate::{
         NetworkEventListenerHalve, WaitingResolution,
     },
     message::{MessageStats, NetMessage, NodeEvent, Transaction},
-    node::{
-        handle_aborted_op, process_message, NetEventRegister, NodeConfig, OpManager,
-        PeerId as FreenetPeerId,
-    },
+    node::{handle_aborted_op, process_message, NetEventRegister, NodeConfig, OpManager},
     ring::PeerKeyLocation,
     tracing::NetEventLog,
 };
 
-type P2pBridgeEvent = Either<(FreenetPeerId, Box<NetMessage>), NodeEvent>;
+type P2pBridgeEvent = Either<(PeerId, Box<NetMessage>), NodeEvent>;
 
 #[derive(Clone)]
 pub(crate) struct P2pBridge {
-    accepted_peers: Arc<DashSet<FreenetPeerId>>,
+    accepted_peers: Arc<DashSet<PeerId>>,
     ev_listener_tx: Sender<P2pBridgeEvent>,
     op_manager: Arc<OpManager>,
     log_register: Arc<dyn NetEventRegister>,
@@ -67,12 +64,12 @@ impl P2pBridge {
 }
 
 impl NetworkBridge for P2pBridge {
-    async fn drop_connection(&mut self, peer: &FreenetPeerId) -> super::ConnResult<()> {
+    async fn drop_connection(&mut self, peer: &PeerId) -> super::ConnResult<()> {
         self.accepted_peers.remove(peer);
         self.ev_listener_tx
             .send(Right(NodeEvent::DropConnection(peer.clone())))
             .await
-            .map_err(|_| ConnectionError::SendNotCompleted)?;
+            .map_err(|_| ConnectionError::SendNotCompleted(peer.clone()))?;
         self.log_register
             .register_events(Either::Left(NetEventLog::disconnected(
                 &self.op_manager.ring,
@@ -82,7 +79,7 @@ impl NetworkBridge for P2pBridge {
         Ok(())
     }
 
-    async fn send(&self, target: &FreenetPeerId, msg: NetMessage) -> super::ConnResult<()> {
+    async fn send(&self, target: &PeerId, msg: NetMessage) -> super::ConnResult<()> {
         self.log_register
             .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager.ring))
             .await;
@@ -90,7 +87,7 @@ impl NetworkBridge for P2pBridge {
         self.ev_listener_tx
             .send(Left((target.clone(), Box::new(msg))))
             .await
-            .map_err(|_| ConnectionError::SendNotCompleted)?;
+            .map_err(|_| ConnectionError::SendNotCompleted(target.clone()))?;
         Ok(())
     }
 }
@@ -108,16 +105,6 @@ pub(in crate::node) struct P2pConnManager {
     listening_ip: IpAddr,
     listening_port: u16,
     is_gateway: bool,
-}
-
-impl Drop for P2pConnManager {
-    fn drop(&mut self) {
-        tracing::info!(
-            "This peer {:?} has active connections with peers: {:?}",
-            self.bridge.op_manager.ring.get_peer_key().unwrap(),
-            self.connection.keys().map(|p| &p.addr)
-        );
-    }
 }
 
 impl P2pConnManager {
@@ -205,15 +192,19 @@ impl P2pConnManager {
                     match self.conn_bridge_rx.recv().await {
                         Some(msg) => match msg {
                             Left((peer, msg)) => {
-                                if let Right(new_conn) = self
+                                let res = self
                                     .handle_bridge_connection_message(
                                         peer,
                                         msg,
                                         &mut outbound_conn_handler,
                                         &mut pending_inbound_gw_conns,
                                     )
-                                    .await?
-                                {
+                                    .await;
+                                if let Err(ConnectionError::SendNotCompleted(peer)) = &res {
+                                    op_manager.ring.prune_connection(peer.clone()).await;
+                                    self.connection.remove(peer);
+                                }
+                                if let Right(new_conn) = res? {
                                     break Ok::<_, anyhow::Error>(Left(new_conn));
                                 }
                             }
@@ -246,7 +237,12 @@ impl P2pConnManager {
                         Some(Ok(peer_conn)) => peer_conn,
                         Some(Err(err)) => {
                             tracing::error!("Error in peer connection: {err}");
-                            // FIXME: clean up the remote connection from everywhere
+                            if let TransportError::ConnectionClosed(socket_addr) = err {
+                                if let Some(peer) = self.connection.keys().find_map(|k| (&k.addr == &socket_addr).then(|| k.clone())) {
+                                    op_manager.ring.prune_connection(peer.clone()).await;
+                                    self.connection.remove(&peer);
+                                }
+                            }
                             continue;
                         }
                         None =>  {
@@ -442,13 +438,15 @@ impl P2pConnManager {
                                 ..
                             })) = &msg
                             {
+                                // FIXME: first should check that this is indeed an alive transaction
                                 tracing::debug!(remote = %joiner, this_peer = ?op_manager.ring.get_peer_key().unwrap(), "Received clean connection message");
                                 // this is the clean up message for a gw connection that was not accepted
                                 // in this case the joiner is connected to another peers, so we don't need to maintain the
                                 // connection with the rejected gateway
                                 gw_inbound_pending_connections.remove(&joiner.peer.addr());
-                                self.connection.remove(&joiner.peer);
+                                tracing::error!(%joiner.peer, "Dropping connection because unneeded");
                                 op_manager.ring.prune_connection(joiner.peer.clone()).await;
+                                self.connection.remove(&joiner.peer);
                             }
 
                             let executor_callback = pending_from_executor
@@ -656,7 +654,7 @@ impl P2pConnManager {
         {
             tx.send(Either::Left(*net_msg))
                 .await
-                .map_err(|_| ConnectionError::SendNotCompleted)?;
+                .map_err(|_| ConnectionError::SendNotCompleted(peer.clone()))?;
             if closing_gw_conn.is_some() {
                 let _ = tx
                     .send(Either::Right(ConnMngrActions::ClosedChannel))
@@ -671,21 +669,16 @@ impl P2pConnManager {
         if let Some((_, conn)) = &mut connection {
             conn.send(net_msg)
                 .await
-                .map_err(|_| ConnectionError::SendNotCompleted)?;
-        } else if let Some(conn) = self.connection.get(&peer) {
-            tracing::debug!(target = %peer, "Connection status: {}", if conn.is_closed() { "closed" } else { "open" });
-            conn.send(Either::Left(*net_msg))
-                .await
-                .map_err(|_| ConnectionError::SendNotCompleted)?;
+                .map_err(|_| ConnectionError::SendNotCompleted(peer))?;
         } else {
             if let Some(conn) = self.connection.get(&peer) {
                 tracing::debug!(target = %peer, "Connection status: {}", conn.is_closed().then(|| "closed").unwrap_or("open"));
                 conn.send(Either::Left(*net_msg))
                     .await
-                    .map_err(|_| ConnectionError::SendNotCompleted)?;
+                    .map_err(|_| ConnectionError::SendNotCompleted(peer))?;
             } else {
                 tracing::error!(target = %peer, "Connection likely dropped");
-                return Err(ConnectionError::SendNotCompleted);
+                return Err(ConnectionError::SendNotCompleted(peer));
             }
         }
 
@@ -701,7 +694,7 @@ enum ConnMngrActions {
     },
     /// Received a new connection
     ConnectionEstablished {
-        peer: FreenetPeerId,
+        peer: PeerId,
         peer_conn: PeerConnection,
     },
     /// Accept connection
@@ -733,7 +726,7 @@ async fn peer_connection_listener(
         tokio::select! {
             msg = rx.recv() => {
                 tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), "Received message from channel");
-                let Some(msg) = msg else { break Err(TransportError::ConnectionClosed); };
+                let Some(msg) = msg else { break Err(TransportError::ConnectionClosed(conn.remote_addr())); };
                 match msg {
                     Left(msg) => {
                         tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr() ,"Sending message to peer. Msg: {msg}");
@@ -745,7 +738,7 @@ async fn peer_connection_listener(
                         tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), "Received action from channel");
                         match action {
                             ConnMngrActions::NodeAction(NodeEvent::DropConnection(_)) | ConnMngrActions::ClosedChannel => {
-                                break Err(TransportError::ConnectionClosed);
+                                break Err(TransportError::ConnectionClosed(conn.remote_addr()));
                             }
                             ConnMngrActions::AcceptConnection => {
                                 return Ok(PeerConnectionInbound { conn, rx, msg: None });
@@ -759,7 +752,7 @@ async fn peer_connection_listener(
                 let Ok(msg) = msg.map_err(|error| {
                     tracing::error!(at=?conn.my_address(), from=%conn.remote_addr(), "Error while receiving message: {error}");
                 }) else {
-                     break Err(TransportError::ConnectionClosed);
+                     break Err(TransportError::ConnectionClosed(conn.remote_addr()));
                 };
                 let net_message = decode_msg(&msg).unwrap();
                 tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr() ,"Received message from peer. Msg: {net_message}");

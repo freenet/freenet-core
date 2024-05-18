@@ -34,7 +34,7 @@ pub(crate) enum ConnectionError {
     #[error("location unknown for this node")]
     LocationUnknown,
     #[error("unable to send message")]
-    SendNotCompleted,
+    SendNotCompleted(PeerId),
     #[error("Unexpected connection req")]
     UnexpectedReq,
     #[error("error while de/serializing message")]
@@ -69,7 +69,7 @@ impl Clone for ConnectionError {
         match self {
             Self::LocationUnknown => Self::LocationUnknown,
             Self::Serialization(_) => Self::Serialization(None),
-            Self::SendNotCompleted => Self::SendNotCompleted,
+            Self::SendNotCompleted(peer) => Self::SendNotCompleted(peer.clone()),
             Self::IOError(err) => Self::IOError(err.clone()),
             Self::Timeout => Self::Timeout,
             Self::UnexpectedReq => Self::UnexpectedReq,

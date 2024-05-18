@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     fmt::Display,
+    io::Write,
     net::SocketAddr,
     ops::Deref,
     process::Stdio,
@@ -8,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 use axum::{
     body::Body,
     extract::{
@@ -193,7 +194,14 @@ pub(super) async fn run(
 ) -> Result<(), Error> {
     match &cmd_config.mode {
         Process::Supervisor => start_supervisor(config).await,
-        Process::Peer => start_child(config, cmd_config).await,
+        Process::Peer => {
+            if let Err(err) = start_child(config, cmd_config).await {
+                let _ = std::io::stderr()
+                    .write_all(format!("exit cause (node: {:?}): {err}", cmd_config.id).as_bytes());
+                std::process::exit(1)
+            }
+            Ok(())
+        }
     }
 }
 
@@ -683,6 +691,7 @@ impl Runnable for NetworkPeer {
                 }
                 Err(e) => {
                     tracing::error!("Node {} failed: {}", peer_id, e);
+                    bail!("Node {} failed: {}", peer_id, e);
                 }
             },
             Err(e) => {

@@ -768,7 +768,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     }
                     Ok(None) => {
                         tracing::debug!(%this_addr, "debug: connection closed");
-                        return Err(TransportError::ConnectionClosed);
+                        return Err(TransportError::ConnectionClosed(remote_addr));
                     }
                     Err(_) => {
                         failures += 1;
