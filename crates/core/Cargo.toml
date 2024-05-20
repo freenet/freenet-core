@@ -71,7 +71,7 @@ opentelemetry-jaeger = { features = ["collector_client", "isahc", "rt-tokio"], o
 tracing = { version = "0.1" }
 tracing-opentelemetry = { optional = true, version = "0.23.0" }
 tracing-subscriber = { optional = true, version = "0.3.16" }
-opentelemetry-otlp = { optional = true, version = "0.15" }
+opentelemetry-otlp = { optional = true, version = "0.16" }
 
 # internal deps
 freenet-stdlib = { features = ["net"], workspace = true }
