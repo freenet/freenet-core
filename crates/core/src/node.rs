@@ -563,6 +563,7 @@ macro_rules! handle_op_not_available {
             match state {
                 OpNotAvailable::Running => {
                     tracing::debug!("Operation still running");
+                    // TODO: do exponential backoff
                     tokio::time::sleep(Duration::from_micros(1_000)).await;
                     continue;
                 }
@@ -622,7 +623,8 @@ async fn process_message_v1<CB>(
         .register_events(NetEventLog::from_inbound_msg_v1(&msg, &op_manager))
         .await;
 
-    for i in 0.. {
+    const MAX_RETRIES: usize = 10usize;
+    for i in 0..MAX_RETRIES {
         tracing::debug!(?tx, "Processing operation, iteration: {i}");
         match msg {
             NetMessageV1::Connect(ref op) => {
