@@ -724,7 +724,11 @@ where
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_secs(15)).await;
+            #[cfg(debug_assertions)]
+            const WAIT_TIME: u64 = 15;
+            #[cfg(not(debug_assertions))]
+            const WAIT_TIME: u64 = 3;
+            tokio::time::sleep(Duration::from_secs(WAIT_TIME)).await;
         }
     });
     Ok(())

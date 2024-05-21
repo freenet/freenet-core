@@ -526,7 +526,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         // Constants for exponential backoff
-        const INITIAL_TIMEOUT: Duration = Duration::from_secs(5);
+        const INITIAL_TIMEOUT: Duration = Duration::from_millis(10);
         const TIMEOUT_MULTIPLIER: f64 = 1.1;
         #[cfg(not(test))]
         const MAX_TIMEOUT: Duration = Duration::from_secs(60); // Maximum timeout limit
@@ -772,7 +772,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     }
                     Err(_) => {
                         failures += 1;
-                        tracing::debug!(%this_addr, "Failed to receive UDP response, time out");
+                        tracing::debug!(%this_addr, %remote_addr, "failed to receive UDP response, time out");
                     }
                 }
 
@@ -783,7 +783,9 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                 // Update timeout using exponential backoff, capped at MAX_TIMEOUT
                 timeout = std::cmp::min(
-                    Duration::from_secs((timeout.as_secs() as f64 * TIMEOUT_MULTIPLIER) as u64),
+                    Duration::from_millis(
+                        ((timeout.as_millis()) as f64 * TIMEOUT_MULTIPLIER) as u64,
+                    ),
                     MAX_TIMEOUT,
                 );
 
