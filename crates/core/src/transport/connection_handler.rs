@@ -419,7 +419,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             let mut buf = [0u8; MAX_PACKET_SIZE];
             let mut waiting_time = INITIAL_INTERVAL;
             let mut attempts = 0;
-            const MAX_ATTEMPTS: usize = 20;
+            const MAX_ATTEMPTS: usize = 30;
 
             while attempts < MAX_ATTEMPTS {
                 outbound_packets
