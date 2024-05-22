@@ -526,8 +526,8 @@ impl<S: Socket> UdpPacketsListener<S> {
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         // Constants for exponential backoff
-        const INITIAL_TIMEOUT: Duration = Duration::from_millis(10);
-        const TIMEOUT_MULTIPLIER: f64 = 1.1;
+        const INITIAL_TIMEOUT: Duration = Duration::from_millis(15);
+        const TIMEOUT_MULTIPLIER: f64 = 1.2;
         #[cfg(not(test))]
         const MAX_TIMEOUT: Duration = Duration::from_secs(60); // Maximum timeout limit
         #[cfg(test)]
@@ -767,7 +767,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                         }
                     }
                     Ok(None) => {
-                        tracing::debug!(%this_addr, "debug: connection closed");
+                        tracing::debug!(%this_addr, %remote_addr, "debug: connection closed");
                         return Err(TransportError::ConnectionClosed(remote_addr));
                     }
                     Err(_) => {
