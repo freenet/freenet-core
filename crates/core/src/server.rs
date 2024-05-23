@@ -185,8 +185,7 @@ pub mod network_node {
     use tower_http::trace::TraceLayer;
 
     use crate::{
-        client_events::websocket::WebSocketProxy, config::Config, dev_tool::NodeConfig,
-        transport::TransportKeypair, DynError,
+        client_events::websocket::WebSocketProxy, config::Config, dev_tool::NodeConfig, DynError,
     };
 
     use super::{http_gateway::HttpGateway, serve};

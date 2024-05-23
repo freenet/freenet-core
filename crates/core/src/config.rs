@@ -46,11 +46,6 @@ pub struct ConfigArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<OperationMode>,
 
-    /// Path to the configuration file.
-    #[clap(short, long)]
-    #[serde(skip)]
-    pub config: Option<PathBuf>,
-
     #[clap(flatten)]
     #[serde(flatten)]
     pub http_gateway: GatewayArgs,
@@ -71,7 +66,6 @@ impl Default for ConfigArgs {
     fn default() -> Self {
         Self {
             mode: Some(OperationMode::Network),
-            config: None,
             http_gateway: GatewayArgs {
                 address: Some(default_gateway_address()),
                 port: Some(default_gateway_port()),
@@ -84,94 +78,72 @@ impl Default for ConfigArgs {
 }
 
 impl ConfigArgs {
-    /// Parse the command line arguments and return the configuration.
-    pub fn build(mut self) -> std::io::Result<Config> {
-        let cfg = if let Some(path) = self.config.as_ref() {
-            if !path.exists() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "Configuration file not found",
-                ));
-            }
+    fn read_config(dir: &PathBuf) -> std::io::Result<Option<ConfigArgs>> {
+        if dir.exists() {
+            let mut dir = std::fs::read_dir(dir)?;
+            let config_args = dir.find_map(|f| {
+                if let Ok(f) = f {
+                    let filename = f.file_name().to_string_lossy().into_owned();
+                    let ext = filename.rsplit('.').next().map(|s| s.to_owned());
 
-            match path.extension() {
-                None => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "Invalid configuration file",
-                    ))
-                }
-                Some(ext) if ext == "toml" => {
-                    let mut file = File::open(path)?;
-                    let mut content = String::new();
-                    file.read_to_string(&mut content)?;
-                    Some(toml::from_str::<Self>(&content).map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                    })?)
-                }
-                Some(ext) if ext == "json" => {
-                    let mut file = File::open(path)?;
-                    Some(serde_json::from_reader::<_, Self>(&mut file)?)
-                }
-                Some(ext) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "Invalid configuration file extension: {}",
-                            ext.to_string_lossy()
-                        ),
-                    ))
-                }
-            }
-        } else {
-            // find default application dir to see if there is a config file
-            let dir = ConfigPathsArgs::app_data_dir()?;
-
-            if dir.exists() {
-                let mut dir = std::fs::read_dir(&dir)?;
-                let config_args = dir.find_map(|f| {
-                    if let Ok(f) = f {
-                        let filename = f.file_name().to_string_lossy().into_owned();
-                        let ext = filename.rsplit('.').next().map(|s| s.to_owned());
-
-                        if let Some(ext) = ext {
-                            if filename.starts_with("config") {
-                                match ext.as_str() {
-                                    "toml" => {
-                                        return Some((filename, ext));
-                                    }
-                                    "json" => {
-                                        return Some((filename, ext));
-                                    }
-                                    _ => {}
+                    if let Some(ext) = ext {
+                        if filename.starts_with("config") {
+                            match ext.as_str() {
+                                "toml" => {
+                                    return Some((filename, ext));
                                 }
+                                "json" => {
+                                    return Some((filename, ext));
+                                }
+                                _ => {}
                             }
                         }
                     }
-
-                    None
-                });
-                match config_args {
-                    Some((filename, ext)) => match ext.as_str() {
-                        "toml" => {
-                            let mut file = File::open(&*filename)?;
-                            let mut content = String::new();
-                            file.read_to_string(&mut content)?;
-                            Some(toml::from_str::<Self>(&content).map_err(|e| {
-                                std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                            })?)
-                        }
-                        "json" => {
-                            let mut file = File::open(&*filename)?;
-                            Some(serde_json::from_reader::<_, Self>(&mut file)?)
-                        }
-                        _ => None,
-                    },
-                    None => None,
                 }
-            } else {
+
                 None
+            });
+            match config_args {
+                Some((filename, ext)) => match ext.as_str() {
+                    "toml" => {
+                        let mut file = File::open(&*filename)?;
+                        let mut content = String::new();
+                        file.read_to_string(&mut content)?;
+                        Ok(Some(toml::from_str::<Self>(&content).map_err(|e| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                        })?))
+                    }
+                    "json" => {
+                        let mut file = File::open(&*filename)?;
+                        Ok(Some(serde_json::from_reader::<_, Self>(&mut file)?))
+                    }
+                    ext => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Invalid configuration file extension: {}", ext),
+                    )),
+                },
+                None => Ok(None),
             }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Parse the command line arguments and return the configuration.
+    pub fn build(mut self) -> std::io::Result<Config> {
+        let cfg = if let Some(path) = self.config_paths.config_dir.as_ref() {
+            if !path.exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Configuration directory not found",
+                ));
+            }
+
+            Self::read_config(path)?
+        } else {
+            // find default application dir to see if there is a config file
+            let dir = ConfigPathsArgs::config_dir()?;
+            Self::read_config(&dir)?
         };
 
         let should_persist = cfg.is_none();
@@ -244,7 +216,7 @@ impl ConfigArgs {
         };
 
         if should_persist {
-            let mut file = File::create(this.config_paths.data_dir.join("config.toml"))?;
+            let mut file = File::create(this.config_paths.config_dir.join("config.toml"))?;
             file.write_all(
                 toml::to_string(&this)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
@@ -400,6 +372,7 @@ const fn default_gateway_port() -> u16 {
 
 #[derive(clap::Parser, Default, Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigPathsArgs {
+    config_dir: Option<PathBuf>,
     contracts_dir: Option<PathBuf>,
     delegates_dir: Option<PathBuf>,
     secrets_dir: Option<PathBuf>,
@@ -444,6 +417,17 @@ impl ConfigPathsArgs {
             project_dir.data_dir().into()
         };
         Ok(app_data_dir)
+    }
+
+    pub fn config_dir() -> std::io::Result<PathBuf> {
+        let project_dir = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
+            .ok_or(std::io::ErrorKind::NotFound)?;
+        let config_data_dir: PathBuf = if cfg!(any(test, debug_assertions)) {
+            std::env::temp_dir().join("freenet").join("config")
+        } else {
+            project_dir.config_dir().into()
+        };
+        Ok(config_data_dir)
     }
 
     pub fn build(self) -> std::io::Result<ConfigPaths> {
@@ -494,6 +478,10 @@ impl ConfigPathsArgs {
             db_dir,
             data_dir: app_data_dir,
             event_log,
+            config_dir: match self.config_dir {
+                Some(dir) => dir,
+                None => Self::config_dir()?,
+            },
         })
     }
 }
@@ -506,6 +494,7 @@ pub struct ConfigPaths {
     db_dir: PathBuf,
     event_log: PathBuf,
     data_dir: PathBuf,
+    config_dir: PathBuf,
 }
 
 impl ConfigPaths {
@@ -543,6 +532,10 @@ impl ConfigPaths {
     pub fn with_delegates_dir(mut self, delegates_dir: PathBuf) -> Self {
         self.delegates_dir = delegates_dir;
         self
+    }
+
+    pub fn config_dir(&self) -> PathBuf {
+        self.config_dir.clone()
     }
 
     pub fn secrets_dir(&self, mode: OperationMode) -> PathBuf {
@@ -593,6 +586,10 @@ impl Config {
 
     pub fn event_log(&self) -> PathBuf {
         self.config_paths.event_log(self.mode)
+    }
+
+    pub fn config_dir(&self) -> PathBuf {
+        self.config_paths.config_dir()
     }
 }
 
