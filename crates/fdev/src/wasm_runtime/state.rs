@@ -1,11 +1,6 @@
-use std::{fs::File, io::Write, sync::Arc};
+use std::{fs::File, io::Write, net::SocketAddr, sync::Arc};
 
-use freenet::dev_tool::{
-    Config, ContractStore, DelegateStore, Executor, OperationMode, SecretsStore, StateStore,
-    Storage,
-};
-use freenet_stdlib::prelude::*;
-use futures::TryFutureExt;
+use freenet_stdlib::{client_api::WebApi, prelude::*};
 use tokio::sync::RwLock;
 
 use crate::wasm_runtime::DeserializationFmt;
@@ -14,47 +9,25 @@ use super::ExecutorConfig;
 
 #[derive(Clone)]
 pub(super) struct AppState {
-    pub(crate) local_node: Arc<RwLock<Executor>>,
+    pub(crate) local_node: Arc<RwLock<WebApi>>,
     config: ExecutorConfig,
 }
 
 impl AppState {
-    const MAX_MEM_CACHE: u32 = 10_000_000;
-    const DEFAULT_MAX_DELEGATE_SIZE: i64 = 10 * 1024 * 1024;
-
     pub async fn new(config: &ExecutorConfig) -> Result<Self, anyhow::Error> {
-        let contract_store =
-            ContractStore::new(Config::conf().contracts_dir(), config.max_contract_size)?;
-        let delegate_store = DelegateStore::new(
-            Config::conf().delegates_dir(),
-            Self::DEFAULT_MAX_DELEGATE_SIZE,
-        )?;
-        let secrets_store = SecretsStore::new(Config::conf().secrets_dir())?;
-        let state_store = StateStore::new(
-            Storage::new(&Config::conf().db_dir()).await?,
-            Self::MAX_MEM_CACHE,
-        )?;
-        let rt = freenet::dev_tool::Runtime::build(
-            contract_store,
-            delegate_store,
-            secrets_store,
-            false,
-        )?;
+        let target: SocketAddr = (config.address, config.port).into();
+        let (stream, _) = tokio_tungstenite::connect_async(&format!(
+            "ws://{}/contract/command?encodingProtocol=native",
+            target
+        ))
+        .await
+        .map_err(|e| {
+            tracing::error!(err=%e);
+            anyhow::anyhow!(format!("fail to connect to the host({target}): {e}"))
+        })?;
+
         Ok(AppState {
-            local_node: Arc::new(RwLock::new(
-                Executor::new(
-                    state_store,
-                    || {
-                        freenet::util::set_cleanup_on_exit()?;
-                        Ok(())
-                    },
-                    OperationMode::Local,
-                    rt,
-                    None,
-                )
-                .map_err(|err| anyhow::anyhow!(err))
-                .await?,
-            )),
+            local_node: Arc::new(RwLock::new(WebApi::start(stream))),
             config: config.clone(),
         })
     }

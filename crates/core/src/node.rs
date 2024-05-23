@@ -8,12 +8,10 @@
 //! - in-memory: a simplifying node used for emulation purposes mainly.
 //! - inter-process: similar to in-memory, but can be rana cross multiple processes, closer to the real p2p impl
 
-use std::net::SocketAddr;
 use std::{
     fmt::Display,
     io::Write,
-    net::{IpAddr, Ipv4Addr},
-    path::PathBuf,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
@@ -28,13 +26,12 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use self::p2p_impl::NodeP2P;
-use crate::message::{MessageStats, NetMessageV1};
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
     config::GlobalExecutor,
     contract::{
         Callback, ClientResponsesReceiver, ClientResponsesSender, ContractError,
-        ExecutorToEventLoopChannel, NetworkContractHandler, OperationMode,
+        ExecutorToEventLoopChannel, NetworkContractHandler,
     },
     message::{NetMessage, NodeEvent, Transaction, TransactionType},
     operations::{
@@ -45,6 +42,10 @@ use crate::{
     router::{RouteEvent, RouteOutcome},
     tracing::{EventRegister, NetEventLog, NetEventRegister},
     DynError,
+};
+use crate::{
+    config::Config,
+    message::{MessageStats, NetMessageV1},
 };
 
 use crate::operations::handle_op_request;
@@ -59,23 +60,6 @@ mod network_bridge;
 mod op_state_manager;
 mod p2p_impl;
 pub(crate) mod testing_impl;
-
-#[derive(clap::Parser, Clone, Debug)]
-pub struct PeerCliConfig {
-    /// Node operation mode.
-    #[clap(value_enum, default_value_t=OperationMode::Local)]
-    pub mode: OperationMode,
-    /// Overrides the default data directory where Freenet contract files are stored.
-    pub node_data_dir: Option<PathBuf>,
-
-    /// Address to bind to
-    #[arg(long, short, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
-    pub address: IpAddr,
-
-    /// Port to expose the websocket API on
-    #[arg(long, short, default_value_t = 50509)]
-    pub port: u16,
-}
 
 pub struct Node(NodeP2P);
 
@@ -109,7 +93,8 @@ pub struct NodeConfig {
     pub local_ip: Option<IpAddr>,
     /// socket port to bind to the network listener.
     pub local_port: Option<u16>,
-    /// IP dialers should connect to, only set on gateways
+    pub(crate) config: Arc<Config>,
+    /// IP dialers should connect to
     pub(crate) public_ip: Option<IpAddr>,
     /// socket port dialers should connect to, only set on gateways
     pub(crate) public_port: Option<u16>,
@@ -127,12 +112,13 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
-    pub fn new() -> NodeConfig {
+    pub fn new(config: Config) -> NodeConfig {
         NodeConfig {
             should_connect: true,
             is_gateway: false,
             key_pair: None,
             remote_nodes: Vec::with_capacity(1),
+            config: Arc::new(config),
             local_ip: None,
             local_port: None,
             public_ip: None,
@@ -145,6 +131,10 @@ impl NodeConfig {
             max_upstream_bandwidth: None,
             max_downstream_bandwidth: None,
         }
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     pub fn is_gateway(&mut self) -> &mut Self {
@@ -210,7 +200,6 @@ impl NodeConfig {
     /// Builds a node using the default backend connection manager.
     pub async fn build<const CLIENTS: usize>(
         self,
-        config: PeerCliConfig,
         clients: [BoxedClient; CLIENTS],
         private_key: TransportKeypair,
     ) -> Result<Node, anyhow::Error> {
@@ -219,23 +208,22 @@ impl NodeConfig {
             {
                 use super::tracing::{CombinedRegister, OTEventRegister};
                 CombinedRegister::new([
-                    Box::new(EventRegister::new(
-                        crate::config::Config::conf().event_log(),
-                    )),
+                    Box::new(EventRegister::new(self.config.event_log())),
                     Box::new(OTEventRegister::new()),
                 ])
             }
             #[cfg(not(feature = "trace-ot"))]
             {
-                EventRegister::new(crate::config::Config::conf().event_log())
+                EventRegister::new(self.config.event_log())
             }
         };
+        let cfg = self.config.clone();
         let node = NodeP2P::build::<NetworkContractHandler, CLIENTS, _>(
             self,
             private_key,
             clients,
             event_register,
-            config,
+            cfg,
         )
         .await?;
         Ok(Node(node))
@@ -244,7 +232,7 @@ impl NodeConfig {
     pub fn get_peer_id(&self) -> Option<PeerId> {
         match (self.key_pair.as_ref(), self.local_ip, self.local_port) {
             (Some(kp), Some(ip), Some(port)) => {
-                Some(PeerId::new(SocketAddr::new(ip, port), kp.public.clone()))
+                Some(PeerId::new(SocketAddr::new(ip, port), kp.public().clone()))
             }
             _ => None,
         }
@@ -269,12 +257,6 @@ impl NodeConfig {
         } else {
             Ok(gateways)
         }
-    }
-}
-
-impl Default for NodeConfig {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -901,7 +883,7 @@ impl PeerId {
 impl<'a> arbitrary::Arbitrary<'a> for PeerId {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let addr: ([u8; 4], u16) = u.arbitrary()?;
-        let pub_key = TransportKeypair::new().public; // FIXME: impl arbitrary for TransportPublicKey
+        let pub_key = TransportKeypair::new().public().clone(); // FIXME: impl arbitrary for TransportPublicKey
         Ok(Self {
             addr: addr.into(),
             pub_key,
@@ -915,7 +897,7 @@ impl PeerId {
         let mut addr = [0; 4];
         rand::thread_rng().fill(&mut addr[..]);
         let port = crate::util::get_free_port().unwrap();
-        let pub_key = TransportKeypair::new().public;
+        let pub_key = TransportKeypair::new().public().clone();
         Self {
             addr: (addr, port).into(),
             pub_key,

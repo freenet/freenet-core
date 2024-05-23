@@ -16,8 +16,10 @@ use freenet_stdlib::client_api::{
     RequestError,
 };
 use freenet_stdlib::prelude::*;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self};
 
+use crate::config::Config;
 use crate::message::Transaction;
 use crate::node::OpManager;
 #[cfg(any(
@@ -33,7 +35,6 @@ use crate::wasm_runtime::{
 };
 use crate::{
     client_events::{ClientId, HostResult},
-    node::PeerCliConfig,
     operations::{self, Operation},
     DynError,
 };
@@ -161,7 +162,8 @@ impl From<Box<RequestError>> for ExecutorError {
 
 type Response = Result<HostResponse, ExecutorError>;
 
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OperationMode {
     /// Run the node in local-only mode. Useful for development purposes.
     Local,
@@ -484,7 +486,7 @@ impl<R> Executor<R> {
     }
 
     async fn get_stores(
-        config: &PeerCliConfig,
+        config: &Config,
     ) -> Result<
         (
             ContractStore,
@@ -496,31 +498,14 @@ impl<R> Executor<R> {
     > {
         const MAX_SIZE: i64 = 10 * 1024 * 1024;
         const MAX_MEM_CACHE: u32 = 10_000_000;
-        let static_conf = crate::config::Config::conf();
 
-        let db_path = crate::config::Config::conf().db_dir();
-        let state_store = StateStore::new(Storage::new(&db_path).await?, MAX_MEM_CACHE).unwrap();
+        let state_store =
+            StateStore::new(Storage::new(&config.db_dir()).await?, MAX_MEM_CACHE).unwrap();
+        let contract_store = ContractStore::new(config.contracts_dir(), MAX_SIZE)?;
 
-        let contract_dir = config
-            .node_data_dir
-            .as_ref()
-            .map(|d| d.join("contracts"))
-            .unwrap_or_else(|| static_conf.contracts_dir());
-        let contract_store = ContractStore::new(contract_dir, MAX_SIZE)?;
+        let delegate_store = DelegateStore::new(config.delegates_dir(), MAX_SIZE)?;
 
-        let delegate_dir = config
-            .node_data_dir
-            .as_ref()
-            .map(|d| d.join("delegates"))
-            .unwrap_or_else(|| static_conf.delegates_dir());
-        let delegate_store = DelegateStore::new(delegate_dir, MAX_SIZE)?;
-
-        let secrets_dir = config
-            .node_data_dir
-            .as_ref()
-            .map(|d| d.join("secrets"))
-            .unwrap_or_else(|| static_conf.secrets_dir());
-        let secret_store = SecretsStore::new(secrets_dir)?;
+        let secret_store = SecretsStore::new(config.secrets_dir())?;
 
         Ok((contract_store, delegate_store, secret_store, state_store))
     }

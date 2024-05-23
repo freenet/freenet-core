@@ -74,7 +74,7 @@ impl NodeP2P {
     {
         let keypair = config.key_pair.clone().unwrap_or_default();
         // FIXME: pass downn this keypair to the network listener
-        let peer_pub_key = keypair.public.clone();
+        let peer_pub_key = keypair.public().clone();
 
         let (notification_channel, notification_tx) = event_loop_notification_channel();
         let (ch_outbound, ch_inbound, wait_for_event) = contract::contract_handler_channel();
