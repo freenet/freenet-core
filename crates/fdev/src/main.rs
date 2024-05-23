@@ -38,7 +38,6 @@ fn main() -> Result<(), anyhow::Error> {
         .enable_all()
         .build()?;
     let config = Config::parse();
-    freenet::config::Config::set_op_mode(config.additional.mode);
     if !config.sub_command.is_child() {
         freenet::config::set_logger(None);
     }

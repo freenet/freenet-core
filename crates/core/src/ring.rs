@@ -260,7 +260,7 @@ impl Ring {
         let peer_pub_key = config
             .key_pair
             .as_ref()
-            .map(|kp| kp.public.clone())
+            .map(|kp| kp.public().clone())
             .ok_or(anyhow::anyhow!("Key pair should be set at this point"))?;
         let peer_key = config.get_peer_id();
 

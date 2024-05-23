@@ -1,6 +1,10 @@
-use std::path::PathBuf;
+use std::{
+    net::{IpAddr, Ipv4Addr},
+    path::PathBuf,
+};
 
 use clap::ArgGroup;
+use freenet::{config::ConfigPathsArgs, dev_tool::OperationMode};
 
 mod commands;
 mod state;
@@ -52,8 +56,18 @@ pub struct ExecutorConfig {
     #[clap(long, requires = "fmt")]
     pub(crate) clean_exit: bool,
     /// Path to the contract to be loaded.
-    #[clap(value_parser)]
-    pub(crate) contract: PathBuf,
+    #[clap(flatten)]
+    pub(crate) paths: ConfigPathsArgs,
+    /// The ip address of freenet node to update the contract to. If the node is running in local mode,
+    /// The default value is `127.0.0.1`
+    #[arg(short, long, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
+    pub(crate) address: IpAddr,
+    /// The port of the running local freenet node.
+    #[arg(short, long, default_value = "50509")]
+    pub(crate) port: u16,
+    /// Node operation mode.
+    #[clap(value_enum, default_value_t = OperationMode::Local, env = "MODE")]
+    pub(crate) mode: OperationMode,
     /// Path to the file containing the parameters for this contract. If not set the default parameters will be empty.
     #[clap(long = "parameters", value_parser)]
     pub(crate) params: Option<PathBuf>,

@@ -74,15 +74,13 @@ impl NetworkPeer {
             {
                 use crate::tracing::OTEventRegister;
                 crate::tracing::CombinedRegister::new([
-                    Box::new(EventRegister::new(
-                        crate::config::Config::conf().event_log(),
-                    )),
+                    Box::new(EventRegister::new(self.config.config.event_log())),
                     Box::new(OTEventRegister::new()),
                 ])
             }
             #[cfg(not(feature = "trace-ot"))]
             {
-                EventRegister::new(crate::config::Config::conf().event_log())
+                EventRegister::new(self.config.config.event_log())
             }
         };
         let node = NodeP2P::build::<MemoryContractHandler, CLIENTS, _>(
