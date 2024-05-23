@@ -87,7 +87,7 @@ pub struct NodeConfig {
     pub should_connect: bool,
     pub is_gateway: bool,
     /// If not specified, a key is generated and used when creating the node.
-    pub key_pair: Option<TransportKeypair>,
+    pub key_pair: TransportKeypair,
     // optional local info, in case this is an initial bootstrap node
     /// IP to bind to the network listener.
     pub local_ip: Option<IpAddr>,
@@ -116,7 +116,7 @@ impl NodeConfig {
         NodeConfig {
             should_connect: true,
             is_gateway: false,
-            key_pair: None,
+            key_pair: config.transport_keypair.clone(),
             remote_nodes: Vec::with_capacity(1),
             config: Arc::new(config),
             local_ip: None,
@@ -144,11 +144,6 @@ impl NodeConfig {
 
     pub fn first_gateway(&mut self) {
         self.should_connect = false;
-    }
-
-    pub fn with_key_pair(&mut self, key_pair: TransportKeypair) -> &mut Self {
-        self.key_pair = Some(key_pair);
-        self
     }
 
     pub fn with_should_connect(&mut self, should_connect: bool) -> &mut Self {
@@ -201,7 +196,6 @@ impl NodeConfig {
     pub async fn build<const CLIENTS: usize>(
         self,
         clients: [BoxedClient; CLIENTS],
-        private_key: TransportKeypair,
     ) -> Result<Node, anyhow::Error> {
         let event_register = {
             #[cfg(feature = "trace-ot")]
@@ -220,7 +214,6 @@ impl NodeConfig {
         let cfg = self.config.clone();
         let node = NodeP2P::build::<NetworkContractHandler, CLIENTS, _>(
             self,
-            private_key,
             clients,
             event_register,
             cfg,
@@ -230,10 +223,11 @@ impl NodeConfig {
     }
 
     pub fn get_peer_id(&self) -> Option<PeerId> {
-        match (self.key_pair.as_ref(), self.local_ip, self.local_port) {
-            (Some(kp), Some(ip), Some(port)) => {
-                Some(PeerId::new(SocketAddr::new(ip, port), kp.public().clone()))
-            }
+        match (self.public_ip, self.public_port) {
+            (Some(ip), Some(port)) => Some(PeerId::new(
+                SocketAddr::new(ip, port),
+                self.key_pair.public().clone(),
+            )),
             _ => None,
         }
     }

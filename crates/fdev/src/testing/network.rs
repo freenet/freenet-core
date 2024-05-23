@@ -670,10 +670,8 @@ impl Runnable for NetworkPeer {
         let event_generator =
             NetworkEventGenerator::new(peer.clone(), memory_event_generator, ws_client);
 
-        let peer_keypair = self.config.key_pair.clone().unwrap();
-
         match self
-            .build(peer_id.clone(), [Box::new(event_generator)], peer_keypair)
+            .build(peer_id.clone(), [Box::new(event_generator)])
             .await
         {
             Ok(node) => match node.run().await {

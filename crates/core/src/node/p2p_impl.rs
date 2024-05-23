@@ -9,7 +9,7 @@ use super::{
     },
     NetEventRegister,
 };
-use crate::transport::{TransportKeypair, TransportPublicKey};
+use crate::transport::TransportPublicKey;
 use crate::{
     client_events::{combinator::ClientEventsCombinator, BoxedClient},
     config::GlobalExecutor,
@@ -63,7 +63,6 @@ impl NodeP2P {
 
     pub(crate) async fn build<CH, const CLIENTS: usize, ER>(
         config: NodeConfig,
-        private_key: TransportKeypair,
         clients: [BoxedClient; CLIENTS],
         event_register: ER,
         ch_builder: CH::Builder,
@@ -72,7 +71,7 @@ impl NodeP2P {
         CH: ContractHandler + Send + 'static,
         ER: NetEventRegister + Clone,
     {
-        let keypair = config.key_pair.clone().unwrap_or_default();
+        let keypair = config.key_pair.clone();
         // FIXME: pass downn this keypair to the network listener
         let peer_pub_key = keypair.public().clone();
 
@@ -92,7 +91,7 @@ impl NodeP2P {
             .map_err(|e| anyhow::anyhow!(e))?;
 
         let conn_manager =
-            P2pConnManager::build(&config, op_manager.clone(), event_register, private_key).await?;
+            P2pConnManager::build(&config, op_manager.clone(), event_register).await?;
 
         let parent_span = tracing::Span::current();
         GlobalExecutor::spawn(

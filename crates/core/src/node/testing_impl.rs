@@ -380,7 +380,6 @@ impl SimNetwork {
 
             let mut config = NodeConfig::new(ConfigArgs::default().build().unwrap());
             config
-                .with_key_pair(keypair)
                 .with_ip(Ipv6Addr::LOCALHOST)
                 .with_port(port)
                 .with_location(location)
@@ -446,8 +445,6 @@ impl SimNetwork {
         for node_no in self.number_of_gateways..num + self.number_of_gateways {
             let label = NodeLabel::node(node_no);
             let peer = PeerId::random();
-            let keypair: crate::dev_tool::TransportKeypair =
-                crate::transport::TransportKeypair::new();
 
             let mut config = NodeConfig::new(ConfigArgs::default().build().unwrap());
             for GatewayConfig { id, location, .. } in &gateways {
@@ -457,7 +454,6 @@ impl SimNetwork {
                 .max_hops_to_live(self.ring_max_htl)
                 .rnd_if_htl_above(self.rnd_if_htl_above)
                 .max_number_of_connections(self.max_connections)
-                .with_key_pair(keypair)
                 .with_ip(Ipv6Addr::LOCALHOST)
                 .with_port(crate::util::get_free_port().unwrap());
 

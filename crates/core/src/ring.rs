@@ -257,11 +257,7 @@ impl Ring {
     ) -> Result<Arc<Self>, anyhow::Error> {
         let (live_tx_tracker, missing_candidate_rx) = LiveTransactionTracker::new();
 
-        let peer_pub_key = config
-            .key_pair
-            .as_ref()
-            .map(|kp| kp.public().clone())
-            .ok_or(anyhow::anyhow!("Key pair should be set at this point"))?;
+        let peer_pub_key = config.key_pair.public().clone();
         let peer_key = config.get_peer_id();
 
         // for location here consider -1 == None

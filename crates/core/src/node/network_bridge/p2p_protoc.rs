@@ -112,7 +112,6 @@ impl P2pConnManager {
         config: &NodeConfig,
         op_manager: Arc<OpManager>,
         event_listener: impl NetEventRegister + Clone,
-        private_key: TransportKeypair,
     ) -> Result<Self, anyhow::Error> {
         let listen_port = config
             .local_port
@@ -126,13 +125,14 @@ impl P2pConnManager {
         let bridge = P2pBridge::new(tx_bridge_cmd, op_manager, event_listener.clone());
 
         let gateways = config.get_gateways()?;
+        let key_pair = config.key_pair.clone();
         Ok(P2pConnManager {
             gateways,
             bridge,
             conn_bridge_rx: rx_bridge_cmd,
             event_listener: Box::new(event_listener),
             connection: HashMap::new(),
-            key_pair: private_key,
+            key_pair,
             listening_ip: listener_ip,
             listening_port: listen_port,
             is_gateway: config.is_gateway,
