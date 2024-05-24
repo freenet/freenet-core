@@ -2,18 +2,20 @@
 
 ## Introduction
 
-This is a simple ping application for Freenet. In this application:
+This is a simple ping application for Freenet designed to illustrate how easy it is to build a contract and a
+command line app that deploys, modifies, and reads it. In this application:
 
 - Every 1 second, the application generates a random name and sends an update request to the host.
-- Every 1.5 seconds, the application fetches the latest names from the host and logs "Hello {name}!" to the console.
+- The application subscribes to these updates and logs "Hello {name}!" to the console.
 
 Note: This application is for testing and demonstration purposes only. It does not perform any authorization for contract updates.
 
 ## Code Overview
 
-- **[app/](https://github.com/freenet/freenet-core/blob/main/apps/freenet-ping/app/src/main.rs)**: Command line app that publishes the Ping contract, updates it periodically, and reads it periodically.
-- **[contracts/](https://github.com/freenet/freenet-core/blob/main/apps/freenet-ping/contracts/ping/src/lib.rs)**: Ping contract implementation.
-- **[types/](https://github.com/freenet/freenet-core/blob/main/apps/freenet-ping/types/src/lib.rs)**: Structs and other types that are shared between the command line app and the contract.
+- **[app/src/main.rs](https://github.com/freenet/freenet-core/blob/main/apps/freenet-ping/app/src/main.rs)**: Command line app 
+  that publishes the Ping contract, updates it periodically, and subscribes to changes.
+- **[contracts/ping/src/lib.rs](https://github.com/freenet/freenet-core/blob/main/apps/freenet-ping/contracts/ping/src/lib.rs)**: Ping contract implementation.
+- **[types/src/lib.rs](https://github.com/freenet/freenet-core/blob/main/apps/freenet-ping/types/src/lib.rs)**: Structs and other types that are shared between the command line app and the contract.
 
 ## Prerequisites
 
