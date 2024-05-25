@@ -148,7 +148,7 @@ impl ConfigArgs {
         } else {
             // find default application dir to see if there is a config file
             let dir = ConfigPathsArgs::config_dir()?;
-            Self::read_config(&dir)?
+            Self::read_config(&dir).ok().flatten()
         };
 
         let should_persist = cfg.is_none();
@@ -220,6 +220,7 @@ impl ConfigArgs {
             config_paths: self.config_paths.build(self.id.as_deref())?,
         };
 
+        fs::create_dir_all(&this.config_paths.config_dir)?;
         if should_persist {
             let mut file = File::create(this.config_paths.config_dir.join("config.toml"))?;
             file.write_all(
@@ -482,8 +483,6 @@ impl ConfigPathsArgs {
             local_file.set_file_name("_EVENT_LOG_LOCAL");
             fs::write(local_file, [])?;
         }
-
-        eprintln!("app_data_dir: {:?}", app_data_dir);
 
         Ok(ConfigPaths {
             contracts_dir,
