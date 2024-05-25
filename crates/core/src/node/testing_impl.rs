@@ -33,10 +33,8 @@ use crate::{
 };
 
 mod in_memory;
-mod inter_process;
 mod network;
 
-pub use self::inter_process::SimPeer;
 pub use self::network::{NetworkPeer, PeerMessage, PeerStatus};
 
 use super::{
