@@ -419,7 +419,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             let mut buf = [0u8; MAX_PACKET_SIZE];
             let mut waiting_time = INITIAL_INTERVAL;
             let mut attempts = 0;
-            const MAX_ATTEMPTS: usize = 20;
+            const MAX_ATTEMPTS: usize = 30;
 
             while attempts < MAX_ATTEMPTS {
                 outbound_packets
@@ -526,8 +526,8 @@ impl<S: Socket> UdpPacketsListener<S> {
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         // Constants for exponential backoff
-        const INITIAL_TIMEOUT: Duration = Duration::from_secs(5);
-        const TIMEOUT_MULTIPLIER: f64 = 1.1;
+        const INITIAL_TIMEOUT: Duration = Duration::from_millis(15);
+        const TIMEOUT_MULTIPLIER: f64 = 1.2;
         #[cfg(not(test))]
         const MAX_TIMEOUT: Duration = Duration::from_secs(60); // Maximum timeout limit
         #[cfg(test)]
@@ -767,12 +767,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                         }
                     }
                     Ok(None) => {
-                        tracing::debug!(%this_addr, "debug: connection closed");
-                        return Err(TransportError::ConnectionClosed);
+                        tracing::debug!(%this_addr, %remote_addr, "debug: connection closed");
+                        return Err(TransportError::ConnectionClosed(remote_addr));
                     }
                     Err(_) => {
                         failures += 1;
-                        tracing::debug!(%this_addr, "Failed to receive UDP response, time out");
+                        tracing::debug!(%this_addr, %remote_addr, "failed to receive UDP response, time out");
                     }
                 }
 
@@ -783,7 +783,9 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                 // Update timeout using exponential backoff, capped at MAX_TIMEOUT
                 timeout = std::cmp::min(
-                    Duration::from_secs((timeout.as_secs() as f64 * TIMEOUT_MULTIPLIER) as u64),
+                    Duration::from_millis(
+                        ((timeout.as_millis()) as f64 * TIMEOUT_MULTIPLIER) as u64,
+                    ),
                     MAX_TIMEOUT,
                 );
 
@@ -877,6 +879,8 @@ mod test {
         Factor(f64),
         /// Drop packets fall in the given range
         Range(Range<usize>),
+        /// Drop packets with the given ranges
+        Ranges(Vec<Range<usize>>),
     }
 
     struct MockSocket {
@@ -935,6 +939,12 @@ mod test {
                 }
                 PacketDropPolicy::Range(r) => {
                     if r.contains(&packet_idx) {
+                        tracing::trace!(id=%packet_idx, %self.this, "drop packet");
+                        return Ok(buf.len());
+                    }
+                }
+                PacketDropPolicy::Ranges(ranges) => {
+                    if ranges.iter().any(|r| r.contains(&packet_idx)) {
                         tracing::trace!(id=%packet_idx, %self.this, "drop packet");
                         return Ok(buf.len());
                     }
@@ -1230,6 +1240,86 @@ mod test {
         let (a, b) = tokio::try_join!(peer_a, peer_b)?;
         a?;
         b?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simulate_nat_traversal_drop_packet_ranges_of_peerb_killed() -> Result<(), DynError> {
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) =
+            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1, 3..usize::MAX])).await?;
+
+        let peer_b = tokio::spawn(async move {
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
+            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+            let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
+            conn.send("some data").await.unwrap();
+            Ok::<_, DynError>(())
+        });
+
+        let peer_a = tokio::spawn(async move {
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
+            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
+            // we should receive the message
+            let b = conn.recv().await.unwrap();
+            assert_eq!(b, b"some data");
+            // as peer b will drop all packets after the third packet, the connection should be broken
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            // conn should be broken as the remote peer cannot receive message and ping
+            conn.recv().await.unwrap_err();
+            Ok::<_, DynError>(())
+        });
+
+        let (a, b) = tokio::try_join!(peer_a, peer_b)?;
+        a?;
+        b?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simulate_nat_traversal_drop_packet_ranges_of_peerb() -> Result<(), DynError> {
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) =
+            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1, 3..9])).await?;
+
+        let peer_b = tokio::spawn(async move {
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
+            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+            let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
+            conn.send("some foo").await.unwrap();
+
+            tokio::time::sleep(Duration::from_secs(10)).await;
+
+            // although we drop some packets, we still alive
+            conn.send("some data").await.unwrap();
+            Ok::<_, DynError>(())
+        });
+
+        let peer_a = tokio::spawn(async move {
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
+            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
+
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            // we should receive the message
+            let b = conn.recv().await.unwrap();
+            assert_eq!(&b[8..], b"some foo");
+
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            // conn should not be broken
+            let b = conn.recv().await.unwrap();
+            assert_eq!(&b[8..], b"some data");
+            Ok::<_, DynError>(())
+        });
+
+        let (a, b) = tokio::try_join!(peer_a, peer_b)?;
+        a?;
+        b?;
+
         Ok(())
     }
 

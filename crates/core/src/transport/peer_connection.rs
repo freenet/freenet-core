@@ -129,8 +129,15 @@ impl PeerConnection {
         // listen for incoming messages or receipts or wait until is time to do anything else again
         let mut resend_check = Some(tokio::time::sleep(tokio::time::Duration::from_secs(1)));
 
+        // #[cfg(debug_assertions)]
+        // const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(2);
+        // #[cfg(not(debug_assertions))]
         const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(20);
+        // #[cfg(debug_assertions)]
+        // const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(6);
+        // #[cfg(not(debug_assertions))]
         const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(60);
+
         let mut keep_alive = tokio::time::interval(KEEP_ALIVE_INTERVAL);
         keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         keep_alive.tick().await;
@@ -140,7 +147,7 @@ impl PeerConnection {
             // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
             tokio::select! {
                 inbound = self.remote_conn.inbound_packet_recv.recv() => {
-                    let packet_data = inbound.ok_or(TransportError::ConnectionClosed)?;
+                    let packet_data = inbound.ok_or(TransportError::ConnectionClosed(self.remote_addr()))?;
                     last_received = std::time::Instant::now();
                     let Ok(decrypted) = packet_data.try_decrypt_sym(&self.remote_conn.inbound_symmetric_key).map_err(|error| {
                         tracing::debug!(%error, remote = ?self.remote_conn.remote_addr, "Failed to decrypt packet, might be an intro packet or a partial packet");
@@ -214,7 +221,7 @@ impl PeerConnection {
                 _ = keep_alive.tick() => {
                     if last_received.elapsed() > KILL_CONNECTION_AFTER {
                         tracing::warn!(remote = ?self.remote_conn.remote_addr, "connection timed out");
-                        return Err(TransportError::ConnectionClosed);
+                        return Err(TransportError::ConnectionClosed(self.remote_addr()));
                     }
                     tracing::trace!(remote = ?self.remote_conn.remote_addr, "sending keep-alive");
                     self.noop(vec![]).await?;
@@ -236,7 +243,7 @@ impl PeerConnection {
                                     .outbound_packets
                                     .send((self.remote_conn.remote_addr, packet.clone()))
                                     .await
-                                    .map_err(|_| TransportError::ConnectionClosed)?;
+                                    .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
                                 self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
                             }
                         }
@@ -275,7 +282,7 @@ impl PeerConnection {
                     .outbound_packets
                     .send((self.remote_conn.remote_addr, packet.data().into()))
                     .await
-                    .map_err(|_| TransportError::ConnectionClosed)?;
+                    .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
                 Ok(None)
             }
             StreamFragment {
@@ -288,7 +295,7 @@ impl PeerConnection {
                     sender
                         .send((fragment_number, payload))
                         .await
-                        .map_err(|_| TransportError::ConnectionClosed)?;
+                        .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
                     tracing::trace!(%stream_id, %fragment_number, "fragment pushed to existing stream");
                 } else {
                     let (sender, receiver) = mpsc::channel(1);
@@ -381,7 +388,7 @@ async fn packet_sending(
             outbound_packets
                 .send((remote_addr, packet.clone().prepared_send()))
                 .await
-                .map_err(|_| TransportError::ConnectionClosed)?;
+                .map_err(|_| TransportError::ConnectionClosed(remote_addr))?;
             sent_tracker
                 .lock()
                 .report_sent_packet(packet_id, packet.prepared_send());
@@ -394,7 +401,7 @@ async fn packet_sending(
                         outbound_packets
                             .send((remote_addr, packet.clone().prepared_send()))
                             .await
-                            .map_err(|_| TransportError::ConnectionClosed)?;
+                            .map_err(|_| TransportError::ConnectionClosed(remote_addr))?;
                         sent_tracker
                             .lock()
                             .report_sent_packet(packet_id, packet.prepared_send());

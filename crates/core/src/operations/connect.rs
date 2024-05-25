@@ -253,6 +253,8 @@ impl Operation for ConnectOp {
                         .ring
                         .should_accept(assigned_location, Some(&joiner));
 
+                    let mut skip_list = skip_list.clone();
+                    skip_list.push(joiner.clone());
                     if let Some(updated_state) = forward_conn(
                         *id,
                         &op_manager.ring,
@@ -260,7 +262,7 @@ impl Operation for ConnectOp {
                         (new_peer_loc.clone(), new_peer_loc.clone()),
                         *hops_to_live,
                         accepted, // gateway always accept the first connection
-                        skip_list.clone(),
+                        skip_list,
                     )
                     .await?
                     {
@@ -301,6 +303,17 @@ impl Operation for ConnectOp {
                             ..
                         },
                 } => {
+                    //debug_assert_ne!(sender.peer, joiner.peer);
+                    if sender.peer == joiner.peer {
+                        tracing::warn!(
+                            tx = %id,
+                            sender = %sender.peer,
+                            joiner = %joiner.peer,
+                            at = %op_manager.ring.own_location().peer,
+                            "Connectivity check from self, aborting"
+                        );
+                        std::process::exit(1);
+                    }
                     let this_peer = op_manager.ring.own_location();
                     let joiner_loc = joiner
                         .location
@@ -319,6 +332,7 @@ impl Operation for ConnectOp {
                         .should_accept(joiner_loc, Some(&joiner.peer))
                     {
                         tracing::debug!(tx = %id, %joiner, "Accepting connection from");
+                        //FIXME: Attempt connection directly from bridge
                         op_manager
                             .ring
                             .add_connection(joiner_loc, joiner.peer.clone())
@@ -710,7 +724,11 @@ where
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_secs(15)).await;
+            #[cfg(debug_assertions)]
+            const WAIT_TIME: u64 = 15;
+            #[cfg(not(debug_assertions))]
+            const WAIT_TIME: u64 = 3;
+            tokio::time::sleep(Duration::from_secs(WAIT_TIME)).await;
         }
     });
     Ok(())

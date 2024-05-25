@@ -3,7 +3,6 @@ use crate::contract::MemoryContractHandler;
 use crate::node::p2p_impl::NodeP2P;
 use crate::node::Node;
 use crate::tracing::EventRegister;
-use crate::transport::TransportKeypair;
 use anyhow::Error;
 use futures::SinkExt;
 use serde::{Deserialize, Serialize};
@@ -67,7 +66,6 @@ impl NetworkPeer {
         &self,
         identifier: String,
         clients: [BoxedClient; CLIENTS],
-        private_key: TransportKeypair,
     ) -> Result<Node, anyhow::Error> {
         let event_register = {
             #[cfg(feature = "trace-ot")]
@@ -85,7 +83,6 @@ impl NetworkPeer {
         };
         let node = NodeP2P::build::<MemoryContractHandler, CLIENTS, _>(
             self.config.clone(),
-            private_key,
             clients,
             event_register,
             identifier,

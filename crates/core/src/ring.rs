@@ -257,11 +257,7 @@ impl Ring {
     ) -> Result<Arc<Self>, anyhow::Error> {
         let (live_tx_tracker, missing_candidate_rx) = LiveTransactionTracker::new();
 
-        let peer_pub_key = config
-            .key_pair
-            .as_ref()
-            .map(|kp| kp.public().clone())
-            .ok_or(anyhow::anyhow!("Key pair should be set at this point"))?;
+        let peer_pub_key = config.key_pair.public().clone();
         let peer_key = config.get_peer_id();
 
         // for location here consider -1 == None
@@ -505,7 +501,6 @@ impl Ring {
     /// # Panic
     /// Will panic if the node checking for this condition has no location assigned.
     pub fn should_accept(&self, location: Location, peer: Option<&PeerId>) -> bool {
-        tracing::debug!("Checking if should accept connection");
         let open_conn = self
             .open_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -527,17 +522,12 @@ impl Ring {
         let accepted = if location == my_location
             || self.connections_by_location.read().contains_key(&location)
         {
-            tracing::debug!(
-                "Ring connections {:?}",
-                &*self.connections_by_location.read()
-            );
             false
         } else if open_conn < self.min_connections {
             true
         } else if open_conn >= self.max_connections {
             false
         } else {
-            tracing::debug!("Evaluating new connection");
             self.topology_manager
                 .write()
                 .evaluate_new_connection(location, Instant::now())

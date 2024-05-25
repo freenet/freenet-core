@@ -36,7 +36,7 @@ pub(crate) enum TransportError {
     #[error("transport handler channel closed, socket likely closed")]
     ChannelClosed,
     #[error("connection to remote closed")]
-    ConnectionClosed,
+    ConnectionClosed(SocketAddr),
     #[error("failed while establishing connection, reason: {cause}")]
     ConnectionEstablishmentFailure { cause: Cow<'static, str> },
     #[error("incomplete inbound stream: {0}")]
