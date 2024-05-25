@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use chrono::Utc;
 use clap::Parser;
 use freenet_ping_types::{Ping, PingContractOptions};
@@ -84,6 +82,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                     tracing::info!("Hello, {}!", name);
                 }
 
+                // the contract already put, so we subscribe to the contract.
+                client
+                    .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
+                        key: contract_key.clone(),
+                        summary: None,
+                    }))
+                    .await?;
+
                 ping
             }
         }
@@ -100,7 +106,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     };
 
     let mut send_tick = tokio::time::interval(args.parameters.frequency);
-    let mut fetch_tick = tokio::time::interval(Duration::from_secs_f64(1.5));
 
     let mut generator = Generator::default();
     loop {
@@ -116,42 +121,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
               tracing::error!(err=%e, "failed to send update request");
             }
           },
-          _ = fetch_tick.tick() => {
-            if let Err(e) = client.send(ClientRequest::ContractOp(ContractRequest::Get { key: contract_key.clone(), fetch_contract: false })).await {
-              tracing::error!(err=%e);
-            }
-          },
           res = client.recv() => {
             match res {
               Ok(resp) => match resp {
                 HostResponse::ContractResponse(resp) => {
                   match resp {
-                    ContractResponse::GetResponse { key, contract: _, state } => {
-
-                      if contract_key.eq(&key) {
-                        let ping = if state.is_empty() {
-                          Ping::default()
-                        } else {
-                          match serde_json::from_slice::<Ping>(&state) {
-                            Ok(p) => p,
-                            Err(e) => {
-                              tracing::error!(err=%e);
-                              continue;
-                            },
-                          }
-                        };
-
-                        for (name, created) in ping.iter() {
-                          if !local_state.contains_key(name) && (*created + chrono::Duration::hours(1) > Utc::now()) {
-                            tracing::info!("Hello, {}!", name);
-                          }
-                        }
-
-                        local_state.merge(ping, args.parameters.ttl);
-                      }
-                    },
                     ContractResponse::PutResponse { key } => {
                       tracing::info!(key=%key, "put ping contract successfully!");
+                      // we successfully put the contract, so we subscribe to the contract.
+                      if key == contract_key {
+                        if let Err(e) = client.send(ClientRequest::ContractOp(ContractRequest::Subscribe { key, summary: None })).await {
+                          tracing::error!(err=%e);
+                          return Err(e.into());
+                        }
+                      }
+                    },
+                    ContractResponse::UpdateNotification { key, update } => {
+                      if key == contract_key {
+                        let mut handle_update = |state: &[u8]| {
+                          let ping = if state.is_empty() {
+                            Ping::default()
+                          } else {
+                            match serde_json::from_slice::<Ping>(state) {
+                              Ok(p) => p,
+                              Err(e) => return Err(e),
+                            }
+                          };
+  
+                          for (name, created) in ping.iter() {
+                            if !local_state.contains_key(name) && (*created + chrono::Duration::hours(1) > Utc::now()) {
+                              tracing::info!("Hello, {}!", name);
+                            }
+                          }
+  
+                          local_state.merge(ping, args.parameters.ttl);
+                          Ok(())
+                        };
+
+                        match update {
+                          UpdateData::State(state) =>  {
+                            if let Err(e) = handle_update(&state) {
+                              tracing::error!(err=%e);
+                            }
+                          },
+                          UpdateData::Delta(delta) => {
+                            if let Err(e) = handle_update(&delta) {
+                              tracing::error!(err=%e);
+                            }
+                          },
+                          UpdateData::StateAndDelta { state, delta } => {
+                            if let Err(e) = handle_update(&state) {
+                              tracing::error!(err=%e);
+                            }
+
+                            if let Err(e) = handle_update(&delta) {
+                              tracing::error!(err=%e);
+                            }
+                          },
+                          _ => unreachable!("unknown state"),
+                        }
+                      }
                     },
                     _ => {},
                   }
