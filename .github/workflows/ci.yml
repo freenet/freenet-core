@@ -17,7 +17,7 @@ jobs:
     strategy:
       max-parallel: 1
       matrix:
-        args: ["--no-default-features --features trace,websocket,sqlite"]
+        args: ["--no-default-features --features trace,websocket,redb"]
     env:
       FREENET_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target

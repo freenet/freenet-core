@@ -13,23 +13,26 @@ use rand::{
 
 use crate::node::PeerId;
 
-pub fn set_cleanup_on_exit() -> Result<(), ctrlc::Error> {
+pub fn set_cleanup_on_exit(id: Option<String>) -> Result<(), ctrlc::Error> {
     ctrlc::set_handler(move || {
         tracing::info!("Received Ctrl+C. Cleaning up...");
 
-        let Ok(path) = crate::config::ConfigPathsArgs::app_data_dir() else {
-            std::process::exit(0);
-        };
-        tracing::info!("Removing content stored at {path:?}");
+        #[cfg(debug_assertions)]
+        {
+            let Ok(path) = crate::config::ConfigPathsArgs::app_data_dir(id.as_deref()) else {
+                std::process::exit(0);
+            };
+            tracing::info!("Removing content stored at {path:?}");
 
-        if path.exists() {
-            let rm = std::fs::remove_dir_all(&path).map_err(|err| {
-                tracing::warn!("Failed cleaning up directory: {err}");
-                err
-            });
-            if rm.is_err() {
-                tracing::error!("Failed to remove content at {path:?}");
-                std::process::exit(-1);
+            if path.exists() {
+                let rm = std::fs::remove_dir_all(&path).map_err(|err| {
+                    tracing::warn!("Failed cleaning up directory: {err}");
+                    err
+                });
+                if rm.is_err() {
+                    tracing::error!("Failed to remove content at {path:?}");
+                    std::process::exit(-1);
+                }
             }
         }
         tracing::info!("Successful cleanup");

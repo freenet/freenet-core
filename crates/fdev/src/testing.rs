@@ -3,11 +3,8 @@ use std::{path::PathBuf, time::Duration};
 use anyhow::Error;
 use freenet::dev_tool::SimNetwork;
 
-mod multiple_process;
 pub(crate) mod network;
 mod single_process;
-
-pub(crate) use multiple_process::Process;
 
 use crate::network_metrics_server::{start_server, ServerConfig};
 
@@ -106,8 +103,6 @@ fn randomize_test_name() -> String {
 pub enum TestMode {
     /// Runs multiple simulated nodes in a single process.
     SingleProcess,
-    /// Runs multiple simulated nodes in multiple processes.
-    MultiProcess(multiple_process::MultiProcessConfig),
     /// Runs multiple simulated nodes in multiple processes and multiple machines.
     Network(network::NetworkProcessConfig),
 }
@@ -124,7 +119,6 @@ pub(crate) async fn test_framework(base_config: TestConfig) -> anyhow::Result<()
     };
     let res = match &base_config.command {
         TestMode::SingleProcess => single_process::run(&base_config).await,
-        TestMode::MultiProcess(config) => multiple_process::run(&base_config, config).await,
         TestMode::Network(config) => network::run(&base_config, config).await,
     };
     if let Some(server) = server {

@@ -64,7 +64,7 @@ struct StdInput {
 
 impl StdInput {
     fn new(config: ExecutorConfig, app_state: AppState) -> Result<Self, anyhow::Error> {
-        let paths = config.paths.clone().build()?;
+        let paths = config.paths.clone().build(None)?;
         let params = config
             .params
             .as_ref()

@@ -877,7 +877,7 @@ impl PeerId {
 impl<'a> arbitrary::Arbitrary<'a> for PeerId {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let addr: ([u8; 4], u16) = u.arbitrary()?;
-        let pub_key = TransportKeypair::new().public().clone(); // FIXME: impl arbitrary for TransportPublicKey
+        let pub_key = TransportKeypair::new().public().clone(); // TODO: impl arbitrary for TransportPublicKey
         Ok(Self {
             addr: addr.into(),
             pub_key,

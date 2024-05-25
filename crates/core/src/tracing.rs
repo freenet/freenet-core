@@ -198,7 +198,10 @@ impl<'a> NetEventLog<'a> {
             NetMessageV1::Connect(connect::ConnectMsg::Response {
                 msg:
                     connect::ConnectResponse::AcceptedBy {
-                        acceptor, accepted, ..
+                        acceptor,
+                        accepted,
+                        joiner,
+                        ..
                     },
                 ..
             }) => {
@@ -209,7 +212,7 @@ impl<'a> NetEventLog<'a> {
                         tx: msg.id(),
                         peer_id: this_peer.clone(),
                         kind: EventKind::Connect(ConnectEvent::Finished {
-                            initiator: acceptor.peer.clone(), // FIXME
+                            initiator: joiner.clone(),
                             location: acceptor.location.unwrap(),
                         }),
                     });

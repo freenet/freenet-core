@@ -16,8 +16,7 @@ impl ContractExecutor for Executor<Runtime> {
             })) => Ok((state, contract)),
             Err(err) => Err(err),
             Ok(_) => {
-                // Safety: check `perform_contract_get` to indeed check this should never happen
-                unsafe { std::hint::unreachable_unchecked() }
+                unreachable!()
             }
         }
     }
@@ -170,7 +169,8 @@ impl Executor<Runtime> {
         Executor::new(
             state_store,
             || {
-                crate::util::set_cleanup_on_exit()?;
+                // FIXME: potentially not cleaning up after exit
+                crate::util::set_cleanup_on_exit(None)?;
                 Ok(())
             },
             OperationMode::Local,
