@@ -15,9 +15,7 @@ use crate::{
     ring::{LiveTransactionTracker, Ring},
 };
 
-use super::{
-    network_bridge::EventLoopNotificationsSender, NetEventRegister, Node, NodeConfig, PeerId,
-};
+use super::{network_bridge::EventLoopNotificationsSender, NetEventRegister, NodeConfig, PeerId};
 
 #[cfg(debug_assertions)]
 macro_rules! check_id_op {

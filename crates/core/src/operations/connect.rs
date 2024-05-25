@@ -332,17 +332,29 @@ impl Operation for ConnectOp {
                         .should_accept(joiner_loc, Some(&joiner.peer))
                     {
                         tracing::debug!(tx = %id, %joiner, "Accepting connection from");
+                        let (callback, mut result) = tokio::sync::mpsc::channel(1);
                         // Attempt to connect to the joiner
                         op_manager
-                            .notify_node_event(NodeEvent::ConnectPeer(joiner.peer.clone()))
-                            .await;
-                        // Add the connection to the ring
-                        op_manager
-                            .ring
-                            .add_connection(joiner_loc, joiner.peer.clone())
-                            .await;
-
-                        true
+                            .notify_node_event(NodeEvent::ConnectPeer {
+                                peer: joiner.peer.clone(),
+                                callback,
+                            })
+                            .await?;
+                        if result
+                            .recv()
+                            .await
+                            .ok_or(OpError::NotificationError)?
+                            .is_ok()
+                        {
+                            // Add the connection to the ring
+                            op_manager
+                                .ring
+                                .add_connection(joiner_loc, joiner.peer.clone())
+                                .await;
+                            true
+                        } else {
+                            false
+                        }
                     } else {
                         tracing::debug!(tx = %id, at = %this_peer.peer, from = %joiner, "Rejecting connection");
                         false

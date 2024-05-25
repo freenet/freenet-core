@@ -49,7 +49,6 @@ use crate::{
 };
 
 use crate::operations::handle_op_request;
-pub use network_bridge::inter_process::InterProcessConnManager;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
 
 use crate::topology::rate::Rate;

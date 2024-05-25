@@ -1084,7 +1084,7 @@ where
                     op_manager.ring.prune_connection(peer).await;
                     continue;
                 }
-                NodeEvent::ConnectPeer(peer) => {
+                NodeEvent::ConnectPeer { peer, .. } => {
                     tracing::info!("TNotifying connection to {peer}");
                     continue;
                 }

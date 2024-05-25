@@ -51,7 +51,7 @@ pub mod dev_tool {
     pub use message::Transaction;
     pub use node::{
         testing_impl::{EventChain, NetworkPeer, NodeLabel, PeerMessage, PeerStatus, SimNetwork},
-        InitPeerNode, InterProcessConnManager, NodeConfig, PeerId,
+        InitPeerNode, NodeConfig, PeerId,
     };
     pub use ring::Location;
     pub use transport::TransportKeypair;

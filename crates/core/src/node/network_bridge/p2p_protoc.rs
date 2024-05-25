@@ -165,7 +165,7 @@ impl P2pConnManager {
         let mut tx_to_client: HashMap<Transaction, ClientId> = HashMap::new();
 
         let mut peer_connections = FuturesUnordered::new();
-        let mut outbound_conn_handler_2 = outbound_conn_handler.clone();
+        // let mut outbound_conn_handler_2 = outbound_conn_handler.clone();
         let mut pending_outbound_conns = FuturesUnordered::new();
         let mut pending_inbound_gw_conns = HashMap::new();
         let mut pending_listening_gw_conns = FuturesUnordered::new();
@@ -382,7 +382,8 @@ impl P2pConnManager {
                                     tracing::debug!(remote = %acceptor.peer, "Connection accepted by target, attempting connection");
                                     // we need to start the process of connecting to the other peer
                                     let remote_peer = acceptor.peer.clone();
-                                    let conn_fut = outbound_conn_handler_2
+                                    let conn_fut = outbound_conn_handler
+                                        .clone()
                                         .connect(acceptor.peer.pub_key.clone(), acceptor.peer.addr)
                                         .await
                                         .map(|peer_conn| (peer_conn, remote_peer))
@@ -486,13 +487,20 @@ impl P2pConnManager {
                     tracing::info!("Shutting down message loop gracefully");
                     break;
                 }
-                Ok(Right(NodeAction(NodeEvent::ConnectPeer(peer_id)))) => {
-                    tracing::info!(remote = %peer_id, this_peer = ?op_manager.ring.get_peer_key().unwrap(), "Connecting to peer");
-                    let conn_fut = outbound_conn_handler_2
-                        .connect(peer_id.pub_key.clone(), peer_id.addr)
-                        .await
-                        .map(|peer_conn| (peer_conn, peer_id))
-                        .boxed();
+                Ok(Right(NodeAction(NodeEvent::ConnectPeer { peer, callback }))) => {
+                    tracing::info!(remote = %peer, this_peer = ?op_manager.ring.get_peer_key().unwrap(), "Connecting to peer");
+                    let mut ob = outbound_conn_handler.clone();
+                    let conn_fut = (async move {
+                        let c = ob.connect(peer.pub_key.clone(), peer.addr).await;
+                        let pc = c.await;
+                        if pc.is_ok() {
+                            let _ = callback.send(Ok(())).await;
+                        } else {
+                            let _ = callback.send(Err(())).await;
+                        }
+                        (pc, peer)
+                    })
+                    .boxed();
                     pending_outbound_conns.push(conn_fut);
                 }
                 Ok(Right(NodeAction(NodeEvent::Disconnect { cause }))) => {
