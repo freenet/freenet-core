@@ -308,6 +308,8 @@ pub(crate) enum NodeEvent {
     ShutdownNode,
     /// Drop the given peer connection.
     DropConnection(PeerId),
+    // Try connecting to the given peer.
+    ConnectPeer(PeerId),
     Disconnect {
         cause: Option<Cow<'static, str>>,
     },
@@ -319,6 +321,9 @@ impl Display for NodeEvent {
             NodeEvent::ShutdownNode => f.write_str("ShutdownNode"),
             NodeEvent::DropConnection(peer) => {
                 write!(f, "DropConnection (from {peer})")
+            }
+            NodeEvent::ConnectPeer(peer) => {
+                write!(f, "ConnectPeer (to {peer})")
             }
             NodeEvent::Disconnect { cause: Some(cause) } => {
                 write!(f, "Disconnect node, reason: {cause}")

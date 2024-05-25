@@ -1084,6 +1084,10 @@ where
                     op_manager.ring.prune_connection(peer).await;
                     continue;
                 }
+                NodeEvent::ConnectPeer(peer) => {
+                    tracing::info!("TNotifying connection to {peer}");
+                    continue;
+                }
                 NodeEvent::Disconnect { cause: Some(cause) } => {
                     tracing::info!(peer = %peer_key, "Shutting down node, reason: {cause}");
                     return Ok(());

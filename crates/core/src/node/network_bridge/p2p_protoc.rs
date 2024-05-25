@@ -485,6 +485,14 @@ impl P2pConnManager {
                     tracing::info!("Shutting down message loop gracefully");
                     break;
                 }
+                Ok(Right(NodeAction(NodeEvent::ConnectPeer(peer_id)))) => {
+                    tracing::info!(remote = %peer_id, this_peer = ?op_manager.ring.get_peer_key().unwrap(), "Connecting to peer");
+                    let conn_fut = outbound_conn_handler_2
+                        .connect(peer_id.pub_key.clone(), peer_id.addr)
+                        .await
+                        .map(|peer_conn| (peer_id, peer_conn));
+                    pending_outbound_conns.push(conn_fut);
+                }
                 Ok(Right(NodeAction(NodeEvent::Disconnect { cause }))) => {
                     match cause {
                         Some(cause) => tracing::warn!("Shutting down node: {cause}"),

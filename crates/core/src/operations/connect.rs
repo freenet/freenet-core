@@ -11,7 +11,7 @@ use futures::Future;
 use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
-use crate::message::NetMessageV1;
+use crate::message::{NetMessageV1, NodeEvent};
 use crate::node::ConnectionError;
 use crate::ring::Ring;
 use crate::transport::TransportPublicKey;
@@ -332,7 +332,11 @@ impl Operation for ConnectOp {
                         .should_accept(joiner_loc, Some(&joiner.peer))
                     {
                         tracing::debug!(tx = %id, %joiner, "Accepting connection from");
-                        //FIXME: Attempt connection directly from bridge
+                        // Attempt to connect to the joiner
+                        op_manager
+                            .notify_node_event(NodeEvent::ConnectPeer(joiner.peer.clone()))
+                            .await;
+                        // Add the connection to the ring
                         op_manager
                             .ring
                             .add_connection(joiner_loc, joiner.peer.clone())
