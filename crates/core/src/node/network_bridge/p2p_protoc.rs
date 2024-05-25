@@ -385,7 +385,8 @@ impl P2pConnManager {
                                     let conn_fut = outbound_conn_handler_2
                                         .connect(acceptor.peer.pub_key.clone(), acceptor.peer.addr)
                                         .await
-                                        .map(|peer_conn| (peer_conn, remote_peer));
+                                        .map(|peer_conn| (peer_conn, remote_peer))
+                                        .boxed();
                                     pending_outbound_conns.push(conn_fut);
                                 } else if &this_peer_id == joiner {
                                     tracing::debug!(remote = %acceptor.peer, "Connection rejected by target");
@@ -490,7 +491,8 @@ impl P2pConnManager {
                     let conn_fut = outbound_conn_handler_2
                         .connect(peer_id.pub_key.clone(), peer_id.addr)
                         .await
-                        .map(|peer_conn| (peer_id, peer_conn));
+                        .map(|peer_conn| (peer_conn, peer_id))
+                        .boxed();
                     pending_outbound_conns.push(conn_fut);
                 }
                 Ok(Right(NodeAction(NodeEvent::Disconnect { cause }))) => {
