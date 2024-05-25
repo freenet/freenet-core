@@ -60,6 +60,10 @@ pub struct ConfigArgs {
     #[clap(flatten)]
     #[serde(flatten)]
     config_paths: ConfigPathsArgs,
+
+    /// An arbitrary identifier for the node, mostly for debugging or testing purposes.
+    #[clap(long)]
+    pub id: Option<String>,
 }
 
 impl Default for ConfigArgs {
@@ -73,6 +77,7 @@ impl Default for ConfigArgs {
             transport_keypair: None,
             log_level: Some(tracing::log::LevelFilter::Info),
             config_paths: Default::default(),
+            id: None,
         }
     }
 }
@@ -212,7 +217,7 @@ impl ConfigArgs {
                 None => TransportKeypair::new(),
             },
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
-            config_paths: self.config_paths.build()?,
+            config_paths: self.config_paths.build(self.id.as_deref())?,
         };
 
         if should_persist {
@@ -408,11 +413,15 @@ impl ConfigPathsArgs {
         }
     }
 
-    pub fn app_data_dir() -> std::io::Result<PathBuf> {
+    pub fn app_data_dir(id: Option<&str>) -> std::io::Result<PathBuf> {
         let project_dir = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
             .ok_or(std::io::ErrorKind::NotFound)?;
         let app_data_dir: PathBuf = if cfg!(any(test, debug_assertions)) {
-            std::env::temp_dir().join("freenet")
+            std::env::temp_dir().join(if let Some(id) = id {
+                format!("freenet-{id}")
+            } else {
+                "freenet".into()
+            })
         } else {
             project_dir.data_dir().into()
         };
@@ -430,8 +439,11 @@ impl ConfigPathsArgs {
         Ok(config_data_dir)
     }
 
-    pub fn build(self) -> std::io::Result<ConfigPaths> {
-        let app_data_dir = self.data_dir.map(Ok).unwrap_or_else(Self::app_data_dir)?;
+    pub fn build(self, id: Option<&str>) -> std::io::Result<ConfigPaths> {
+        let app_data_dir = self
+            .data_dir
+            .map(Ok)
+            .unwrap_or_else(|| Self::app_data_dir(id))?;
         let contracts_dir = self
             .contracts_dir
             .unwrap_or_else(|| app_data_dir.join("contracts"));
@@ -470,6 +482,8 @@ impl ConfigPathsArgs {
             local_file.set_file_name("_EVENT_LOG_LOCAL");
             fs::write(local_file, [])?;
         }
+
+        eprintln!("app_data_dir: {:?}", app_data_dir);
 
         Ok(ConfigPaths {
             contracts_dir,

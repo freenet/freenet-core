@@ -879,7 +879,7 @@ fn group_locations_in_buckets(
     let mut distances = HashMap::new();
     for (bucket, group) in &locs
         .into_iter()
-        .group_by(|l| (l * (10.0f64).powi(scale)).floor() as u32)
+        .chunk_by(|l| (l * (10.0f64).powi(scale)).floor() as u32)
     {
         let count = group.count();
         distances
