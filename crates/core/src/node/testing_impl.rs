@@ -377,6 +377,7 @@ impl SimNetwork {
             let location = Location::random();
 
             let mut config = NodeConfig::new(ConfigArgs::default().build().unwrap());
+            config.key_pair = keypair;
             config
                 .with_ip(Ipv6Addr::LOCALHOST)
                 .with_port(port)
