@@ -391,7 +391,7 @@ impl Ring {
                 .get_router_events(10_000)
                 .await
                 .map_err(|error| {
-                    tracing::error!("shutting down refresh router task");
+                    tracing::error!(%error, "shutting down refresh router task");
                     error
                 })
                 .expect("todo: propagate this to main thread");
@@ -556,7 +556,7 @@ impl Ring {
     }
 
     pub async fn add_connection(&self, loc: Location, peer: PeerId) {
-        tracing::info!(%peer, "Adding connection to peer");
+        tracing::info!(%peer, this = ?self.get_peer_key(), "Adding connection to peer");
         self.event_register
             .register_events(Either::Left(NetEventLog::connected(
                 self,
