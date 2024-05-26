@@ -713,20 +713,13 @@ where
                     "Attempting to connect to {} gateways in parallel",
                     number_of_parallel_connections
                 );
-                for gateway in gateways
-                    .iter()
+                for gateway in op_manager
+                    .ring
+                    .is_connected(gateways.iter())
                     .shuffle()
                     .take(number_of_parallel_connections)
                 {
                     tracing::info!(%gateway, "Attempting connection to gateway");
-                    // FIXME: because it stays connected after first attempt, even if it fails,
-                    // we won't be ever retrying with the same gateway
-                    // for gateway in op_manager
-                    //     .ring
-                    //     .is_connected(gateways.iter())
-                    //     .shuffle()
-                    //     .take(number_of_parallel_connections)
-                    // {
                     if let Err(error) = join_ring_request(
                         None,
                         peer_pub_key.clone(),

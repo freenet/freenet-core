@@ -722,7 +722,11 @@ impl Ring {
         };
         {
             let conns = &mut *self.connections_by_location.write();
-            conns.remove(&loc);
+            if let Some(conns) = conns.get_mut(&loc) {
+                if let Some(pos) = conns.iter().position(|c| &c.location.peer == &peer) {
+                    conns.swap_remove(pos);
+                }
+            }
         }
         {
             self.subscribers.alter_all(|_, mut subs| {
