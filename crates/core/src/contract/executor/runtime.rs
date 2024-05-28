@@ -160,17 +160,17 @@ impl ContractExecutor for Executor<Runtime> {
 
 impl Executor<Runtime> {
     pub async fn from_config(
-        config: &Config,
+        config: Arc<Config>,
         event_loop_channel: Option<ExecutorToEventLoopChannel<ExecutorHalve>>,
     ) -> Result<Self, DynError> {
         let (contract_store, delegate_store, secret_store, state_store) =
-            Self::get_stores(config).await?;
+            Self::get_stores(&config).await?;
         let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
         Executor::new(
             state_store,
-            || {
+            move || {
                 // FIXME: potentially not cleaning up after exit
-                crate::util::set_cleanup_on_exit(None)?;
+                crate::util::set_cleanup_on_exit(config.paths().clone())?;
                 Ok(())
             },
             OperationMode::Local,
