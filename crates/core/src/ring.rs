@@ -331,8 +331,8 @@ impl Ring {
         };
 
         if let Some(loc) = config.location {
-            if config.local_ip.is_none() || config.local_port.is_none() {
-                return Err(anyhow::anyhow!("IP and port are required for gateways"));
+            if config.peer_id.is_none() {
+                return Err(anyhow::anyhow!("PeerId is required for gateways"));
             }
             ring.update_location(Some(loc));
         }
