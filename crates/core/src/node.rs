@@ -49,7 +49,6 @@ use crate::{
 };
 
 use crate::operations::handle_op_request;
-pub use network_bridge::inter_process::InterProcessConnManager;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
 
 use crate::topology::rate::Rate;
@@ -617,18 +616,6 @@ async fn process_message_v1<CB>(
                         .instrument(span)
                         .await;
                 handle_op_not_available!(op_result);
-                match &op_result {
-                    Ok(Some(OpEnum::Connect(op))) => {
-                        tracing::info!(?op, "Connect operation started");
-                    }
-                    Ok(None) => {
-                        tracing::info!("Connect operation not started");
-                    }
-                    Err(err) => {
-                        tracing::error!(%err, "Connect operation failed");
-                    }
-                    _ => {}
-                }
                 return report_result(
                     tx,
                     op_result,

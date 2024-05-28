@@ -377,6 +377,7 @@ impl SimNetwork {
             let location = Location::random();
 
             let mut config = NodeConfig::new(ConfigArgs::default().build().unwrap());
+            config.key_pair = keypair;
             config
                 .with_ip(Ipv6Addr::LOCALHOST)
                 .with_port(port)
@@ -386,7 +387,8 @@ impl SimNetwork {
                 .min_number_of_connections(self.min_connections)
                 .is_gateway()
                 .rnd_if_htl_above(self.rnd_if_htl_above);
-
+            config.public_ip = Some(Ipv6Addr::LOCALHOST.into());
+            config.public_port = Some(port);
             self.event_listener.add_node(label.clone(), id.clone());
             configs.push((
                 config,
@@ -448,12 +450,15 @@ impl SimNetwork {
             for GatewayConfig { id, location, .. } in &gateways {
                 config.add_gateway(InitPeerNode::new(id.clone(), *location));
             }
+            let port = crate::util::get_free_port().unwrap();
             config
                 .max_hops_to_live(self.ring_max_htl)
                 .rnd_if_htl_above(self.rnd_if_htl_above)
                 .max_number_of_connections(self.max_connections)
                 .with_ip(Ipv6Addr::LOCALHOST)
-                .with_port(crate::util::get_free_port().unwrap());
+                .with_port(port);
+            config.public_ip = Some(Ipv6Addr::LOCALHOST.into());
+            config.public_port = Some(port);
 
             self.event_listener.add_node(label.clone(), peer);
 
@@ -1082,6 +1087,10 @@ where
                         )))
                         .await;
                     op_manager.ring.prune_connection(peer).await;
+                    continue;
+                }
+                NodeEvent::ConnectPeer { peer, .. } => {
+                    tracing::info!("TNotifying connection to {peer}");
                     continue;
                 }
                 NodeEvent::Disconnect { cause: Some(cause) } => {

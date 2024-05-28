@@ -302,12 +302,17 @@ pub(crate) trait InnerMessage: Into<NetMessage> {
 }
 
 /// Internal node events emitted to the event loop.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub(crate) enum NodeEvent {
     /// For unspecified reasons the node is gracefully shutting down.
     ShutdownNode,
     /// Drop the given peer connection.
     DropConnection(PeerId),
+    // Try connecting to the given peer.
+    ConnectPeer {
+        peer: PeerId,
+        callback: tokio::sync::mpsc::Sender<Result<(), ()>>,
+    },
     Disconnect {
         cause: Option<Cow<'static, str>>,
     },
@@ -319,6 +324,9 @@ impl Display for NodeEvent {
             NodeEvent::ShutdownNode => f.write_str("ShutdownNode"),
             NodeEvent::DropConnection(peer) => {
                 write!(f, "DropConnection (from {peer})")
+            }
+            NodeEvent::ConnectPeer { peer, .. } => {
+                write!(f, "ConnectPeer (to {peer})")
             }
             NodeEvent::Disconnect { cause: Some(cause) } => {
                 write!(f, "Disconnect node, reason: {cause}")

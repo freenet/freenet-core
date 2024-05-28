@@ -7,7 +7,7 @@ use tracing::Instrument;
 use crate::{
     config::GlobalExecutor,
     contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent, SenderHalve},
-    message::{MessageStats, NetMessage, Transaction, TransactionType},
+    message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
     operations::{
         connect::ConnectOp, get::GetOp, put::PutOp, subscribe::SubscribeOp, update::UpdateOp,
         OpEnum, OpError,
@@ -106,6 +106,18 @@ impl OpManager {
         self.push(*msg.id(), op).await?;
         self.to_event_listener
             .send(Either::Left(msg))
+            .await
+            .map_err(Into::into)
+    }
+
+    // An early, fast path, return for communicating events in the node to the main message handler,
+    // without any transmission in the network whatsoever and avoiding any state transition.
+    //
+    // Useful when we want to notify connection attempts, or other events that do not require any
+    // network communication with other nodes.
+    pub async fn notify_node_event(&self, msg: NodeEvent) -> Result<(), OpError> {
+        self.to_event_listener
+            .send(Either::Right(msg))
             .await
             .map_err(Into::into)
     }
