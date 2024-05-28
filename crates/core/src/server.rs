@@ -180,8 +180,6 @@ pub mod local_node {
 }
 
 pub mod network_node {
-    use std::net::SocketAddr;
-
     use tower_http::trace::TraceLayer;
 
     use crate::{
@@ -190,13 +188,13 @@ pub mod network_node {
 
     use super::{http_gateway::HttpGateway, serve};
 
-    pub async fn run_network_node(config: Config, socket: SocketAddr) -> Result<(), DynError> {
-        let (gw, gw_router) = HttpGateway::as_router(&socket);
+    pub async fn run_network_node(config: Config) -> Result<(), DynError> {
+        let ws_socket = (config.ws_api.address, config.ws_api.port).into();
+        let (gw, gw_router) = HttpGateway::as_router(&ws_socket);
         let (ws_proxy, ws_router) = WebSocketProxy::as_router(gw_router);
-        serve(socket, ws_router.layer(TraceLayer::new_for_http()));
+        serve(ws_socket, ws_router.layer(TraceLayer::new_for_http()));
 
-        let mut node_config = NodeConfig::new(config);
-        node_config.with_ip(socket.ip()).with_port(socket.port());
+        let node_config = NodeConfig::new(config);
         let is_gateway = node_config.is_gateway;
         let node = node_config
             .build([Box::new(gw), Box::new(ws_proxy)])

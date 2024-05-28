@@ -4,7 +4,6 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::anyhow;
 use dashmap::DashSet;
 use either::{Either, Left, Right};
 use futures::stream::FuturesUnordered;
@@ -113,13 +112,8 @@ impl P2pConnManager {
         op_manager: Arc<OpManager>,
         event_listener: impl NetEventRegister + Clone,
     ) -> Result<Self, anyhow::Error> {
-        let listen_port = config
-            .local_port
-            .ok_or_else(|| anyhow::anyhow!("network listener port does not contain a port"))?;
-
-        let listener_ip = config
-            .local_ip
-            .ok_or(anyhow!("network listener IP not set"))?;
+        let listen_port = config.network_listener_port;
+        let listener_ip = config.network_listener_ip;
 
         let (tx_bridge_cmd, rx_bridge_cmd) = mpsc::channel(100);
         let bridge = P2pBridge::new(tx_bridge_cmd, op_manager, event_listener.clone());
