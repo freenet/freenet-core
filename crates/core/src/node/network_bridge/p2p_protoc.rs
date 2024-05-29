@@ -152,6 +152,7 @@ impl P2pConnManager {
         tracing::info!(%self.listening_port, %self.listening_ip, %self.is_gateway, key = %self.key_pair.public(), "Opening network listener");
 
         let mut state = EventListenerState::new();
+        tracing::info!(%self.listening_port, %self.listening_ip, %self.is_gateway, key = %self.key_pair.public(), "Openning network listener");
 
         let (outbound_conn_handler, inbound_conn_handler) = create_connection_handler::<UdpSocket>(
             self.key_pair.clone(),

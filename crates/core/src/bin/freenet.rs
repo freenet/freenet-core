@@ -7,7 +7,7 @@ use freenet::{
     run_local_node, run_network_node,
     server::serve_gateway,
 };
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 async fn run(config: Config) -> anyhow::Result<()> {
     match config.mode {
@@ -18,12 +18,13 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
 async fn run_local(config: Config) -> anyhow::Result<()> {
     tracing::info!("Starting freenet node in local mode");
-    let socket = config.ws_api;
-
+    let port = config.ws_api.port;
+    let ip = config.ws_api.address;
     let executor = Executor::from_config(Arc::new(config), None)
         .await
         .map_err(anyhow::Error::msg)?;
 
+    let socket: SocketAddr = (ip, port).into();
     run_local_node(executor, socket)
         .await
         .map_err(anyhow::Error::msg)

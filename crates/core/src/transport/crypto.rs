@@ -1,8 +1,12 @@
+use pkcs1::EncodeRsaPrivateKey;
 use rand::rngs::OsRng;
-use rsa::{pkcs8, Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
+use rsa::{
+    pkcs1::{self},
+    pkcs8, Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey,
+};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransportKeypair {
     pub(super) public: TransportPublicKey,
     pub(super) secret: TransportSecretKey,
@@ -85,7 +89,7 @@ impl From<RsaPublicKey> for TransportPublicKey {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct TransportSecretKey(RsaPrivateKey);
 
 impl TransportSecretKey {
@@ -104,6 +108,18 @@ impl TransportSecretKey {
 
         self.0
             .to_pkcs8_pem(line_endings)
+            .map(|s| s.as_str().as_bytes().to_vec())
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, pkcs1::Error> {
+        #[cfg(unix)]
+        let line_endings = pkcs1::LineEnding::LF;
+
+        #[cfg(windows)]
+        let line_endings = pkcs1::LineEnding::CRLF;
+
+        self.0
+            .to_pkcs1_pem(line_endings)
             .map(|s| s.as_str().as_bytes().to_vec())
     }
 }
