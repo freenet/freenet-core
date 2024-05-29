@@ -377,16 +377,16 @@ impl SimNetwork {
             let location = Location::random();
 
             let mut config = NodeConfig::new(ConfigArgs::default().build().unwrap());
+            config.key_pair = keypair;
+            config.network_listener_ip = Ipv6Addr::LOCALHOST.into();
+            config.network_listener_port = port;
             config
-                .with_ip(Ipv6Addr::LOCALHOST)
-                .with_port(port)
                 .with_location(location)
                 .max_hops_to_live(self.ring_max_htl)
                 .max_number_of_connections(self.max_connections)
                 .min_number_of_connections(self.min_connections)
                 .is_gateway()
                 .rnd_if_htl_above(self.rnd_if_htl_above);
-
             self.event_listener.add_node(label.clone(), id.clone());
             configs.push((
                 config,
@@ -448,12 +448,13 @@ impl SimNetwork {
             for GatewayConfig { id, location, .. } in &gateways {
                 config.add_gateway(InitPeerNode::new(id.clone(), *location));
             }
+            let port = crate::util::get_free_port().unwrap();
+            config.network_listener_port = port;
+            config.network_listener_ip = Ipv6Addr::LOCALHOST.into();
             config
                 .max_hops_to_live(self.ring_max_htl)
                 .rnd_if_htl_above(self.rnd_if_htl_above)
-                .max_number_of_connections(self.max_connections)
-                .with_ip(Ipv6Addr::LOCALHOST)
-                .with_port(crate::util::get_free_port().unwrap());
+                .max_number_of_connections(self.max_connections);
 
             self.event_listener.add_node(label.clone(), peer);
 
@@ -1082,6 +1083,10 @@ where
                         )))
                         .await;
                     op_manager.ring.prune_connection(peer).await;
+                    continue;
+                }
+                NodeEvent::ConnectPeer { peer, .. } => {
+                    tracing::info!("TNotifying connection to {peer}");
                     continue;
                 }
                 NodeEvent::Disconnect { cause: Some(cause) } => {

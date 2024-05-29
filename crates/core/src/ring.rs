@@ -331,8 +331,8 @@ impl Ring {
         };
 
         if let Some(loc) = config.location {
-            if config.local_ip.is_none() || config.local_port.is_none() {
-                return Err(anyhow::anyhow!("IP and port are required for gateways"));
+            if config.peer_id.is_none() {
+                return Err(anyhow::anyhow!("PeerId is required for gateways"));
             }
             ring.update_location(Some(loc));
         }
@@ -391,7 +391,7 @@ impl Ring {
                 .get_router_events(10_000)
                 .await
                 .map_err(|error| {
-                    tracing::error!("shutting down refresh router task");
+                    tracing::error!(%error, "shutting down refresh router task");
                     error
                 })
                 .expect("todo: propagate this to main thread");
@@ -556,7 +556,7 @@ impl Ring {
     }
 
     pub async fn add_connection(&self, loc: Location, peer: PeerId) {
-        tracing::info!(%peer, "Adding connection to peer");
+        tracing::info!(%peer, this = ?self.get_peer_key(), "Adding connection to peer");
         self.event_register
             .register_events(Either::Left(NetEventLog::connected(
                 self,
@@ -722,7 +722,11 @@ impl Ring {
         };
         {
             let conns = &mut *self.connections_by_location.write();
-            conns.remove(&loc);
+            if let Some(conns) = conns.get_mut(&loc) {
+                if let Some(pos) = conns.iter().position(|c| &c.location.peer == &peer) {
+                    conns.swap_remove(pos);
+                }
+            }
         }
         {
             self.subscribers.alter_all(|_, mut subs| {

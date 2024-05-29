@@ -14,7 +14,7 @@ use pkcs1::DecodeRsaPrivateKey;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
-use crate::{local_node::OperationMode, transport::TransportKeypair};
+use crate::{dev_tool::PeerId, local_node::OperationMode, transport::TransportKeypair};
 
 /// Default maximum number of connections for the peer.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 20;
@@ -48,15 +48,22 @@ pub struct ConfigArgs {
 
     #[clap(flatten)]
     #[serde(flatten)]
-    pub http_gateway: GatewayArgs,
+    pub ws_api: WebsocketApiArgs,
+
+    #[clap(flatten)]
+    #[serde(flatten)]
+    pub network_listener: NetworkArgs,
+
     #[clap(value_parser, env = "TRANSPORT_KEYPAIR")]
     pub transport_keypair: Option<PathBuf>,
+
     #[serde(
         with = "serde_option_log_level_filter",
         skip_serializing_if = "Option::is_none"
     )]
     #[clap(long, env = "LOG_LEVEL")]
     pub log_level: Option<tracing::log::LevelFilter>,
+
     #[clap(flatten)]
     #[serde(flatten)]
     config_paths: ConfigPathsArgs,
@@ -70,8 +77,14 @@ impl Default for ConfigArgs {
     fn default() -> Self {
         Self {
             mode: Some(OperationMode::Network),
-            http_gateway: GatewayArgs {
-                address: Some(default_gateway_address()),
+            network_listener: NetworkArgs {
+                address: Some(default_address()),
+                port: Some(default_gateway_port()),
+                public_address: None,
+                public_port: None,
+            },
+            ws_api: WebsocketApiArgs {
+                address: Some(default_address()),
                 port: Some(default_gateway_port()),
             },
             transport_keypair: None,
@@ -163,12 +176,12 @@ impl ConfigArgs {
                 self.mode = cfg.mode;
             }
 
-            if self.http_gateway.address.is_none() {
-                self.http_gateway.address = cfg.http_gateway.address;
+            if self.ws_api.address.is_none() {
+                self.ws_api.address = cfg.ws_api.address;
             }
 
-            if self.http_gateway.port.is_none() {
-                self.http_gateway.port = cfg.http_gateway.port;
+            if self.ws_api.port.is_none() {
+                self.ws_api.port = cfg.ws_api.port;
             }
 
             if self.log_level.is_none() {
@@ -180,42 +193,58 @@ impl ConfigArgs {
 
         let mode = self.mode.unwrap_or(OperationMode::Network);
 
+        let transport_key = self
+            .transport_keypair
+            .map(|path_to_key| {
+                let mut key_file = File::open(&path_to_key).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to open key file {}: {e}", path_to_key.display()),
+                    )
+                })?;
+                let mut buf = String::new();
+                key_file.read_to_string(&mut buf).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to read key file {}: {e}", path_to_key.display()),
+                    )
+                })?;
+
+                let pk = rsa::RsaPrivateKey::from_pkcs1_pem(&buf).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Failed to read key file {}: {e}", path_to_key.display()),
+                    )
+                })?;
+
+                Ok::<_, std::io::Error>(TransportKeypair::from_private_key(pk))
+            })
+            .transpose()?;
         let this = Config {
             mode,
-            http_gateway: GatewayConfig {
-                address: self.http_gateway.address.unwrap_or_else(|| match mode {
-                    OperationMode::Local => default_local_gateway_address(),
-                    OperationMode::Network => default_gateway_address(),
+            peer_id: self
+                .network_listener
+                .public_address
+                .zip(self.network_listener.public_port)
+                .zip(transport_key.as_ref())
+                .map(|((addr, port), key)| PeerId::new((addr, port).into(), key.public().clone())),
+            network_api: NetworkApiConfig {
+                address: self.ws_api.address.unwrap_or_else(|| match mode {
+                    OperationMode::Local => default_local_address(),
+                    OperationMode::Network => default_address(),
                 }),
-                port: self.http_gateway.port.unwrap_or(default_gateway_port()),
+                port: self.ws_api.port.unwrap_or(default_gateway_port()),
+                public_address: self.network_listener.public_address,
+                public_port: self.network_listener.public_port,
             },
-            transport_keypair: match self.transport_keypair {
-                Some(path_to_key) => {
-                    let mut key_file = File::open(&path_to_key).map_err(|e| {
-                        std::io::Error::new(
-                            e.kind(),
-                            format!("Failed to open key file {}: {e}", path_to_key.display()),
-                        )
-                    })?;
-                    let mut buf = String::new();
-                    key_file.read_to_string(&mut buf).map_err(|e| {
-                        std::io::Error::new(
-                            e.kind(),
-                            format!("Failed to read key file {}: {e}", path_to_key.display()),
-                        )
-                    })?;
-
-                    let pk = rsa::RsaPrivateKey::from_pkcs1_pem(&buf).map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("Failed to read key file {}: {e}", path_to_key.display()),
-                        )
-                    })?;
-
-                    TransportKeypair::from_private_key(pk)
-                }
-                None => TransportKeypair::new(),
+            ws_api: WebsocketApiConfig {
+                address: self.ws_api.address.unwrap_or_else(|| match mode {
+                    OperationMode::Local => default_local_address(),
+                    OperationMode::Network => default_address(),
+                }),
+                port: self.ws_api.port.unwrap_or(default_gateway_port()),
             },
+            transport_keypair: transport_key.unwrap_or_else(TransportKeypair::new),
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
             config_paths: Arc::new(self.config_paths.build(self.id.as_deref())?),
         };
@@ -311,14 +340,19 @@ mod serde_option_log_level_filter {
 pub struct Config {
     /// Node operation mode.
     pub mode: OperationMode,
-
     #[serde(flatten)]
-    pub http_gateway: GatewayConfig,
+    pub network_api: NetworkApiConfig,
+    #[serde(flatten)]
+    pub ws_api: WebsocketApiConfig,
+    // FIXME: rebuild from path which should be stored in config
+    #[serde(skip)]
     pub transport_keypair: TransportKeypair,
     #[serde(with = "serde_log_level_filter")]
     pub log_level: tracing::log::LevelFilter,
     #[serde(flatten)]
     config_paths: Arc<ConfigPaths>,
+    #[serde(skip)]
+    pub(crate) peer_id: Option<PeerId>,
 }
 
 impl Config {
@@ -332,46 +366,100 @@ impl Config {
 }
 
 #[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]
-pub struct GatewayArgs {
-    /// Address to bind to, default is 0.0.0.0
-    #[arg(long = "gateway-address", env = "GATEWAY_ADDRESS")]
-    #[serde(rename = "gateway-address", skip_serializing_if = "Option::is_none")]
+pub struct NetworkArgs {
+    /// Address to bind to for the network event listener, default is 0.0.0.0
+    #[arg(long = "network-address", env = "NETWORK_ADDRESS")]
+    #[serde(rename = "network-address", skip_serializing_if = "Option::is_none")]
     pub address: Option<IpAddr>,
 
-    /// Port to expose api on, default is 50509
-    #[arg(long = "gateway-port", env = "GATEWAY_PORT")]
-    #[serde(rename = "gateway-port", skip_serializing_if = "Option::is_none")]
+    /// Port to bind for the network event listener, default is 31337
+    #[arg(long = "network-port", env = "NETWORK_PORT")]
+    #[serde(rename = "network-port", skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+
+    /// Public address for the network. Required for gateways.
+    #[arg(long = "public-network-address", env = "PUBLIC_NETWORK_ADDRESS")]
+    #[serde(
+        rename = "public-network-address",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub public_address: Option<IpAddr>,
+
+    /// Public port for the network. Required for gateways.
+    #[arg(long = "public-network-port", env = "PUBLIC_NETWORK_PORT")]
+    #[serde(
+        rename = "public-network-port",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub public_port: Option<u16>,
+}
+
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+pub struct NetworkApiConfig {
+    /// Address to bind to
+    #[serde(default = "default_address", rename = "network-address")]
+    pub address: IpAddr,
+
+    /// Port to expose api on
+    #[serde(default = "default_network_port", rename = "network-port")]
+    pub port: u16,
+
+    #[serde(
+        rename = "public_network_address",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub public_address: Option<IpAddr>,
+
+    #[serde(rename = "public_port", skip_serializing_if = "Option::is_none")]
+    pub public_port: Option<u16>,
+}
+
+#[inline]
+const fn default_network_port() -> u16 {
+    31337
+}
+
+#[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]
+pub struct WebsocketApiArgs {
+    /// Address to bind to for the websocket API, default is 0.0.0.0
+    #[arg(long = "ws-api-address", env = "WS_API_ADDRESS")]
+    #[serde(rename = "ws-api-address", skip_serializing_if = "Option::is_none")]
+    pub address: Option<IpAddr>,
+
+    /// Port to expose the websocket on, default is 50509
+    #[arg(long = "ws-api-port", env = "WS_API_PORT")]
+    #[serde(rename = "ws-api-port", skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
-pub struct GatewayConfig {
+pub struct WebsocketApiConfig {
     /// Address to bind to
-    #[serde(default = "default_gateway_address", rename = "gateway-address")]
+    #[serde(default = "default_address", rename = "ws-api-address")]
     pub address: IpAddr,
 
     /// Port to expose api on
-    #[serde(default = "default_gateway_port", rename = "gateway-port")]
+    #[serde(default = "default_gateway_port", rename = "ws-api-port")]
     pub port: u16,
 }
 
-impl Default for GatewayConfig {
+impl Default for WebsocketApiConfig {
     #[inline]
     fn default() -> Self {
         Self {
-            address: default_gateway_address(),
+            address: default_address(),
             port: default_gateway_port(),
         }
     }
 }
 
 #[inline]
-const fn default_gateway_address() -> IpAddr {
+const fn default_address() -> IpAddr {
     IpAddr::V4(Ipv4Addr::UNSPECIFIED)
 }
 
 #[inline]
-const fn default_local_gateway_address() -> IpAddr {
+const fn default_local_address() -> IpAddr {
     IpAddr::V4(Ipv4Addr::LOCALHOST)
 }
 

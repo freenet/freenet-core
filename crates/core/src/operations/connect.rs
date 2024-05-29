@@ -11,7 +11,7 @@ use futures::Future;
 use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
-use crate::message::NetMessageV1;
+use crate::message::{NetMessageV1, NodeEvent};
 use crate::node::ConnectionError;
 use crate::ring::Ring;
 use crate::transport::TransportPublicKey;
@@ -332,13 +332,29 @@ impl Operation for ConnectOp {
                         .should_accept(joiner_loc, Some(&joiner.peer))
                     {
                         tracing::debug!(tx = %id, %joiner, "Accepting connection from");
-                        //FIXME: Attempt connection directly from bridge
+                        let (callback, mut result) = tokio::sync::mpsc::channel(1);
+                        // Attempt to connect to the joiner
                         op_manager
-                            .ring
-                            .add_connection(joiner_loc, joiner.peer.clone())
-                            .await;
-
-                        true
+                            .notify_node_event(NodeEvent::ConnectPeer {
+                                peer: joiner.peer.clone(),
+                                callback,
+                            })
+                            .await?;
+                        if result
+                            .recv()
+                            .await
+                            .ok_or(OpError::NotificationError)?
+                            .is_ok()
+                        {
+                            // Add the connection to the ring
+                            op_manager
+                                .ring
+                                .add_connection(joiner_loc, joiner.peer.clone())
+                                .await;
+                            true
+                        } else {
+                            false
+                        }
                     } else {
                         tracing::debug!(tx = %id, at = %this_peer.peer, from = %joiner, "Rejecting connection");
                         false
@@ -697,20 +713,13 @@ where
                     "Attempting to connect to {} gateways in parallel",
                     number_of_parallel_connections
                 );
-                for gateway in gateways
-                    .iter()
+                for gateway in op_manager
+                    .ring
+                    .is_connected(gateways.iter())
                     .shuffle()
                     .take(number_of_parallel_connections)
                 {
                     tracing::info!(%gateway, "Attempting connection to gateway");
-                    // FIXME: because it stays connected after first attempt, even if it fails,
-                    // we won't be ever retrying with the same gateway
-                    // for gateway in op_manager
-                    //     .ring
-                    //     .is_connected(gateways.iter())
-                    //     .shuffle()
-                    //     .take(number_of_parallel_connections)
-                    // {
                     if let Err(error) = join_ring_request(
                         None,
                         peer_pub_key.clone(),
@@ -753,6 +762,7 @@ where
         return Err(OpError::ConnError(ConnectionError::FailedConnectOp));
     }
     let tx_id = Transaction::new::<ConnectMsg>();
+    tracing::info!(%gateway.peer, ?peer_pub_key, "Attempting network join");
     let mut op = initial_request(
         peer_pub_key,
         gateway.clone(),

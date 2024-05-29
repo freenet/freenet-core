@@ -330,22 +330,21 @@ impl DelegateRuntimeInterface for Runtime {
                 InboundDelegateMsg::GetSecretRequest(GetSecretRequest {
                     key: secret_key, ..
                 }) => {
-                    // FIXME: here only allow this if the application is trusted
-                    // if attested.is_some() {
-                    let secret = self.secret_store.get_secret(delegate_key, &secret_key)?;
-                    let msg = OutboundDelegateMsg::GetSecretResponse(GetSecretResponse {
-                        key: secret_key,
-                        value: Some(secret),
-                        context: Default::default(),
-                    });
-                    results.push(msg);
-                    // } else {
-                    //     return Err(DelegateExecError::UnauthorizedSecretAccess {
-                    //         secret: secret_key.clone(),
-                    //         delegate: delegate_key.clone(),
-                    //     }
-                    //     .into());
-                    // }
+                    if attested.is_some() {
+                        let secret = self.secret_store.get_secret(delegate_key, &secret_key)?;
+                        let msg = OutboundDelegateMsg::GetSecretResponse(GetSecretResponse {
+                            key: secret_key,
+                            value: Some(secret),
+                            context: Default::default(),
+                        });
+                        results.push(msg);
+                    } else {
+                        return Err(DelegateExecError::UnauthorizedSecretAccess {
+                            secret: secret_key.clone(),
+                            delegate: delegate_key.clone(),
+                        }
+                        .into());
+                    }
                 }
                 _ => {}
             }

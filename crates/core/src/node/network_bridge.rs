@@ -11,7 +11,6 @@ use super::PeerId;
 use crate::message::{NetMessage, NodeEvent};
 
 pub(crate) mod in_memory;
-pub(crate) mod inter_process;
 pub(crate) mod p2p_protoc;
 
 // TODO: use this constants when we do real net i/o
