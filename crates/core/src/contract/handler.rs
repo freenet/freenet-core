@@ -96,7 +96,7 @@ impl ContractHandler for NetworkContractHandler<Runtime> {
     where
         Self: Sized + 'static,
     {
-        let executor = Executor::from_config(&config, Some(executor_request_sender)).await?;
+        let executor = Executor::from_config(config.clone(), Some(executor_request_sender)).await?;
         Ok(Self { executor, channel })
     }
 

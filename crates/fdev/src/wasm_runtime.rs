@@ -1,6 +1,7 @@
 use std::{
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
+    sync::Arc,
 };
 
 use clap::ArgGroup;
@@ -18,8 +19,8 @@ pub async fn run_local_executor(config: ExecutorConfig) -> Result<(), anyhow::Er
     }
 
     if config.clean_exit {
-        // FIXME: potentially not cleaning up the correct directory
-        freenet::util::set_cleanup_on_exit(None)?;
+        let paths = config.paths.clone().build(None)?;
+        freenet::util::set_cleanup_on_exit(Arc::new(paths))?;
     }
 
     let app_state = state::AppState::new(&config).await?;

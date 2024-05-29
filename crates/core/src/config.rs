@@ -4,7 +4,7 @@ use std::{
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
-    sync::atomic::AtomicBool,
+    sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
 
@@ -246,7 +246,7 @@ impl ConfigArgs {
             },
             transport_keypair: transport_key.unwrap_or_else(TransportKeypair::new),
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
-            config_paths: self.config_paths.build(self.id.as_deref())?,
+            config_paths: Arc::new(self.config_paths.build(self.id.as_deref())?),
         };
 
         fs::create_dir_all(&this.config_paths.config_dir)?;
@@ -350,7 +350,7 @@ pub struct Config {
     #[serde(with = "serde_log_level_filter")]
     pub log_level: tracing::log::LevelFilter,
     #[serde(flatten)]
-    config_paths: ConfigPaths,
+    config_paths: Arc<ConfigPaths>,
     #[serde(skip)]
     pub(crate) peer_id: Option<PeerId>,
 }
@@ -358,6 +358,10 @@ pub struct Config {
 impl Config {
     pub fn transport_keypair(&self) -> &TransportKeypair {
         &self.transport_keypair
+    }
+
+    pub(crate) fn paths(&self) -> Arc<ConfigPaths> {
+        self.config_paths.clone()
     }
 }
 
@@ -666,7 +670,55 @@ impl ConfigPaths {
         self.event_log = event_log;
         self
     }
+
+    pub fn iter(&self) -> ConfigPathsIter {
+        ConfigPathsIter {
+            curr: 0,
+            config_paths: self,
+        }
+    }
+
+    fn path_by_index(&self, index: usize) -> (bool, &PathBuf) {
+        match index {
+            0 => (true, &self.contracts_dir),
+            1 => (true, &self.delegates_dir),
+            2 => (true, &self.secrets_dir),
+            3 => (true, &self.db_dir),
+            4 => (true, &self.data_dir),
+            5 => (false, &self.event_log),
+            6 => (true, &self.config_dir),
+            _ => panic!("invalid path index"),
+        }
+    }
+
+    const MAX_PATH_INDEX: usize = 6;
 }
+
+pub struct ConfigPathsIter<'a> {
+    curr: usize,
+    config_paths: &'a ConfigPaths,
+}
+
+impl<'a> Iterator for ConfigPathsIter<'a> {
+    /// The first is whether this path is a directory or a file.
+    type Item = (bool, &'a PathBuf);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.curr > ConfigPaths::MAX_PATH_INDEX {
+            None
+        } else {
+            let path = self.config_paths.path_by_index(self.curr);
+            self.curr += 1;
+            Some(path)
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(ConfigPaths::MAX_PATH_INDEX))
+    }
+}
+
+impl<'a> core::iter::FusedIterator for ConfigPathsIter<'a> {}
 
 impl Config {
     pub fn db_dir(&self) -> PathBuf {
