@@ -147,6 +147,33 @@ impl ConfigArgs {
         }
     }
 
+    fn read_transport_keypair(
+        path_to_key: PathBuf,
+    ) -> std::io::Result<(PathBuf, TransportKeypair)> {
+        let mut key_file = File::open(&path_to_key).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("Failed to open key file {}: {e}", path_to_key.display()),
+            )
+        })?;
+        let mut buf = String::new();
+        key_file.read_to_string(&mut buf).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("Failed to read key file {}: {e}", path_to_key.display()),
+            )
+        })?;
+
+        let pk = rsa::RsaPrivateKey::from_pkcs1_pem(&buf).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to read key file {}: {e}", path_to_key.display()),
+            )
+        })?;
+
+        Ok::<_, std::io::Error>((path_to_key, TransportKeypair::from_private_key(pk)))
+    }
+
     /// Parse the command line arguments and return the configuration.
     pub fn build(mut self) -> std::io::Result<Config> {
         let cfg = if let Some(path) = self.config_paths.config_dir.as_ref() {
@@ -192,42 +219,44 @@ impl ConfigArgs {
         }
 
         let mode = self.mode.unwrap_or(OperationMode::Network);
+        let config_paths = self.config_paths.build(self.id.as_deref())?;
 
         let transport_key = self
             .transport_keypair
-            .map(|path_to_key| {
-                let mut key_file = File::open(&path_to_key).map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!("Failed to open key file {}: {e}", path_to_key.display()),
-                    )
-                })?;
-                let mut buf = String::new();
-                key_file.read_to_string(&mut buf).map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!("Failed to read key file {}: {e}", path_to_key.display()),
-                    )
-                })?;
-
-                let pk = rsa::RsaPrivateKey::from_pkcs1_pem(&buf).map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("Failed to read key file {}: {e}", path_to_key.display()),
-                    )
-                })?;
-
-                Ok::<_, std::io::Error>(TransportKeypair::from_private_key(pk))
-            })
+            .map(Self::read_transport_keypair)
             .transpose()?;
+        let (transport_keypair_path, transport_keypair) =
+            if let Some((transport_key_path, transport_key)) = transport_key {
+                (transport_key_path, transport_key)
+            } else {
+                let transport_key = TransportKeypair::new();
+                let transport_key_path =
+                    config_paths.secrets_dir(mode).join("transport_keypair.pem");
+
+                // if the transport key file exists, then read it
+                if transport_key_path.exists() {
+                    Self::read_transport_keypair(transport_key_path)?
+                } else {
+                    let mut file = File::create(&transport_key_path)?;
+                    file.write_all(&transport_key.secret().to_bytes().map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("failed to write transport key: {e}"),
+                        )
+                    })?)?;
+                    (transport_key_path, transport_key)
+                }
+            };
+
         let this = Config {
             mode,
             peer_id: self
                 .network_listener
                 .public_address
                 .zip(self.network_listener.public_port)
-                .zip(transport_key.as_ref())
-                .map(|((addr, port), key)| PeerId::new((addr, port).into(), key.public().clone())),
+                .map(|(addr, port)| {
+                    PeerId::new((addr, port).into(), transport_keypair.public().clone())
+                }),
             network_api: NetworkApiConfig {
                 address: self.ws_api.address.unwrap_or_else(|| match mode {
                     OperationMode::Local => default_local_address(),
@@ -244,9 +273,10 @@ impl ConfigArgs {
                 }),
                 port: self.ws_api.port.unwrap_or(default_gateway_port()),
             },
-            transport_keypair: transport_key.unwrap_or_else(TransportKeypair::new),
+            transport_keypair,
+            transport_keypair_path,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
-            config_paths: Arc::new(self.config_paths.build(self.id.as_deref())?),
+            config_paths: Arc::new(config_paths),
         };
 
         fs::create_dir_all(&this.config_paths.config_dir)?;
@@ -344,9 +374,10 @@ pub struct Config {
     pub network_api: NetworkApiConfig,
     #[serde(flatten)]
     pub ws_api: WebsocketApiConfig,
-    // FIXME: rebuild from path which should be stored in config
     #[serde(skip)]
     pub transport_keypair: TransportKeypair,
+    #[serde(rename = "transport_keypair")]
+    pub transport_keypair_path: PathBuf,
     #[serde(with = "serde_log_level_filter")]
     pub log_level: tracing::log::LevelFilter,
     #[serde(flatten)]

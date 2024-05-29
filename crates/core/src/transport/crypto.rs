@@ -1,3 +1,4 @@
+use pkcs1::EncodeRsaPrivateKey;
 use rand::rngs::OsRng;
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,10 @@ impl TransportKeypair {
     pub fn public(&self) -> &TransportPublicKey {
         &self.public
     }
+
+    pub(crate) fn secret(&self) -> &TransportSecretKey {
+        &self.secret
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Hash)]
@@ -60,6 +65,18 @@ impl TransportSecretKey {
     pub fn decrypt(&self, data: &[u8]) -> rsa::Result<Vec<u8>> {
         let padding = Pkcs1v15Encrypt;
         self.0.decrypt(padding, data)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, pkcs1::Error> {
+        #[cfg(unix)]
+        let line_endings = pkcs1::LineEnding::LF;
+
+        #[cfg(windows)]
+        let line_endings = pkcs1::LineEnding::CRLF;
+
+        self.0
+            .to_pkcs1_pem(line_endings)
+            .map(|s| s.as_str().as_bytes().to_vec())
     }
 }
 
