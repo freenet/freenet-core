@@ -96,7 +96,7 @@ impl Default for ConfigArgs {
 }
 
 impl ConfigArgs {
-    fn read_config(dir: &PathBuf) -> std::io::Result<Option<ConfigArgs>> {
+    fn read_config(dir: &PathBuf) -> std::io::Result<Option<Config>> {
         if dir.exists() {
             let mut dir = std::fs::read_dir(dir)?;
             let config_args = dir.find_map(|f| {
@@ -127,13 +127,21 @@ impl ConfigArgs {
                         let mut file = File::open(&*filename)?;
                         let mut content = String::new();
                         file.read_to_string(&mut content)?;
-                        Ok(Some(toml::from_str::<Self>(&content).map_err(|e| {
+                        let mut config = toml::from_str::<Config>(&content).map_err(|e| {
                             std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                        })?))
+                        })?;
+                        let (_, transport_keypair) =
+                            Self::read_transport_keypair(config.secrets_dir())?;
+                        config.transport_keypair = transport_keypair;
+                        Ok(Some(config))
                     }
                     "json" => {
                         let mut file = File::open(&*filename)?;
-                        Ok(Some(serde_json::from_reader::<_, Self>(&mut file)?))
+                        let mut config = serde_json::from_reader::<_, Config>(&mut file)?;
+                        let (_, transport_keypair) =
+                            Self::read_transport_keypair(config.secrets_dir())?;
+                        config.transport_keypair = transport_keypair;
+                        Ok(Some(config))
                     }
                     ext => Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
@@ -195,27 +203,13 @@ impl ConfigArgs {
 
         // merge the configuration from the file with the command line arguments
         if let Some(cfg) = cfg {
-            if self.transport_keypair.is_none() {
-                self.transport_keypair = cfg.transport_keypair;
-            }
-
-            if self.mode.is_none() {
-                self.mode = cfg.mode;
-            }
-
-            if self.ws_api.address.is_none() {
-                self.ws_api.address = cfg.ws_api.address;
-            }
-
-            if self.ws_api.port.is_none() {
-                self.ws_api.port = cfg.ws_api.port;
-            }
-
-            if self.log_level.is_none() {
-                self.log_level = cfg.log_level;
-            }
-
-            self.config_paths.merge(cfg.config_paths);
+            self.transport_keypair
+                .get_or_insert(cfg.transport_keypair_path);
+            self.mode.get_or_insert(cfg.mode);
+            self.ws_api.address.get_or_insert(cfg.ws_api.address);
+            self.ws_api.port.get_or_insert(cfg.ws_api.port);
+            self.log_level.get_or_insert(cfg.log_level);
+            self.config_paths.merge(cfg.config_paths.as_ref().clone());
         }
 
         let mode = self.mode.unwrap_or(OperationMode::Network);
@@ -511,30 +505,14 @@ pub struct ConfigPathsArgs {
 }
 
 impl ConfigPathsArgs {
-    fn merge(&mut self, other: Self) {
-        if self.contracts_dir.is_none() {
-            self.contracts_dir = other.contracts_dir;
-        }
-
-        if self.delegates_dir.is_none() {
-            self.delegates_dir = other.delegates_dir;
-        }
-
-        if self.secrets_dir.is_none() {
-            self.secrets_dir = other.secrets_dir;
-        }
-
-        if self.db_dir.is_none() {
-            self.db_dir = other.db_dir;
-        }
-
-        if self.event_log.is_none() {
-            self.event_log = other.event_log;
-        }
-
-        if self.data_dir.is_none() {
-            self.data_dir = other.data_dir;
-        }
+    fn merge(&mut self, other: ConfigPaths) {
+        self.config_dir.get_or_insert(other.config_dir);
+        self.contracts_dir.get_or_insert(other.contracts_dir);
+        self.delegates_dir.get_or_insert(other.delegates_dir);
+        self.secrets_dir.get_or_insert(other.secrets_dir);
+        self.db_dir.get_or_insert(other.db_dir);
+        self.event_log.get_or_insert(other.event_log);
+        self.data_dir.get_or_insert(other.data_dir);
     }
 
     pub fn app_data_dir(id: Option<&str>) -> std::io::Result<PathBuf> {
@@ -622,7 +600,7 @@ impl ConfigPathsArgs {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigPaths {
     contracts_dir: PathBuf,
     delegates_dir: PathBuf,
