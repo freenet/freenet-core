@@ -1249,16 +1249,19 @@ pub(super) mod test {
     use dashmap::DashMap;
     use std::{
         collections::HashMap,
+        net::{Ipv4Addr, SocketAddr},
         sync::atomic::{AtomicUsize, Ordering::SeqCst},
     };
+    use tracing::level_filters::LevelFilter;
 
     use super::*;
-    use crate::{node::testing_impl::NodeLabel, ring::Distance};
+    use crate::{dev_tool::TransportKeypair, node::testing_impl::NodeLabel, ring::Distance};
 
     static LOG_ID: AtomicUsize = AtomicUsize::new(0);
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn event_register_read_write() -> Result<(), DynError> {
+        crate::config::set_logger(Some(LevelFilter::TRACE));
         use std::time::Duration;
         let temp_dir = tempfile::tempdir()?;
         let log_path = temp_dir.path().join("event_log");
@@ -1272,13 +1275,17 @@ pub(super) mod test {
         let mut transactions = vec![];
         let mut peers = vec![];
         let mut events = vec![];
+        let key = TransportKeypair::new();
+        let pub_key = key.public();
+        let socket: SocketAddr = (Ipv4Addr::LOCALHOST, 8080).into();
         for _ in 0..TEST_LOGS {
             let tx: Transaction = gen.arbitrary()?;
             transactions.push(tx);
-            let peer: PeerId = gen.arbitrary()?;
+            let peer: PeerId = PeerId::new(socket, pub_key.clone());
             peers.push(peer);
         }
-        let mut total_route_events = 0;
+        let mut total_route_events: usize = 0;
+        tracing::info!("generating logs");
         for i in 0..TEST_LOGS {
             let kind: EventKind = gen.arbitrary()?;
             if matches!(kind, EventKind::Route(_)) {
@@ -1290,7 +1297,9 @@ pub(super) mod test {
                 kind,
             });
         }
+        tracing::info!(?total_route_events);
         register.register_events(Either::Right(events)).await;
+        tracing::info!("waiting for logs to be written");
         while register.log_sender.capacity() != 1000 {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
