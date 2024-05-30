@@ -1249,13 +1249,12 @@ pub(super) mod test {
     use dashmap::DashMap;
     use std::{
         collections::HashMap,
-        net::{Ipv4Addr, SocketAddr},
         sync::atomic::{AtomicUsize, Ordering::SeqCst},
     };
     use tracing::level_filters::LevelFilter;
 
     use super::*;
-    use crate::{dev_tool::TransportKeypair, node::testing_impl::NodeLabel, ring::Distance};
+    use crate::{node::testing_impl::NodeLabel, ring::Distance};
 
     static LOG_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -1275,17 +1274,13 @@ pub(super) mod test {
         let mut transactions = vec![];
         let mut peers = vec![];
         let mut events = vec![];
-        let key = TransportKeypair::new();
-        let pub_key = key.public();
-        let socket: SocketAddr = (Ipv4Addr::LOCALHOST, 8080).into();
         for _ in 0..TEST_LOGS {
             let tx: Transaction = gen.arbitrary()?;
             transactions.push(tx);
-            let peer: PeerId = PeerId::new(socket, pub_key.clone());
+            let peer: PeerId = PeerId::random();
             peers.push(peer);
         }
         let mut total_route_events: usize = 0;
-        tracing::info!("generating logs");
         for i in 0..TEST_LOGS {
             let kind: EventKind = gen.arbitrary()?;
             if matches!(kind, EventKind::Route(_)) {
@@ -1297,9 +1292,7 @@ pub(super) mod test {
                 kind,
             });
         }
-        tracing::info!(?total_route_events);
         register.register_events(Either::Right(events)).await;
-        tracing::info!("waiting for logs to be written");
         while register.log_sender.capacity() != 1000 {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
