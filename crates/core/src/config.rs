@@ -1,3 +1,4 @@
+use std::io::Cursor;
 use std::{
     fs::{self, File},
     future::Future,
@@ -13,6 +14,7 @@ use once_cell::sync::Lazy;
 use pkcs1::DecodeRsaPrivateKey;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
+use tracing::log::logger;
 
 use crate::{dev_tool::PeerId, local_node::OperationMode, transport::TransportKeypair};
 
@@ -46,6 +48,9 @@ pub struct ConfigArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<OperationMode>,
 
+    #[clap(long, env = "IS_GATEWAY")]
+    pub is_gateway: bool,
+
     #[clap(flatten)]
     #[serde(flatten)]
     pub ws_api: WebsocketApiArgs,
@@ -78,6 +83,7 @@ impl Default for ConfigArgs {
     fn default() -> Self {
         Self {
             mode: Some(OperationMode::Network),
+            is_gateway: false,
             network_listener: NetworkArgs {
                 address: Some(default_address()),
                 port: Some(default_gateway_port()),
@@ -98,9 +104,10 @@ impl Default for ConfigArgs {
 
 impl ConfigArgs {
     fn read_config(dir: &PathBuf) -> std::io::Result<Option<Config>> {
+        println!("Reading config from: {:#?}", dir);
         if dir.exists() {
-            let mut dir = std::fs::read_dir(dir)?;
-            let config_args = dir.find_map(|f| {
+            let mut dir_to_read = std::fs::read_dir(dir)?;
+            let config_args = dir_to_read.find_map(|f| {
                 if let Ok(f) = f {
                     let filename = f.file_name().to_string_lossy().into_owned();
                     let ext = filename.rsplit('.').next().map(|s| s.to_owned());
@@ -124,25 +131,9 @@ impl ConfigArgs {
             });
             match config_args {
                 Some((filename, ext)) => match ext.as_str() {
-                    "toml" => {
-                        let mut file = File::open(&*filename)?;
-                        let mut content = String::new();
-                        file.read_to_string(&mut content)?;
-                        let mut config = toml::from_str::<Config>(&content).map_err(|e| {
-                            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                        })?;
-                        let (_, transport_keypair) =
-                            Self::read_transport_keypair(config.secrets_dir())?;
-                        config.transport_keypair = transport_keypair;
-                        Ok(Some(config))
-                    }
-                    "json" => {
-                        let mut file = File::open(&*filename)?;
-                        let mut config = serde_json::from_reader::<_, Config>(&mut file)?;
-                        let (_, transport_keypair) =
-                            Self::read_transport_keypair(config.secrets_dir())?;
-                        config.transport_keypair = transport_keypair;
-                        Ok(Some(config))
+                    "toml" | "json" => {
+                        let file_dir = dir.join(filename);
+                        Self::read_config_file(file_dir)
                     }
                     ext => Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
@@ -156,9 +147,32 @@ impl ConfigArgs {
         }
     }
 
+    fn read_config_file(file_dir: PathBuf) -> std::io::Result<Option<Config>> {
+        let mut file = File::open(file_dir.clone())?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        let mut config = if file_dir.extension().unwrap() == "toml" {
+            toml::from_str::<Config>(&content)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+        } else {
+            serde_json::from_reader::<_, Config>(Cursor::new(content))?
+        };
+        let path_to_key = config.transport_keypair_path.clone();
+        let transport_keypair = match Self::read_transport_keypair(path_to_key) {
+            Ok((_, transport_keypair)) => transport_keypair,
+            Err(e) => {
+                eprintln!("Error reading transport keypair: {}", e);
+                TransportKeypair::new()
+            }
+        };
+        config.transport_keypair = transport_keypair;
+        Ok(Some(config))
+    }
+
     fn read_transport_keypair(
         path_to_key: PathBuf,
     ) -> std::io::Result<(PathBuf, TransportKeypair)> {
+        println!("Reading key file: {:#?}", path_to_key);
         let mut key_file = File::open(&path_to_key).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
@@ -214,12 +228,15 @@ impl ConfigArgs {
         }
 
         let mode = self.mode.unwrap_or(OperationMode::Network);
+        let is_gateway = self.is_gateway;
+
         let config_paths = self.config_paths.build(self.id.as_deref())?;
 
         let transport_key = self
             .transport_keypair
             .map(Self::read_transport_keypair)
             .transpose()?;
+
         let (transport_keypair_path, transport_keypair) =
             if let Some((transport_key_path, transport_key)) = transport_key {
                 (transport_key_path, transport_key)
@@ -243,8 +260,11 @@ impl ConfigArgs {
                 }
             };
 
+        println!("Transport keypair: {:#?}", transport_keypair);
+
         let this = Config {
             mode,
+            is_gateway,
             peer_id: self
                 .network_listener
                 .public_address
@@ -273,6 +293,8 @@ impl ConfigArgs {
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
             config_paths: Arc::new(config_paths),
         };
+
+        println!("Config: {:#?}", this);
 
         fs::create_dir_all(&this.config_paths.config_dir)?;
         if should_persist {
@@ -365,6 +387,7 @@ mod serde_option_log_level_filter {
 pub struct Config {
     /// Node operation mode.
     pub mode: OperationMode,
+    pub is_gateway: bool,
     #[serde(flatten)]
     pub network_api: NetworkApiConfig,
     #[serde(flatten)]

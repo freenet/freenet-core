@@ -111,7 +111,7 @@ impl NodeConfig {
     pub fn new(config: Config) -> NodeConfig {
         NodeConfig {
             should_connect: true,
-            is_gateway: false,
+            is_gateway: config.is_gateway,
             key_pair: config.transport_keypair.clone(),
             remote_nodes: Vec::with_capacity(1),
             peer_id: config.peer_id.clone(),
