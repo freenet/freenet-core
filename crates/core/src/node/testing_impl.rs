@@ -376,7 +376,9 @@ impl SimNetwork {
             let id = PeerId::new((Ipv6Addr::LOCALHOST, port).into(), keypair.public().clone());
             let location = Location::random();
 
-            let mut config = NodeConfig::new(ConfigArgs::default().build().unwrap());
+            let mut config_args = ConfigArgs::default();
+            config_args.id = Some(format!("{label}"));
+            let mut config = NodeConfig::new(config_args.build().unwrap());
             config.key_pair = keypair;
             config.network_listener_ip = Ipv6Addr::LOCALHOST.into();
             config.network_listener_port = port;
@@ -444,7 +446,9 @@ impl SimNetwork {
             let label = NodeLabel::node(node_no);
             let peer = PeerId::random();
 
-            let mut config = NodeConfig::new(ConfigArgs::default().build().unwrap());
+            let mut config_args = ConfigArgs::default();
+            config_args.id = Some(format!("{label}"));
+            let mut config = NodeConfig::new(config_args.build().unwrap());
             for GatewayConfig { id, location, .. } in &gateways {
                 config.add_gateway(InitPeerNode::new(id.clone(), *location));
             }

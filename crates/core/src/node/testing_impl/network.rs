@@ -43,7 +43,7 @@ impl NetworkPeer {
             .await
             .expect("Failed to connect to supervisor");
 
-        let config_url = format!("http://localhost:3000/config/{}", peer_id);
+        let config_url = format!("http://127.0.0.1:3000/config/{}", peer_id);
         let response = reqwest::get(&config_url).await?;
         let peer_config = response.json::<crate::node::NodeConfig>().await?;
 

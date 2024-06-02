@@ -1251,7 +1251,6 @@ pub(super) mod test {
         collections::HashMap,
         sync::atomic::{AtomicUsize, Ordering::SeqCst},
     };
-    use tracing::level_filters::LevelFilter;
 
     use super::*;
     use crate::{node::testing_impl::NodeLabel, ring::Distance};
@@ -1260,7 +1259,8 @@ pub(super) mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn event_register_read_write() -> Result<(), DynError> {
-        crate::config::set_logger(Some(LevelFilter::TRACE));
+        // use tracing::level_filters::LevelFilter;
+        // crate::config::set_logger(Some(LevelFilter::TRACE));
         use std::time::Duration;
         let temp_dir = tempfile::tempdir()?;
         let log_path = temp_dir.path().join("event_log");
