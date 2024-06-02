@@ -325,8 +325,8 @@ mod serde_log_level_filter {
     where
         D: Deserializer<'de>,
     {
-        let level = <&str>::deserialize(deserializer)?;
-        parse_log_level_str::<D>(level)
+        let level = String::deserialize(deserializer)?;
+        parse_log_level_str::<D>(level.as_str())
     }
 }
 
@@ -804,5 +804,18 @@ pub fn set_logger(level: Option<tracing::level_filters::LevelFilter>) {
         }
 
         crate::tracing::tracer::init_tracer(level).expect("failed tracing initialization")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_serde() {
+        let args = ConfigArgs::default();
+        let cfg = args.build().unwrap();
+        let serialized = toml::to_string(&cfg).unwrap();
+        let _: Config = toml::from_str(&serialized).unwrap();
     }
 }
