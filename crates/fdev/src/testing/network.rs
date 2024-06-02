@@ -184,6 +184,8 @@ async fn start_child(config: &TestConfig, cmd_config: &NetworkProcessConfig) -> 
     if let Some(peer_id) = &cmd_config.id {
         let peer = NetworkPeer::new(peer_id.clone()).await?;
         peer.run(config, peer_id.clone()).await?;
+    } else {
+        bail!("Peer id not set");
     }
     Ok(())
 }

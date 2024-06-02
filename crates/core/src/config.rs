@@ -70,6 +70,7 @@ pub struct ConfigArgs {
 
     /// An arbitrary identifier for the node, mostly for debugging or testing purposes.
     #[clap(long)]
+    #[serde(skip)]
     pub id: Option<String>,
 }
 
@@ -518,7 +519,8 @@ impl ConfigPathsArgs {
     pub fn app_data_dir(id: Option<&str>) -> std::io::Result<PathBuf> {
         let project_dir = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
             .ok_or(std::io::ErrorKind::NotFound)?;
-        let app_data_dir: PathBuf = if cfg!(any(test, debug_assertions)) {
+        // if id is set, most likely we are running tests or in simulated mode
+        let app_data_dir: PathBuf = if cfg!(any(test, debug_assertions)) || id.is_some() {
             std::env::temp_dir().join(if let Some(id) = id {
                 format!("freenet-{id}")
             } else {

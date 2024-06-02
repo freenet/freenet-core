@@ -1259,6 +1259,8 @@ pub(super) mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn event_register_read_write() -> Result<(), DynError> {
+        // use tracing::level_filters::LevelFilter;
+        // crate::config::set_logger(Some(LevelFilter::TRACE));
         use std::time::Duration;
         let temp_dir = tempfile::tempdir()?;
         let log_path = temp_dir.path().join("event_log");
@@ -1275,10 +1277,10 @@ pub(super) mod test {
         for _ in 0..TEST_LOGS {
             let tx: Transaction = gen.arbitrary()?;
             transactions.push(tx);
-            let peer: PeerId = gen.arbitrary()?;
+            let peer: PeerId = PeerId::random();
             peers.push(peer);
         }
-        let mut total_route_events = 0;
+        let mut total_route_events: usize = 0;
         for i in 0..TEST_LOGS {
             let kind: EventKind = gen.arbitrary()?;
             if matches!(kind, EventKind::Route(_)) {

@@ -762,7 +762,7 @@ where
         return Err(OpError::ConnError(ConnectionError::FailedConnectOp));
     }
     let tx_id = Transaction::new::<ConnectMsg>();
-    tracing::info!(%gateway.peer, ?peer_pub_key, "Attempting network join");
+    tracing::info!(%gateway.peer, %peer_pub_key, "Attempting network join");
     let mut op = initial_request(
         peer_pub_key,
         gateway.clone(),

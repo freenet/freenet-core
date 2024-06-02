@@ -58,6 +58,22 @@ impl TransportPublicKey {
     }
 }
 
+impl std::fmt::Display for TransportPublicKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let encoded = self.0.to_pkcs1_der().map_err(|_| std::fmt::Error)?;
+        write!(
+            f,
+            "{}",
+            bs58::encode(if encoded.as_bytes().len() > 16 {
+                &encoded.as_bytes()[..16]
+            } else {
+                encoded.as_bytes()
+            })
+            .into_string()
+        )
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct TransportSecretKey(RsaPrivateKey);
 

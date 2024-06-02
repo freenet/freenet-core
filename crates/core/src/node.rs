@@ -845,11 +845,27 @@ impl PeerId {
     }
 }
 
+thread_local! {
+    static PEER_ID: std::cell::RefCell<Option<TransportPublicKey>> = std::cell::RefCell::new(None);
+}
+
 #[cfg(test)]
 impl<'a> arbitrary::Arbitrary<'a> for PeerId {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let addr: ([u8; 4], u16) = u.arbitrary()?;
-        let pub_key = TransportKeypair::new().public().clone(); // TODO: impl arbitrary for TransportPublicKey
+
+        let pub_key = PEER_ID.with(|peer_id| {
+            let mut peer_id = peer_id.borrow_mut();
+            match &*peer_id {
+                Some(k) => k.clone(),
+                None => {
+                    let key = TransportKeypair::new().public().clone();
+                    peer_id.replace(key.clone());
+                    key
+                }
+            }
+        });
+
         Ok(Self {
             addr: addr.into(),
             pub_key,
@@ -863,7 +879,19 @@ impl PeerId {
         let mut addr = [0; 4];
         rand::thread_rng().fill(&mut addr[..]);
         let port = crate::util::get_free_port().unwrap();
-        let pub_key = TransportKeypair::new().public().clone();
+
+        let pub_key = PEER_ID.with(|peer_id| {
+            let mut peer_id = peer_id.borrow_mut();
+            match &*peer_id {
+                Some(k) => k.clone(),
+                None => {
+                    let key = TransportKeypair::new().public().clone();
+                    peer_id.replace(key.clone());
+                    key
+                }
+            }
+        });
+
         Self {
             addr: (addr, port).into(),
             pub_key,

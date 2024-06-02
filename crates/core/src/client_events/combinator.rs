@@ -207,7 +207,6 @@ impl<Fut: Future + Unpin, const N: usize> Future for SelectAll<Fut, N> {
                     .flatten();
                 match item {
                     Some((idx, res)) => {
-                        eprintln!("polled {idx}");
                         self.inner[idx] = None;
                         let rest = std::mem::replace(&mut self.inner, [(); N].map(|_| None));
                         return Poll::Ready((res, idx, rest));
