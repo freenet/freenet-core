@@ -70,6 +70,7 @@ pub struct ConfigArgs {
 
     /// An arbitrary identifier for the node, mostly for debugging or testing purposes.
     #[clap(long)]
+    #[serde(skip)]
     pub id: Option<String>,
 }
 
