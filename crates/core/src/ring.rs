@@ -5,6 +5,7 @@
 
 use std::collections::VecDeque;
 use std::hash::Hash;
+use std::net::{IpAddr, SocketAddr};
 use std::{
     cmp::Reverse,
     collections::BTreeMap,
@@ -938,6 +939,25 @@ impl Ring {
 pub struct Location(f64);
 
 impl Location {
+    pub fn from_address(addr: &SocketAddr) -> Self {
+        match addr.ip() {
+            IpAddr::V4(ipv4) => {
+                let octets = ipv4.octets();
+                let combined_octets = (u32::from(octets[0]) << 16)
+                    | (u32::from(octets[1]) << 8)
+                    | u32::from(octets[2]);
+                Location(combined_octets as f64 / (u32::MAX as f64))
+            }
+            IpAddr::V6(ipv6) => {
+                let segments = ipv6.segments();
+                let combined_segments = (u64::from(segments[0]) << 32)
+                    | (u64::from(segments[1]) << 16)
+                    | u64::from(segments[2]);
+                Location(combined_segments as f64 / (u64::MAX as f64))
+            }
+        }
+    }
+
     pub fn new(location: f64) -> Self {
         debug_assert!(
             (0.0..=1.0).contains(&location),

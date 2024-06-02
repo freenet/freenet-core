@@ -2,7 +2,7 @@ use std::{
     fs::{self, File},
     future::Future,
     io::{Read, Write},
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{atomic::AtomicBool, Arc},
     time::Duration,
@@ -243,15 +243,44 @@ impl ConfigArgs {
                 }
             };
 
+        let peer_id = self
+            .network_listener
+            .public_address
+            .zip(self.network_listener.public_port)
+            .map(|(addr, port)| {
+                PeerId::new((addr, port).into(), transport_keypair.public().clone())
+            });
+        let gateways = config_paths.config_dir.join("gateways.toml");
+        let gateways = match File::open(&*gateways) {
+            Ok(mut file) => {
+                let mut content = String::new();
+                file.read_to_string(&mut content)?;
+                toml::from_str::<Gateways>(&content)
+                    .map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                    })?
+                    .gateways
+            }
+            Err(err) => {
+                #[cfg(not(any(test, debug_assertions)))]
+                {
+                    if peer_id.is_none() {
+                        tracing::error!("Failed to read gateways file: {err}");
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "Cannot initialize node without gateways",
+                        ));
+                    }
+                }
+                let _ = err;
+                tracing::warn!("No gateways file found, initializing disjoint gateway.");
+                vec![]
+            }
+        };
+
         let this = Config {
             mode,
-            peer_id: self
-                .network_listener
-                .public_address
-                .zip(self.network_listener.public_port)
-                .map(|(addr, port)| {
-                    PeerId::new((addr, port).into(), transport_keypair.public().clone())
-                }),
+            peer_id,
             network_api: NetworkApiConfig {
                 address: self.ws_api.address.unwrap_or_else(|| match mode {
                     OperationMode::Local => default_local_address(),
@@ -272,11 +301,12 @@ impl ConfigArgs {
             transport_keypair_path,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
             config_paths: Arc::new(config_paths),
+            gateways,
         };
 
-        fs::create_dir_all(&this.config_paths.config_dir)?;
+        fs::create_dir_all(&this.config_dir())?;
         if should_persist {
-            let mut file = File::create(this.config_paths.config_dir.join("config.toml"))?;
+            let mut file = File::create(this.config_dir().join("config.toml"))?;
             file.write_all(
                 toml::to_string(&this)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
@@ -369,6 +399,7 @@ pub struct Config {
     pub network_api: NetworkApiConfig,
     #[serde(flatten)]
     pub ws_api: WebsocketApiConfig,
+    // TODO:
     #[serde(skip)]
     pub transport_keypair: TransportKeypair,
     #[serde(rename = "transport_keypair")]
@@ -379,6 +410,8 @@ pub struct Config {
     config_paths: Arc<ConfigPaths>,
     #[serde(skip)]
     pub(crate) peer_id: Option<PeerId>,
+    #[serde(skip)]
+    pub(crate) gateways: Vec<GatewayConfig>,
 }
 
 impl Config {
@@ -757,6 +790,27 @@ impl Config {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct Gateways {
+    pub gateways: Vec<GatewayConfig>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GatewayConfig {
+    /// Address of the gateway. It can be either a URL or an IP address and port.
+    pub address: Address,
+
+    /// Path to the public key of the gateway in PEM format.
+    #[serde(rename = "public_key")]
+    pub public_key_path: PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Address {
+    Hostname(String),
+    HostAddress(SocketAddr),
+}
+
 pub(crate) struct GlobalExecutor;
 
 impl GlobalExecutor {
@@ -814,10 +868,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_serde() {
+    fn test_serde_config_args() {
         let args = ConfigArgs::default();
         let cfg = args.build().unwrap();
         let serialized = toml::to_string(&cfg).unwrap();
         let _: Config = toml::from_str(&serialized).unwrap();
+    }
+
+    #[test]
+    fn test_gateways() {
+        let gateways = Gateways {
+            gateways: vec![
+                GatewayConfig {
+                    address: Address::HostAddress(([127, 0, 0, 1], default_network_port()).into()),
+                    public_key_path: PathBuf::from("path/to/key"),
+                },
+                GatewayConfig {
+                    address: Address::Hostname("technic.locut.us".to_string()),
+                    public_key_path: PathBuf::from("path/to/key"),
+                },
+            ],
+        };
+
+        let serialized = toml::to_string(&gateways).unwrap();
+        let _: Gateways = toml::from_str(&serialized).unwrap();
     }
 }

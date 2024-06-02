@@ -45,6 +45,7 @@ pub fn set_cleanup_on_exit(config: Arc<ConfigPaths>) -> Result<(), ctrlc::Error>
                 }
             }
         }
+        let _ = config;
         tracing::info!("Successful cleanup");
 
         std::process::exit(0);

@@ -74,6 +74,12 @@ impl std::fmt::Display for TransportPublicKey {
     }
 }
 
+impl From<RsaPublicKey> for TransportPublicKey {
+    fn from(key: RsaPublicKey) -> Self {
+        TransportPublicKey(key)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct TransportSecretKey(RsaPrivateKey);
 

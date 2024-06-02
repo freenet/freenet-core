@@ -10,7 +10,8 @@
 
 use std::{
     fmt::Display,
-    io::Write,
+    fs::File,
+    io::Read,
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -22,13 +23,14 @@ use freenet_stdlib::{
     prelude::{ContractKey, RelatedContracts, WrappedState},
 };
 
+use pkcs1::DecodeRsaPublicKey;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use self::p2p_impl::NodeP2P;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
-    config::GlobalExecutor,
+    config::{GatewayConfig, GlobalExecutor},
     contract::{
         Callback, ClientResponsesReceiver, ClientResponsesSender, ContractError,
         ExecutorToEventLoopChannel, NetworkContractHandler,
@@ -94,9 +96,9 @@ pub struct NodeConfig {
     pub network_listener_port: u16,
     pub(crate) peer_id: Option<PeerId>,
     pub(crate) config: Arc<Config>,
-    /// At least an other running listener node is required for joining the network.
+    /// At least one gateway is required for joining the network.
     /// Not necessary if this is an initial node.
-    pub(crate) remote_nodes: Vec<InitPeerNode>,
+    pub(crate) gateways: Vec<InitPeerNode>,
     /// the location of this node, used for gateways.
     pub(crate) location: Option<Location>,
     pub(crate) max_hops_to_live: Option<usize>,
@@ -108,12 +110,32 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
-    pub fn new(config: Config) -> NodeConfig {
-        NodeConfig {
+    pub fn new(config: Config) -> anyhow::Result<NodeConfig> {
+        let mut gateways = Vec::with_capacity(config.gateways.len());
+        for gw in &config.gateways {
+            let GatewayConfig {
+                address,
+                public_key_path,
+            } = gw;
+
+            let mut key_file = File::open(&public_key_path)?;
+            let mut buf = String::new();
+            key_file.read_to_string(&mut buf)?;
+
+            let pub_key = rsa::RsaPublicKey::from_pkcs1_pem(&buf)?;
+
+            let address = match address {
+                crate::config::Address::Hostname(_) => todo!("impl resolution of hostname to ip"),
+                crate::config::Address::HostAddress(addr) => *addr,
+            };
+            let peer_id = PeerId::new(address, TransportPublicKey::from(pub_key));
+            gateways.push(InitPeerNode::new(peer_id, Location::from_address(&address)));
+        }
+        Ok(NodeConfig {
             should_connect: true,
             is_gateway: false,
             key_pair: config.transport_keypair.clone(),
-            remote_nodes: Vec::with_capacity(1),
+            gateways,
             peer_id: config.peer_id.clone(),
             network_listener_ip: config.network_api.address,
             network_listener_port: config.network_api.port,
@@ -125,7 +147,7 @@ impl NodeConfig {
             min_number_conn: None,
             max_upstream_bandwidth: None,
             max_downstream_bandwidth: None,
-        }
+        })
     }
 
     pub fn config(&self) -> &Config {
@@ -178,7 +200,7 @@ impl NodeConfig {
 
     /// Connection info for an already existing peer. Required in case this is not a gateway node.
     pub fn add_gateway(&mut self, peer: InitPeerNode) -> &mut Self {
-        self.remote_nodes.push(peer);
+        self.gateways.push(peer);
         self
     }
 
@@ -220,7 +242,7 @@ impl NodeConfig {
     /// and no gateways are specified.
     fn get_gateways(&self) -> Result<Vec<PeerKeyLocation>, anyhow::Error> {
         let gateways: Vec<PeerKeyLocation> = self
-            .remote_nodes
+            .gateways
             .iter()
             .map(|node| PeerKeyLocation {
                 peer: node.peer_id.clone(),
@@ -488,6 +510,7 @@ async fn report_result(
             }
             #[cfg(any(debug_assertions, test))]
             {
+                use std::io::Write;
                 let OpError::InvalidStateTransition { tx, state, trace } = err else {
                     tracing::error!("Finished transaction with error: {err}");
                     return;
