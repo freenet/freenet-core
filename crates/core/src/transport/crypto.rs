@@ -1,4 +1,4 @@
-use pkcs1::EncodeRsaPrivateKey;
+use pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey};
 use rand::rngs::OsRng;
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};

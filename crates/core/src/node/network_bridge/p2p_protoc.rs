@@ -473,10 +473,6 @@ impl P2pConnManager {
                         }
                     }
                 }
-                Ok(Right(NodeAction(NodeEvent::ShutdownNode))) => {
-                    tracing::info!("Shutting down message loop gracefully");
-                    break;
-                }
                 Ok(Right(NodeAction(NodeEvent::ConnectPeer { peer, callback }))) => {
                     tracing::info!(remote = %peer, this_peer = ?op_manager.ring.get_peer_key().unwrap(), "Connecting to peer");
                     let mut ob = outbound_conn_handler.clone();

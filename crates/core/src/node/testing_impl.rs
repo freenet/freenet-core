@@ -1077,7 +1077,6 @@ where
         let msg = match msg {
             Ok(Either::Left(msg)) => msg,
             Ok(Either::Right(action)) => match action {
-                NodeEvent::ShutdownNode => break Ok(()),
                 NodeEvent::DropConnection(peer) => {
                     tracing::info!("Dropping connection to {peer}");
                     event_register
