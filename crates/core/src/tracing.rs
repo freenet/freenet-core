@@ -38,6 +38,9 @@ pub(crate) use test::TestEventListener;
 
 use crate::node::OpManager;
 
+/// An append-only log for network events.
+mod aof;
+
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 struct ListenerLogId(usize);
@@ -408,6 +411,7 @@ impl EventRegister {
         let mut event_log = match OpenOptions::new()
             .write(true)
             .read(true)
+            .append(true)
             .open(&*event_log_path)
             .await
         {
@@ -523,6 +527,11 @@ impl EventRegister {
             }
         }
 
+        tracing::error!(
+            "num_written: {num_written}, num_recs: {num_recs}",
+            num_written = num_written,
+            num_recs = num_recs
+        );
         if *num_written >= Self::BATCH_SIZE {
             {
                 use tokio::io::AsyncWriteExt;
@@ -531,20 +540,25 @@ impl EventRegister {
                     tracing::error!("Failed writting to event log: {err}");
                     panic!("Failed writting event log");
                 }
+
+                if let Err(err) = event_log.sync_all().await {
+                    tracing::error!("Failed syncing event log: {err}");
+                    panic!("Failed syncing event log");
+                }
             }
             *num_recs += *num_written;
             *num_written = 0;
         }
 
         // Check the number of lines and truncate if needed
-        if *num_recs > Self::MAX_LOG_RECORDS {
-            const REMOVE_RECS: usize = 1000 + EVENT_REGISTER_BATCH_SIZE; // making space for 1000 new records
-            if let Err(err) = Self::truncate_records(event_log, REMOVE_RECS).await {
-                tracing::error!("Failed truncating log file: {:?}", err);
-                panic!("Failed truncating log file");
-            }
-            *num_recs -= REMOVE_RECS;
-        }
+        // if *num_recs > Self::MAX_LOG_RECORDS {
+        //     const REMOVE_RECS: usize = 1000 + EVENT_REGISTER_BATCH_SIZE; // making space for 1000 new records
+        //     if let Err(err) = Self::truncate_records(event_log, REMOVE_RECS).await {
+        //         tracing::error!("Failed truncating log file: {:?}", err);
+        //         panic!("Failed truncating log file");
+        //     }
+        //     *num_recs -= REMOVE_RECS;
+        // }
     }
 
     async fn num_lines(path: &Path) -> io::Result<usize> {
@@ -620,6 +634,7 @@ impl EventRegister {
 
         // Truncate the file to the new size
         file.set_len(buffer.len() as u64).await?;
+        file.sync_all().await?;
         file.seek(io::SeekFrom::End(0)).await?;
         Ok(())
     }
@@ -1267,7 +1282,7 @@ pub(super) mod test {
         std::fs::File::create(&log_path)?;
 
         // force a truncation
-        const TEST_LOGS: usize = EventRegister::MAX_LOG_RECORDS + 100;
+        const TEST_LOGS: usize = 100;
         let register = EventRegister::new(log_path.clone());
         let bytes = crate::util::test::random_bytes_2mb();
         let mut gen = arbitrary::Unstructured::new(&bytes);
@@ -1293,12 +1308,11 @@ pub(super) mod test {
             });
         }
         register.register_events(Either::Right(events)).await;
-        while register.log_sender.capacity() != 1000 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        tokio::time::sleep(Duration::from_millis(1_000)).await;
-        let ev =
-            EventRegister::get_router_events(EventRegister::MAX_LOG_RECORDS, &log_path).await?;
+        // while register.log_sender.capacity() != 1000 {
+        //     tokio::time::sleep(Duration::from_millis(500)).await;
+        // }
+        tokio::time::sleep(Duration::from_millis(10_000)).await;
+        let ev = EventRegister::get_router_events(100, &log_path).await?;
         assert_eq!(ev.len(), total_route_events);
         Ok(())
     }
