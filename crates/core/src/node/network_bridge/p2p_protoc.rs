@@ -168,15 +168,6 @@ impl P2pConnManager {
         let mut gw_inbound_pending_connections = HashSet::new();
 
         loop {
-            tracing::info!(
-                "This peer {:?} has active connections with peers: {:?}",
-                self.bridge.op_manager.ring.get_peer_key().unwrap(),
-                gw_inbound_pending_connections
-                    .iter()
-                    .chain(self.connections.keys().map(|p| &p.addr))
-                    .collect::<Vec<_>>()
-            );
-
             let notification_msg = notification_channel.0.recv().map(|m| match m {
                 None => Ok(Right(ClosedChannel)),
                 Some(Left(msg)) => Ok(Left((msg, None))),
@@ -422,8 +413,10 @@ impl P2pConnManager {
                                             "Established connection with peer",
                                         );
                                         gw_inbound_pending_connections.insert(remote_addr);
-
                                         self.connections.insert(peer_id.clone(), msg_sender);
+                                        self.print_connected_peers(
+                                            gw_inbound_pending_connections.iter(),
+                                        );
                                     } else if joiner.is_none() {
                                         tracing::error!(
                                             "Joiner unexpectedly not set for connection request."
@@ -519,6 +512,7 @@ impl P2pConnManager {
                     peer_conn,
                 })) => {
                     gw_inbound_pending_connections.insert(remote_addr);
+                    self.print_connected_peers(gw_inbound_pending_connections.iter());
                     let (tx, rx) = mpsc::channel(10);
                     pending_inbound_gw_conns.insert(remote_addr, tx);
                     let task = peer_connection_listener(rx, peer_conn).boxed();
@@ -527,6 +521,7 @@ impl P2pConnManager {
                 Ok(Right(ConnectionEstablished { peer, peer_conn })) => {
                     let (tx, rx) = mpsc::channel(10);
                     self.connections.insert(peer.clone(), tx);
+                    self.print_connected_peers(gw_inbound_pending_connections.iter());
 
                     // Spawn a task to handle the connection messages (inbound and outbound)
                     let task = peer_connection_listener(rx, peer_conn).boxed();
@@ -698,6 +693,25 @@ impl P2pConnManager {
         }
 
         Ok(connection.map(Either::Right).unwrap_or(Either::Left(())))
+    }
+
+    #[inline]
+    fn print_connected_peers<'a>(
+        &self,
+        gw_inbound_pending_connections: impl Iterator<Item = &'a SocketAddr>,
+    ) {
+        tracing::debug!(
+            "This peer {:?} has active connections with peers: {:?}",
+            self.bridge.op_manager.ring.get_peer_key().as_ref(),
+            self.connections.keys().map(|p| &p.addr).collect::<Vec<_>>()
+        );
+        if self.is_gateway {
+            tracing::debug!(
+                "This gateway {:?} has pending connections with peers: {:?}",
+                self.bridge.op_manager.ring.get_peer_key().as_ref(),
+                gw_inbound_pending_connections.collect::<Vec<_>>()
+            );
+        }
     }
 }
 
