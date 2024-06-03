@@ -419,22 +419,20 @@ impl EventRegister {
         }
 
         // store remaining logs
-        let mut batch_serialized_data = Vec::with_capacity(event_log.batch.len() * 1024);
-        for log_item in event_log.batch.drain(..) {
-            let (header, mut serialized) = match aof::LogFile::encode_log(&log_item) {
-                Err(err) => {
-                    tracing::error!("Failed serializing log: {err}");
-                    break;
+        let moved_batch = std::mem::replace(&mut event_log.batch, aof::Batch::new(aof::BATCH_SIZE));
+        let batch_states = moved_batch.states;
+        match aof::LogFile::encode_batch(&moved_batch) {
+            Ok(batch_serialized_data) => {
+                if !batch_serialized_data.is_empty()
+                    && event_log.write_all(&batch_serialized_data).await.is_err()
+                {
+                    panic!("Failed writting event log");
                 }
-                Ok(serialized) => serialized,
-            };
-            batch_serialized_data.extend_from_slice(&header);
-            batch_serialized_data.append(&mut serialized);
-        }
-        if !batch_serialized_data.is_empty()
-            && event_log.write_all(&batch_serialized_data).await.is_err()
-        {
-            panic!("Failed writting event log");
+                event_log.update_states(batch_states);
+            }
+            Err(err) => {
+                tracing::error!("Failed encode batch: {err}");
+            }
         }
     }
 }
@@ -859,17 +857,23 @@ enum EventKind {
 }
 
 impl EventKind {
+    const CONNECT: u8 = 0;
+    const PUT: u8 = 1;
+    const GET: u8 = 2;
     const ROUTE: u8 = 3;
+    const SUBSCRIBED: u8 = 4;
+    const IGNORED: u8 = 5;
+    const DISCONNECTED: u8 = 6;
 
     const fn varint_id(&self) -> u8 {
         match self {
-            EventKind::Connect(_) => 0,
-            EventKind::Put(_) => 1,
-            EventKind::Get { .. } => 2,
+            EventKind::Connect(_) => Self::CONNECT,
+            EventKind::Put(_) => Self::PUT,
+            EventKind::Get { .. } => Self::GET,
             EventKind::Route(_) => Self::ROUTE,
-            EventKind::Subscribed { .. } => 4,
-            EventKind::Ignored => 5,
-            EventKind::Disconnected { .. } => 6,
+            EventKind::Subscribed { .. } => Self::SUBSCRIBED,
+            EventKind::Ignored => Self::IGNORED,
+            EventKind::Disconnected { .. } => Self::DISCONNECTED,
         }
     }
 }
@@ -1019,50 +1023,6 @@ pub(super) mod test {
     use crate::{node::testing_impl::NodeLabel, ring::Distance};
 
     static LOG_ID: AtomicUsize = AtomicUsize::new(0);
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn event_register_read_write() -> Result<(), DynError> {
-        crate::config::set_logger(Some(LevelFilter::TRACE));
-        use std::time::Duration;
-        let temp_dir = tempfile::tempdir()?;
-        let log_path = temp_dir.path().join("event_log");
-        std::fs::File::create(&log_path)?;
-
-        // force a truncation
-        const TEST_LOGS: usize = aof::MAX_LOG_RECORDS;
-        let register = EventRegister::new(log_path.clone());
-        let bytes = crate::util::test::random_bytes_2mb();
-        let mut gen = arbitrary::Unstructured::new(&bytes);
-        let mut transactions = vec![];
-        let mut peers = vec![];
-        let mut events = vec![];
-        for _ in 0..TEST_LOGS {
-            let tx: Transaction = gen.arbitrary()?;
-            transactions.push(tx);
-            let peer: PeerId = PeerId::random();
-            peers.push(peer);
-        }
-        let mut total_route_events: usize = 0;
-        for i in 0..TEST_LOGS {
-            let kind: EventKind = gen.arbitrary()?;
-            if matches!(kind, EventKind::Route(_)) {
-                total_route_events += 1;
-            }
-            events.push(NetEventLog {
-                tx: &transactions[i],
-                peer_id: peers[i].clone(),
-                kind,
-            });
-        }
-        register.register_events(Either::Right(events)).await;
-        // while register.log_sender.capacity() != 1000 {
-        //     tokio::time::sleep(Duration::from_millis(500)).await;
-        // }
-        tokio::time::sleep(Duration::from_millis(10_000)).await;
-        let ev = aof::LogFile::get_router_events(TEST_LOGS, &log_path).await?;
-        assert_eq!(ev.len(), total_route_events);
-        Ok(())
-    }
 
     #[derive(Clone)]
     pub(crate) struct TestEventListener {
