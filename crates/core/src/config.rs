@@ -83,6 +83,7 @@ impl Default for ConfigArgs {
                 port: Some(default_gateway_port()),
                 public_address: None,
                 public_port: None,
+                is_gateway: false,
             },
             ws_api: WebsocketApiArgs {
                 address: Some(default_address()),
@@ -99,8 +100,8 @@ impl Default for ConfigArgs {
 impl ConfigArgs {
     fn read_config(dir: &PathBuf) -> std::io::Result<Option<Config>> {
         if dir.exists() {
-            let mut dir = std::fs::read_dir(dir)?;
-            let config_args = dir.find_map(|f| {
+            let mut read_dir = std::fs::read_dir(dir)?;
+            let config_args = read_dir.find_map(|f| {
                 if let Ok(f) = f {
                     let filename = f.file_name().to_string_lossy().into_owned();
                     let ext = filename.rsplit('.').next().map(|s| s.to_owned());
@@ -123,32 +124,38 @@ impl ConfigArgs {
                 None
             });
             match config_args {
-                Some((filename, ext)) => match ext.as_str() {
-                    "toml" => {
-                        let mut file = File::open(&*filename)?;
-                        let mut content = String::new();
-                        file.read_to_string(&mut content)?;
-                        let mut config = toml::from_str::<Config>(&content).map_err(|e| {
-                            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                        })?;
-                        let (_, transport_keypair) =
-                            Self::read_transport_keypair(config.secrets_dir())?;
-                        config.transport_keypair = transport_keypair;
-                        Ok(Some(config))
+                Some((filename, ext)) => {
+                    tracing::info!(
+                        "Reading configuration file: {:?}",
+                        dir.join(&filename).with_extension(&ext)
+                    );
+                    match ext.as_str() {
+                        "toml" => {
+                            let mut file = File::open(&*filename)?;
+                            let mut content = String::new();
+                            file.read_to_string(&mut content)?;
+                            let mut config = toml::from_str::<Config>(&content).map_err(|e| {
+                                std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                            })?;
+                            let (_, transport_keypair) =
+                                Self::read_transport_keypair(config.secrets_dir())?;
+                            config.transport_keypair = transport_keypair;
+                            Ok(Some(config))
+                        }
+                        "json" => {
+                            let mut file = File::open(&*filename)?;
+                            let mut config = serde_json::from_reader::<_, Config>(&mut file)?;
+                            let (_, transport_keypair) =
+                                Self::read_transport_keypair(config.secrets_dir())?;
+                            config.transport_keypair = transport_keypair;
+                            Ok(Some(config))
+                        }
+                        ext => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("Invalid configuration file extension: {}", ext),
+                        )),
                     }
-                    "json" => {
-                        let mut file = File::open(&*filename)?;
-                        let mut config = serde_json::from_reader::<_, Config>(&mut file)?;
-                        let (_, transport_keypair) =
-                            Self::read_transport_keypair(config.secrets_dir())?;
-                        config.transport_keypair = transport_keypair;
-                        Ok(Some(config))
-                    }
-                    ext => Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("Invalid configuration file extension: {}", ext),
-                    )),
-                },
+                }
                 None => Ok(None),
             }
         } else {
@@ -196,7 +203,7 @@ impl ConfigArgs {
             Self::read_config(path)?
         } else {
             // find default application dir to see if there is a config file
-            let dir = ConfigPathsArgs::config_dir()?;
+            let dir = ConfigPathsArgs::config_dir(self.id.as_deref())?;
             Self::read_config(&dir).ok().flatten()
         };
 
@@ -302,6 +309,7 @@ impl ConfigArgs {
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
             config_paths: Arc::new(config_paths),
             gateways,
+            is_gateway: self.network_listener.is_gateway,
         };
 
         fs::create_dir_all(&this.config_dir())?;
@@ -399,7 +407,6 @@ pub struct Config {
     pub network_api: NetworkApiConfig,
     #[serde(flatten)]
     pub ws_api: WebsocketApiConfig,
-    // TODO:
     #[serde(skip)]
     pub transport_keypair: TransportKeypair,
     #[serde(rename = "transport_keypair")]
@@ -412,6 +419,7 @@ pub struct Config {
     pub(crate) peer_id: Option<PeerId>,
     #[serde(skip)]
     pub(crate) gateways: Vec<GatewayConfig>,
+    pub(crate) is_gateway: bool,
 }
 
 impl Config {
@@ -451,6 +459,11 @@ pub struct NetworkArgs {
         skip_serializing_if = "Option::is_none"
     )]
     pub public_port: Option<u16>,
+
+    /// Whether the node is a gateway or not.
+    /// If the node is a gateway, it will be able to accept connections from other nodes.
+    #[arg(long)]
+    pub is_gateway: bool,
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
@@ -565,11 +578,17 @@ impl ConfigPathsArgs {
         Ok(app_data_dir)
     }
 
-    pub fn config_dir() -> std::io::Result<PathBuf> {
+    pub fn config_dir(id: Option<&str>) -> std::io::Result<PathBuf> {
         let project_dir = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
             .ok_or(std::io::ErrorKind::NotFound)?;
-        let config_data_dir: PathBuf = if cfg!(any(test, debug_assertions)) {
-            std::env::temp_dir().join("freenet").join("config")
+        let config_data_dir: PathBuf = if cfg!(any(test, debug_assertions)) || id.is_some() {
+            std::env::temp_dir()
+                .join(if let Some(id) = id {
+                    format!("freenet-{id}")
+                } else {
+                    "freenet".into()
+                })
+                .join("config")
         } else {
             project_dir.config_dir().into()
         };
@@ -629,7 +648,7 @@ impl ConfigPathsArgs {
             event_log,
             config_dir: match self.config_dir {
                 Some(dir) => dir,
-                None => Self::config_dir()?,
+                None => Self::config_dir(id)?,
             },
         })
     }
@@ -797,7 +816,7 @@ struct Gateways {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GatewayConfig {
-    /// Address of the gateway. It can be either a URL or an IP address and port.
+    /// Address of the gateway. It can be either a hostname or an IP address and port.
     pub address: Address,
 
     /// Path to the public key of the gateway in PEM format.
@@ -807,7 +826,9 @@ pub struct GatewayConfig {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Address {
+    #[serde(rename = "hostname")]
     Hostname(String),
+    #[serde(rename = "host_address")]
     HostAddress(SocketAddr),
 }
 

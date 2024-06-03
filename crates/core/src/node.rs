@@ -23,7 +23,7 @@ use freenet_stdlib::{
     prelude::{ContractKey, RelatedContracts, WrappedState},
 };
 
-use pkcs1::DecodeRsaPublicKey;
+use rsa::pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
@@ -122,10 +122,12 @@ impl NodeConfig {
             let mut buf = String::new();
             key_file.read_to_string(&mut buf)?;
 
-            let pub_key = rsa::RsaPublicKey::from_pkcs1_pem(&buf)?;
+            let pub_key = rsa::RsaPublicKey::from_public_key_pem(&buf)?;
 
             let address = match address {
-                crate::config::Address::Hostname(_) => todo!("impl resolution of hostname to ip"),
+                crate::config::Address::Hostname(hostname) => {
+                    todo!("impl resolution of hostname to ip: {hostname}")
+                }
                 crate::config::Address::HostAddress(addr) => *addr,
             };
             let peer_id = PeerId::new(address, TransportPublicKey::from(pub_key));
@@ -133,7 +135,7 @@ impl NodeConfig {
         }
         Ok(NodeConfig {
             should_connect: true,
-            is_gateway: false,
+            is_gateway: config.is_gateway,
             key_pair: config.transport_keypair.clone(),
             gateways,
             peer_id: config.peer_id.clone(),

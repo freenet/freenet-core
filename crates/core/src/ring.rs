@@ -800,7 +800,10 @@ impl Ring {
         let mut live_tx = None;
         let mut pending_conn_adds = VecDeque::new();
         'outer: loop {
-            //
+            if self.get_peer_key().is_none() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
             loop {
                 match missing_candidates.try_recv() {
                     Ok(missing_candidate) => {

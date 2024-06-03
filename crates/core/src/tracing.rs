@@ -159,7 +159,9 @@ impl<'a> NetEventLog<'a> {
     }
 
     pub fn from_outbound_msg(msg: &'a NetMessage, ring: &'a Ring) -> Either<Self, Vec<Self>> {
-        let peer_id = ring.get_peer_key().unwrap();
+        let Some(peer_id) = ring.get_peer_key() else {
+            return Either::Right(vec![]);
+        };
         let kind = match msg {
             NetMessage::V1(NetMessageV1::Connect(connect::ConnectMsg::Response {
                 msg:
