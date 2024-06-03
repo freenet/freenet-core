@@ -1,7 +1,7 @@
 use byteorder::ByteOrder;
 use tokio::{
     fs::{File, OpenOptions},
-    io::{self, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, Error},
+    io::{self, AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWriteExt, BufReader, Error},
 };
 
 use std::path::Path;
@@ -30,6 +30,8 @@ pub(super) struct LogFile {
     // make this configurable?
     max_log_records: usize,
     pub(super) batch: Vec<NetLogMessage>,
+    num_written: usize,
+    num_recs: usize,
 }
 
 impl LogFile {
@@ -40,13 +42,16 @@ impl LogFile {
             .append(true)
             .open(path)
             .await?;
-
-        let writer = file.try_clone().await?;
+        let mut reader = BufReader::new(file);
+        let num_recs = Self::num_lines(&mut reader).await.expect("non IO error");
+        let writer = reader.get_ref().try_clone().await?;
         Ok(Self {
-            reader: BufReader::new(file),
+            reader,
             writer,
             max_log_records: MAX_LOG_RECORDS,
             batch: Vec::with_capacity(BATCH_SIZE),
+            num_written: 0,
+            num_recs,
         })
     }
 
@@ -60,8 +65,7 @@ impl LogFile {
         Ok((header, serialized))
     }
 
-    pub async fn num_lines(path: &Path) -> io::Result<usize> {
-        let mut file = BufReader::new(File::open(path).await?);
+    pub async fn num_lines(file: &mut (impl AsyncRead + AsyncSeek + Unpin)) -> io::Result<usize> {
         let mut num_records = 0;
         let mut buf = [0; EVENT_LOG_HEADER_SIZE]; // Read the u32 length prefix + u8 event kind
 
@@ -82,12 +86,7 @@ impl LogFile {
         Ok(num_records)
     }
 
-    pub async fn persist_log(
-        &mut self,
-        num_written: &mut usize,
-        num_recs: &mut usize,
-        log: NetLogMessage,
-    ) {
+    pub async fn persist_log(&mut self, log: NetLogMessage) {
         self.batch.push(log);
         let mut batch_buf = vec![];
 
@@ -115,7 +114,7 @@ impl LogFile {
                 Ok(Ok(serialized_data)) => {
                     // tracing::debug!(bytes = %serialized_data.len(), %num_logs, "serialized logs");
                     batch_buf = serialized_data;
-                    *num_written += num_logs;
+                    self.num_written += num_logs;
                     self.batch.clear(); // Clear the batch for new data
                 }
                 _ => {
@@ -124,12 +123,7 @@ impl LogFile {
             }
         }
 
-        tracing::error!(
-            "num_written: {num_written}, num_recs: {num_recs}",
-            num_written = num_written,
-            num_recs = num_recs
-        );
-        if *num_written >= BATCH_SIZE {
+        if self.num_written >= BATCH_SIZE {
             {
                 let _guard = FILE_LOCK.lock().await;
                 if let Err(err) = self.writer.write_all(&batch_buf).await {
@@ -142,18 +136,18 @@ impl LogFile {
                     panic!("Failed syncing event log");
                 }
             }
-            *num_recs += *num_written;
-            *num_written = 0;
+            self.num_recs += self.num_written;
+            self.num_written = 0;
         }
 
         // Check the number of lines and truncate if needed
-        if *num_recs > self.max_log_records {
+        if self.num_recs > self.max_log_records {
             const REMOVE_RECS: usize = 1000 + EVENT_REGISTER_BATCH_SIZE; // making space for 1000 new records
             if let Err(err) = self.truncate_records(REMOVE_RECS).await {
                 tracing::error!("Failed truncating log file: {:?}", err);
                 panic!("Failed truncating log file");
             }
-            *num_recs -= REMOVE_RECS;
+            self.num_recs -= REMOVE_RECS;
         }
     }
 

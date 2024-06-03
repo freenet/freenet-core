@@ -397,11 +397,6 @@ impl EventRegister {
                 panic!("Failed openning log file"); // fixme: propagate this to the main event loop
             }
         };
-        let mut num_written = 0;
-
-        let mut num_recs = aof::LogFile::num_lines(event_log_path.as_path())
-            .await
-            .expect("non IO error");
 
         let mut ws = connect_to_metrics_server().await;
 
@@ -417,7 +412,7 @@ impl EventRegister {
                     if let Some(ws) = ws.as_mut() {
                         send_to_metrics_server(ws, &log).await;
                     }
-                    event_log.persist_log(&mut num_written, &mut num_recs, log).await;
+                    event_log.persist_log(log).await;
                 }
                 ws_msg = ws_recv => {
                     if let Some((ws, ws_msg)) = ws.as_mut().zip(ws_msg) {
@@ -430,14 +425,14 @@ impl EventRegister {
         // store remaining logs
         let mut batch_serialized_data = Vec::with_capacity(event_log.batch.len() * 1024);
         for log_item in event_log.batch.drain(..) {
-            let (mut header, mut serialized) = match aof::LogFile::encode_log(&log_item) {
+            let (header, mut serialized) = match aof::LogFile::encode_log(&log_item) {
                 Err(err) => {
                     tracing::error!("Failed serializing log: {err}");
                     break;
                 }
                 Ok(serialized) => serialized,
             };
-            batch_serialized_data.extend_from_slice(&mut header);
+            batch_serialized_data.extend_from_slice(&header);
             batch_serialized_data.append(&mut serialized);
         }
         if !batch_serialized_data.is_empty() {
