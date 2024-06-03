@@ -298,6 +298,7 @@ impl LogFile {
         &mut self,
         remove_records: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = FILE_LOCK.lock().await;
         self.file.rewind().await?;
         // tracing::debug!(position = file.stream_position().await.unwrap());
         let mut records_count = 0;
@@ -341,11 +342,20 @@ impl LogFile {
 
         // Seek back to the beginning and write the remaining content
         self.file.rewind().await?;
+        self.file.get_mut().rewind().await?;
         self.file.write_all(&buffer).await?;
-
         // Truncate the file to the new size
         self.file.get_ref().set_len(buffer.len() as u64).await?;
         self.file.get_ref().sync_all().await?;
+
+        {
+            self.file.rewind().await?;
+            let records = Self::get_router_events_in(MAX_LOG_RECORDS, &mut self.file)
+                .await
+                .unwrap();
+            tracing::error!("records {:?}", records.len());
+        }
+
         self.file.seek(io::SeekFrom::End(0)).await?;
         Ok(())
     }
@@ -358,9 +368,15 @@ impl LogFile {
         let event_num = max_event_number.min(MAX_EVENT_HISTORY);
 
         let _guard: tokio::sync::MutexGuard<'_, ()> = FILE_LOCK.lock().await;
-        let mut file =
-            tokio::io::BufReader::new(OpenOptions::new().read(true).open(event_log_path).await?);
+        let mut file = BufReader::new(OpenOptions::new().read(true).open(event_log_path).await?);
 
+        Self::get_router_events_in(event_num, &mut file).await
+    }
+
+    async fn get_router_events_in(
+        event_num: usize,
+        file: &mut (impl AsyncRead + AsyncSeek + Unpin),
+    ) -> Result<Vec<RouteEvent>, DynError> {
         let new_records_ts = NEW_RECORDS_TS
             .get()
             .expect("set on initialization")
