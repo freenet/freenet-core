@@ -70,6 +70,23 @@ impl core::ops::SubAssign<u8> for States {
     }
 }
 
+impl core::ops::AddAssign<u8> for States {
+    fn add_assign(&mut self, rhs: u8) {
+        self.total += 1;
+
+        match rhs {
+            EventKind::CONNECT => self.connect_events += 1,
+            EventKind::PUT => self.put_events += 1,
+            EventKind::GET => self.get_events += 1,
+            EventKind::ROUTE => self.route_events += 1,
+            EventKind::SUBSCRIBED => self.subscribed_events += 1,
+            EventKind::IGNORED => self.ignored_events += 1,
+            EventKind::DISCONNECTED => self.disconnected_events += 1,
+            _ => unreachable!(),
+        }
+    }
+}
+
 impl core::ops::SubAssign for States {
     fn sub_assign(&mut self, rhs: Self) {
         self.total -= rhs.total;
@@ -234,8 +251,6 @@ impl LogFile {
     }
 
     pub async fn persist_log(&mut self, log: NetLogMessage) {
-        let _guard = FILE_LOCK.lock().await;
-
         self.batch.push(log);
         let mut batch_buf = vec![];
 
@@ -247,7 +262,6 @@ impl LogFile {
 
             match serialization_task.await {
                 Ok(Ok(serialized_data)) => {
-                    // tracing::debug!(bytes = %serialized_data.len(), %num_logs, "serialized logs");
                     batch_buf = serialized_data;
                     self.current_states += batch_states;
                     self.batch.clear(); // Clear the batch for new data
@@ -307,7 +321,7 @@ impl LogFile {
                 tracing::error!(%error, ?pos, "error while trying to read file");
                 return Err(error.into());
             }
-            removed_states -= header[4];
+            removed_states += header[4];
             records_count += 1;
         }
 
@@ -343,8 +357,7 @@ impl LogFile {
         const MAX_EVENT_HISTORY: usize = 10_000;
         let event_num = max_event_number.min(MAX_EVENT_HISTORY);
 
-        // tracing::info!(?event_log_path);
-        // let _guard: tokio::sync::MutexGuard<'_, ()> = FILE_LOCK.lock().await;
+        let _guard: tokio::sync::MutexGuard<'_, ()> = FILE_LOCK.lock().await;
         let mut file =
             tokio::io::BufReader::new(OpenOptions::new().read(true).open(event_log_path).await?);
 
@@ -412,7 +425,7 @@ impl LogFile {
     }
 
     pub async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
-        // let _guard = FILE_LOCK.lock().await;
+        let _guard = FILE_LOCK.lock().await;
         if let Err(err) = self.file.get_mut().write_all(data).await {
             tracing::error!("Failed writting to event log: {err}");
             return Err(err);
