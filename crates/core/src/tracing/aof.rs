@@ -16,9 +16,9 @@ const RECORD_LENGTH: usize = core::mem::size_of::<u32>();
 const EVENT_KIND_LENGTH: usize = 1;
 const EVENT_LOG_HEADER_SIZE: usize = RECORD_LENGTH + EVENT_KIND_LENGTH; // len + varint id
 #[cfg(not(test))]
-const MAX_LOG_RECORDS: usize = 100_000;
+pub(super) const MAX_LOG_RECORDS: usize = 100_000;
 #[cfg(test)]
-const MAX_LOG_RECORDS: usize = 10_000;
+pub(super) const MAX_LOG_RECORDS: usize = 10_000;
 const EVENT_REGISTER_BATCH_SIZE: usize = 100;
 const BATCH_SIZE: usize = EVENT_REGISTER_BATCH_SIZE;
 

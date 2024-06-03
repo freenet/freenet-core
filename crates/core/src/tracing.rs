@@ -1029,7 +1029,7 @@ pub(super) mod test {
         std::fs::File::create(&log_path)?;
 
         // force a truncation
-        const TEST_LOGS: usize = 100;
+        const TEST_LOGS: usize = aof::MAX_LOG_RECORDS;
         let register = EventRegister::new(log_path.clone());
         let bytes = crate::util::test::random_bytes_2mb();
         let mut gen = arbitrary::Unstructured::new(&bytes);
@@ -1059,7 +1059,7 @@ pub(super) mod test {
         //     tokio::time::sleep(Duration::from_millis(500)).await;
         // }
         tokio::time::sleep(Duration::from_millis(10_000)).await;
-        let ev = aof::LogFile::get_router_events(100, &log_path).await?;
+        let ev = aof::LogFile::get_router_events(TEST_LOGS, &log_path).await?;
         assert_eq!(ev.len(), total_route_events);
         Ok(())
     }
