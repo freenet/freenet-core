@@ -5,10 +5,7 @@ use either::Either;
 use freenet_stdlib::prelude::*;
 use futures::{future::BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
-use tokio::{
-    net::TcpStream,
-    sync::{mpsc, Mutex},
-};
+use tokio::{net::TcpStream, sync::mpsc};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::{
@@ -367,7 +364,6 @@ pub(crate) struct EventRegister {
 
 /// Records from a new session must have higher than this ts.
 static NEW_RECORDS_TS: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
-static FILE_LOCK: Mutex<()> = Mutex::const_new(());
 
 const DEFAULT_METRICS_SERVER_PORT: u16 = 55010;
 
@@ -435,12 +431,10 @@ impl EventRegister {
             batch_serialized_data.extend_from_slice(&header);
             batch_serialized_data.append(&mut serialized);
         }
-        if !batch_serialized_data.is_empty() {
-            let _guard = FILE_LOCK.lock().await;
-            if let Err(err) = event_log.write_all(&batch_serialized_data).await {
-                tracing::error!("Failed writting to event log: {err}");
-                panic!("Failed writting event log");
-            }
+        if !batch_serialized_data.is_empty()
+            && event_log.write_all(&batch_serialized_data).await.is_err()
+        {
+            panic!("Failed writting event log");
         }
     }
 }

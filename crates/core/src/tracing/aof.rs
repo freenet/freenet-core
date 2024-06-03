@@ -61,7 +61,7 @@ impl LogFile {
         let serialized = bincode::serialize(&log)?;
         let mut header = [0; EVENT_LOG_HEADER_SIZE];
         DefaultEndian::write_u32(&mut header, serialized.len() as u32);
-        header[4] = log.kind.varint_id(); // varint id
+        header[4] = log.kind.varint_id(); // event kind
         Ok((header, serialized))
     }
 
@@ -125,15 +125,9 @@ impl LogFile {
 
         if self.num_written >= BATCH_SIZE {
             {
-                let _guard = FILE_LOCK.lock().await;
-                if let Err(err) = self.writer.write_all(&batch_buf).await {
-                    tracing::error!("Failed writting to event log: {err}");
-                    panic!("Failed writting event log");
-                }
-
-                if let Err(err) = self.writer.sync_all().await {
-                    tracing::error!("Failed syncing event log: {err}");
-                    panic!("Failed syncing event log");
+                let res = self.write_all(&batch_buf).await;
+                if res.is_err() {
+                    panic!("Failed writing to log file");
                 }
             }
             self.num_recs += self.num_written;
@@ -237,11 +231,13 @@ impl LogFile {
                 }
             }
 
+            let length = DefaultEndian::read_u32(&header[..4]);
             if header[4] == EventKind::ROUTE {
-                let length = DefaultEndian::read_u32(&header[..4]);
                 let mut buf = vec![0; length as usize];
                 file.read_exact(&mut buf).await?;
                 records.push(buf);
+            } else {
+                file.seek(io::SeekFrom::Current(length as i64)).await?;
             }
 
             num_records += 1;
@@ -249,6 +245,8 @@ impl LogFile {
                 break;
             }
         }
+
+        tracing::info!(len = records.len(), "records read");
 
         if records.is_empty() {
             return Ok(vec![]);
@@ -277,8 +275,16 @@ impl LogFile {
     }
 
     pub async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
-        self.writer.write_all(data).await?;
-        self.writer.sync_all().await?;
+        let _guard = FILE_LOCK.lock().await;
+        if let Err(err) = self.writer.write_all(&data).await {
+            tracing::error!("Failed writting to event log: {err}");
+            return Err(err);
+        }
+
+        if let Err(err) = self.writer.sync_all().await {
+            tracing::error!("Failed syncing event log: {err}");
+            return Err(err);
+        }
         Ok(())
     }
 }
