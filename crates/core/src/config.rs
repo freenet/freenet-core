@@ -542,12 +542,26 @@ const fn default_gateway_port() -> u16 {
 
 #[derive(clap::Parser, Default, Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigPathsArgs {
+    /// The configuration directory.
+    #[arg(long, default_value = None, env = "CONFIG_DIR")]
     config_dir: Option<PathBuf>,
+    /// The contracts directory.
+    #[arg(long, default_value = None, env = "CONTRACTS_DIR")]
     contracts_dir: Option<PathBuf>,
+    /// The delegates directory.
+    #[arg(long, default_value = None, env = "DELEGATES_DIR")]
     delegates_dir: Option<PathBuf>,
+    /// The secrets directory.
+    #[arg(long, default_value = None, env = "SECRECTS_DIR")]
     secrets_dir: Option<PathBuf>,
+    /// The database directory.
+    #[arg(long, default_value = None, env = "DB_DIR")]
     db_dir: Option<PathBuf>,
+    /// The event log file.
+    #[arg(long, default_value = None, env = "EVENT_LOG")]
     event_log: Option<PathBuf>,
+    /// The data directory.
+    #[arg(long, default_value = None, env = "DATA_DIR")]
     data_dir: Option<PathBuf>,
 }
 
