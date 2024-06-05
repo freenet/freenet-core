@@ -288,8 +288,6 @@ impl LogFile {
 
         // Check the number of lines and truncate if needed
         if self.states.total > self.max_log_records {
-            tracing::info!("before truncating {:?}", self.states);
-
             if let Err(err) = self.truncate_records(REMOVE_RECS).await {
                 tracing::error!("Failed truncating log file: {:?}", err);
                 panic!("Failed truncating log file");
