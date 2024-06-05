@@ -70,7 +70,7 @@ pkcs1 = { version = "0.7", features = ["std", "pem"] }
 opentelemetry = "0.22"
 opentelemetry-jaeger = { features = ["collector_client", "isahc", "rt-tokio"], optional = true, version = "0.21" }
 tracing = { version = "0.1" }
-tracing-opentelemetry = { optional = true, version = "0.23.0" }
+tracing-opentelemetry = { optional = true, version = "0.24.0" }
 tracing-subscriber = { optional = true, version = "0.3.16" }
 opentelemetry-otlp = { optional = true, version = "0.15" }
 
