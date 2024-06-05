@@ -4,7 +4,7 @@ use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWriteExt, BufReader, Error},
 };
 
-use std::{path::Path, sync::atomic::AtomicUsize};
+use std::path::{Path, PathBuf};
 
 use tokio::sync::Mutex;
 
@@ -135,6 +135,7 @@ impl Batch {
         self.batch.len()
     }
 
+    #[allow(dead_code)]
     #[inline]
     fn is_empty(&self) -> bool {
         self.batch.is_empty()
@@ -148,7 +149,9 @@ impl Batch {
 }
 
 pub(super) struct LogFile {
-    file: BufReader<File>,
+    file: Option<BufReader<File>>,
+    path: PathBuf,
+    rewrite_path: PathBuf,
     // make this configurable?
     max_log_records: usize,
     pub(super) batch: Batch,
@@ -166,11 +169,11 @@ impl LogFile {
             .open(path)
             .await?;
         let mut file = BufReader::new(file);
-        tracing::error!("open {}", path.display());
         let states = Self::num_lines(&mut file).await.expect("non IO error");
-        tracing::error!("states {:?}", states);
         Ok(Self {
-            file,
+            file: Some(file),
+            path: path.to_path_buf(),
+            rewrite_path: path.with_extension("rewrite"),
             max_log_records: MAX_LOG_RECORDS,
             batch: Batch {
                 batch: Vec::with_capacity(BATCH_SIZE),
@@ -299,26 +302,28 @@ impl LogFile {
         remove_records: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let _guard = FILE_LOCK.lock().await;
-        self.file.rewind().await?;
-        // tracing::debug!(position = file.stream_position().await.unwrap());
+        let mut file = self.file.take().unwrap();
+        file.rewind().await?;
+        file.get_mut().rewind().await?;
+
         let mut records_count = 0;
         let mut removed_states = States::default();
         while records_count < remove_records {
             let mut header = [0u8; EVENT_LOG_HEADER_SIZE];
-            if let Err(error) = self.file.read_exact(&mut header).await {
+            if let Err(error) = file.read_exact(&mut header).await {
                 if matches!(error.kind(), io::ErrorKind::UnexpectedEof) {
                     break;
                 }
-                let pos = self.file.stream_position().await;
+                let pos = file.stream_position().await;
                 tracing::error!(%error, ?pos, "error while trying to read file");
                 return Err(error.into());
             }
             let length = DefaultEndian::read_u32(&header[..4]);
-            if let Err(error) = self.file.seek(io::SeekFrom::Current(length as i64)).await {
+            if let Err(error) = file.seek(io::SeekFrom::Current(length as i64)).await {
                 if matches!(error.kind(), io::ErrorKind::UnexpectedEof) {
                     break;
                 }
-                let pos = self.file.stream_position().await;
+                let pos = file.stream_position().await;
                 tracing::error!(%error, ?pos, "error while trying to read file");
                 return Err(error.into());
             }
@@ -326,37 +331,62 @@ impl LogFile {
             records_count += 1;
         }
 
-        // Copy the rest of the file to the buffer
-        let mut buffer = Vec::new();
-        if let Err(error) = self.file.read_to_end(&mut buffer).await {
-            if !matches!(error.kind(), io::ErrorKind::UnexpectedEof) {
-                let pos = self.file.stream_position().await;
+        let mut bk = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&self.rewrite_path)
+            .await?;
+
+        let mut new_states = States::default();
+        loop {
+            let mut header = [0u8; EVENT_LOG_HEADER_SIZE];
+            if let Err(error) = file.read_exact(&mut header).await {
+                if matches!(error.kind(), io::ErrorKind::UnexpectedEof) {
+                    break;
+                }
+                let pos = file.stream_position().await;
                 tracing::error!(%error, ?pos, "error while trying to read file");
+                return Err(error.into());
+            }
+
+            let length = DefaultEndian::read_u32(&header[..4]);
+            let mut buf = vec![0u8; EVENT_LOG_HEADER_SIZE + length as usize];
+            buf[..EVENT_LOG_HEADER_SIZE].copy_from_slice(&header);
+            if let Err(error) = file.read_exact(&mut buf[EVENT_LOG_HEADER_SIZE..]).await {
+                if matches!(error.kind(), io::ErrorKind::UnexpectedEof) {
+                    break;
+                }
+                let pos = file.stream_position().await;
+                tracing::error!(%error, ?pos, "error while trying to read file");
+                return Err(error.into());
+            }
+            new_states += header[4];
+
+            if let Err(error) = bk.write_all(&buf).await {
+                let pos = bk.stream_position().await;
+                tracing::error!(%error, ?pos, "error while trying to write file");
                 return Err(error.into());
             }
         }
 
-        self.states -= removed_states;
+        self.states = new_states;
 
-        tracing::error!("removed {removed_states:?} remaining {:?}", self.states);
+        drop(bk);
+        drop(file);
+        std::fs::remove_file(&self.path)?;
+        std::fs::rename(&self.rewrite_path, &self.path)?;
 
-        // Seek back to the beginning and write the remaining content
-        self.file.rewind().await?;
-        self.file.get_mut().rewind().await?;
-        self.file.write_all(&buffer).await?;
-        // Truncate the file to the new size
-        self.file.get_ref().set_len(buffer.len() as u64).await?;
-        self.file.get_ref().sync_all().await?;
+        self.file = Some(BufReader::new(
+            OpenOptions::new()
+                .read(true)
+                .append(true)
+                .write(true)
+                .open(&self.path)
+                .await?,
+        ));
 
-        {
-            self.file.rewind().await?;
-            let records = Self::get_router_events_in(MAX_LOG_RECORDS, &mut self.file)
-                .await
-                .unwrap();
-            tracing::error!("records {:?}", records.len());
-        }
-
-        self.file.seek(io::SeekFrom::End(0)).await?;
         Ok(())
     }
 
@@ -412,8 +442,6 @@ impl LogFile {
             num_records += 1;
         }
 
-        tracing::info!(len = records.len(), total = num_records, "records read");
-
         if records.is_empty() {
             return Ok(vec![]);
         }
@@ -442,12 +470,13 @@ impl LogFile {
 
     pub async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
         let _guard = FILE_LOCK.lock().await;
-        if let Err(err) = self.file.get_mut().write_all(data).await {
+        let file = self.file.as_mut().unwrap();
+        if let Err(err) = file.get_mut().write_all(data).await {
             tracing::error!("Failed writting to event log: {err}");
             return Err(err);
         }
 
-        if let Err(err) = self.file.get_mut().sync_all().await {
+        if let Err(err) = file.get_mut().sync_all().await {
             tracing::error!("Failed syncing event log: {err}");
             return Err(err);
         }
