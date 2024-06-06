@@ -9,10 +9,11 @@
 //! - inter-process: similar to in-memory, but can be rana cross multiple processes, closer to the real p2p impl
 
 use std::{
+    borrow::Cow,
     fmt::Display,
     fs::File,
     io::Read,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     sync::Arc,
     time::Duration,
 };
@@ -30,7 +31,7 @@ use tracing::Instrument;
 use self::p2p_impl::NodeP2P;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
-    config::{GatewayConfig, GlobalExecutor},
+    config::{Address, GatewayConfig, GlobalExecutor},
     contract::{
         Callback, ClientResponsesReceiver, ClientResponsesSender, ContractError,
         ExecutorToEventLoopChannel, NetworkContractHandler,
@@ -110,7 +111,7 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
-    pub fn new(config: Config) -> anyhow::Result<NodeConfig> {
+    pub async fn new(config: Config) -> anyhow::Result<NodeConfig> {
         let mut gateways = Vec::with_capacity(config.gateways.len());
         for gw in &config.gateways {
             let GatewayConfig {
@@ -118,18 +119,13 @@ impl NodeConfig {
                 public_key_path,
             } = gw;
 
-            let mut key_file = File::open(&public_key_path)?;
+            let mut key_file = File::open(public_key_path)?;
             let mut buf = String::new();
             key_file.read_to_string(&mut buf)?;
 
             let pub_key = rsa::RsaPublicKey::from_public_key_pem(&buf)?;
 
-            let address = match address {
-                crate::config::Address::Hostname(hostname) => {
-                    todo!("impl resolution of hostname to ip: {hostname}")
-                }
-                crate::config::Address::HostAddress(addr) => *addr,
-            };
+            let address = Self::parse_socket_addr(address).await?;
             let peer_id = PeerId::new(address, TransportPublicKey::from(pub_key));
             gateways.push(InitPeerNode::new(peer_id, Location::from_address(&address)));
         }
@@ -150,6 +146,63 @@ impl NodeConfig {
             max_upstream_bandwidth: None,
             max_downstream_bandwidth: None,
         })
+    }
+
+    async fn parse_socket_addr(address: &Address) -> anyhow::Result<SocketAddr> {
+        let hostname = match address {
+            crate::config::Address::Hostname(hostname) => {
+                match hostname.rsplit_once(':') {
+                    None => {
+                        // no port found, use default
+                        let hostname_with_port =
+                            format!("{}:{}", hostname, crate::config::default_gateway_port());
+
+                        if let Ok(mut addrs) = hostname_with_port.to_socket_addrs() {
+                            if let Some(addr) = addrs.next() {
+                                return Ok(addr);
+                            }
+                        }
+
+                        Cow::Borrowed(hostname.as_str())
+                    }
+                    Some((host, port)) => match port.parse::<u16>() {
+                        Ok(_) => {
+                            if let Ok(mut addrs) = hostname.to_socket_addrs() {
+                                if let Some(addr) = addrs.next() {
+                                    return Ok(addr);
+                                }
+                            }
+
+                            Cow::Borrowed(host)
+                        }
+                        Err(_) => return Err(anyhow::anyhow!("Invalid port number: {port}")),
+                    },
+                }
+            }
+            Address::HostAddress(addr) => return Ok(*addr),
+        };
+
+        let (conf, opts) = hickory_resolver::system_conf::read_system_conf()?;
+        let resolver = hickory_resolver::TokioAsyncResolver::new(
+            conf,
+            opts,
+            hickory_resolver::name_server::GenericConnector::new(
+                hickory_resolver::name_server::TokioRuntimeProvider::new(),
+            ),
+        );
+
+        // only issue one query with .
+        let hostname = if hostname.ends_with('.') {
+            hostname
+        } else {
+            Cow::Owned(format!("{}.", hostname))
+        };
+
+        let ips = resolver.lookup_ip(hostname.as_ref()).await?;
+        match ips.into_iter().next() {
+            Some(ip) => Ok(SocketAddr::new(ip, crate::config::default_gateway_port())),
+            None => Err(anyhow::anyhow!("Fail to resolve IP address of {hostname}")),
+        }
     }
 
     pub fn config(&self) -> &Config {
