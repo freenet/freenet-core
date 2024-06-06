@@ -420,7 +420,7 @@ impl EventRegister {
 
         // store remaining logs
         let moved_batch = std::mem::replace(&mut event_log.batch, aof::Batch::new(aof::BATCH_SIZE));
-        let batch_states = moved_batch.states;
+        let batch_writes = moved_batch.num_writes;
         match aof::LogFile::encode_batch(&moved_batch) {
             Ok(batch_serialized_data) => {
                 if !batch_serialized_data.is_empty()
@@ -428,7 +428,7 @@ impl EventRegister {
                 {
                     panic!("Failed writting event log");
                 }
-                event_log.update_states(batch_states);
+                event_log.update_recs(batch_writes);
             }
             Err(err) => {
                 tracing::error!("Failed encode batch: {err}");
@@ -1017,7 +1017,6 @@ pub(super) mod test {
         collections::HashMap,
         sync::atomic::{AtomicUsize, Ordering::SeqCst},
     };
-    use tracing::level_filters::LevelFilter;
 
     use super::*;
     use crate::{node::testing_impl::NodeLabel, ring::Distance};

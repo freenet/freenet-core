@@ -25,84 +25,9 @@ pub(super) const BATCH_SIZE: usize = EVENT_REGISTER_BATCH_SIZE;
 
 type DefaultEndian = byteorder::BigEndian;
 
-#[derive(Debug, Default, Copy, Clone)]
-pub(super) struct States {
-    total: usize,
-    connect_events: usize,
-    put_events: usize,
-    get_events: usize,
-    route_events: usize,
-    subscribed_events: usize,
-    ignored_events: usize,
-    disconnected_events: usize,
-}
-
-impl core::ops::AddAssign for States {
-    fn add_assign(&mut self, rhs: Self) {
-        self.total += rhs.total;
-        self.connect_events += rhs.connect_events;
-        self.put_events += rhs.put_events;
-        self.get_events += rhs.get_events;
-        self.route_events += rhs.route_events;
-        self.subscribed_events += rhs.subscribed_events;
-        self.ignored_events += rhs.ignored_events;
-        self.disconnected_events += rhs.disconnected_events;
-    }
-}
-
-impl core::ops::SubAssign<u8> for States {
-    fn sub_assign(&mut self, rhs: u8) {
-        self.total = self.total.saturating_sub(1);
-        match rhs {
-            EventKind::CONNECT => self.connect_events = self.connect_events.saturating_sub(1),
-            EventKind::PUT => self.put_events = self.put_events.saturating_sub(1),
-            EventKind::GET => self.get_events = self.get_events.saturating_sub(1),
-            EventKind::ROUTE => self.route_events = self.route_events.saturating_sub(1),
-            EventKind::SUBSCRIBED => {
-                self.subscribed_events = self.subscribed_events.saturating_sub(1)
-            }
-            EventKind::IGNORED => self.ignored_events = self.ignored_events.saturating_sub(1),
-            EventKind::DISCONNECTED => {
-                self.disconnected_events = self.disconnected_events.saturating_sub(1)
-            }
-            _ => unreachable!(),
-        }
-    }
-}
-
-impl core::ops::AddAssign<u8> for States {
-    fn add_assign(&mut self, rhs: u8) {
-        self.total += 1;
-
-        match rhs {
-            EventKind::CONNECT => self.connect_events += 1,
-            EventKind::PUT => self.put_events += 1,
-            EventKind::GET => self.get_events += 1,
-            EventKind::ROUTE => self.route_events += 1,
-            EventKind::SUBSCRIBED => self.subscribed_events += 1,
-            EventKind::IGNORED => self.ignored_events += 1,
-            EventKind::DISCONNECTED => self.disconnected_events += 1,
-            _ => unreachable!(),
-        }
-    }
-}
-
-impl core::ops::SubAssign for States {
-    fn sub_assign(&mut self, rhs: Self) {
-        self.total -= rhs.total;
-        self.connect_events -= rhs.connect_events;
-        self.put_events -= rhs.put_events;
-        self.get_events -= rhs.get_events;
-        self.route_events -= rhs.route_events;
-        self.subscribed_events -= rhs.subscribed_events;
-        self.ignored_events -= rhs.ignored_events;
-        self.disconnected_events -= rhs.disconnected_events;
-    }
-}
-
 pub(super) struct Batch {
     pub batch: Vec<NetLogMessage>,
-    pub states: States,
+    pub num_writes: usize,
 }
 
 impl Batch {
@@ -110,23 +35,13 @@ impl Batch {
     pub fn new(cap: usize) -> Self {
         Self {
             batch: Vec::with_capacity(cap),
-            states: Default::default(),
+            num_writes: 0,
         }
     }
 
     #[inline]
     fn push(&mut self, log: NetLogMessage) {
-        match log.kind.varint_id() {
-            EventKind::CONNECT => self.states.connect_events += 1,
-            EventKind::PUT => self.states.put_events += 1,
-            EventKind::GET => self.states.get_events += 1,
-            EventKind::ROUTE => self.states.route_events += 1,
-            EventKind::SUBSCRIBED => self.states.subscribed_events += 1,
-            EventKind::IGNORED => self.states.ignored_events += 1,
-            EventKind::DISCONNECTED => self.states.disconnected_events += 1,
-            _ => unreachable!(),
-        }
-        self.states.total += 1;
+        self.num_writes += 1;
         self.batch.push(log);
     }
 
@@ -144,7 +59,7 @@ impl Batch {
     #[inline]
     fn clear(&mut self) {
         self.batch.clear();
-        self.states = Default::default();
+        self.num_writes = 0;
     }
 }
 
@@ -155,8 +70,8 @@ pub(super) struct LogFile {
     // make this configurable?
     max_log_records: usize,
     pub(super) batch: Batch,
-    current_states: States,
-    states: States,
+    num_writes: usize,
+    num_recs: usize,
 }
 
 impl LogFile {
@@ -169,7 +84,7 @@ impl LogFile {
             .open(path)
             .await?;
         let mut file = BufReader::new(file);
-        let states = Self::num_lines(&mut file).await.expect("non IO error");
+        let num_recs = Self::num_lines(&mut file).await.expect("non IO error");
         Ok(Self {
             file: Some(file),
             path: path.to_path_buf(),
@@ -177,15 +92,15 @@ impl LogFile {
             max_log_records: MAX_LOG_RECORDS,
             batch: Batch {
                 batch: Vec::with_capacity(BATCH_SIZE),
-                states: Default::default(),
+                num_writes: 0,
             },
-            current_states: Default::default(),
-            states,
+            num_writes: 0,
+            num_recs,
         })
     }
 
-    pub(super) fn update_states(&mut self, states: States) {
-        self.states += states;
+    pub(super) fn update_recs(&mut self, recs: usize) {
+        self.num_recs += recs;
     }
 
     pub fn encode_log(
@@ -198,15 +113,8 @@ impl LogFile {
         Ok((header, serialized))
     }
 
-    async fn num_lines(file: &mut (impl AsyncRead + AsyncSeek + Unpin)) -> io::Result<States> {
+    async fn num_lines(file: &mut (impl AsyncRead + AsyncSeek + Unpin)) -> io::Result<usize> {
         let mut num_records = 0;
-        let mut connect_events: usize = 0;
-        let mut put_events: usize = 0;
-        let mut get_events: usize = 0;
-        let mut route_events: usize = 0;
-        let mut subscribed_events: usize = 0;
-        let mut ignored_events: usize = 0;
-        let mut disconnected_events: usize = 0;
 
         let mut buf = [0; EVENT_LOG_HEADER_SIZE]; // Read the u32 length prefix + u8 event kind
 
@@ -221,13 +129,7 @@ impl LogFile {
             let length = DefaultEndian::read_u32(&buf[..4]) as u64;
 
             match buf[4] {
-                EventKind::CONNECT => connect_events += 1,
-                EventKind::PUT => put_events += 1,
-                EventKind::GET => get_events += 1,
-                EventKind::ROUTE => route_events += 1,
-                EventKind::SUBSCRIBED => subscribed_events += 1,
-                EventKind::IGNORED => ignored_events += 1,
-                EventKind::DISCONNECTED => disconnected_events += 1,
+                0..=6 => {}
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -241,16 +143,7 @@ impl LogFile {
             }
         }
 
-        Ok(States {
-            total: num_records,
-            connect_events,
-            put_events,
-            get_events,
-            route_events,
-            subscribed_events,
-            ignored_events,
-            disconnected_events,
-        })
+        Ok(num_records)
     }
 
     pub async fn persist_log(&mut self, log: NetLogMessage) {
@@ -259,14 +152,14 @@ impl LogFile {
 
         if self.batch.len() >= BATCH_SIZE {
             let moved_batch = std::mem::replace(&mut self.batch, Batch::new(BATCH_SIZE));
-            let batch_states = moved_batch.states;
+            let batch_writes = moved_batch.num_writes;
             let serialization_task =
                 tokio::task::spawn_blocking(move || Self::encode_batch(&moved_batch));
 
             match serialization_task.await {
                 Ok(Ok(serialized_data)) => {
                     batch_buf = serialized_data;
-                    self.current_states += batch_states;
+                    self.num_writes += batch_writes;
                     self.batch.clear(); // Clear the batch for new data
                 }
                 _ => {
@@ -275,19 +168,19 @@ impl LogFile {
             }
         }
 
-        if self.current_states.total >= BATCH_SIZE {
+        if self.num_writes >= BATCH_SIZE {
             {
                 let res = self.write_all(&batch_buf).await;
                 if res.is_err() {
                     panic!("Failed writing to log file");
                 }
             }
-            self.states += self.current_states;
-            self.current_states = Default::default();
+            self.num_recs += self.num_writes;
+            self.num_writes = 0;
         }
 
         // Check the number of lines and truncate if needed
-        if self.states.total > self.max_log_records {
+        if self.num_recs > self.max_log_records {
             if let Err(err) = self.truncate_records(REMOVE_RECS).await {
                 tracing::error!("Failed truncating log file: {:?}", err);
                 panic!("Failed truncating log file");
@@ -305,7 +198,6 @@ impl LogFile {
         file.get_mut().rewind().await?;
 
         let mut records_count = 0;
-        let mut removed_states = States::default();
         while records_count < remove_records {
             let mut header = [0u8; EVENT_LOG_HEADER_SIZE];
             if let Err(error) = file.read_exact(&mut header).await {
@@ -325,7 +217,6 @@ impl LogFile {
                 tracing::error!(%error, ?pos, "error while trying to read file");
                 return Err(error.into());
             }
-            removed_states += header[4];
             records_count += 1;
         }
 
@@ -337,7 +228,7 @@ impl LogFile {
             .open(&self.rewrite_path)
             .await?;
 
-        let mut new_states = States::default();
+        let mut num_recs = 0;
         loop {
             let mut header = [0u8; EVENT_LOG_HEADER_SIZE];
             if let Err(error) = file.read_exact(&mut header).await {
@@ -360,7 +251,8 @@ impl LogFile {
                 tracing::error!(%error, ?pos, "error while trying to read file");
                 return Err(error.into());
             }
-            new_states += header[4];
+
+            num_recs += 1;
 
             if let Err(error) = bk.write_all(&buf).await {
                 let pos = bk.stream_position().await;
@@ -369,7 +261,7 @@ impl LogFile {
             }
         }
 
-        self.states = new_states;
+        self.num_recs = num_recs;
 
         drop(bk);
         drop(file);
