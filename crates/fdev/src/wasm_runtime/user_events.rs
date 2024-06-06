@@ -124,18 +124,6 @@ impl StdInput {
                 tracing::debug!("{cmd:?} value:\n{json_str}");
                 Ok(json_str.into_bytes().into())
             }
-            #[cfg(feature = "messagepack")]
-            Some(DeserializationFmt::MessagePack) => {
-                let mut buf = vec![];
-                self.input.read_to_end(&mut buf).unwrap();
-                let state = rmpv::decode::read_value_ref(&mut buf.as_ref()).map_err(|e| {
-                    Box::new(ClientError::from(ErrorKind::Unhandled {
-                        cause: format!("deserialization error: {e}"),
-                    }))
-                })?;
-                tracing::debug!("{cmd:?} value:\n{state}");
-                Ok(buf.into())
-            }
             _ => {
                 let state: Vec<u8> = self.read_input().map_err(|e| {
                     Box::new(ClientError::from(ErrorKind::Unhandled {

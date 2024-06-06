@@ -312,7 +312,7 @@ impl ConfigArgs {
             is_gateway: self.network_listener.is_gateway,
         };
 
-        fs::create_dir_all(&this.config_dir())?;
+        fs::create_dir_all(this.config_dir())?;
         if should_persist {
             let mut file = File::create(this.config_dir().join("config.toml"))?;
             file.write_all(

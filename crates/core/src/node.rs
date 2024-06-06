@@ -927,7 +927,7 @@ impl PeerId {
 }
 
 thread_local! {
-    static PEER_ID: std::cell::RefCell<Option<TransportPublicKey>> = std::cell::RefCell::new(None);
+    static PEER_ID: std::cell::RefCell<Option<TransportPublicKey>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]

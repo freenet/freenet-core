@@ -225,7 +225,7 @@ impl P2pConnManager {
                         Some(Err(err)) => {
                             tracing::error!("Error in peer connection: {err}");
                             if let TransportError::ConnectionClosed(socket_addr) = err {
-                                if let Some(peer) = self.connections.keys().find_map(|k| (&k.addr == &socket_addr).then(|| k.clone())) {
+                                if let Some(peer) = self.connections.keys().find_map(|k| (k.addr == socket_addr).then(|| k.clone())) {
                                     op_manager.ring.prune_connection(peer.clone()).await;
                                     self.connections.remove(&peer);
                                 }
@@ -676,16 +676,14 @@ impl P2pConnManager {
             conn.send(net_msg)
                 .await
                 .map_err(|_| ConnectionError::SendNotCompleted(peer))?;
+        } else if let Some(conn) = self.connections.get(&peer) {
+            tracing::debug!(target = %peer, "Connection status: {}", if conn.is_closed() { "closed" } else { "open" });
+            conn.send(Either::Left(*net_msg))
+                .await
+                .map_err(|_| ConnectionError::SendNotCompleted(peer))?;
         } else {
-            if let Some(conn) = self.connections.get(&peer) {
-                tracing::debug!(target = %peer, "Connection status: {}", conn.is_closed().then(|| "closed").unwrap_or("open"));
-                conn.send(Either::Left(*net_msg))
-                    .await
-                    .map_err(|_| ConnectionError::SendNotCompleted(peer))?;
-            } else {
-                tracing::error!(target = %peer, "Connection likely dropped");
-                return Err(ConnectionError::SendNotCompleted(peer));
-            }
+            tracing::error!(target = %peer, "Connection likely dropped");
+            return Err(ConnectionError::SendNotCompleted(peer));
         }
 
         Ok(connection.map(Either::Right).unwrap_or(Either::Left(())))
