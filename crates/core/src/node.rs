@@ -149,7 +149,7 @@ impl NodeConfig {
     }
 
     async fn parse_socket_addr(address: &Address) -> anyhow::Result<SocketAddr> {
-        let hostname = match address {
+        let (hostname, port) = match address {
             crate::config::Address::Hostname(hostname) => {
                 match hostname.rsplit_once(':') {
                     None => {
@@ -163,17 +163,17 @@ impl NodeConfig {
                             }
                         }
 
-                        Cow::Borrowed(hostname.as_str())
+                        (Cow::Borrowed(hostname.as_str()), None)
                     }
                     Some((host, port)) => match port.parse::<u16>() {
-                        Ok(_) => {
+                        Ok(port) => {
                             if let Ok(mut addrs) = hostname.to_socket_addrs() {
                                 if let Some(addr) = addrs.next() {
                                     return Ok(addr);
                                 }
                             }
 
-                            Cow::Borrowed(host)
+                            (Cow::Borrowed(host), Some(port))
                         }
                         Err(_) => return Err(anyhow::anyhow!("Invalid port number: {port}")),
                     },
@@ -200,7 +200,10 @@ impl NodeConfig {
 
         let ips = resolver.lookup_ip(hostname.as_ref()).await?;
         match ips.into_iter().next() {
-            Some(ip) => Ok(SocketAddr::new(ip, crate::config::default_gateway_port())),
+            Some(ip) => Ok(SocketAddr::new(
+                ip,
+                port.unwrap_or_else(crate::config::default_gateway_port),
+            )),
             None => Err(anyhow::anyhow!("Fail to resolve IP address of {hostname}")),
         }
     }
@@ -991,5 +994,33 @@ impl std::fmt::Debug for PeerId {
 impl Display for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.addr)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_hostname_resolution() {
+        let addr = Address::Hostname("localhost".to_string());
+        let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
+        assert_eq!(
+            socket_addr,
+            SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                crate::config::default_gateway_port()
+            )
+        );
+
+        let addr = Address::Hostname("google.com".to_string());
+        let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
+        assert_eq!(socket_addr.port(), crate::config::default_gateway_port());
+
+        let addr = Address::Hostname("google.com:8080".to_string());
+        let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
+        assert_eq!(socket_addr.port(), 8080);
     }
 }
