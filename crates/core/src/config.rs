@@ -536,7 +536,7 @@ const fn default_local_address() -> IpAddr {
 }
 
 #[inline]
-const fn default_gateway_port() -> u16 {
+pub(crate) const fn default_gateway_port() -> u16 {
     50509
 }
 
