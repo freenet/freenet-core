@@ -108,7 +108,13 @@ pub enum TestMode {
 }
 
 pub(crate) async fn test_framework(base_config: TestConfig) -> anyhow::Result<(), Error> {
-    let (server, changes_recorder) = if !base_config.disable_metrics {
+    let disable_metrics = base_config.disable_metrics || {
+        match &base_config.command {
+            TestMode::Network(config) => matches!(config.mode, network::Process::Peer),
+            _ => false,
+        }
+    };
+    let (server, changes_recorder) = if !disable_metrics {
         let (s, r) = start_server(&ServerConfig {
             log_directory: base_config.execution_data.clone(),
         })

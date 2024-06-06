@@ -5,6 +5,7 @@
 
 use std::collections::VecDeque;
 use std::hash::Hash;
+use std::net::{IpAddr, SocketAddr};
 use std::{
     cmp::Reverse,
     collections::BTreeMap,
@@ -331,8 +332,8 @@ impl Ring {
         };
 
         if let Some(loc) = config.location {
-            if config.local_ip.is_none() || config.local_port.is_none() {
-                return Err(anyhow::anyhow!("IP and port are required for gateways"));
+            if config.peer_id.is_none() {
+                return Err(anyhow::anyhow!("PeerId is required for gateways"));
             }
             ring.update_location(Some(loc));
         }
@@ -799,7 +800,10 @@ impl Ring {
         let mut live_tx = None;
         let mut pending_conn_adds = VecDeque::new();
         'outer: loop {
-            //
+            if self.get_peer_key().is_none() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
             loop {
                 match missing_candidates.try_recv() {
                     Ok(missing_candidate) => {
@@ -938,6 +942,25 @@ impl Ring {
 pub struct Location(f64);
 
 impl Location {
+    pub fn from_address(addr: &SocketAddr) -> Self {
+        match addr.ip() {
+            IpAddr::V4(ipv4) => {
+                let octets = ipv4.octets();
+                let combined_octets = (u32::from(octets[0]) << 16)
+                    | (u32::from(octets[1]) << 8)
+                    | u32::from(octets[2]);
+                Location(combined_octets as f64 / (u32::MAX as f64))
+            }
+            IpAddr::V6(ipv6) => {
+                let segments = ipv6.segments();
+                let combined_segments = (u64::from(segments[0]) << 32)
+                    | (u64::from(segments[1]) << 16)
+                    | u64::from(segments[2]);
+                Location(combined_segments as f64 / (u64::MAX as f64))
+            }
+        }
+    }
+
     pub fn new(location: f64) -> Self {
         debug_assert!(
             (0.0..=1.0).contains(&location),

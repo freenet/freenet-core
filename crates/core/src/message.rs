@@ -304,8 +304,6 @@ pub(crate) trait InnerMessage: Into<NetMessage> {
 /// Internal node events emitted to the event loop.
 #[derive(Debug, Clone)]
 pub(crate) enum NodeEvent {
-    /// For unspecified reasons the node is gracefully shutting down.
-    ShutdownNode,
     /// Drop the given peer connection.
     DropConnection(PeerId),
     // Try connecting to the given peer.
@@ -321,7 +319,6 @@ pub(crate) enum NodeEvent {
 impl Display for NodeEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NodeEvent::ShutdownNode => f.write_str("ShutdownNode"),
             NodeEvent::DropConnection(peer) => {
                 write!(f, "DropConnection (from {peer})")
             }

@@ -10,7 +10,8 @@
 
 use std::{
     fmt::Display,
-    io::Write,
+    fs::File,
+    io::Read,
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -22,13 +23,14 @@ use freenet_stdlib::{
     prelude::{ContractKey, RelatedContracts, WrappedState},
 };
 
+use rsa::pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use self::p2p_impl::NodeP2P;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
-    config::GlobalExecutor,
+    config::{GatewayConfig, GlobalExecutor},
     contract::{
         Callback, ClientResponsesReceiver, ClientResponsesSender, ContractError,
         ExecutorToEventLoopChannel, NetworkContractHandler,
@@ -89,17 +91,14 @@ pub struct NodeConfig {
     pub key_pair: TransportKeypair,
     // optional local info, in case this is an initial bootstrap node
     /// IP to bind to the network listener.
-    pub local_ip: Option<IpAddr>,
+    pub network_listener_ip: IpAddr,
     /// socket port to bind to the network listener.
-    pub local_port: Option<u16>,
+    pub network_listener_port: u16,
+    pub(crate) peer_id: Option<PeerId>,
     pub(crate) config: Arc<Config>,
-    /// IP dialers should connect to
-    pub(crate) public_ip: Option<IpAddr>,
-    /// socket port dialers should connect to, only set on gateways
-    pub(crate) public_port: Option<u16>,
-    /// At least an other running listener node is required for joining the network.
+    /// At least one gateway is required for joining the network.
     /// Not necessary if this is an initial node.
-    pub(crate) remote_nodes: Vec<InitPeerNode>,
+    pub(crate) gateways: Vec<InitPeerNode>,
     /// the location of this node, used for gateways.
     pub(crate) location: Option<Location>,
     pub(crate) max_hops_to_live: Option<usize>,
@@ -111,17 +110,38 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
-    pub fn new(config: Config) -> NodeConfig {
-        NodeConfig {
+    pub fn new(config: Config) -> anyhow::Result<NodeConfig> {
+        let mut gateways = Vec::with_capacity(config.gateways.len());
+        for gw in &config.gateways {
+            let GatewayConfig {
+                address,
+                public_key_path,
+            } = gw;
+
+            let mut key_file = File::open(&public_key_path)?;
+            let mut buf = String::new();
+            key_file.read_to_string(&mut buf)?;
+
+            let pub_key = rsa::RsaPublicKey::from_public_key_pem(&buf)?;
+
+            let address = match address {
+                crate::config::Address::Hostname(hostname) => {
+                    todo!("impl resolution of hostname to ip: {hostname}")
+                }
+                crate::config::Address::HostAddress(addr) => *addr,
+            };
+            let peer_id = PeerId::new(address, TransportPublicKey::from(pub_key));
+            gateways.push(InitPeerNode::new(peer_id, Location::from_address(&address)));
+        }
+        Ok(NodeConfig {
             should_connect: true,
-            is_gateway: false,
+            is_gateway: config.is_gateway,
             key_pair: config.transport_keypair.clone(),
-            remote_nodes: Vec::with_capacity(1),
+            gateways,
+            peer_id: config.peer_id.clone(),
+            network_listener_ip: config.network_api.address,
+            network_listener_port: config.network_api.port,
             config: Arc::new(config),
-            local_ip: None,
-            local_port: None,
-            public_ip: None,
-            public_port: None,
             location: None,
             max_hops_to_live: None,
             rnd_if_htl_above: None,
@@ -129,7 +149,7 @@ impl NodeConfig {
             min_number_conn: None,
             max_upstream_bandwidth: None,
             max_downstream_bandwidth: None,
-        }
+        })
     }
 
     pub fn config(&self) -> &Config {
@@ -170,13 +190,8 @@ impl NodeConfig {
         self
     }
 
-    pub fn with_port(&mut self, port: u16) -> &mut Self {
-        self.local_port = Some(port);
-        self
-    }
-
-    pub fn with_ip<T: Into<IpAddr>>(&mut self, ip: T) -> &mut Self {
-        self.local_ip = Some(ip.into());
+    pub fn with_peer_id(&mut self, peer_id: PeerId) -> &mut Self {
+        self.peer_id = Some(peer_id);
         self
     }
 
@@ -187,7 +202,7 @@ impl NodeConfig {
 
     /// Connection info for an already existing peer. Required in case this is not a gateway node.
     pub fn add_gateway(&mut self, peer: InitPeerNode) -> &mut Self {
-        self.remote_nodes.push(peer);
+        self.gateways.push(peer);
         self
     }
 
@@ -222,20 +237,14 @@ impl NodeConfig {
     }
 
     pub fn get_peer_id(&self) -> Option<PeerId> {
-        match (self.public_ip, self.public_port) {
-            (Some(ip), Some(port)) => Some(PeerId::new(
-                SocketAddr::new(ip, port),
-                self.key_pair.public().clone(),
-            )),
-            _ => None,
-        }
+        self.peer_id.clone()
     }
 
     /// Returns all specified gateways for this peer. Returns an error if the peer is not a gateway
     /// and no gateways are specified.
     fn get_gateways(&self) -> Result<Vec<PeerKeyLocation>, anyhow::Error> {
         let gateways: Vec<PeerKeyLocation> = self
-            .remote_nodes
+            .gateways
             .iter()
             .map(|node| PeerKeyLocation {
                 peer: node.peer_id.clone(),
@@ -243,7 +252,7 @@ impl NodeConfig {
             })
             .collect();
 
-        if (self.local_ip.is_none() || self.local_port.is_none()) && gateways.is_empty() {
+        if !self.is_gateway && gateways.is_empty() {
             anyhow::bail!(
             "At least one remote gateway is required to join an existing network for non-gateway nodes."
         )
@@ -503,6 +512,7 @@ async fn report_result(
             }
             #[cfg(any(debug_assertions, test))]
             {
+                use std::io::Write;
                 let OpError::InvalidStateTransition { tx, state, trace } = err else {
                     tracing::error!("Finished transaction with error: {err}");
                     return;

@@ -4,7 +4,7 @@ use freenet::{
     local_node::{Executor, OperationMode},
     server::{local_node::run_local_node, network_node::run_network_node},
 };
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -16,17 +16,16 @@ async fn run(config: Config) -> Result<(), DynError> {
 }
 
 async fn run_local(config: Config) -> Result<(), DynError> {
-    let port = config.http_gateway.port;
-    let ip = config.http_gateway.address;
-    let executor = Executor::from_config(&config, None).await?;
+    let port = config.ws_api.port;
+    let ip = config.ws_api.address;
+    let executor = Executor::from_config(Arc::new(config), None).await?;
+
     let socket: SocketAddr = (ip, port).into();
     run_local_node(executor, socket).await
 }
 
 async fn run_network(config: Config) -> Result<(), DynError> {
-    let port = config.http_gateway.port;
-    let ip = config.http_gateway.address;
-    run_network_node(config, (ip, port).into()).await
+    run_network_node(config).await
 }
 
 fn main() -> Result<(), DynError> {

@@ -12,7 +12,6 @@ use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
 use crate::message::{NetMessageV1, NodeEvent};
-use crate::node::ConnectionError;
 use crate::ring::Ring;
 use crate::transport::TransportPublicKey;
 use crate::{
@@ -707,6 +706,10 @@ where
     };
     let gateways = gateways.to_vec();
     tokio::task::spawn(async move {
+        if gateways.is_empty() {
+            tracing::warn!("No gateways available, aborting join procedure");
+            return;
+        }
         loop {
             if op_manager.ring.open_connections() == 0 {
                 tracing::info!(
@@ -754,15 +757,18 @@ pub(crate) async fn join_ring_request<CM>(
 where
     CM: NetworkBridge + Send,
 {
-    if !op_manager.ring.should_accept(
-        gateway.location.unwrap_or_else(Location::random),
-        Some(&gateway.peer),
-    ) {
-        // ensure that we still want to connect AND reserve an spot implicitly
-        return Err(OpError::ConnError(ConnectionError::FailedConnectOp));
+    if op_manager.ring.num_connections() > 0 {
+        use crate::node::ConnectionError;
+        if !op_manager.ring.should_accept(
+            gateway.location.unwrap_or_else(Location::random),
+            Some(&gateway.peer),
+        ) {
+            // ensure that we still want to connect AND reserve an spot implicitly
+            return Err(OpError::ConnError(ConnectionError::FailedConnectOp));
+        }
     }
     let tx_id = Transaction::new::<ConnectMsg>();
-    tracing::info!(%gateway.peer, ?peer_pub_key, "Attempting network join");
+    tracing::info!(%gateway.peer, %peer_pub_key, "Attempting network join");
     let mut op = initial_request(
         peer_pub_key,
         gateway.clone(),

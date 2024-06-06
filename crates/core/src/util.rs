@@ -3,38 +3,49 @@ pub(crate) mod time_source;
 use std::{
     collections::{BTreeMap, HashSet},
     net::{Ipv4Addr, SocketAddr, TcpListener},
+    sync::Arc,
     time::Duration,
 };
 
+use crate::{config::ConfigPaths, node::PeerId};
 use rand::{
     prelude::{Rng, StdRng},
     SeedableRng,
 };
 
-use crate::node::PeerId;
-
-pub fn set_cleanup_on_exit(id: Option<String>) -> Result<(), ctrlc::Error> {
+pub fn set_cleanup_on_exit(config: Arc<ConfigPaths>) -> Result<(), ctrlc::Error> {
     ctrlc::set_handler(move || {
         tracing::info!("Received Ctrl+C. Cleaning up...");
 
         #[cfg(debug_assertions)]
         {
-            let Ok(path) = crate::config::ConfigPathsArgs::app_data_dir(id.as_deref()) else {
-                std::process::exit(0);
-            };
-            tracing::info!("Removing content stored at {path:?}");
+            let paths = config.iter();
+            for (is_dir, path) in paths {
+                if path.exists() {
+                    tracing::info!("Removing content stored at {path:?}");
+                    let rm = if is_dir {
+                        std::fs::remove_dir_all(path).map_err(|err| {
+                            tracing::warn!("Failed cleaning up directory: {err}");
+                            err
+                        })
+                    } else {
+                        std::fs::remove_file(path).map_err(|err| {
+                            tracing::warn!("Failed cleaning up file: {err}");
+                            err
+                        })
+                    };
 
-            if path.exists() {
-                let rm = std::fs::remove_dir_all(&path).map_err(|err| {
-                    tracing::warn!("Failed cleaning up directory: {err}");
-                    err
-                });
-                if rm.is_err() {
-                    tracing::error!("Failed to remove content at {path:?}");
-                    std::process::exit(-1);
+                    match rm {
+                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                            tracing::error!("Failed to remove directory at {path:?}");
+                            std::process::exit(-1);
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
+        let _ = config;
         tracing::info!("Successful cleanup");
 
         std::process::exit(0);

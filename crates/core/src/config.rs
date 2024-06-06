@@ -2,9 +2,9 @@ use std::{
     fs::{self, File},
     future::Future,
     io::{Read, Write},
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
-    sync::atomic::AtomicBool,
+    sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
 
@@ -14,7 +14,7 @@ use pkcs1::DecodeRsaPrivateKey;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
-use crate::{local_node::OperationMode, transport::TransportKeypair};
+use crate::{dev_tool::PeerId, local_node::OperationMode, transport::TransportKeypair};
 
 /// Default maximum number of connections for the peer.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 20;
@@ -48,21 +48,29 @@ pub struct ConfigArgs {
 
     #[clap(flatten)]
     #[serde(flatten)]
-    pub http_gateway: GatewayArgs,
+    pub ws_api: WebsocketApiArgs,
+
+    #[clap(flatten)]
+    #[serde(flatten)]
+    pub network_listener: NetworkArgs,
+
     #[clap(value_parser, env = "TRANSPORT_KEYPAIR")]
     pub transport_keypair: Option<PathBuf>,
+
     #[serde(
         with = "serde_option_log_level_filter",
         skip_serializing_if = "Option::is_none"
     )]
     #[clap(long, env = "LOG_LEVEL")]
     pub log_level: Option<tracing::log::LevelFilter>,
+
     #[clap(flatten)]
     #[serde(flatten)]
     config_paths: ConfigPathsArgs,
 
     /// An arbitrary identifier for the node, mostly for debugging or testing purposes.
     #[clap(long)]
+    #[serde(skip)]
     pub id: Option<String>,
 }
 
@@ -70,8 +78,15 @@ impl Default for ConfigArgs {
     fn default() -> Self {
         Self {
             mode: Some(OperationMode::Network),
-            http_gateway: GatewayArgs {
-                address: Some(default_gateway_address()),
+            network_listener: NetworkArgs {
+                address: Some(default_address()),
+                port: Some(default_gateway_port()),
+                public_address: None,
+                public_port: None,
+                is_gateway: false,
+            },
+            ws_api: WebsocketApiArgs {
+                address: Some(default_address()),
                 port: Some(default_gateway_port()),
             },
             transport_keypair: None,
@@ -83,10 +98,10 @@ impl Default for ConfigArgs {
 }
 
 impl ConfigArgs {
-    fn read_config(dir: &PathBuf) -> std::io::Result<Option<ConfigArgs>> {
+    fn read_config(dir: &PathBuf) -> std::io::Result<Option<Config>> {
         if dir.exists() {
-            let mut dir = std::fs::read_dir(dir)?;
-            let config_args = dir.find_map(|f| {
+            let mut read_dir = std::fs::read_dir(dir)?;
+            let config_args = read_dir.find_map(|f| {
                 if let Ok(f) = f {
                     let filename = f.file_name().to_string_lossy().into_owned();
                     let ext = filename.rsplit('.').next().map(|s| s.to_owned());
@@ -109,29 +124,70 @@ impl ConfigArgs {
                 None
             });
             match config_args {
-                Some((filename, ext)) => match ext.as_str() {
-                    "toml" => {
-                        let mut file = File::open(&*filename)?;
-                        let mut content = String::new();
-                        file.read_to_string(&mut content)?;
-                        Ok(Some(toml::from_str::<Self>(&content).map_err(|e| {
-                            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                        })?))
+                Some((filename, ext)) => {
+                    tracing::info!(
+                        "Reading configuration file: {:?}",
+                        dir.join(&filename).with_extension(&ext)
+                    );
+                    match ext.as_str() {
+                        "toml" => {
+                            let mut file = File::open(&*filename)?;
+                            let mut content = String::new();
+                            file.read_to_string(&mut content)?;
+                            let mut config = toml::from_str::<Config>(&content).map_err(|e| {
+                                std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                            })?;
+                            let (_, transport_keypair) =
+                                Self::read_transport_keypair(config.secrets_dir())?;
+                            config.transport_keypair = transport_keypair;
+                            Ok(Some(config))
+                        }
+                        "json" => {
+                            let mut file = File::open(&*filename)?;
+                            let mut config = serde_json::from_reader::<_, Config>(&mut file)?;
+                            let (_, transport_keypair) =
+                                Self::read_transport_keypair(config.secrets_dir())?;
+                            config.transport_keypair = transport_keypair;
+                            Ok(Some(config))
+                        }
+                        ext => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("Invalid configuration file extension: {}", ext),
+                        )),
                     }
-                    "json" => {
-                        let mut file = File::open(&*filename)?;
-                        Ok(Some(serde_json::from_reader::<_, Self>(&mut file)?))
-                    }
-                    ext => Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("Invalid configuration file extension: {}", ext),
-                    )),
-                },
+                }
                 None => Ok(None),
             }
         } else {
             Ok(None)
         }
+    }
+
+    fn read_transport_keypair(
+        path_to_key: PathBuf,
+    ) -> std::io::Result<(PathBuf, TransportKeypair)> {
+        let mut key_file = File::open(&path_to_key).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("Failed to open key file {}: {e}", path_to_key.display()),
+            )
+        })?;
+        let mut buf = String::new();
+        key_file.read_to_string(&mut buf).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("Failed to read key file {}: {e}", path_to_key.display()),
+            )
+        })?;
+
+        let pk = rsa::RsaPrivateKey::from_pkcs1_pem(&buf).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to read key file {}: {e}", path_to_key.display()),
+            )
+        })?;
+
+        Ok::<_, std::io::Error>((path_to_key, TransportKeypair::from_private_key(pk)))
     }
 
     /// Parse the command line arguments and return the configuration.
@@ -147,7 +203,7 @@ impl ConfigArgs {
             Self::read_config(path)?
         } else {
             // find default application dir to see if there is a config file
-            let dir = ConfigPathsArgs::config_dir()?;
+            let dir = ConfigPathsArgs::config_dir(self.id.as_deref())?;
             Self::read_config(&dir).ok().flatten()
         };
 
@@ -155,74 +211,110 @@ impl ConfigArgs {
 
         // merge the configuration from the file with the command line arguments
         if let Some(cfg) = cfg {
-            if self.transport_keypair.is_none() {
-                self.transport_keypair = cfg.transport_keypair;
-            }
-
-            if self.mode.is_none() {
-                self.mode = cfg.mode;
-            }
-
-            if self.http_gateway.address.is_none() {
-                self.http_gateway.address = cfg.http_gateway.address;
-            }
-
-            if self.http_gateway.port.is_none() {
-                self.http_gateway.port = cfg.http_gateway.port;
-            }
-
-            if self.log_level.is_none() {
-                self.log_level = cfg.log_level;
-            }
-
-            self.config_paths.merge(cfg.config_paths);
+            self.transport_keypair
+                .get_or_insert(cfg.transport_keypair_path);
+            self.mode.get_or_insert(cfg.mode);
+            self.ws_api.address.get_or_insert(cfg.ws_api.address);
+            self.ws_api.port.get_or_insert(cfg.ws_api.port);
+            self.log_level.get_or_insert(cfg.log_level);
+            self.config_paths.merge(cfg.config_paths.as_ref().clone());
         }
 
         let mode = self.mode.unwrap_or(OperationMode::Network);
+        let config_paths = self.config_paths.build(self.id.as_deref())?;
+
+        let transport_key = self
+            .transport_keypair
+            .map(Self::read_transport_keypair)
+            .transpose()?;
+        let (transport_keypair_path, transport_keypair) =
+            if let Some((transport_key_path, transport_key)) = transport_key {
+                (transport_key_path, transport_key)
+            } else {
+                let transport_key = TransportKeypair::new();
+                let transport_key_path =
+                    config_paths.secrets_dir(mode).join("transport_keypair.pem");
+
+                // if the transport key file exists, then read it
+                if transport_key_path.exists() {
+                    Self::read_transport_keypair(transport_key_path)?
+                } else {
+                    let mut file = File::create(&transport_key_path)?;
+                    file.write_all(&transport_key.secret().to_bytes().map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("failed to write transport key: {e}"),
+                        )
+                    })?)?;
+                    (transport_key_path, transport_key)
+                }
+            };
+
+        let peer_id = self
+            .network_listener
+            .public_address
+            .zip(self.network_listener.public_port)
+            .map(|(addr, port)| {
+                PeerId::new((addr, port).into(), transport_keypair.public().clone())
+            });
+        let gateways = config_paths.config_dir.join("gateways.toml");
+        let gateways = match File::open(&*gateways) {
+            Ok(mut file) => {
+                let mut content = String::new();
+                file.read_to_string(&mut content)?;
+                toml::from_str::<Gateways>(&content)
+                    .map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                    })?
+                    .gateways
+            }
+            Err(err) => {
+                #[cfg(not(any(test, debug_assertions)))]
+                {
+                    if peer_id.is_none() {
+                        tracing::error!("Failed to read gateways file: {err}");
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "Cannot initialize node without gateways",
+                        ));
+                    }
+                }
+                let _ = err;
+                tracing::warn!("No gateways file found, initializing disjoint gateway.");
+                vec![]
+            }
+        };
 
         let this = Config {
             mode,
-            http_gateway: GatewayConfig {
-                address: self.http_gateway.address.unwrap_or_else(|| match mode {
-                    OperationMode::Local => default_local_gateway_address(),
-                    OperationMode::Network => default_gateway_address(),
+            peer_id,
+            network_api: NetworkApiConfig {
+                address: self.ws_api.address.unwrap_or_else(|| match mode {
+                    OperationMode::Local => default_local_address(),
+                    OperationMode::Network => default_address(),
                 }),
-                port: self.http_gateway.port.unwrap_or(default_gateway_port()),
+                port: self.ws_api.port.unwrap_or(default_gateway_port()),
+                public_address: self.network_listener.public_address,
+                public_port: self.network_listener.public_port,
             },
-            transport_keypair: match self.transport_keypair {
-                Some(path_to_key) => {
-                    let mut key_file = File::open(&path_to_key).map_err(|e| {
-                        std::io::Error::new(
-                            e.kind(),
-                            format!("Failed to open key file {}: {e}", path_to_key.display()),
-                        )
-                    })?;
-                    let mut buf = String::new();
-                    key_file.read_to_string(&mut buf).map_err(|e| {
-                        std::io::Error::new(
-                            e.kind(),
-                            format!("Failed to read key file {}: {e}", path_to_key.display()),
-                        )
-                    })?;
-
-                    let pk = rsa::RsaPrivateKey::from_pkcs1_pem(&buf).map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("Failed to read key file {}: {e}", path_to_key.display()),
-                        )
-                    })?;
-
-                    TransportKeypair::from_private_key(pk)
-                }
-                None => TransportKeypair::new(),
+            ws_api: WebsocketApiConfig {
+                address: self.ws_api.address.unwrap_or_else(|| match mode {
+                    OperationMode::Local => default_local_address(),
+                    OperationMode::Network => default_address(),
+                }),
+                port: self.ws_api.port.unwrap_or(default_gateway_port()),
             },
+            transport_keypair,
+            transport_keypair_path,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
-            config_paths: self.config_paths.build(self.id.as_deref())?,
+            config_paths: Arc::new(config_paths),
+            gateways,
+            is_gateway: self.network_listener.is_gateway,
         };
 
-        fs::create_dir_all(&this.config_paths.config_dir)?;
+        fs::create_dir_all(&this.config_dir())?;
         if should_persist {
-            let mut file = File::create(this.config_paths.config_dir.join("config.toml"))?;
+            let mut file = File::create(this.config_dir().join("config.toml"))?;
             file.write_all(
                 toml::to_string(&this)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
@@ -272,8 +364,8 @@ mod serde_log_level_filter {
     where
         D: Deserializer<'de>,
     {
-        let level = <&str>::deserialize(deserializer)?;
-        parse_log_level_str::<D>(level)
+        let level = String::deserialize(deserializer)?;
+        parse_log_level_str::<D>(level.as_str())
     }
 }
 
@@ -311,63 +403,135 @@ mod serde_option_log_level_filter {
 pub struct Config {
     /// Node operation mode.
     pub mode: OperationMode,
-
     #[serde(flatten)]
-    pub http_gateway: GatewayConfig,
+    pub network_api: NetworkApiConfig,
+    #[serde(flatten)]
+    pub ws_api: WebsocketApiConfig,
+    #[serde(skip)]
     pub transport_keypair: TransportKeypair,
+    #[serde(rename = "transport_keypair")]
+    pub transport_keypair_path: PathBuf,
     #[serde(with = "serde_log_level_filter")]
     pub log_level: tracing::log::LevelFilter,
     #[serde(flatten)]
-    config_paths: ConfigPaths,
+    config_paths: Arc<ConfigPaths>,
+    #[serde(skip)]
+    pub(crate) peer_id: Option<PeerId>,
+    #[serde(skip)]
+    pub(crate) gateways: Vec<GatewayConfig>,
+    pub(crate) is_gateway: bool,
 }
 
 impl Config {
     pub fn transport_keypair(&self) -> &TransportKeypair {
         &self.transport_keypair
     }
+
+    pub(crate) fn paths(&self) -> Arc<ConfigPaths> {
+        self.config_paths.clone()
+    }
 }
 
 #[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]
-pub struct GatewayArgs {
-    /// Address to bind to, default is 0.0.0.0
-    #[arg(long = "gateway-address", env = "GATEWAY_ADDRESS")]
-    #[serde(rename = "gateway-address", skip_serializing_if = "Option::is_none")]
+pub struct NetworkArgs {
+    /// Address to bind to for the network event listener, default is 0.0.0.0
+    #[arg(long = "network-address", env = "NETWORK_ADDRESS")]
+    #[serde(rename = "network-address", skip_serializing_if = "Option::is_none")]
     pub address: Option<IpAddr>,
 
-    /// Port to expose api on, default is 50509
-    #[arg(long = "gateway-port", env = "GATEWAY_PORT")]
-    #[serde(rename = "gateway-port", skip_serializing_if = "Option::is_none")]
+    /// Port to bind for the network event listener, default is 31337
+    #[arg(long = "network-port", env = "NETWORK_PORT")]
+    #[serde(rename = "network-port", skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+
+    /// Public address for the network. Required for gateways.
+    #[arg(long = "public-network-address", env = "PUBLIC_NETWORK_ADDRESS")]
+    #[serde(
+        rename = "public-network-address",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub public_address: Option<IpAddr>,
+
+    /// Public port for the network. Required for gateways.
+    #[arg(long = "public-network-port", env = "PUBLIC_NETWORK_PORT")]
+    #[serde(
+        rename = "public-network-port",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub public_port: Option<u16>,
+
+    /// Whether the node is a gateway or not.
+    /// If the node is a gateway, it will be able to accept connections from other nodes.
+    #[arg(long)]
+    pub is_gateway: bool,
+}
+
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+pub struct NetworkApiConfig {
+    /// Address to bind to
+    #[serde(default = "default_address", rename = "network-address")]
+    pub address: IpAddr,
+
+    /// Port to expose api on
+    #[serde(default = "default_network_port", rename = "network-port")]
+    pub port: u16,
+
+    #[serde(
+        rename = "public_network_address",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub public_address: Option<IpAddr>,
+
+    #[serde(rename = "public_port", skip_serializing_if = "Option::is_none")]
+    pub public_port: Option<u16>,
+}
+
+#[inline]
+const fn default_network_port() -> u16 {
+    31337
+}
+
+#[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]
+pub struct WebsocketApiArgs {
+    /// Address to bind to for the websocket API, default is 0.0.0.0
+    #[arg(long = "ws-api-address", env = "WS_API_ADDRESS")]
+    #[serde(rename = "ws-api-address", skip_serializing_if = "Option::is_none")]
+    pub address: Option<IpAddr>,
+
+    /// Port to expose the websocket on, default is 50509
+    #[arg(long = "ws-api-port", env = "WS_API_PORT")]
+    #[serde(rename = "ws-api-port", skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
-pub struct GatewayConfig {
+pub struct WebsocketApiConfig {
     /// Address to bind to
-    #[serde(default = "default_gateway_address", rename = "gateway-address")]
+    #[serde(default = "default_address", rename = "ws-api-address")]
     pub address: IpAddr,
 
     /// Port to expose api on
-    #[serde(default = "default_gateway_port", rename = "gateway-port")]
+    #[serde(default = "default_gateway_port", rename = "ws-api-port")]
     pub port: u16,
 }
 
-impl Default for GatewayConfig {
+impl Default for WebsocketApiConfig {
     #[inline]
     fn default() -> Self {
         Self {
-            address: default_gateway_address(),
+            address: default_address(),
             port: default_gateway_port(),
         }
     }
 }
 
 #[inline]
-const fn default_gateway_address() -> IpAddr {
+const fn default_address() -> IpAddr {
     IpAddr::V4(Ipv4Addr::UNSPECIFIED)
 }
 
 #[inline]
-const fn default_local_gateway_address() -> IpAddr {
+const fn default_local_address() -> IpAddr {
     IpAddr::V4(Ipv4Addr::LOCALHOST)
 }
 
@@ -378,46 +542,45 @@ const fn default_gateway_port() -> u16 {
 
 #[derive(clap::Parser, Default, Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigPathsArgs {
+    /// The configuration directory.
+    #[arg(long, default_value = None, env = "CONFIG_DIR")]
     config_dir: Option<PathBuf>,
+    /// The contracts directory.
+    #[arg(long, default_value = None, env = "CONTRACTS_DIR")]
     contracts_dir: Option<PathBuf>,
+    /// The delegates directory.
+    #[arg(long, default_value = None, env = "DELEGATES_DIR")]
     delegates_dir: Option<PathBuf>,
+    /// The secrets directory.
+    #[arg(long, default_value = None, env = "SECRECTS_DIR")]
     secrets_dir: Option<PathBuf>,
+    /// The database directory.
+    #[arg(long, default_value = None, env = "DB_DIR")]
     db_dir: Option<PathBuf>,
+    /// The event log file.
+    #[arg(long, default_value = None, env = "EVENT_LOG")]
     event_log: Option<PathBuf>,
+    /// The data directory.
+    #[arg(long, default_value = None, env = "DATA_DIR")]
     data_dir: Option<PathBuf>,
 }
 
 impl ConfigPathsArgs {
-    fn merge(&mut self, other: Self) {
-        if self.contracts_dir.is_none() {
-            self.contracts_dir = other.contracts_dir;
-        }
-
-        if self.delegates_dir.is_none() {
-            self.delegates_dir = other.delegates_dir;
-        }
-
-        if self.secrets_dir.is_none() {
-            self.secrets_dir = other.secrets_dir;
-        }
-
-        if self.db_dir.is_none() {
-            self.db_dir = other.db_dir;
-        }
-
-        if self.event_log.is_none() {
-            self.event_log = other.event_log;
-        }
-
-        if self.data_dir.is_none() {
-            self.data_dir = other.data_dir;
-        }
+    fn merge(&mut self, other: ConfigPaths) {
+        self.config_dir.get_or_insert(other.config_dir);
+        self.contracts_dir.get_or_insert(other.contracts_dir);
+        self.delegates_dir.get_or_insert(other.delegates_dir);
+        self.secrets_dir.get_or_insert(other.secrets_dir);
+        self.db_dir.get_or_insert(other.db_dir);
+        self.event_log.get_or_insert(other.event_log);
+        self.data_dir.get_or_insert(other.data_dir);
     }
 
     pub fn app_data_dir(id: Option<&str>) -> std::io::Result<PathBuf> {
         let project_dir = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
             .ok_or(std::io::ErrorKind::NotFound)?;
-        let app_data_dir: PathBuf = if cfg!(any(test, debug_assertions)) {
+        // if id is set, most likely we are running tests or in simulated mode
+        let app_data_dir: PathBuf = if cfg!(any(test, debug_assertions)) || id.is_some() {
             std::env::temp_dir().join(if let Some(id) = id {
                 format!("freenet-{id}")
             } else {
@@ -429,11 +592,17 @@ impl ConfigPathsArgs {
         Ok(app_data_dir)
     }
 
-    pub fn config_dir() -> std::io::Result<PathBuf> {
+    pub fn config_dir(id: Option<&str>) -> std::io::Result<PathBuf> {
         let project_dir = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
             .ok_or(std::io::ErrorKind::NotFound)?;
-        let config_data_dir: PathBuf = if cfg!(any(test, debug_assertions)) {
-            std::env::temp_dir().join("freenet").join("config")
+        let config_data_dir: PathBuf = if cfg!(any(test, debug_assertions)) || id.is_some() {
+            std::env::temp_dir()
+                .join(if let Some(id) = id {
+                    format!("freenet-{id}")
+                } else {
+                    "freenet".into()
+                })
+                .join("config")
         } else {
             project_dir.config_dir().into()
         };
@@ -493,13 +662,13 @@ impl ConfigPathsArgs {
             event_log,
             config_dir: match self.config_dir {
                 Some(dir) => dir,
-                None => Self::config_dir()?,
+                None => Self::config_dir(id)?,
             },
         })
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigPaths {
     contracts_dir: PathBuf,
     delegates_dir: PathBuf,
@@ -578,7 +747,55 @@ impl ConfigPaths {
         self.event_log = event_log;
         self
     }
+
+    pub fn iter(&self) -> ConfigPathsIter {
+        ConfigPathsIter {
+            curr: 0,
+            config_paths: self,
+        }
+    }
+
+    fn path_by_index(&self, index: usize) -> (bool, &PathBuf) {
+        match index {
+            0 => (true, &self.contracts_dir),
+            1 => (true, &self.delegates_dir),
+            2 => (true, &self.secrets_dir),
+            3 => (true, &self.db_dir),
+            4 => (true, &self.data_dir),
+            5 => (false, &self.event_log),
+            6 => (true, &self.config_dir),
+            _ => panic!("invalid path index"),
+        }
+    }
+
+    const MAX_PATH_INDEX: usize = 6;
 }
+
+pub struct ConfigPathsIter<'a> {
+    curr: usize,
+    config_paths: &'a ConfigPaths,
+}
+
+impl<'a> Iterator for ConfigPathsIter<'a> {
+    /// The first is whether this path is a directory or a file.
+    type Item = (bool, &'a PathBuf);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.curr > ConfigPaths::MAX_PATH_INDEX {
+            None
+        } else {
+            let path = self.config_paths.path_by_index(self.curr);
+            self.curr += 1;
+            Some(path)
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(ConfigPaths::MAX_PATH_INDEX))
+    }
+}
+
+impl<'a> core::iter::FusedIterator for ConfigPathsIter<'a> {}
 
 impl Config {
     pub fn db_dir(&self) -> PathBuf {
@@ -604,6 +821,29 @@ impl Config {
     pub fn config_dir(&self) -> PathBuf {
         self.config_paths.config_dir()
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Gateways {
+    pub gateways: Vec<GatewayConfig>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GatewayConfig {
+    /// Address of the gateway. It can be either a hostname or an IP address and port.
+    pub address: Address,
+
+    /// Path to the public key of the gateway in PEM format.
+    #[serde(rename = "public_key")]
+    pub public_key_path: PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Address {
+    #[serde(rename = "hostname")]
+    Hostname(String),
+    #[serde(rename = "host_address")]
+    HostAddress(SocketAddr),
 }
 
 pub(crate) struct GlobalExecutor;
@@ -655,5 +895,37 @@ pub fn set_logger(level: Option<tracing::level_filters::LevelFilter>) {
         }
 
         crate::tracing::tracer::init_tracer(level).expect("failed tracing initialization")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_serde_config_args() {
+        let args = ConfigArgs::default();
+        let cfg = args.build().unwrap();
+        let serialized = toml::to_string(&cfg).unwrap();
+        let _: Config = toml::from_str(&serialized).unwrap();
+    }
+
+    #[test]
+    fn test_gateways() {
+        let gateways = Gateways {
+            gateways: vec![
+                GatewayConfig {
+                    address: Address::HostAddress(([127, 0, 0, 1], default_network_port()).into()),
+                    public_key_path: PathBuf::from("path/to/key"),
+                },
+                GatewayConfig {
+                    address: Address::Hostname("technic.locut.us".to_string()),
+                    public_key_path: PathBuf::from("path/to/key"),
+                },
+            ],
+        };
+
+        let serialized = toml::to_string(&gateways).unwrap();
+        let _: Gateways = toml::from_str(&serialized).unwrap();
     }
 }

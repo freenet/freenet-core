@@ -43,11 +43,11 @@ impl NetworkPeer {
             .await
             .expect("Failed to connect to supervisor");
 
-        let config_url = format!("http://localhost:3000/config/{}", peer_id);
+        let config_url = format!("http://127.0.0.1:3000/config/{}", peer_id);
         let response = reqwest::get(&config_url).await?;
         let peer_config = response.json::<crate::node::NodeConfig>().await?;
 
-        tracing::debug!(?peer_config.public_port, %peer_config.is_gateway, key = ?peer_config.key_pair.public(), "Received peer config");
+        tracing::debug!(?peer_config.network_listener_port, %peer_config.is_gateway, key = ?peer_config.key_pair.public(), "Received peer config");
 
         let (user_ev_controller, receiver_ch): (PeerEventSender, PeerEventReceiver) =
             tokio::sync::watch::channel((0, peer_config.get_peer_id().unwrap()));
