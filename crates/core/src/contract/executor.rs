@@ -171,6 +171,15 @@ pub enum OperationMode {
     Network,
 }
 
+impl Display for OperationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OperationMode::Local => write!(f, "local"),
+            OperationMode::Network => write!(f, "network"),
+        }
+    }
+}
+
 pub struct ExecutorToEventLoopChannel<End: sealed::ChannelHalve> {
     op_manager: Arc<OpManager>,
     end: End,

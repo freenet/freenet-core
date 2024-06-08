@@ -83,6 +83,7 @@ impl Node {
 /// If both are provided but also additional peers are added via the [`Self::add_gateway()`] method, this node will
 /// be listening but also try to connect to an existing peer.
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[non_exhaustive] // avoid directly instantiating this struct
 pub struct NodeConfig {
     /// Determines if an initial connection should be attempted.
     /// Only true for an initial gateway/node. If false, the gateway will be disconnected unless other peers connect through it.
@@ -112,6 +113,7 @@ pub struct NodeConfig {
 
 impl NodeConfig {
     pub async fn new(config: Config) -> anyhow::Result<NodeConfig> {
+        tracing::info!("Loading node configuration for mode {}", config.mode);
         let mut gateways = Vec::with_capacity(config.gateways.len());
         for gw in &config.gateways {
             let GatewayConfig {

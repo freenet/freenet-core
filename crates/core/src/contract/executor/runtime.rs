@@ -160,7 +160,6 @@ impl Executor<Runtime> {
         Executor::new(
             state_store,
             move || {
-                // FIXME: potentially not cleaning up after exit
                 crate::util::set_cleanup_on_exit(config.paths().clone())?;
                 Ok(())
             },
