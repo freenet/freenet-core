@@ -55,7 +55,7 @@ impl WebSocketProxy {
         let (proxy_request_sender, proxy_server_request) = mpsc::channel(PARALLELISM);
 
         let router = server_routing
-            .route("/contract/command", get(websocket_commands))
+            .route("/v1/contract/command", get(websocket_commands))
             .layer(Extension(WebSocketRequest(proxy_request_sender)))
             .layer(axum::middleware::from_fn(connection_info));
         (

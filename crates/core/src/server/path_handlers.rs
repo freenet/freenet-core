@@ -214,7 +214,7 @@ fn contract_web_path(key: &ContractKey) -> PathBuf {
 
 #[inline]
 fn get_file_path(uri: axum::http::Uri) -> Result<String, Box<WebSocketApiError>> {
-    let p = uri.path().strip_prefix("/contract/").ok_or_else(|| {
+    let p = uri.path().strip_prefix("/v1/contract/").ok_or_else(|| {
         Box::new(WebSocketApiError::InvalidParam {
             error_cause: format!("{uri} not valid"),
         })
@@ -231,7 +231,7 @@ fn get_file_path(uri: axum::http::Uri) -> Result<String, Box<WebSocketApiError>>
 
 #[test]
 fn get_path() {
-    let req_path = "/contract/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/web/state.html";
+    let req_path = "/v1/contract/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/web/state.html";
     let base_dir =
         PathBuf::from("/tmp/freenet/webs/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/web/");
     let uri: axum::http::Uri = req_path.parse().unwrap();

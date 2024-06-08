@@ -271,7 +271,7 @@ impl ConfigArgs {
             Err(err) => {
                 #[cfg(not(any(test, debug_assertions)))]
                 {
-                    if peer_id.is_none() {
+                    if peer_id.is_none() && mode == OperationMode::Network {
                         tracing::error!("Failed to read gateways file: {err}");
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::NotFound,

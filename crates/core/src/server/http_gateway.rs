@@ -60,10 +60,10 @@ impl HttpGateway {
         let config = Config { localhost };
 
         let router = Router::new()
-            .route("/", get(home))
-            .route("/contract/web/:key/", get(web_home))
+            .route("/v1", get(home))
+            .route("/v1/contract/web/:key/", get(web_home))
             .with_state(config)
-            .route("/contract/web/:key/*path", get(web_subpages))
+            .route("/v1/contract/web/:key/*path", get(web_subpages))
             .layer(Extension(HttpGatewayRequest(proxy_request_sender)));
 
         (
@@ -97,7 +97,7 @@ async fn web_home(
     let auth_header = headers::Authorization::<headers::authorization::Bearer>::name().to_string();
     let cookie = cookie::Cookie::build((auth_header, format!("Bearer {}", token.as_str())))
         .domain(domain)
-        .path(format!("/contract/web/{key}"))
+        .path(format!("/v1/contract/web/{key}"))
         .same_site(cookie::SameSite::Strict)
         .max_age(cookie::time::Duration::days(1))
         .secure(!config.localhost)
@@ -119,7 +119,7 @@ async fn web_home(
 async fn web_subpages(
     Path((key, last_path)): Path<(String, String)>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
-    let full_path: String = format!("/contract/web/{}/{}", key, last_path);
+    let full_path: String = format!("/v1/contract/web/{}/{}", key, last_path);
     path_handlers::variable_content(key, full_path)
         .await
         .map_err(|e| *e)

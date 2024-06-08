@@ -72,9 +72,9 @@ async fn run_server(
         .unwrap_or(DEFAULT_PORT);
 
     let router = Router::new()
-        .route("/", get(home))
-        .route("/push-stats/", get(push_stats))
-        .route("/pull-stats/peer-changes/", get(pull_peer_changes))
+        .route("/v1", get(home))
+        .route("/v1/push-stats/", get(push_stats))
+        .route("/v1/pull-stats/peer-changes/", get(pull_peer_changes))
         .with_state(Arc::new(ServerState {
             changes,
             peer_data: DashMap::new(),
@@ -91,7 +91,7 @@ async fn run_server(
 async fn home() -> Response {
     Response::builder()
         .status(StatusCode::FOUND)
-        .header("Location", "/pull-stats/")
+        .header("Location", "/v1/pull-stats/")
         .body(Body::empty())
         .expect("should be valid response")
         .into_response()

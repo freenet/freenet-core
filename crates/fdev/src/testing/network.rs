@@ -214,9 +214,9 @@ pub async fn start_server(supervisor: Arc<Supervisor>) -> Result<(), NetworkSimu
     let cloned_supervisor = supervisor.clone();
 
     let router = Router::new()
-        .route("/ws", get(|ws| ws_handler(ws, cloned_supervisor)))
+        .route("/v1/ws", get(|ws| ws_handler(ws, cloned_supervisor)))
         .route(
-            "/config/:peer_id",
+            "/v1/config/:peer_id",
             get(|path: Path<String>| config_handler(peers_config, path)),
         );
 
