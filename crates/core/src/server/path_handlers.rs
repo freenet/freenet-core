@@ -34,7 +34,7 @@ pub(super) async fn contract_home(
     request_sender
         .send(ClientConnection::NewConnection {
             callbacks: response_sender,
-            assigned_token: Some((assigned_token, key.clone().into())),
+            assigned_token: Some((assigned_token, key.into())),
         })
         .await
         .map_err(|err| WebSocketApiError::NodeError {
@@ -53,7 +53,7 @@ pub(super) async fn contract_home(
             client_id,
             req: Box::new(
                 ContractRequest::Get {
-                    key: key.clone(),
+                    key,
                     fetch_contract: true,
                 }
                 .into(),

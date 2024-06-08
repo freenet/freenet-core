@@ -508,7 +508,7 @@ pub(crate) mod test {
                                 continue;
                             }
                             let request = ContractRequest::Update {
-                                key: contract.key().clone(),
+                                key: contract.key(),
                                 data: new_state,
                             };
                             if state.owns_contracts.contains(&contract.key()) {

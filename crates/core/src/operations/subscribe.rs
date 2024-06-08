@@ -65,9 +65,9 @@ pub(crate) async fn request_subscribe(
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
     let (target, _id) = if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        if !super::has_contract(op_manager, key.clone()).await? {
+        if !super::has_contract(op_manager, *key).await? {
             return Err(OpError::ContractError(ContractError::ContractNotFound(
-                key.clone(),
+                *key,
             )));
         }
         const EMPTY: &[PeerId] = &[];
@@ -77,7 +77,7 @@ pub(crate) async fn request_subscribe(
                 .closest_potentially_caching(key, EMPTY)
                 .into_iter()
                 .next()
-                .ok_or_else(|| RingError::NoCachingPeers(key.clone()))?,
+                .ok_or_else(|| RingError::NoCachingPeers(*key))?,
             *id,
         )
     } else {
@@ -198,7 +198,7 @@ impl Operation for SubscribeOp {
                     new_state = self.state;
                     return_msg = Some(SubscribeMsg::SeekNode {
                         id: *id,
-                        key: key.clone(),
+                        key: *key,
                         target: target.clone(),
                         subscriber: sender.clone(),
                         skip_list: vec![sender.peer],
@@ -219,7 +219,7 @@ impl Operation for SubscribeOp {
                     let return_not_subbed = || -> OperationResult {
                         OperationResult {
                             return_msg: Some(NetMessage::from(SubscribeMsg::ReturnSub {
-                                key: key.clone(),
+                                key: *key,
                                 id: *id,
                                 subscribed: false,
                                 sender: this_peer.clone(),
@@ -229,7 +229,7 @@ impl Operation for SubscribeOp {
                         }
                     };
 
-                    if !super::has_contract(op_manager, key.clone()).await? {
+                    if !super::has_contract(op_manager, *key).await? {
                         tracing::debug!(tx = %id, %key, "Contract not found, trying other peer");
 
                         let Some(new_target) = op_manager
@@ -261,7 +261,7 @@ impl Operation for SubscribeOp {
                             }),
                             (SubscribeMsg::SeekNode {
                                 id: *id,
-                                key: key.clone(),
+                                key: *key,
                                 subscriber: this_peer,
                                 target: new_target,
                                 skip_list: new_skip_list,
@@ -295,7 +295,7 @@ impl Operation for SubscribeOp {
                                 sender: target.clone(),
                                 target: subscriber.clone(),
                                 id: *id,
-                                key: key.clone(),
+                                key: *key,
                                 subscribed: true,
                             });
                         }
@@ -334,7 +334,7 @@ impl Operation for SubscribeOp {
                                     let subscriber = op_manager.ring.own_location();
                                     return_msg = Some(SubscribeMsg::SeekNode {
                                         id: *id,
-                                        key: key.clone(),
+                                        key: *key,
                                         subscriber,
                                         target,
                                         skip_list: skip_list.clone(),
@@ -342,7 +342,7 @@ impl Operation for SubscribeOp {
                                         retries: retries + 1,
                                     });
                                 } else {
-                                    return Err(RingError::NoCachingPeers(key.clone()).into());
+                                    return Err(RingError::NoCachingPeers(*key).into());
                                 }
                                 new_state = Some(SubscribeState::AwaitingResponse {
                                     skip_list,
@@ -385,7 +385,7 @@ impl Operation for SubscribeOp {
                         if let Some(upstream_subscriber) = upstream_subscriber {
                             return_msg = Some(SubscribeMsg::ReturnSub {
                                 id: *id,
-                                key: key.clone(),
+                                key: *key,
                                 sender: target.clone(),
                                 target: upstream_subscriber,
                                 subscribed: true,
@@ -473,11 +473,6 @@ mod messages {
             }
         }
 
-        fn terminal(&self) -> bool {
-            use SubscribeMsg::*;
-            matches!(self, ReturnSub { .. } | SeekNode { .. })
-        }
-
         fn requested_location(&self) -> Option<Location> {
             match self {
                 Self::SeekNode { key, .. } => Some(Location::from(key.id())),
@@ -528,10 +523,10 @@ mod test {
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let contract: WrappedContract = gen.arbitrary()?;
         let contract_val: WrappedState = gen.arbitrary()?;
-        let contract_key: ContractKey = contract.key().clone();
+        let contract_key: ContractKey = *contract.key();
 
         let event = ContractRequest::Subscribe {
-            key: contract_key.clone(),
+            key: contract_key,
             summary: None,
         }
         .into();

@@ -232,7 +232,7 @@ impl<'a> NetEventLog<'a> {
                     id: *id,
                     requester: op_manager.ring.get_peer_key().unwrap(),
                     target: target.clone(),
-                    key: key.clone(),
+                    key: *key,
                 })
             }
             NetMessageV1::Put(PutMsg::Broadcasting {
@@ -242,7 +242,7 @@ impl<'a> NetEventLog<'a> {
                 ..
             }) => EventKind::Put(PutEvent::BroadcastEmitted {
                 broadcast_to: broadcast_to.clone(),
-                key: key.clone(),
+                key: *key,
                 value: new_value.clone(),
             }),
             NetMessageV1::Put(PutMsg::BroadcastTo {
@@ -252,21 +252,21 @@ impl<'a> NetEventLog<'a> {
                 ..
             }) => EventKind::Put(PutEvent::BroadcastReceived {
                 requester: sender.peer.clone(),
-                key: key.clone(),
+                key: *key,
                 value: new_value.clone(),
             }),
             NetMessageV1::Get(GetMsg::ReturnGet {
                 key,
                 value: StoreResponse { state: Some(_), .. },
                 ..
-            }) => EventKind::Get { key: key.clone() },
+            }) => EventKind::Get { key: *key },
             NetMessageV1::Subscribe(SubscribeMsg::ReturnSub {
                 subscribed: true,
                 key,
                 sender,
                 ..
             }) => EventKind::Subscribed {
-                key: key.clone(),
+                key: *key,
                 at: sender.clone(),
             },
             _ => EventKind::Ignored,
@@ -1116,10 +1116,10 @@ pub(super) mod test {
                 let mut was_received = false;
                 for ev in events {
                     match ev {
-                        PutEvent::BroadcastEmitted { key, .. } if key.clone() == *for_key => {
+                        PutEvent::BroadcastEmitted { key, .. } if key == for_key => {
                             was_emitted = true;
                         }
-                        PutEvent::BroadcastReceived { key, .. } if key.clone() == *for_key => {
+                        PutEvent::BroadcastReceived { key, .. } if key == for_key => {
                             was_received = true;
                         }
                         _ => {}

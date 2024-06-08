@@ -432,13 +432,12 @@ impl Ring {
         let mut old_subscribers = vec![];
         let mut contract_to_drop = None;
         if self.seeding_contract.len() < Self::MAX_SEEDING_CONTRACTS {
-            let dropped_contract = self
+            let dropped_contract = *self
                 .seeding_contract
                 .iter()
                 .min_by_key(|v| *v.value())
                 .unwrap()
-                .key()
-                .clone();
+                .key();
             self.seeding_contract.remove(&dropped_contract);
             if let Some((_, mut subscribers_of_contract)) =
                 self.subscribers.remove(&dropped_contract)
@@ -668,7 +667,7 @@ impl Ring {
 
     pub fn register_subscription(&self, contract: &ContractKey, subscriber: PeerKeyLocation) {
         self.subscribers
-            .entry(contract.clone())
+            .entry(*contract)
             .or_insert(Vec::with_capacity(Self::TOTAL_MAX_SUBSCRIPTIONS))
             .value_mut()
             .push(subscriber);
@@ -682,7 +681,7 @@ impl Ring {
     ) -> Result<(), ()> {
         let mut subs = self
             .subscribers
-            .entry(contract.clone())
+            .entry(*contract)
             .or_insert(Vec::with_capacity(Self::TOTAL_MAX_SUBSCRIPTIONS));
         if subs.len() >= Self::MAX_SUBSCRIBERS {
             return Err(());
@@ -724,7 +723,7 @@ impl Ring {
         {
             let conns = &mut *self.connections_by_location.write();
             if let Some(conns) = conns.get_mut(&loc) {
-                if let Some(pos) = conns.iter().position(|c| &c.location.peer == &peer) {
+                if let Some(pos) = conns.iter().position(|c| c.location.peer == peer) {
                     conns.swap_remove(pos);
                 }
             }
