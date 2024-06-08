@@ -1045,17 +1045,6 @@ mod messages {
             }
         }
 
-        fn terminal(&self) -> bool {
-            use ConnectMsg::*;
-            matches!(
-                self,
-                Response {
-                    msg: ConnectResponse::AcceptedBy { .. },
-                    ..
-                } | Connected { .. }
-            )
-        }
-
         fn requested_location(&self) -> Option<Location> {
             self.target().and_then(|pkloc| pkloc.borrow().location)
         }

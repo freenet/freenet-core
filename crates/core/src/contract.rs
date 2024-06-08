@@ -38,7 +38,7 @@ where
             } => {
                 match contract_handler
                     .executor()
-                    .fetch_contract(key.clone(), fetch_contract)
+                    .fetch_contract(key, fetch_contract)
                     .instrument(tracing::info_span!("fetch_contract", %key, %fetch_contract))
                     .await
                 {
@@ -89,12 +89,7 @@ where
             } => {
                 let put_result = contract_handler
                     .executor()
-                    .upsert_contract_state(
-                        key.clone(),
-                        Either::Left(state),
-                        related_contracts,
-                        contract,
-                    )
+                    .upsert_contract_state(key, Either::Left(state), related_contracts, contract)
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await;
                 contract_handler
@@ -119,7 +114,7 @@ where
                 let update_result = contract_handler
                     .executor()
                     .upsert_contract_state(
-                        key.clone(),
+                        key,
                         Either::Left(state.clone()),
                         related_contracts,
                         None,

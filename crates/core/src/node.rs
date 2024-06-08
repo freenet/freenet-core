@@ -754,7 +754,7 @@ async fn process_message_v1<CB>(
                 .await;
             }
             NetMessageV1::Unsubscribed { ref key, .. } => {
-                subscribe(op_manager, key.clone(), None).await;
+                subscribe(op_manager, *key, None).await;
                 break;
             }
             _ => break, // Exit the loop if no applicable message type is found
@@ -769,7 +769,7 @@ async fn subscribe(op_manager: Arc<OpManager>, key: ContractKey, client_id: Opti
     let timeout = tokio::time::timeout(TIMEOUT, async {
         // Initialize a subscribe op.
         loop {
-            let op = subscribe::start_op(key.clone());
+            let op = subscribe::start_op(key);
             if let Some(client_id) = client_id {
                 let _ = op_manager
                     .ch_outbound
@@ -782,7 +782,7 @@ async fn subscribe(op_manager: Arc<OpManager>, key: ContractKey, client_id: Opti
                 {
                     tracing::info!(%key, "Trying to subscribe to a contract not present, requesting it first");
                     missing_contract = true;
-                    let get_op = get::start_op(key.clone(), true);
+                    let get_op = get::start_op(key, true);
                     if let Err(error) = get::request_get(&op_manager, get_op).await {
                         tracing::error!(%key, %error, "Failed getting the contract while previously trying to subscribe; bailing");
                         break Err(error);

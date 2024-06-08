@@ -306,7 +306,7 @@ impl<T> From<SendError<T>> for OpError {
 
 /// If the contract is not found, it will try to get it first if the `try_get` parameter is set.
 async fn start_subscription_request(op_manager: &OpManager, key: ContractKey, try_get: bool) {
-    let sub_op = subscribe::start_op(key.clone());
+    let sub_op = subscribe::start_op(key);
     if let Err(error) = subscribe::request_subscribe(op_manager, sub_op).await {
         if !try_get {
             tracing::warn!(%error, "Error subscribing to contract");
@@ -314,7 +314,7 @@ async fn start_subscription_request(op_manager: &OpManager, key: ContractKey, tr
         }
         if let OpError::ContractError(ContractError::ContractNotFound(key)) = &error {
             tracing::debug!(%key, "Contract not found, trying to get it first");
-            let get_op = get::start_op(key.clone(), true);
+            let get_op = get::start_op(*key, true);
             if let Err(error) = get::request_get(op_manager, get_op).await {
                 tracing::warn!(%error, "Error getting contract");
             }

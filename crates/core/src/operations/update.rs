@@ -50,7 +50,7 @@ impl UpdateOp {
         if let Some(UpdateState::Finished { key, summary }) = &self.state {
             Ok(HostResponse::ContractResponse(
                 freenet_stdlib::client_api::ContractResponse::UpdateResponse {
-                    key: key.clone(),
+                    key: *key,
                     summary: summary.clone(),
                 },
             ))
@@ -171,7 +171,7 @@ impl Operation for UpdateOp {
                         sender,
                         target: target.clone(),
                         value: value.clone(),
-                        key: key.clone(),
+                        key: *key,
                         related_contracts: related_contracts.clone(),
                     });
 
@@ -199,13 +199,8 @@ impl Operation for UpdateOp {
 
                     if is_subscribed_contract {
                         tracing::debug!("Peer is subscribed to contract. About to update it");
-                        update_contract(
-                            op_manager,
-                            key.clone(),
-                            value.clone(),
-                            related_contracts.clone(),
-                        )
-                        .await?;
+                        update_contract(op_manager, *key, value.clone(), related_contracts.clone())
+                            .await?;
                         tracing::debug!(
                             tx = %id,
                             "Successfully updated a value for contract {} @ {:?} - update",
@@ -214,7 +209,7 @@ impl Operation for UpdateOp {
                         );
                     } else {
                         tracing::debug!("contract not found in this peer. Should throw an error");
-                        return Err(OpError::RingError(RingError::NoCachingPeers(key.clone())));
+                        return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
                     }
 
                     match try_to_broadcast(
@@ -223,7 +218,7 @@ impl Operation for UpdateOp {
                         op_manager,
                         self.state,
                         (broadcast_to, sender.clone()),
-                        key.clone(),
+                        *key,
                         value.clone(),
                         false,
                     )
@@ -252,7 +247,7 @@ impl Operation for UpdateOp {
                     tracing::debug!("Attempting contract value update - BroadcastTo - update");
                     let new_value = update_contract(
                         op_manager,
-                        key.clone(),
+                        *key,
                         new_value.clone(),
                         RelatedContracts::default(),
                     )
@@ -273,7 +268,7 @@ impl Operation for UpdateOp {
                         op_manager,
                         self.state,
                         (broadcast_to, sender.clone()),
-                        key.clone(),
+                        *key,
                         new_value,
                         true,
                     )
@@ -302,7 +297,7 @@ impl Operation for UpdateOp {
                     for peer in broadcast_to.iter() {
                         let msg = UpdateMsg::BroadcastTo {
                             id: *id,
-                            key: key.clone(),
+                            key: *key,
                             new_value: new_value.clone(),
                             sender: sender.clone(),
                         };
@@ -609,7 +604,7 @@ pub(crate) async fn request_update(
         op_manager
             .ring
             .add_subscriber(key, sender)
-            .map_err(|_| RingError::NoCachingPeers(key.clone()))?;
+            .map_err(|_| RingError::NoCachingPeers(*key))?;
 
         closest
     };
@@ -626,7 +621,7 @@ pub(crate) async fn request_update(
             related_contracts,
         }) => {
             let new_state = Some(UpdateState::AwaitingResponse {
-                key: key.clone(),
+                key,
                 upstream: None,
             });
             let msg = UpdateMsg::RequestUpdate {
@@ -731,11 +726,6 @@ mod messages {
                 UpdateMsg::SeekNode { target, .. } => Some(target),
                 _ => None,
             }
-        }
-
-        fn terminal(&self) -> bool {
-            use UpdateMsg::*;
-            matches!(self, SuccessfulUpdate { .. } | SeekNode { .. })
         }
 
         fn requested_location(&self) -> Option<crate::ring::Location> {
