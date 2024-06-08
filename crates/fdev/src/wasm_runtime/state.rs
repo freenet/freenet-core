@@ -17,7 +17,7 @@ impl AppState {
     pub async fn new(config: &ExecutorConfig) -> Result<Self, anyhow::Error> {
         let target: SocketAddr = (config.address, config.port).into();
         let (stream, _) = tokio_tungstenite::connect_async(&format!(
-            "ws://{}/contract/command?encodingProtocol=native",
+            "ws://{}/v1/contract/command?encodingProtocol=native",
             target
         ))
         .await

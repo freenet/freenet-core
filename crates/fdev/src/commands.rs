@@ -164,7 +164,7 @@ async fn execute_command(
     };
 
     let (stream, _) = tokio_tungstenite::connect_async(&format!(
-        "ws://{}/contract/command?encodingProtocol=native",
+        "ws://{}/v1/contract/command?encodingProtocol=native",
         target
     ))
     .await
