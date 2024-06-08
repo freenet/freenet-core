@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::Arc;
 use std::time::Duration;
 
-use freenet_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -67,15 +66,6 @@ pub(crate) trait ContractHandler {
 
     fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve>;
 
-    /// # Arguments
-    /// - updates: channel to send back updates from contracts to whoever is subscribed to the contract.
-    fn handle_request<'a, 's: 'a>(
-        &'s mut self,
-        req: ClientRequest<'a>,
-        client_id: ClientId,
-        updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
-    ) -> impl Future<Output = Result<HostResponse, DynError>> + Send + 'a;
-
     fn executor(&mut self) -> &mut Self::ContractExecutor;
 }
 
@@ -104,19 +94,6 @@ impl ContractHandler for NetworkContractHandler<Runtime> {
         &mut self.channel
     }
 
-    async fn handle_request<'a, 's: 'a>(
-        &'s mut self,
-        req: ClientRequest<'a>,
-        client_id: ClientId,
-        updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
-    ) -> Result<HostResponse, DynError> {
-        let res = self
-            .executor
-            .handle_request(client_id, req, updates)
-            .await?;
-        Ok(res)
-    }
-
     fn executor(&mut self) -> &mut Self::ContractExecutor {
         &mut self.executor
     }
@@ -141,19 +118,6 @@ impl ContractHandler for NetworkContractHandler<super::MockRuntime> {
 
     fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve> {
         &mut self.channel
-    }
-
-    async fn handle_request<'a, 's: 'a>(
-        &'s mut self,
-        req: ClientRequest<'a>,
-        client_id: ClientId,
-        updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
-    ) -> Result<HostResponse, DynError> {
-        let res = self
-            .executor
-            .handle_request(client_id, req, updates)
-            .await?;
-        Ok(res)
     }
 
     fn executor(&mut self) -> &mut Self::ContractExecutor {
@@ -470,10 +434,6 @@ pub mod test {
 }
 
 pub(super) mod in_memory {
-    use crate::client_events::ClientId;
-    use freenet_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
-    use tokio::sync::mpsc::UnboundedSender;
-
     use super::{
         super::{
             executor::{ExecutorHalve, ExecutorToEventLoopChannel},
@@ -520,15 +480,6 @@ pub(super) mod in_memory {
 
         fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve> {
             &mut self.channel
-        }
-
-        async fn handle_request<'a, 's: 'a>(
-            &'s mut self,
-            _req: ClientRequest<'a>,
-            _client_id: ClientId,
-            _updates: Option<UnboundedSender<Result<HostResponse, ClientError>>>,
-        ) -> Result<HostResponse, DynError> {
-            unreachable!()
         }
 
         fn executor(&mut self) -> &mut Self::ContractExecutor {

@@ -9,6 +9,7 @@ use std::{
 };
 
 use directories::ProjectDirs;
+use either::Either;
 use once_cell::sync::Lazy;
 use pkcs1::DecodeRsaPrivateKey;
 use serde::{Deserialize, Serialize};
@@ -101,7 +102,7 @@ impl ConfigArgs {
     fn read_config(dir: &PathBuf) -> std::io::Result<Option<Config>> {
         if dir.exists() {
             let mut read_dir = std::fs::read_dir(dir)?;
-            let config_args = read_dir.find_map(|f| {
+            let config_args: Option<(String, String)> = read_dir.find_map(|f| {
                 if let Ok(f) = f {
                     let filename = f.file_name().to_string_lossy().into_owned();
                     let ext = filename.rsplit('.').next().map(|s| s.to_owned());
@@ -203,8 +204,20 @@ impl ConfigArgs {
             Self::read_config(path)?
         } else {
             // find default application dir to see if there is a config file
-            let dir = ConfigPathsArgs::config_dir(self.id.as_deref())?;
-            Self::read_config(&dir).ok().flatten()
+            let (config, data) = {
+                match ConfigPathsArgs::default_dirs(self.id.as_deref())? {
+                    Either::Left(defaults) => (
+                        defaults.config_local_dir().to_path_buf(),
+                        defaults.data_local_dir().to_path_buf(),
+                    ),
+                    Either::Right(dir) => (dir.clone(), dir),
+                }
+            };
+            self.config_paths.config_dir = Some(config.clone());
+            if self.config_paths.data_dir.is_none() {
+                self.config_paths.data_dir = Some(data);
+            }
+            Self::read_config(&config).ok().flatten()
         };
 
         let should_persist = cfg.is_none();
@@ -232,22 +245,7 @@ impl ConfigArgs {
                 (transport_key_path, transport_key)
             } else {
                 let transport_key = TransportKeypair::new();
-                let transport_key_path =
-                    config_paths.secrets_dir(mode).join("transport_keypair.pem");
-
-                // if the transport key file exists, then read it
-                if transport_key_path.exists() {
-                    Self::read_transport_keypair(transport_key_path)?
-                } else {
-                    let mut file = File::create(&transport_key_path)?;
-                    file.write_all(&transport_key.secret().to_bytes().map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("failed to write transport key: {e}"),
-                        )
-                    })?)?;
-                    (transport_key_path, transport_key)
-                }
+                (PathBuf::new(), transport_key)
             };
 
         let peer_id = self
@@ -257,8 +255,8 @@ impl ConfigArgs {
             .map(|(addr, port)| {
                 PeerId::new((addr, port).into(), transport_keypair.public().clone())
             });
-        let gateways = config_paths.config_dir.join("gateways.toml");
-        let gateways = match File::open(&*gateways) {
+        let gateways_file = config_paths.config_dir.join("gateways.toml");
+        let gateways = match File::open(&*gateways_file) {
             Ok(mut file) => {
                 let mut content = String::new();
                 file.read_to_string(&mut content)?;
@@ -271,8 +269,10 @@ impl ConfigArgs {
             Err(err) => {
                 #[cfg(not(any(test, debug_assertions)))]
                 {
+
                     if peer_id.is_none() && mode == OperationMode::Network {
-                        tracing::error!("Failed to read gateways file: {err}");
+                        tracing::error!(file = ?gateways_file, "Failed to read gateways file: {err}");
+
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
                             "Cannot initialize node without gateways",
@@ -312,9 +312,10 @@ impl ConfigArgs {
             is_gateway: self.network_listener.is_gateway,
         };
 
-        fs::create_dir_all(&this.config_dir())?;
+        fs::create_dir_all(this.config_dir())?;
         if should_persist {
             let mut file = File::create(this.config_dir().join("config.toml"))?;
+            tracing::info!("Persisting configuration to {:?}", file);
             file.write_all(
                 toml::to_string(&this)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
@@ -576,44 +577,34 @@ impl ConfigPathsArgs {
         self.data_dir.get_or_insert(other.data_dir);
     }
 
-    pub fn app_data_dir(id: Option<&str>) -> std::io::Result<PathBuf> {
-        let project_dir = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
-            .ok_or(std::io::ErrorKind::NotFound)?;
+    fn default_dirs(id: Option<&str>) -> std::io::Result<Either<ProjectDirs, PathBuf>> {
         // if id is set, most likely we are running tests or in simulated mode
-        let app_data_dir: PathBuf = if cfg!(any(test, debug_assertions)) || id.is_some() {
-            std::env::temp_dir().join(if let Some(id) = id {
+        let default_dir: Either<_, _> = if cfg!(any(test, debug_assertions)) || id.is_some() {
+            Either::Right(std::env::temp_dir().join(if let Some(id) = id {
                 format!("freenet-{id}")
             } else {
                 "freenet".into()
-            })
+            }))
         } else {
-            project_dir.data_dir().into()
+            Either::Left(
+                ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
+                    .ok_or(std::io::ErrorKind::NotFound)?,
+            )
         };
-        Ok(app_data_dir)
-    }
-
-    pub fn config_dir(id: Option<&str>) -> std::io::Result<PathBuf> {
-        let project_dir = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
-            .ok_or(std::io::ErrorKind::NotFound)?;
-        let config_data_dir: PathBuf = if cfg!(any(test, debug_assertions)) || id.is_some() {
-            std::env::temp_dir()
-                .join(if let Some(id) = id {
-                    format!("freenet-{id}")
-                } else {
-                    "freenet".into()
-                })
-                .join("config")
-        } else {
-            project_dir.config_dir().into()
-        };
-        Ok(config_data_dir)
+        Ok(default_dir)
     }
 
     pub fn build(self, id: Option<&str>) -> std::io::Result<ConfigPaths> {
         let app_data_dir = self
             .data_dir
-            .map(Ok)
-            .unwrap_or_else(|| Self::app_data_dir(id))?;
+            .map(Ok::<_, std::io::Error>)
+            .unwrap_or_else(|| {
+                let default_dirs = Self::default_dirs(id)?;
+                let Either::Left(defaults) = default_dirs else {
+                    unreachable!()
+                };
+                Ok(defaults.data_dir().to_path_buf())
+            })?;
         let contracts_dir = self
             .contracts_dir
             .unwrap_or_else(|| app_data_dir.join("contracts"));
@@ -653,6 +644,17 @@ impl ConfigPathsArgs {
             fs::write(local_file, [])?;
         }
 
+        let config_dir = self
+            .config_dir
+            .map(Ok::<_, std::io::Error>)
+            .unwrap_or_else(|| {
+                let default_dirs = Self::default_dirs(id)?;
+                let Either::Left(defaults) = default_dirs else {
+                    unreachable!()
+                };
+                Ok(defaults.config_dir().to_path_buf())
+            })?;
+
         Ok(ConfigPaths {
             contracts_dir,
             delegates_dir,
@@ -660,10 +662,7 @@ impl ConfigPathsArgs {
             db_dir,
             data_dir: app_data_dir,
             event_log,
-            config_dir: match self.config_dir {
-                Some(dir) => dir,
-                None => Self::config_dir(id)?,
-            },
+            config_dir,
         })
     }
 }

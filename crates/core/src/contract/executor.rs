@@ -77,7 +77,7 @@ impl ExecutorError {
 
         if let RuntimeInnerError::ContractExecError(e) = error {
             if let Some(InnerOpError::Upsert(key)) = &op {
-                return ExecutorError::request(StdContractError::update_exec_error(key.clone(), e));
+                return ExecutorError::request(StdContractError::update_exec_error(*key, e));
             }
         }
 
@@ -169,6 +169,15 @@ pub enum OperationMode {
     Local,
     /// Standard operation mode.
     Network,
+}
+
+impl Display for OperationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OperationMode::Local => write!(f, "local"),
+            OperationMode::Network => write!(f, "network"),
+        }
+    }
 }
 
 pub struct ExecutorToEventLoopChannel<End: sealed::ChannelHalve> {
@@ -418,11 +427,6 @@ pub(crate) trait ContractExecutor: Send + 'static {
         key: ContractKey,
         fetch_contract: bool,
     ) -> impl Future<Output = Result<(WrappedState, Option<ContractContainer>), ExecutorError>> + Send;
-
-    fn store_contract(
-        &mut self,
-        contract: ContractContainer,
-    ) -> impl Future<Output = Result<(), ExecutorError>> + Send;
 
     fn upsert_contract_state(
         &mut self,

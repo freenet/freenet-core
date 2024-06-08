@@ -185,14 +185,14 @@ impl Runtime {
             let contract = self
                 .contract_store
                 .fetch_contract(key, parameters)
-                .ok_or_else(|| RuntimeInnerError::ContractNotFound(key.clone()))?;
+                .ok_or_else(|| RuntimeInnerError::ContractNotFound(*key))?;
             let module = match contract {
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
                     Module::new(&self.wasm_store, contract_v1.code().data())?
                 }
                 _ => unimplemented!(),
             };
-            self.contract_modules.insert(key.clone(), module);
+            self.contract_modules.insert(*key, module);
             self.contract_modules.get(key).unwrap()
         }
         .clone();

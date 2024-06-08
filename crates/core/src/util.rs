@@ -100,6 +100,7 @@ impl ExponentialBackoff {
     }
 }
 
+#[allow(clippy::result_unit_err)]
 pub fn get_free_port() -> Result<u16, ()> {
     let mut port;
     for _ in 0..100 {

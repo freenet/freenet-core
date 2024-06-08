@@ -232,11 +232,7 @@ pub(crate) trait MessageStats {
 
     fn target(&self) -> Option<PeerKeyLocation>;
 
-    fn terminal(&self) -> bool;
-
     fn requested_location(&self) -> Option<Location>;
-
-    fn track_stats(&self) -> bool;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -296,8 +292,6 @@ pub(crate) trait InnerMessage: Into<NetMessage> {
 
     fn target(&self) -> Option<impl Borrow<PeerKeyLocation>>;
 
-    fn terminal(&self) -> bool;
-
     fn requested_location(&self) -> Option<Location>;
 }
 
@@ -348,21 +342,9 @@ impl MessageStats for NetMessage {
         }
     }
 
-    fn terminal(&self) -> bool {
-        match self {
-            NetMessage::V1(msg) => msg.terminal(),
-        }
-    }
-
     fn requested_location(&self) -> Option<Location> {
         match self {
             NetMessage::V1(msg) => msg.requested_location(),
-        }
-    }
-
-    fn track_stats(&self) -> bool {
-        match self {
-            NetMessage::V1(msg) => msg.track_stats(),
         }
     }
 }
@@ -392,18 +374,6 @@ impl MessageStats for NetMessageV1 {
         }
     }
 
-    fn terminal(&self) -> bool {
-        match self {
-            NetMessageV1::Connect(op) => op.terminal(),
-            NetMessageV1::Put(op) => op.terminal(),
-            NetMessageV1::Get(op) => op.terminal(),
-            NetMessageV1::Subscribe(op) => op.terminal(),
-            NetMessageV1::Update(op) => op.terminal(),
-            NetMessageV1::Aborted(_) => true,
-            NetMessageV1::Unsubscribed { .. } => true,
-        }
-    }
-
     fn requested_location(&self) -> Option<Location> {
         match self {
             NetMessageV1::Connect(op) => op.requested_location(),
@@ -414,13 +384,6 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::Aborted(_) => None,
             NetMessageV1::Unsubscribed { .. } => None,
         }
-    }
-
-    fn track_stats(&self) -> bool {
-        !matches!(
-            self,
-            NetMessageV1::Connect(_) | NetMessageV1::Subscribe(_) | NetMessageV1::Aborted(_)
-        )
     }
 }
 

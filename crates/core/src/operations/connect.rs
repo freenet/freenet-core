@@ -684,8 +684,8 @@ impl ConnectState {
 /// # Arguments
 ///
 /// - gateways: Inmutable list of known gateways. Passed when starting up the node.
-/// After the initial connections through the gateways are established all other connections
-/// (to gateways or regular peers) will be treated as regular connections.
+///   After the initial connections through the gateways are established all other connections
+///   (to gateways or regular peers) will be treated as regular connections.
 ///
 /// - is_gateway: Whether this peer is a gateway or not.
 pub(crate) async fn initial_join_procedure<CM>(
@@ -1043,17 +1043,6 @@ mod messages {
                 Connected { target, .. } => Some(target),
                 _ => None,
             }
-        }
-
-        fn terminal(&self) -> bool {
-            use ConnectMsg::*;
-            matches!(
-                self,
-                Response {
-                    msg: ConnectResponse::AcceptedBy { .. },
-                    ..
-                } | Connected { .. }
-            )
         }
 
         fn requested_location(&self) -> Option<Location> {

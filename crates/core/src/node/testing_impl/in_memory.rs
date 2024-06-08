@@ -102,7 +102,7 @@ where
             let key: ContractKey = contract.key();
             self.op_manager
                 .notify_contract_handler(ContractHandlerEvent::PutQuery {
-                    key: key.clone(),
+                    key,
                     state,
                     related_contracts: RelatedContracts::default(),
                     contract: Some(contract),
@@ -114,7 +114,7 @@ where
                 self.op_manager.ring.get_peer_key().unwrap()
             );
             if subscription {
-                self.op_manager.ring.seed_contract(key.clone());
+                self.op_manager.ring.seed_contract(key);
             }
             if let Some(subscribers) = contract_subscribers.get(&key) {
                 // add contract subscribers

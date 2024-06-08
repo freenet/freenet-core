@@ -44,11 +44,8 @@ pub enum SubCommand {
 impl SubCommand {
     pub fn is_child(&self) -> bool {
         if let SubCommand::Test(config) = self {
-            match &config.command {
-                crate::testing::TestMode::Network(config) => {
-                    return matches!(config.mode, crate::testing::network::Process::Peer);
-                }
-                _ => {}
+            if let crate::testing::TestMode::Network(config) = &config.command {
+                return matches!(config.mode, crate::testing::network::Process::Peer);
             }
         }
         false

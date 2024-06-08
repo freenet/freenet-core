@@ -16,6 +16,7 @@ async fn run(config: Config) -> Result<(), DynError> {
 }
 
 async fn run_local(config: Config) -> Result<(), DynError> {
+    tracing::info!("Starting freenet node in local mode");
     let port = config.ws_api.port;
     let ip = config.ws_api.address;
     let executor = Executor::from_config(Arc::new(config), None).await?;
@@ -25,6 +26,7 @@ async fn run_local(config: Config) -> Result<(), DynError> {
 }
 
 async fn run_network(config: Config) -> Result<(), DynError> {
+    tracing::info!("Starting freenet node in network mode");
     run_network_node(config).await
 }
 
@@ -32,7 +34,11 @@ fn main() -> Result<(), DynError> {
     freenet::config::set_logger(None);
     let config = ConfigArgs::parse().build()?;
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+        .worker_threads(
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1),
+        )
         .enable_all()
         .build()
         .unwrap();
