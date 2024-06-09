@@ -280,14 +280,14 @@ impl ConfigArgs {
             mode,
             peer_id,
             network_api: NetworkApiConfig {
-                address: self.ws_api.address.unwrap_or_else(|| match mode {
+                address: self.network_listener.address.unwrap_or_else(|| match mode {
                     OperationMode::Local => default_local_address(),
                     OperationMode::Network => default_address(),
                 }),
                 port: self
-                    .ws_api
-                    .ws_api_port
-                    .unwrap_or(default_http_gateway_port()),
+                    .network_listener
+                    .network_port
+                    .unwrap_or(default_network_port()),
                 public_address: self.network_listener.public_address,
                 public_port: self.network_listener.public_port,
             },

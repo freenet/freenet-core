@@ -145,7 +145,7 @@ impl P2pConnManager {
     ) -> Result<(), anyhow::Error> {
         use ConnMngrActions::*;
 
-        tracing::info!(%self.listening_port, %self.is_gateway, key = %self.key_pair.public(), "Openning network listener");
+        tracing::info!(%self.listening_port, %self.listening_ip, %self.is_gateway, key = %self.key_pair.public(), "Openning network listener");
 
         let (mut outbound_conn_handler, mut inbound_conn_handler) =
             create_connection_handler::<UdpSocket>(

@@ -35,19 +35,19 @@ impl PacketRateLimiter<InstantTimeSrc> {
 
 impl<T: TimeSource> PacketRateLimiter<T> {
     pub(super) async fn rate_limiter<S: Socket>(mut self, bandwidth_limit: usize, socket: Arc<S>) {
+        tracing::info!(bandwidth_limit, "Rate limiter task started");
         while let Some((socket_addr, packet)) = self.outbound_packets.recv().await {
             if let Some(wait_time) = self.can_send_packet(bandwidth_limit, packet.len()) {
                 tokio::time::sleep(wait_time).await;
                 if let Err(error) = socket.send_to(&packet, socket_addr).await {
                     tracing::debug!("Error sending packet: {:?}", error);
-                } else {
-                    self.add_packet(packet.len());
+                    continue;
                 }
             } else if let Err(error) = socket.send_to(&packet, socket_addr).await {
                 tracing::debug!(%socket_addr, "Error sending packet: {:?}", error);
-            } else {
-                self.add_packet(packet.len());
+                continue;
             }
+            self.add_packet(packet.len());
         }
         tracing::debug!("Rate limiter task ended unexpectedly");
     }
@@ -79,7 +79,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
     /// exceeded within the `window_size`. Otherwise returns Some(wait_time) where wait_time is the
     /// amount of time that should be waited before sending the packet.
     ///
-    /// `bandwidth_limit` should be set to 50% higher than the target upstream bandwidth the
+    /// `bandwidth_limit` (in bytes) should be set to 50% higher than the target upstream bandwidth the
     /// [topology manager](crate::topology::TopologyManager) is aiming for, as it serves
     /// as a hard limit which we'd prefer not to hit.
     fn can_send_packet(&mut self, bandwidth_limit: usize, packet_size: usize) -> Option<Duration> {
