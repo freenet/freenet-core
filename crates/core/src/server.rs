@@ -182,13 +182,11 @@ pub mod local_node {
 pub mod network_node {
     use tower_http::trace::TraceLayer;
 
-    use crate::{
-        client_events::websocket::WebSocketProxy, config::Config, dev_tool::NodeConfig, DynError,
-    };
+    use crate::{client_events::websocket::WebSocketProxy, config::Config, dev_tool::NodeConfig};
 
     use super::{http_gateway::HttpGateway, serve};
 
-    pub async fn run_network_node(config: Config) -> Result<(), DynError> {
+    pub async fn run_network_node(config: Config) -> Result<(), anyhow::Error> {
         let ws_socket = (config.ws_api.address, config.ws_api.port).into();
         let (gw, gw_router) = HttpGateway::as_router(&ws_socket);
         let (ws_proxy, ws_router) = WebSocketProxy::as_router(gw_router);

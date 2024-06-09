@@ -102,11 +102,11 @@ impl ConfigArgs {
                 }
                 let filename = e.file_name().to_string_lossy().into_owned();
                 let ext = filename.rsplit('.').next().map(|s| s.to_owned());
-                tracing::info!("Found configuration file: {filename}, {ext:?}");
                 if let Some(ext) = ext {
                     if filename.starts_with("config") {
                         match ext.as_str() {
                             "toml" => {
+                                tracing::info!("Found configuration file: {filename}.{ext}");
                                 return Some((filename, ext));
                             }
                             "json" => {
@@ -202,12 +202,13 @@ impl ConfigArgs {
             if self.config_paths.data_dir.is_none() {
                 self.config_paths.data_dir = Some(data);
             }
-            Self::read_config(&config)?
+            Self::read_config(&config)?.map(|cfg| {
+                tracing::info!("Found configuration file in default directory");
+                cfg
+            })
         };
 
-        if cfg.is_some() {
-            tracing::debug!("Found configuration file in default directory");
-        }
+        if cfg.is_some() {}
 
         let should_persist = cfg.is_none();
 

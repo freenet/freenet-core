@@ -44,7 +44,6 @@ use crate::{
     ring::{Location, PeerKeyLocation},
     router::{RouteEvent, RouteOutcome},
     tracing::{EventRegister, NetEventLog, NetEventRegister},
-    DynError,
 };
 use crate::{
     config::Config,
@@ -66,7 +65,7 @@ pub(crate) mod testing_impl;
 pub struct Node(NodeP2P);
 
 impl Node {
-    pub async fn run(self) -> Result<(), DynError> {
+    pub async fn run(self) -> Result<(), anyhow::Error> {
         self.0.run_node().await?;
         Ok(())
     }

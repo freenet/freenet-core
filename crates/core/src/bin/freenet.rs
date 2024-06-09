@@ -6,31 +6,33 @@ use freenet::{
 };
 use std::{net::SocketAddr, sync::Arc};
 
-type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
-
-async fn run(config: Config) -> Result<(), DynError> {
+async fn run(config: Config) -> Result<(), anyhow::Error> {
     match config.mode {
         OperationMode::Local => run_local(config).await,
         OperationMode::Network => run_network(config).await,
     }
 }
 
-async fn run_local(config: Config) -> Result<(), DynError> {
+async fn run_local(config: Config) -> Result<(), anyhow::Error> {
     tracing::info!("Starting freenet node in local mode");
     let port = config.ws_api.port;
     let ip = config.ws_api.address;
-    let executor = Executor::from_config(Arc::new(config), None).await?;
+    let executor = Executor::from_config(Arc::new(config), None)
+        .await
+        .map_err(anyhow::Error::msg)?;
 
     let socket: SocketAddr = (ip, port).into();
-    run_local_node(executor, socket).await
+    run_local_node(executor, socket)
+        .await
+        .map_err(anyhow::Error::msg)
 }
 
-async fn run_network(config: Config) -> Result<(), DynError> {
+async fn run_network(config: Config) -> Result<(), anyhow::Error> {
     tracing::info!("Starting freenet node in network mode");
     run_network_node(config).await
 }
 
-fn main() -> Result<(), DynError> {
+fn main() -> Result<(), anyhow::Error> {
     freenet::config::set_logger(None);
     let config = ConfigArgs::parse().build()?;
     let rt = tokio::runtime::Builder::new_multi_thread()
