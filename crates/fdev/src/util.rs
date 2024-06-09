@@ -21,11 +21,6 @@ where
             let deser = serde_json::from_slice(data.as_ref())?;
             Ok(deser)
         }
-        #[cfg(feature = "messagepack")]
-        Some(DeserializationFmt::MessagePack) => {
-            let deser = rmp_serde::decode::from_read(data.as_ref())?;
-            Ok(deser)
-        }
         _ => Ok(bincode::deserialize(data.as_ref())?),
     }
 }

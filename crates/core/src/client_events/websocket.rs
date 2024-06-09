@@ -82,7 +82,7 @@ impl WebSocketProxy {
                         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                         if let Some(ch) = self.response_channels.get(&client_id) {
                             ch.send(HostCallbackResult::SubscriptionChannel {
-                                key: key.clone(),
+                                key: *key,
                                 id: client_id,
                                 callback: rx,
                             })

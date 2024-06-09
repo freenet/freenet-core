@@ -82,14 +82,14 @@ where
                 .get(key)
                 .await
                 .map_err(Into::into)?
-                .ok_or_else(|| StateStoreError::MissingContract(key.clone()))?;
+                .ok_or_else(|| StateStoreError::MissingContract(*key))?;
         }
         self.store
-            .store(key.clone(), state.clone())
+            .store(*key, state.clone())
             .await
             .map_err(Into::into)?;
         let cost = state.size() as i64;
-        self.state_mem_cache.insert(key.clone(), state, cost).await;
+        self.state_mem_cache.insert(*key, state, cost).await;
         Ok(())
     }
 
@@ -100,11 +100,11 @@ where
         params: Parameters<'static>,
     ) -> Result<(), StateStoreError> {
         self.store
-            .store(key.clone(), state.clone())
+            .store(key, state.clone())
             .await
             .map_err(Into::into)?;
         let cost = state.size() as i64;
-        self.state_mem_cache.insert(key.clone(), state, cost).await;
+        self.state_mem_cache.insert(key, state, cost).await;
         self.store
             .store_params(key, params.clone())
             .await
@@ -119,7 +119,7 @@ where
             return Ok(v.value().clone());
         }
         let r = self.store.get(key).await.map_err(Into::into)?;
-        r.ok_or_else(|| StateStoreError::MissingContract(key.clone()))
+        r.ok_or_else(|| StateStoreError::MissingContract(*key))
     }
 
     pub async fn get_params<'a>(

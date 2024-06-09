@@ -114,7 +114,7 @@ impl ContractStore {
     pub fn store_contract(&mut self, contract: ContractContainer) -> RuntimeResult<()> {
         let (key, code) = match contract.clone() {
             ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
-                (contract_v1.key().clone(), contract_v1.code().clone())
+                (*contract_v1.key(), contract_v1.code().clone())
             }
             _ => unimplemented!(),
         };

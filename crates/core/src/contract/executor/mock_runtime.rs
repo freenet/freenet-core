@@ -75,14 +75,6 @@ impl ContractExecutor for Executor<MockRuntime> {
         Ok((state, contract))
     }
 
-    async fn store_contract(&mut self, contract: ContractContainer) -> Result<(), ExecutorError> {
-        self.runtime
-            .contract_store
-            .store_contract(contract)
-            .map_err(ExecutorError::other)?;
-        Ok(())
-    }
-
     async fn upsert_contract_state(
         &mut self,
         key: ContractKey,
