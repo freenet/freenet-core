@@ -275,9 +275,9 @@ mod tests {
         };
 
         let secret_args = SecretArgs {
-            transport_keypair: Some(transport_keypair_path.clone()),
-            nonce: Some(nonce_path.clone()),
-            cipher: Some(cipher_path.clone()),
+            transport_keypair: None,
+            nonce: None,
+            cipher: None,
         };
 
         let loaded_secrets = secret_args.build(&secrets_dir).unwrap();
