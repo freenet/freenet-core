@@ -176,6 +176,7 @@ pub mod local_node {
 }
 
 pub mod network_node {
+    use anyhow::Context;
     use tower_http::trace::TraceLayer;
 
     use crate::{client_events::websocket::WebSocketProxy, config::Config, dev_tool::NodeConfig};
@@ -188,11 +189,18 @@ pub mod network_node {
         let (ws_proxy, ws_router) = WebSocketProxy::as_router(gw_router);
         serve(ws_socket, ws_router.layer(TraceLayer::new_for_http()));
 
-        let node_config = NodeConfig::new(config).await?;
+        tracing::info!("Initializing node configuration");
+
+        let node_config = NodeConfig::new(config)
+            .await
+            .with_context(|| "failed while loading node config")?;
         let is_gateway = node_config.is_gateway;
         let node = node_config
             .build([Box::new(gw), Box::new(ws_proxy)])
-            .await?;
+            .await
+            .with_context(|| "failed while building the node")?;
+
+        tracing::info!("Starting node");
 
         match node.run().await {
             Ok(_) => {
