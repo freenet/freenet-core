@@ -10,10 +10,6 @@ use super::*;
 const NONCE_SIZE: usize = 24;
 const CIPHER_SIZE: usize = 32;
 
-const NONCE_FILENAME: &str = "nonce";
-const CIPHER_FILENAME: &str = "cipher";
-const TRANSPORT_KEYPAIR_FILENAME: &str = "keypair";
-
 impl ConfigArgs {
     pub(super) fn read_secrets(
         path_to_key: PathBuf,
@@ -51,8 +47,7 @@ pub struct SecretArgs {
 }
 
 impl SecretArgs {
-    pub(super) fn build(self, secrets_dir: impl AsRef<Path>) -> std::io::Result<Secrets> {
-        let secrets_dir = secrets_dir.as_ref();
+    pub(super) fn build(self) -> std::io::Result<Secrets> {
         let transport_key = self
             .transport_keypair
             .as_ref()
@@ -62,28 +57,14 @@ impl SecretArgs {
         {
             (self.transport_keypair.unwrap(), transport_key)
         } else {
-            // try secret dir
-            let path = secrets_dir.join(TRANSPORT_KEYPAIR_FILENAME);
-            if path.exists() {
-                let kp = read_transport_keypair(&path)?;
-                (path, kp)
-            } else {
-                let transport_key = TransportKeypair::new();
-                (PathBuf::new(), transport_key)
-            }
+            let transport_key = TransportKeypair::new();
+            (PathBuf::new(), transport_key)
         };
         let nonce = self.nonce.as_ref().map(read_nonce).transpose()?;
         let (nonce_path, nonce) = if let Some(nonce) = nonce {
             (self.nonce.unwrap(), nonce)
         } else {
-            // try secret dir
-            let path = secrets_dir.join(NONCE_FILENAME);
-            if path.exists() {
-                let nonce = read_nonce(&path)?;
-                (path, nonce)
-            } else {
-                (PathBuf::new(), DelegateRequest::DEFAULT_NONCE)
-            }
+            (PathBuf::new(), DelegateRequest::DEFAULT_NONCE)
         };
 
         let cipher = self.cipher.as_ref().map(read_cipher).transpose()?;
@@ -91,14 +72,7 @@ impl SecretArgs {
         let (cipher_path, cipher) = if let Some(cipher) = cipher {
             (self.cipher.unwrap(), cipher)
         } else {
-            // try secret dir
-            let path = secrets_dir.join(CIPHER_FILENAME);
-            if path.exists() {
-                let cipher = read_cipher(&path)?;
-                (path, cipher)
-            } else {
-                (PathBuf::new(), DelegateRequest::DEFAULT_CIPHER)
-            }
+            (PathBuf::new(), DelegateRequest::DEFAULT_CIPHER)
         };
 
         Ok(Secrets {
@@ -240,56 +214,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_load_from_secret_dir() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let secrets_dir = temp_dir.path().join("secrets");
-        std::fs::create_dir_all(&secrets_dir).unwrap();
-
-        let transport_keypair = TransportKeypair::new();
-        let nonce = [0u8; NONCE_SIZE];
-        let cipher = [0u8; CIPHER_SIZE];
-
-        let transport_keypair_path = secrets_dir.join(TRANSPORT_KEYPAIR_FILENAME);
-        let nonce_path = secrets_dir.join(NONCE_FILENAME);
-        let cipher_path = secrets_dir.join(CIPHER_FILENAME);
-
-        // write secrets to files
-        let mut transport_keypair_file = File::create(&transport_keypair_path).unwrap();
-        transport_keypair_file
-            .write_all(transport_keypair.secret().to_bytes().unwrap().as_slice())
-            .unwrap();
-
-        let mut nonce_file = File::create(&nonce_path).unwrap();
-        nonce_file.write_all(&nonce).unwrap();
-
-        let mut cipher_file = File::create(&cipher_path).unwrap();
-        cipher_file.write_all(&cipher).unwrap();
-
-        let secrets = Secrets {
-            transport_keypair,
-            transport_keypair_path: transport_keypair_path.clone(),
-            nonce,
-            nonce_path: nonce_path.clone(),
-            cipher,
-            cipher_path: cipher_path.clone(),
-        };
-
-        let secret_args = SecretArgs {
-            transport_keypair: None,
-            nonce: None,
-            cipher: None,
-        };
-
-        let loaded_secrets = secret_args.build(&secrets_dir).unwrap();
-        assert_eq!(secrets, loaded_secrets);
-    }
-
-    #[test]
     fn test_load_from_different_files() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let secrets_dir = temp_dir.path().join("secrets");
-        std::fs::create_dir_all(&secrets_dir).unwrap();
-
         let transport_keypair = TransportKeypair::new();
         let nonce = [0u8; NONCE_SIZE];
         let cipher = [0u8; CIPHER_SIZE];
@@ -320,16 +245,14 @@ mod tests {
             cipher: Some(cipher_file.path().to_path_buf()),
         };
 
-        let loaded_secrets = secret_args.build(&secrets_dir).unwrap();
+        let loaded_secrets = secret_args.build().unwrap();
         assert_eq!(secrets, loaded_secrets);
     }
 
     #[test]
     fn test_load_default() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let secrets_dir = temp_dir.path().join("secrets");
         let secret_args = SecretArgs::default();
-        let loaded_secrets = secret_args.build(&secrets_dir).unwrap();
+        let loaded_secrets = secret_args.build().unwrap();
         assert_eq!(DelegateRequest::DEFAULT_CIPHER, loaded_secrets.cipher);
         assert_eq!(DelegateRequest::DEFAULT_NONCE, loaded_secrets.nonce);
     }

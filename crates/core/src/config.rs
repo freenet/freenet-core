@@ -218,7 +218,7 @@ impl ConfigArgs {
         let mode = self.mode.unwrap_or(OperationMode::Network);
         let config_paths = self.config_paths.build(self.id.as_deref())?;
 
-        let secrets = self.secrets.build(&config_paths.secrets_dir)?;
+        let secrets = self.secrets.build()?;
 
         let peer_id = self
             .network_listener
