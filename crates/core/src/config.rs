@@ -288,7 +288,6 @@ impl ConfigArgs {
         if should_persist {
             let mut file = File::create(this.config_dir().join("config.toml"))?;
             tracing::info!("Persisting configuration to {:?}", file);
-            this.secrets.persist()?;
             file.write_all(
                 toml::to_string(&this)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?

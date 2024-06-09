@@ -69,7 +69,7 @@ impl SecretArgs {
                 (path, kp)
             } else {
                 let transport_key = TransportKeypair::new();
-                (path, transport_key)
+                (PathBuf::new(), transport_key)
             }
         };
         let nonce = self.nonce.as_ref().map(read_nonce).transpose()?;
@@ -82,7 +82,7 @@ impl SecretArgs {
                 let nonce = read_nonce(&path)?;
                 (path, nonce)
             } else {
-                (path, DelegateRequest::DEFAULT_NONCE)
+                (PathBuf::new(), DelegateRequest::DEFAULT_NONCE)
             }
         };
 
@@ -97,7 +97,7 @@ impl SecretArgs {
                 let cipher = read_cipher(&path)?;
                 (path, cipher)
             } else {
-                (path, DelegateRequest::DEFAULT_CIPHER)
+                (PathBuf::new(), DelegateRequest::DEFAULT_CIPHER)
             }
         };
 
@@ -119,7 +119,7 @@ impl SecretArgs {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Secrets {
     #[serde(skip)]
     pub transport_keypair: TransportKeypair,
@@ -168,29 +168,6 @@ impl Secrets {
     #[inline]
     pub fn transport_keypair(&self) -> &TransportKeypair {
         &self.transport_keypair
-    }
-
-    pub(super) fn persist(&self) -> std::io::Result<()> {
-        let pk = self.transport_keypair.secret();
-        let mut key_file = File::create(&self.transport_keypair_path)?;
-        key_file.write_all(
-            pk.to_bytes()
-                .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("Failed to write keypair file: {e}"),
-                    )
-                })?
-                .as_slice(),
-        )?;
-
-        let mut nonce_file = File::create(&self.nonce_path)?;
-        nonce_file.write_all(&self.nonce)?;
-
-        let mut cipher_file = File::create(&self.cipher_path)?;
-        cipher_file.write_all(&self.cipher)?;
-
-        Ok(())
     }
 }
 
@@ -256,4 +233,54 @@ fn read_transport_keypair(path_to_key: impl AsRef<Path>) -> std::io::Result<Tran
     })?;
 
     Ok::<_, std::io::Error>(TransportKeypair::from_private_key(pk))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets_dir).unwrap();
+
+        let transport_keypair = TransportKeypair::new();
+        let nonce = DelegateRequest::DEFAULT_NONCE;
+        let cipher = DelegateRequest::DEFAULT_CIPHER;
+
+        let transport_keypair_path = secrets_dir.join(TRANSPORT_KEYPAIR_FILENAME);
+        let nonce_path = secrets_dir.join(NONCE_FILENAME);
+        let cipher_path = secrets_dir.join(CIPHER_FILENAME);
+
+        // write secrets to files
+        let mut transport_keypair_file = File::create(&transport_keypair_path).unwrap();
+        transport_keypair_file
+            .write_all(transport_keypair.secret().to_bytes().unwrap().as_slice())
+            .unwrap();
+
+        let mut nonce_file = File::create(&nonce_path).unwrap();
+        nonce_file.write_all(&nonce).unwrap();
+
+        let mut cipher_file = File::create(&cipher_path).unwrap();
+        cipher_file.write_all(&cipher).unwrap();
+
+        let secrets = Secrets {
+            transport_keypair,
+            transport_keypair_path: transport_keypair_path.clone(),
+            nonce,
+            nonce_path: nonce_path.clone(),
+            cipher,
+            cipher_path: cipher_path.clone(),
+        };
+
+        let secret_args = SecretArgs {
+            transport_keypair: Some(transport_keypair_path.clone()),
+            nonce: Some(nonce_path.clone()),
+            cipher: Some(cipher_path.clone()),
+        };
+
+        let loaded_secrets = secret_args.build(&secrets_dir).unwrap();
+        assert_eq!(secrets, loaded_secrets);
+    }
 }

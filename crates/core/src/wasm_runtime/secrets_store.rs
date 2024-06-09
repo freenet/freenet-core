@@ -97,19 +97,6 @@ impl StoreFsManagement for SecretsStore {
     }
 }
 
-// static DEFAULT_CIPHER: Lazy<XChaCha20Poly1305> = Lazy::new(|| {
-//     let arr = GenericArray::from_slice(&DelegateRequest::DEFAULT_CIPHER);
-//     XChaCha20Poly1305::new(arr)
-// });
-
-// static DEFAULT_NONCE: Lazy<XNonce> =
-//     Lazy::new(|| GenericArray::from_slice(&DelegateRequest::DEFAULT_NONCE).to_owned());
-
-// static DEFAULT_ENCRYPTION: Lazy<Encryption> = Lazy::new(|| Encryption {
-//     cipher: (*DEFAULT_CIPHER).clone(),
-//     nonce: *DEFAULT_NONCE,
-// });
-
 impl SecretsStore {
     pub fn new(secrets_dir: PathBuf, secrets: Secrets) -> RuntimeResult<Self> {
         let mut key_to_secret_part = Arc::new(DashMap::new());
