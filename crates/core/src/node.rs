@@ -134,7 +134,7 @@ impl NodeConfig {
         Ok(NodeConfig {
             should_connect: true,
             is_gateway: config.is_gateway,
-            key_pair: config.transport_keypair.clone(),
+            key_pair: config.transport_keypair().clone(),
             gateways,
             peer_id: config.peer_id.clone(),
             network_listener_ip: config.network_api.address,
