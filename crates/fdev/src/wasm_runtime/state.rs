@@ -7,6 +7,8 @@ use crate::wasm_runtime::DeserializationFmt;
 
 use super::ExecutorConfig;
 
+mod v1;
+
 #[derive(Clone)]
 pub(super) struct AppState {
     pub(crate) local_node: Arc<RwLock<WebApi>>,
@@ -15,21 +17,7 @@ pub(super) struct AppState {
 
 impl AppState {
     pub async fn new(config: &ExecutorConfig) -> Result<Self, anyhow::Error> {
-        let target: SocketAddr = (config.address, config.port).into();
-        let (stream, _) = tokio_tungstenite::connect_async(&format!(
-            "ws://{}/v1/contract/command?encodingProtocol=native",
-            target
-        ))
-        .await
-        .map_err(|e| {
-            tracing::error!(err=%e);
-            anyhow::anyhow!(format!("fail to connect to the host({target}): {e}"))
-        })?;
-
-        Ok(AppState {
-            local_node: Arc::new(RwLock::new(WebApi::start(stream))),
-            config: config.clone(),
-        })
+        AppState::new_v1(config).await
     }
 
     pub fn printout_deser<R: AsRef<[u8]> + ?Sized>(&self, data: &R) -> Result<(), std::io::Error> {
