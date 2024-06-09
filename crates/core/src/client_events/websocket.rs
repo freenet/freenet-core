@@ -32,6 +32,8 @@ use crate::{
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
 
+mod v1;
+
 #[derive(Clone)]
 struct WebSocketRequest(mpsc::Sender<ClientConnection>);
 
@@ -52,19 +54,7 @@ const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optima
 
 impl WebSocketProxy {
     pub fn as_router(server_routing: Router) -> (Self, Router) {
-        let (proxy_request_sender, proxy_server_request) = mpsc::channel(PARALLELISM);
-
-        let router = server_routing
-            .route("/contract/command", get(websocket_commands))
-            .layer(Extension(WebSocketRequest(proxy_request_sender)))
-            .layer(axum::middleware::from_fn(connection_info));
-        (
-            WebSocketProxy {
-                proxy_server_request,
-                response_channels: HashMap::new(),
-            },
-            router,
-        )
+        WebSocketProxy::as_router_v1(server_routing)
     }
 
     async fn internal_proxy_recv(
