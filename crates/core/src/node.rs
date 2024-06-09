@@ -18,6 +18,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context;
 use either::Either;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ErrorKind},
@@ -120,7 +121,9 @@ impl NodeConfig {
                 public_key_path,
             } = gw;
 
-            let mut key_file = File::open(public_key_path)?;
+            let mut key_file = File::open(public_key_path).with_context(|| {
+                format!("failed loading gateway pubkey from {public_key_path:?}")
+            })?;
             let mut buf = String::new();
             key_file.read_to_string(&mut buf)?;
 

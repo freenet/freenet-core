@@ -8,10 +8,11 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context;
 use directories::ProjectDirs;
 use either::Either;
 use once_cell::sync::Lazy;
-use pkcs1::DecodeRsaPrivateKey;
+use rsa::pkcs8::DecodePrivateKey;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
@@ -52,6 +53,7 @@ pub struct ConfigArgs {
     #[clap(flatten)]
     pub network_listener: NetworkArgs,
 
+    /// Path to the RSA private key for the transport layer.
     #[clap(long, value_parser, default_value=None, env = "TRANSPORT_KEYPAIR")]
     pub transport_keypair: Option<PathBuf>,
 
@@ -166,7 +168,7 @@ impl ConfigArgs {
             )
         })?;
 
-        let pk = rsa::RsaPrivateKey::from_pkcs1_pem(&buf).map_err(|e| {
+        let pk = rsa::RsaPrivateKey::from_pkcs8_pem(&buf).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Failed to read key file {}: {e}", path_to_key.display()),
@@ -177,13 +179,13 @@ impl ConfigArgs {
     }
 
     /// Parse the command line arguments and return the configuration.
-    pub fn build(mut self) -> std::io::Result<Config> {
+    pub fn build(mut self) -> anyhow::Result<Config> {
         let cfg = if let Some(path) = self.config_paths.config_dir.as_ref() {
             if !path.exists() {
-                return Err(std::io::Error::new(
+                return Err(anyhow::Error::new(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "Configuration directory not found",
-                ));
+                )));
             }
 
             Self::read_config(path)?
@@ -208,8 +210,6 @@ impl ConfigArgs {
             })
         };
 
-        if cfg.is_some() {}
-
         let should_persist = cfg.is_none();
 
         // merge the configuration from the file with the command line arguments
@@ -230,7 +230,8 @@ impl ConfigArgs {
         let transport_key = self
             .transport_keypair
             .map(Self::read_transport_keypair)
-            .transpose()?;
+            .transpose()
+            .with_context(|| "failed while reading transport key file")?;
         let (transport_keypair_path, transport_keypair) =
             if let Some((transport_key_path, transport_key)) = transport_key {
                 (Some(transport_key_path), transport_key)
@@ -263,10 +264,10 @@ impl ConfigArgs {
                     if peer_id.is_none() && mode == OperationMode::Network {
                         tracing::error!(file = ?gateways_file, "Failed to read gateways file: {err}");
 
-                        return Err(std::io::Error::new(
+                        return Err(anyhow::Error::new(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
                             "Cannot initialize node without gateways",
-                        ));
+                        )));
                     }
                 }
                 let _ = err;
