@@ -46,7 +46,7 @@ pub(crate) enum HostCallbackResult {
 
 fn serve(socket: SocketAddr, router: axum::Router) {
     tokio::spawn(async move {
-        tracing::info!("listening on {}", socket);
+        tracing::info!("HTTP gateway listening on {}", socket);
         let listener = tokio::net::TcpListener::bind(socket).await.unwrap();
         axum::serve(listener, router).await.map_err(|e| {
             tracing::error!("Error while running HTTP gateway server: {e}");

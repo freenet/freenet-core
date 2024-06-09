@@ -131,10 +131,18 @@ impl NodeConfig {
             let peer_id = PeerId::new(address, TransportPublicKey::from(pub_key));
             gateways.push(InitPeerNode::new(peer_id, Location::from_address(&address)));
         }
+        tracing::info!(
+            "Node will be listening at {}:{} internal address",
+            config.network_api.address,
+            config.network_api.port
+        );
+        if let Some(peer_id) = &config.peer_id {
+            tracing::info!("Node external address: {}", peer_id.addr());
+        }
         Ok(NodeConfig {
             should_connect: true,
             is_gateway: config.is_gateway,
-            key_pair: config.transport_keypair.clone(),
+            key_pair: config.transport_keypair().clone(),
             gateways,
             peer_id: config.peer_id.clone(),
             network_listener_ip: config.network_api.address,
@@ -156,8 +164,11 @@ impl NodeConfig {
                 match hostname.rsplit_once(':') {
                     None => {
                         // no port found, use default
-                        let hostname_with_port =
-                            format!("{}:{}", hostname, crate::config::default_gateway_port());
+                        let hostname_with_port = format!(
+                            "{}:{}",
+                            hostname,
+                            crate::config::default_http_gateway_port()
+                        );
 
                         if let Ok(mut addrs) = hostname_with_port.to_socket_addrs() {
                             if let Some(addr) = addrs.next() {
@@ -204,7 +215,7 @@ impl NodeConfig {
         match ips.into_iter().next() {
             Some(ip) => Ok(SocketAddr::new(
                 ip,
-                port.unwrap_or_else(crate::config::default_gateway_port),
+                port.unwrap_or_else(crate::config::default_http_gateway_port),
             )),
             None => Err(anyhow::anyhow!("Fail to resolve IP address of {hostname}")),
         }
@@ -1013,13 +1024,16 @@ mod tests {
             socket_addr,
             SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
-                crate::config::default_gateway_port()
+                crate::config::default_http_gateway_port()
             )
         );
 
         let addr = Address::Hostname("google.com".to_string());
         let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
-        assert_eq!(socket_addr.port(), crate::config::default_gateway_port());
+        assert_eq!(
+            socket_addr.port(),
+            crate::config::default_http_gateway_port()
+        );
 
         let addr = Address::Hostname("google.com:8080".to_string());
         let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
