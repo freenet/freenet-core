@@ -36,7 +36,7 @@ use crate::{
     aft::AftRecords,
     api::{node_response_error_handling, TryNodeAction, WebApiRequestClient},
     app::Identity,
-    DynError,
+    anyhow::Error,
 };
 
 type InboxContract = ContractKey;
@@ -77,7 +77,7 @@ impl InternalSettings {
         stored_settings: StoredSettings,
         next_id: u64,
         private_key: RsaPrivateKey,
-    ) -> Result<Self, DynError> {
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             next_msg_id: next_id,
             private_key,
@@ -85,7 +85,7 @@ impl InternalSettings {
         })
     }
 
-    fn to_stored(&self) -> Result<StoredSettings, DynError> {
+    fn to_stored(&self) -> anyhow::Result<StoredSettings> {
         Ok(StoredSettings {
             minimum_tier: self.minimum_tier,
             private: vec![],
@@ -101,14 +101,14 @@ pub(crate) struct MessageModel {
 }
 
 impl MessageModel {
-    fn to_stored(&self, key: &RsaPrivateKey) -> Result<StoredMessage, DynError> {
+    fn to_stored(&self, key: &RsaPrivateKey) -> anyhow::Result<StoredMessage> {
         let mut rng = OsRng;
         let decrypted_content = serde_json::to_vec(&self.content)?;
         let content = key
             .to_public_key()
             .encrypt(&mut rng, Pkcs1v15Encrypt, decrypted_content.as_ref())
             .map_err(|e| format!("{e}"))?;
-        Ok::<_, DynError>(StoredMessage {
+        Ok::<_, anyhow::Error>(StoredMessage {
             content,
             token_assignment: self.token_assignment.clone(),
         })
@@ -118,7 +118,7 @@ impl MessageModel {
         client: &mut WebApiRequestClient,
         assignment: TokenAssignment,
         inbox_contract: InboxContract,
-    ) -> Result<(), DynError> {
+    ) -> anyhow::Result<()> {
         let pending_update = PENDING_INBOXES_UPDATE.with(|map| {
             let map = &mut *map.borrow_mut();
             let update = map.get_mut(&inbox_contract).and_then(|messages| {
@@ -168,7 +168,7 @@ impl DecryptedMessage {
         client: &mut WebApiRequestClient,
         recipient_key: RsaPublicKey,
         from: &Identity,
-    ) -> Result<(), DynError> {
+    ) -> anyhow::Result<()> {
         let (hash, _) = self.assignment_hash_and_signed_content()?;
         crate::log::debug!(
             "requesting token for assignment hash: {}",
@@ -191,9 +191,9 @@ impl DecryptedMessage {
         Ok(())
     }
 
-    fn to_stored(&self, token_assignment: TokenAssignment) -> Result<StoredMessage, DynError> {
+    fn to_stored(&self, token_assignment: TokenAssignment) -> anyhow::Result<StoredMessage> {
         let (_, content) = self.assignment_hash_and_signed_content()?;
-        Ok::<_, DynError>(StoredMessage {
+        Ok::<_, anyhow::Error>(StoredMessage {
             content,
             token_assignment,
         })
@@ -223,7 +223,7 @@ impl DecryptedMessage {
         content
     }
 
-    fn assignment_hash_and_signed_content(&self) -> Result<([u8; 32], Vec<u8>), DynError> {
+    fn assignment_hash_and_signed_content(&self) -> anyhow::Result<([u8; 32], Vec<u8>)> {
         let mut rng = OsRng;
         let decrypted_content: Vec<u8> = serde_json::to_vec(self)?;
 
@@ -281,7 +281,7 @@ impl InboxModel {
             client: &mut WebApiRequestClient,
             contract_key: &ContractKey,
             identity: &Identity,
-        ) -> Result<(), DynError> {
+        ) -> anyhow::Result<()> {
             let alias = identity.alias();
             INBOX_TO_ID.with(|map| {
                 map.borrow_mut()
@@ -294,7 +294,7 @@ impl InboxModel {
             Ok(())
         }
 
-        fn get_key(identity: &Identity) -> Result<ContractKey, DynError> {
+        fn get_key(identity: &Identity) -> anyhow::Result<ContractKey> {
             let pub_key = identity.key.to_public_key();
             let params = freenet_email_inbox::InboxParams { pub_key }
                 .try_into()
@@ -336,7 +336,7 @@ impl InboxModel {
     pub async fn load(
         client: &mut WebApiRequestClient,
         id: &Identity,
-    ) -> Result<ContractKey, DynError> {
+    ) -> anyhow::Result<ContractKey> {
         let params = InboxParams {
             pub_key: id.key.to_public_key(),
         }
@@ -372,7 +372,7 @@ impl InboxModel {
         &mut self,
         mut client: WebApiRequestClient,
         ids: &[u64],
-    ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
+    ) -> anyhow::Result<LocalBoxFuture<'static, ()>> {
         let mut signed: Vec<u8> = Vec::with_capacity(ids.len() * 32);
         let mut to_rm_message_id = Vec::with_capacity(ids.len() * 32);
         for m in &self.messages {
@@ -425,7 +425,7 @@ impl InboxModel {
     }
 
     // TODO: only used when an inbox is created first time when putting the contract
-    fn to_state(&self) -> Result<State<'static>, DynError> {
+    fn to_state(&self) -> anyhow::Result<State<'static>> {
         let settings = self.settings.to_stored()?;
         let messages = self
             .messages
@@ -441,7 +441,7 @@ impl InboxModel {
         private_key: rsa::RsaPrivateKey,
         state: StoredInbox,
         key: ContractKey,
-    ) -> Result<Self, DynError> {
+    ) -> anyhow::Result<Self> {
         let messages = state
             .messages
             .iter()
@@ -454,7 +454,7 @@ impl InboxModel {
                     token_assignment: msg.token_assignment.clone(),
                 })
             })
-            .collect::<Result<Vec<_>, DynError>>()?;
+            .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(Self {
             settings: InternalSettings::from_stored(
                 state.settings,
@@ -497,7 +497,7 @@ impl InboxModel {
     async fn update_settings_at_store(
         &mut self,
         client: &mut WebApiRequestClient,
-    ) -> Result<(), DynError> {
+    ) -> anyhow::Result<()> {
         let settings = self.settings.to_stored()?;
         let serialized = serde_json::to_vec(&settings)?;
         let signing_key = SigningKey::<Sha256>::new(self.settings.private_key.clone());
@@ -514,7 +514,7 @@ impl InboxModel {
         Ok(())
     }
 
-    async fn get_state(client: &mut WebApiRequestClient, key: ContractKey) -> Result<(), DynError> {
+    async fn get_state(client: &mut WebApiRequestClient, key: ContractKey) -> anyhow::Result<()> {
         let request = ContractRequest::Get {
             key,
             fetch_contract: false,
@@ -526,7 +526,7 @@ impl InboxModel {
     pub async fn subscribe(
         client: &mut WebApiRequestClient,
         key: ContractKey,
-    ) -> Result<(), DynError> {
+    ) -> anyhow::Result<()> {
         // todo: send the proper summary from the current state
         let summary: StateSummary = serde_json::to_vec(&InboxSummary::new(HashSet::new()))?.into();
         let request = ContractRequest::Subscribe {
@@ -545,7 +545,7 @@ mod tests {
     use super::*;
 
     impl InboxModel {
-        fn new(private_key: RsaPrivateKey) -> Result<Self, DynError> {
+        fn new(private_key: RsaPrivateKey) -> anyhow::Result<Self> {
             let params = InboxParams {
                 pub_key: private_key.to_public_key(),
             };

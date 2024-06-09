@@ -16,14 +16,14 @@ Options:
  -c --code      Compiles the contract and saves the code hash
 "#;
 
-type DynError = Box<dyn std::error::Error>;
+type anyhow::Error = Box<dyn std::error::Error>;
 struct Args {
     path: PathBuf,
     key: Option<PathBuf>,
 }
 
 impl Args {
-    fn parse_args() -> Result<Self, DynError> {
+    fn parse_args() -> anyhow::Result<Self> {
         let mut pargs = pico_args::Arguments::from_env();
         if pargs.contains(["-h", "--help"]) {
             println!("{HELP}");
@@ -43,7 +43,7 @@ impl Args {
     }
 }
 
-fn main() -> Result<(), DynError> {
+fn main() -> anyhow::Result<()> {
     let args = Args::parse_args()?;
 
     let secret_key = match args.key {

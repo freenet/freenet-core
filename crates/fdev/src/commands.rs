@@ -43,7 +43,7 @@ pub(crate) struct PutDelegate {
     pub(crate) cipher: String,
 }
 
-pub async fn put(config: PutConfig, other: BaseConfig) -> Result<(), anyhow::Error> {
+pub async fn put(config: PutConfig, other: BaseConfig) -> anyhow::Result<()> {
     if config.release {
         anyhow::bail!("Cannot publish contracts in the network yet");
     }
@@ -65,7 +65,7 @@ async fn put_contract(
     contract_config: &PutContract,
     other: BaseConfig,
     params: Parameters<'static>,
-) -> Result<(), anyhow::Error> {
+) -> anyhow::Result<()> {
     let contract = ContractContainer::try_from((config.code.as_path(), params))?;
     let state = if let Some(ref state_path) = contract_config.state {
         let mut buf = vec![];
@@ -96,7 +96,7 @@ async fn put_delegate(
     delegate_config: &PutDelegate,
     other: BaseConfig,
     params: Parameters<'static>,
-) -> Result<(), anyhow::Error> {
+) -> anyhow::Result<()> {
     let delegate = DelegateContainer::try_from((config.code.as_path(), params))?;
 
     let (cipher, nonce) = if delegate_config.cipher.is_empty() && delegate_config.nonce.is_empty() {
@@ -130,7 +130,7 @@ For additional hardening is recommended to use a different cipher and nonce to e
     execute_command(request, other, config.address, config.port).await
 }
 
-pub async fn update(config: UpdateConfig, other: BaseConfig) -> Result<(), anyhow::Error> {
+pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<()> {
     if config.release {
         anyhow::bail!("Cannot publish contracts in the network yet");
     }
@@ -150,6 +150,6 @@ async fn execute_command(
     other: BaseConfig,
     address: IpAddr,
     port: u16,
-) -> Result<(), anyhow::Error> {
+) -> anyhow::Result<()> {
     v1::execute_command(request, other, address, port).await
 }

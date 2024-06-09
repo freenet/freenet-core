@@ -62,21 +62,17 @@ pub mod local_node {
     use crate::{
         client_events::{websocket::WebSocketProxy, ClientEventsProxy, OpenRequest},
         contract::{Executor, ExecutorError},
-        DynError,
     };
 
     use super::{http_gateway::HttpGateway, serve};
 
-    pub async fn run_local_node(
-        mut executor: Executor,
-        socket: SocketAddr,
-    ) -> Result<(), DynError> {
+    pub async fn run_local_node(mut executor: Executor, socket: SocketAddr) -> anyhow::Result<()> {
         match socket.ip() {
             IpAddr::V4(ip) if !ip.is_loopback() => {
-                return Err(format!("invalid ip: {ip}, expecting localhost").into())
+                anyhow::bail!("invalid ip: {ip}, expecting localhost")
             }
             IpAddr::V6(ip) if !ip.is_loopback() => {
-                return Err(format!("invalid ip: {ip}, expecting localhost").into())
+                anyhow::bail!("invalid ip: {ip}, expecting localhost")
             }
             _ => {}
         }
@@ -138,7 +134,7 @@ pub mod local_node {
                     }
                     continue;
                 }
-                _ => Err(ExecutorError::other("not supported")),
+                _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
             };
 
             match res {
@@ -186,7 +182,7 @@ pub mod network_node {
 
     use super::{http_gateway::HttpGateway, serve};
 
-    pub async fn run_network_node(config: Config) -> Result<(), anyhow::Error> {
+    pub async fn run_network_node(config: Config) -> anyhow::Result<()> {
         let ws_socket = (config.ws_api.address, config.ws_api.port).into();
         let (gw, gw_router) = HttpGateway::as_router(&ws_socket);
         let (ws_proxy, ws_router) = WebSocketProxy::as_router(gw_router);

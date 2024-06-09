@@ -10,7 +10,7 @@ pub(crate) mod test_util;
 
 const MAIN_ELEMENT_ID: &str = "freenet-email-main";
 
-type DynError = Box<dyn std::error::Error + Send + Sync>;
+type anyhow::Error = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn main() {
     #[cfg(not(target_family = "wasm"))]

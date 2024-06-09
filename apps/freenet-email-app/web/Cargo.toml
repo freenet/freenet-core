@@ -15,6 +15,7 @@ name = "app"
 
 [dependencies]
 bs58 = "0.5"
+anyhow = "1"
 arc-swap = "1.6"
 rand_chacha = "0.3"
 chrono = { workspace = true, features = ["wasmbind"] }

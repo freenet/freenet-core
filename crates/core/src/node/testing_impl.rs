@@ -528,7 +528,7 @@ impl SimNetwork {
         seed: u64,
         max_contract_num: usize,
         iterations: usize,
-    ) -> Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>>
+    ) -> Vec<tokio::task::JoinHandle<anyhow::Result<()>>>
     where
         R: RandomEventGenerator + Send + 'static,
     {
@@ -679,7 +679,7 @@ impl SimNetwork {
         label: impl Into<NodeLabel>,
         event_id: EventId,
         await_for: Option<Duration>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> anyhow::Result<()> {
         let label = label.into();
         let pos = self
             .labels
@@ -719,7 +719,7 @@ impl SimNetwork {
 
     /// Checks that all peers in the network have acquired at least one connection to any
     /// other peers.
-    pub fn check_connectivity(&self, time_out: Duration) -> Result<(), anyhow::Error> {
+    pub fn check_connectivity(&self, time_out: Duration) -> anyhow::Result<()> {
         self.connectivity(time_out, 1.0)
     }
 
@@ -729,11 +729,11 @@ impl SimNetwork {
         &self,
         time_out: Duration,
         percent: f64,
-    ) -> Result<(), anyhow::Error> {
+    ) -> anyhow::Result<()> {
         self.connectivity(time_out, percent)
     }
 
-    fn connectivity(&self, time_out: Duration, percent: f64) -> Result<(), anyhow::Error> {
+    fn connectivity(&self, time_out: Duration, percent: f64) -> anyhow::Result<()> {
         let num_nodes = self.number_of_nodes;
         let mut connected = HashSet::new();
         let elapsed = Instant::now();
@@ -796,7 +796,7 @@ impl SimNetwork {
     ///
     /// - at least 50% of the peers have more than the minimum connections
     /// - the average number of connections per peer is above the mean between max and min connections
-    pub fn network_connectivity_quality(&self) -> Result<(), anyhow::Error> {
+    pub fn network_connectivity_quality(&self) -> anyhow::Result<()> {
         const HIGHER_THAN_MIN_THRESHOLD: f64 = 0.5;
         let num_nodes = self.number_of_nodes;
         let min_connections_threshold = (num_nodes as f64 * HIGHER_THAN_MIN_THRESHOLD) as usize;
@@ -912,7 +912,7 @@ fn pretty_print_connections(
 }
 
 #[test]
-fn group_locations_test() -> Result<(), anyhow::Error> {
+fn group_locations_test() -> anyhow::Result<()> {
     let locations = vec![0.5356, 0.5435, 0.5468, 0.5597, 0.6745, 0.7309, 0.7412];
 
     let mut grouped: Vec<_> = group_locations_in_buckets(locations.clone(), 1).collect();
@@ -961,7 +961,7 @@ where
     client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
 }
 
-async fn run_node<NB, UsrEv>(mut config: RunnerConfig<NB, UsrEv>) -> Result<(), anyhow::Error>
+async fn run_node<NB, UsrEv>(mut config: RunnerConfig<NB, UsrEv>) -> anyhow::Result<()>
 where
     NB: NetworkBridge + NetworkBridgeExt,
     UsrEv: ClientEventsProxy + Send + 'static,
@@ -1024,7 +1024,7 @@ async fn run_event_listener<NB, UsrEv>(
         client_wait_for_transaction: mut wait_for_event,
         ..
     }: RunnerConfig<NB, UsrEv>,
-) -> Result<(), anyhow::Error>
+) -> anyhow::Result<()>
 where
     NB: NetworkBridge + NetworkBridgeExt,
     UsrEv: ClientEventsProxy + Send + 'static,

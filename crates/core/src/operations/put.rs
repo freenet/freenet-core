@@ -931,7 +931,7 @@ mod test {
     use crate::node::testing_impl::{NodeSpecification, SimNetwork};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn successful_put_op_between_nodes() -> Result<(), anyhow::Error> {
+    async fn successful_put_op_between_nodes() -> anyhow::Result<()> {
         const NUM_NODES: usize = 2usize;
         const NUM_GW: usize = 1usize;
 

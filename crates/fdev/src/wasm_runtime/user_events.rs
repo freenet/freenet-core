@@ -36,7 +36,7 @@ pub(super) async fn user_fn_handler(
     config: ExecutorConfig,
     command_sender: CommandSender,
     app_state: AppState,
-) -> Result<(), anyhow::Error> {
+) -> anyhow::Result<()> {
     let mut input = StdInput::new(config, app_state)?;
     tracing::debug!("running... send a command or write \"help\" for help");
     loop {
@@ -63,7 +63,7 @@ struct StdInput {
 }
 
 impl StdInput {
-    fn new(config: ExecutorConfig, app_state: AppState) -> Result<Self, anyhow::Error> {
+    fn new(config: ExecutorConfig, app_state: AppState) -> anyhow::Result<Self> {
         let paths = config.paths.clone().build(None)?;
         let params = config
             .params
@@ -91,7 +91,7 @@ impl StdInput {
         })
     }
 
-    fn read_input<T>(&mut self) -> Result<T, anyhow::Error>
+    fn read_input<T>(&mut self) -> anyhow::Result<T>
     where
         T: DeserializeOwned,
     {

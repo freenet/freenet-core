@@ -869,7 +869,7 @@ mod test {
     use crate::node::testing_impl::{NodeSpecification, SimNetwork};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn successful_get_op_between_nodes() -> Result<(), anyhow::Error> {
+    async fn successful_get_op_between_nodes() -> anyhow::Result<()> {
         const NUM_NODES: usize = 1usize;
         const NUM_GW: usize = 1usize;
 
@@ -924,7 +924,7 @@ mod test {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn contract_not_found() -> Result<(), anyhow::Error> {
+    async fn contract_not_found() -> anyhow::Result<()> {
         const NUM_NODES: usize = 2usize;
         const NUM_GW: usize = 1usize;
 
@@ -961,7 +961,7 @@ mod test {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn contract_found_after_retry() -> Result<(), anyhow::Error> {
+    async fn contract_found_after_retry() -> anyhow::Result<()> {
         // crate::config::set_logger();
         const NUM_NODES: usize = 2usize;
         const NUM_GW: usize = 1usize;

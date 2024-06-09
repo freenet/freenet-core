@@ -22,7 +22,7 @@ impl<ER> Builder<ER> {
         self,
         user_events: UsrEv,
         parent_span: tracing::Span,
-    ) -> Result<(), anyhow::Error>
+    ) -> anyhow::Result<()>
     where
         UsrEv: ClientEventsProxy + Send + 'static,
         ER: NetEventRegister + Clone,
@@ -96,7 +96,7 @@ where
         &mut self,
         contracts: Vec<(ContractContainer, WrappedState, bool)>,
         contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> anyhow::Result<()> {
         use crate::contract::ContractHandlerEvent;
         for (contract, state, subscription) in contracts {
             let key: ContractKey = contract.key();

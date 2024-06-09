@@ -9,7 +9,7 @@ use rand::rngs::OsRng;
 use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey};
 
 use crate::app::{ContractType, User, UserId};
-use crate::DynError;
+
 
 use super::{InboxView, NodeAction};
 
@@ -410,7 +410,7 @@ pub(super) fn create_alias<'x>(cx: Scope<'x>, actions: &'x Coroutine<NodeAction>
 fn get_key(
     generate: &UseState<bool>,
     key_path: &UseState<String>,
-) -> Result<RsaPrivateKey, DynError> {
+) -> anyhow::Result<RsaPrivateKey> {
     if *generate.get() {
         crate::log::debug!("generating secret key");
         let private_key =

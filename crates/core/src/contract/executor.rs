@@ -36,7 +36,6 @@ use crate::wasm_runtime::{
 use crate::{
     client_events::{ClientId, HostResult},
     operations::{self, Operation},
-    DynError,
 };
 
 use super::storages::Storage;
@@ -45,7 +44,7 @@ pub(super) mod mock_runtime;
 pub(super) mod runtime;
 
 #[derive(Debug)]
-pub struct ExecutorError(Either<Box<RequestError>, DynError>);
+pub struct ExecutorError(Either<Box<RequestError>, anyhow::Error>);
 
 enum InnerOpError {
     Upsert(ContractKey),
@@ -55,13 +54,13 @@ enum InnerOpError {
 impl std::error::Error for ExecutorError {}
 
 impl ExecutorError {
-    pub fn other(error: impl Into<DynError>) -> Self {
+    pub fn other(error: impl Into<anyhow::Error>) -> Self {
         Self(Either::Right(error.into()))
     }
 
     /// Call this when an unreachable path is reached but need to avoid panics.
     fn internal_error() -> Self {
-        ExecutorError(Either::Right("internal error".into()))
+        ExecutorError(Either::Right(anyhow::anyhow!("internal error")))
     }
 
     fn request(error: impl Into<RequestError>) -> Self {
@@ -107,19 +106,19 @@ impl ExecutorError {
                 Some(InnerOpError::Upsert(key)) => {
                     return ExecutorError::request(StdContractError::update_exec_error(key, e))
                 }
-                _ => return ExecutorError::other(format!("execution error: {e}")),
+                _ => return ExecutorError::other(anyhow::anyhow!("execution error: {e}")),
             },
             RuntimeInnerError::WasmExportError(e) => match op {
                 Some(InnerOpError::Upsert(key)) => {
                     return ExecutorError::request(StdContractError::update_exec_error(key, e))
                 }
-                _ => return ExecutorError::other(format!("execution error: {e}")),
+                _ => return ExecutorError::other(anyhow::anyhow!("execution error: {e}")),
             },
             RuntimeInnerError::WasmInstantiationError(e) => match op {
                 Some(InnerOpError::Upsert(key)) => {
                     return ExecutorError::request(StdContractError::update_exec_error(key, e))
                 }
-                _ => return ExecutorError::other(format!("execution error: {e}")),
+                _ => return ExecutorError::other(anyhow::anyhow!("execution error: {e}")),
             },
             _ => {}
         }
@@ -225,7 +224,7 @@ enum CallbackError {
 }
 
 impl ExecutorToEventLoopChannel<ExecutorHalve> {
-    async fn send_to_event_loop<Op, T>(&mut self, message: T) -> Result<Transaction, DynError>
+    async fn send_to_event_loop<Op, T>(&mut self, message: T) -> anyhow::Result<Transaction>
     where
         T: ComposeNetworkMessage<Op>,
         Op: Operation + Send + 'static,
@@ -257,7 +256,7 @@ impl ExecutorToEventLoopChannel<ExecutorHalve> {
             .response_for_rx
             .recv()
             .await
-            .ok_or_else(|| ExecutorError::other("channel closed"))?;
+            .ok_or_else(|| ExecutorError::other(anyhow::anyhow!("channel closed")))?;
         if op_result.id() != &transaction {
             self.end.completed.insert(*op_result.id(), op_result);
             return Err(CallbackError::MissingResult);
@@ -267,13 +266,13 @@ impl ExecutorToEventLoopChannel<ExecutorHalve> {
 }
 
 impl ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
-    pub async fn transaction_from_executor(&mut self) -> Result<Transaction, DynError> {
+    pub async fn transaction_from_executor(&mut self) -> anyhow::Result<Transaction> {
         let tx = self
             .end
             .waiting_for_op_rx
             .recv()
             .await
-            .ok_or("channel closed")?;
+            .ok_or(anyhow::anyhow!("channel closed"))?;
         Ok(tx)
     }
 
@@ -463,11 +462,11 @@ pub struct Executor<R = Runtime> {
 impl<R> Executor<R> {
     pub async fn new(
         state_store: StateStore<Storage>,
-        ctrl_handler: impl FnOnce() -> Result<(), DynError>,
+        ctrl_handler: impl FnOnce() -> anyhow::Result<()>,
         mode: OperationMode,
         runtime: R,
         event_loop_channel: Option<ExecutorToEventLoopChannel<ExecutorHalve>>,
-    ) -> Result<Self, DynError> {
+    ) -> anyhow::Result<Self> {
         ctrl_handler()?;
 
         Ok(Self {
@@ -498,7 +497,7 @@ impl<R> Executor<R> {
             SecretsStore,
             StateStore<Storage>,
         ),
-        DynError,
+        anyhow::Error,
     > {
         const MAX_SIZE: i64 = 10 * 1024 * 1024;
         const MAX_MEM_CACHE: u32 = 10_000_000;
@@ -521,7 +520,9 @@ impl<R> Executor<R> {
         M: ComposeNetworkMessage<Op>,
     {
         let Some(ch) = &mut self.event_loop_channel else {
-            return Err(ExecutorError::other("missing event loop channel"));
+            return Err(ExecutorError::other(anyhow::anyhow!(
+                "missing event loop channel"
+            )));
         };
         let transaction = ch
             .send_to_event_loop(request)

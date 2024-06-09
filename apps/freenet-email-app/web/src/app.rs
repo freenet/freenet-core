@@ -17,7 +17,7 @@ use crate::api::{node_response_error_handling, TryNodeAction};
 use crate::{
     api::WebApiRequestClient,
     inbox::{DecryptedMessage, InboxModel, MessageModel},
-    DynError,
+    anyhow::Error,
 };
 
 mod login;
@@ -194,7 +194,7 @@ impl InboxView {
         to: RsaPublicKey,
         title: &str,
         content: &str,
-    ) -> Result<Vec<LocalBoxFuture<'static, ()>>, DynError> {
+    ) -> anyhow::Result<Vec<LocalBoxFuture<'static, ()>>> {
         tracing::debug!("sending message from {from}");
         let content = DecryptedMessage {
             title: title.to_owned(),
@@ -236,7 +236,7 @@ impl InboxView {
         client: WebApiRequestClient,
         ids: &[u64],
         inbox_data: InboxesData,
-    ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
+    ) -> anyhow::Result<LocalBoxFuture<'static, ()>> {
         tracing::debug!("removing messages: {ids:?}");
         // FIXME: indexing by id fails cause all not aliases inboxes has been loaded initially
         let inbox_data = inbox_data.load_full();
@@ -250,7 +250,7 @@ impl InboxView {
         client: WebApiRequestClient,
         ids: &[u64],
         inbox_data: InboxesData,
-    ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
+    ) -> anyhow::Result<LocalBoxFuture<'static, ()>> {
         {
             let messages = &mut *self.messages.borrow_mut();
             let mut removed_messages = Vec::with_capacity(ids.len());
@@ -267,7 +267,7 @@ impl InboxView {
     }
 
     #[cfg(all(feature = "ui-testing", not(feature = "use-node")))]
-    fn load_messages(&self, id: &Identity) -> Result<(), DynError> {
+    fn load_messages(&self, id: &Identity) -> anyhow::Result<()> {
         let emails = {
             if id.id == UserId(0) {
                 vec![
@@ -322,7 +322,7 @@ impl InboxView {
         &self,
         id: &Identity,
         actions: &Coroutine<NodeAction>,
-    ) -> Result<(), DynError> {
+    ) -> anyhow::Result<()> {
         actions.send(NodeAction::LoadMessages(Box::new(id.clone())));
         Ok(())
     }

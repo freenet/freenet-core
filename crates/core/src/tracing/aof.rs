@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::sync::Mutex;
 
-use super::{DynError, EventKind, NetLogMessage, RouteEvent, NEW_RECORDS_TS};
+use super::{EventKind, NetLogMessage, RouteEvent, NEW_RECORDS_TS};
 
 static FILE_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -283,7 +283,7 @@ impl LogFile {
     pub async fn get_router_events(
         max_event_number: usize,
         event_log_path: &Path,
-    ) -> Result<Vec<RouteEvent>, DynError> {
+    ) -> anyhow::Result<Vec<RouteEvent>> {
         const MAX_EVENT_HISTORY: usize = 10_000;
         let event_num = max_event_number.min(MAX_EVENT_HISTORY);
 
@@ -296,7 +296,7 @@ impl LogFile {
     async fn get_router_events_in(
         event_num: usize,
         file: &mut (impl AsyncRead + AsyncSeek + Unpin),
-    ) -> Result<Vec<RouteEvent>, DynError> {
+    ) -> anyhow::Result<Vec<RouteEvent>> {
         let new_records_ts = NEW_RECORDS_TS
             .get()
             .expect("set on initialization")
@@ -351,7 +351,7 @@ impl LogFile {
                     }
                 }
             }
-            Ok::<_, DynError>(filtered)
+            Ok::<_, anyhow::Error>(filtered)
         })
         .await??;
 
@@ -406,7 +406,7 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn read_write() -> Result<(), DynError> {
+    async fn read_write() -> anyhow::Result<()> {
         NEW_RECORDS_TS.get_or_init(SystemTime::now);
         crate::config::set_logger(Some(LevelFilter::TRACE));
         let temp_dir = tempfile::tempdir()?;
@@ -453,7 +453,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn read_write_small() -> Result<(), DynError> {
+    async fn read_write_small() -> anyhow::Result<()> {
         NEW_RECORDS_TS.get_or_init(SystemTime::now);
         crate::config::set_logger(Some(LevelFilter::TRACE));
         let temp_dir = tempfile::tempdir()?;
@@ -500,7 +500,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn read_write_truncate() -> Result<(), DynError> {
+    async fn read_write_truncate() -> anyhow::Result<()> {
         NEW_RECORDS_TS.get_or_init(SystemTime::now);
         crate::config::set_logger(Some(LevelFilter::TRACE));
         let temp_dir = tempfile::tempdir()?;

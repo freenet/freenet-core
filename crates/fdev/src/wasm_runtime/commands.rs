@@ -8,7 +8,7 @@ pub(super) async fn wasm_runtime(
     _config: ExecutorConfig,
     mut command_receiver: CommandReceiver,
     mut app: AppState,
-) -> Result<(), anyhow::Error> {
+) -> anyhow::Result<()> {
     loop {
         let req = command_receiver.recv().await;
         let dc = execute_command(
@@ -23,10 +23,7 @@ pub(super) async fn wasm_runtime(
     Ok(())
 }
 
-async fn execute_command(
-    req: ClientRequest<'static>,
-    app: &mut AppState,
-) -> Result<bool, anyhow::Error> {
+async fn execute_command(req: ClientRequest<'static>, app: &mut AppState) -> anyhow::Result<bool> {
     let node = &mut *app.local_node.write().await;
     match req {
         ClientRequest::ContractOp(_) => {
