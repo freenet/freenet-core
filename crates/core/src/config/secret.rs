@@ -4,6 +4,7 @@ use aes_gcm::KeyInit;
 use blake3::traits::digest::generic_array::GenericArray;
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use freenet_stdlib::client_api::DelegateRequest;
+use rsa::pkcs8::DecodePrivateKey;
 
 use super::*;
 
@@ -45,7 +46,7 @@ impl ConfigArgs {
 
 #[derive(Debug, Default, Clone, clap::Parser, serde::Serialize, serde::Deserialize)]
 pub struct SecretArgs {
-    /// Path to the transport keypair file.
+    /// Path to the RSA private key for the transport layer.
     #[clap(long, value_parser, default_value=None, env = "TRANSPORT_KEYPAIR")]
     pub transport_keypair: Option<PathBuf>,
 
@@ -218,7 +219,7 @@ fn read_transport_keypair(path_to_key: impl AsRef<Path>) -> std::io::Result<Tran
         )
     })?;
 
-    let pk = rsa::RsaPrivateKey::from_pkcs1_pem(&buf).map_err(|e| {
+    let pk = rsa::RsaPrivateKey::from_pkcs8_pem(&buf).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("Failed to read key file {}: {e}", path_to_key.display()),

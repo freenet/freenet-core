@@ -11,7 +11,6 @@ use std::{
 use directories::ProjectDirs;
 use either::Either;
 use once_cell::sync::Lazy;
-use pkcs1::DecodeRsaPrivateKey;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
@@ -166,13 +165,13 @@ impl ConfigArgs {
     }
 
     /// Parse the command line arguments and return the configuration.
-    pub fn build(mut self) -> std::io::Result<Config> {
+    pub fn build(mut self) -> anyhow::Result<Config> {
         let cfg = if let Some(path) = self.config_paths.config_dir.as_ref() {
             if !path.exists() {
-                return Err(std::io::Error::new(
+                return Err(anyhow::Error::new(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "Configuration directory not found",
-                ));
+                )));
             }
 
             Self::read_config(path)?
@@ -241,10 +240,10 @@ impl ConfigArgs {
                     if peer_id.is_none() && mode == OperationMode::Network {
                         tracing::error!(file = ?gateways_file, "Failed to read gateways file: {err}");
 
-                        return Err(std::io::Error::new(
+                        return Err(anyhow::Error::new(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
                             "Cannot initialize node without gateways",
-                        ));
+                        )));
                     }
                 }
                 let _ = err;
