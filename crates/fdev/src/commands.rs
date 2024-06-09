@@ -13,6 +13,8 @@ use freenet_stdlib::{
 
 use crate::config::{BaseConfig, PutConfig, UpdateConfig};
 
+mod v1;
+
 #[derive(Debug, Clone, clap::Subcommand)]
 pub(crate) enum PutType {
     /// Puts a new contract
@@ -149,32 +151,5 @@ async fn execute_command(
     address: IpAddr,
     port: u16,
 ) -> Result<(), anyhow::Error> {
-    let mode = other.mode;
-
-    let target = match mode {
-        OperationMode::Local => {
-            if !address.is_loopback() {
-                return Err(anyhow::anyhow!(
-                    "invalid ip: {address}, expecting a loopback ip address in local mode"
-                ));
-            }
-            SocketAddr::new(address, port)
-        }
-        OperationMode::Network => SocketAddr::new(address, port),
-    };
-
-    let (stream, _) = tokio_tungstenite::connect_async(&format!(
-        "ws://{}/contract/command?encodingProtocol=native",
-        target
-    ))
-    .await
-    .map_err(|e| {
-        tracing::error!(err=%e);
-        anyhow::anyhow!(format!("fail to connect to the host({target}): {e}"))
-    })?;
-
-    WebApi::start(stream)
-        .send(request)
-        .await
-        .map_err(Into::into)
+    v1::execute_command(request, other, address, port).await
 }

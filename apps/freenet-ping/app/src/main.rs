@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
 
     // create a websocket connection to host.
     let uri = format!(
-        "ws://{}/contract/command?encodingProtocol=native",
+        "ws://{}/v1/contract/command?encodingProtocol=native",
         args.host
     );
     let (stream, _resp) = tokio_tungstenite::connect_async(&uri).await.map_err(|e| {
