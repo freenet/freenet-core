@@ -12,13 +12,25 @@ const CIPHER_SIZE: usize = 32;
 
 impl ConfigArgs {
     pub(super) fn read_secrets(
-        path_to_key: PathBuf,
-        path_to_nonce: PathBuf,
-        path_to_cipher: PathBuf,
+        path_to_key: Option<PathBuf>,
+        path_to_nonce: Option<PathBuf>,
+        path_to_cipher: Option<PathBuf>,
     ) -> std::io::Result<Secrets> {
-        let transport_keypair = read_transport_keypair(&path_to_key)?;
-        let nonce = read_nonce(&path_to_nonce)?;
-        let cipher = read_cipher(&path_to_cipher)?;
+        let transport_keypair = if let Some(ref path_to_key) = path_to_key {
+            read_transport_keypair(path_to_key)?
+        } else {
+            TransportKeypair::new()
+        };
+        let nonce = if let Some(ref path_to_nonce) = path_to_nonce {
+            read_nonce(path_to_nonce)?
+        } else {
+            DelegateRequest::DEFAULT_NONCE
+        };
+        let cipher = if let Some(ref path_to_cipher) = path_to_cipher {
+            read_cipher(path_to_cipher)?
+        } else {
+            DelegateRequest::DEFAULT_CIPHER
+        };
 
         Ok(Secrets {
             transport_keypair,
@@ -34,15 +46,15 @@ impl ConfigArgs {
 #[derive(Debug, Default, Clone, clap::Parser, serde::Serialize, serde::Deserialize)]
 pub struct SecretArgs {
     /// Path to the transport keypair file.
-    #[clap(value_parser, env = "TRANSPORT_KEYPAIR")]
+    #[clap(long, value_parser, default_value=None, env = "TRANSPORT_KEYPAIR")]
     pub transport_keypair: Option<PathBuf>,
 
     /// Path to the nonce file.
-    #[clap(value_parser, env = "NONCE")]
+    #[clap(long, value_parser, default_value=None, env = "NONCE")]
     pub nonce: Option<PathBuf>,
 
     /// Path to the cipher file.
-    #[clap(value_parser, env = "CIPHER")]
+    #[clap(long, value_parser, default_value=None, env = "CIPHER")]
     pub cipher: Option<PathBuf>,
 }
 
@@ -55,24 +67,24 @@ impl SecretArgs {
             .transpose()?;
         let (transport_keypair_path, transport_keypair) = if let Some(transport_key) = transport_key
         {
-            (self.transport_keypair.unwrap(), transport_key)
+            (self.transport_keypair, transport_key)
         } else {
             let transport_key = TransportKeypair::new();
-            (PathBuf::new(), transport_key)
+            (None, transport_key)
         };
         let nonce = self.nonce.as_ref().map(read_nonce).transpose()?;
         let (nonce_path, nonce) = if let Some(nonce) = nonce {
-            (self.nonce.unwrap(), nonce)
+            (self.nonce, nonce)
         } else {
-            (PathBuf::new(), DelegateRequest::DEFAULT_NONCE)
+            (None, DelegateRequest::DEFAULT_NONCE)
         };
 
         let cipher = self.cipher.as_ref().map(read_cipher).transpose()?;
 
         let (cipher_path, cipher) = if let Some(cipher) = cipher {
-            (self.cipher.unwrap(), cipher)
+            (self.cipher, cipher)
         } else {
-            (PathBuf::new(), DelegateRequest::DEFAULT_CIPHER)
+            (None, DelegateRequest::DEFAULT_CIPHER)
         };
 
         Ok(Secrets {
@@ -86,10 +98,17 @@ impl SecretArgs {
     }
 
     pub(super) fn merge(&mut self, other: Secrets) {
-        self.transport_keypair
-            .get_or_insert(other.transport_keypair_path);
-        self.nonce.get_or_insert(other.nonce_path);
-        self.cipher.get_or_insert(other.cipher_path);
+        if self.transport_keypair.is_none() {
+            self.transport_keypair = other.transport_keypair_path;
+        }
+
+        if self.nonce.is_none() {
+            self.nonce = other.nonce_path;
+        }
+
+        if self.cipher.is_none() {
+            self.cipher = other.cipher_path;
+        }
     }
 }
 
@@ -97,16 +116,16 @@ impl SecretArgs {
 pub struct Secrets {
     #[serde(skip)]
     pub transport_keypair: TransportKeypair,
-    #[serde(rename = "transport_keypair")]
-    pub transport_keypair_path: PathBuf,
+    #[serde(rename = "transport_keypair", skip_serializing_if = "Option::is_none")]
+    pub transport_keypair_path: Option<PathBuf>,
     #[serde(skip)]
     pub nonce: [u8; 24],
-    #[serde(rename = "nonce")]
-    pub nonce_path: PathBuf,
+    #[serde(rename = "nonce", skip_serializing_if = "Option::is_none")]
+    pub nonce_path: Option<PathBuf>,
     #[serde(skip)]
     pub cipher: [u8; 32],
-    #[serde(rename = "nonce")]
-    pub cipher_path: PathBuf,
+    #[serde(rename = "cipher", skip_serializing_if = "Option::is_none")]
+    pub cipher_path: Option<PathBuf>,
 }
 
 // Only used in tests
@@ -119,11 +138,11 @@ impl Default for Secrets {
 
         Secrets {
             transport_keypair,
-            transport_keypair_path: PathBuf::new(),
+            transport_keypair_path: None,
             nonce,
-            nonce_path: PathBuf::new(),
+            nonce_path: None,
             cipher,
-            cipher_path: PathBuf::new(),
+            cipher_path: None,
         }
     }
 }
@@ -232,11 +251,11 @@ mod tests {
 
         let secrets = Secrets {
             transport_keypair,
-            transport_keypair_path: transport_keypair_file.path().to_path_buf(),
+            transport_keypair_path: Some(transport_keypair_file.path().to_path_buf()),
             nonce,
-            nonce_path: nonce_file.path().to_path_buf(),
+            nonce_path: Some(nonce_file.path().to_path_buf()),
             cipher,
-            cipher_path: cipher_file.path().to_path_buf(),
+            cipher_path: Some(cipher_file.path().to_path_buf()),
         };
 
         let secret_args = SecretArgs {

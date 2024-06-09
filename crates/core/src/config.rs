@@ -43,39 +43,29 @@ const QUALIFIER: &str = "";
 const ORGANIZATION: &str = "The Freenet Project Inc";
 const APPLICATION: &str = "Freenet";
 
-#[derive(clap::Parser, Debug, Serialize, Deserialize)]
+#[derive(clap::Parser, Debug)]
 pub struct ConfigArgs {
     /// Node operation mode. Default is network mode.
     #[clap(value_enum, env = "MODE")]
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<OperationMode>,
 
     #[clap(flatten)]
-    #[serde(flatten)]
     pub ws_api: WebsocketApiArgs,
 
     #[clap(flatten)]
-    #[serde(flatten)]
     pub network_listener: NetworkArgs,
 
     #[clap(flatten)]
-    #[serde(flatten)]
     pub secrets: SecretArgs,
 
-    #[serde(
-        with = "serde_option_log_level_filter",
-        skip_serializing_if = "Option::is_none"
-    )]
     #[clap(long, env = "LOG_LEVEL")]
     pub log_level: Option<tracing::log::LevelFilter>,
 
     #[clap(flatten)]
-    #[serde(flatten)]
     config_paths: ConfigPathsArgs,
 
     /// An arbitrary identifier for the node, mostly for debugging or testing purposes.
     #[clap(long)]
-    #[serde(skip)]
     pub id: Option<String>,
 }
 
@@ -85,14 +75,14 @@ impl Default for ConfigArgs {
             mode: Some(OperationMode::Network),
             network_listener: NetworkArgs {
                 address: Some(default_address()),
-                port: Some(default_gateway_port()),
+                network_port: Some(default_network_port()),
                 public_address: None,
                 public_port: None,
                 is_gateway: false,
             },
             ws_api: WebsocketApiArgs {
                 address: Some(default_address()),
-                port: Some(default_gateway_port()),
+                ws_api_port: Some(default_http_gateway_port()),
             },
             secrets: Default::default(),
             log_level: Some(tracing::log::LevelFilter::Info),
@@ -104,73 +94,74 @@ impl Default for ConfigArgs {
 
 impl ConfigArgs {
     fn read_config(dir: &PathBuf) -> std::io::Result<Option<Config>> {
-        if dir.exists() {
-            let mut read_dir = std::fs::read_dir(dir)?;
-            let config_args: Option<(String, String)> = read_dir.find_map(|f| {
-                if let Ok(f) = f {
-                    let filename = f.file_name().to_string_lossy().into_owned();
-                    let ext = filename.rsplit('.').next().map(|s| s.to_owned());
-
-                    if let Some(ext) = ext {
-                        if filename.starts_with("config") {
-                            match ext.as_str() {
-                                "toml" => {
-                                    return Some((filename, ext));
-                                }
-                                "json" => {
-                                    return Some((filename, ext));
-                                }
-                                _ => {}
+        if !dir.exists() {
+            return Ok(None);
+        }
+        let mut read_dir = std::fs::read_dir(dir)?;
+        let config_args: Option<(String, String)> = read_dir.find_map(|e| {
+            if let Ok(e) = e {
+                if e.path().is_dir() {
+                    return None;
+                }
+                let filename = e.file_name().to_string_lossy().into_owned();
+                let ext = filename.rsplit('.').next().map(|s| s.to_owned());
+                if let Some(ext) = ext {
+                    if filename.starts_with("config") {
+                        match ext.as_str() {
+                            "toml" => {
+                                tracing::info!("Found configuration file: {filename}.{ext}");
+                                return Some((filename, ext));
                             }
+                            "json" => {
+                                return Some((filename, ext));
+                            }
+                            _ => {}
                         }
                     }
                 }
-
-                None
-            });
-            match config_args {
-                Some((filename, ext)) => {
-                    tracing::info!(
-                        "Reading configuration file: {:?}",
-                        dir.join(&filename).with_extension(&ext)
-                    );
-                    match ext.as_str() {
-                        "toml" => {
-                            let mut file = File::open(&*filename)?;
-                            let mut content = String::new();
-                            file.read_to_string(&mut content)?;
-                            let mut config = toml::from_str::<Config>(&content).map_err(|e| {
-                                std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                            })?;
-                            let secrets = Self::read_secrets(
-                                config.secrets.transport_keypair_path,
-                                config.secrets.nonce_path,
-                                config.secrets.cipher_path,
-                            )?;
-                            config.secrets = secrets;
-                            Ok(Some(config))
-                        }
-                        "json" => {
-                            let mut file = File::open(&*filename)?;
-                            let mut config = serde_json::from_reader::<_, Config>(&mut file)?;
-                            let secrets = Self::read_secrets(
-                                config.secrets.transport_keypair_path,
-                                config.secrets.nonce_path,
-                                config.secrets.cipher_path,
-                            )?;
-                            config.secrets = secrets;
-                            Ok(Some(config))
-                        }
-                        ext => Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!("Invalid configuration file extension: {}", ext),
-                        )),
-                    }
-                }
-                None => Ok(None),
             }
-        } else {
-            Ok(None)
+
+            None
+        });
+
+        match config_args {
+            Some((filename, ext)) => {
+                let path = dir.join(&filename).with_extension(&ext);
+                tracing::info!("Reading configuration file: {path:?}",);
+                match ext.as_str() {
+                    "toml" => {
+                        let mut file = File::open(&path)?;
+                        let mut content = String::new();
+                        file.read_to_string(&mut content)?;
+                        let mut config = toml::from_str::<Config>(&content).map_err(|e| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                        })?;
+                        let secrets = Self::read_secrets(
+                            config.secrets.transport_keypair_path,
+                            config.secrets.nonce_path,
+                            config.secrets.cipher_path,
+                        )?;
+                        config.secrets = secrets;
+                        Ok(Some(config))
+                    }
+                    "json" => {
+                        let mut file = File::open(&path)?;
+                        let mut config = serde_json::from_reader::<_, Config>(&mut file)?;
+                        let secrets = Self::read_secrets(
+                            config.secrets.transport_keypair_path,
+                            config.secrets.nonce_path,
+                            config.secrets.cipher_path,
+                        )?;
+                        config.secrets = secrets;
+                        Ok(Some(config))
+                    }
+                    ext => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Invalid configuration file extension: {}", ext),
+                    )),
+                }
+            }
+            None => Ok(None),
         }
     }
 
@@ -200,7 +191,10 @@ impl ConfigArgs {
             if self.config_paths.data_dir.is_none() {
                 self.config_paths.data_dir = Some(data);
             }
-            Self::read_config(&config).ok().flatten()
+            Self::read_config(&config)?.map(|cfg| {
+                tracing::info!("Found configuration file in default directory");
+                cfg
+            })
         };
 
         let should_persist = cfg.is_none();
@@ -210,7 +204,7 @@ impl ConfigArgs {
             self.secrets.merge(cfg.secrets);
             self.mode.get_or_insert(cfg.mode);
             self.ws_api.address.get_or_insert(cfg.ws_api.address);
-            self.ws_api.port.get_or_insert(cfg.ws_api.port);
+            self.ws_api.ws_api_port.get_or_insert(cfg.ws_api.port);
             self.log_level.get_or_insert(cfg.log_level);
             self.config_paths.merge(cfg.config_paths.as_ref().clone());
         }
@@ -267,7 +261,10 @@ impl ConfigArgs {
                     OperationMode::Local => default_local_address(),
                     OperationMode::Network => default_address(),
                 }),
-                port: self.ws_api.port.unwrap_or(default_gateway_port()),
+                port: self
+                    .ws_api
+                    .ws_api_port
+                    .unwrap_or(default_http_gateway_port()),
                 public_address: self.network_listener.public_address,
                 public_port: self.network_listener.public_port,
             },
@@ -276,7 +273,10 @@ impl ConfigArgs {
                     OperationMode::Local => default_local_address(),
                     OperationMode::Network => default_address(),
                 }),
-                port: self.ws_api.port.unwrap_or(default_gateway_port()),
+                port: self
+                    .ws_api
+                    .ws_api_port
+                    .unwrap_or(default_http_gateway_port()),
             },
             secrets,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
@@ -287,8 +287,9 @@ impl ConfigArgs {
 
         fs::create_dir_all(this.config_dir())?;
         if should_persist {
-            let mut file = File::create(this.config_dir().join("config.toml"))?;
-            tracing::info!("Persisting configuration to {:?}", file);
+            let path = this.config_dir().join("config.toml");
+            tracing::info!("Persisting configuration to {:?}", path);
+            let mut file = File::create(path)?;
             file.write_all(
                 toml::to_string(&this)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
@@ -343,36 +344,6 @@ mod serde_log_level_filter {
     }
 }
 
-mod serde_option_log_level_filter {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use tracing::log::LevelFilter;
-
-    pub fn serialize<S>(level: &Option<LevelFilter>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        if let Some(level) = level {
-            super::serde_log_level_filter::serialize(level, serializer)
-        } else {
-            serializer.serialize_none()
-        }
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<LevelFilter>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let level = <Option<&str>>::deserialize(deserializer)?;
-
-        match level {
-            Some(level) => Ok(Some(
-                super::serde_log_level_filter::parse_log_level_str::<D>(level)?,
-            )),
-            None => Ok(None),
-        }
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     /// Node operation mode.
@@ -412,9 +383,9 @@ pub struct NetworkArgs {
     pub address: Option<IpAddr>,
 
     /// Port to bind for the network event listener, default is 31337
-    #[arg(long = "network-port", env = "NETWORK_PORT")]
+    #[arg(long, env = "NETWORK_PORT")]
     #[serde(rename = "network-port", skip_serializing_if = "Option::is_none")]
-    pub port: Option<u16>,
+    pub network_port: Option<u16>,
 
     /// Public address for the network. Required for gateways.
     #[arg(long = "public-network-address", env = "PUBLIC_NETWORK_ADDRESS")]
@@ -471,9 +442,9 @@ pub struct WebsocketApiArgs {
     pub address: Option<IpAddr>,
 
     /// Port to expose the websocket on, default is 50509
-    #[arg(long = "ws-api-port", env = "WS_API_PORT")]
+    #[arg(long, env = "WS_API_PORT")]
     #[serde(rename = "ws-api-port", skip_serializing_if = "Option::is_none")]
-    pub port: Option<u16>,
+    pub ws_api_port: Option<u16>,
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
@@ -483,7 +454,7 @@ pub struct WebsocketApiConfig {
     pub address: IpAddr,
 
     /// Port to expose api on
-    #[serde(default = "default_gateway_port", rename = "ws-api-port")]
+    #[serde(default = "default_http_gateway_port", rename = "ws-api-port")]
     pub port: u16,
 }
 
@@ -492,7 +463,7 @@ impl Default for WebsocketApiConfig {
     fn default() -> Self {
         Self {
             address: default_address(),
-            port: default_gateway_port(),
+            port: default_http_gateway_port(),
         }
     }
 }
@@ -508,7 +479,7 @@ const fn default_local_address() -> IpAddr {
 }
 
 #[inline]
-pub(crate) const fn default_gateway_port() -> u16 {
+pub(crate) const fn default_http_gateway_port() -> u16 {
     50509
 }
 
