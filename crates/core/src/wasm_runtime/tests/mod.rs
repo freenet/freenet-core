@@ -63,7 +63,7 @@ pub(crate) fn setup_test_contract(name: &str) -> Result<TestSetup, Box<dyn std::
 
     let mut contract_store = ContractStore::new(temp_dir.path().join("contract"), 10_000)?;
     let delegate_store = DelegateStore::new(temp_dir.path().join("delegate"), 10_000)?;
-    let secrets_store = SecretsStore::new(temp_dir.path().join("secrets"))?;
+    let secrets_store = SecretsStore::new(temp_dir.path().join("secrets"), Default::default())?;
     let contract_bytes = WrappedContract::new(
         Arc::new(ContractCode::from(get_test_module(name)?)),
         vec![].into(),
