@@ -120,7 +120,10 @@ impl DelegateStore {
 
         // save on disc
         let version = APIVersion::from(delegate.clone());
-        let output: Vec<u8> = delegate.code().to_bytes_versioned(version)?;
+        let output: Vec<u8> = delegate
+            .code()
+            .to_bytes_versioned(version)
+            .map_err(|e| anyhow::anyhow!(e))?;
         let mut file = File::create(delegate_path)?;
         file.write_all(output.as_slice())?;
 

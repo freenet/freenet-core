@@ -141,7 +141,9 @@ impl ContractStore {
 
         // save on disc
         let version = APIVersion::from(contract);
-        let output: Vec<u8> = code.to_bytes_versioned(version)?;
+        let output: Vec<u8> = code
+            .to_bytes_versioned(version)
+            .map_err(|e| anyhow::anyhow!(e))?;
         let mut file = File::create(key_path)?;
         file.write_all(output.as_slice())?;
 
