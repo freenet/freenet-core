@@ -615,7 +615,9 @@ impl Ring {
     ) -> Option<PeerKeyLocation> {
         let connections = self.connections_by_location.read();
         let peers = connections.values().filter_map(|conns| {
-            let conn = conns.choose(&mut rand::thread_rng()).unwrap();
+            let Some(conn) = conns.choose(&mut rand::thread_rng()) else {
+                return None;
+            };
             if let Some(requester) = requesting {
                 if requester == &conn.location.peer {
                     return None;
