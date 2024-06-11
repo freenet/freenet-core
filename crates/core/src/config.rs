@@ -8,15 +8,16 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Context;
 use directories::ProjectDirs;
 use either::Either;
 use once_cell::sync::Lazy;
-use rsa::pkcs8::DecodePrivateKey;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
 use crate::{dev_tool::PeerId, local_node::OperationMode, transport::TransportKeypair};
+
+mod secret;
+pub use secret::*;
 
 /// Default maximum number of connections for the peer.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 20;
@@ -53,9 +54,8 @@ pub struct ConfigArgs {
     #[clap(flatten)]
     pub network_listener: NetworkArgs,
 
-    /// Path to the RSA private key for the transport layer.
-    #[clap(long, value_parser, default_value=None, env = "TRANSPORT_KEYPAIR")]
-    pub transport_keypair: Option<PathBuf>,
+    #[clap(flatten)]
+    pub secrets: SecretArgs,
 
     #[clap(long, env = "LOG_LEVEL")]
     pub log_level: Option<tracing::log::LevelFilter>,
@@ -83,7 +83,7 @@ impl Default for ConfigArgs {
                 address: Some(default_address()),
                 ws_api_port: Some(default_http_gateway_port()),
             },
-            transport_keypair: None,
+            secrets: Default::default(),
             log_level: Some(tracing::log::LevelFilter::Info),
             config_paths: Default::default(),
             id: None,
@@ -122,6 +122,7 @@ impl ConfigArgs {
 
             None
         });
+
         match config_args {
             Some((filename, ext)) => {
                 let path = dir.join(&filename).with_extension(&ext);
@@ -131,14 +132,26 @@ impl ConfigArgs {
                         let mut file = File::open(&path)?;
                         let mut content = String::new();
                         file.read_to_string(&mut content)?;
-                        let config = toml::from_str::<Config>(&content).map_err(|e| {
+                        let mut config = toml::from_str::<Config>(&content).map_err(|e| {
                             std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
                         })?;
+                        let secrets = Self::read_secrets(
+                            config.secrets.transport_keypair_path,
+                            config.secrets.nonce_path,
+                            config.secrets.cipher_path,
+                        )?;
+                        config.secrets = secrets;
                         Ok(Some(config))
                     }
                     "json" => {
                         let mut file = File::open(&path)?;
-                        let config = serde_json::from_reader::<_, Config>(&mut file)?;
+                        let mut config = serde_json::from_reader::<_, Config>(&mut file)?;
+                        let secrets = Self::read_secrets(
+                            config.secrets.transport_keypair_path,
+                            config.secrets.nonce_path,
+                            config.secrets.cipher_path,
+                        )?;
+                        config.secrets = secrets;
                         Ok(Some(config))
                     }
                     ext => Err(std::io::Error::new(
@@ -149,33 +162,6 @@ impl ConfigArgs {
             }
             None => Ok(None),
         }
-    }
-
-    fn read_transport_keypair(
-        path_to_key: PathBuf,
-    ) -> std::io::Result<(PathBuf, TransportKeypair)> {
-        let mut key_file = File::open(&path_to_key).map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!("Failed to open key file {}: {e}", path_to_key.display()),
-            )
-        })?;
-        let mut buf = String::new();
-        key_file.read_to_string(&mut buf).map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!("Failed to read key file {}: {e}", path_to_key.display()),
-            )
-        })?;
-
-        let pk = rsa::RsaPrivateKey::from_pkcs8_pem(&buf).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Failed to read key file {}: {e}", path_to_key.display()),
-            )
-        })?;
-
-        Ok::<_, std::io::Error>((path_to_key, TransportKeypair::from_private_key(pk)))
     }
 
     /// Parse the command line arguments and return the configuration.
@@ -214,9 +200,7 @@ impl ConfigArgs {
 
         // merge the configuration from the file with the command line arguments
         if let Some(cfg) = cfg {
-            if let Some(key) = cfg.transport_keypair_path {
-                self.transport_keypair.get_or_insert(key);
-            }
+            self.secrets.merge(cfg.secrets);
             self.mode.get_or_insert(cfg.mode);
             self.ws_api.address.get_or_insert(cfg.ws_api.address);
             self.ws_api.ws_api_port.get_or_insert(cfg.ws_api.port);
@@ -227,25 +211,17 @@ impl ConfigArgs {
         let mode = self.mode.unwrap_or(OperationMode::Network);
         let config_paths = self.config_paths.build(self.id.as_deref())?;
 
-        let transport_key = self
-            .transport_keypair
-            .map(Self::read_transport_keypair)
-            .transpose()
-            .with_context(|| "failed while reading transport key file")?;
-        let (transport_keypair_path, transport_keypair) =
-            if let Some((transport_key_path, transport_key)) = transport_key {
-                (Some(transport_key_path), transport_key)
-            } else {
-                let transport_key = TransportKeypair::new();
-                (None, transport_key)
-            };
+        let secrets = self.secrets.build()?;
 
         let peer_id = self
             .network_listener
             .public_address
             .zip(self.network_listener.public_port)
             .map(|(addr, port)| {
-                PeerId::new((addr, port).into(), transport_keypair.public().clone())
+                PeerId::new(
+                    (addr, port).into(),
+                    secrets.transport_keypair.public().clone(),
+                )
             });
         let gateways_file = config_paths.config_dir.join("gateways.toml");
         let gateways = match File::open(&*gateways_file) {
@@ -280,14 +256,14 @@ impl ConfigArgs {
             mode,
             peer_id,
             network_api: NetworkApiConfig {
-                address: self.ws_api.address.unwrap_or_else(|| match mode {
+                address: self.network_listener.address.unwrap_or_else(|| match mode {
                     OperationMode::Local => default_local_address(),
                     OperationMode::Network => default_address(),
                 }),
                 port: self
-                    .ws_api
-                    .ws_api_port
-                    .unwrap_or(default_http_gateway_port()),
+                    .network_listener
+                    .network_port
+                    .unwrap_or(default_network_port()),
                 public_address: self.network_listener.public_address,
                 public_port: self.network_listener.public_port,
             },
@@ -301,8 +277,7 @@ impl ConfigArgs {
                     .ws_api_port
                     .unwrap_or(default_http_gateway_port()),
             },
-            transport_keypair,
-            transport_keypair_path,
+            secrets,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
             config_paths: Arc::new(config_paths),
             gateways,
@@ -376,10 +351,8 @@ pub struct Config {
     pub network_api: NetworkApiConfig,
     #[serde(flatten)]
     pub ws_api: WebsocketApiConfig,
-    #[serde(skip)]
-    pub transport_keypair: TransportKeypair,
-    #[serde(rename = "transport_keypair", skip_serializing_if = "Option::is_none")]
-    pub transport_keypair_path: Option<PathBuf>,
+    #[serde(flatten)]
+    pub secrets: Secrets,
     #[serde(with = "serde_log_level_filter")]
     pub log_level: tracing::log::LevelFilter,
     #[serde(flatten)]
@@ -393,7 +366,7 @@ pub struct Config {
 
 impl Config {
     pub fn transport_keypair(&self) -> &TransportKeypair {
-        &self.transport_keypair
+        self.secrets.transport_keypair()
     }
 
     pub(crate) fn paths(&self) -> Arc<ConfigPaths> {
