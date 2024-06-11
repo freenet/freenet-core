@@ -241,7 +241,7 @@ impl Operation for ConnectOp {
                         .clone()
                         .expect("should be already set at the p2p bridge level");
                     let this_peer = op_manager.ring.own_location();
-                    let assigned_location = Location::random();
+                    let assigned_location = Location::from_address(&joiner.addr);
 
                     let new_peer_loc = PeerKeyLocation {
                         location: Some(assigned_location),
