@@ -125,7 +125,7 @@ impl ConfigArgs {
 
         match config_args {
             Some((filename, ext)) => {
-                let path = dir.join(&filename).with_extension(&ext);
+                let path = dir.join(filename).with_extension(&ext);
                 tracing::info!("Reading configuration file: {path:?}",);
                 match ext.as_str() {
                     "toml" => {
