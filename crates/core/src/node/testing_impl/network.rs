@@ -66,7 +66,7 @@ impl NetworkPeer {
         &self,
         identifier: String,
         clients: [BoxedClient; CLIENTS],
-    ) -> Result<Node, anyhow::Error> {
+    ) -> anyhow::Result<Node> {
         let event_register = {
             #[cfg(feature = "trace-ot")]
             {

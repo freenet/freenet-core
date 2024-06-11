@@ -13,7 +13,7 @@ mod user_events;
 
 const DEFAULT_MAX_CONTRACT_SIZE: i64 = 50 * 1024 * 1024;
 
-pub async fn run_local_executor(config: ExecutorConfig) -> Result<(), anyhow::Error> {
+pub async fn run_local_executor(config: ExecutorConfig) -> anyhow::Result<()> {
     if config.disable_tui_mode {
         anyhow::bail!("TUI mode not yet implemented");
     }

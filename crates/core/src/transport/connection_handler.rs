@@ -863,7 +863,7 @@ mod test {
     use tracing::info;
 
     use super::*;
-    use crate::{transport::packet_data::MAX_DATA_SIZE, DynError};
+    use crate::transport::packet_data::MAX_DATA_SIZE;
 
     #[allow(clippy::type_complexity)]
     static CHANNELS: OnceLock<
@@ -986,7 +986,7 @@ mod test {
 
     async fn set_peer_connection(
         packet_drop_policy: PacketDropPolicy,
-    ) -> Result<(TransportPublicKey, OutboundConnectionHandler, SocketAddr), DynError> {
+    ) -> anyhow::Result<(TransportPublicKey, OutboundConnectionHandler, SocketAddr)> {
         set_peer_connection_in(packet_drop_policy, false)
             .await
             .map(|(pk, (o, _), s)| (pk, o, s))
@@ -1000,7 +1000,7 @@ mod test {
             mpsc::Receiver<PeerConnection>,
             SocketAddr,
         ),
-        DynError,
+        anyhow::Error,
     > {
         set_peer_connection_in(packet_drop_policy, true)
             .await
@@ -1016,7 +1016,7 @@ mod test {
             (OutboundConnectionHandler, mpsc::Receiver<PeerConnection>),
             SocketAddr,
         ),
-        DynError,
+        anyhow::Error,
     > {
         static PORT: AtomicU16 = AtomicU16::new(25000);
 
@@ -1066,7 +1066,7 @@ mod test {
     async fn run_test<G: TestFixture>(
         config: TestConfig,
         generators: Vec<G>,
-    ) -> Result<(), DynError> {
+    ) -> anyhow::Result<()> {
         assert_eq!(generators.len(), config.peers);
         let mut peer_keys_and_addr = vec![];
         let mut peer_conns = vec![];
@@ -1118,8 +1118,8 @@ mod test {
                             peer_conn.send(test_gen_cp.gen_msg()).await?;
                             let msg = tokio::select! {
                                 _ = to.tick() => {
-                                    return Err::<_, DynError>(
-                                        format!("timeout waiting for messages, total time: {:.2}", start.elapsed().as_secs_f64()).into()
+                                    return Err::<_, anyhow::Error>(
+                                        anyhow::anyhow!("timeout waiting for messages, total time: {:.2}", start.elapsed().as_secs_f64())
                                     );
                                 }
                                 msg = peer_conn.recv() => {
@@ -1145,7 +1145,7 @@ mod test {
                     });
                 }
                 let results = conns.try_collect::<Vec<_>>().await?;
-                Ok::<_, DynError>((results, test_generator))
+                Ok::<_, anyhow::Error>((results, test_generator))
             });
             tasks.push(peer);
         }
@@ -1167,7 +1167,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn simulate_nat_traversal() -> Result<(), DynError> {
+    async fn simulate_nat_traversal() -> anyhow::Result<()> {
         // crate::config::set_logger();
         let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection(Default::default()).await?;
@@ -1175,13 +1175,13 @@ mod test {
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
-            Ok::<_, DynError>(())
+            Ok::<_, anyhow::Error>(())
         });
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
-            Ok::<_, DynError>(())
+            Ok::<_, anyhow::Error>(())
         });
 
         let (a, b) = tokio::try_join!(peer_a, peer_b)?;
@@ -1191,7 +1191,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn simulate_nat_traversal_drop_first_packets_for_all() -> Result<(), DynError> {
+    async fn simulate_nat_traversal_drop_first_packets_for_all() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (peer_a_pub, mut peer_a, peer_a_addr) =
             set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
@@ -1201,13 +1201,13 @@ mod test {
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
-            Ok::<_, DynError>(())
+            Ok::<_, anyhow::Error>(())
         });
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
-            Ok::<_, DynError>(())
+            Ok::<_, anyhow::Error>(())
         });
 
         let (a, b) = tokio::try_join!(peer_a, peer_b)?;
@@ -1217,7 +1217,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn simulate_nat_traversal_drop_first_packets_of_peerb() -> Result<(), DynError> {
+    async fn simulate_nat_traversal_drop_first_packets_of_peerb() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
@@ -1227,14 +1227,14 @@ mod test {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
             let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
-            Ok::<_, DynError>(())
+            Ok::<_, anyhow::Error>(())
         });
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
-            Ok::<_, DynError>(())
+            Ok::<_, anyhow::Error>(())
         });
 
         let (a, b) = tokio::try_join!(peer_a, peer_b)?;
@@ -1244,7 +1244,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn simulate_nat_traversal_drop_packet_ranges_of_peerb_killed() -> Result<(), DynError> {
+    async fn simulate_nat_traversal_drop_packet_ranges_of_peerb_killed() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
@@ -1255,7 +1255,7 @@ mod test {
             let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
             let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
             conn.send("some data").await.unwrap();
-            Ok::<_, DynError>(())
+            Ok::<_, anyhow::Error>(())
         });
 
         let peer_a = tokio::spawn(async move {
@@ -1269,7 +1269,7 @@ mod test {
             tokio::time::sleep(Duration::from_secs(10)).await;
             // conn should be broken as the remote peer cannot receive message and ping
             conn.recv().await.unwrap_err();
-            Ok::<_, DynError>(())
+            Ok::<_, anyhow::Error>(())
         });
 
         let (a, b) = tokio::try_join!(peer_a, peer_b)?;
@@ -1280,7 +1280,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn simulate_nat_traversal_drop_packet_ranges_of_peerb() -> Result<(), DynError> {
+    async fn simulate_nat_traversal_drop_packet_ranges_of_peerb() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
@@ -1296,7 +1296,7 @@ mod test {
 
             // although we drop some packets, we still alive
             conn.send("some data").await.unwrap();
-            Ok::<_, DynError>(())
+            Ok::<_, anyhow::Error>(())
         });
 
         let peer_a = tokio::spawn(async move {
@@ -1313,7 +1313,7 @@ mod test {
             // conn should not be broken
             let b = conn.recv().await.unwrap();
             assert_eq!(&b[8..], b"some data");
-            Ok::<_, DynError>(())
+            Ok::<_, anyhow::Error>(())
         });
 
         let (a, b) = tokio::try_join!(peer_a, peer_b)?;
@@ -1324,7 +1324,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn simulate_gateway_connection() -> Result<(), DynError> {
+    async fn simulate_gateway_connection() -> anyhow::Result<()> {
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
             set_peer_connection(Default::default()).await?;
         let (gw_pub, mut gw_conn, gw_addr) = set_gateway_connection(Default::default()).await?;
@@ -1333,14 +1333,14 @@ mod test {
             let gw_conn = gw_conn.recv();
             let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
-                .ok_or("no connection")?;
-            Ok::<_, DynError>(())
+                .ok_or(anyhow::anyhow!("no connection"))?;
+            Ok::<_, anyhow::Error>(())
         });
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
-            Ok::<_, DynError>(())
+            Ok::<_, anyhow::Error>(())
         });
 
         let (a, b) = tokio::try_join!(peer_a, gw)?;
@@ -1350,7 +1350,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn simulate_gateway_connection_drop_first_packets_of_gateway() -> Result<(), DynError> {
+    async fn simulate_gateway_connection_drop_first_packets_of_gateway() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
             set_peer_connection(Default::default()).await?;
@@ -1361,14 +1361,14 @@ mod test {
             let gw_conn = gw_conn.recv();
             let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
-                .ok_or("no connection")?;
-            Ok::<_, DynError>(())
+                .ok_or(anyhow::anyhow!("no connection"))?;
+            Ok::<_, anyhow::Error>(())
         });
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
-            Ok::<_, DynError>(())
+            Ok::<_, anyhow::Error>(())
         });
 
         let (a, b) = tokio::try_join!(peer_a, gw)?;
@@ -1378,7 +1378,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn simulate_gateway_connection_drop_first_packets_for_all() -> Result<(), DynError> {
+    async fn simulate_gateway_connection_drop_first_packets_for_all() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
             set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
@@ -1389,14 +1389,14 @@ mod test {
             let gw_conn = gw_conn.recv();
             let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
-                .ok_or("no connection")?;
-            Ok::<_, DynError>(())
+                .ok_or(anyhow::anyhow!("no connection"))?;
+            Ok::<_, anyhow::Error>(())
         });
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(10), peer_b_conn).await??;
-            Ok::<_, DynError>(())
+            Ok::<_, anyhow::Error>(())
         });
 
         let (a, b) = tokio::try_join!(peer_a, gw)?;
@@ -1406,7 +1406,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn simulate_gateway_connection_drop_first_packets_of_peer() -> Result<(), DynError> {
+    async fn simulate_gateway_connection_drop_first_packets_of_peer() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
             set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
@@ -1416,14 +1416,14 @@ mod test {
             let gw_conn = gw_conn.recv();
             let _ = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
-                .ok_or("no connection")?;
-            Ok::<_, DynError>(())
+                .ok_or(anyhow::anyhow!("no connection"))?;
+            Ok::<_, anyhow::Error>(())
         });
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
             let _ = tokio::time::timeout(Duration::from_secs(10), peer_b_conn).await??;
-            Ok::<_, DynError>(())
+            Ok::<_, anyhow::Error>(())
         });
 
         let (a, b) = tokio::try_join!(peer_a, gw)?;
@@ -1433,7 +1433,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn simulate_send_short_message() -> Result<(), DynError> {
+    async fn simulate_send_short_message() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         #[derive(Clone, Copy)]
         struct TestData(&'static str, usize);
@@ -1466,7 +1466,7 @@ mod test {
     /// This one is the maximum size (1324 currently) of a short message from user side
     /// by using public send API can be directly sent
     #[tokio::test]
-    async fn simulate_send_max_short_message() -> Result<(), DynError> {
+    async fn simulate_send_max_short_message() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::ERROR));
         let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection(Default::default()).await?;
@@ -1479,7 +1479,7 @@ mod test {
                 .await
                 .unwrap();
             conn.send(data).await?;
-            Ok::<_, DynError>(())
+            Ok::<_, anyhow::Error>(())
         });
 
         let peer_a = tokio::spawn(async move {
@@ -1487,7 +1487,7 @@ mod test {
             let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
             let msg = conn.recv().await?;
             assert!(msg.len() <= MAX_DATA_SIZE);
-            Ok::<_, DynError>(())
+            Ok::<_, anyhow::Error>(())
         });
 
         let (a, b) = tokio::try_join!(peer_a, peer_b)?;
@@ -1518,7 +1518,7 @@ mod test {
                             .await
                             .unwrap();
                     conn.outbound_short_message(data).await?;
-                    Ok::<_, DynError>(())
+                    Ok::<_, anyhow::Error>(())
                 });
 
                 let peer_a = tokio::spawn(async move {
@@ -1527,19 +1527,19 @@ mod test {
                         tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
                     let msg = conn.recv().await?;
                     assert!(msg.len() <= MAX_DATA_SIZE);
-                    Ok::<_, DynError>(())
+                    Ok::<_, anyhow::Error>(())
                 });
 
                 let (a, b) = tokio::try_join!(peer_a, peer_b)?;
                 a?;
                 b?;
-                Result::<(), DynError>::Ok(())
+                Result::<(), anyhow::Error>::Ok(())
             })
             .unwrap();
     }
 
     #[tokio::test]
-    async fn simulate_send_streamed_message() -> Result<(), DynError> {
+    async fn simulate_send_streamed_message() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         #[derive(Clone, Copy)]
         struct TestData(&'static str);
@@ -1573,7 +1573,7 @@ mod test {
     // #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     // #[tokio::test]
-    async fn simulate_packet_dropping() -> Result<(), DynError> {
+    async fn simulate_packet_dropping() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::INFO));
         #[derive(Clone, Copy)]
         struct TestData(&'static str);

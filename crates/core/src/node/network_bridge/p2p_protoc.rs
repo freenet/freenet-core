@@ -111,7 +111,7 @@ impl P2pConnManager {
         config: &NodeConfig,
         op_manager: Arc<OpManager>,
         event_listener: impl NetEventRegister + Clone,
-    ) -> Result<Self, anyhow::Error> {
+    ) -> anyhow::Result<Self> {
         let listen_port = config.network_listener_port;
         let listener_ip = config.network_listener_ip;
 
@@ -142,7 +142,7 @@ impl P2pConnManager {
         mut executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         cli_response_sender: ClientResponsesSender,
         mut node_controller: Receiver<NodeEvent>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> anyhow::Result<()> {
         use ConnMngrActions::*;
 
         tracing::info!(%self.listening_port, %self.listening_ip, %self.is_gateway, key = %self.key_pair.public(), "Openning network listener");

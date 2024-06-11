@@ -61,7 +61,7 @@ impl OpManager {
         ch_outbound: ContractHandlerChannel<SenderHalve>,
         config: &NodeConfig,
         event_register: ER,
-    ) -> Result<Self, anyhow::Error> {
+    ) -> anyhow::Result<Self> {
         let ring = Ring::new(
             config,
             notification_channel.clone(),

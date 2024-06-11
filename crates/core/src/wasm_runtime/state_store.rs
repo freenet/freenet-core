@@ -2,12 +2,10 @@ use core::future::Future;
 use freenet_stdlib::prelude::*;
 use stretto::AsyncCache;
 
-use crate::DynError;
-
 #[derive(thiserror::Error, Debug)]
 pub enum StateStoreError {
     #[error(transparent)]
-    Any(#[from] DynError),
+    Any(#[from] anyhow::Error),
     #[error("missing contract: {0}")]
     MissingContract(ContractKey),
 }
@@ -15,9 +13,11 @@ pub enum StateStoreError {
 impl From<StateStoreError> for crate::wasm_runtime::ContractError {
     fn from(value: StateStoreError) -> Self {
         match value {
-            StateStoreError::Any(err) => crate::wasm_runtime::ContractError::from(err),
+            StateStoreError::Any(err) => {
+                crate::wasm_runtime::ContractError::from(anyhow::format_err!(err))
+            }
             err @ StateStoreError::MissingContract(_) => {
-                crate::wasm_runtime::ContractError::from(Into::<DynError>::into(format!("{err}")))
+                crate::wasm_runtime::ContractError::from(anyhow::format_err!(err))
             }
         }
     }
@@ -54,7 +54,7 @@ pub struct StateStore<S: StateStorage> {
 impl<S> StateStore<S>
 where
     S: StateStorage + Send + 'static,
-    <S as StateStorage>::Error: Into<DynError>,
+    <S as StateStorage>::Error: Into<anyhow::Error>,
 {
     const AVG_STATE_SIZE: usize = 1_000;
 
@@ -64,7 +64,7 @@ where
         let counters = max_size as usize / Self::AVG_STATE_SIZE * 10;
         Ok(Self {
             state_mem_cache: AsyncCache::new(counters, max_size as i64, tokio::spawn)
-                .map_err(|err| StateStoreError::Any(Box::new(err)))?,
+                .map_err(|err| StateStoreError::Any(anyhow::anyhow!(err)))?,
             // params_mem_cache: AsyncCache::new(counters, max_size as i64)
             //     .map_err(|err| StateStoreError::Any(Box::new(err)))?,
             store,

@@ -66,7 +66,7 @@ pub(crate) mod testing_impl;
 pub struct Node(NodeP2P);
 
 impl Node {
-    pub async fn run(self) -> Result<(), anyhow::Error> {
+    pub async fn run(self) -> anyhow::Result<()> {
         self.0.run_node().await?;
         Ok(())
     }
@@ -281,7 +281,7 @@ impl NodeConfig {
     pub async fn build<const CLIENTS: usize>(
         self,
         clients: [BoxedClient; CLIENTS],
-    ) -> Result<Node, anyhow::Error> {
+    ) -> anyhow::Result<Node> {
         let event_register = {
             #[cfg(feature = "trace-ot")]
             {
@@ -313,7 +313,7 @@ impl NodeConfig {
 
     /// Returns all specified gateways for this peer. Returns an error if the peer is not a gateway
     /// and no gateways are specified.
-    fn get_gateways(&self) -> Result<Vec<PeerKeyLocation>, anyhow::Error> {
+    fn get_gateways(&self) -> anyhow::Result<Vec<PeerKeyLocation>> {
         let gateways: Vec<PeerKeyLocation> = self
             .gateways
             .iter()

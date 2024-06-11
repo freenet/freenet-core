@@ -1,7 +1,7 @@
 use super::*;
 
 impl AppState {
-    pub async fn new_v1(config: &ExecutorConfig) -> Result<Self, anyhow::Error> {
+    pub async fn new_v1(config: &ExecutorConfig) -> anyhow::Result<Self> {
         let target: SocketAddr = (config.address, config.port).into();
         let (stream, _) = tokio_tungstenite::connect_async(&format!(
             "ws://{}/v1/contract/command?encodingProtocol=native",

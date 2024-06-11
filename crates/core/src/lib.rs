@@ -29,8 +29,6 @@ pub mod util;
 /// WASM code execution runtime, tailored for the contract and delegate APIs.
 mod wasm_runtime;
 
-type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
-
 /// Exports to build a running local node.
 pub mod local_node {
     use super::*;

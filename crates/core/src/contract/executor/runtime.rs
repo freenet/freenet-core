@@ -153,7 +153,7 @@ impl Executor<Runtime> {
     pub async fn from_config(
         config: Arc<Config>,
         event_loop_channel: Option<ExecutorToEventLoopChannel<ExecutorHalve>>,
-    ) -> Result<Self, DynError> {
+    ) -> anyhow::Result<Self> {
         let (contract_store, delegate_store, secret_store, state_store) =
             Self::get_stores(&config).await?;
         let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
@@ -246,7 +246,7 @@ impl Executor<Runtime> {
                 }
                 Err(RequestError::Disconnect.into())
             }
-            _ => Err(ExecutorError::other("not supported")),
+            _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
         }
     }
 
@@ -272,8 +272,9 @@ impl Executor<Runtime> {
                 fetch_contract: contract,
             } => self.perform_contract_get(contract, key).await,
             ContractRequest::Subscribe { key, summary } => {
-                let updates =
-                    updates.ok_or_else(|| ExecutorError::other("missing update channel"))?;
+                let updates = updates.ok_or_else(|| {
+                    ExecutorError::other(anyhow::anyhow!("missing update channel"))
+                })?;
                 self.register_contract_notifier(key, cli_id, updates, summary)?;
                 // by default a subscribe op has an implicit get
                 let res = self.perform_contract_get(false, key).await?;
@@ -287,7 +288,7 @@ impl Executor<Runtime> {
                 }
                 Ok(res)
             }
-            _ => Err(ExecutorError::other("not supported")),
+            _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
         }
     }
 
@@ -381,13 +382,13 @@ impl Executor<Runtime> {
 
                     Err(err) => {
                         tracing::error!("failed executing delegate `{key}`: {err}");
-                        Err(ExecutorError::other(format!(
+                        Err(ExecutorError::other(anyhow::anyhow!(
                             "uncontrolled error while executing `{key}`"
                         )))
                     }
                 }
             }
-            _ => Err(ExecutorError::other("not supported")),
+            _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
         }
     }
 
@@ -719,7 +720,7 @@ impl Executor<Runtime> {
     async fn get_local_contract(
         &self,
         id: &ContractInstanceId,
-    ) -> Result<State<'static>, Either<Box<RequestError>, DynError>> {
+    ) -> Result<State<'static>, Either<Box<RequestError>, anyhow::Error>> {
         let Ok(contract) = self.state_store.get(&(*id).into()).await else {
             return Err(Either::Right(
                 StdContractError::MissingRelated { key: *id }.into(),

@@ -37,7 +37,7 @@ pub(super) struct NodeP2P {
 }
 
 impl NodeP2P {
-    pub(super) async fn run_node(self) -> Result<(), anyhow::Error> {
+    pub(super) async fn run_node(self) -> anyhow::Result<()> {
         if self.should_try_connect {
             connect::initial_join_procedure(
                 self.op_manager.clone(),
@@ -66,7 +66,7 @@ impl NodeP2P {
         clients: [BoxedClient; CLIENTS],
         event_register: ER,
         ch_builder: CH::Builder,
-    ) -> Result<NodeP2P, anyhow::Error>
+    ) -> anyhow::Result<NodeP2P>
     where
         CH: ContractHandler + Send + 'static,
         ER: NetEventRegister + Clone,

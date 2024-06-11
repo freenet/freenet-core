@@ -18,7 +18,7 @@ use super::{
 use crate::client_events::HostResult;
 use crate::config::Config;
 use crate::message::Transaction;
-use crate::{client_events::ClientId, wasm_runtime::Runtime, DynError};
+use crate::{client_events::ClientId, wasm_runtime::Runtime};
 
 pub(crate) struct ClientResponsesReceiver(UnboundedReceiver<(ClientId, HostResult)>);
 
@@ -60,7 +60,7 @@ pub(crate) trait ContractHandler {
         contract_handler_channel: ContractHandlerChannel<ContractHandlerHalve>,
         executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
         builder: Self::Builder,
-    ) -> impl Future<Output = Result<Self, DynError>> + Send
+    ) -> impl Future<Output = anyhow::Result<Self>> + Send
     where
         Self: Sized + 'static;
 
@@ -82,7 +82,7 @@ impl ContractHandler for NetworkContractHandler<Runtime> {
         channel: ContractHandlerChannel<ContractHandlerHalve>,
         executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
         config: Self::Builder,
-    ) -> Result<Self, DynError>
+    ) -> anyhow::Result<Self>
     where
         Self: Sized + 'static,
     {
@@ -108,7 +108,7 @@ impl ContractHandler for NetworkContractHandler<super::MockRuntime> {
         channel: ContractHandlerChannel<ContractHandlerHalve>,
         executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
         identifier: Self::Builder,
-    ) -> Result<Self, DynError>
+    ) -> anyhow::Result<Self>
     where
         Self: Sized + 'static,
     {
@@ -203,12 +203,12 @@ static EV_ID: AtomicU64 = AtomicU64::new(0);
 impl ContractHandlerChannel<WaitingResolution> {
     pub async fn relay_transaction_result_to_client(
         &mut self,
-    ) -> Result<(ClientId, Transaction), DynError> {
+    ) -> anyhow::Result<(ClientId, Transaction)> {
         self.end
             .wait_for_res_rx
             .recv()
             .await
-            .ok_or_else(|| "channel dropped".into())
+            .ok_or_else(|| anyhow::anyhow!("channel dropped"))
     }
 }
 
@@ -386,7 +386,7 @@ pub mod test {
     use crate::config::GlobalExecutor;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn channel_test() -> Result<(), anyhow::Error> {
+    async fn channel_test() -> anyhow::Result<()> {
         let (send_halve, mut rcv_halve, _) = contract_handler_channel();
 
         let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
@@ -441,7 +441,6 @@ pub(super) mod in_memory {
         },
         ContractHandler, ContractHandlerChannel, ContractHandlerHalve,
     };
-    use crate::DynError;
 
     pub(crate) struct MemoryContractHandler {
         channel: ContractHandlerChannel<ContractHandlerHalve>,
@@ -471,7 +470,7 @@ pub(super) mod in_memory {
             channel: ContractHandlerChannel<ContractHandlerHalve>,
             executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
             identifier: Self::Builder,
-        ) -> Result<Self, DynError>
+        ) -> anyhow::Result<Self>
         where
             Self: Sized + 'static,
         {
@@ -488,7 +487,7 @@ pub(super) mod in_memory {
     }
 
     #[test]
-    fn serialization() -> Result<(), anyhow::Error> {
+    fn serialization() -> anyhow::Result<()> {
         use freenet_stdlib::prelude::WrappedContract;
         let bytes = crate::util::test::random_bytes_1kb();
         let mut gen = arbitrary::Unstructured::new(&bytes);

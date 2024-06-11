@@ -23,7 +23,7 @@ enum FileType {
 #[derive(clap::Parser, Clone)]
 struct CodeInspection {}
 
-pub fn inspect(config: InspectConfig) -> Result<(), anyhow::Error> {
+pub fn inspect(config: InspectConfig) -> anyhow::Result<()> {
     if !config.file.exists() {
         return Err(Error::CommandFailed("couldn't find file").into());
     }
