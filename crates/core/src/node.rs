@@ -1014,7 +1014,7 @@ impl Display for PeerId {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
 
@@ -1022,12 +1022,17 @@ mod tests {
     async fn test_hostname_resolution() {
         let addr = Address::Hostname("localhost".to_string());
         let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
-        assert_eq!(
-            socket_addr,
-            SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                crate::config::default_http_gateway_port()
-            )
+        assert!(
+            socket_addr
+                == SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    crate::config::default_http_gateway_port()
+                )
+                || socket_addr
+                    == SocketAddr::new(
+                        IpAddr::V6(Ipv6Addr::LOCALHOST),
+                        crate::config::default_http_gateway_port()
+                    )
         );
 
         let addr = Address::Hostname("google.com".to_string());

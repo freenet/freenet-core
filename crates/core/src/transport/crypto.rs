@@ -1,4 +1,3 @@
-use pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey};
 use rand::rngs::OsRng;
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};
@@ -60,7 +59,9 @@ impl TransportPublicKey {
 
 impl std::fmt::Display for TransportPublicKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let encoded = self.0.to_pkcs1_der().map_err(|_| std::fmt::Error)?;
+        use pkcs8::EncodePublicKey;
+
+        let encoded = self.0.to_public_key_der().map_err(|_| std::fmt::Error)?;
         write!(
             f,
             "{}",
@@ -89,7 +90,9 @@ impl TransportSecretKey {
         self.0.decrypt(padding, data)
     }
 
-    pub fn to_bytes(&self) -> Result<Vec<u8>, pkcs1::Error> {
+    pub fn to_pkcs1_pem(&self) -> Result<Vec<u8>, pkcs1::Error> {
+        use pkcs1::EncodeRsaPrivateKey;
+
         #[cfg(unix)]
         let line_endings = pkcs1::LineEnding::LF;
 
@@ -98,6 +101,20 @@ impl TransportSecretKey {
 
         self.0
             .to_pkcs1_pem(line_endings)
+            .map(|s| s.as_str().as_bytes().to_vec())
+    }
+
+    pub fn to_pkcs8_pem(&self) -> Result<Vec<u8>, pkcs8::Error> {
+        use pkcs8::EncodePrivateKey;
+
+        #[cfg(unix)]
+        let line_endings = pkcs8::LineEnding::LF;
+
+        #[cfg(windows)]
+        let line_endings = pkcs8::LineEnding::CRLF;
+
+        self.0
+            .to_pkcs8_pem(line_endings)
             .map(|s| s.as_str().as_bytes().to_vec())
     }
 }
