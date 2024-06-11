@@ -425,7 +425,7 @@ mod test {
 
         let contract_store = ContractStore::new(contracts_dir, 10_000)?;
         let delegate_store = DelegateStore::new(delegates_dir, 10_000)?;
-        let secret_store = SecretsStore::new(secrets_dir)?;
+        let secret_store = SecretsStore::new(secrets_dir, Default::default())?;
 
         let mut runtime =
             Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();

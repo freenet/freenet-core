@@ -508,7 +508,7 @@ impl<R> Executor<R> {
 
         let delegate_store = DelegateStore::new(config.delegates_dir(), MAX_SIZE)?;
 
-        let secret_store = SecretsStore::new(config.secrets_dir())?;
+        let secret_store = SecretsStore::new(config.secrets_dir(), config.secrets.clone())?;
 
         Ok((contract_store, delegate_store, secret_store, state_store))
     }
