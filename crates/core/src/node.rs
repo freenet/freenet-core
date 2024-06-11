@@ -66,6 +66,10 @@ pub(crate) mod testing_impl;
 pub struct Node(NodeP2P);
 
 impl Node {
+    pub fn update_location(&mut self, location: Location) {
+        self.0.op_manager.ring.update_location(Some(location));
+    }
+
     pub async fn run(self) -> anyhow::Result<()> {
         self.0.run_node().await?;
         Ok(())

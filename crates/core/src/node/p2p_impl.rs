@@ -24,7 +24,7 @@ use crate::{
 
 use super::OpManager;
 
-pub(super) struct NodeP2P {
+pub(crate) struct NodeP2P {
     pub(crate) peer_pub_key: TransportPublicKey,
     pub(crate) op_manager: Arc<OpManager>,
     notification_channel: EventLoopNotificationsReceiver,
