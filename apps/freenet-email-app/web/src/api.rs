@@ -8,7 +8,7 @@ use freenet_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use futures::SinkExt;
 
 use crate::app::{ContractType, InboxController};
-
+use crate::DynError;
 
 type ClientRequester = UnboundedSender<ClientRequest<'static>>;
 type HostResponses = UnboundedReceiver<Result<HostResponse, ClientError>>;
@@ -161,7 +161,7 @@ mod contract_api {
         contract_code: &[u8],
         contract_state: impl Into<Vec<u8>>,
         params: &Parameters<'static>,
-    ) -> anyhow::Result<ContractKey> {
+    ) -> Result<ContractKey, DynError> {
         let contract = ContractContainer::try_from((contract_code.to_vec(), params))?;
         let key = contract.key();
         crate::log::debug!("putting contract {key}");
@@ -187,7 +187,7 @@ mod delegate_api {
         delegate_code_hash: &str,
         delegate_code: &[u8],
         params: &Parameters<'static>,
-    ) -> anyhow::Result<DelegateKey> {
+    ) -> Result<DelegateKey, DynError> {
         let key = DelegateKey::from_params(delegate_code_hash, params)?;
         let delegate = DelegateContainer::try_from((delegate_code.to_vec(), params))?;
         assert_eq!(&key, delegate.key());
@@ -220,7 +220,7 @@ mod inbox_management {
     pub(super) async fn create_contract(
         client: &mut WebApiRequestClient,
         private_key: RsaPrivateKey,
-    ) -> anyhow::Result<ContractKey> {
+    ) -> Result<ContractKey, DynError> {
         let pub_key = private_key.to_public_key();
         let params: Parameters = InboxParams { pub_key }.try_into()?;
         let state = {
@@ -256,7 +256,7 @@ mod token_record_management {
     pub(super) async fn create_contract(
         client: &mut WebApiRequestClient,
         private_key: RsaPrivateKey,
-    ) -> anyhow::Result<ContractKey> {
+    ) -> Result<ContractKey, DynError> {
         let pub_key = private_key.to_public_key();
         let params: Parameters = TokenDelegateParameters::new(pub_key).try_into()?;
         let contract_key = contract_api::create_contract(
@@ -295,7 +295,7 @@ mod token_generator_management {
     pub(super) async fn create_delegate(
         client: &mut WebApiRequestClient,
         private_key: RsaPrivateKey,
-    ) -> anyhow::Result<DelegateKey> {
+    ) -> Result<DelegateKey, DynError> {
         let params = DelegateParameters::new(private_key.clone()).try_into()?;
         let delegate_key =
             delegate_api::create_delegate(client, TOKEN_GEN_CODE_HASH, TOKEN_GEN_CODE, &params)
@@ -332,7 +332,7 @@ mod identity_management {
 
     pub(super) async fn create_delegate(
         client: &mut WebApiRequestClient,
-    ) -> anyhow::Result<DelegateKey> {
+    ) -> Result<DelegateKey, DynError> {
         let params = IdentityParams::try_from(ID_MANAGER_KEY)?;
         let params = params.try_into()?;
         let key =
@@ -354,7 +354,7 @@ mod identity_management {
 
     pub(super) async fn load_aliases(
         client: &mut WebApiRequestClient,
-    ) -> anyhow::Result<DelegateKey> {
+    ) -> Result<DelegateKey, DynError> {
         let params = IdentityParams::try_from(ID_MANAGER_KEY)?;
         let secret_id = params.as_secret_id();
         let params = Parameters::try_from(params)?;
@@ -437,7 +437,7 @@ mod identity_management {
         alias: Rc<str>,
         description: String,
         key: RsaPrivateKey,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), DynError> {
         crate::log::debug!("creating {alias}");
         let params = IdentityParams::try_from(ID_MANAGER_KEY)?;
         let params = params.try_into()?;
@@ -1092,11 +1092,11 @@ pub(crate) async fn node_comms(
     }
 }
 
-pub(crate) type AsyncActionResult = Result<(), (anyhow::Error, TryNodeAction)>;
+pub(crate) type AsyncActionResult = Result<(), (DynError, TryNodeAction)>;
 
 pub(crate) async fn node_response_error_handling(
     mut error_channel: NodeResponses,
-    res: anyhow::Result<()>,
+    res: Result<(), DynError>,
     action: TryNodeAction,
 ) {
     // todo: all errors should be handled properly and propagated to the UI if fitting

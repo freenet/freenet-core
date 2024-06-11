@@ -18,7 +18,7 @@ use freenet_email_inbox::InboxParams;
 
 use crate::api::{node_response_error_handling, TryNodeAction};
 use crate::inbox::MessageModel;
-use crate::{api::WebApiRequestClient, app::Identity, anyhow::Error};
+use crate::{api::WebApiRequestClient, app::Identity, DynError};
 
 pub(crate) const TOKEN_RECORD_CODE_HASH: &str =
     include_str!("../../../../modules/antiflood-tokens/contracts/token-allocation-record/build/token_allocation_record_code_hash");
@@ -82,7 +82,7 @@ impl AftRecords {
         client: &mut WebApiRequestClient,
         identity: &Identity,
         contract_to_id: &HashMap<AftRecord, Identity>,
-    ) -> anyhow::Result<AftRecord> {
+    ) -> Result<AftRecord, DynError> {
         let params = TokenDelegateParameters::new(identity.key.to_public_key())
             .try_into()
             .map_err(|e| format!("{e}"))?;
@@ -110,7 +110,7 @@ impl AftRecords {
         client: &mut WebApiRequestClient,
         aft_record: AftRecordId,
         summary: TokenAllocationSummary,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), DynError> {
         let Some(confirmed) = PENDING_CONFIRMED_ASSIGNMENTS.with(|pending| {
             let pending = &mut *pending.borrow_mut();
             pending.get_mut(&aft_record).and_then(|registers| {
@@ -134,7 +134,7 @@ impl AftRecords {
     pub async fn allocated_assignment(
         client: &mut WebApiRequestClient,
         record: TokenAssignment,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), DynError> {
         let Some(inbox) = PENDING_INBOXES_UPDATES.with(|queue| {
             queue.borrow().iter().find_map(|(inbox, hash)| {
                 if &record.assignment_hash == hash {
@@ -177,7 +177,7 @@ impl AftRecords {
         recipient_key: RsaPublicKey,
         generator_id: &Identity,
         assignment_hash: [u8; 32],
-    ) -> anyhow::Result<DelegateKey> {
+    ) -> Result<DelegateKey, DynError> {
         static REQUEST_ID: AtomicU32 = AtomicU32::new(0);
         let sender_key = generator_id.key.to_public_key();
         let token_params: Parameters = DelegateParameters::new(generator_id.clone().key)
@@ -247,7 +247,7 @@ impl AftRecords {
         identity: Identity,
         state: State<'_>,
         key: &ContractKey,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), DynError> {
         crate::log::debug!(
             "setting AFT record contract for `{alias}` ({key})",
             alias = identity.alias
@@ -260,7 +260,7 @@ impl AftRecords {
         Ok(())
     }
 
-    pub fn update_record(identity: Identity, update_data: UpdateData) -> anyhow::Result<()> {
+    pub fn update_record(identity: Identity, update_data: UpdateData) -> Result<(), DynError> {
         let record = match update_data {
             StateUpdate(state) => {
                 crate::log::debug!(
@@ -274,7 +274,7 @@ impl AftRecords {
                 TokenAllocationRecord::try_from(delta)?
             }
             _ => {
-                return Err(anyhow::Error::from(
+                return Err(DynError::from(
                     "Unexpected update data type while updating the record",
                 ));
             }
@@ -286,7 +286,7 @@ impl AftRecords {
         Ok(())
     }
 
-    async fn get_state(client: &mut WebApiRequestClient, key: AftRecord) -> anyhow::Result<()> {
+    async fn get_state(client: &mut WebApiRequestClient, key: AftRecord) -> Result<(), DynError> {
         let request = ContractRequest::Get {
             key,
             fetch_contract: false,
@@ -298,7 +298,7 @@ impl AftRecords {
     pub async fn subscribe(
         client: &mut WebApiRequestClient,
         key: AftRecord,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), DynError> {
         // todo: send the proper summary from the current state
         let request = ContractRequest::Subscribe { key, summary: None };
         client.send(request.into()).await?;
