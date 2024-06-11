@@ -1541,7 +1541,7 @@ dependencies = [
  "parking_lot",
  "pav_regression",
  "pico-args",
- "pkcs1",
+ "pkcs8",
  "rand",
  "redb",
  "reqwest",
