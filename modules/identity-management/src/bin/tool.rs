@@ -1,6 +1,6 @@
 use std::{
     path::PathBuf,
-    fs::{self, File},
+    fs,
 };
 
 use freenet_stdlib::prelude::Parameters;
@@ -16,7 +16,6 @@ Options:
  -c --code      Compiles the contract and saves the code hash
 "#;
 
-type anyhow::Error = Box<dyn std::error::Error>;
 struct Args {
     path: PathBuf,
     key: Option<PathBuf>,
@@ -37,7 +36,7 @@ impl Args {
         if !path.exists() {
             fs::create_dir_all(&path)?;
         } else if !path.is_dir() {
-            return Err("path must be a directory".into());
+            anyhow::bail!("path must be a directory")
         }
         Ok(Args { path, key })
     }
