@@ -18,14 +18,13 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
 
-use super::packet_data::SymmetricAES;
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
-    packet_data::MAX_PACKET_SIZE,
+    packet_data::{PacketData, SymmetricAES, MAX_PACKET_SIZE},
     peer_connection::{PeerConnection, RemoteConnection},
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
-    PacketData, Socket, TransportError,
+    Socket, TransportError,
 };
 
 const PROTOC_VERSION: [u8; 2] = 1u16.to_le_bytes();
@@ -79,8 +78,18 @@ pub(crate) async fn create_connection_handler<S: Socket>(
     ))
 }
 
+/// Receives  new inbound connections from the network.
 pub(crate) struct InboundConnectionHandler {
     new_connection_notifier: mpsc::Receiver<PeerConnection>,
+}
+
+#[cfg(test)]
+impl InboundConnectionHandler {
+    pub fn new(new_connection_notifier: mpsc::Receiver<PeerConnection>) -> Self {
+        InboundConnectionHandler {
+            new_connection_notifier,
+        }
+    }
 }
 
 impl InboundConnectionHandler {
@@ -89,9 +98,17 @@ impl InboundConnectionHandler {
     }
 }
 
+/// Requests a new outbound connection to a remote peer.
 #[derive(Clone)]
 pub(crate) struct OutboundConnectionHandler {
     send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>,
+}
+
+#[cfg(test)]
+impl OutboundConnectionHandler {
+    pub fn new(send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>) -> Self {
+        OutboundConnectionHandler { send_queue }
+    }
 }
 
 impl OutboundConnectionHandler {
@@ -132,7 +149,7 @@ impl OutboundConnectionHandler {
     }
 
     #[cfg(test)]
-    fn test_set_up(
+    fn new_test(
         socket_addr: SocketAddr,
         socket: Arc<impl Socket>,
         keypair: TransportKeypair,
@@ -811,7 +828,7 @@ impl<S: Socket> UdpPacketsListener<S> {
     }
 }
 
-enum ConnectionEvent {
+pub(crate) enum ConnectionEvent {
     ConnectionStart {
         remote_public_key: TransportPublicKey,
         open_connection: oneshot::Sender<Result<RemoteConnection, TransportError>>,
@@ -1026,7 +1043,7 @@ mod test {
         let socket = Arc::new(
             MockSocket::test_config(packet_drop_policy, (Ipv4Addr::LOCALHOST, port).into()).await,
         );
-        let (peer_conn, inbound_conn) = OutboundConnectionHandler::test_set_up(
+        let (peer_conn, inbound_conn) = OutboundConnectionHandler::new_test(
             (Ipv4Addr::LOCALHOST, port).into(),
             socket,
             peer_keypair,

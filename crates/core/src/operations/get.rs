@@ -293,7 +293,7 @@ impl Operation for GetOp {
                         transfer_time: None,
                         first_response_time: None,
                     }));
-                    let own_loc = op_manager.ring.own_location();
+                    let own_loc = op_manager.ring.connection_manager.own_location();
                     return_msg = Some(GetMsg::SeekNode {
                         key: *key,
                         id: *id,
@@ -564,7 +564,7 @@ impl Operation for GetOp {
                                 let is_subscribed_contract =
                                     op_manager.ring.is_seeding_contract(&key);
                                 if !is_subscribed_contract && should_subscribe {
-                                    tracing::debug!(tx = %id, %key, peer = %op_manager.ring.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
+                                    tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
                                     super::start_subscription_request(op_manager, key, false).await;
                                 }
                             }
@@ -730,7 +730,7 @@ async fn try_forward_or_return(
                     state: None,
                     contract: None,
                 },
-                sender: op_manager.ring.own_location(),
+                sender: op_manager.ring.connection_manager.own_location(),
                 target: sender, // return to requester
                 skip_list: new_skip_list,
             }),

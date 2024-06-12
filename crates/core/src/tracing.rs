@@ -116,7 +116,7 @@ pub(crate) struct NetEventLog<'a> {
 
 impl<'a> NetEventLog<'a> {
     pub fn route_event(tx: &'a Transaction, ring: &'a Ring, route_event: &RouteEvent) -> Self {
-        let peer_id = ring.get_peer_key().unwrap().clone();
+        let peer_id = ring.connection_manager.get_peer_key().unwrap().clone();
         NetEventLog {
             tx,
             peer_id,
@@ -125,12 +125,12 @@ impl<'a> NetEventLog<'a> {
     }
 
     pub fn connected(ring: &'a Ring, peer: PeerId, location: Location) -> Self {
-        let peer_id = ring.get_peer_key().unwrap().clone();
+        let peer_id = ring.connection_manager.get_peer_key().unwrap().clone();
         NetEventLog {
             tx: Transaction::NULL,
             peer_id,
             kind: EventKind::Connect(ConnectEvent::Connected {
-                this: ring.own_location(),
+                this: ring.connection_manager.own_location(),
                 connected: PeerKeyLocation {
                     peer,
                     location: Some(location),
@@ -140,7 +140,7 @@ impl<'a> NetEventLog<'a> {
     }
 
     pub fn disconnected(ring: &'a Ring, from: &'a PeerId) -> Self {
-        let peer_id = ring.get_peer_key().unwrap().clone();
+        let peer_id = ring.connection_manager.get_peer_key().unwrap().clone();
         NetEventLog {
             tx: Transaction::NULL,
             peer_id,
@@ -149,7 +149,7 @@ impl<'a> NetEventLog<'a> {
     }
 
     pub fn from_outbound_msg(msg: &'a NetMessage, ring: &'a Ring) -> Either<Self, Vec<Self>> {
-        let Some(peer_id) = ring.get_peer_key() else {
+        let Some(peer_id) = ring.connection_manager.get_peer_key() else {
             return Either::Right(vec![]);
         };
         let kind = match msg {
@@ -160,7 +160,7 @@ impl<'a> NetEventLog<'a> {
                     },
                 ..
             })) => {
-                let this_peer = ring.own_location();
+                let this_peer = ring.connection_manager.own_location();
                 if *accepted {
                     EventKind::Connect(ConnectEvent::Connected {
                         this: this_peer,
@@ -197,7 +197,7 @@ impl<'a> NetEventLog<'a> {
                     },
                 ..
             }) => {
-                let this_peer = &op_manager.ring.get_peer_key().unwrap();
+                let this_peer = &op_manager.ring.connection_manager.get_peer_key().unwrap();
                 let mut events = vec![];
                 if *accepted {
                     events.push(NetEventLog {
@@ -217,7 +217,7 @@ impl<'a> NetEventLog<'a> {
                 id,
                 ..
             }) => {
-                let this_peer = &op_manager.ring.get_peer_key().unwrap();
+                let this_peer = &op_manager.ring.connection_manager.get_peer_key().unwrap();
                 let key = contract.key();
                 EventKind::Put(PutEvent::Request {
                     requester: this_peer.clone(),
@@ -229,7 +229,7 @@ impl<'a> NetEventLog<'a> {
             NetMessageV1::Put(PutMsg::SuccessfulPut { id, target, key }) => {
                 EventKind::Put(PutEvent::PutSuccess {
                     id: *id,
-                    requester: op_manager.ring.get_peer_key().unwrap(),
+                    requester: op_manager.ring.connection_manager.get_peer_key().unwrap(),
                     target: target.clone(),
                     key: *key,
                 })
@@ -272,7 +272,12 @@ impl<'a> NetEventLog<'a> {
         };
         Either::Left(NetEventLog {
             tx: msg.id(),
-            peer_id: op_manager.ring.get_peer_key().unwrap().clone(),
+            peer_id: op_manager
+                .ring
+                .connection_manager
+                .get_peer_key()
+                .unwrap()
+                .clone(),
             kind,
         })
     }

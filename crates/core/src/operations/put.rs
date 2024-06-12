@@ -142,7 +142,7 @@ impl Operation for PutOp {
                     htl,
                     target,
                 } => {
-                    let sender = op_manager.ring.own_location();
+                    let sender = op_manager.ring.connection_manager.own_location();
 
                     let key = contract.key();
                     tracing::debug!(
@@ -267,7 +267,7 @@ impl Operation for PutOp {
                     contract,
                     sender,
                 } => {
-                    let target = op_manager.ring.own_location();
+                    let target = op_manager.ring.connection_manager.own_location();
 
                     tracing::debug!("Attempting contract value update");
                     let new_value = put_contract(
@@ -314,7 +314,7 @@ impl Operation for PutOp {
                     contract,
                     upstream,
                 } => {
-                    let sender = op_manager.ring.own_location();
+                    let sender = op_manager.ring.connection_manager.own_location();
                     let mut broadcasted_to = *broadcasted_to;
 
                     let mut broadcasting = Vec::with_capacity(broadcast_to.len());
@@ -373,13 +373,13 @@ impl Operation for PutOp {
                         Some(PutState::AwaitingResponse { key, upstream }) => {
                             let is_subscribed_contract = op_manager.ring.is_seeding_contract(&key);
                             if !is_subscribed_contract && op_manager.ring.should_seed(&key) {
-                                tracing::debug!(tx = %id, %key, peer = %op_manager.ring.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
+                                tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
                                 super::start_subscription_request(op_manager, key, true).await;
                             }
                             tracing::info!(
                                 tx = %id,
                                 %key,
-                                this_peer = %op_manager.ring.get_peer_key().unwrap(),
+                                this_peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
                                 "Peer completed contract value put",
                             );
                             new_state = Some(PutState::Finished { key });
@@ -405,7 +405,7 @@ impl Operation for PutOp {
                     skip_list,
                 } => {
                     let key = contract.key();
-                    let peer_loc = op_manager.ring.own_location();
+                    let peer_loc = op_manager.ring.connection_manager.own_location();
 
                     tracing::debug!(
                         %key,
@@ -462,7 +462,11 @@ impl Operation for PutOp {
                                             NetMessage::V1(NetMessageV1::Unsubscribed {
                                                 transaction: Transaction::new::<PutMsg>(),
                                                 key,
-                                                from: op_manager.ring.get_peer_key().unwrap(),
+                                                from: op_manager
+                                                    .ring
+                                                    .connection_manager
+                                                    .get_peer_key()
+                                                    .unwrap(),
                                             }),
                                         )
                                         .await?;
@@ -655,7 +659,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
         return Err(OpError::UnexpectedOpState);
     };
 
-    let sender = op_manager.ring.own_location();
+    let sender = op_manager.ring.connection_manager.own_location();
 
     // the initial request must provide:
     // - a peer as close as possible to the contract location
@@ -762,7 +766,7 @@ where
     let forward_to = op_manager
         .ring
         .closest_potentially_caching(&key, &*skip_list);
-    let own_pkloc = op_manager.ring.own_location();
+    let own_pkloc = op_manager.ring.connection_manager.own_location();
     let own_loc = own_pkloc.location.expect("infallible");
     if let Some(peer) = forward_to {
         let other_loc = peer.location.as_ref().expect("infallible");
