@@ -7,7 +7,7 @@ use super::{
     network_bridge::{
         event_loop_notification_channel, p2p_protoc::P2pConnManager, EventLoopNotificationsReceiver,
     },
-    NetEventRegister,
+    NetEventRegister, PeerId,
 };
 use crate::transport::TransportPublicKey;
 use crate::{
@@ -34,6 +34,8 @@ pub(crate) struct NodeP2P {
     cli_response_sender: ClientResponsesSender,
     node_controller: tokio::sync::mpsc::Receiver<NodeEvent>,
     should_try_connect: bool,
+    pub(super) peer_id: Option<PeerId>,
+    pub(super) is_gateway: bool,
 }
 
 impl NodeP2P {
@@ -118,6 +120,8 @@ impl NodeP2P {
             cli_response_sender,
             node_controller: node_controller_rx,
             should_try_connect: config.should_connect,
+            peer_id: config.peer_id,
+            is_gateway: config.is_gateway,
         })
     }
 }

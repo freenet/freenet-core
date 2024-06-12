@@ -14,7 +14,7 @@ use http_gateway::HttpGateway;
 use tower_http::trace::TraceLayer;
 
 use crate::{
-    client_events::{websocket::WebSocketProxy, AuthToken, ClientId, HostResult},
+    client_events::{websocket::WebSocketProxy, AuthToken, BoxedClient, ClientId, HostResult},
     config::WebsocketApiConfig,
 };
 
@@ -181,7 +181,12 @@ pub mod local_node {
     }
 }
 
-pub(crate) async fn serve_gateway(config: WebsocketApiConfig) -> (HttpGateway, WebSocketProxy) {
+pub async fn serve_gateway(config: WebsocketApiConfig) -> [BoxedClient; 2] {
+    let (gw, ws_proxy) = serve_gateway_in(config).await;
+    [Box::new(gw), Box::new(ws_proxy)]
+}
+
+pub(crate) async fn serve_gateway_in(config: WebsocketApiConfig) -> (HttpGateway, WebSocketProxy) {
     let ws_socket = (config.address, config.port).into();
     let (gw, gw_router) = HttpGateway::as_router(&ws_socket);
     let (ws_proxy, ws_router) = WebSocketProxy::as_router(gw_router);

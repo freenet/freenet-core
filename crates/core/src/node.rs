@@ -1031,7 +1031,7 @@ pub async fn run_local_node(
         _ => {}
     }
 
-    let (mut gw, mut ws_proxy) = crate::server::serve_gateway(socket).await;
+    let (mut gw, mut ws_proxy) = crate::server::serve_gateway_in(socket).await;
 
     // TODO: use combinator instead
     // let mut all_clients =
@@ -1126,34 +1126,23 @@ pub async fn run_local_node(
     }
 }
 
-pub async fn run_network_node(config: Config) -> anyhow::Result<()> {
-    let (gw, ws_proxy) = crate::server::serve_gateway(config.ws_api).await;
+pub async fn run_network_node(mut node: Node) -> anyhow::Result<()> {
+    tracing::info!("Starting node");
 
-    tracing::info!("Initializing node configuration");
-    let node_config = NodeConfig::new(config)
-        .await
-        .with_context(|| "failed while loading node config")?;
-
-    let is_gateway = node_config.is_gateway;
+    let is_gateway = node.0.is_gateway;
     let location = is_gateway
         .then(|| {
-            node_config
+            node.0
                 .peer_id
                 .clone()
                 .map(|id| Location::from_address(&id.addr()))
         })
         .flatten();
-    let mut node = node_config
-        .build([Box::new(gw), Box::new(ws_proxy)])
-        .await
-        .with_context(|| "failed while building the node")?;
 
     if let Some(location) = location {
         tracing::info!("Setting initial location: {location}");
         node.update_location(location);
     }
-
-    tracing::info!("Starting node");
 
     match node.run().await {
         Ok(_) => {
