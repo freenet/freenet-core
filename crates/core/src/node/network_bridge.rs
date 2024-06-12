@@ -10,6 +10,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use super::PeerId;
 use crate::message::{NetMessage, NodeEvent};
 
+mod connector;
 pub(crate) mod in_memory;
 pub(crate) mod p2p_protoc;
 

@@ -26,7 +26,9 @@ use self::{packet_data::PacketData, peer_connection::StreamId};
 
 pub use self::crypto::TransportKeypair;
 pub(crate) use self::{
-    connection_handler::{create_connection_handler, OutboundConnectionHandler},
+    connection_handler::{
+        create_connection_handler, InboundConnectionHandler, OutboundConnectionHandler,
+    },
     crypto::TransportPublicKey,
     peer_connection::PeerConnection,
 };

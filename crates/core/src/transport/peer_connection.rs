@@ -35,16 +35,16 @@ type Result<T = (), E = TransportError> = std::result::Result<T, E>;
 const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 100;
 
 #[must_use]
-pub(super) struct RemoteConnection {
-    pub outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
-    pub outbound_symmetric_key: Aes128Gcm,
-    pub remote_addr: SocketAddr,
-    pub sent_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
-    pub last_packet_id: Arc<AtomicU32>,
-    pub inbound_packet_recv: mpsc::Receiver<PacketData<UnknownEncryption>>,
-    pub inbound_symmetric_key: Aes128Gcm,
-    pub inbound_symmetric_key_bytes: [u8; 16],
-    pub my_address: Option<SocketAddr>,
+pub(crate) struct RemoteConnection {
+    pub(super) outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
+    pub(super) outbound_symmetric_key: Aes128Gcm,
+    pub(super) remote_addr: SocketAddr,
+    pub(super) sent_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
+    pub(super) last_packet_id: Arc<AtomicU32>,
+    pub(super) inbound_packet_recv: mpsc::Receiver<PacketData<UnknownEncryption>>,
+    pub(super) inbound_symmetric_key: Aes128Gcm,
+    pub(super) inbound_symmetric_key_bytes: [u8; 16],
+    pub(super) my_address: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

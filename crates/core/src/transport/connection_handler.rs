@@ -83,6 +83,15 @@ pub(crate) struct InboundConnectionHandler {
     new_connection_notifier: mpsc::Receiver<PeerConnection>,
 }
 
+#[cfg(test)]
+impl InboundConnectionHandler {
+    pub fn new(new_connection_notifier: mpsc::Receiver<PeerConnection>) -> Self {
+        InboundConnectionHandler {
+            new_connection_notifier,
+        }
+    }
+}
+
 impl InboundConnectionHandler {
     pub async fn next_connection(&mut self) -> Option<PeerConnection> {
         self.new_connection_notifier.recv().await
@@ -92,6 +101,13 @@ impl InboundConnectionHandler {
 #[derive(Clone)]
 pub(crate) struct OutboundConnectionHandler {
     send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>,
+}
+
+#[cfg(test)]
+impl OutboundConnectionHandler {
+    pub fn new(send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>) -> Self {
+        OutboundConnectionHandler { send_queue }
+    }
 }
 
 impl OutboundConnectionHandler {
@@ -811,7 +827,7 @@ impl<S: Socket> UdpPacketsListener<S> {
     }
 }
 
-enum ConnectionEvent {
+pub(crate) enum ConnectionEvent {
     ConnectionStart {
         remote_public_key: TransportPublicKey,
         open_connection: oneshot::Sender<Result<RemoteConnection, TransportError>>,
