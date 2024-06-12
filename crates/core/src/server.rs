@@ -181,33 +181,29 @@ pub mod network_node {
 
     use crate::{
         client_events::websocket::WebSocketProxy,
-        config::Config,
         dev_tool::{Location, NodeConfig},
     };
 
     use super::{http_gateway::HttpGateway, serve};
 
-    pub async fn run_network_node(config: Config) -> anyhow::Result<()> {
-        let ws_socket = (config.ws_api.address, config.ws_api.port).into();
+    pub async fn run_network_node(config: NodeConfig) -> anyhow::Result<()> {
+        let ws_socket = (config.config.ws_api.address, config.config.ws_api.port).into();
         let (gw, gw_router) = HttpGateway::as_router(&ws_socket);
         let (ws_proxy, ws_router) = WebSocketProxy::as_router(gw_router);
         serve(ws_socket, ws_router.layer(TraceLayer::new_for_http()));
 
         tracing::info!("Initializing node configuration");
 
-        let node_config = NodeConfig::new(config)
-            .await
-            .with_context(|| "failed while loading node config")?;
-        let is_gateway = node_config.is_gateway;
+        let is_gateway = config.is_gateway;
         let location = is_gateway
             .then(|| {
-                node_config
+                config
                     .peer_id
                     .clone()
                     .map(|id| Location::from_address(&id.addr()))
             })
             .flatten();
-        let mut node = node_config
+        let mut node = config
             .build([Box::new(gw), Box::new(ws_proxy)])
             .await
             .with_context(|| "failed while building the node")?;

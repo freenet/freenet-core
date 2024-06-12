@@ -1,6 +1,8 @@
+use anyhow::Context;
 use clap::Parser;
 use freenet::{
     config::{Config, ConfigArgs},
+    dev_tool::NodeConfig,
     local_node::{Executor, OperationMode},
     server::{local_node::run_local_node, network_node::run_network_node},
 };
@@ -29,7 +31,11 @@ async fn run_local(config: Config) -> anyhow::Result<()> {
 
 async fn run_network(config: Config) -> anyhow::Result<()> {
     tracing::info!("Starting freenet node in network mode");
-    run_network_node(config).await
+
+    let node_config = NodeConfig::new(config)
+        .await
+        .with_context(|| "failed while loading node config")?;
+    run_network_node(node_config).await
 }
 
 fn main() -> anyhow::Result<()> {
