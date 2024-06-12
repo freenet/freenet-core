@@ -10,7 +10,13 @@ use freenet_stdlib::{
     prelude::*,
 };
 
-use crate::client_events::{AuthToken, ClientId, HostResult};
+use http_gateway::HttpGateway;
+use tower_http::trace::TraceLayer;
+
+use crate::{
+    client_events::{websocket::WebSocketProxy, AuthToken, ClientId, HostResult},
+    config::WebsocketApiConfig,
+};
 
 pub use app_packaging::WebApp;
 
@@ -175,60 +181,10 @@ pub mod local_node {
     }
 }
 
-pub mod network_node {
-    use anyhow::Context;
-    use tower_http::trace::TraceLayer;
-
-    use crate::{
-        client_events::websocket::WebSocketProxy,
-        dev_tool::{Location, NodeConfig},
-    };
-
-    use super::{http_gateway::HttpGateway, serve};
-
-    pub async fn run_network_node(config: NodeConfig) -> anyhow::Result<()> {
-        let ws_socket = (config.config.ws_api.address, config.config.ws_api.port).into();
-        let (gw, gw_router) = HttpGateway::as_router(&ws_socket);
-        let (ws_proxy, ws_router) = WebSocketProxy::as_router(gw_router);
-        serve(ws_socket, ws_router.layer(TraceLayer::new_for_http()));
-
-        tracing::info!("Initializing node configuration");
-
-        let is_gateway = config.is_gateway;
-        let location = is_gateway
-            .then(|| {
-                config
-                    .peer_id
-                    .clone()
-                    .map(|id| Location::from_address(&id.addr()))
-            })
-            .flatten();
-        let mut node = config
-            .build([Box::new(gw), Box::new(ws_proxy)])
-            .await
-            .with_context(|| "failed while building the node")?;
-
-        if let Some(location) = location {
-            tracing::info!("Setting initial location: {location}");
-            node.update_location(location);
-        }
-
-        tracing::info!("Starting node");
-
-        match node.run().await {
-            Ok(_) => {
-                if is_gateway {
-                    tracing::info!("Gateway finished");
-                } else {
-                    tracing::info!("Node finished");
-                }
-
-                Ok(())
-            }
-            Err(e) => {
-                tracing::error!("{e}");
-                Err(e)
-            }
-        }
-    }
+pub(crate) async fn serve_gateway(config: WebsocketApiConfig) -> (HttpGateway, WebSocketProxy) {
+    let ws_socket = (config.address, config.port).into();
+    let (gw, gw_router) = HttpGateway::as_router(&ws_socket);
+    let (ws_proxy, ws_router) = WebSocketProxy::as_router(gw_router);
+    serve(ws_socket, ws_router.layer(TraceLayer::new_for_http()));
+    (gw, ws_proxy)
 }

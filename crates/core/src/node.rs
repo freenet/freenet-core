@@ -32,11 +32,12 @@ use tracing::Instrument;
 use self::p2p_impl::NodeP2P;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
-    config::{Address, GatewayConfig, GlobalExecutor},
+    config::{Address, GatewayConfig, GlobalExecutor, WebsocketApiConfig},
     contract::{
-        Callback, ClientResponsesReceiver, ClientResponsesSender, ContractError,
+        Callback, ClientResponsesReceiver, ClientResponsesSender, ContractError, ExecutorError,
         ExecutorToEventLoopChannel, NetworkContractHandler,
     },
+    local_node::Executor,
     message::{NetMessage, NodeEvent, Transaction, TransactionType},
     operations::{
         connect::{self, ConnectOp},
@@ -1013,6 +1014,161 @@ impl std::fmt::Debug for PeerId {
 impl Display for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.addr)
+    }
+}
+
+pub async fn run_local_node(
+    mut executor: Executor,
+    socket: WebsocketApiConfig,
+) -> anyhow::Result<()> {
+    match socket.address {
+        IpAddr::V4(ip) if !ip.is_loopback() => {
+            anyhow::bail!("invalid ip: {ip}, expecting localhost")
+        }
+        IpAddr::V6(ip) if !ip.is_loopback() => {
+            anyhow::bail!("invalid ip: {ip}, expecting localhost")
+        }
+        _ => {}
+    }
+
+    let (mut gw, mut ws_proxy) = crate::server::serve_gateway(socket).await;
+
+    // TODO: use combinator instead
+    // let mut all_clients =
+    //    ClientEventsCombinator::new([Box::new(ws_handle), Box::new(http_handle)]);
+    enum Receiver {
+        Ws,
+        Gw,
+    }
+    let mut receiver;
+    loop {
+        let req = tokio::select! {
+            req = ws_proxy.recv() => {
+                receiver = Receiver::Ws;
+                req?
+            }
+            req = gw.recv() => {
+                receiver = Receiver::Gw;
+                req?
+            }
+        };
+        let OpenRequest {
+            client_id: id,
+            request,
+            notification_channel,
+            token,
+            ..
+        } = req;
+        tracing::trace!(cli_id = %id, "got request -> {request}");
+
+        let res = match *request {
+            ClientRequest::ContractOp(op) => {
+                executor
+                    .contract_requests(op, id, notification_channel)
+                    .await
+            }
+            ClientRequest::DelegateOp(op) => {
+                let attested_contract =
+                    token.and_then(|token| gw.attested_contracts.get(&token).map(|(t, _)| t));
+                executor.delegate_request(op, attested_contract)
+            }
+            ClientRequest::Disconnect { cause } => {
+                if let Some(cause) = cause {
+                    tracing::info!("disconnecting cause: {cause}");
+                }
+                // fixme: token must live for a bit to allow reconnections
+                if let Some(rm_token) = gw
+                    .attested_contracts
+                    .iter()
+                    .find_map(|(k, (_, eid))| (eid == &id).then(|| k.clone()))
+                {
+                    gw.attested_contracts.remove(&rm_token);
+                }
+                continue;
+            }
+            _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
+        };
+
+        match res {
+            Ok(res) => {
+                match receiver {
+                    Receiver::Ws => ws_proxy.send(id, Ok(res)).await?,
+                    Receiver::Gw => gw.send(id, Ok(res)).await?,
+                };
+            }
+            Err(err) if err.is_request() => {
+                let err = ErrorKind::RequestError(err.unwrap_request());
+                match receiver {
+                    Receiver::Ws => {
+                        ws_proxy.send(id, Err(err.into())).await?;
+                    }
+                    Receiver::Gw => {
+                        gw.send(id, Err(err.into())).await?;
+                    }
+                };
+            }
+            Err(err) => {
+                tracing::error!("{err}");
+                let err = Err(ErrorKind::Unhandled {
+                    cause: format!("{err}").into(),
+                }
+                .into());
+                match receiver {
+                    Receiver::Ws => {
+                        ws_proxy.send(id, err).await?;
+                    }
+                    Receiver::Gw => {
+                        gw.send(id, err).await?;
+                    }
+                };
+            }
+        }
+    }
+}
+
+pub async fn run_network_node(config: Config) -> anyhow::Result<()> {
+    let (gw, ws_proxy) = crate::server::serve_gateway(config.ws_api).await;
+
+    tracing::info!("Initializing node configuration");
+    let node_config = NodeConfig::new(config)
+        .await
+        .with_context(|| "failed while loading node config")?;
+
+    let is_gateway = node_config.is_gateway;
+    let location = is_gateway
+        .then(|| {
+            node_config
+                .peer_id
+                .clone()
+                .map(|id| Location::from_address(&id.addr()))
+        })
+        .flatten();
+    let mut node = node_config
+        .build([Box::new(gw), Box::new(ws_proxy)])
+        .await
+        .with_context(|| "failed while building the node")?;
+
+    if let Some(location) = location {
+        tracing::info!("Setting initial location: {location}");
+        node.update_location(location);
+    }
+
+    tracing::info!("Starting node");
+
+    match node.run().await {
+        Ok(_) => {
+            if is_gateway {
+                tracing::info!("Gateway finished");
+            } else {
+                tracing::info!("Node finished");
+            }
+
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("{e}");
+            Err(e)
+        }
     }
 }
 
