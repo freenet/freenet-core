@@ -35,7 +35,7 @@ impl std::ops::Deref for HttpGatewayRequest {
 /// [specification](https://docs.freenet.org/glossary.html#container-contract) for Locutus.
 ///
 /// Check the Locutus book for [more information](https://docs.freenet.org/dev-guide.html).
-pub(super) struct HttpGateway {
+pub(crate) struct HttpGateway {
     pub attested_contracts: HashMap<AuthToken, (ContractInstanceId, ClientId)>,
     proxy_server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,

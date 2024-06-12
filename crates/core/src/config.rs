@@ -457,6 +457,15 @@ pub struct WebsocketApiConfig {
     pub port: u16,
 }
 
+impl From<SocketAddr> for WebsocketApiConfig {
+    fn from(addr: SocketAddr) -> Self {
+        Self {
+            address: addr.ip(),
+            port: addr.port(),
+        }
+    }
+}
+
 impl Default for WebsocketApiConfig {
     #[inline]
     fn default() -> Self {
