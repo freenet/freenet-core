@@ -1,8 +1,10 @@
+//! Handles initial connection handshake.
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
 };
 
+use either::Either;
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -14,23 +16,28 @@ use crate::{
     },
 };
 
-pub(super) enum Action {
-    None,
-    RemoveTransaction(Transaction),
-}
-
 type OutboundConnResult = (PeerId, Result<PeerConnection, TransportError>);
 
 pub(super) enum Event {
+    /// An inbound connection to a peer was successfully established at a gateway.
     InboundConnection(PeerConnection),
+    /// An outbound connection to a peer was successfully established.
     OutboundConnectionSuccessful {
         peer_id: PeerId,
         connection: PeerConnection,
     },
+    /// An outbound connection to a peer failed to be established.
     OutboundConnectionFailed {
         peer_id: PeerId,
         error: TransportError,
     },
+    /// An outbound connection to a gateway was rejected.
+    OutboundConnectionRejected {
+        peer_id: PeerId,
+        error: TransportError,
+    },
+    /// Clean up a transaction that was completed.
+    RemoveTransaction(Transaction),
 }
 
 /// Use for sending messages to a peer which has not yet been confirmed at a logical level
@@ -47,31 +54,34 @@ impl OutboundMessage {
 }
 
 /// Handles initial connection handshake.
-pub(super) struct Connector {
+pub(super) struct HandshakeHandler {
     is_gateway: bool,
     connecting: HashMap<SocketAddr, Transaction>,
     connected: HashSet<SocketAddr>,
     inbound_conn_handler: InboundConnectionHandler,
     outbound_conn_handler: OutboundConnectionHandler,
-    ongoing_connections: FuturesUnordered<BoxFuture<'static, OutboundConnResult>>,
+    ongoing_outbound_connections: FuturesUnordered<BoxFuture<'static, OutboundConnResult>>,
+    unconfirmed_inbound_connections:
+        FuturesUnordered<BoxFuture<'static, Either<PeerConnection, ()>>>,
     pending_msg_rx: Receiver<(SocketAddr, NetMessage)>,
     establish_connection_rx: Receiver<(PeerId, Transaction)>,
 }
 
-impl Connector {
+impl HandshakeHandler {
     pub fn new(
         inbound_conn_handler: InboundConnectionHandler,
         outbound_conn_handler: OutboundConnectionHandler,
     ) -> (Self, EstablishConnection, OutboundMessage) {
         let (pending_msg_tx, pending_msg_rx) = tokio::sync::mpsc::channel(100);
         let (establish_connection_tx, establish_connection_rx) = tokio::sync::mpsc::channel(100);
-        let connector = Connector {
+        let connector = HandshakeHandler {
             is_gateway: false,
             connecting: HashMap::new(),
             connected: HashSet::new(),
             inbound_conn_handler,
             outbound_conn_handler,
-            ongoing_connections: FuturesUnordered::new(),
+            ongoing_outbound_connections: FuturesUnordered::new(),
+            unconfirmed_inbound_connections: FuturesUnordered::new(),
             pending_msg_rx,
             establish_connection_rx,
         };
@@ -86,14 +96,14 @@ impl Connector {
     pub async fn wait_for_events(&mut self) -> Result<Event, TransportError> {
         loop {
             tokio::select! {
-                conn = self.inbound_conn_handler.next_connection() => {
-                    let Some(conn) = conn else {
+                new_conn = self.inbound_conn_handler.next_connection() => {
+                    let Some(conn) = new_conn else {
                         return Err(TransportError::ChannelClosed);
                     };
-                    break Ok(Event::InboundConnection(conn));
+                    self.track_inbound_connection(conn);
                 }
-                res = self.ongoing_connections.next(), if !self.ongoing_connections.is_empty() => {
-                    let r = match res {
+                outbound_conn = self.ongoing_outbound_connections.next(), if !self.ongoing_outbound_connections.is_empty() => {
+                    let r = match outbound_conn {
                         Some((peer_id, Ok(connection))) => {
                             Ok(Event::OutboundConnectionSuccessful { peer_id, connection })
                         }
@@ -108,7 +118,9 @@ impl Connector {
                     let Some((addr, msg)) = pending_msg else {
                         return Err(TransportError::ChannelClosed);
                     };
-                    self.outbound(addr, msg);
+                    if let Some(event) = self.outbound(addr, msg) {
+                        break Ok(event);
+                    }
                 }
                 establish_connection = self.establish_connection_rx.recv() => {
                     let Some((peer_id, tx)) = establish_connection else {
@@ -116,12 +128,25 @@ impl Connector {
                     };
                     self.start_outbound_connection(peer_id, tx).await;
                 }
+
             }
         }
     }
 
-    /// Messages sent to a pending confirmation outbound connection.
-    fn outbound(&mut self, addr: SocketAddr, op: NetMessage) -> Action {
+    fn track_inbound_connection(&mut self, conn: PeerConnection) {
+        let f = async move {
+            // TODO: in case of a new inbound connection, we are a gateway
+            // maybe handle the corresponding part of the initial forwarding etc. here to simplify the code
+            // and whether we accept or not the connection, wait for the handshake to be completed before making
+            // the connection available for other ops; just remember to reserve a spot in case we accept the new connection
+            todo!()
+        }
+        .boxed();
+        self.unconfirmed_inbound_connections.push(f);
+    }
+
+    /// Messages sent to a pending outbound connection.
+    fn outbound(&mut self, addr: SocketAddr, op: NetMessage) -> Option<Event> {
         match op {
             NetMessage::V1(NetMessageV1::Connect(op)) => {
                 let tx = *op.id();
@@ -133,12 +158,15 @@ impl Connector {
                 {
                     // avoid duplicate connection attempts
                     tracing::warn!("Duplicate connection attempt to {addr}, ignoring");
-                    return Action::RemoveTransaction(tx);
+                    return Some(Event::RemoveTransaction(tx));
                 }
                 self.connecting.insert(addr, tx);
-                Action::None
+
+                // TODO: check what the exact message is to track state of the connection and what we should do with it
+
+                None
             }
-            _ => Action::None,
+            _ => None,
         }
     }
 
@@ -158,7 +186,8 @@ impl Connector {
             .await
             .map(move |c| (remote, c))
             .boxed();
-        self.ongoing_connections.push(f);
+        // TODO: if it's a gateway, maybe it will be eventually rejected, and is just forwarding, so take that in mind
+        self.ongoing_outbound_connections.push(f);
     }
 }
 
