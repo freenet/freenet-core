@@ -1,0 +1,34 @@
+name: Deploy Documentation
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+      - name: Install mdbook
+        run: |
+          mkdir mdbook
+          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.21/mdbook-v0.4.21-x86_64-unknown-linux-gnu.tar.gz | tar -xz --directory=./mdbook
+          echo `pwd`/mdbook >> $GITHUB_PATH
+      - name: Deploy GitHub Pages
+        run: |
+          cd docs
+          mdbook build
+          git worktree add gh-pages
+          git config user.name "Deploy from CI"
+          git config user.email ""
+          cd gh-pages
+          # Delete the ref to avoid keeping history.
+          #### Disabled following line to avoid screwing up custom domain
+          #### git update-ref -d refs/heads/gh-pages
+          rm -rf *
+          mv ../book/* .
+          git add .
+          git commit -m "Deploy $GITHUB_SHA to gh-pages"
+          git push --force --set-upstream origin gh-pages
