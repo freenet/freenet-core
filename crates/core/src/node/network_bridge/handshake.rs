@@ -6,7 +6,7 @@ use std::{
 
 use either::Either;
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{self};
 
 use crate::{
     dev_tool::{PeerId, Transaction},
@@ -16,7 +16,16 @@ use crate::{
     },
 };
 
+type Result<T, E = HandshakeHandlerError> = std::result::Result<T, E>;
 type OutboundConnResult = (PeerId, Result<PeerConnection, TransportError>);
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum HandshakeHandlerError {
+    #[error("channel closed")]
+    ChannelClosed,
+    #[error(transparent)]
+    Serialization(#[from] Box<bincode::ErrorKind>),
+}
 
 pub(super) enum Event {
     /// An inbound connection to a peer was successfully established at a gateway.
@@ -42,14 +51,28 @@ pub(super) enum Event {
 
 /// Use for sending messages to a peer which has not yet been confirmed at a logical level
 /// or is just a transient connection (e.g. in case of gateways just forwarding messages).
-pub(super) struct OutboundMessage(Sender<(SocketAddr, NetMessage)>);
-
-/// Use for starting a new outboound connection to a peer.
-pub(super) struct EstablishConnection(Sender<(PeerId, Transaction)>);
+pub(super) struct OutboundMessage(mpsc::Sender<(SocketAddr, NetMessage)>);
 
 impl OutboundMessage {
-    pub async fn send(&self, addr: SocketAddr, msg: NetMessage) {
-        self.0.send((addr, msg)).await.unwrap();
+    pub async fn send_to(&self, remote: SocketAddr, msg: NetMessage) -> Result<()> {
+        self.0
+            .send((remote, msg))
+            .await
+            .map_err(|_| HandshakeHandlerError::ChannelClosed)?;
+        Ok(())
+    }
+}
+
+/// Use for starting a new outboound connection to a peer.
+pub(super) struct EstablishConnection(mpsc::Sender<(PeerId, Transaction)>);
+
+impl EstablishConnection {
+    pub async fn establish_conn(&self, remote: PeerId, tx: Transaction) -> Result<()> {
+        self.0
+            .send((remote, tx))
+            .await
+            .map_err(|_| HandshakeHandlerError::ChannelClosed)?;
+        Ok(())
     }
 }
 
@@ -60,11 +83,16 @@ pub(super) struct HandshakeHandler {
     connected: HashSet<SocketAddr>,
     inbound_conn_handler: InboundConnectionHandler,
     outbound_conn_handler: OutboundConnectionHandler,
+    /// On-going outbound connection attempts.
     ongoing_outbound_connections: FuturesUnordered<BoxFuture<'static, OutboundConnResult>>,
+    /// This is for connections that are not yet confirmed at a logical level in gateways
     unconfirmed_inbound_connections:
-        FuturesUnordered<BoxFuture<'static, Either<PeerConnection, ()>>>,
-    pending_msg_rx: Receiver<(SocketAddr, NetMessage)>,
-    establish_connection_rx: Receiver<(PeerId, Transaction)>,
+        FuturesUnordered<BoxFuture<'static, Result<Either<PeerConnection, ()>, TransportError>>>,
+    outbound_messages: HashMap<SocketAddr, mpsc::Sender<NetMessage>>,
+    /// The other end of `OutboundMessage`, receives messages to be sent to a yet not confirmed peer.
+    pending_msg_rx: mpsc::Receiver<(SocketAddr, NetMessage)>,
+    /// The other end of `EstablishConnection`, receives commands to establisha new outbound connection.
+    establish_connection_rx: mpsc::Receiver<(PeerId, Transaction)>,
 }
 
 impl HandshakeHandler {
@@ -82,6 +110,7 @@ impl HandshakeHandler {
             outbound_conn_handler,
             ongoing_outbound_connections: FuturesUnordered::new(),
             unconfirmed_inbound_connections: FuturesUnordered::new(),
+            outbound_messages: HashMap::new(),
             pending_msg_rx,
             establish_connection_rx,
         };
@@ -114,6 +143,20 @@ impl HandshakeHandler {
                     };
                     break r;
                 }
+                unconfirmed_inbound_conn = self.unconfirmed_inbound_connections.next(), if !self.unconfirmed_inbound_connections.is_empty() => {
+                    match unconfirmed_inbound_conn {
+                        Some(Ok(Either::Left(connection))) => {
+                            return Ok(Event::InboundConnection(connection));
+                        }
+                        Some(Ok(Either::Right(()))) => {
+                            continue;
+                        }
+                        Some(Err(error)) => {
+                            return Err(error);
+                        }
+                        None => return Err(TransportError::ChannelClosed),
+                    }
+                }
                 pending_msg = self.pending_msg_rx.recv() => {
                     let Some((addr, msg)) = pending_msg else {
                         return Err(TransportError::ChannelClosed);
@@ -134,15 +177,11 @@ impl HandshakeHandler {
     }
 
     fn track_inbound_connection(&mut self, conn: PeerConnection) {
-        let f = async move {
-            // TODO: in case of a new inbound connection, we are a gateway
-            // maybe handle the corresponding part of the initial forwarding etc. here to simplify the code
-            // and whether we accept or not the connection, wait for the handshake to be completed before making
-            // the connection available for other ops; just remember to reserve a spot in case we accept the new connection
-            todo!()
-        }
-        .boxed();
+        let (outbound_msg_sender, outbound_msg_recv) = mpsc::channel(1);
+        let remote = conn.remote_addr();
+        let f = gw_peer_connection_listener(conn, PeerOutboundMessage(outbound_msg_recv)).boxed();
         self.unconfirmed_inbound_connections.push(f);
+        self.outbound_messages.insert(remote, outbound_msg_sender);
     }
 
     /// Messages sent to a pending outbound connection.
@@ -191,8 +230,157 @@ impl HandshakeHandler {
     }
 }
 
+#[repr(transparent)]
+struct PeerOutboundMessage(mpsc::Receiver<NetMessage>);
+
+/// Handles the communication with a potentially transient peer connection.
+async fn gw_peer_connection_listener(
+    mut conn: PeerConnection,
+    mut outbound: PeerOutboundMessage,
+) -> Result<Either<PeerConnection, ()>, TransportError> {
+    loop {
+        tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), "Waiting for message from peer");
+        tokio::select! {
+            msg = outbound.0.recv() => {
+                let Some(msg) = msg else { break Err(TransportError::ConnectionClosed(conn.remote_addr())); };
+                tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr() ,"Sending message to peer. Msg: {msg}");
+                        conn
+                            .send(msg)
+                            .await?;
+            }
+            msg = conn.recv() => {
+                let Ok(msg) = msg.map_err(|error| {
+                    tracing::error!(at=?conn.my_address(), from=%conn.remote_addr(), "Error while receiving message: {error}");
+                }) else {
+                     break Err(TransportError::ConnectionClosed(conn.remote_addr()));
+                };
+                let net_message = decode_msg(&msg).unwrap();
+                tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), %net_message, "Received message from peer");
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn decode_msg(data: &[u8]) -> Result<NetMessage> {
+    bincode::deserialize(data).map_err(|err| HandshakeHandlerError::Serialization(err))
+}
+
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn test_connector() {}
+    use std::time::Duration;
+
+    use aes_gcm::{Aes128Gcm, KeyInit};
+    use anyhow::bail;
+    use tokio::sync::mpsc;
+    use tracing::level_filters::LevelFilter;
+
+    use super::*;
+    use crate::{
+        config,
+        dev_tool::TransportKeypair,
+        operations::connect::ConnectMsg,
+        transport::{ConnectionEvent, OutboundConnectionHandler, PacketData},
+    };
+
+    struct TransportMock {
+        inbound_sender: mpsc::Sender<PeerConnection>,
+        outbound_recv: mpsc::Receiver<(SocketAddr, ConnectionEvent)>,
+    }
+
+    impl TransportMock {
+        /// This would happen when a new unsolicited connection is established with a gateway or
+        /// when after initialising a connection with a peer via `outbound_recv`, a connection
+        /// is successfully established.
+        async fn new_inbound_conn(&mut self, addr: SocketAddr) {
+            let out_symm_key = Aes128Gcm::new_from_slice(&[0; 16]).unwrap();
+            let in_symm_key = Aes128Gcm::new_from_slice(&[1; 16]).unwrap();
+            let (conn, packet_sender) =
+                PeerConnection::new_test(addr, out_symm_key, in_symm_key.clone());
+            // First a new connection is established
+            self.inbound_sender.send(conn).await.unwrap();
+            tracing::debug!("New inbound connection established");
+
+            let id = Transaction::new::<ConnectMsg>();
+            let joiner_key = TransportKeypair::new();
+            let pub_key = joiner_key.public().clone();
+            let initial_join_req = ConnectMsg::Request {
+                id,
+                msg: crate::operations::connect::ConnectRequest::StartJoinReq {
+                    joiner: None,
+                    joiner_key: pub_key,
+                    hops_to_live: 10,
+                    max_hops_to_live: 10,
+                    skip_list: vec![],
+                },
+            };
+
+            let msg = NetMessage::V1(NetMessageV1::Connect(initial_join_req));
+            let msg = bincode::serialize(&msg).unwrap();
+            let encrypted = PacketData::from_buf_plain(msg).encrypt_symmetric(&in_symm_key);
+            tracing::debug!("Sending initial connection message");
+            packet_sender
+                .send(encrypted.as_unknown().into())
+                .await
+                .unwrap();
+        }
+    }
+
+    struct NodeMock {
+        establish_conn: EstablishConnection,
+        outbound_msg: OutboundMessage,
+    }
+
+    struct TestVerifier {
+        transport: TransportMock,
+        node: NodeMock,
+    }
+
+    fn config_handler() -> (HandshakeHandler, TestVerifier) {
+        let (outbound_sender, outbound_recv) = mpsc::channel(5);
+        let outbound_conn_handler = OutboundConnectionHandler::new(outbound_sender);
+        let (inbound_sender, inbound_recv) = mpsc::channel(5);
+        let inbound_conn_handler = InboundConnectionHandler::new(inbound_recv);
+        let (handler, establish_conn, out) =
+            HandshakeHandler::new(inbound_conn_handler, outbound_conn_handler);
+        (
+            handler,
+            TestVerifier {
+                transport: TransportMock {
+                    inbound_sender,
+                    outbound_recv,
+                },
+                node: NodeMock {
+                    establish_conn,
+                    outbound_msg: out,
+                },
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn test_gateway_inbound_conn() -> anyhow::Result<()> {
+        config::set_logger(Some(LevelFilter::DEBUG));
+        let (mut handler, mut test) = config_handler();
+        let test_controller = async {
+            let addr = ([127, 0, 0, 1], 10000).into();
+            test.transport.new_inbound_conn(addr).await;
+            Ok::<_, anyhow::Error>(())
+        };
+
+        let gw_inbound = async {
+            let event =
+                tokio::time::timeout(Duration::from_secs(60), handler.wait_for_events()).await??;
+            match event {
+                Event::InboundConnection(conn) => {
+                    let addr: SocketAddr = ([127u8, 0, 0, 1], 10000u16).into();
+                    assert_eq!(conn.remote_addr(), addr);
+                    Ok(())
+                }
+                _ => bail!("Unexpected event"),
+            }
+        };
+        futures::try_join!(test_controller, gw_inbound)?;
+        Ok(())
+    }
 }

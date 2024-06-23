@@ -108,6 +108,29 @@ impl PeerConnection {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_test(
+        remote_addr: SocketAddr,
+        outbound_symmetric_key: Aes128Gcm,
+        inbound_symmetric_key: Aes128Gcm,
+    ) -> (Self, mpsc::Sender<PacketData<UnknownEncryption>>) {
+        use parking_lot::Mutex;
+        let (outbound_packets, _) = mpsc::channel(1);
+        let (inbound_packet_sender, inbound_packet_recv) = mpsc::channel(1);
+        let remote = RemoteConnection {
+            outbound_packets,
+            outbound_symmetric_key,
+            remote_addr,
+            sent_tracker: Arc::new(Mutex::new(SentPacketTracker::new())),
+            last_packet_id: Arc::new(AtomicU32::new(0)),
+            inbound_packet_recv,
+            inbound_symmetric_key,
+            inbound_symmetric_key_bytes: [1; 16],
+            my_address: None,
+        };
+        (Self::new(remote), inbound_packet_sender)
+    }
+
     pub async fn send<T>(&mut self, data: T) -> Result
     where
         T: Serialize + Send + 'static,

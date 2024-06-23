@@ -22,14 +22,17 @@ type MessagePayload = Vec<u8>;
 
 type PacketId = u32;
 
-use self::{packet_data::PacketData, peer_connection::StreamId};
+use self::peer_connection::StreamId;
 
+#[cfg(test)]
+pub(crate) use self::connection_handler::ConnectionEvent;
 pub use self::crypto::TransportKeypair;
 pub(crate) use self::{
     connection_handler::{
         create_connection_handler, InboundConnectionHandler, OutboundConnectionHandler,
     },
     crypto::TransportPublicKey,
+    packet_data::PacketData,
     peer_connection::PeerConnection,
 };
 

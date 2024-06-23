@@ -18,10 +18,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
 
-use super::packet_data::SymmetricAES;
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
-    packet_data::MAX_PACKET_SIZE,
+    packet_data::{SymmetricAES, MAX_PACKET_SIZE},
     peer_connection::{PeerConnection, RemoteConnection},
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
@@ -148,7 +147,7 @@ impl OutboundConnectionHandler {
     }
 
     #[cfg(test)]
-    fn test_set_up(
+    fn new_test(
         socket_addr: SocketAddr,
         socket: Arc<impl Socket>,
         keypair: TransportKeypair,
@@ -1042,7 +1041,7 @@ mod test {
         let socket = Arc::new(
             MockSocket::test_config(packet_drop_policy, (Ipv4Addr::LOCALHOST, port).into()).await,
         );
-        let (peer_conn, inbound_conn) = OutboundConnectionHandler::test_set_up(
+        let (peer_conn, inbound_conn) = OutboundConnectionHandler::new_test(
             (Ipv4Addr::LOCALHOST, port).into(),
             socket,
             peer_keypair,
