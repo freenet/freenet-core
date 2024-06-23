@@ -4,15 +4,16 @@ use std::{
     net::SocketAddr,
 };
 
-use either::Either;
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use tokio::sync::mpsc::{self};
 
 use crate::{
     dev_tool::{PeerId, Transaction},
     message::{InnerMessage, NetMessage, NetMessageV1},
+    operations::connect::{ConnectMsg, ConnectRequest},
     transport::{
         InboundConnectionHandler, OutboundConnectionHandler, PeerConnection, TransportError,
+        TransportPublicKey,
     },
 };
 
@@ -43,7 +44,7 @@ pub(super) enum Event {
     /// An outbound connection to a gateway was rejected.
     OutboundConnectionRejected {
         peer_id: PeerId,
-        error: TransportError,
+        error: HandshakeHandlerError,
     },
     /// Clean up a transaction that was completed.
     RemoveTransaction(Transaction),
@@ -86,12 +87,14 @@ pub(super) struct HandshakeHandler {
     /// On-going outbound connection attempts.
     ongoing_outbound_connections: FuturesUnordered<BoxFuture<'static, OutboundConnResult>>,
     /// This is for connections that are not yet confirmed at a logical level in gateways
-    unconfirmed_inbound_connections:
-        FuturesUnordered<BoxFuture<'static, Result<Either<PeerConnection, ()>, TransportError>>>,
+    unconfirmed_inbound_connections: FuturesUnordered<
+        BoxFuture<'static, Result<(InternalEvent, PeerOutboundMessage), TransportError>>,
+    >,
     outbound_messages: HashMap<SocketAddr, mpsc::Sender<NetMessage>>,
     /// The other end of `OutboundMessage`, receives messages to be sent to a yet not confirmed peer.
     pending_msg_rx: mpsc::Receiver<(SocketAddr, NetMessage)>,
-    /// The other end of `EstablishConnection`, receives commands to establisha new outbound connection.
+    queues: HashMap<SocketAddr, Vec<NetMessage>>,
+    /// The other end of `EstablishConnection`, receives commands to establish a new outbound connection.
     establish_connection_rx: mpsc::Receiver<(PeerId, Transaction)>,
 }
 
@@ -112,6 +115,7 @@ impl HandshakeHandler {
             unconfirmed_inbound_connections: FuturesUnordered::new(),
             outbound_messages: HashMap::new(),
             pending_msg_rx,
+            queues: HashMap::new(),
             establish_connection_rx,
         };
         (
@@ -144,24 +148,33 @@ impl HandshakeHandler {
                     break r;
                 }
                 unconfirmed_inbound_conn = self.unconfirmed_inbound_connections.next(), if !self.unconfirmed_inbound_connections.is_empty() => {
-                    match unconfirmed_inbound_conn {
-                        Some(Ok(Either::Left(connection))) => {
-                            return Ok(Event::InboundConnection(connection));
+                    let Some(res) = unconfirmed_inbound_conn else {
+                        return Err(TransportError::ChannelClosed);
+                    };
+                    let (event, outbound_sender) = res?;
+                    match event {
+                        InternalEvent::NewConnection(conn) => break Ok(Event::InboundConnection(conn)),
+                        InternalEvent::InboundJoinRequest {
+                            conn, id, joiner, joiner_key, hops_to_live, max_hops_to_live, skip_list
+                        } => {
+                            // TODO: check whether we should accept the connection or not here
+                            // this will divert into 2 different code paths: promote to established connection or transient connection
+                            self.unconfirmed_inbound_connections.push(gw_peer_connection_listener(conn, outbound_sender).boxed());
                         }
-                        Some(Ok(Either::Right(()))) => {
+                        InternalEvent::DropInboundConnection(conn) => {
+                            let addr = conn.remote_addr();
+                            self.outbound_messages.remove(&addr);
+                            self.queues.remove(&addr);
+                            self.connecting.remove(&addr);
                             continue;
                         }
-                        Some(Err(error)) => {
-                            return Err(error);
-                        }
-                        None => return Err(TransportError::ChannelClosed),
                     }
                 }
                 pending_msg = self.pending_msg_rx.recv() => {
                     let Some((addr, msg)) = pending_msg else {
                         return Err(TransportError::ChannelClosed);
                     };
-                    if let Some(event) = self.outbound(addr, msg) {
+                    if let Some(event) = self.outbound(addr, msg).await {
                         break Ok(event);
                     }
                 }
@@ -185,27 +198,33 @@ impl HandshakeHandler {
     }
 
     /// Messages sent to a pending outbound connection.
-    fn outbound(&mut self, addr: SocketAddr, op: NetMessage) -> Option<Event> {
-        match op {
-            NetMessage::V1(NetMessageV1::Connect(op)) => {
-                let tx = *op.id();
-                if self
-                    .connecting
-                    .get(&addr)
-                    .filter(|current_tx| *current_tx != &tx)
-                    .is_some()
-                {
-                    // avoid duplicate connection attempts
-                    tracing::warn!("Duplicate connection attempt to {addr}, ignoring");
-                    return Some(Event::RemoveTransaction(tx));
+    async fn outbound(&mut self, addr: SocketAddr, op: NetMessage) -> Option<Event> {
+        if let Some(alive_conn) = self.outbound_messages.get_mut(&addr) {
+            match &op {
+                NetMessage::V1(NetMessageV1::Connect(op)) => {
+                    // TODO: check what the exact message is to track state of the connection and what we should do with it
+
+                    let tx = *op.id();
+                    if self
+                        .connecting
+                        .get(&addr)
+                        .filter(|current_tx| *current_tx != &tx)
+                        .is_some()
+                    {
+                        // avoid duplicate connection attempts
+                        tracing::warn!("Duplicate connection attempt to {addr}, ignoring");
+                        return Some(Event::RemoveTransaction(tx));
+                    }
+                    self.connecting.insert(addr, tx);
                 }
-                self.connecting.insert(addr, tx);
-
-                // TODO: check what the exact message is to track state of the connection and what we should do with it
-
-                None
+                _ => {}
             }
-            _ => None,
+            alive_conn.send(op).await;
+            None
+        } else {
+            // if is a message to a peer which is not yet connected, just queue it
+            self.queues.entry(addr).or_default().push(op);
+            None
         }
     }
 
@@ -230,6 +249,20 @@ impl HandshakeHandler {
     }
 }
 
+enum InternalEvent {
+    NewConnection(PeerConnection),
+    InboundJoinRequest {
+        conn: PeerConnection,
+        id: Transaction,
+        joiner: Option<PeerId>,
+        joiner_key: TransportPublicKey,
+        hops_to_live: usize,
+        max_hops_to_live: usize,
+        skip_list: Vec<PeerId>,
+    },
+    DropInboundConnection(PeerConnection),
+}
+
 #[repr(transparent)]
 struct PeerOutboundMessage(mpsc::Receiver<NetMessage>);
 
@@ -237,9 +270,8 @@ struct PeerOutboundMessage(mpsc::Receiver<NetMessage>);
 async fn gw_peer_connection_listener(
     mut conn: PeerConnection,
     mut outbound: PeerOutboundMessage,
-) -> Result<Either<PeerConnection, ()>, TransportError> {
+) -> Result<(InternalEvent, PeerOutboundMessage), TransportError> {
     loop {
-        tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), "Waiting for message from peer");
         tokio::select! {
             msg = outbound.0.recv() => {
                 let Some(msg) = msg else { break Err(TransportError::ConnectionClosed(conn.remote_addr())); };
@@ -256,6 +288,15 @@ async fn gw_peer_connection_listener(
                 };
                 let net_message = decode_msg(&msg).unwrap();
                 tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), %net_message, "Received message from peer");
+                match net_message {
+                    NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
+                        id,
+                        msg: ConnectRequest::StartJoinReq { joiner, joiner_key, hops_to_live, max_hops_to_live, skip_list }
+                    })) => {
+                        break Ok((InternalEvent::InboundJoinRequest { conn, id, joiner, joiner_key, hops_to_live, max_hops_to_live, skip_list }, outbound));
+                    }
+                    _ => todo!(),
+                }
             }
         }
     }
@@ -280,7 +321,7 @@ mod tests {
         config,
         dev_tool::TransportKeypair,
         operations::connect::ConnectMsg,
-        transport::{ConnectionEvent, OutboundConnectionHandler, PacketData},
+        transport::{ConnectionEvent, OutboundConnectionHandler, SymmetricMessage},
     };
 
     struct TransportMock {
@@ -306,7 +347,7 @@ mod tests {
             let pub_key = joiner_key.public().clone();
             let initial_join_req = ConnectMsg::Request {
                 id,
-                msg: crate::operations::connect::ConnectRequest::StartJoinReq {
+                msg: ConnectRequest::StartJoinReq {
                     joiner: None,
                     joiner_key: pub_key,
                     hops_to_live: 10,
@@ -317,10 +358,12 @@ mod tests {
 
             let msg = NetMessage::V1(NetMessageV1::Connect(initial_join_req));
             let msg = bincode::serialize(&msg).unwrap();
-            let encrypted = PacketData::from_buf_plain(msg).encrypt_symmetric(&in_symm_key);
+            let sym_msg =
+                SymmetricMessage::serialize_msg_to_packet_data(0, msg, &in_symm_key, vec![])
+                    .unwrap();
             tracing::debug!("Sending initial connection message");
             packet_sender
-                .send(encrypted.as_unknown().into())
+                .send(sym_msg.as_unknown().into())
                 .await
                 .unwrap();
         }

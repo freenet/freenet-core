@@ -20,11 +20,11 @@ use tokio::task;
 
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
-    packet_data::{SymmetricAES, MAX_PACKET_SIZE},
+    packet_data::{PacketData, SymmetricAES, MAX_PACKET_SIZE},
     peer_connection::{PeerConnection, RemoteConnection},
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
-    PacketData, Socket, TransportError,
+    Socket, TransportError,
 };
 
 const PROTOC_VERSION: [u8; 2] = 1u16.to_le_bytes();
