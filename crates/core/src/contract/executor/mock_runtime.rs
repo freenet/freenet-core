@@ -15,9 +15,6 @@ impl Executor<MockRuntime> {
         std::fs::create_dir_all(&contracts_data_dir).expect("directory created");
         let contract_store = ContractStore::new(contracts_data_dir, u16::MAX as i64)?;
 
-        // FIXME: if is sqlite it should be a dir, named <data_dir>/db
-        // let db_path = data_dir.join("db");
-        // let state_store = StateStore::new(Storage::new(&db_path).await?, u16::MAX as u32).unwrap();
         tracing::debug!("creating state store at path: {data_dir:?}");
         std::fs::create_dir_all(&data_dir).expect("directory created");
         let state_store = StateStore::new(Storage::new(&data_dir).await?, u16::MAX as u32).unwrap();
