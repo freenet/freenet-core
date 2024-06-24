@@ -10,6 +10,7 @@ pub mod generated;
 mod message;
 /// Node configuration, implementations and execution (entry points for the binaries).
 mod node;
+pub use node::{run_local_node, run_network_node};
 /// Network operation/transaction state machines.
 mod operations;
 /// Ring connections and routing.
@@ -28,8 +29,6 @@ mod transport;
 pub mod util;
 /// WASM code execution runtime, tailored for the contract and delegate APIs.
 mod wasm_runtime;
-
-type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// Exports to build a running local node.
 pub mod local_node {

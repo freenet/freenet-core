@@ -264,7 +264,7 @@ impl std::fmt::Display for PeerIdHumanReadable {
 }
 
 impl ServerState {
-    fn save_record(&self, change: ChangesWrapper) -> Result<(), anyhow::Error> {
+    fn save_record(&self, change: ChangesWrapper) -> anyhow::Result<()> {
         match change {
             ChangesWrapper::PeerChange(PeerChange::AddedConnection(added)) => {
                 let from_peer_id: PeerId = bincode::deserialize(added.from().bytes())?;

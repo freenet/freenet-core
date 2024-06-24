@@ -6,6 +6,7 @@ edition = "2021"
 [workspace]
 
 [dependencies]
+anyhow = "1"
 p384 =  { version = "0.13", default-features = false, features = ["serde", "pem", "pkcs8", "arithmetic"] }
 freenet-stdlib = { path = "../../stdlib/rust" }
 # freenet-stdlib = { version = "0.0.7" }

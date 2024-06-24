@@ -27,7 +27,6 @@ use crate::{
     client_events::AuthToken,
     server::{ClientConnection, HostCallbackResult},
     util::EncodingProtocol,
-    DynError,
 };
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
@@ -224,7 +223,7 @@ async fn websocket_interface(
     mut auth_token: Option<AuthToken>,
     encoding_protoc: EncodingProtocol,
     ws: WebSocket,
-) -> Result<(), DynError> {
+) -> anyhow::Result<()> {
     let (mut response_rx, client_id) = new_client_connection(&request_sender).await?;
     let (mut tx, mut rx) = ws.split();
     let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::UnboundedReceiver<HostResult>)>>> =
@@ -246,7 +245,7 @@ async fn websocket_interface(
                                 active_listeners.push_back((key, listener));
                             }
                             Err(err @ mpsc::error::TryRecvError::Disconnected) => {
-                                return Err(Box::new(err) as DynError)
+                                return Err(anyhow::anyhow!(err))
                             }
                         }
                     }
@@ -345,7 +344,7 @@ async fn process_client_request(
     request_sender: &mpsc::Sender<ClientConnection>,
     auth_token: &mut Option<AuthToken>,
     encoding_protoc: EncodingProtocol,
-) -> Result<Option<Message>, Option<DynError>> {
+) -> Result<Option<Message>, Option<anyhow::Error>> {
     let msg = match msg {
         Ok(Message::Binary(data)) => data,
         Ok(Message::Text(data)) => data.into_bytes(),
@@ -401,7 +400,7 @@ async fn process_host_response(
     client_id: ClientId,
     encoding_protoc: EncodingProtocol,
     tx: &mut SplitSink<WebSocket, Message>,
-) -> Result<Option<NewSubscription>, DynError> {
+) -> anyhow::Result<Option<NewSubscription>> {
     match msg {
         Some(HostCallbackResult::Result { id, result }) => {
             debug_assert_eq!(id, client_id);
@@ -452,7 +451,9 @@ async fn process_host_response(
             tx.send(Message::Binary(result_error)).await?;
             tx.send(Message::Close(None)).await?;
             tracing::warn!("node shut down while handling responses for {client_id}");
-            Err(format!("node shut down while handling responses for {client_id}").into())
+            Err(anyhow::anyhow!(
+                "node shut down while handling responses for {client_id}"
+            ))
         }
     }
 }

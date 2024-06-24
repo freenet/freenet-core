@@ -43,7 +43,6 @@ use crate::{
     node::{self, EventLoopNotificationsSender, NodeConfig, PeerId},
     operations::connect,
     router::Router,
-    DynError,
 };
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -255,7 +254,7 @@ impl Ring {
         event_loop_notifier: EventLoopNotificationsSender,
         event_register: ER,
         is_gateway: bool,
-    ) -> Result<Arc<Self>, anyhow::Error> {
+    ) -> anyhow::Result<Arc<Self>> {
         let (live_tx_tracker, missing_candidate_rx) = LiveTransactionTracker::new();
 
         let peer_pub_key = config.key_pair.public().clone();
@@ -616,7 +615,7 @@ impl Ring {
     ) -> Option<PeerKeyLocation> {
         let connections = self.connections_by_location.read();
         let peers = connections.values().filter_map(|conns| {
-            let conn = conns.choose(&mut rand::thread_rng()).unwrap();
+            let conn = conns.choose(&mut rand::thread_rng())?;
             if let Some(requester) = requesting {
                 if requester == &conn.location.peer {
                     return None;
@@ -772,7 +771,7 @@ impl Ring {
         notifier: EventLoopNotificationsSender,
         live_tx_tracker: LiveTransactionTracker,
         mut missing_candidates: sync::mpsc::Receiver<PeerId>,
-    ) -> Result<(), DynError> {
+    ) -> anyhow::Result<()> {
         #[cfg(not(test))]
         const CONNECTION_AGE_THRESOLD: Duration = Duration::from_secs(60 * 5);
         #[cfg(test)]
@@ -798,7 +797,7 @@ impl Ring {
 
         let mut live_tx = None;
         let mut pending_conn_adds = VecDeque::new();
-        'outer: loop {
+        loop {
             if self.get_peer_key().is_none() {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
@@ -811,7 +810,7 @@ impl Ring {
                     Err(sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(sync::mpsc::error::TryRecvError::Disconnected) => {
                         tracing::debug!("Shutting down connection maintenance");
-                        break 'outer Err("finished".into());
+                        anyhow::bail!("finished");
                     }
                 }
             }
@@ -906,7 +905,7 @@ impl Ring {
         ideal_location: Location,
         skip_list: &[&PeerId],
         notifier: &EventLoopNotificationsSender,
-    ) -> Result<Option<Transaction>, DynError> {
+    ) -> anyhow::Result<Option<Transaction>> {
         use crate::message::InnerMessage;
         let Some(query_target) = self.routing(ideal_location, None, skip_list) else {
             return Ok(None);

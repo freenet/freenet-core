@@ -32,11 +32,12 @@ use tracing::Instrument;
 use self::p2p_impl::NodeP2P;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
-    config::{Address, GatewayConfig, GlobalExecutor},
+    config::{Address, GatewayConfig, GlobalExecutor, WebsocketApiConfig},
     contract::{
-        Callback, ClientResponsesReceiver, ClientResponsesSender, ContractError,
+        Callback, ClientResponsesReceiver, ClientResponsesSender, ContractError, ExecutorError,
         ExecutorToEventLoopChannel, NetworkContractHandler,
     },
+    local_node::Executor,
     message::{NetMessage, NodeEvent, Transaction, TransactionType},
     operations::{
         connect::{self, ConnectOp},
@@ -66,7 +67,11 @@ pub(crate) mod testing_impl;
 pub struct Node(NodeP2P);
 
 impl Node {
-    pub async fn run(self) -> Result<(), anyhow::Error> {
+    pub fn update_location(&mut self, location: Location) {
+        self.0.op_manager.ring.update_location(Some(location));
+    }
+
+    pub async fn run(self) -> anyhow::Result<()> {
         self.0.run_node().await?;
         Ok(())
     }
@@ -281,7 +286,7 @@ impl NodeConfig {
     pub async fn build<const CLIENTS: usize>(
         self,
         clients: [BoxedClient; CLIENTS],
-    ) -> Result<Node, anyhow::Error> {
+    ) -> anyhow::Result<Node> {
         let event_register = {
             #[cfg(feature = "trace-ot")]
             {
@@ -313,7 +318,7 @@ impl NodeConfig {
 
     /// Returns all specified gateways for this peer. Returns an error if the peer is not a gateway
     /// and no gateways are specified.
-    fn get_gateways(&self) -> Result<Vec<PeerKeyLocation>, anyhow::Error> {
+    fn get_gateways(&self) -> anyhow::Result<Vec<PeerKeyLocation>> {
         let gateways: Vec<PeerKeyLocation> = self
             .gateways
             .iter()
@@ -1012,9 +1017,153 @@ impl Display for PeerId {
     }
 }
 
+pub async fn run_local_node(
+    mut executor: Executor,
+    socket: WebsocketApiConfig,
+) -> anyhow::Result<()> {
+    match socket.address {
+        IpAddr::V4(ip) if !ip.is_loopback() => {
+            anyhow::bail!("invalid ip: {ip}, expecting localhost")
+        }
+        IpAddr::V6(ip) if !ip.is_loopback() => {
+            anyhow::bail!("invalid ip: {ip}, expecting localhost")
+        }
+        _ => {}
+    }
+
+    let (mut gw, mut ws_proxy) = crate::server::serve_gateway_in(socket).await;
+
+    // TODO: use combinator instead
+    // let mut all_clients =
+    //    ClientEventsCombinator::new([Box::new(ws_handle), Box::new(http_handle)]);
+    enum Receiver {
+        Ws,
+        Gw,
+    }
+    let mut receiver;
+    loop {
+        let req = tokio::select! {
+            req = ws_proxy.recv() => {
+                receiver = Receiver::Ws;
+                req?
+            }
+            req = gw.recv() => {
+                receiver = Receiver::Gw;
+                req?
+            }
+        };
+        let OpenRequest {
+            client_id: id,
+            request,
+            notification_channel,
+            token,
+            ..
+        } = req;
+        tracing::trace!(cli_id = %id, "got request -> {request}");
+
+        let res = match *request {
+            ClientRequest::ContractOp(op) => {
+                executor
+                    .contract_requests(op, id, notification_channel)
+                    .await
+            }
+            ClientRequest::DelegateOp(op) => {
+                let attested_contract =
+                    token.and_then(|token| gw.attested_contracts.get(&token).map(|(t, _)| t));
+                executor.delegate_request(op, attested_contract)
+            }
+            ClientRequest::Disconnect { cause } => {
+                if let Some(cause) = cause {
+                    tracing::info!("disconnecting cause: {cause}");
+                }
+                // fixme: token must live for a bit to allow reconnections
+                if let Some(rm_token) = gw
+                    .attested_contracts
+                    .iter()
+                    .find_map(|(k, (_, eid))| (eid == &id).then(|| k.clone()))
+                {
+                    gw.attested_contracts.remove(&rm_token);
+                }
+                continue;
+            }
+            _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
+        };
+
+        match res {
+            Ok(res) => {
+                match receiver {
+                    Receiver::Ws => ws_proxy.send(id, Ok(res)).await?,
+                    Receiver::Gw => gw.send(id, Ok(res)).await?,
+                };
+            }
+            Err(err) if err.is_request() => {
+                let err = ErrorKind::RequestError(err.unwrap_request());
+                match receiver {
+                    Receiver::Ws => {
+                        ws_proxy.send(id, Err(err.into())).await?;
+                    }
+                    Receiver::Gw => {
+                        gw.send(id, Err(err.into())).await?;
+                    }
+                };
+            }
+            Err(err) => {
+                tracing::error!("{err}");
+                let err = Err(ErrorKind::Unhandled {
+                    cause: format!("{err}").into(),
+                }
+                .into());
+                match receiver {
+                    Receiver::Ws => {
+                        ws_proxy.send(id, err).await?;
+                    }
+                    Receiver::Gw => {
+                        gw.send(id, err).await?;
+                    }
+                };
+            }
+        }
+    }
+}
+
+pub async fn run_network_node(mut node: Node) -> anyhow::Result<()> {
+    tracing::info!("Starting node");
+
+    let is_gateway = node.0.is_gateway;
+    let location = is_gateway
+        .then(|| {
+            node.0
+                .peer_id
+                .clone()
+                .map(|id| Location::from_address(&id.addr()))
+        })
+        .flatten();
+
+    if let Some(location) = location {
+        tracing::info!("Setting initial location: {location}");
+        node.update_location(location);
+    }
+
+    match node.run().await {
+        Ok(_) => {
+            if is_gateway {
+                tracing::info!("Gateway finished");
+            } else {
+                tracing::info!("Node finished");
+            }
+
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("{e}");
+            Err(e)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
 
@@ -1022,12 +1171,17 @@ mod tests {
     async fn test_hostname_resolution() {
         let addr = Address::Hostname("localhost".to_string());
         let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
-        assert_eq!(
-            socket_addr,
-            SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                crate::config::default_http_gateway_port()
-            )
+        assert!(
+            socket_addr
+                == SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    crate::config::default_http_gateway_port()
+                )
+                || socket_addr
+                    == SocketAddr::new(
+                        IpAddr::V6(Ipv6Addr::LOCALHOST),
+                        crate::config::default_http_gateway_port()
+                    )
         );
 
         let addr = Address::Hostname("google.com".to_string());

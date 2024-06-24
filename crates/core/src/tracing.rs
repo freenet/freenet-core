@@ -17,7 +17,6 @@ use crate::{
     operations::{connect, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg},
     ring::{Location, PeerKeyLocation, Ring},
     router::RouteEvent,
-    DynError,
 };
 
 #[cfg(feature = "trace-ot")]
@@ -41,7 +40,7 @@ pub(crate) trait NetEventRegister: std::any::Any + Send + Sync + 'static {
     ) -> BoxFuture<'a, ()>;
     fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<()>;
     fn trait_clone(&self) -> Box<dyn NetEventRegister>;
-    fn get_router_events(&self, number: usize) -> BoxFuture<Result<Vec<RouteEvent>, DynError>>;
+    fn get_router_events(&self, number: usize) -> BoxFuture<anyhow::Result<Vec<RouteEvent>>>;
 }
 
 #[cfg(feature = "trace-ot")]
@@ -81,7 +80,7 @@ impl<const N: usize> NetEventRegister for CombinedRegister<N> {
         .boxed()
     }
 
-    fn get_router_events(&self, number: usize) -> BoxFuture<Result<Vec<RouteEvent>, DynError>> {
+    fn get_router_events(&self, number: usize) -> BoxFuture<anyhow::Result<Vec<RouteEvent>>> {
         async move {
             for reg in &self.0 {
                 let events = reg.get_router_events(number).await?;
@@ -460,7 +459,7 @@ impl NetEventRegister for EventRegister {
         async {}.boxed()
     }
 
-    fn get_router_events(&self, number: usize) -> BoxFuture<Result<Vec<RouteEvent>, DynError>> {
+    fn get_router_events(&self, number: usize) -> BoxFuture<anyhow::Result<Vec<RouteEvent>>> {
         async move { aof::LogFile::get_router_events(number, &self.log_file).await }.boxed()
     }
 }
@@ -826,10 +825,7 @@ mod opentelemetry_tracer {
             .boxed()
         }
 
-        fn get_router_events(
-            &self,
-            _number: usize,
-        ) -> BoxFuture<Result<Vec<RouteEvent>, DynError>> {
+        fn get_router_events(&self, _number: usize) -> BoxFuture<anyhow::Result<Vec<RouteEvent>>> {
             async { Ok(vec![]) }.boxed()
         }
     }
@@ -934,9 +930,7 @@ pub(crate) mod tracer {
     use tracing::level_filters::LevelFilter;
     use tracing_subscriber::{Layer, Registry};
 
-    use crate::DynError;
-
-    pub fn init_tracer(level: Option<LevelFilter>) -> Result<(), DynError> {
+    pub fn init_tracer(level: Option<LevelFilter>) -> anyhow::Result<()> {
         let default_filter = if cfg!(any(test, debug_assertions)) {
             LevelFilter::DEBUG
         } else {
@@ -1245,16 +1239,13 @@ pub(super) mod test {
             async {}.boxed()
         }
 
-        fn get_router_events(
-            &self,
-            _number: usize,
-        ) -> BoxFuture<Result<Vec<RouteEvent>, DynError>> {
+        fn get_router_events(&self, _number: usize) -> BoxFuture<anyhow::Result<Vec<RouteEvent>>> {
             async { Ok(vec![]) }.boxed()
         }
     }
 
     #[tokio::test]
-    async fn test_get_connections() -> Result<(), anyhow::Error> {
+    async fn test_get_connections() -> anyhow::Result<()> {
         use crate::ring::Location;
         let peer_id = PeerId::random();
         let loc = Location::try_from(0.5)?;

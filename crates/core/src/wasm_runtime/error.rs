@@ -2,8 +2,6 @@ use std::fmt::Display;
 
 use freenet_stdlib::prelude::{ContractKey, DelegateKey};
 
-use crate::DynError;
-
 use super::{delegate, runtime, secrets_store};
 
 pub type RuntimeResult<T> = std::result::Result<T, ContractError>;
@@ -39,7 +37,7 @@ macro_rules! impl_err {
     };
 }
 
-impl_err!(Box<dyn std::error::Error + Send + Sync>);
+impl_err!(anyhow::Error);
 impl_err!(freenet_stdlib::memory::buf::Error);
 impl_err!(std::io::Error);
 impl_err!(secrets_store::SecretStoreError);
@@ -55,7 +53,7 @@ impl_err!(wasmer::RuntimeError);
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum RuntimeInnerError {
     #[error(transparent)]
-    Any(#[from] DynError),
+    Any(#[from] anyhow::Error),
 
     #[error(transparent)]
     BufferError(#[from] freenet_stdlib::memory::buf::Error),

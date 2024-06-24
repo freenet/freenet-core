@@ -515,7 +515,7 @@ mod test {
     use crate::node::testing_impl::{NodeSpecification, SimNetwork};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn successful_subscribe_op_between_nodes() -> Result<(), anyhow::Error> {
+    async fn successful_subscribe_op_between_nodes() -> anyhow::Result<()> {
         const NUM_NODES: usize = 4usize;
         const NUM_GW: usize = 1usize;
 

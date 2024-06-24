@@ -8,7 +8,7 @@ impl Executor<MockRuntime> {
     pub async fn new_mock(
         identifier: &str,
         event_loop_channel: ExecutorToEventLoopChannel<ExecutorHalve>,
-    ) -> Result<Self, DynError> {
+    ) -> anyhow::Result<Self> {
         let data_dir = Self::test_data_dir(identifier);
 
         let contracts_data_dir = data_dir.join("contracts");
@@ -56,7 +56,7 @@ impl ContractExecutor for Executor<MockRuntime> {
             .await
             .map_err(ExecutorError::other)?
         else {
-            return Err(ExecutorError::other(format!(
+            return Err(ExecutorError::other(anyhow::anyhow!(
                 "missing state and/or parameters for contract {key}"
             )));
         };
@@ -68,7 +68,7 @@ impl ContractExecutor for Executor<MockRuntime> {
             None
         };
         let Ok(state) = self.state_store.get(&key).await else {
-            return Err(ExecutorError::other(format!(
+            return Err(ExecutorError::other(anyhow::anyhow!(
                 "missing state for contract {key}"
             )));
         };
