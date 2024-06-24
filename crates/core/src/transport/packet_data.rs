@@ -43,21 +43,21 @@ const fn _check_valid_size<const N: usize>() {
 }
 
 #[derive(Clone)]
-pub(super) struct PacketData<DT: Encryption, const N: usize = MAX_PACKET_SIZE> {
+pub(crate) struct PacketData<DT: Encryption, const N: usize = MAX_PACKET_SIZE> {
     data: [u8; N],
     pub size: usize,
     data_type: PhantomData<DT>,
 }
 
-pub(super) trait Encryption: Clone {}
+pub(crate) trait Encryption: Clone {}
 
 /// Decrypted packet
 #[derive(Clone, Copy)]
-pub(super) struct Plaintext;
+pub(crate) struct Plaintext;
 
 /// Packet is encrypted using symmetric crypto (most packets if not an intro packet)
 #[derive(Clone, Copy)]
-pub(super) struct SymmetricAES;
+pub(crate) struct SymmetricAES;
 
 /// Packet is encrypted using assympetric crypto (typically an intro packet)
 #[derive(Clone, Copy)]
@@ -66,7 +66,7 @@ pub(super) struct AssymetricRSA;
 /// This is used when we don't know the encryption type of the packet, perhaps because we
 /// haven't yet determined whether it is an intro packet.
 #[derive(Clone, Copy)]
-pub(super) struct UnknownEncryption;
+pub(crate) struct UnknownEncryption;
 
 impl Encryption for Plaintext {}
 impl Encryption for SymmetricAES {}
@@ -155,7 +155,7 @@ impl<const N: usize> PacketData<Plaintext, N> {
         }
     }
 
-    pub(super) fn encrypt_symmetric(&self, cipher: &Aes128Gcm) -> PacketData<SymmetricAES, N> {
+    pub(crate) fn encrypt_symmetric(&self, cipher: &Aes128Gcm) -> PacketData<SymmetricAES, N> {
         _check_valid_size::<N>();
         debug_assert!(self.size <= MAX_DATA_SIZE);
 
@@ -182,6 +182,17 @@ impl<const N: usize> PacketData<Plaintext, N> {
         PacketData {
             data: buffer,
             size: NONCE_SIZE + payload_length + TAG_SIZE,
+            data_type: PhantomData,
+        }
+    }
+}
+
+#[cfg(test)]
+impl<const N: usize> PacketData<SymmetricAES, N> {
+    pub fn as_unknown(self) -> PacketData<UnknownEncryption, N> {
+        PacketData {
+            data: self.data,
+            size: self.size,
             data_type: PhantomData,
         }
     }
@@ -222,7 +233,7 @@ impl<const N: usize> PacketData<UnknownEncryption, N> {
         })
     }
 
-    pub fn try_decrypt_asym(
+    pub(super) fn try_decrypt_asym(
         &self,
         key: &TransportSecretKey,
     ) -> Result<PacketData<AssymetricRSA, N>, TransportError> {
@@ -238,7 +249,7 @@ impl<const N: usize> PacketData<UnknownEncryption, N> {
         Ok(r)
     }
 
-    pub fn assert_assymetric(&self) -> PacketData<AssymetricRSA, N> {
+    pub(super) fn assert_assymetric(&self) -> PacketData<AssymetricRSA, N> {
         PacketData {
             data: self.data,
             size: self.size,
