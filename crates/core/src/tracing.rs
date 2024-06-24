@@ -591,12 +591,11 @@ mod opentelemetry_tracer {
 
             let tracer = {
                 let tracer_provider = global::tracer_provider();
-                tracer_provider.versioned_tracer(
-                    "freenet",
-                    Some(env!("CARGO_PKG_VERSION")),
-                    Some("https://opentelemetry.io/schemas/1.21.0"),
-                    None,
-                )
+                tracer_provider
+                    .tracer_builder("freenet")
+                    .with_version(env!("CARGO_PKG_VERSION"))
+                    .with_schema_url("https://opentelemetry.io/schemas/1.21.0")
+                    .build()
             };
             let tx_bytes = transaction.as_bytes();
             let mut span_id = [0; 8];
@@ -671,6 +670,10 @@ mod opentelemetry_tracer {
             T: Into<std::borrow::Cow<'static, str>>,
         {
             unreachable!("shouldn't change span name")
+        }
+
+        fn add_link(&mut self, span_context: trace::SpanContext, attributes: Vec<KeyValue>) {
+            self.inner.add_link(span_context, attributes);
         }
     }
 
@@ -927,10 +930,11 @@ enum PutEvent {
 
 #[cfg(feature = "trace")]
 pub(crate) mod tracer {
+    use opentelemetry_otlp::WithExportConfig;
     use tracing::level_filters::LevelFilter;
     use tracing_subscriber::{Layer, Registry};
 
-    pub fn init_tracer(level: Option<LevelFilter>) -> anyhow::Result<()> {
+    pub fn init_tracer(level: Option<LevelFilter>, endpoint: Option<String>) -> anyhow::Result<()> {
         let default_filter = if cfg!(any(test, debug_assertions)) {
             LevelFilter::DEBUG
         } else {
@@ -972,12 +976,21 @@ pub(crate) mod tracer {
                 println!("setting OT collector with identifier: {identifier}");
                 let tracing_ot_layer = {
                     // Connect the Jaeger OT tracer with the tracing middleware
-                    // FIXME: remove
-                    #[allow(deprecated)]
-                    let ot_jaeger_tracer =
-                        opentelemetry_jaeger::config::agent::AgentPipeline::default()
-                            .with_service_name(identifier)
-                            .install_simple()?;
+                    let ot_jaeger_tracer = opentelemetry_otlp::new_pipeline()
+                        .tracing()
+                        .with_exporter(
+                            opentelemetry_otlp::new_exporter()
+                                .tonic()
+                                .with_endpoint(endpoint.unwrap_or_default()),
+                        )
+                        .with_trace_config(
+                            opentelemetry_sdk::trace::Config::default().with_resource(
+                                opentelemetry_sdk::Resource::new(vec![
+                                    opentelemetry::KeyValue::new(identifier, "tracing-jaeger"),
+                                ]),
+                            ),
+                        )
+                        .install_simple()?;
                     // Get a tracer which will route OT spans to a Jaeger agent
                     tracing_opentelemetry::layer().with_tracer(ot_jaeger_tracer)
                 };

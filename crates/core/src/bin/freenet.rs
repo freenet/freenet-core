@@ -48,7 +48,7 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
-    freenet::config::set_logger(None);
+    freenet::config::set_logger(None, None);
     let config = ConfigArgs::parse().build()?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(

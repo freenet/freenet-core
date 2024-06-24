@@ -827,7 +827,7 @@ impl GlobalExecutor {
     }
 }
 
-pub fn set_logger(level: Option<tracing::level_filters::LevelFilter>) {
+pub fn set_logger(level: Option<tracing::level_filters::LevelFilter>, endpoint: Option<String>) {
     #[cfg(feature = "trace")]
     {
         static LOGGER_SET: AtomicBool = AtomicBool::new(false);
@@ -843,7 +843,7 @@ pub fn set_logger(level: Option<tracing::level_filters::LevelFilter>) {
             return;
         }
 
-        crate::tracing::tracer::init_tracer(level).expect("failed tracing initialization")
+        crate::tracing::tracer::init_tracer(level, endpoint).expect("failed tracing initialization")
     }
 }
 

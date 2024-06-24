@@ -182,7 +182,7 @@ async fn start_child(config: &TestConfig, cmd_config: &NetworkProcessConfig) -> 
         "FREENET_PEER_ID",
         cmd_config.clone().id.expect("id should be set"),
     );
-    freenet::config::set_logger(None);
+    freenet::config::set_logger(None, None);
     if let Some(peer_id) = &cmd_config.id {
         let peer = NetworkPeer::new(peer_id.clone()).await?;
         peer.run(config, peer_id.clone()).await?;
