@@ -8,9 +8,10 @@ use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt}
 use tokio::sync::mpsc::{self};
 
 use crate::{
-    dev_tool::{PeerId, Transaction},
+    dev_tool::{Location, PeerId, Transaction},
     message::{InnerMessage, NetMessage, NetMessageV1},
-    operations::connect::{ConnectMsg, ConnectRequest},
+    operations::connect::{self, ConnectMsg, ConnectRequest},
+    ring::ConnectionManager,
     transport::{
         InboundConnectionHandler, OutboundConnectionHandler, PeerConnection, TransportError,
         TransportPublicKey,
@@ -96,12 +97,14 @@ pub(super) struct HandshakeHandler {
     queues: HashMap<SocketAddr, Vec<NetMessage>>,
     /// The other end of `EstablishConnection`, receives commands to establish a new outbound connection.
     establish_connection_rx: mpsc::Receiver<(PeerId, Transaction)>,
+    connection_manager: ConnectionManager,
 }
 
 impl HandshakeHandler {
     pub fn new(
         inbound_conn_handler: InboundConnectionHandler,
         outbound_conn_handler: OutboundConnectionHandler,
+        connection_manager: ConnectionManager,
     ) -> (Self, EstablishConnection, OutboundMessage) {
         let (pending_msg_tx, pending_msg_rx) = tokio::sync::mpsc::channel(100);
         let (establish_connection_tx, establish_connection_rx) = tokio::sync::mpsc::channel(100);
@@ -117,6 +120,7 @@ impl HandshakeHandler {
             pending_msg_rx,
             queues: HashMap::new(),
             establish_connection_rx,
+            connection_manager,
         };
         (
             connector,
@@ -157,9 +161,15 @@ impl HandshakeHandler {
                         InternalEvent::InboundJoinRequest {
                             conn, id, joiner, joiner_key, hops_to_live, max_hops_to_live, skip_list
                         } => {
-                            // TODO: check whether we should accept the connection or not here
-                            // this will divert into 2 different code paths: promote to established connection or transient connection
-                            self.unconfirmed_inbound_connections.push(gw_peer_connection_listener(conn, outbound_sender).boxed());
+                            let remote = conn.remote_addr();
+                            let location = Location::from_address(&remote);
+                            let peer_id = joiner.unwrap_or_else(|| PeerId::new(remote, joiner_key));
+                            let should_accept = self.connection_manager.should_accept(location, Some(&peer_id));
+                            if should_accept {
+                                todo!();
+                            } else {
+                                self.unconfirmed_inbound_connections.push(gw_peer_connection_listener(conn, outbound_sender).boxed());
+                            }
                         }
                         InternalEvent::DropInboundConnection(conn) => {
                             let addr = conn.remote_addr();
@@ -219,7 +229,11 @@ impl HandshakeHandler {
                 }
                 _ => {}
             }
-            alive_conn.send(op).await;
+            if alive_conn.send(op).await.is_err() {
+                self.queues.remove(&addr);
+                self.outbound_messages.remove(&addr);
+                self.connecting.remove(&addr);
+            }
             None
         } else {
             // if is a message to a peer which is not yet connected, just queue it
@@ -384,8 +398,11 @@ mod tests {
         let outbound_conn_handler = OutboundConnectionHandler::new(outbound_sender);
         let (inbound_sender, inbound_recv) = mpsc::channel(5);
         let inbound_conn_handler = InboundConnectionHandler::new(inbound_recv);
-        let (handler, establish_conn, out) =
-            HandshakeHandler::new(inbound_conn_handler, outbound_conn_handler);
+        let (handler, establish_conn, out) = HandshakeHandler::new(
+            inbound_conn_handler,
+            outbound_conn_handler,
+            ConnectionManager::default(),
+        );
         (
             handler,
             TestVerifier {

@@ -133,7 +133,7 @@ impl P2pConnManager {
         })
     }
 
-    #[tracing::instrument(name = "network_event_listener", fields(peer = ?self.bridge.op_manager.ring.get_peer_key()), skip_all)]
+    #[tracing::instrument(name = "network_event_listener", fields(peer = ?self.bridge.op_manager.ring.connection_manager.get_peer_key()), skip_all)]
     pub async fn run_event_listener(
         mut self,
         op_manager: Arc<OpManager>,
@@ -363,6 +363,7 @@ impl P2pConnManager {
                                 // for the other peer returning this response, check handle_bridge_connection_message
                                 let this_peer_id = op_manager
                                     .ring
+                                    .connection_manager
                                     .set_peer_key(joiner.clone())
                                     .unwrap_or_else(|| joiner.clone());
                                 if *accepted && &this_peer_id == joiner {
@@ -430,7 +431,7 @@ impl P2pConnManager {
                             })) = &msg
                             {
                                 // FIXME: first should check that this is indeed an alive transaction
-                                tracing::debug!(remote = %joiner, this_peer = ?op_manager.ring.get_peer_key().unwrap(), "Received clean connection message");
+                                tracing::debug!(remote = %joiner, this_peer = ?op_manager.ring.connection_manager.get_peer_key().unwrap(), "Received clean connection message");
                                 // this is the clean up message for a gw connection that was not accepted
                                 // in this case the joiner is connected to another peers, so we don't need to maintain the
                                 // connection with the rejected gateway
@@ -453,7 +454,7 @@ impl P2pConnManager {
                             let span = tracing::info_span!(
                                 parent: parent_span,
                                 "process_network_message",
-                                peer = ?self.bridge.op_manager.ring.get_peer_key(),
+                                peer = ?self.bridge.op_manager.ring.connection_manager.get_peer_key(),
                                 transaction = %msg.id(),
                                 tx_type = %msg.id().transaction_type()
                             );
@@ -473,7 +474,7 @@ impl P2pConnManager {
                     }
                 }
                 Ok(Right(NodeAction(NodeEvent::ConnectPeer { peer, callback }))) => {
-                    tracing::info!(remote = %peer, this_peer = ?op_manager.ring.get_peer_key().unwrap(), "Connecting to peer");
+                    tracing::info!(remote = %peer, this_peer = ?op_manager.ring.connection_manager.get_peer_key().unwrap(), "Connecting to peer");
                     let mut ob = outbound_conn_handler.clone();
                     let conn_fut = (async move {
                         let c = ob.connect(peer.pub_key.clone(), peer.addr).await;
@@ -496,7 +497,7 @@ impl P2pConnManager {
                     return Ok(());
                 }
                 Ok(Right(NodeAction(NodeEvent::DropConnection(peer_id)))) => {
-                    tracing::info!(remote = %peer_id, this_peer = ?op_manager.ring.get_peer_key().unwrap(), "Dropping connection");
+                    tracing::info!(remote = %peer_id, this_peer = ?op_manager.ring.connection_manager.get_peer_key().unwrap(), "Dropping connection");
                     gw_inbound_pending_connections.remove(&peer_id.addr());
                     op_manager.ring.prune_connection(peer_id.clone()).await;
                     self.connections.remove(&peer_id);
@@ -590,13 +591,29 @@ impl P2pConnManager {
                         Self::establish_connection(outbound_conn_handler, &peer).await?;
 
                     // Set the local peer ID using the connection information
-                    if self.bridge.op_manager.ring.get_peer_key().is_none() {
+                    if self
+                        .bridge
+                        .op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_key()
+                        .is_none()
+                    {
                         tracing::debug!("Setting peer key for the first time");
                         let my_address: SocketAddr = peer_conn.my_address().unwrap();
                         let own_peer_id = PeerId::new(my_address, joiner_key.clone());
-                        self.bridge.op_manager.ring.set_peer_key(own_peer_id);
+                        self.bridge
+                            .op_manager
+                            .ring
+                            .connection_manager
+                            .set_peer_key(own_peer_id);
                     }
-                    *joiner = self.bridge.op_manager.ring.get_peer_key();
+                    *joiner = self
+                        .bridge
+                        .op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_key();
                     *skip_list = self.connections.keys().cloned().collect();
                     connection = Some((peer.clone(), peer_conn));
                 } else {
@@ -624,6 +641,7 @@ impl P2pConnManager {
                         .bridge
                         .op_manager
                         .ring
+                        .connection_manager
                         .get_peer_key()
                         .expect("should be set at this point")
                 {
@@ -695,13 +713,23 @@ impl P2pConnManager {
     ) {
         tracing::debug!(
             "This peer {:?} has active connections with peers: {:?}",
-            self.bridge.op_manager.ring.get_peer_key().as_ref(),
+            self.bridge
+                .op_manager
+                .ring
+                .connection_manager
+                .get_peer_key()
+                .as_ref(),
             self.connections.keys().map(|p| &p.addr).collect::<Vec<_>>()
         );
         if self.is_gateway {
             tracing::debug!(
                 "This gateway {:?} has pending connections with peers: {:?}",
-                self.bridge.op_manager.ring.get_peer_key().as_ref(),
+                self.bridge
+                    .op_manager
+                    .ring
+                    .connection_manager
+                    .get_peer_key()
+                    .as_ref(),
                 gw_inbound_pending_connections.collect::<Vec<_>>()
             );
         }

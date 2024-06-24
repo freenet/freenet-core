@@ -9,7 +9,6 @@ use super::{
     },
     NetEventRegister,
 };
-use crate::transport::TransportPublicKey;
 use crate::{
     client_events::{combinator::ClientEventsCombinator, BoxedClient},
     config::GlobalExecutor,
@@ -21,6 +20,7 @@ use crate::{
     node::NodeConfig,
     operations::connect,
 };
+use crate::{ring::ConnectionManager, transport::TransportPublicKey};
 
 use super::OpManager;
 
@@ -34,6 +34,7 @@ pub(crate) struct NodeP2P {
     cli_response_sender: ClientResponsesSender,
     node_controller: tokio::sync::mpsc::Receiver<NodeEvent>,
     should_try_connect: bool,
+    connection_manager: ConnectionManager,
 }
 
 impl NodeP2P {
@@ -66,7 +67,7 @@ impl NodeP2P {
         clients: [BoxedClient; CLIENTS],
         event_register: ER,
         ch_builder: CH::Builder,
-    ) -> anyhow::Result<NodeP2P>
+    ) -> anyhow::Result<Self>
     where
         CH: ContractHandler + Send + 'static,
         ER: NetEventRegister + Clone,
@@ -77,11 +78,13 @@ impl NodeP2P {
         let (ch_outbound, ch_inbound, wait_for_event) = contract::contract_handler_channel();
         let (client_responses, cli_response_sender) = contract::client_responses_channel();
 
+        let connection_manager = ConnectionManager::new(&config);
         let op_manager = Arc::new(OpManager::new(
             notification_tx,
             ch_outbound,
             &config,
             event_register.clone(),
+            connection_manager.clone(),
         )?);
         let (executor_listener, executor_sender) = contract::executor_channel(op_manager.clone());
         let contract_handler = CH::build(ch_inbound, executor_sender, ch_builder)
@@ -118,6 +121,7 @@ impl NodeP2P {
             cli_response_sender,
             node_controller: node_controller_rx,
             should_try_connect: config.should_connect,
+            connection_manager,
         })
     }
 }

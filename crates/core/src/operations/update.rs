@@ -157,7 +157,7 @@ impl Operation for UpdateOp {
                     related_contracts,
                     value,
                 } => {
-                    let sender = op_manager.ring.own_location();
+                    let sender = op_manager.ring.connection_manager.own_location();
 
                     tracing::debug!(
                         "Requesting update for contract {} from {} to {}",
@@ -242,7 +242,7 @@ impl Operation for UpdateOp {
                         return Err(OpError::StatePushed);
                     };
 
-                    let target = op_manager.ring.own_location();
+                    let target = op_manager.ring.connection_manager.own_location();
 
                     tracing::debug!("Attempting contract value update - BroadcastTo - update");
                     let new_value = update_contract(
@@ -289,7 +289,7 @@ impl Operation for UpdateOp {
                     new_value,
                     upstream,
                 } => {
-                    let sender = op_manager.ring.own_location();
+                    let sender = op_manager.ring.connection_manager.own_location();
                     let mut broadcasted_to = *broadcasted_to;
 
                     let mut broadcasting = Vec::with_capacity(broadcast_to.len());
@@ -354,7 +354,7 @@ impl Operation for UpdateOp {
                             tracing::debug!(
                                 tx = %id,
                                 %key,
-                                this_peer = ?op_manager.ring.get_peer_key(),
+                                this_peer = ?op_manager.ring.connection_manager.get_peer_key(),
                                 "Peer completed contract value update - SuccessfulUpdate",
                             );
 
@@ -583,7 +583,7 @@ pub(crate) async fn request_update(
         return Err(OpError::UnexpectedOpState);
     };
 
-    let sender = op_manager.ring.own_location();
+    let sender = op_manager.ring.connection_manager.own_location();
 
     // the initial request must provide:
     // - a peer as close as possible to the contract location

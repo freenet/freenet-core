@@ -67,7 +67,11 @@ pub struct Node(NodeP2P);
 
 impl Node {
     pub fn update_location(&mut self, location: Location) {
-        self.0.op_manager.ring.update_location(Some(location));
+        self.0
+            .op_manager
+            .ring
+            .connection_manager
+            .update_location(Some(location));
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
@@ -414,6 +418,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                 } => {
                     let peer_id = op_manager
                         .ring
+                        .connection_manager
                         .get_peer_key()
                         .expect("Peer id not found at put op, it should be set");
                     // Initialize a put op.
@@ -438,6 +443,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                 ContractRequest::Update { key, data } => {
                     let peer_id = op_manager
                         .ring
+                        .connection_manager
                         .get_peer_key()
                         .expect("Peer id not found at update op, it should be set");
                     tracing::debug!(
@@ -472,6 +478,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                 } => {
                     let peer_id = op_manager
                         .ring
+                        .connection_manager
                         .get_peer_key()
                         .expect("Peer id not found at get op, it should be set");
                     // Initialize a get op.
@@ -603,7 +610,11 @@ async fn report_result(
                         second_trace_lines.join("\n")
                     })
                     .unwrap_or_default();
-                let peer = &op_manager.ring.get_peer_key().expect("Peer key not found");
+                let peer = &op_manager
+                    .ring
+                    .connection_manager
+                    .get_peer_key()
+                    .expect("Peer key not found");
                 let log = format!(
                     "Transaction ({tx} @ {peer}) error trace:\n {trace} \nstate:\n {state:?}\n"
                 );
@@ -692,7 +703,7 @@ async fn process_message_v1<CB>(
                 let span = tracing::info_span!(
                     parent: parent_span,
                     "handle_connect_op_request",
-                    peer = ?op_manager.ring.get_peer_key(),
+                    peer = ?op_manager.ring.connection_manager.get_peer_key(),
                     transaction = %msg.id(),
                     tx_type = %msg.id().transaction_type()
                 );
@@ -860,7 +871,8 @@ where
             // only keep attempting to connect if the node hasn't got enough connections yet
             Ok(Some(OpEnum::Connect(op)))
                 if op.has_backoff()
-                    && op_manager.ring.open_connections() < op_manager.ring.min_connections =>
+                    && op_manager.ring.open_connections()
+                        < op_manager.ring.connection_manager.min_connections =>
             {
                 let ConnectOp {
                     gateway, backoff, ..

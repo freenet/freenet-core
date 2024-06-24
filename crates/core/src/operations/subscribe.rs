@@ -194,7 +194,7 @@ impl Operation for SubscribeOp {
                         self.state,
                         Some(SubscribeState::AwaitingResponse { .. })
                     ));
-                    let sender = op_manager.ring.own_location();
+                    let sender = op_manager.ring.connection_manager.own_location();
                     new_state = self.state;
                     return_msg = Some(SubscribeMsg::SeekNode {
                         id: *id,
@@ -215,7 +215,7 @@ impl Operation for SubscribeOp {
                     htl,
                     retries,
                 } => {
-                    let this_peer = op_manager.ring.own_location();
+                    let this_peer = op_manager.ring.connection_manager.own_location();
                     let return_not_subbed = || -> OperationResult {
                         OperationResult {
                             return_msg: Some(NetMessage::from(SubscribeMsg::ReturnSub {
@@ -331,7 +331,8 @@ impl Operation for SubscribeOp {
                                     .into_iter()
                                     .next()
                                 {
-                                    let subscriber = op_manager.ring.own_location();
+                                    let subscriber =
+                                        op_manager.ring.connection_manager.own_location();
                                     return_msg = Some(SubscribeMsg::SeekNode {
                                         id: *id,
                                         key: *key,

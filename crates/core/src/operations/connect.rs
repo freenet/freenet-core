@@ -94,7 +94,7 @@ impl Operation for ConnectOp {
                         ..
                     }
                 ) {
-                    Some(Box::new(op_manager.ring.own_location()))
+                    Some(Box::new(op_manager.ring.connection_manager.own_location()))
                 } else {
                     None
                 };
@@ -147,7 +147,7 @@ impl Operation for ConnectOp {
                         },
                     id,
                 } => {
-                    let own_loc = op_manager.ring.own_location();
+                    let own_loc = op_manager.ring.connection_manager.own_location();
                     let PeerKeyLocation {
                         peer: this_peer,
                         location: Some(_),
@@ -240,7 +240,7 @@ impl Operation for ConnectOp {
                     let joiner: PeerId = joiner
                         .clone()
                         .expect("should be already set at the p2p bridge level");
-                    let this_peer = op_manager.ring.own_location();
+                    let this_peer = op_manager.ring.connection_manager.own_location();
                     let assigned_location = Location::from_address(&joiner.addr);
 
                     let new_peer_loc = PeerKeyLocation {
@@ -250,6 +250,7 @@ impl Operation for ConnectOp {
 
                     let accepted = op_manager
                         .ring
+                        .connection_manager
                         .should_accept(assigned_location, Some(&joiner));
 
                     let mut skip_list = skip_list.clone();
@@ -308,12 +309,12 @@ impl Operation for ConnectOp {
                             tx = %id,
                             sender = %sender.peer,
                             joiner = %joiner.peer,
-                            at = %op_manager.ring.own_location().peer,
+                            at = %op_manager.ring.connection_manager.own_location().peer,
                             "Connectivity check from self, aborting"
                         );
                         std::process::exit(1);
                     }
-                    let this_peer = op_manager.ring.own_location();
+                    let this_peer = op_manager.ring.connection_manager.own_location();
                     let joiner_loc = joiner
                         .location
                         .expect("should be already set at the p2p bridge level");
@@ -328,6 +329,7 @@ impl Operation for ConnectOp {
 
                     let should_accept = if op_manager
                         .ring
+                        .connection_manager
                         .should_accept(joiner_loc, Some(&joiner.peer))
                     {
                         tracing::debug!(tx = %id, %joiner, "Accepting connection from");
@@ -407,7 +409,11 @@ impl Operation for ConnectOp {
                         "Connect response received",
                     );
 
-                    let this_peer_id = op_manager.ring.get_peer_key().expect("peer id not found");
+                    let this_peer_id = op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_key()
+                        .expect("peer id not found");
 
                     match self.state.as_mut() {
                         Some(ConnectState::ConnectingToNode(info)) => {
@@ -448,7 +454,10 @@ impl Operation for ConnectOp {
                                 location = %your_location,
                                 "Updating assigned location"
                             );
-                            op_manager.ring.update_location(target.location);
+                            op_manager
+                                .ring
+                                .connection_manager
+                                .update_location(target.location);
 
                             if remaining_connetions == 0 {
                                 tracing::debug!(
@@ -701,7 +710,8 @@ where
     let number_of_parallel_connections = {
         let max_potential_conns_per_gw = op_manager.ring.max_hops_to_live;
         // e.g. 10 gateways and htl 5 -> only need 2 connections in parallel
-        let needed_to_cover_max = op_manager.ring.max_connections / max_potential_conns_per_gw;
+        let needed_to_cover_max =
+            op_manager.ring.connection_manager.max_connections / max_potential_conns_per_gw;
         gateways.iter().take(needed_to_cover_max).count().max(1)
     };
     let gateways = gateways.to_vec();
@@ -746,7 +756,7 @@ where
     Ok(())
 }
 
-#[tracing::instrument(fields(peer = ?op_manager.ring.get_peer_key()), skip_all)]
+#[tracing::instrument(fields(peer = ?op_manager.ring.connection_manager.get_peer_key()), skip_all)]
 pub(crate) async fn join_ring_request<CM>(
     backoff: Option<ExponentialBackoff>,
     peer_pub_key: TransportPublicKey,
@@ -759,7 +769,7 @@ where
 {
     if op_manager.ring.num_connections() > 0 {
         use crate::node::ConnectionError;
-        if !op_manager.ring.should_accept(
+        if !op_manager.ring.connection_manager.should_accept(
             gateway.location.unwrap_or_else(Location::random),
             Some(&gateway.peer),
         ) {

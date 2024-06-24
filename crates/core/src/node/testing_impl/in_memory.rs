@@ -12,7 +12,7 @@ use crate::{
         op_state_manager::OpManager,
         NetEventRegister, NetworkBridge,
     },
-    ring::PeerKeyLocation,
+    ring::{ConnectionManager, PeerKeyLocation},
 };
 
 use super::{Builder, RunnerConfig};
@@ -33,11 +33,13 @@ impl<ER> Builder<ER> {
         let (ops_ch_channel, ch_channel, wait_for_event) = contract::contract_handler_channel();
 
         let _guard = parent_span.enter();
+        let connection_manager = ConnectionManager::new(&self.config);
         let op_manager = Arc::new(OpManager::new(
             notification_tx,
             ops_ch_channel,
             &self.config,
             self.event_register.clone(),
+            connection_manager.clone(),
         )?);
         std::mem::drop(_guard);
         let (executor_listener, executor_sender) = executor_channel(op_manager.clone());
@@ -111,7 +113,11 @@ where
             tracing::debug!(
                 "Appended contract {} to peer {}",
                 key,
-                self.op_manager.ring.get_peer_key().unwrap()
+                self.op_manager
+                    .ring
+                    .connection_manager
+                    .get_peer_key()
+                    .unwrap()
             );
             if subscription {
                 self.op_manager.ring.seed_contract(key);
