@@ -8,8 +8,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{fs::File, io::Read};
 
-use crate::DynError;
-
 const INTERNAL_KEY: usize = 32;
 const TOMBSTONE_MARKER: usize = 1;
 
@@ -154,7 +152,7 @@ pub(super) trait StoreFsManagement: Sized {
     fn watch_changes(
         mut container: Self::MemContainer,
         key_file_path: &Path,
-    ) -> Result<(), DynError> {
+    ) -> anyhow::Result<()> {
         let key_path = key_file_path.to_path_buf();
         let key_path_cp = key_path.clone();
         let mut watcher = notify::recommended_watcher(

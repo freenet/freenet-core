@@ -125,7 +125,7 @@ impl ConfigArgs {
 
         match config_args {
             Some((filename, ext)) => {
-                let path = dir.join(&filename).with_extension(&ext);
+                let path = dir.join(filename).with_extension(&ext);
                 tracing::info!("Reading configuration file: {path:?}",);
                 match ext.as_str() {
                     "toml" => {
@@ -455,6 +455,15 @@ pub struct WebsocketApiConfig {
     /// Port to expose api on
     #[serde(default = "default_http_gateway_port", rename = "ws-api-port")]
     pub port: u16,
+}
+
+impl From<SocketAddr> for WebsocketApiConfig {
+    fn from(addr: SocketAddr) -> Self {
+        Self {
+            address: addr.ip(),
+            port: addr.port(),
+        }
+    }
 }
 
 impl Default for WebsocketApiConfig {

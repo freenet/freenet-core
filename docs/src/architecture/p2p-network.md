@@ -15,7 +15,7 @@ In Freenet, a "peer" is any computer running the [Freenet
 Core](https://github.com/freenet/freenet-core) software. The peers are organized
 in a ring-like structure, with each peer assigned a specific numerical value
 between 0.0 and 1.0, indicating its location in the network's topology. This
-location is derived from the peer's public key.
+location is derived from the peer's IP address.
 
 ## Establishing Neighbor Connections
 

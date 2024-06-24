@@ -16,7 +16,7 @@ pub(super) struct AppState {
 }
 
 impl AppState {
-    pub async fn new(config: &ExecutorConfig) -> Result<Self, anyhow::Error> {
+    pub async fn new(config: &ExecutorConfig) -> anyhow::Result<Self> {
         AppState::new_v1(config).await
     }
 

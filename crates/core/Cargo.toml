@@ -65,7 +65,7 @@ wasmer = { features = ["sys"], workspace = true }
 xz2 = { version = "0.1" }
 reqwest = { version = "0.12", features = ["json"] }
 rsa = { version = "0.9", features = ["serde", "pem"] }
-pkcs1 = { version = "0.7", features = ["std", "pem"] }
+pkcs8 = { version = "0.10", features = ["std", "pem"] }
 
 # Tracing deps
 opentelemetry = "0.22"

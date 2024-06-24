@@ -228,7 +228,6 @@ impl ResourceTotals {
 // Tests
 #[cfg(test)]
 mod tests {
-    use crate::DynError;
 
     use super::*;
 
@@ -288,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn test_meter_report() -> Result<(), DynError> {
+    fn test_meter_report() -> anyhow::Result<()> {
         let mut meter = Meter::new_with_window_size(100);
 
         // Report some usage and test that the total and attributed usage are updated

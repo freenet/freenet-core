@@ -5,7 +5,7 @@ pub(super) async fn execute_command(
     other: BaseConfig,
     address: IpAddr,
     port: u16,
-) -> Result<(), anyhow::Error> {
+) -> anyhow::Result<()> {
     let mode = other.mode;
 
     let target = match mode {

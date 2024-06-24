@@ -241,7 +241,7 @@ impl Operation for ConnectOp {
                         .clone()
                         .expect("should be already set at the p2p bridge level");
                     let this_peer = op_manager.ring.own_location();
-                    let assigned_location = Location::random();
+                    let assigned_location = Location::from_address(&joiner.addr);
 
                     let new_peer_loc = PeerKeyLocation {
                         location: Some(assigned_location),
@@ -1131,7 +1131,7 @@ mod test {
 
     /// Given a network of one node and one gateway test that both are connected.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn one_node_connects_to_gw() -> Result<(), anyhow::Error> {
+    async fn one_node_connects_to_gw() -> anyhow::Result<()> {
         const NUM_NODES: usize = 1usize;
         const NUM_GW: usize = 1usize;
         const MAX_HTL: usize = 1usize;
@@ -1156,7 +1156,7 @@ mod test {
 
     /// Once a gateway is left without remaining open slots, ensure forwarding connects
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn forward_connection_to_node() -> Result<(), anyhow::Error> {
+    async fn forward_connection_to_node() -> anyhow::Result<()> {
         const NUM_NODES: usize = 3usize;
         const NUM_GW: usize = 1usize;
         const MAX_HTL: usize = 2usize;
@@ -1190,7 +1190,7 @@ mod test {
 
     /// Given a network of N peers all good connectivity
     #[tokio::test(flavor = "multi_thread")]
-    async fn network_should_achieve_good_connectivity() -> Result<(), anyhow::Error> {
+    async fn network_should_achieve_good_connectivity() -> anyhow::Result<()> {
         // crate::config::set_logger();
         const NUM_NODES: usize = 10usize;
         const NUM_GW: usize = 2usize;

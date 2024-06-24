@@ -23,18 +23,27 @@ curl https://sh.rustup.rs -sSf | sh
 Note: The Homebrew installation of Rust may interfere with `fdev`. It is
 recommended to use `rustup`, as shown above, to avoid these issues.
 
-### Installing Freenet and fdev
+### Installing Freenet Core and FDev from Git
 
-After setting up Cargo, install `freenet` and `fdev` with the following command.
-This installs `fdev` (the Freenet development tool) and a local Freenet peer
-for development purposes:
+- Clone the Freenet Core repository and the stdlib submodule, and navigate to the application directory:
 
-```bash
-cargo install freenet fdev
-```
+*Note:* Currently these should be installed from the git repo as the code is changing rapidly, once things
+are more stable they can be installed from crates.io which will simplify this step.
 
-This command will install `fdev` (Freenet development tool) and a working Freenet peer that can
-be used for local development.
+  ```bash
+  git clone --recurse-submodules https://github.com/freenet/freenet-core.git
+  cd freenet-core/apps/freenet-ping
+  ```
+
+### Freenet Development Tool and Kernel
+
+- Install the Freenet development tool (`fdev`) and the Freenet kernel for local development:
+
+  ```bash
+  # You should be in freenet-core/apps/freenet-ping
+  cargo install --path ../../crates/core
+  cargo install --path ../../crates/fdev
+  ```
 
 ### Add WebAssembly target
 

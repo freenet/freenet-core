@@ -373,7 +373,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<Supervisor>) -> anyhow
 async fn handle_outgoing_messages(
     supervisor: &Arc<Supervisor>,
     sender: &mut SplitSink<WebSocket, Message>,
-) -> Result<(), anyhow::Error> {
+) -> anyhow::Result<()> {
     let mut event_rx = supervisor.event_rx.lock().await;
     while let Some((event, peer_id)) = event_rx.recv().await {
         tracing::info!("Received event {} for peer {}", event, peer_id);
@@ -395,7 +395,7 @@ async fn handle_outgoing_messages(
 async fn handle_incoming_messages(
     supervisor: &Arc<Supervisor>,
     receiver: &mut SplitStream<WebSocket>,
-) -> Result<(), anyhow::Error> {
+) -> anyhow::Result<()> {
     while let Some(result) = receiver.next().await {
         // Handle the received message or log the error.
         match result {
@@ -406,10 +406,7 @@ async fn handle_incoming_messages(
     Ok(())
 }
 
-async fn process_message(
-    message: Message,
-    supervisor: &Arc<Supervisor>,
-) -> Result<(), anyhow::Error> {
+async fn process_message(message: Message, supervisor: &Arc<Supervisor>) -> anyhow::Result<()> {
     match message {
         Message::Binary(bytes) => {
             let peer_msg: PeerMessage = bincode::deserialize(&bytes)
@@ -430,7 +427,7 @@ async fn process_message(
 async fn handle_peer_message(
     peer_msg: PeerMessage,
     supervisor: &Arc<Supervisor>,
-) -> Result<(), anyhow::Error> {
+) -> anyhow::Result<()> {
     match peer_msg {
         PeerMessage::Event(event) => {
             // TODO: Implement actual event handling logic here.

@@ -7,7 +7,7 @@ use super::{
     network_bridge::{
         event_loop_notification_channel, p2p_protoc::P2pConnManager, EventLoopNotificationsReceiver,
     },
-    NetEventRegister,
+    NetEventRegister, PeerId,
 };
 use crate::transport::TransportPublicKey;
 use crate::{
@@ -24,7 +24,7 @@ use crate::{
 
 use super::OpManager;
 
-pub(super) struct NodeP2P {
+pub(crate) struct NodeP2P {
     pub(crate) peer_pub_key: TransportPublicKey,
     pub(crate) op_manager: Arc<OpManager>,
     notification_channel: EventLoopNotificationsReceiver,
@@ -34,10 +34,12 @@ pub(super) struct NodeP2P {
     cli_response_sender: ClientResponsesSender,
     node_controller: tokio::sync::mpsc::Receiver<NodeEvent>,
     should_try_connect: bool,
+    pub(super) peer_id: Option<PeerId>,
+    pub(super) is_gateway: bool,
 }
 
 impl NodeP2P {
-    pub(super) async fn run_node(self) -> Result<(), anyhow::Error> {
+    pub(super) async fn run_node(self) -> anyhow::Result<()> {
         if self.should_try_connect {
             connect::initial_join_procedure(
                 self.op_manager.clone(),
@@ -66,7 +68,7 @@ impl NodeP2P {
         clients: [BoxedClient; CLIENTS],
         event_register: ER,
         ch_builder: CH::Builder,
-    ) -> Result<NodeP2P, anyhow::Error>
+    ) -> anyhow::Result<NodeP2P>
     where
         CH: ContractHandler + Send + 'static,
         ER: NetEventRegister + Clone,
@@ -118,6 +120,8 @@ impl NodeP2P {
             cli_response_sender,
             node_controller: node_controller_rx,
             should_try_connect: config.should_connect,
+            peer_id: config.peer_id,
+            is_gateway: config.is_gateway,
         })
     }
 }

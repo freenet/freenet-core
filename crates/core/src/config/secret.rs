@@ -245,7 +245,13 @@ mod tests {
 
         // write secrets to files
         transport_keypair_file
-            .write_all(transport_keypair.secret().to_bytes().unwrap().as_slice())
+            .write_all(
+                transport_keypair
+                    .secret()
+                    .to_pkcs8_pem()
+                    .unwrap()
+                    .as_slice(),
+            )
             .unwrap();
         nonce_file.write_all(&nonce).unwrap();
         cipher_file.write_all(&cipher).unwrap();
