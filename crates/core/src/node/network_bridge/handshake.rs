@@ -10,7 +10,7 @@ use tokio::sync::mpsc::{self};
 use crate::{
     dev_tool::{Location, PeerId, Transaction},
     message::{InnerMessage, NetMessage, NetMessageV1},
-    operations::connect::{self, ConnectMsg, ConnectRequest},
+    operations::connect::{ConnectMsg, ConnectOp, ConnectRequest},
     ring::ConnectionManager,
     transport::{
         InboundConnectionHandler, OutboundConnectionHandler, PeerConnection, TransportError,
@@ -18,15 +18,19 @@ use crate::{
     },
 };
 
-type Result<T, E = HandshakeHandlerError> = std::result::Result<T, E>;
+type Result<T, E = HandshakeError> = std::result::Result<T, E>;
 type OutboundConnResult = (PeerId, Result<PeerConnection, TransportError>);
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum HandshakeHandlerError {
+pub(super) enum HandshakeError {
     #[error("channel closed")]
     ChannelClosed,
+    #[error("connection closed to {0}")]
+    ConnectionClosed(SocketAddr),
     #[error(transparent)]
     Serialization(#[from] Box<bincode::ErrorKind>),
+    #[error(transparent)]
+    TransportError(#[from] TransportError),
 }
 
 pub(super) enum Event {
@@ -45,9 +49,21 @@ pub(super) enum Event {
     /// An outbound connection to a gateway was rejected.
     OutboundConnectionRejected {
         peer_id: PeerId,
-        error: HandshakeHandlerError,
+        /// The ongoing connection operation state, to keep track of the forwarded connection attempts.
+        connection: ConnectOp,
     },
-    /// Clean up a transaction that was completed.
+    /// Message relayed by a gateway with a transient connection from a third party.
+    OutboundGatewayRelayMessage {
+        peer_id: PeerId,
+        message: ConnectMsg,
+    },
+    /// An outbound connection to a gateway was successfully established. It can be managed by the connection manager.
+    OutboundGatewayConnectionSuccessful {
+        peer_id: PeerId,
+        connection: PeerConnection,
+        op: ConnectMsg,
+    },
+    /// Clean up a transaction that was completed or duplicate.
     RemoveTransaction(Transaction),
 }
 
@@ -60,7 +76,7 @@ impl OutboundMessage {
         self.0
             .send((remote, msg))
             .await
-            .map_err(|_| HandshakeHandlerError::ChannelClosed)?;
+            .map_err(|_| HandshakeError::ChannelClosed)?;
         Ok(())
     }
 }
@@ -73,7 +89,7 @@ impl EstablishConnection {
         self.0
             .send((remote, tx))
             .await
-            .map_err(|_| HandshakeHandlerError::ChannelClosed)?;
+            .map_err(|_| HandshakeError::ChannelClosed)?;
         Ok(())
     }
 }
@@ -89,7 +105,7 @@ pub(super) struct HandshakeHandler {
     ongoing_outbound_connections: FuturesUnordered<BoxFuture<'static, OutboundConnResult>>,
     /// This is for connections that are not yet confirmed at a logical level in gateways
     unconfirmed_inbound_connections: FuturesUnordered<
-        BoxFuture<'static, Result<(InternalEvent, PeerOutboundMessage), TransportError>>,
+        BoxFuture<'static, Result<(InternalEvent, PeerOutboundMessage), HandshakeError>>,
     >,
     outbound_messages: HashMap<SocketAddr, mpsc::Sender<NetMessage>>,
     /// The other end of `OutboundMessage`, receives messages to be sent to a yet not confirmed peer.
@@ -130,12 +146,12 @@ impl HandshakeHandler {
     }
 
     /// Listens for either new inbound connections or messages from pending outbound/inbound connections.
-    pub async fn wait_for_events(&mut self) -> Result<Event, TransportError> {
+    pub async fn wait_for_events(&mut self) -> Result<Event, HandshakeError> {
         loop {
             tokio::select! {
                 new_conn = self.inbound_conn_handler.next_connection() => {
                     let Some(conn) = new_conn else {
-                        return Err(TransportError::ChannelClosed);
+                        return Err(HandshakeError::ChannelClosed);
                     };
                     self.track_inbound_connection(conn);
                 }
@@ -147,32 +163,36 @@ impl HandshakeHandler {
                         Some((peer_id, Err(error))) => {
                             Ok(Event::OutboundConnectionFailed { peer_id, error })
                         }
-                        None => Err(TransportError::ChannelClosed),
+                        None => Err(HandshakeError::ChannelClosed),
                     };
                     break r;
                 }
                 unconfirmed_inbound_conn = self.unconfirmed_inbound_connections.next(), if !self.unconfirmed_inbound_connections.is_empty() => {
                     let Some(res) = unconfirmed_inbound_conn else {
-                        return Err(TransportError::ChannelClosed);
+                        return Err(HandshakeError::ChannelClosed);
                     };
                     let (event, outbound_sender) = res?;
                     match event {
                         InternalEvent::NewConnection(conn) => break Ok(Event::InboundConnection(conn)),
-                        InternalEvent::InboundJoinRequest {
-                            conn, id, joiner, joiner_key, hops_to_live, max_hops_to_live, skip_list
-                        } => {
+                        InternalEvent::InboundJoinRequest(req) => {
+                            let InboundJoinRequest { conn, id, joiner, joiner_key, hops_to_live, max_hops_to_live, skip_list } = req;
                             let remote = conn.remote_addr();
                             let location = Location::from_address(&remote);
                             let peer_id = joiner.unwrap_or_else(|| PeerId::new(remote, joiner_key));
                             let should_accept = self.connection_manager.should_accept(location, Some(&peer_id));
                             if should_accept {
-                                todo!();
-                            } else {
                                 self.unconfirmed_inbound_connections.push(gw_peer_connection_listener(conn, outbound_sender).boxed());
+                            } else {
+                                self.unconfirmed_inbound_connections.push(gw_transient_peer_conn(conn, outbound_sender, TransientConnection {
+                                    tx: id,
+                                    peer_id,
+                                    max_hops_to_live: max_hops_to_live,
+                                    hops_to_live,
+                                    skip_list,
+                                }).boxed());
                             }
                         }
-                        InternalEvent::DropInboundConnection(conn) => {
-                            let addr = conn.remote_addr();
+                        InternalEvent::DropInboundConnection(addr) => {
                             self.outbound_messages.remove(&addr);
                             self.queues.remove(&addr);
                             self.connecting.remove(&addr);
@@ -182,7 +202,7 @@ impl HandshakeHandler {
                 }
                 pending_msg = self.pending_msg_rx.recv() => {
                     let Some((addr, msg)) = pending_msg else {
-                        return Err(TransportError::ChannelClosed);
+                        return Err(HandshakeError::ChannelClosed);
                     };
                     if let Some(event) = self.outbound(addr, msg).await {
                         break Ok(event);
@@ -190,7 +210,7 @@ impl HandshakeHandler {
                 }
                 establish_connection = self.establish_connection_rx.recv() => {
                     let Some((peer_id, tx)) = establish_connection else {
-                        return Err(TransportError::ChannelClosed);
+                        return Err(HandshakeError::ChannelClosed);
                     };
                     self.start_outbound_connection(peer_id, tx).await;
                 }
@@ -237,6 +257,7 @@ impl HandshakeHandler {
             None
         } else {
             // if is a message to a peer which is not yet connected, just queue it
+            tracing::debug!("Queueing message to {addr}", addr = addr);
             self.queues.entry(addr).or_default().push(op);
             None
         }
@@ -258,23 +279,24 @@ impl HandshakeHandler {
             .await
             .map(move |c| (remote, c))
             .boxed();
-        // TODO: if it's a gateway, maybe it will be eventually rejected, and is just forwarding, so take that in mind
         self.ongoing_outbound_connections.push(f);
     }
 }
 
+struct InboundJoinRequest {
+    conn: PeerConnection,
+    id: Transaction,
+    joiner: Option<PeerId>,
+    joiner_key: TransportPublicKey,
+    hops_to_live: usize,
+    max_hops_to_live: usize,
+    skip_list: Vec<PeerId>,
+}
+
 enum InternalEvent {
     NewConnection(PeerConnection),
-    InboundJoinRequest {
-        conn: PeerConnection,
-        id: Transaction,
-        joiner: Option<PeerId>,
-        joiner_key: TransportPublicKey,
-        hops_to_live: usize,
-        max_hops_to_live: usize,
-        skip_list: Vec<PeerId>,
-    },
-    DropInboundConnection(PeerConnection),
+    InboundJoinRequest(InboundJoinRequest),
+    DropInboundConnection(SocketAddr),
 }
 
 #[repr(transparent)]
@@ -284,11 +306,11 @@ struct PeerOutboundMessage(mpsc::Receiver<NetMessage>);
 async fn gw_peer_connection_listener(
     mut conn: PeerConnection,
     mut outbound: PeerOutboundMessage,
-) -> Result<(InternalEvent, PeerOutboundMessage), TransportError> {
+) -> Result<(InternalEvent, PeerOutboundMessage), HandshakeError> {
     loop {
         tokio::select! {
             msg = outbound.0.recv() => {
-                let Some(msg) = msg else { break Err(TransportError::ConnectionClosed(conn.remote_addr())); };
+                let Some(msg) = msg else { break Err(HandshakeError::ConnectionClosed(conn.remote_addr())); };
                 tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr() ,"Sending message to peer. Msg: {msg}");
                         conn
                             .send(msg)
@@ -298,7 +320,7 @@ async fn gw_peer_connection_listener(
                 let Ok(msg) = msg.map_err(|error| {
                     tracing::error!(at=?conn.my_address(), from=%conn.remote_addr(), "Error while receiving message: {error}");
                 }) else {
-                     break Err(TransportError::ConnectionClosed(conn.remote_addr()));
+                     break Err(HandshakeError::ConnectionClosed(conn.remote_addr()));
                 };
                 let net_message = decode_msg(&msg).unwrap();
                 tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), %net_message, "Received message from peer");
@@ -307,18 +329,42 @@ async fn gw_peer_connection_listener(
                         id,
                         msg: ConnectRequest::StartJoinReq { joiner, joiner_key, hops_to_live, max_hops_to_live, skip_list }
                     })) => {
-                        break Ok((InternalEvent::InboundJoinRequest { conn, id, joiner, joiner_key, hops_to_live, max_hops_to_live, skip_list }, outbound));
+                        break Ok((InternalEvent::InboundJoinRequest(InboundJoinRequest { conn, id, joiner, joiner_key, hops_to_live, max_hops_to_live, skip_list }), outbound));
                     }
-                    _ => todo!(),
+                    other =>  {
+                        tracing::warn!(at=?conn.my_address(), from=%conn.remote_addr(), %other, "Unexpected message received from peer, terminating connection");
+                        break Err(HandshakeError::ConnectionClosed(conn.remote_addr()));
+                    }
                 }
             }
         }
     }
 }
 
+/// Handles the communication with a potentially transient peer connection.
+async fn gw_transient_peer_conn(
+    mut conn: PeerConnection,
+    outbound: PeerOutboundMessage,
+    transaction: TransientConnection,
+) -> Result<(InternalEvent, PeerOutboundMessage), HandshakeError> {
+    // TODO: add the proper logic for handling forwarding of messages
+    Ok((
+        InternalEvent::DropInboundConnection(conn.remote_addr()),
+        outbound,
+    ))
+}
+
+struct TransientConnection {
+    tx: Transaction,
+    peer_id: PeerId,
+    max_hops_to_live: usize,
+    hops_to_live: usize,
+    skip_list: Vec<PeerId>,
+}
+
 #[inline(always)]
 fn decode_msg(data: &[u8]) -> Result<NetMessage> {
-    bincode::deserialize(data).map_err(|err| HandshakeHandlerError::Serialization(err))
+    bincode::deserialize(data).map_err(|err| HandshakeError::Serialization(err))
 }
 
 #[cfg(test)]
