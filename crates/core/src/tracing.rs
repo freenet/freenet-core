@@ -930,7 +930,6 @@ enum PutEvent {
 
 #[cfg(feature = "trace")]
 pub(crate) mod tracer {
-    use opentelemetry_otlp::WithExportConfig;
     use tracing::level_filters::LevelFilter;
     use tracing_subscriber::{Layer, Registry};
 
