@@ -78,6 +78,7 @@ pub(crate) async fn create_connection_handler<S: Socket>(
     ))
 }
 
+/// Receives  new inbound connections from the network.
 pub(crate) struct InboundConnectionHandler {
     new_connection_notifier: mpsc::Receiver<PeerConnection>,
 }
@@ -97,6 +98,7 @@ impl InboundConnectionHandler {
     }
 }
 
+/// Requests a new outbound connection to a remote peer.
 #[derive(Clone)]
 pub(crate) struct OutboundConnectionHandler {
     send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>,

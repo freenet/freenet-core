@@ -97,6 +97,15 @@ pub(crate) struct PeerConnection {
     outbound_stream_futures: FuturesUnordered<JoinHandle<Result>>,
 }
 
+#[cfg(test)]
+impl std::fmt::Debug for PeerConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerConnection")
+            .field("remote_conn", &self.remote_conn.remote_addr)
+            .finish()
+    }
+}
+
 impl PeerConnection {
     pub(super) fn new(remote_conn: RemoteConnection) -> Self {
         Self {
@@ -129,6 +138,34 @@ impl PeerConnection {
             my_address: None,
         };
         (Self::new(remote), inbound_packet_sender)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_remote_test(
+        remote_addr: SocketAddr,
+        outbound_symmetric_key: Aes128Gcm,
+        inbound_symmetric_key: Aes128Gcm,
+    ) -> (
+        RemoteConnection,
+        mpsc::Sender<PacketData<UnknownEncryption>>,
+    ) {
+        use parking_lot::Mutex;
+        let (outbound_packets, _) = mpsc::channel(1);
+        let (inbound_packet_sender, inbound_packet_recv) = mpsc::channel(1);
+        (
+            RemoteConnection {
+                outbound_packets,
+                outbound_symmetric_key,
+                remote_addr,
+                sent_tracker: Arc::new(Mutex::new(SentPacketTracker::new())),
+                last_packet_id: Arc::new(AtomicU32::new(0)),
+                inbound_packet_recv,
+                inbound_symmetric_key,
+                inbound_symmetric_key_bytes: [1; 16],
+                my_address: None,
+            },
+            inbound_packet_sender,
+        )
     }
 
     pub async fn send<T>(&mut self, data: T) -> Result

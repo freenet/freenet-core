@@ -26,7 +26,12 @@ use self::peer_connection::StreamId;
 
 pub use self::crypto::TransportKeypair;
 #[cfg(test)]
-pub(crate) use self::{connection_handler::ConnectionEvent, symmetric_message::SymmetricMessage};
+pub(crate) use self::{
+    connection_handler::ConnectionEvent,
+    packet_data::{PacketData, UnknownEncryption},
+    peer_connection::RemoteConnection,
+    symmetric_message::SymmetricMessage,
+};
 pub(crate) use self::{
     connection_handler::{
         create_connection_handler, InboundConnectionHandler, OutboundConnectionHandler,
