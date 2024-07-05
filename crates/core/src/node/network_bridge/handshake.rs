@@ -19,7 +19,7 @@ use crate::{
 };
 
 type Result<T, E = HandshakeError> = std::result::Result<T, E>;
-type OutboundConnResult = (PeerId, Result<PeerConnection, TransportError>);
+type OutboundConnResult = Result<InternalEvent, (PeerId, HandshakeError)>;
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum HandshakeError {
@@ -45,7 +45,7 @@ pub(super) enum Event {
     /// An outbound connection to a peer failed to be established.
     OutboundConnectionFailed {
         peer_id: PeerId,
-        error: TransportError,
+        error: HandshakeError,
     },
     /// An outbound connection to a gateway was rejected.
     OutboundConnectionRejected {
@@ -157,13 +157,17 @@ impl HandshakeHandler {
                 }
                 outbound_conn = self.ongoing_outbound_connections.next(), if !self.ongoing_outbound_connections.is_empty() => {
                     let r = match outbound_conn {
-                        Some((peer_id, Ok(connection))) => {
-                            Ok(Event::OutboundConnectionSuccessful { peer_id, connection })
+                        Some(Ok(InternalEvent::OutboundConnEstablished(id, connection))) => {
+                            tracing::debug!(at=?connection.my_address(), from=%connection.remote_addr(), "Outbound connection successful");
+                            self.wait_for_gw_confirmation(id, connection).await;
+                            continue;
                         }
-                        Some((peer_id, Err(error))) => {
-                            Ok(Event::OutboundConnectionFailed { peer_id, error })
+                        Some(Err((peer_id, error))) => {
+                            tracing::debug!(from=%peer_id.addr, "Outbound connection failed: {error}");
+                            Ok(Event::OutboundConnectionFailed { peer_id, error: error.into() })
                         }
                         None => Err(HandshakeError::ChannelClosed),
+                        _ => unreachable!()
                     };
                     break r;
                 }
@@ -198,6 +202,10 @@ impl HandshakeHandler {
                             self.queues.remove(&addr);
                             self.connecting.remove(&addr);
                             continue;
+                        }
+                        InternalEvent::OutboundConnEstablished(peer_id, connection) => {
+                            tracing::debug!(at=?connection.my_address(), from=%connection.remote_addr(), "Outbound connection successful");
+                            return Ok(Event::OutboundConnectionSuccessful { peer_id, connection });
                         }
                     }
                 }
@@ -278,10 +286,46 @@ impl HandshakeHandler {
             .outbound_conn_handler
             .connect(remote.pub_key.clone(), remote.addr)
             .await
-            .map(move |c| (remote, c))
+            .map(move |c| match c {
+                Ok(conn) => Ok(InternalEvent::OutboundConnEstablished(remote, conn)),
+                Err(e) => Err((remote, e.into())),
+            })
             .boxed();
         self.ongoing_outbound_connections.push(f);
     }
+
+    async fn wait_for_gw_confirmation(&mut self, peer_id: PeerId, conn: PeerConnection) {
+        self.ongoing_outbound_connections.push(
+            wait_for_gw_confirmation(peer_id, conn, self.connection_manager.max_hops_to_live)
+                .boxed(),
+        );
+    }
+}
+
+async fn wait_for_gw_confirmation(
+    peer_id: PeerId,
+    mut conn: PeerConnection,
+    max_hops_to_live: usize,
+) -> OutboundConnResult {
+    let tx = Transaction::new::<ConnectMsg>();
+    let msg = NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
+        id: tx,
+        msg: ConnectRequest::StartJoinReq {
+            joiner: None,
+            joiner_key: peer_id.pub_key.clone(),
+            hops_to_live: max_hops_to_live,
+            max_hops_to_live,
+            skip_list: vec![],
+        },
+    }));
+    tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), "Sending initial connection message to gw");
+    conn.send(msg)
+        .await
+        .map_err(|err| (peer_id.clone(), HandshakeError::TransportError(err)))?;
+    conn.recv()
+        .await
+        .map_err(|err| (peer_id, HandshakeError::TransportError(err)))?;
+    todo!()
 }
 
 #[cfg_attr(test, derive(Debug))]
@@ -297,6 +341,7 @@ pub(crate) struct InboundJoinRequest {
 
 enum InternalEvent {
     InboundJoinRequest(InboundJoinRequest),
+    OutboundConnEstablished(PeerId, PeerConnection),
     DropInboundConnection(SocketAddr),
 }
 
@@ -330,10 +375,22 @@ async fn gw_peer_connection_listener(
                         id,
                         msg: ConnectRequest::StartJoinReq { joiner, joiner_key, hops_to_live, max_hops_to_live, skip_list }
                     })) => {
-                        break Ok((InternalEvent::InboundJoinRequest(InboundJoinRequest { conn, id, joiner, joiner_key, hops_to_live, max_hops_to_live, skip_list }), outbound));
+                        break Ok((
+                            InternalEvent::InboundJoinRequest(
+                                InboundJoinRequest {
+                                    conn, id, joiner, joiner_key, hops_to_live, max_hops_to_live, skip_list
+                                }
+                            ),
+                            outbound
+                        ));
                     }
                     other =>  {
-                        tracing::warn!(at=?conn.my_address(), from=%conn.remote_addr(), %other, "Unexpected message received from peer, terminating connection");
+                        tracing::warn!(
+                            at=?conn.my_address(),
+                            from=%conn.remote_addr(),
+                            %other,
+                            "Unexpected message received from peer, terminating connection"
+                        );
                         break Err(HandshakeError::ConnectionClosed(conn.remote_addr()));
                     }
                 }
@@ -379,7 +436,8 @@ mod tests {
     use super::*;
     use crate::{
         dev_tool::TransportKeypair,
-        operations::connect::ConnectMsg,
+        operations::connect::{ConnectMsg, ConnectResponse},
+        ring::PeerKeyLocation,
         transport::{
             ConnectionEvent, OutboundConnectionHandler, PacketData, RemoteConnection,
             SymmetricMessage, UnknownEncryption,
@@ -440,14 +498,14 @@ mod tests {
                     skip_list: vec![],
                 },
             };
-            tracing::debug!("Sending initial connection message");
             let msg = NetMessage::V1(NetMessageV1::Connect(initial_join_req));
             let msg = bincode::serialize(&msg).unwrap();
-            self.send_msg(addr, msg).await
+            tracing::debug!("Sending initial connection message");
+            self.inbound_msg(addr, msg).await
         }
 
         /// A peer established a connection successfully with a gateway.
-        async fn establish_outbound_conn(&mut self, addr: SocketAddr) {
+        async fn establish_outbound_conn(&mut self, addr: SocketAddr) -> Transaction {
             let id = Transaction::new::<ConnectMsg>();
             let joiner_key = TransportKeypair::new();
             let pub_key = joiner_key.public().clone();
@@ -464,10 +522,11 @@ mod tests {
             tracing::debug!("Sending initial connection message");
             let msg = NetMessage::V1(NetMessageV1::Connect(initial_join_req));
             let msg = bincode::serialize(&msg).unwrap();
-            self.send_msg(addr, msg).await
+            self.inbound_msg(addr, msg).await;
+            id
         }
 
-        async fn send_msg(&mut self, addr: SocketAddr, msg: Vec<u8>) {
+        async fn inbound_msg(&mut self, addr: SocketAddr, msg: Vec<u8>) {
             let (out_symm_key, packet_sender) = self.packet_senders.get_mut(&addr).unwrap();
             let sym_msg =
                 SymmetricMessage::serialize_msg_to_packet_data(0, msg, &out_symm_key, vec![])
@@ -492,7 +551,7 @@ mod tests {
                 .unwrap();
         }
 
-        async fn send_msg(&self, remote: SocketAddr, msg: NetMessage) {
+        async fn outbound_msg(&self, remote: SocketAddr, msg: NetMessage) {
             self.outbound_msg.send_to(remote, msg).await.unwrap();
         }
     }
@@ -533,8 +592,8 @@ mod tests {
         test: &mut TestVerifier,
         addr: SocketAddr,
         pub_key: TransportPublicKey,
+        id: Transaction,
     ) -> oneshot::Sender<Result<RemoteConnection, TransportError>> {
-        let id = Transaction::new::<ConnectMsg>();
         test.node
             .establish_conn(PeerId::new(addr, pub_key.clone()), id)
             .await;
@@ -589,10 +648,11 @@ mod tests {
 
         let joiner_key = TransportKeypair::new();
         let pub_key = joiner_key.public().clone();
+        let id = Transaction::new::<ConnectMsg>();
 
         let test_controller = async {
             let addr = ([127, 0, 0, 1], 10000).into();
-            let open_connection = start_conn(&mut test, addr, pub_key.clone()).await;
+            let open_connection = start_conn(&mut test, addr, pub_key.clone(), id).await;
             test.transport
                 .new_outbound_conn(addr, open_connection)
                 .await;
@@ -623,10 +683,11 @@ mod tests {
 
         let joiner_key = TransportKeypair::new();
         let pub_key = joiner_key.public().clone();
+        let id = Transaction::new::<ConnectMsg>();
 
         let test_controller = async {
             let addr = ([127, 0, 0, 1], 10000).into();
-            let open_connection = start_conn(&mut test, addr, pub_key.clone()).await;
+            let open_connection = start_conn(&mut test, addr, pub_key.clone(), id).await;
             open_connection
                 .send(Err(TransportError::ConnectionEstablishmentFailure {
                     cause: "Connection refused".into(),
@@ -645,7 +706,9 @@ mod tests {
                     assert_eq!(peer_id.pub_key, pub_key);
                     assert!(matches!(
                         error,
-                        TransportError::ConnectionEstablishmentFailure { .. }
+                        HandshakeError::TransportError(
+                            TransportError::ConnectionEstablishmentFailure { .. }
+                        )
                     ));
                     Ok(())
                 }
@@ -661,33 +724,70 @@ mod tests {
         crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG));
         let (mut handler, mut test) = config_handler();
 
+        let gw_key = TransportKeypair::new();
+        let gw_pub_key = gw_key.public().clone();
+        let gw_peer_id = PeerId::new(([127, 0, 0, 1], 10000).into(), gw_pub_key.clone());
+
         let joiner_key = TransportKeypair::new();
-        let pub_key = joiner_key.public().clone();
+        let joiner_pub_key = joiner_key.public().clone();
+        let joiner_peer_id = PeerId::new(([127, 0, 0, 1], 10001).into(), joiner_pub_key.clone());
+
+        let tx = Transaction::new::<ConnectMsg>();
 
         let test_controller = async {
             let addr = ([127, 0, 0, 1], 10000).into();
-            let open_connection = start_conn(&mut test, addr, pub_key.clone()).await;
+            let open_connection = start_conn(&mut test, addr, gw_pub_key.clone(), tx).await;
             test.transport
                 .new_outbound_conn(addr, open_connection)
                 .await;
+
+            let acceptor = PeerKeyLocation {
+                peer: gw_peer_id.clone(),
+                location: Some(Location::random()),
+            };
+            let initial_join_req = ConnectMsg::Response {
+                id: tx,
+                sender: acceptor.clone(),
+                target: PeerKeyLocation {
+                    peer: joiner_peer_id.clone(),
+                    location: Some(Location::random()),
+                },
+                msg: ConnectResponse::AcceptedBy {
+                    accepted: false,
+                    acceptor,
+                    joiner: joiner_peer_id.clone(),
+                },
+            };
+            let msg = NetMessage::V1(NetMessageV1::Connect(initial_join_req));
+            let msg = bincode::serialize(&msg).unwrap();
+            test.transport.inbound_msg(addr, msg).await;
 
             Ok::<_, anyhow::Error>(())
         };
 
         let peer_inbound = async {
-            let event =
-                tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
-            match event {
-                Event::OutboundConnectionRejected {
-                    peer_id,
-                    connection,
-                } => {
-                    let addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
-                    assert_eq!(peer_id.addr, addr);
-                    assert_eq!(peer_id.pub_key, pub_key);
-                    Ok(())
+            loop {
+                let event =
+                    tokio::time::timeout(Duration::from_secs(60), handler.wait_for_events())
+                        .await??;
+                match event {
+                    Event::OutboundConnectionSuccessful { peer_id, .. } => {
+                        let addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
+                        assert_eq!(peer_id.addr, addr);
+                        assert_eq!(peer_id.pub_key, gw_pub_key);
+                        tracing::debug!("Outbound connection successful");
+                    }
+                    Event::OutboundConnectionRejected {
+                        peer_id,
+                        connection,
+                    } => {
+                        let addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
+                        assert_eq!(peer_id.addr, addr);
+                        assert_eq!(peer_id.pub_key, gw_pub_key);
+                        break Ok(());
+                    }
+                    other => bail!("Unexpected event: {:?}", other),
                 }
-                other => bail!("Unexpected event: {:?}", other),
             }
         };
         futures::try_join!(test_controller, peer_inbound)?;

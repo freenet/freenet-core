@@ -16,6 +16,7 @@ pub(crate) struct ConnectionManager {
     pub(super) peer_key: Arc<Mutex<Option<PeerId>>>,
     pub min_connections: usize,
     pub max_connections: usize,
+    pub max_hops_to_live: usize,
 }
 
 #[cfg(test)]
@@ -25,12 +26,14 @@ impl Default for ConnectionManager {
         let max_connections = Ring::DEFAULT_MAX_CONNECTIONS;
         let max_upstream_bandwidth = Ring::DEFAULT_MAX_UPSTREAM_BANDWIDTH;
         let max_downstream_bandwidth = Ring::DEFAULT_MAX_DOWNSTREAM_BANDWIDTH;
+        let max_hops_to_live = Ring::DEFAULT_MAX_HOPS_TO_LIVE;
 
         Self::init(
             max_upstream_bandwidth,
             max_downstream_bandwidth,
             min_connections,
             max_connections,
+            max_hops_to_live,
         )
     }
 }
@@ -61,11 +64,18 @@ impl ConnectionManager {
             Ring::DEFAULT_MAX_DOWNSTREAM_BANDWIDTH
         };
 
+        let max_hops_to_live = if let Some(v) = config.max_hops_to_live {
+            v
+        } else {
+            Ring::DEFAULT_MAX_HOPS_TO_LIVE
+        };
+
         Self::init(
             max_upstream_bandwidth,
             max_downstream_bandwidth,
             min_connections,
             max_connections,
+            max_hops_to_live,
         )
     }
 
@@ -74,6 +84,7 @@ impl ConnectionManager {
         max_downstream_bandwidth: Rate,
         min_connections: usize,
         max_connections: usize,
+        max_hops_to_live: usize,
     ) -> Self {
         // for location here consider -1 == None
         let own_location = AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()));
@@ -94,6 +105,7 @@ impl ConnectionManager {
             peer_key: Arc::new(Mutex::new(None)),
             min_connections,
             max_connections,
+            max_hops_to_live,
         }
     }
 
