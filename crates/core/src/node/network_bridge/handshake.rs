@@ -435,6 +435,7 @@ mod tests {
     use aes_gcm::{aead::Aead, Aes128Gcm, KeyInit};
     use anyhow::{anyhow, bail};
     use blake3::Hash;
+    use serde::Serialize;
     use tokio::sync::{mpsc, oneshot};
 
     use super::*;
@@ -505,10 +506,11 @@ mod tests {
                     skip_list: vec![],
                 },
             };
-            let msg = NetMessage::V1(NetMessageV1::Connect(initial_join_req));
-            let msg = bincode::serialize(&msg).unwrap();
-            tracing::debug!("Sending initial connection message");
-            self.inbound_msg(addr, msg).await
+            self.inbound_msg(
+                addr,
+                NetMessage::V1(NetMessageV1::Connect(initial_join_req)),
+            )
+            .await
         }
 
         /// A peer established a connection successfully with a gateway.
@@ -527,13 +529,13 @@ mod tests {
                 },
             };
             tracing::debug!("Sending initial connection message");
-            let msg = NetMessage::V1(NetMessageV1::Connect(initial_join_req));
-            let msg = bincode::serialize(&msg).unwrap();
-            self.inbound_msg(addr, msg).await;
+            self.inbound_msg(addr, NetMessageV1::Connect(initial_join_req))
+                .await;
             id
         }
 
-        async fn inbound_msg(&mut self, addr: SocketAddr, msg: Vec<u8>) {
+        async fn inbound_msg(&mut self, addr: SocketAddr, msg: impl Serialize) {
+            let msg = bincode::serialize(&msg).unwrap();
             let (out_symm_key, packet_sender) = self.packet_senders.get_mut(&addr).unwrap();
             let sym_msg =
                 SymmetricMessage::serialize_msg_to_packet_data(0, msg, &out_symm_key, vec![])
@@ -683,6 +685,8 @@ mod tests {
         let pub_key = joiner_key.public().clone();
         let id = Transaction::new::<ConnectMsg>();
 
+        let remote_addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
+
         let test_controller = async {
             let addr = ([127, 0, 0, 1], 10000).into();
             let open_connection = start_conn(&mut test, addr, pub_key.clone(), id).await;
@@ -691,6 +695,39 @@ mod tests {
                 .await;
             tracing::debug!("Outbound connection established");
             let msg = test.transport.recv_outbound_msg().await?;
+            let msg = match msg {
+                NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
+                    id: inbound_id,
+                    msg:
+                        ConnectRequest::StartJoinReq {
+                            joiner, joiner_key, ..
+                        },
+                })) => {
+                    assert_eq!(id, inbound_id);
+                    assert!(joiner.is_none());
+                    let sender = PeerKeyLocation {
+                        peer: PeerId::new(addr, pub_key.clone()),
+                        location: Some(Location::from_address(&remote_addr)),
+                    };
+                    let joiner_peer_id = PeerId::new(addr, joiner_key.clone());
+                    let target = PeerKeyLocation {
+                        peer: joiner_peer_id.clone(),
+                        location: Some(Location::random()),
+                    };
+                    NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
+                        id: inbound_id,
+                        sender: sender.clone(),
+                        target,
+                        msg: ConnectResponse::AcceptedBy {
+                            accepted: true,
+                            acceptor: sender,
+                            joiner: joiner_peer_id,
+                        },
+                    }))
+                }
+                other => bail!("Unexpected message: {:?}", other),
+            };
+            test.transport.inbound_msg(addr, msg).await;
             Ok::<_, anyhow::Error>(())
         };
 
@@ -699,8 +736,7 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
             match event {
                 Event::OutboundConnectionSuccessful { peer_id, .. } => {
-                    let addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
-                    assert_eq!(peer_id.addr, addr);
+                    assert_eq!(peer_id.addr, remote_addr);
                     assert_eq!(peer_id.pub_key, pub_key);
                     Ok(())
                 }
@@ -792,9 +828,12 @@ mod tests {
                     joiner: joiner_peer_id.clone(),
                 },
             };
-            let msg = NetMessage::V1(NetMessageV1::Connect(initial_join_req));
-            let msg = bincode::serialize(&msg).unwrap();
-            test.transport.inbound_msg(addr, msg).await;
+            test.transport
+                .inbound_msg(
+                    addr,
+                    NetMessage::V1(NetMessageV1::Connect(initial_join_req)),
+                )
+                .await;
 
             Ok::<_, anyhow::Error>(())
         };
