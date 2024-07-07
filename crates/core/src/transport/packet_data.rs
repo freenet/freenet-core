@@ -97,7 +97,7 @@ fn internal_sym_decryption<const N: usize>(
 }
 
 impl<DT: Encryption, const N: usize> PacketData<DT, N> {
-    pub(super) fn data(&self) -> &[u8] {
+    pub(crate) fn data(&self) -> &[u8] {
         &self.data[..self.size]
     }
 }
@@ -219,7 +219,7 @@ impl<const N: usize> PacketData<UnknownEncryption, N> {
             && self.data[..self.size] == actual_intro_packet.data[..actual_intro_packet.size]
     }
 
-    pub(super) fn try_decrypt_sym(
+    pub(crate) fn try_decrypt_sym(
         &self,
         inbound_sym_key: &Aes128Gcm,
     ) -> Result<PacketData<SymmetricAES, N>, aes_gcm::Error> {

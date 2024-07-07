@@ -322,9 +322,12 @@ async fn wait_for_gw_confirmation(
     conn.send(msg)
         .await
         .map_err(|err| (peer_id.clone(), HandshakeError::TransportError(err)))?;
-    conn.recv()
+    tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), "Waiting for answer from gw");
+    let msg = conn
+        .recv()
         .await
         .map_err(|err| (peer_id, HandshakeError::TransportError(err)))?;
+    tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), "Received answer from gw");
     todo!()
 }
 
@@ -427,10 +430,11 @@ fn decode_msg(data: &[u8]) -> Result<NetMessage> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
-    use aes_gcm::{Aes128Gcm, KeyInit};
+    use aes_gcm::{aead::Aead, Aes128Gcm, KeyInit};
     use anyhow::{anyhow, bail};
+    use blake3::Hash;
     use tokio::sync::{mpsc, oneshot};
 
     use super::*;
@@ -440,7 +444,7 @@ mod tests {
         ring::PeerKeyLocation,
         transport::{
             ConnectionEvent, OutboundConnectionHandler, PacketData, RemoteConnection,
-            SymmetricMessage, UnknownEncryption,
+            SymmetricMessage, SymmetricMessagePayload, UnknownEncryption,
         },
     };
 
@@ -449,6 +453,8 @@ mod tests {
         outbound_recv: mpsc::Receiver<(SocketAddr, ConnectionEvent)>,
         packet_senders:
             HashMap<SocketAddr, (Aes128Gcm, mpsc::Sender<PacketData<UnknownEncryption>>)>,
+        packet_receivers: Vec<mpsc::Receiver<(SocketAddr, Arc<[u8]>)>>,
+        in_key: Aes128Gcm,
     }
 
     impl TransportMock {
@@ -470,7 +476,7 @@ mod tests {
         ) {
             let out_symm_key = Aes128Gcm::new_from_slice(&[0; 16]).unwrap();
             let in_symm_key = Aes128Gcm::new_from_slice(&[1; 16]).unwrap();
-            let (conn, packet_sender) =
+            let (conn, packet_sender, packet_recv) =
                 PeerConnection::new_remote_test(addr, out_symm_key, in_symm_key.clone());
             callback
                 .send(Ok(conn))
@@ -479,6 +485,7 @@ mod tests {
             tracing::debug!("New outbound connection established");
             self.packet_senders
                 .insert(addr, (in_symm_key, packet_sender));
+            self.packet_receivers.push(packet_recv);
         }
 
         /// This would happen when a new unsolicited connection is established with a gateway or
@@ -536,6 +543,29 @@ mod tests {
                 .await
                 .unwrap();
         }
+
+        async fn recv_outbound_msg(&mut self) -> anyhow::Result<NetMessage> {
+            let (_, msg) = self.packet_receivers[0]
+                .recv()
+                .await
+                .ok_or_else(|| anyhow::Error::msg("Failed to receive packet"))?;
+            tracing::info!("Received message");
+            let packet: PacketData<UnknownEncryption> = PacketData::from_buf(&*msg);
+            let packet = packet
+                .try_decrypt_sym(&self.in_key)
+                .map_err(|_| anyhow!("Failed to decrypt packet"))?;
+            let msg: SymmetricMessage = bincode::deserialize(packet.data()).unwrap();
+            let SymmetricMessage {
+                payload: SymmetricMessagePayload::ShortMessage { payload },
+                ..
+            } = msg
+            else {
+                panic!()
+            };
+            let msg: NetMessage = bincode::deserialize(&payload).unwrap();
+            tracing::debug!("Received message: {:?}", msg);
+            Ok(msg)
+        }
     }
 
     struct NodeMock {
@@ -579,6 +609,8 @@ mod tests {
                     inbound_sender,
                     outbound_recv,
                     packet_senders: HashMap::new(),
+                    packet_receivers: Vec::new(),
+                    in_key: Aes128Gcm::new_from_slice(&[0; 16]).unwrap(),
                 },
                 node: NodeMock {
                     establish_conn,
@@ -644,6 +676,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_to_gw_outbound_conn() -> anyhow::Result<()> {
+        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG));
         let (mut handler, mut test) = config_handler();
 
         let joiner_key = TransportKeypair::new();
@@ -656,7 +689,8 @@ mod tests {
             test.transport
                 .new_outbound_conn(addr, open_connection)
                 .await;
-
+            tracing::debug!("Outbound connection established");
+            let msg = test.transport.recv_outbound_msg().await?;
             Ok::<_, anyhow::Error>(())
         };
 

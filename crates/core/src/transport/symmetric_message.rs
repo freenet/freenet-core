@@ -18,7 +18,7 @@ pub(crate) struct SymmetricMessage {
     pub(super) packet_id: PacketId,
     // #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) confirm_receipt: Vec<PacketId>,
-    pub(super) payload: SymmetricMessagePayload,
+    pub(crate) payload: SymmetricMessagePayload,
 }
 
 impl SymmetricMessage {

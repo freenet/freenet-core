@@ -148,9 +148,10 @@ impl PeerConnection {
     ) -> (
         RemoteConnection,
         mpsc::Sender<PacketData<UnknownEncryption>>,
+        mpsc::Receiver<(SocketAddr, Arc<[u8]>)>,
     ) {
         use parking_lot::Mutex;
-        let (outbound_packets, _) = mpsc::channel(1);
+        let (outbound_packets, outbound_packets_recv) = mpsc::channel(1);
         let (inbound_packet_sender, inbound_packet_recv) = mpsc::channel(1);
         (
             RemoteConnection {
@@ -165,6 +166,7 @@ impl PeerConnection {
                 my_address: None,
             },
             inbound_packet_sender,
+            outbound_packets_recv,
         )
     }
 

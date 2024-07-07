@@ -30,7 +30,7 @@ pub(crate) use self::{
     connection_handler::ConnectionEvent,
     packet_data::{PacketData, UnknownEncryption},
     peer_connection::RemoteConnection,
-    symmetric_message::SymmetricMessage,
+    symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
 };
 pub(crate) use self::{
     connection_handler::{
