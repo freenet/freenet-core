@@ -43,7 +43,7 @@ itertools = "0.13"
 notify = "6"
 once_cell = "1"
 ordered-float = "4"
-pav_regression = "0.4.0"
+pav_regression = "0.5.1"
 parking_lot = "0.12"
 rand = { features = ["small_rng"], workspace = true }
 redb = { optional = true, version = "2" }
@@ -83,7 +83,7 @@ freenet-stdlib = { features = ["net"], workspace = true }
 arbitrary = { features = ["derive"], version = "1" }
 chrono = { features = ["arbitrary"], workspace = true }
 freenet-stdlib = { features = ["net", "testing"], workspace = true }
-pav_regression = "0.4"
+pav_regression = "0.5.1"
 pico-args = "0.5"
 statrs = "0.17"
 tempfile = "3"
