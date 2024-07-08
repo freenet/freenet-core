@@ -1,6 +1,6 @@
 use crate::ring::{Distance, Location, PeerKeyLocation};
 use pav_regression::IsotonicRegression;
-use pav_regression::{Coordinate, Point};
+use pav_regression::Point;
 use serde::Serialize;
 use std::collections::HashMap;
 
