@@ -1604,7 +1604,7 @@ dependencies = [
  "serde_with",
  "thiserror",
  "tokio",
- "tokio-tungstenite 0.23.1",
+ "tokio-tungstenite 0.21.0",
  "tracing",
  "tracing-subscriber",
  "wasm-bindgen",
