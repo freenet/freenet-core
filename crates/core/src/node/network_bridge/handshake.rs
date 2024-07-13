@@ -14,9 +14,9 @@ use crate::{
     dev_tool::{Location, PeerId, Transaction},
     message::{InnerMessage, NetMessage, NetMessageV1},
     node::NetworkBridge,
-    operations::connect::{forward_conn, ConnectMsg, ConnectOp, ConnectRequest},
+    operations::connect::{forward_conn, ConnectMsg, ConnectOp, ConnectRequest, ConnectResponse},
     ring::{ConnectionManager, PeerKeyLocation},
-    router::{self, Router},
+    router::Router,
     transport::{
         InboundConnectionHandler, OutboundConnectionHandler, PeerConnection, TransportError,
         TransportPublicKey,
@@ -277,6 +277,7 @@ impl HandshakeHandler {
                 }
                 _ => {}
             }
+
             if alive_conn.send(op).await.is_err() {
                 self.queues.remove(&addr);
                 self.outbound_messages.remove(&addr);
@@ -284,6 +285,37 @@ impl HandshakeHandler {
             }
             None
         } else {
+            let mut send_to_remote = None;
+            match &op {
+                NetMessage::V1(NetMessageV1::Connect(op)) => {
+                    match op {
+                        ConnectMsg::Response {
+                            msg: ConnectResponse::AcceptedBy { joiner, .. },
+                            ..
+                        } => {
+                            // this may be a reply message from a downstream peer to which it was forwarded previously
+                            // for a transient connection, in this case we must send this message to the proper
+                            // gw_transient_peer_conn future that is waiting for it
+                            send_to_remote = Some(joiner.addr);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+
+            if let Some(remote) = send_to_remote {
+                if let Some(addr) = self.outbound_messages.get_mut(&remote) {
+                    if addr.send(op).await.is_err() {
+                        tracing::warn!("Failed to send message to {addr}", addr = remote);
+                    }
+                } else {
+                    // this shouldn't happen really
+                    tracing::error!("No outbound message sender for {addr}", addr = remote);
+                };
+                return None;
+            }
+
             // if is a message to a peer which is not yet connected, just queue it
             tracing::debug!("Queueing message to {addr}", addr = addr);
             self.queues.entry(addr).or_default().push(op);
@@ -380,6 +412,14 @@ async fn gw_peer_connection_listener(
         tokio::select! {
             msg = outbound.0.recv() => {
                 let Some(msg) = msg else { break Err(HandshakeError::ConnectionClosed(conn.remote_addr())); };
+                match &msg {
+                    NetMessage::V1(NetMessageV1::Connect(op)) => {
+                        // TODO: in this case it may be a reply of a third party we forwarded to, and need to send that back to the joiner
+                        // and count the reply
+                        todo!()
+                    }
+                    _ => {}
+                }
                 tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr() ,"Sending message to peer. Msg: {msg}");
                         conn
                             .send(msg)
