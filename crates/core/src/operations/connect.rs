@@ -659,7 +659,7 @@ pub(crate) enum ConnectState {
 }
 
 #[derive(Debug, Clone)]
-struct ConnectivityInfo {
+pub(crate) struct ConnectivityInfo {
     remaining_checks: usize,
     requester: Requester,
 }
@@ -674,7 +674,7 @@ impl ConnectivityInfo {
 }
 
 #[derive(Debug, Clone)]
-struct ConnectionInfo {
+pub(crate) struct ConnectionInfo {
     gateway: PeerKeyLocation,
     peer_pub_key: TransportPublicKey,
     max_hops_to_live: usize,
@@ -683,7 +683,7 @@ struct ConnectionInfo {
 }
 
 #[derive(Debug, Clone)]
-struct NewConnectionInfo {
+pub(crate) struct NewConnectionInfo {
     remaining_connetions: usize,
 }
 

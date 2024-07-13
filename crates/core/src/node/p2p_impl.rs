@@ -34,7 +34,6 @@ pub(crate) struct NodeP2P {
     cli_response_sender: ClientResponsesSender,
     node_controller: tokio::sync::mpsc::Receiver<NodeEvent>,
     should_try_connect: bool,
-    connection_manager: ConnectionManager,
 }
 
 impl NodeP2P {
@@ -84,7 +83,7 @@ impl NodeP2P {
             ch_outbound,
             &config,
             event_register.clone(),
-            connection_manager.clone(),
+            connection_manager,
         )?);
         let (executor_listener, executor_sender) = contract::executor_channel(op_manager.clone());
         let contract_handler = CH::build(ch_inbound, executor_sender, ch_builder)
@@ -121,7 +120,6 @@ impl NodeP2P {
             cli_response_sender,
             node_controller: node_controller_rx,
             should_try_connect: config.should_connect,
-            connection_manager,
         })
     }
 }

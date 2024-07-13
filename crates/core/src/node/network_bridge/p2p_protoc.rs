@@ -152,24 +152,21 @@ impl P2pConnManager {
 
         tracing::info!(%self.listening_port, %self.listening_ip, %self.is_gateway, key = %self.key_pair.public(), "Openning network listener");
 
-        let (mut outbound_conn_handler, mut inbound_conn_handler) =
-            create_connection_handler::<UdpSocket>(
-                self.key_pair.clone(),
-                self.listening_ip,
-                self.listening_port,
-                self.is_gateway,
-            )
-            .await?;
+        let (outbound_conn_handler, inbound_conn_handler) = create_connection_handler::<UdpSocket>(
+            self.key_pair.clone(),
+            self.listening_ip,
+            self.listening_port,
+            self.is_gateway,
+        )
+        .await?;
 
         // FIXME: this two containers need to be clean up on transaction time-out
         let mut pending_from_executor = HashSet::new();
         let mut tx_to_client: HashMap<Transaction, ClientId> = HashMap::new();
+        let mut transient_conn = HashMap::new();
 
+        // stores the persistent connections after they have been established and accepted
         let mut peer_connections = FuturesUnordered::new();
-        let mut pending_outbound_conns = FuturesUnordered::new();
-        let mut pending_inbound_gw_conns = HashMap::new();
-        let mut pending_listening_gw_conns = FuturesUnordered::new();
-        let mut gw_inbound_pending_connections = HashSet::new();
 
         let (mut handshake_handler, establish_connection, outbound_message) = HandshakeHandler::new(
             inbound_conn_handler,
@@ -178,10 +175,11 @@ impl P2pConnManager {
             self.bridge.op_manager.ring.router.clone(),
         );
 
+        // TODO: move the code inside the loop to a function
         loop {
             let notification_msg = notification_channel.0.recv().map(|m| match m {
                 None => Ok(Right(ClosedChannel)),
-                Some(Left(msg)) => Ok(Left((Some(msg), None::<()>))),
+                Some(Left(msg)) => Ok(Left((Some(msg), None::<SocketAddr>))),
                 Some(Right(action)) => Ok(Right(NodeAction(action))),
             });
 
@@ -197,6 +195,29 @@ impl P2pConnManager {
             });
 
             let msg: Result<_, ConnectionError> = tokio::select! {
+                msg = peer_connections.next(), if !peer_connections.is_empty() => {
+                    let PeerConnectionInbound { conn, rx, msg } = match msg {
+                        Some(Ok(peer_conn)) => peer_conn,
+                        Some(Err(err)) => {
+                            tracing::error!("Error in peer connection: {err}");
+                            if let TransportError::ConnectionClosed(socket_addr) = err {
+                                if let Some(peer) = self.connections.keys().find_map(|k| (k.addr == socket_addr).then(|| k.clone())) {
+                                    op_manager.ring.prune_connection(peer.clone()).await;
+                                    self.connections.remove(&peer);
+                                }
+                            }
+                            continue;
+                        }
+                        None =>  {
+                            tracing::error!("All peer connections closed");
+                            continue;
+                        }
+                    };
+                    let remote_addr = conn.remote_addr();
+                    let task = peer_connection_listener(rx, conn).boxed();
+                    peer_connections.push(task);
+                    Ok(Left((msg, Some(remote_addr))))
+                }
                 msg = notification_msg => { msg }
                 msg = bridge_msg => { msg }
                 msg = conn_event => {
@@ -241,7 +262,13 @@ impl P2pConnManager {
                             .await?;
                             continue;
                         }
-                        mut msg => {
+                        msg => {
+                            if let Some(addr) = transient_conn.get(msg.id()) {
+                                // this is a message that should be sent to the handshake handler
+                                // so it can be forwarded to a transient joiner
+                                outbound_message.send_to(*addr, msg).await?;
+                                continue;
+                            }
                             let executor_callback = pending_from_executor
                                 .remove(msg.id())
                                 .then(|| executor_listener.callback());
@@ -289,7 +316,7 @@ impl P2pConnManager {
                         (pc, peer)
                     })
                     .boxed();
-                    pending_outbound_conns.push(conn_fut);
+                    // pending_outbound_conns.push(conn_fut);
                 }
                 Ok(Right(NodeAction(NodeEvent::Disconnect { cause }))) => {
                     match cause {
@@ -300,31 +327,21 @@ impl P2pConnManager {
                 }
                 Ok(Right(NodeAction(NodeEvent::DropConnection(peer_id)))) => {
                     tracing::info!(remote = %peer_id, this_peer = ?op_manager.ring.connection_manager.get_peer_key().unwrap(), "Dropping connection");
-                    gw_inbound_pending_connections.remove(&peer_id.addr());
+                    // gw_inbound_pending_connections.remove(&peer_id.addr());
+                    // TODO: handshake handler should be able to drop the connection just in case
                     op_manager.ring.prune_connection(peer_id.clone()).await;
                     self.connections.remove(&peer_id);
                     tracing::info!("Dropped connection with peer {}", peer_id);
                 }
-                Ok(Right(GatewayConnection {
-                    remote_addr,
-                    peer_conn,
-                })) => {
-                    gw_inbound_pending_connections.insert(remote_addr);
-                    self.print_connected_peers(gw_inbound_pending_connections.iter());
-                    let (tx, rx) = mpsc::channel(10);
-                    pending_inbound_gw_conns.insert(remote_addr, tx);
-                    let task = peer_connection_listener(rx, peer_conn).boxed();
-                    pending_listening_gw_conns.push(task);
-                }
-                Ok(Right(ConnectionEstablished { peer, peer_conn })) => {
-                    let (tx, rx) = mpsc::channel(10);
-                    self.connections.insert(peer.clone(), tx);
-                    self.print_connected_peers(gw_inbound_pending_connections.iter());
+                // Ok(Right(ConnectionEstablished { peer, peer_conn })) => {
+                //     let (tx, rx) = mpsc::channel(10);
+                //     self.connections.insert(peer.clone(), tx);
+                //     self.print_connected_peers(gw_inbound_pending_connections.iter());
 
-                    // Spawn a task to handle the connection messages (inbound and outbound)
-                    let task = peer_connection_listener(rx, peer_conn).boxed();
-                    peer_connections.push(task);
-                }
+                //     // Spawn a task to handle the connection messages (inbound and outbound)
+                //     let task = peer_connection_listener(rx, peer_conn).boxed();
+                //     peer_connections.push(task);
+                // }
                 Ok(Right(ClosedChannel)) => {
                     tracing::info!("Notification channel closed");
                     break;
@@ -338,9 +355,28 @@ impl P2pConnManager {
                 }
                 Ok(Right(HandShakeAction(event))) => {
                     match event {
-                        Event::InboundConnection(join_req) => {
-                            // TODO: Need to add the connection to the gw properly into self.connections
-                            todo!()
+                        Event::InboundConnection(InboundJoinRequest {
+                            conn,
+                            id,
+                            joiner,
+                            joiner_key,
+                            hops_to_live,
+                            max_hops_to_live,
+                            skip_list,
+                        }) => {
+                            // TODO: Need to add the operation to the op_manager properly, in the correct state
+                            let (tx, rx) = mpsc::channel(1);
+                            self.connections
+                                .insert(joiner.expect("should be set at this point"), tx);
+
+                            // Spawn a task to handle the connection messages (inbound and outbound)
+                            let task = peer_connection_listener(rx, conn).boxed();
+                            peer_connections.push(task);
+                        }
+                        Event::TransientForwardTransaction(addr, tx) => {
+                            if let Some(older_tx) = transient_conn.insert(tx, addr) {
+                                todo!("Handle the case when there is an older transaction");
+                            }
                         }
                         _ => {
                             //TODO: Implement the rest of the events
@@ -550,16 +586,6 @@ impl P2pConnManager {
 }
 
 enum ConnMngrActions {
-    /// Gateway connection
-    GatewayConnection {
-        remote_addr: SocketAddr,
-        peer_conn: PeerConnection,
-    },
-    /// Received a new connection
-    ConnectionEstablished {
-        peer: PeerId,
-        peer_conn: PeerConnection,
-    },
     HandShakeAction(Event),
     /// Accept connection
     AcceptConnection,

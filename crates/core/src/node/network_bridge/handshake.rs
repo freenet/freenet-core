@@ -71,6 +71,8 @@ pub(super) enum Event {
     },
     /// Clean up a transaction that was completed or duplicate.
     RemoveTransaction(Transaction),
+    /// Wait for replies via an other peer from forwarded connection attempts.
+    TransientForwardTransaction(SocketAddr, Transaction),
 }
 
 /// Use for sending messages to a peer which has not yet been confirmed at a logical level
@@ -195,7 +197,8 @@ impl HandshakeHandler {
                                 return Ok(Event::InboundConnection(req));
                             } else {
                                 let InboundJoinRequest { conn, id, hops_to_live, max_hops_to_live, skip_list, .. } = req;
-                                tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), "Transient connection");
+                                let remote = conn.remote_addr();
+                                tracing::debug!(at=?conn.my_address(), from=%remote, "Transient connection");
                                 self.unconfirmed_inbound_connections.push(
                                     gw_transient_peer_conn(
                                         conn,
@@ -211,6 +214,7 @@ impl HandshakeHandler {
                                         self.router.clone()
                                     ).boxed()
                                 );
+                                return Ok(Event::TransientForwardTransaction(remote, id));
                             }
                         }
                         InternalEvent::DropInboundConnection(addr) => {
@@ -348,14 +352,14 @@ async fn wait_for_gw_confirmation(
 }
 
 #[cfg_attr(test, derive(Debug))]
-pub(crate) struct InboundJoinRequest {
-    conn: PeerConnection,
-    id: Transaction,
-    joiner: Option<PeerId>,
-    joiner_key: TransportPublicKey,
-    hops_to_live: usize,
-    max_hops_to_live: usize,
-    skip_list: Vec<PeerId>,
+pub(super) struct InboundJoinRequest {
+    pub conn: PeerConnection,
+    pub id: Transaction,
+    pub joiner: Option<PeerId>,
+    pub joiner_key: TransportPublicKey,
+    pub hops_to_live: usize,
+    pub max_hops_to_live: usize,
+    pub skip_list: Vec<PeerId>,
 }
 
 enum InternalEvent {
@@ -446,7 +450,6 @@ async fn gw_transient_peer_conn(
         }
     }
 
-    // TODO: call crates/core/src/operations/connect.rs::forward_conn to forward the connection request
     // TODO: after forwarding track the messagesfrom those peers and send back to joiner
 
     let mut nw_bridge = ForwardPeerMessage;
