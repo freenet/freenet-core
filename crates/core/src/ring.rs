@@ -183,12 +183,11 @@ impl Eq for Score {}
 // multithreaded maps. In the future if performance requires it some of this can be moved
 // towards a more lock-free multithreading model if necessary.
 pub(crate) struct Ring {
-    pub rnd_if_htl_above: usize,
     pub max_hops_to_live: usize,
     pub connection_manager: ConnectionManager,
+    pub router: Arc<RwLock<Router>>,
     pub live_tx_tracker: LiveTransactionTracker,
     peer_pub_key: TransportPublicKey,
-    router: Arc<RwLock<Router>>,
     /// The container for subscriber is a vec instead of something like a hashset
     /// that would allow for blind inserts of duplicate peers subscribing because
     /// of data locality, since we are likely to end up iterating over the whole sequence
@@ -259,18 +258,11 @@ impl Ring {
             Self::DEFAULT_MAX_HOPS_TO_LIVE
         };
 
-        let rnd_if_htl_above = if let Some(v) = config.rnd_if_htl_above {
-            v
-        } else {
-            Self::DEFAULT_RAND_WALK_ABOVE_HTL
-        };
-
         let router = Arc::new(RwLock::new(Router::new(&[])));
         GlobalExecutor::spawn(Self::refresh_router(router.clone(), event_register.clone()));
 
         // Just initialize with a fake location, this will be later updated when the peer has an actual location assigned.
         let ring = Ring {
-            rnd_if_htl_above,
             max_hops_to_live,
             router,
             connection_manager,
@@ -473,29 +465,9 @@ impl Ring {
         contract_key: &ContractKey,
         skip_list: impl Contains<PeerId>,
     ) -> Option<PeerKeyLocation> {
-        self.routing(Location::from(contract_key), None, skip_list)
-    }
-
-    /// Route an op to the most optimal target.
-    pub fn routing(
-        &self,
-        target: Location,
-        requesting: Option<&PeerId>,
-        skip_list: impl Contains<PeerId>,
-    ) -> Option<PeerKeyLocation> {
-        use rand::seq::SliceRandom;
-        let connections = self.connection_manager.connections_by_location.read();
-        let peers = connections.values().filter_map(|conns| {
-            let conn = conns.choose(&mut rand::thread_rng())?;
-            if let Some(requester) = requesting {
-                if requester == &conn.location.peer {
-                    return None;
-                }
-            }
-            (!skip_list.has_element(&conn.location.peer)).then_some(&conn.location)
-        });
-        let router = &*self.router.read();
-        router.select_peer(peers, target).cloned()
+        let router = self.router.read();
+        self.connection_manager
+            .routing(Location::from(contract_key), None, skip_list, &router)
     }
 
     pub fn routing_finished(&self, event: crate::router::RouteEvent) {
@@ -504,36 +476,6 @@ impl Ring {
             .write()
             .report_outbound_request(event.peer.clone(), event.contract_location);
         self.router.write().add_event(event);
-    }
-
-    /// Get a random peer from the known ring connections.
-    pub fn random_peer<F>(&self, filter_fn: F) -> Option<PeerKeyLocation>
-    where
-        F: Fn(&PeerId) -> bool,
-    {
-        let peers = &*self.connection_manager.location_for_peer.read();
-        let amount = peers.len();
-        if amount == 0 {
-            return None;
-        }
-        let mut rng = rand::thread_rng();
-        let mut attempts = 0;
-        loop {
-            if attempts >= amount * 2 {
-                return None;
-            }
-            let selected = rng.gen_range(0..amount);
-            let (peer, loc) = peers.iter().nth(selected).expect("infallible");
-            if !filter_fn(peer) {
-                attempts += 1;
-                continue;
-            } else {
-                return Some(PeerKeyLocation {
-                    peer: peer.clone(),
-                    location: Some(*loc),
-                });
-            }
-        }
     }
 
     pub fn register_subscription(&self, contract: &ContractKey, subscriber: PeerKeyLocation) {
@@ -573,10 +515,6 @@ impl Ring {
         contract: &ContractKey,
     ) -> Option<DmRef<ContractKey, Vec<PeerKeyLocation>>> {
         self.subscribers.get(contract)
-    }
-
-    pub fn num_connections(&self) -> usize {
-        self.connection_manager.connections_by_location.read().len()
     }
 
     pub async fn prune_connection(&self, peer: PeerId) {
@@ -773,8 +711,16 @@ impl Ring {
         notifier: &EventLoopNotificationsSender,
     ) -> anyhow::Result<Option<Transaction>> {
         use crate::message::InnerMessage;
-        let Some(query_target) = self.routing(ideal_location, None, skip_list) else {
-            return Ok(None);
+        let query_target = {
+            let router = self.router.read();
+            if let Some(t) =
+                self.connection_manager
+                    .routing(ideal_location, None, skip_list, &router)
+            {
+                t
+            } else {
+                return Ok(None);
+            }
         };
         let joiner = self.connection_manager.own_location();
         tracing::debug!(

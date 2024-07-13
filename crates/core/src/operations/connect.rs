@@ -12,7 +12,8 @@ use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
 use crate::message::{NetMessageV1, NodeEvent};
-use crate::ring::Ring;
+use crate::ring::ConnectionManager;
+use crate::router::Router;
 use crate::transport::TransportPublicKey;
 use crate::{
     message::{InnerMessage, NetMessage, Transaction},
@@ -255,20 +256,23 @@ impl Operation for ConnectOp {
 
                     let mut skip_list = skip_list.clone();
                     skip_list.push(joiner.clone());
-                    if let Some(updated_state) = forward_conn(
-                        *id,
-                        &op_manager.ring,
-                        network_bridge,
-                        (new_peer_loc.clone(), new_peer_loc.clone()),
-                        *hops_to_live,
-                        accepted, // gateway always accept the first connection
-                        skip_list,
-                    )
-                    .await?
                     {
-                        new_state = Some(updated_state);
-                    } else {
-                        new_state = None;
+                        if let Some(updated_state) = forward_conn(
+                            *id,
+                            &op_manager.ring.connection_manager,
+                            op_manager.ring.router.clone(),
+                            network_bridge,
+                            (new_peer_loc.clone(), new_peer_loc.clone()),
+                            *hops_to_live,
+                            accepted, // gateway always accept the first connection
+                            skip_list,
+                        )
+                        .await?
+                        {
+                            new_state = Some(updated_state);
+                        } else {
+                            new_state = None;
+                        }
                     }
 
                     if accepted {
@@ -361,21 +365,24 @@ impl Operation for ConnectOp {
                         false
                     };
 
-                    if let Some(updated_state) = forward_conn(
-                        *id,
-                        &op_manager.ring,
-                        network_bridge,
-                        (sender.clone(), joiner.clone()),
-                        *hops_to_live,
-                        should_accept,
-                        skip_list.clone(),
-                    )
-                    .await?
                     {
-                        new_state = Some(updated_state);
-                    } else {
-                        tracing::debug!(tx = %id, at = %this_peer.peer, "Rejecting connection from {:?}", joiner);
-                        new_state = None
+                        if let Some(updated_state) = forward_conn(
+                            *id,
+                            &op_manager.ring.connection_manager,
+                            op_manager.ring.router.clone(),
+                            network_bridge,
+                            (sender.clone(), joiner.clone()),
+                            *hops_to_live,
+                            should_accept,
+                            skip_list.clone(),
+                        )
+                        .await?
+                        {
+                            new_state = Some(updated_state);
+                        } else {
+                            tracing::debug!(tx = %id, at = %this_peer.peer, "Rejecting connection from {:?}", joiner);
+                            new_state = None
+                        }
                     }
 
                     let response = ConnectResponse::AcceptedBy {
@@ -767,7 +774,7 @@ pub(crate) async fn join_ring_request<CM>(
 where
     CM: NetworkBridge + Send,
 {
-    if op_manager.ring.num_connections() > 0 {
+    if op_manager.ring.connection_manager.num_connections() > 0 {
         use crate::node::ConnectionError;
         if !op_manager.ring.connection_manager.should_accept(
             gateway.location.unwrap_or_else(Location::random),
@@ -895,9 +902,10 @@ where
     Ok(())
 }
 
-async fn forward_conn<NB>(
+pub(crate) async fn forward_conn<NB>(
     id: Transaction,
-    ring: &Ring,
+    connection_manager: &ConnectionManager,
+    router: Arc<parking_lot::RwLock<Router>>,
     network_bridge: &mut NB,
     (req_peer, joiner): (PeerKeyLocation, PeerKeyLocation),
     left_htl: usize,
@@ -916,7 +924,7 @@ where
         return Ok(None);
     }
 
-    if ring.num_connections() == 0 {
+    if connection_manager.num_connections() == 0 {
         tracing::warn!(
             tx = %id,
             joiner = %joiner.peer,
@@ -925,7 +933,18 @@ where
         return Ok(None);
     }
 
-    let target_peer = select_forward_target(id, ring, &req_peer, &joiner, left_htl, &skip_list);
+    let target_peer = {
+        let router = router.read();
+        select_forward_target(
+            id,
+            connection_manager,
+            &router,
+            &req_peer,
+            &joiner,
+            left_htl,
+            &skip_list,
+        )
+    };
     match target_peer {
         Some(target_peer) => {
             let forward_msg =
@@ -940,31 +959,34 @@ where
 
 fn select_forward_target(
     id: Transaction,
-    ring: &Ring,
+    connection_manager: &ConnectionManager,
+    router: &Router,
     request_peer: &PeerKeyLocation,
     joiner: &PeerKeyLocation,
     left_htl: usize,
     skip_list: &[PeerId],
 ) -> Option<PeerKeyLocation> {
-    if left_htl >= ring.rnd_if_htl_above {
+    if left_htl >= connection_manager.rnd_if_htl_above {
         tracing::debug!(
             tx = %id,
             joiner = %joiner.peer,
             "Randomly selecting peer to forward connect request",
         );
-        ring.random_peer(|p| !skip_list.contains(p))
+        connection_manager.random_peer(|p| !skip_list.contains(p))
     } else {
         tracing::debug!(
             tx = %id,
             joiner = %joiner.peer,
             "Selecting close peer to forward request",
         );
-        ring.routing(
-            joiner.location.unwrap(),
-            Some(&request_peer.peer),
-            skip_list,
-        )
-        .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))
+        connection_manager
+            .routing(
+                joiner.location.unwrap(),
+                Some(&request_peer.peer),
+                skip_list,
+                router,
+            )
+            .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))
     }
 }
 

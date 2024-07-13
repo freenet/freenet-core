@@ -15,9 +15,17 @@ use tracing::Instrument;
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::message::NetMessageV1;
 
+use crate::node::network_bridge::handshake::HandshakeError::ChannelClosed;
+use crate::node::network_bridge::handshake::{
+    EstablishConnection, Event, HandshakeError, HandshakeHandler, InboundJoinRequest,
+    OutboundMessage,
+};
 use crate::node::PeerId;
 use crate::operations::connect::{self, ConnectMsg, ConnectRequest, ConnectResponse};
-use crate::transport::{create_connection_handler, OutboundConnectionHandler, PeerConnection, TransportError, TransportKeypair, TransportPublicKey};
+use crate::transport::{
+    create_connection_handler, OutboundConnectionHandler, PeerConnection, TransportError,
+    TransportKeypair, TransportPublicKey,
+};
 use crate::{
     client_events::ClientId,
     config::GlobalExecutor,
@@ -30,8 +38,6 @@ use crate::{
     ring::PeerKeyLocation,
     tracing::NetEventLog,
 };
-use crate::node::network_bridge::handshake::{EstablishConnection, Event, HandshakeError, HandshakeHandler, InboundJoinRequest, OutboundMessage};
-use crate::node::network_bridge::handshake::HandshakeError::ChannelClosed;
 
 type P2pBridgeEvent = Either<(PeerId, Box<NetMessage>), NodeEvent>;
 
@@ -165,8 +171,12 @@ impl P2pConnManager {
         let mut pending_listening_gw_conns = FuturesUnordered::new();
         let mut gw_inbound_pending_connections = HashSet::new();
 
-        let (mut handshake_handler, establish_connection, outbound_message) =
-            HandshakeHandler::new(inbound_conn_handler, outbound_conn_handler.clone(), self.bridge.op_manager.ring.connection_manager.clone());
+        let (mut handshake_handler, establish_connection, outbound_message) = HandshakeHandler::new(
+            inbound_conn_handler,
+            outbound_conn_handler.clone(),
+            self.bridge.op_manager.ring.connection_manager.clone(),
+            self.bridge.op_manager.ring.router.clone(),
+        );
 
         loop {
             let notification_msg = notification_channel.0.recv().map(|m| match m {

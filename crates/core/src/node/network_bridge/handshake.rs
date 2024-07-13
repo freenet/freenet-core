@@ -1,7 +1,9 @@
 //! Handles initial connection handshake.
+use parking_lot::RwLock;
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
+    sync::Arc,
 };
 use tokio::time::{timeout, Duration};
 
@@ -11,8 +13,10 @@ use tokio::sync::mpsc::{self};
 use crate::{
     dev_tool::{Location, PeerId, Transaction},
     message::{InnerMessage, NetMessage, NetMessageV1},
+    node::NetworkBridge,
     operations::connect::{ConnectMsg, ConnectOp, ConnectRequest},
     ring::ConnectionManager,
+    router::Router,
     transport::{
         InboundConnectionHandler, OutboundConnectionHandler, PeerConnection, TransportError,
         TransportPublicKey,
@@ -115,6 +119,7 @@ pub(super) struct HandshakeHandler {
     /// The other end of `EstablishConnection`, receives commands to establish a new outbound connection.
     establish_connection_rx: mpsc::Receiver<(PeerId, Transaction)>,
     connection_manager: ConnectionManager,
+    router: Arc<RwLock<Router>>,
 }
 
 impl HandshakeHandler {
@@ -122,6 +127,7 @@ impl HandshakeHandler {
         inbound_conn_handler: InboundConnectionHandler,
         outbound_conn_handler: OutboundConnectionHandler,
         connection_manager: ConnectionManager,
+        router: Arc<RwLock<Router>>,
     ) -> (Self, EstablishConnection, OutboundMessage) {
         let (pending_msg_tx, pending_msg_rx) = tokio::sync::mpsc::channel(100);
         let (establish_connection_tx, establish_connection_rx) = tokio::sync::mpsc::channel(100);
@@ -137,6 +143,7 @@ impl HandshakeHandler {
             queues: HashMap::new(),
             establish_connection_rx,
             connection_manager,
+            router,
         };
         (
             connector,
@@ -403,7 +410,7 @@ async fn gw_peer_connection_listener(
     }
 }
 
-/// Handles the communication with a potentially transient peer connection.
+/// Handles the communication from a gw with a transient peer connection.
 async fn gw_transient_peer_conn(
     mut conn: PeerConnection,
     mut outbound: PeerOutboundMessage,
@@ -412,13 +419,34 @@ async fn gw_transient_peer_conn(
     let timeout_duration = Duration::from_secs(10);
     let mut connection_ended = false;
 
+    // Attempt forwarding the connection request to the next hop and wait for answers
+    // then return those answers to the transitory peer connection.
+
+    // TODO: this type should be capturing the messages to be forwarded to other peers and communicate
+    // that back to the network event loop via Events
+    struct ForwardPeerMessage;
+
+    impl NetworkBridge for ForwardPeerMessage {
+        async fn send(&self, target: &PeerId, msg: NetMessage) -> super::ConnResult<()> {
+            Ok(())
+        }
+
+        async fn drop_connection(&mut self, peer: &PeerId) -> super::ConnResult<()> {
+            Ok(())
+        }
+    }
+
+    // TODO: call crates/core/src/operations/connect.rs::forward_conn to forward the connection request
+    // TODO: after forwarding track the messagesfrom those peers and send back to joiner
+
+
     loop {
         tokio::select! {
             incoming_result = timeout(timeout_duration, conn.recv()) => {
                 match incoming_result {
                     Ok(Ok(msg)) => {
                         let net_msg = decode_msg(&msg).unwrap();
-                        if is_drop_connection_message(&transaction, &net_msg) {
+                        if transaction.is_drop_connection_message(&net_msg) {
                             tracing::debug!("Received drop connection message");
                             connection_ended = true;
                             break;
@@ -469,22 +497,31 @@ async fn gw_transient_peer_conn(
     }
 }
 
-fn is_drop_connection_message(transient_connection: &TransientConnection, net_message: &NetMessage) -> bool {
-    if let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request { id, msg: ConnectRequest::CleanConnection { joiner } })) = net_message {
-        if id != &transient_connection.tx || joiner.peer != transient_connection.peer_id {
-            return false;
-        }
-        return true;
-    }
-    false
-}
-
 struct TransientConnection {
     tx: Transaction,
     peer_id: PeerId,
     max_hops_to_live: usize,
     hops_to_live: usize,
     skip_list: Vec<PeerId>,
+}
+
+impl TransientConnection {
+    fn is_drop_connection_message(&self, net_message: &NetMessage) -> bool {
+        if let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
+            id,
+            msg: ConnectRequest::CleanConnection { joiner },
+        })) = net_message
+        {
+            // this peer should never be receiving messages for other transactions at this point
+            debug_assert_eq!(id, &self.tx);
+
+            if id != &self.tx || joiner.peer != self.peer_id {
+                return false;
+            }
+            return true;
+        }
+        false
+    }
 }
 
 #[inline(always)]
@@ -496,9 +533,8 @@ fn decode_msg(data: &[u8]) -> Result<NetMessage> {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use aes_gcm::{aead::Aead, Aes128Gcm, KeyInit};
+    use aes_gcm::{Aes128Gcm, KeyInit};
     use anyhow::{anyhow, bail};
-    use blake3::Hash;
     use serde::Serialize;
     use tokio::sync::{mpsc, oneshot};
 
@@ -666,8 +702,13 @@ mod tests {
         let peer_id = PeerId::new(([127, 0, 0, 1], 10000).into(), keypair.public().clone());
         let mngr = ConnectionManager::default();
         mngr.set_peer_key(peer_id.clone());
-        let (handler, establish_conn, outbound_msg) =
-            HandshakeHandler::new(inbound_conn_handler, outbound_conn_handler, mngr);
+        let router = Router::new(&[]);
+        let (handler, establish_conn, outbound_msg) = HandshakeHandler::new(
+            inbound_conn_handler,
+            outbound_conn_handler,
+            mngr,
+            Arc::new(RwLock::new(router)),
+        );
         (
             handler,
             TestVerifier {
@@ -756,9 +797,13 @@ mod tests {
         };
 
         let gw_inbound = async {
-            let event = tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
+            let event =
+                tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
             match event {
-                Event::OutboundConnectionRejected { peer_id, connection } => {
+                Event::OutboundConnectionRejected {
+                    peer_id,
+                    connection,
+                } => {
                     let expected_addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
                     assert_eq!(peer_id.addr, expected_addr);
                     assert!(matches!(connection, ConnectOp { .. }));
@@ -771,7 +816,7 @@ mod tests {
         futures::try_join!(test_controller, gw_inbound)?;
         Ok(())
     }
-    
+
     #[tokio::test]
     async fn test_peer_to_gw_outbound_conn() -> anyhow::Result<()> {
         crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG));

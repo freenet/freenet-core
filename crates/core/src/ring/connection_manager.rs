@@ -17,6 +17,7 @@ pub(crate) struct ConnectionManager {
     pub min_connections: usize,
     pub max_connections: usize,
     pub max_hops_to_live: usize,
+    pub rnd_if_htl_above: usize,
 }
 
 #[cfg(test)]
@@ -27,6 +28,7 @@ impl Default for ConnectionManager {
         let max_upstream_bandwidth = Ring::DEFAULT_MAX_UPSTREAM_BANDWIDTH;
         let max_downstream_bandwidth = Ring::DEFAULT_MAX_DOWNSTREAM_BANDWIDTH;
         let max_hops_to_live = Ring::DEFAULT_MAX_HOPS_TO_LIVE;
+        let rnd_if_htl_above = Ring::DEFAULT_RAND_WALK_ABOVE_HTL;
 
         Self::init(
             max_upstream_bandwidth,
@@ -34,6 +36,7 @@ impl Default for ConnectionManager {
             min_connections,
             max_connections,
             max_hops_to_live,
+            rnd_if_htl_above,
         )
     }
 }
@@ -70,12 +73,19 @@ impl ConnectionManager {
             Ring::DEFAULT_MAX_HOPS_TO_LIVE
         };
 
+        let rnd_if_htl_above = if let Some(v) = config.rnd_if_htl_above {
+            v
+        } else {
+            Ring::DEFAULT_RAND_WALK_ABOVE_HTL
+        };
+
         Self::init(
             max_upstream_bandwidth,
             max_downstream_bandwidth,
             min_connections,
             max_connections,
             max_hops_to_live,
+            rnd_if_htl_above,
         )
     }
 
@@ -85,6 +95,7 @@ impl ConnectionManager {
         min_connections: usize,
         max_connections: usize,
         max_hops_to_live: usize,
+        rnd_if_htl_above: usize,
     ) -> Self {
         // for location here consider -1 == None
         let own_location = AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()));
@@ -106,6 +117,7 @@ impl ConnectionManager {
             min_connections,
             max_connections,
             max_hops_to_live,
+            rnd_if_htl_above,
         }
     }
 
@@ -220,5 +232,61 @@ impl ConnectionManager {
         self.open_connections
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         Some(loc)
+    }
+
+    /// Get a random peer from the known ring connections.
+    pub fn random_peer<F>(&self, filter_fn: F) -> Option<PeerKeyLocation>
+    where
+        F: Fn(&PeerId) -> bool,
+    {
+        let peers = &*self.location_for_peer.read();
+        let amount = peers.len();
+        if amount == 0 {
+            return None;
+        }
+        let mut rng = rand::thread_rng();
+        let mut attempts = 0;
+        loop {
+            if attempts >= amount * 2 {
+                return None;
+            }
+            let selected = rng.gen_range(0..amount);
+            let (peer, loc) = peers.iter().nth(selected).expect("infallible");
+            if !filter_fn(peer) {
+                attempts += 1;
+                continue;
+            } else {
+                return Some(PeerKeyLocation {
+                    peer: peer.clone(),
+                    location: Some(*loc),
+                });
+            }
+        }
+    }
+
+    /// Route an op to the most optimal target.
+    pub fn routing(
+        &self,
+        target: Location,
+        requesting: Option<&PeerId>,
+        skip_list: impl Contains<PeerId>,
+        router: &Router,
+    ) -> Option<PeerKeyLocation> {
+        use rand::seq::SliceRandom;
+        let connections = self.connections_by_location.read();
+        let peers = connections.values().filter_map(|conns| {
+            let conn = conns.choose(&mut rand::thread_rng())?;
+            if let Some(requester) = requesting {
+                if requester == &conn.location.peer {
+                    return None;
+                }
+            }
+            (!skip_list.has_element(&conn.location.peer)).then_some(&conn.location)
+        });
+        router.select_peer(peers, target).cloned()
+    }
+
+    pub fn num_connections(&self) -> usize {
+        self.connections_by_location.read().len()
     }
 }
