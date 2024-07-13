@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
 };
+use tokio::time::{timeout, Duration};
 
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use tokio::sync::mpsc::{self};
@@ -405,14 +406,77 @@ async fn gw_peer_connection_listener(
 /// Handles the communication with a potentially transient peer connection.
 async fn gw_transient_peer_conn(
     mut conn: PeerConnection,
-    outbound: PeerOutboundMessage,
+    mut outbound: PeerOutboundMessage,
     transaction: TransientConnection,
 ) -> Result<(InternalEvent, PeerOutboundMessage), HandshakeError> {
-    // TODO: add the proper logic for handling forwarding of messages
-    Ok((
-        InternalEvent::DropInboundConnection(conn.remote_addr()),
-        outbound,
-    ))
+    let timeout_duration = Duration::from_secs(10);
+    let mut connection_ended = false;
+
+    loop {
+        tokio::select! {
+            incoming_result = timeout(timeout_duration, conn.recv()) => {
+                match incoming_result {
+                    Ok(Ok(msg)) => {
+                        let net_msg = decode_msg(&msg).unwrap();
+                        if is_drop_connection_message(&transaction, &net_msg) {
+                            tracing::debug!("Received drop connection message");
+                            connection_ended = true;
+                            break;
+                        } else {
+                            tracing::warn!(
+                                at=?conn.my_address(),
+                                from=%conn.remote_addr(),
+                                %net_msg,
+                                "Unexpected message received from peer, terminating connection"
+                            );
+                            break;
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!("Error receiving message: {:?}", e);
+                        connection_ended = true;
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::debug!("Transient connection timed out");
+                        connection_ended = true;
+                        break;
+                    }
+                }
+            }
+            outgoing_msg = outbound.0.recv() => {
+                match outgoing_msg {
+                    Some(msg) => {
+                        conn.send(msg).await?;
+                    }
+                    None => {
+                        tracing::debug!("Outbound channel closed");
+                        connection_ended = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if connection_ended {
+        Ok((
+            InternalEvent::DropInboundConnection(conn.remote_addr()),
+            outbound,
+        ))
+    } else {
+        Err(HandshakeError::ConnectionClosed(conn.remote_addr()))
+    }
+}
+
+fn is_drop_connection_message(transient_connection: &TransientConnection, net_message: &NetMessage) -> bool {
+    if let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request { id, msg: ConnectRequest::CleanConnection { joiner } })) = net_message {
+        if id != &transient_connection.tx || joiner.peer != transient_connection.peer_id {
+            return false;
+        }
+        return true;
+    }
+    false
 }
 
 struct TransientConnection {
@@ -676,6 +740,38 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_gateway_inbound_conn_rejected() -> anyhow::Result<()> {
+        let (mut handler, mut test) = config_handler();
+
+        // Configure the handler to reject connections by setting max_connections to 0
+        handler.connection_manager.max_connections = 0;
+        handler.connection_manager.min_connections = 0;
+
+        let test_controller = async {
+            let addr = ([127, 0, 0, 1], 10000).into();
+            test.transport.new_conn(addr).await;
+            test.transport.establish_inbound_conn(addr).await;
+            Ok::<_, anyhow::Error>(())
+        };
+
+        let gw_inbound = async {
+            let event = tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
+            match event {
+                Event::OutboundConnectionRejected { peer_id, connection } => {
+                    let expected_addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
+                    assert_eq!(peer_id.addr, expected_addr);
+                    assert!(matches!(connection, ConnectOp { .. }));
+                    Ok(())
+                }
+                other => Ok(()),
+            }
+        };
+
+        futures::try_join!(test_controller, gw_inbound)?;
+        Ok(())
+    }
+    
     #[tokio::test]
     async fn test_peer_to_gw_outbound_conn() -> anyhow::Result<()> {
         crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG));
