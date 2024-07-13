@@ -177,19 +177,15 @@ impl Operation for ConnectOp {
                                 desirable_peer = %desirable_peer.peer,
                                 "Found a desirable peer to connect to",
                             );
-                            let msg = ConnectMsg::Request {
-                                id: *id,
-                                msg: ConnectRequest::CheckConnectivity {
-                                    sender: own_loc.clone(),
-                                    joiner: joiner.clone(),
-                                    hops_to_live: *max_hops_to_live,
-                                    max_hops_to_live: *max_hops_to_live,
-                                    skip_list,
-                                },
-                            };
-                            network_bridge
-                                .send(&desirable_peer.peer, msg.into())
-                                .await?;
+                            let msg = create_forward_message(
+                                *id,
+                                &own_loc,
+                                joiner,
+                                *max_hops_to_live,
+                                *max_hops_to_live,
+                                &skip_list,
+                            );
+                            network_bridge.send(&desirable_peer.peer, msg).await?;
                             return_msg = None;
                             new_state = Some(ConnectState::AwaitingConnectionAcquisition {});
                         } else {
@@ -234,7 +230,8 @@ impl Operation for ConnectOp {
                         ConnectRequest::StartJoinReq {
                             joiner,
                             hops_to_live,
-                            skip_list, //
+                            skip_list,
+                            max_hops_to_live,
                             ..
                         },
                 } => {
@@ -264,7 +261,8 @@ impl Operation for ConnectOp {
                             network_bridge,
                             (new_peer_loc.clone(), new_peer_loc.clone()),
                             *hops_to_live,
-                            accepted, // gateway always accept the first connection
+                            *max_hops_to_live,
+                            accepted,
                             skip_list,
                         )
                         .await?
@@ -303,6 +301,7 @@ impl Operation for ConnectOp {
                             sender,
                             joiner,
                             hops_to_live,
+                            max_hops_to_live,
                             skip_list,
                             ..
                         },
@@ -373,6 +372,7 @@ impl Operation for ConnectOp {
                             network_bridge,
                             (sender.clone(), joiner.clone()),
                             *hops_to_live,
+                            *max_hops_to_live,
                             should_accept,
                             skip_list.clone(),
                         )
@@ -649,7 +649,7 @@ where
 type Requester = PeerKeyLocation;
 
 #[derive(Debug)]
-enum ConnectState {
+pub(crate) enum ConnectState {
     Initializing,
     ConnectingToNode(ConnectionInfo),
     AwaitingConnectivity(ConnectivityInfo),
@@ -909,6 +909,7 @@ pub(crate) async fn forward_conn<NB>(
     network_bridge: &mut NB,
     (req_peer, joiner): (PeerKeyLocation, PeerKeyLocation),
     left_htl: usize,
+    max_htl: usize,
     accepted: bool,
     skip_list: Vec<PeerId>,
 ) -> Result<Option<ConnectState>, OpError>
@@ -947,8 +948,14 @@ where
     };
     match target_peer {
         Some(target_peer) => {
-            let forward_msg =
-                create_forward_message(id, &req_peer, &joiner, left_htl, &[req_peer.peer.clone()]);
+            let forward_msg = create_forward_message(
+                id,
+                &req_peer,
+                &joiner,
+                left_htl,
+                max_htl,
+                &[req_peer.peer.clone()],
+            );
             tracing::debug!(target: "network", "Forwarding connection request to {:?}", target_peer);
             network_bridge.send(&target_peer.peer, forward_msg).await?;
             update_state_with_forward_info(&req_peer, left_htl)
@@ -995,6 +1002,7 @@ fn create_forward_message(
     request_peer: &PeerKeyLocation,
     joiner: &PeerKeyLocation,
     hops_to_live: usize,
+    max_hops_to_live: usize,
     skip_list: &[PeerId],
 ) -> NetMessage {
     NetMessage::from(ConnectMsg::Request {
@@ -1002,8 +1010,8 @@ fn create_forward_message(
         msg: ConnectRequest::CheckConnectivity {
             sender: request_peer.clone(),
             joiner: joiner.clone(),
-            hops_to_live,
-            max_hops_to_live: hops_to_live,
+            hops_to_live: hops_to_live.saturating_sub(1), // decrement the hops to live for the next hop
+            max_hops_to_live,
             skip_list: skip_list.to_vec(),
         },
     })

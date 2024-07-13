@@ -14,9 +14,9 @@ use crate::{
     dev_tool::{Location, PeerId, Transaction},
     message::{InnerMessage, NetMessage, NetMessageV1},
     node::NetworkBridge,
-    operations::connect::{ConnectMsg, ConnectOp, ConnectRequest},
-    ring::ConnectionManager,
-    router::Router,
+    operations::connect::{forward_conn, ConnectMsg, ConnectOp, ConnectRequest},
+    ring::{ConnectionManager, PeerKeyLocation},
+    router::{self, Router},
     transport::{
         InboundConnectionHandler, OutboundConnectionHandler, PeerConnection, TransportError,
         TransportPublicKey,
@@ -196,13 +196,21 @@ impl HandshakeHandler {
                             } else {
                                 let InboundJoinRequest { conn, id, hops_to_live, max_hops_to_live, skip_list, .. } = req;
                                 tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), "Transient connection");
-                                self.unconfirmed_inbound_connections.push(gw_transient_peer_conn(conn, outbound_sender, TransientConnection {
-                                    tx: id,
-                                    peer_id,
-                                    max_hops_to_live,
-                                    hops_to_live,
-                                    skip_list,
-                                }).boxed());
+                                self.unconfirmed_inbound_connections.push(
+                                    gw_transient_peer_conn(
+                                        conn,
+                                        outbound_sender,
+                                        TransientConnection {
+                                            tx: id,
+                                            joiner: peer_id,
+                                            max_hops_to_live,
+                                            hops_to_live,
+                                            skip_list,
+                                        },
+                                        self.connection_manager.clone(),
+                                        self.router.clone()
+                                    ).boxed()
+                                );
                             }
                         }
                         InternalEvent::DropInboundConnection(addr) => {
@@ -415,6 +423,8 @@ async fn gw_transient_peer_conn(
     mut conn: PeerConnection,
     mut outbound: PeerOutboundMessage,
     transaction: TransientConnection,
+    conn_manager: ConnectionManager,
+    router: Arc<RwLock<Router>>,
 ) -> Result<(InternalEvent, PeerOutboundMessage), HandshakeError> {
     let timeout_duration = Duration::from_secs(10);
     let mut connection_ended = false;
@@ -439,6 +449,29 @@ async fn gw_transient_peer_conn(
     // TODO: call crates/core/src/operations/connect.rs::forward_conn to forward the connection request
     // TODO: after forwarding track the messagesfrom those peers and send back to joiner
 
+    let mut nw_bridge = ForwardPeerMessage;
+
+    let joiner_loc = Location::from_address(&conn.remote_addr());
+    let joiner_pk_loc = PeerKeyLocation {
+        peer: transaction.joiner.clone(),
+        location: Some(joiner_loc),
+    };
+    let my_peer_id = conn_manager.own_location();
+    let Ok(Some(mut conn_state)) = forward_conn(
+        transaction.tx,
+        &conn_manager,
+        router.clone(),
+        &mut nw_bridge,
+        (my_peer_id, joiner_pk_loc),
+        transaction.hops_to_live,
+        transaction.hops_to_live,
+        false,
+        vec![transaction.joiner.clone()],
+    )
+    .await
+    else {
+        return Err(HandshakeError::ConnectionClosed(conn.remote_addr()));
+    };
 
     loop {
         tokio::select! {
@@ -499,7 +532,7 @@ async fn gw_transient_peer_conn(
 
 struct TransientConnection {
     tx: Transaction,
-    peer_id: PeerId,
+    joiner: PeerId,
     max_hops_to_live: usize,
     hops_to_live: usize,
     skip_list: Vec<PeerId>,
@@ -512,10 +545,11 @@ impl TransientConnection {
             msg: ConnectRequest::CleanConnection { joiner },
         })) = net_message
         {
-            // this peer should never be receiving messages for other transactions at this point
+            // this peer should never be receiving messages for other transactions or other peers at this point
             debug_assert_eq!(id, &self.tx);
+            debug_assert_eq!(joiner.peer, self.joiner);
 
-            if id != &self.tx || joiner.peer != self.peer_id {
+            if id != &self.tx || joiner.peer != self.joiner {
                 return false;
             }
             return true;

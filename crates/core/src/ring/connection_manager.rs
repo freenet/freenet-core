@@ -187,6 +187,10 @@ impl ConnectionManager {
     }
 
     /// Returns this node location in the ring, if any (must have join the ring already).
+    ///
+    /// # Panic
+    ///
+    /// Will panic if the node has no peer id assigned yet.
     pub fn own_location(&self) -> PeerKeyLocation {
         let location = f64::from_le_bytes(
             self.own_location
