@@ -102,25 +102,56 @@ impl EstablishConnection {
     }
 }
 
-/// Handles initial connection handshake.
+type OutboundMessageSender = mpsc::Sender<NetMessage>;
+type OutboundMessageReceiver = mpsc::Receiver<(SocketAddr, NetMessage)>;
+type EstablishConnectionReceiver = mpsc::Receiver<(PeerId, Transaction)>;
+
+
+/// Manages the handshake process for establishing connections with peers.
+/// Handles both inbound and outbound connection attempts, and manages
+/// the transition from unconfirmed to confirmed connections.
 pub(super) struct HandshakeHandler {
+    /// Tracks ongoing connection attempts by their remote socket address
     connecting: HashMap<SocketAddr, Transaction>,
+
+    /// Set of socket addresses for established connections
     connected: HashSet<SocketAddr>,
+
+    /// Handles incoming connections from the network
     inbound_conn_handler: InboundConnectionHandler,
+
+    /// Initiates outgoing connections to remote peers
     outbound_conn_handler: OutboundConnectionHandler,
-    /// On-going outbound connection attempts.
+
+    /// Queue of ongoing outbound connection attempts
+    /// Used for non-gateway peers initiating connections
     ongoing_outbound_connections: FuturesUnordered<BoxFuture<'static, OutboundConnResult>>,
-    /// This is for connections that are not yet confirmed at a logical level in gateways
+
+    /// Queue of inbound connections not yet confirmed at the logical level
+    /// Used primarily by gateways for handling new peer join requests
     unconfirmed_inbound_connections: FuturesUnordered<
         BoxFuture<'static, Result<(InternalEvent, PeerOutboundMessage), HandshakeError>>,
     >,
-    outbound_messages: HashMap<SocketAddr, mpsc::Sender<NetMessage>>,
-    /// The other end of `OutboundMessage`, receives messages to be sent to a yet not confirmed peer.
-    pending_msg_rx: mpsc::Receiver<(SocketAddr, NetMessage)>,
+
+    /// Mapping of socket addresses to channels for sending messages to peers
+    /// Used for both confirmed and unconfirmed connections
+    outbound_messages: HashMap<SocketAddr, OutboundMessageSender>,
+
+    /// Receiver for messages to be sent to peers not yet confirmed
+    /// Part of the OutboundMessage public API
+    pending_msg_rx: OutboundMessageReceiver,
+
+    /// Queues messages for peers that are not yet connected
     queues: HashMap<SocketAddr, Vec<NetMessage>>,
-    /// The other end of `EstablishConnection`, receives commands to establish a new outbound connection.
-    establish_connection_rx: mpsc::Receiver<(PeerId, Transaction)>,
+
+    /// Receiver for commands to establish new outbound connections
+    /// Part of the EstablishConnection public API
+    establish_connection_rx: EstablishConnectionReceiver,
+
+    /// Manages the node's connections and topology
     connection_manager: ConnectionManager,
+
+    /// Handles routing decisions within the network
     router: Arc<RwLock<Router>>,
 }
 
@@ -154,10 +185,12 @@ impl HandshakeHandler {
         )
     }
 
-    /// Listens for either new inbound connections or messages from pending outbound/inbound connections.
+    /// Processes events related to connection establishment and management.
+    /// This is the main event loop for the HandshakeHandler.
     pub async fn wait_for_events(&mut self) -> Result<Event, HandshakeError> {
         loop {
             tokio::select! {
+                // Handle new inbound connections
                 new_conn = self.inbound_conn_handler.next_connection() => {
                     let Some(conn) = new_conn else {
                         return Err(HandshakeError::ChannelClosed);
@@ -165,6 +198,7 @@ impl HandshakeHandler {
                     tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), "New inbound connection");
                     self.track_inbound_connection(conn);
                 }
+                // Process outbound connection attempts
                 outbound_conn = self.ongoing_outbound_connections.next(), if !self.ongoing_outbound_connections.is_empty() => {
                     let r = match outbound_conn {
                         Some(Ok(InternalEvent::OutboundConnEstablished(id, connection))) => {
@@ -181,6 +215,7 @@ impl HandshakeHandler {
                     };
                     break r;
                 }
+                // Handle unconfirmed inbound connections (mainly for gateways)
                 unconfirmed_inbound_conn = self.unconfirmed_inbound_connections.next(), if !self.unconfirmed_inbound_connections.is_empty() => {
                     let Some(res) = unconfirmed_inbound_conn else {
                         return Err(HandshakeError::ChannelClosed);
@@ -229,6 +264,7 @@ impl HandshakeHandler {
                         }
                     }
                 }
+                // Process pending messages for unconfirmed connections
                 pending_msg = self.pending_msg_rx.recv() => {
                     let Some((addr, msg)) = pending_msg else {
                         return Err(HandshakeError::ChannelClosed);
@@ -237,6 +273,7 @@ impl HandshakeHandler {
                         break Ok(event);
                     }
                 }
+                // Handle requests to establish new connections
                 establish_connection = self.establish_connection_rx.recv() => {
                     let Some((peer_id, tx)) = establish_connection else {
                         return Err(HandshakeError::ChannelClosed);
@@ -247,6 +284,7 @@ impl HandshakeHandler {
         }
     }
 
+    /// Tracks a new inbound connection and sets up message handling for it.
     fn track_inbound_connection(&mut self, conn: PeerConnection) {
         let (outbound_msg_sender, outbound_msg_recv) = mpsc::channel(1);
         let remote = conn.remote_addr();
@@ -255,7 +293,7 @@ impl HandshakeHandler {
         self.outbound_messages.insert(remote, outbound_msg_sender);
     }
 
-    /// Messages sent to a pending outbound connection.
+    /// Handles outbound messages to peers, including queueing for disconnected peers.
     async fn outbound(&mut self, addr: SocketAddr, op: NetMessage) -> Option<Event> {
         if let Some(alive_conn) = self.outbound_messages.get_mut(&addr) {
             match &op {
@@ -346,6 +384,7 @@ impl HandshakeHandler {
         self.ongoing_outbound_connections.push(f);
     }
 
+    /// Waits for confirmation from a gateway after establishing a connection.
     async fn wait_for_gw_confirmation(&mut self, peer_id: PeerId, conn: PeerConnection) {
         self.ongoing_outbound_connections.push(
             wait_for_gw_confirmation(peer_id, conn, self.connection_manager.max_hops_to_live)
@@ -354,6 +393,8 @@ impl HandshakeHandler {
     }
 }
 
+
+/// Waits for confirmation from a gateway after initiating a connection.
 async fn wait_for_gw_confirmation(
     peer_id: PeerId,
     mut conn: PeerConnection,
@@ -403,7 +444,8 @@ enum InternalEvent {
 #[repr(transparent)]
 struct PeerOutboundMessage(mpsc::Receiver<NetMessage>);
 
-/// Handles the communication with a potentially transient peer connection.
+/// Handles communication with a potentially transient peer connection.
+/// Used primarily by gateways to manage connections in the process of joining the network.
 async fn gw_peer_connection_listener(
     mut conn: PeerConnection,
     mut outbound: PeerOutboundMessage,
@@ -462,7 +504,8 @@ async fn gw_peer_connection_listener(
     }
 }
 
-/// Handles the communication from a gw with a transient peer connection.
+/// Manages a transient connection during the joining process.
+/// Handles forwarding of connection requests and tracking of responses.
 async fn gw_transient_peer_conn(
     mut conn: PeerConnection,
     mut outbound: PeerOutboundMessage,
