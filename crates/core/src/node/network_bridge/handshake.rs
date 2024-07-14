@@ -16,6 +16,7 @@ use crate::{
     node::NetworkBridge,
     operations::connect::{
         forward_conn, ConnectMsg, ConnectOp, ConnectRequest, ConnectResponse, ConnectState,
+        ConnectivityInfo,
     },
     ring::{ConnectionManager, PeerKeyLocation},
     router::Router,
@@ -60,11 +61,6 @@ pub(super) enum Event {
         /// The ongoing connection operation state, to keep track of the forwarded connection attempts.
         connection: ConnectOp,
     },
-    /// Message relayed by a gateway with a transient connection from a third party.
-    OutboundGatewayRelayMessage {
-        peer_id: PeerId,
-        message: ConnectMsg,
-    },
     /// An outbound connection to a gateway was successfully established. It can be managed by the connection manager.
     OutboundGatewayConnectionSuccessful {
         peer_id: PeerId,
@@ -74,7 +70,12 @@ pub(super) enum Event {
     /// Clean up a transaction that was completed or duplicate.
     RemoveTransaction(Transaction),
     /// Wait for replies via an other peer from forwarded connection attempts.
-    TransientForwardTransaction(SocketAddr, Transaction),
+    TransientForwardTransaction {
+        target: SocketAddr,
+        tx: Transaction,
+        forward_to: PeerId,
+        msg: NetMessage,
+    },
 }
 
 /// Use for sending messages to a peer which has not yet been confirmed at a logical level
@@ -232,25 +233,37 @@ impl HandshakeHandler {
                                 tracing::debug!(at=?req.conn.my_address(), from=%req.conn.remote_addr(), "Accepting connection");
                                 return Ok(Event::InboundConnection(req));
                             } else {
-                                let InboundJoinRequest { conn, id, hops_to_live, max_hops_to_live, skip_list, .. } = req;
+                                let InboundJoinRequest { mut conn, id, hops_to_live, max_hops_to_live, skip_list, .. } = req;
                                 let remote = conn.remote_addr();
                                 tracing::debug!(at=?conn.my_address(), from=%remote, "Transient connection");
+                                let mut tx = TransientConnection {
+                                    tx: id,
+                                    joiner: peer_id,
+                                    max_hops_to_live,
+                                    hops_to_live,
+                                    skip_list,
+                                };
+                                let (peer_id, msg, tx_info) = match self.forward_transient_connection(&mut conn, &mut tx).await {
+                                    Ok(msg) => msg,
+                                    Err(e) => {
+                                        tracing::error!(from=%remote, "Error forwarding transient connection: {e}");
+                                        return Err(e);
+                                    }
+                                };
                                 self.unconfirmed_inbound_connections.push(
                                     gw_transient_peer_conn(
                                         conn,
                                         outbound_sender,
-                                        TransientConnection {
-                                            tx: id,
-                                            joiner: peer_id,
-                                            max_hops_to_live,
-                                            hops_to_live,
-                                            skip_list,
-                                        },
-                                        self.connection_manager.clone(),
-                                        self.router.clone()
+                                        tx,
+                                        tx_info,
                                     ).boxed()
                                 );
-                                return Ok(Event::TransientForwardTransaction(remote, id));
+                                return Ok(Event::TransientForwardTransaction {
+                                    target: remote,
+                                    tx: id,
+                                    forward_to: peer_id,
+                                    msg,
+                                });
                             }
                         }
                         InternalEvent::DropInboundConnection(addr) => {
@@ -283,6 +296,84 @@ impl HandshakeHandler {
                 }
             }
         }
+    }
+
+    async fn forward_transient_connection(
+        &mut self,
+        conn: &mut PeerConnection,
+        transaction: &mut TransientConnection,
+    ) -> Result<(PeerId, NetMessage, ConnectivityInfo)> {
+        // Attempt forwarding the connection request to the next hop and wait for answers
+        // then return those answers to the transitory peer connection.
+        struct ForwardPeerMessage {
+            msg: parking_lot::Mutex<Option<(PeerId, NetMessage)>>,
+        }
+
+        impl NetworkBridge for ForwardPeerMessage {
+            async fn send(
+                &self,
+                target: &PeerId,
+                forward_msg: NetMessage,
+            ) -> super::ConnResult<()> {
+                debug_assert!(matches!(
+                    forward_msg,
+                    NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
+                        msg: ConnectRequest::CheckConnectivity { .. },
+                        ..
+                    }))
+                ));
+                self.msg
+                    .try_lock()
+                    .expect("unique ref")
+                    .replace((target.clone(), forward_msg));
+                Ok(())
+            }
+
+            async fn drop_connection(&mut self, _: &PeerId) -> super::ConnResult<()> {
+                if cfg!(debug_assertions) {
+                    unreachable!()
+                }
+                Ok(())
+            }
+        }
+
+        let mut nw_bridge = ForwardPeerMessage {
+            msg: parking_lot::Mutex::new(None),
+        };
+
+        let joiner_loc = Location::from_address(&conn.remote_addr());
+        let joiner_pk_loc = PeerKeyLocation {
+            peer: transaction.joiner.clone(),
+            location: Some(joiner_loc),
+        };
+        let my_peer_id = self.connection_manager.own_location();
+        transaction.skip_list.push(transaction.joiner.clone());
+        transaction.skip_list.push(my_peer_id.peer.clone());
+        let Ok(Some(conn_state)) = forward_conn(
+            transaction.tx,
+            &self.connection_manager,
+            self.router.clone(),
+            &mut nw_bridge,
+            (my_peer_id.clone(), joiner_pk_loc),
+            transaction.hops_to_live,
+            transaction.max_hops_to_live,
+            false,
+            transaction.skip_list.clone(),
+        )
+        .await
+        else {
+            return Err(HandshakeError::ConnectionClosed(conn.remote_addr()));
+        };
+
+        let (forward_target, msg) = nw_bridge
+            .msg
+            .into_inner()
+            .expect("target was successfully set");
+        let ConnectState::AwaitingConnectivity(info) = conn_state else {
+            unreachable!()
+        };
+
+        Ok((forward_target, msg, info))
     }
 
     /// Tracks a new inbound connection and sets up message handling for it.
@@ -503,57 +594,10 @@ async fn gw_transient_peer_conn(
     mut conn: PeerConnection,
     mut outbound: PeerOutboundMessage,
     transaction: TransientConnection,
-    conn_manager: ConnectionManager,
-    router: Arc<RwLock<Router>>,
+    mut info: ConnectivityInfo,
 ) -> Result<(InternalEvent, PeerOutboundMessage), HandshakeError> {
     // TODO: should be the same timeout as the one used for any other tx
     let timeout_duration = Duration::from_secs(10);
-
-    // Attempt forwarding the connection request to the next hop and wait for answers
-    // then return those answers to the transitory peer connection.
-
-    // TODO: this type should be capturing the messages to be forwarded to other peers and communicate
-    // that back to the network event loop via Events
-    struct ForwardPeerMessage;
-
-    impl NetworkBridge for ForwardPeerMessage {
-        async fn send(&self, target: &PeerId, msg: NetMessage) -> super::ConnResult<()> {
-            Ok(())
-        }
-
-        async fn drop_connection(&mut self, peer: &PeerId) -> super::ConnResult<()> {
-            Ok(())
-        }
-    }
-
-    // TODO: after forwarding track the messagesfrom those peers and send back to joiner
-
-    let mut nw_bridge = ForwardPeerMessage;
-
-    let joiner_loc = Location::from_address(&conn.remote_addr());
-    let joiner_pk_loc = PeerKeyLocation {
-        peer: transaction.joiner.clone(),
-        location: Some(joiner_loc),
-    };
-    let my_peer_id = conn_manager.own_location();
-    let Ok(Some(conn_state)) = forward_conn(
-        transaction.tx,
-        &conn_manager,
-        router.clone(),
-        &mut nw_bridge,
-        (my_peer_id.clone(), joiner_pk_loc),
-        transaction.hops_to_live,
-        transaction.hops_to_live,
-        false,
-        vec![transaction.joiner.clone(), my_peer_id.peer],
-    )
-    .await
-    else {
-        return Err(HandshakeError::ConnectionClosed(conn.remote_addr()));
-    };
-    let ConnectState::AwaitingConnectivity(mut info) = conn_state else {
-        unreachable!()
-    };
 
     loop {
         tokio::select! {

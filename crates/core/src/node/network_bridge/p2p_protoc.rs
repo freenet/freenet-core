@@ -373,10 +373,17 @@ impl P2pConnManager {
                             let task = peer_connection_listener(rx, conn).boxed();
                             peer_connections.push(task);
                         }
-                        Event::TransientForwardTransaction(addr, tx) => {
-                            if let Some(older_tx) = transient_conn.insert(tx, addr) {
+                        Event::TransientForwardTransaction {
+                            target,
+                            tx,
+                            forward_to,
+                            msg,
+                        } => {
+                            if let Some(older_tx) = transient_conn.insert(tx, target) {
                                 todo!("Handle the case when there is an older transaction");
                             }
+                            // TODO: send the message to the target
+                            todo!()
                         }
                         _ => {
                             //TODO: Implement the rest of the events
