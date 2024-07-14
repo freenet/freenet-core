@@ -148,7 +148,7 @@ impl NodeConfig {
             config.network_api.port
         );
         if let Some(peer_id) = &config.peer_id {
-            tracing::info!("Node external address: {}", peer_id.addr());
+            tracing::info!("Node external address: {}", peer_id.addr);
         }
         Ok(NodeConfig {
             should_connect: true,
@@ -912,10 +912,13 @@ where
     Ok(())
 }
 
-/*
-- Cuando es un gateway: se define desde el inicio del nodo
-- Cuando es un peer regular: se define en el momento de la conexión con el gateway
-*/
+/// The identifier of a peer in the network is composed of its address and public key.
+///
+/// A regular peer will have its `PeerId` set when it connects to a gateway as it get's
+/// its external address from the gateway.
+///
+/// A gateway will have its `PeerId` set when it is created since it will know its own address
+/// from the start.
 #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone)]
 pub struct PeerId {
     pub addr: SocketAddr,
@@ -934,27 +937,9 @@ impl PartialOrd for PeerId {
     }
 }
 
-// impl FromStr for PeerId {
-//     type Err = anyhow::Error;
-//     fn from_str(s: &str) -> Result<Self, Self::Err> {
-//         Ok(Self {
-//             addr: s.parse()?,
-//             pub_key: TransportKeypair::new().public,
-//         })
-//     }
-// }
-
 impl PeerId {
     pub fn new(addr: SocketAddr, pub_key: TransportPublicKey) -> Self {
         Self { addr, pub_key }
-    }
-
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
-    }
-
-    pub fn pub_key(&self) -> &TransportPublicKey {
-        &self.pub_key
     }
 }
 

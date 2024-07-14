@@ -97,7 +97,6 @@ pub(crate) struct PeerConnection {
     outbound_stream_futures: FuturesUnordered<JoinHandle<Result>>,
 }
 
-#[cfg(test)]
 impl std::fmt::Debug for PeerConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PeerConnection")
@@ -120,11 +119,16 @@ impl PeerConnection {
     #[cfg(test)]
     pub(crate) fn new_test(
         remote_addr: SocketAddr,
+        my_address: SocketAddr,
         outbound_symmetric_key: Aes128Gcm,
         inbound_symmetric_key: Aes128Gcm,
-    ) -> (Self, mpsc::Sender<PacketData<UnknownEncryption>>) {
+    ) -> (
+        Self,
+        mpsc::Sender<PacketData<UnknownEncryption>>,
+        mpsc::Receiver<(SocketAddr, Arc<[u8]>)>,
+    ) {
         use parking_lot::Mutex;
-        let (outbound_packets, _) = mpsc::channel(1);
+        let (outbound_packets, outbound_packets_recv) = mpsc::channel(1);
         let (inbound_packet_sender, inbound_packet_recv) = mpsc::channel(1);
         let remote = RemoteConnection {
             outbound_packets,
@@ -135,14 +139,19 @@ impl PeerConnection {
             inbound_packet_recv,
             inbound_symmetric_key,
             inbound_symmetric_key_bytes: [1; 16],
-            my_address: None,
+            my_address: Some(my_address),
         };
-        (Self::new(remote), inbound_packet_sender)
+        (
+            Self::new(remote),
+            inbound_packet_sender,
+            outbound_packets_recv,
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn new_remote_test(
         remote_addr: SocketAddr,
+        my_address: SocketAddr,
         outbound_symmetric_key: Aes128Gcm,
         inbound_symmetric_key: Aes128Gcm,
     ) -> (
@@ -163,7 +172,7 @@ impl PeerConnection {
                 inbound_packet_recv,
                 inbound_symmetric_key,
                 inbound_symmetric_key_bytes: [1; 16],
-                my_address: None,
+                my_address: Some(my_address),
             },
             inbound_packet_sender,
             outbound_packets_recv,

@@ -18,11 +18,12 @@ pub(crate) struct ConnectionManager {
     pub max_connections: usize,
     pub max_hops_to_live: usize,
     pub rnd_if_htl_above: usize,
+    pub_key: Arc<TransportPublicKey>,
 }
 
 #[cfg(test)]
-impl Default for ConnectionManager {
-    fn default() -> Self {
+impl ConnectionManager {
+    pub fn default_with_key(pub_key: TransportPublicKey) -> Self {
         let min_connections = Ring::DEFAULT_MIN_CONNECTIONS;
         let max_connections = Ring::DEFAULT_MAX_CONNECTIONS;
         let max_upstream_bandwidth = Ring::DEFAULT_MAX_UPSTREAM_BANDWIDTH;
@@ -37,7 +38,14 @@ impl Default for ConnectionManager {
             max_connections,
             max_hops_to_live,
             rnd_if_htl_above,
+            pub_key,
         )
+    }
+
+    pub fn add_connection(&self, conn: Connection) {
+        let loc = conn.location.location.unwrap_or_else(Location::random);
+        let mut conns = self.connections_by_location.write();
+        conns.entry(loc).or_default().push(conn);
     }
 }
 
@@ -86,6 +94,7 @@ impl ConnectionManager {
             max_connections,
             max_hops_to_live,
             rnd_if_htl_above,
+            config.key_pair.public().clone(),
         )
     }
 
@@ -96,6 +105,7 @@ impl ConnectionManager {
         max_connections: usize,
         max_hops_to_live: usize,
         rnd_if_htl_above: usize,
+        pub_key: TransportPublicKey,
     ) -> Self {
         // for location here consider -1 == None
         let own_location = AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()));
@@ -118,6 +128,7 @@ impl ConnectionManager {
             max_connections,
             max_hops_to_live,
             rnd_if_htl_above,
+            pub_key: Arc::new(pub_key),
         }
     }
 
@@ -211,10 +222,10 @@ impl ConnectionManager {
     }
 
     /// Sets the peer id if is not already set, or returns the current peer id.
-    pub fn set_peer_key(&self, peer_key: PeerId) -> Option<PeerId> {
+    pub fn try_set_peer_key(&self, addr: SocketAddr) -> Option<PeerId> {
         let mut this_peer = self.peer_key.lock();
         if this_peer.is_none() {
-            *this_peer = Some(peer_key);
+            *this_peer = Some(PeerId::new(addr, (&*self.pub_key).clone()));
             None
         } else {
             this_peer.clone()

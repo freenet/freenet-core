@@ -96,6 +96,19 @@ pub(crate) struct Connection {
     open_at: Instant,
 }
 
+#[cfg(test)]
+impl Connection {
+    pub fn new(peer: PeerId, location: Location) -> Self {
+        Connection {
+            location: PeerKeyLocation {
+                peer,
+                location: Some(location),
+            },
+            open_at: Instant::now(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct LiveTransactionTracker {
     tx_per_peer: Arc<DashMap<PeerId, Vec<Transaction>>>,
@@ -233,7 +246,7 @@ impl Ring {
     const DEFAULT_RAND_WALK_ABOVE_HTL: usize = 7;
 
     /// Max hops to be performed for certain operations (e.g. propagating connection of a peer in the network).
-    const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
+    pub const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
 
     /// Max number of seeding contracts.
     const MAX_SEEDING_CONTRACTS: usize = 100;
