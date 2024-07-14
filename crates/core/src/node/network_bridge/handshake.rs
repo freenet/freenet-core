@@ -14,7 +14,9 @@ use crate::{
     dev_tool::{Location, PeerId, Transaction},
     message::{InnerMessage, NetMessage, NetMessageV1},
     node::NetworkBridge,
-    operations::connect::{forward_conn, ConnectMsg, ConnectOp, ConnectRequest, ConnectResponse},
+    operations::connect::{
+        forward_conn, ConnectMsg, ConnectOp, ConnectRequest, ConnectResponse, ConnectState,
+    },
     ring::{ConnectionManager, PeerKeyLocation},
     router::Router,
     transport::{
@@ -454,14 +456,7 @@ async fn gw_peer_connection_listener(
         tokio::select! {
             msg = outbound.0.recv() => {
                 let Some(msg) = msg else { break Err(HandshakeError::ConnectionClosed(conn.remote_addr())); };
-                match &msg {
-                    NetMessage::V1(NetMessageV1::Connect(op)) => {
-                        // TODO: in this case it may be a reply of a third party we forwarded to, and need to send that back to the joiner
-                        // and count the reply
-                        todo!()
-                    }
-                    _ => {}
-                }
+
                 tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr() ,"Sending message to peer. Msg: {msg}");
                         conn
                             .send(msg)
@@ -513,8 +508,8 @@ async fn gw_transient_peer_conn(
     conn_manager: ConnectionManager,
     router: Arc<RwLock<Router>>,
 ) -> Result<(InternalEvent, PeerOutboundMessage), HandshakeError> {
+    // TODO: should be the same timeout as the one used for any other tx
     let timeout_duration = Duration::from_secs(10);
-    let mut connection_ended = false;
 
     // Attempt forwarding the connection request to the next hop and wait for answers
     // then return those answers to the transitory peer connection.
@@ -543,7 +538,7 @@ async fn gw_transient_peer_conn(
         location: Some(joiner_loc),
     };
     let my_peer_id = conn_manager.own_location();
-    let Ok(Some(mut conn_state)) = forward_conn(
+    let Ok(Some(conn_state)) = forward_conn(
         transaction.tx,
         &conn_manager,
         router.clone(),
@@ -558,6 +553,9 @@ async fn gw_transient_peer_conn(
     else {
         return Err(HandshakeError::ConnectionClosed(conn.remote_addr()));
     };
+    let ConnectState::AwaitingConnectivity(mut info) = conn_state else {
+        unreachable!()
+    };
 
     loop {
         tokio::select! {
@@ -567,8 +565,7 @@ async fn gw_transient_peer_conn(
                         let net_msg = decode_msg(&msg).unwrap();
                         if transaction.is_drop_connection_message(&net_msg) {
                             tracing::debug!("Received drop connection message");
-                            connection_ended = true;
-                            break;
+                            break Ok((InternalEvent::DropInboundConnection(conn.remote_addr()), outbound));
                         } else {
                             tracing::warn!(
                                 at=?conn.my_address(),
@@ -576,43 +573,66 @@ async fn gw_transient_peer_conn(
                                 %net_msg,
                                 "Unexpected message received from peer, terminating connection"
                             );
-                            break;
+                            break Err(HandshakeError::ConnectionClosed(conn.remote_addr()));
                         }
                     }
                     Ok(Err(e)) => {
                         tracing::error!("Error receiving message: {:?}", e);
-                        connection_ended = true;
-                        break;
+                        break Ok((InternalEvent::DropInboundConnection(conn.remote_addr()), outbound));
                     }
                     Err(_) => {
                         tracing::debug!("Transient connection timed out");
-                        connection_ended = true;
-                        break;
+                        break Ok((InternalEvent::DropInboundConnection(conn.remote_addr()), outbound));
                     }
                 }
             }
-            outgoing_msg = outbound.0.recv() => {
-                match outgoing_msg {
-                    Some(msg) => {
+            outbound_msg = timeout(timeout_duration, outbound.0.recv()) => {
+                match outbound_msg {
+                    Ok(Some(msg)) => {
+                        if matches!(
+                            msg,
+                            NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response { msg: ConnectResponse::AcceptedBy { .. }, .. }))
+                        ) {
+                            let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
+                                id,
+                                target,
+                                msg: ConnectResponse::AcceptedBy { accepted, acceptor, joiner },
+                                ..
+                            })) = msg else {
+                                unreachable!()
+                            };
+                            // TODO: in this case it may be a reply of a third party we forwarded to,
+                            // and need to send that back to the joiner and count the reply
+                            let msg = NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
+                                id,
+                                sender: target,
+                                target: acceptor.clone(),
+                                msg: ConnectResponse::AcceptedBy {
+                                    accepted,
+                                    acceptor,
+                                    joiner,
+                                },
+                            }));
+                            conn.send(msg).await?;
+                            if info.decrement_check() {
+                                break Ok((InternalEvent::DropInboundConnection(conn.remote_addr()), outbound));
+                            } else {
+                                continue;
+                            }
+                        }
                         conn.send(msg).await?;
                     }
-                    None => {
+                    Ok(None) => {
                         tracing::debug!("Outbound channel closed");
-                        connection_ended = true;
-                        break;
+                        break Ok((InternalEvent::DropInboundConnection(conn.remote_addr()), outbound));
+                    }
+                    Err(_) => {
+                        tracing::debug!("Transient connection timed out");
+                        break Ok((InternalEvent::DropInboundConnection(conn.remote_addr()), outbound));
                     }
                 }
             }
         }
-    }
-
-    if connection_ended {
-        Ok((
-            InternalEvent::DropInboundConnection(conn.remote_addr()),
-            outbound,
-        ))
-    } else {
-        Err(HandshakeError::ConnectionClosed(conn.remote_addr()))
     }
 }
 

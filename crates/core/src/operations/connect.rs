@@ -500,6 +500,8 @@ impl Operation for ConnectOp {
                                 );
                                 let acceptor_loc =
                                     acceptor.location.expect("location not found for acceptor");
+                                // FIXME: is this correct? the peer receiving the msg is always connected to the sender and is just
+                                // forwarding the reply to the joiner
                                 op_manager
                                     .ring
                                     .add_connection(acceptor_loc, acceptor.peer.clone())
@@ -659,6 +661,7 @@ pub(crate) enum ConnectState {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub(crate) struct ConnectivityInfo {
     remaining_checks: usize,
     requester: Requester,
@@ -670,6 +673,12 @@ impl ConnectivityInfo {
             requester,
             remaining_checks,
         }
+    }
+
+    /// Decrements the remaining checks and returns whether the checks are complete.
+    pub fn decrement_check(&mut self) -> bool {
+        self.remaining_checks = self.remaining_checks.saturating_sub(1);
+        self.remaining_checks == 0
     }
 }
 
