@@ -108,7 +108,6 @@ type OutboundMessageSender = mpsc::Sender<NetMessage>;
 type OutboundMessageReceiver = mpsc::Receiver<(SocketAddr, NetMessage)>;
 type EstablishConnectionReceiver = mpsc::Receiver<(PeerId, Transaction)>;
 
-
 /// Manages the handshake process for establishing connections with peers.
 /// Handles both inbound and outbound connection attempts, and manages
 /// the transition from unconfirmed to confirmed connections.
@@ -395,7 +394,6 @@ impl HandshakeHandler {
     }
 }
 
-
 /// Waits for confirmation from a gateway after initiating a connection.
 async fn wait_for_gw_confirmation(
     peer_id: PeerId,
@@ -543,11 +541,11 @@ async fn gw_transient_peer_conn(
         &conn_manager,
         router.clone(),
         &mut nw_bridge,
-        (my_peer_id, joiner_pk_loc),
+        (my_peer_id.clone(), joiner_pk_loc),
         transaction.hops_to_live,
         transaction.hops_to_live,
         false,
-        vec![transaction.joiner.clone()],
+        vec![transaction.joiner.clone(), my_peer_id.peer],
     )
     .await
     else {
@@ -601,7 +599,7 @@ async fn gw_transient_peer_conn(
                             })) = msg else {
                                 unreachable!()
                             };
-                            // TODO: in this case it may be a reply of a third party we forwarded to,
+                            // in this case it may be a reply of a third party we forwarded to,
                             // and need to send that back to the joiner and count the reply
                             let msg = NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
                                 id,

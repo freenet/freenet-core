@@ -183,7 +183,7 @@ impl Operation for ConnectOp {
                                 joiner,
                                 *max_hops_to_live,
                                 *max_hops_to_live,
-                                &skip_list,
+                                skip_list,
                             );
                             network_bridge.send(&desirable_peer.peer, msg).await?;
                             return_msg = None;
@@ -920,7 +920,7 @@ pub(crate) async fn forward_conn<NB>(
     left_htl: usize,
     max_htl: usize,
     accepted: bool,
-    skip_list: Vec<PeerId>,
+    mut skip_list: Vec<PeerId>,
 ) -> Result<Option<ConnectState>, OpError>
 where
     NB: NetworkBridge,
@@ -955,16 +955,11 @@ where
             &skip_list,
         )
     };
+    skip_list.push(req_peer.peer.clone());
     match target_peer {
         Some(target_peer) => {
-            let forward_msg = create_forward_message(
-                id,
-                &req_peer,
-                &joiner,
-                left_htl,
-                max_htl,
-                &[req_peer.peer.clone()],
-            );
+            let forward_msg =
+                create_forward_message(id, &req_peer, &joiner, left_htl, max_htl, skip_list);
             tracing::debug!(target: "network", "Forwarding connection request to {:?}", target_peer);
             network_bridge.send(&target_peer.peer, forward_msg).await?;
             update_state_with_forward_info(&req_peer, left_htl)
@@ -1012,7 +1007,7 @@ fn create_forward_message(
     joiner: &PeerKeyLocation,
     hops_to_live: usize,
     max_hops_to_live: usize,
-    skip_list: &[PeerId],
+    skip_list: Vec<PeerId>,
 ) -> NetMessage {
     NetMessage::from(ConnectMsg::Request {
         id,
@@ -1021,7 +1016,7 @@ fn create_forward_message(
             joiner: joiner.clone(),
             hops_to_live: hops_to_live.saturating_sub(1), // decrement the hops to live for the next hop
             max_hops_to_live,
-            skip_list: skip_list.to_vec(),
+            skip_list,
         },
     })
 }
