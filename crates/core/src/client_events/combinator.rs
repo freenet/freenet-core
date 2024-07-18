@@ -68,9 +68,12 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
                     // this receiver ain't awaiting, queue a new one
                     // SAFETY: is safe here to extend the lifetime since clients are required to be 'static
                     //         and we take ownership, so they will be alive for the duration of the program
+                    let f = Box::pin(self.hosts_rx[i].recv())
+                        as Pin<Box<dyn Future<Output = _> + Send + Sync + '_>>;
                     let new_pend = unsafe {
-                        std::mem::transmute(Box::pin(self.hosts_rx[i].recv())
-                            as Pin<Box<dyn Future<Output = _> + Send + Sync + '_>>)
+                        std::mem::transmute::<_, Pin<Box<dyn Future<Output = _> + Send + Sync + '_>>>(
+                            f,
+                        )
                     };
                     *fut = Some(new_pend);
                 }
