@@ -963,6 +963,10 @@ pub(crate) mod tracer {
             } else {
                 fmt_layer.boxed()
             };
+            #[cfg(not(feature = "trace-ot"))]
+            {
+                let _ = endpoint;
+            }
 
             #[cfg(feature = "trace-ot")]
             {
