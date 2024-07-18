@@ -3094,12 +3094,13 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pav_regression"
-version = "0.4.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55e602c9eaa5bd2b89f5214636de0a845ddb2000db1cb429887eac12dbcd5996"
+checksum = "13de74d772b05f09cece1a9af106ddd386d28f059692cba2c1e61a9fe76fb66b"
 dependencies = [
  "ordered-float 3.9.2",
  "serde",
+ "thiserror",
 ]
 
 [[package]]
