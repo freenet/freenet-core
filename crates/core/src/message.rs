@@ -303,6 +303,7 @@ pub(crate) enum NodeEvent {
     // Try connecting to the given peer.
     ConnectPeer {
         peer: PeerId,
+        tx: Transaction,
         callback: tokio::sync::mpsc::Sender<Result<(), ()>>,
     },
     Disconnect {

@@ -341,6 +341,7 @@ impl Operation for ConnectOp {
                         op_manager
                             .notify_node_event(NodeEvent::ConnectPeer {
                                 peer: joiner.peer.clone(),
+                                tx: *id,
                                 callback,
                             })
                             .await?;

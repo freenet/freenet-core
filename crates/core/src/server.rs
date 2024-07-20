@@ -204,7 +204,7 @@ pub mod network_node {
                 node_config
                     .peer_id
                     .clone()
-                    .map(|id| Location::from_address(&id.addr()))
+                    .map(|id| Location::from_address(&id.addr))
             })
             .flatten();
         let mut node = node_config

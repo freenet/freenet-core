@@ -97,7 +97,6 @@ pub(crate) struct PeerConnection {
     outbound_stream_futures: FuturesUnordered<JoinHandle<Result>>,
 }
 
-#[cfg(test)]
 impl std::fmt::Debug for PeerConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PeerConnection")

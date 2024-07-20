@@ -41,7 +41,7 @@ pub(super) enum HandshakeError {
     TransportError(#[from] TransportError),
 }
 
-#[cfg_attr(test, derive(Debug))]
+#[derive(Debug)]
 pub(super) enum Event {
     /// An inbound connection to a peer was successfully established at a gateway.
     InboundConnection(InboundJoinRequest),
@@ -515,7 +515,7 @@ async fn wait_for_gw_confirmation(
     todo!()
 }
 
-#[cfg_attr(test, derive(Debug))]
+#[derive(Debug)]
 pub(super) struct InboundJoinRequest {
     pub conn: PeerConnection,
     pub id: Transaction,
@@ -991,7 +991,7 @@ mod tests {
                     assert!(matches!(connection, ConnectOp { .. }));
                     Ok(())
                 }
-                other => Ok(()),
+                other => Err(anyhow!("Unexpected event: {:?}", other)),
             }
         };
 
