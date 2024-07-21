@@ -92,7 +92,7 @@ impl OutboundMessage {
 }
 
 /// Use for starting a new outboound connection to a peer.
-pub(super) struct EstablishConnection(mpsc::Sender<(PeerId, Transaction)>);
+pub(super) struct EstablishConnection(pub(crate) mpsc::Sender<(PeerId, Transaction)>);
 
 impl EstablishConnection {
     pub async fn establish_conn(&self, remote: PeerId, tx: Transaction) -> Result<()> {
