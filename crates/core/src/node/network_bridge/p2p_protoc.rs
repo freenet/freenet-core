@@ -5,7 +5,6 @@ use either::{Either, Left, Right};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
-use log::debug;
 use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
 use std::{
