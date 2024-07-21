@@ -404,7 +404,6 @@ impl P2pConnManager {
                         Event::OutboundGatewayConnectionSuccessful {
                             peer_id,
                             connection,
-                            op,
                         } => {
                             if let Some(cb) = awaiting_connection.remove(&peer_id.addr) {
                                 let _ = cb.send(Ok(())).await;
@@ -416,6 +415,7 @@ impl P2pConnManager {
                             // Spawn a task to handle the connection messages (inbound and outbound)
                             let task = peer_connection_listener(rx, connection).boxed();
                             peer_connections.push(task);
+                            todo!("Create a new connect op to handle the inbound forward connection attempts")
                         }
                         _ => {
                             //TODO: Implement the rest of the events if it applies

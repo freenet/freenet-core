@@ -6,6 +6,7 @@ use std::{
     sync::Arc,
 };
 use tokio::time::{timeout, Duration};
+use tracing_subscriber::field::debug;
 
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use tokio::sync::mpsc::{self};
@@ -39,6 +40,8 @@ pub(super) enum HandshakeError {
     Serialization(#[from] Box<bincode::ErrorKind>),
     #[error(transparent)]
     TransportError(#[from] TransportError),
+    #[error("receibed an unexpected message at this point: {0}")]
+    UnexpectedMessage(NetMessage),
 }
 
 #[derive(Debug)]
@@ -65,7 +68,6 @@ pub(super) enum Event {
     OutboundGatewayConnectionSuccessful {
         peer_id: PeerId,
         connection: PeerConnection,
-        op: ConnectMsg,
     },
     /// Clean up a transaction that was completed or duplicate.
     RemoveTransaction(Transaction),
@@ -143,9 +145,6 @@ pub(super) struct HandshakeHandler {
     /// Part of the OutboundMessage public API
     pending_msg_rx: OutboundMessageReceiver,
 
-    /// Queues messages for peers that are not yet connected
-    queues: HashMap<SocketAddr, Vec<NetMessage>>,
-
     /// Receiver for commands to establish new outbound connections
     /// Part of the EstablishConnection public API
     establish_connection_rx: EstablishConnectionReceiver,
@@ -175,7 +174,6 @@ impl HandshakeHandler {
             unconfirmed_inbound_connections: FuturesUnordered::new(),
             outbound_messages: HashMap::new(),
             pending_msg_rx,
-            queues: HashMap::new(),
             establish_connection_rx,
             connection_manager,
             router,
@@ -204,9 +202,26 @@ impl HandshakeHandler {
                 outbound_conn = self.ongoing_outbound_connections.next(), if !self.ongoing_outbound_connections.is_empty() => {
                     let r = match outbound_conn {
                         Some(Ok(InternalEvent::OutboundConnEstablished(id, connection))) => {
+                            if let Some(addr) = connection.my_address() {
+                                self.connection_manager.try_set_peer_key(addr);
+                            }
                             tracing::debug!(at=?connection.my_address(), from=%connection.remote_addr(), "Outbound connection successful");
-                            self.wait_for_gw_confirmation(id, connection).await;
+                            self.wait_for_gw_confirmation(id, connection).await?;
                             continue;
+                        }
+                        Some(Ok(InternalEvent::OutboundGwConnConfirmed(id, connection))) => {
+                            tracing::debug!(at=?connection.my_address(), from=%connection.remote_addr(), "Outbound connection confirmed");
+                            self.connected.insert(connection.remote_addr());
+                            self.connecting.remove(&connection.remote_addr());
+                            return Ok(Event::OutboundGatewayConnectionSuccessful { peer_id: id, connection  });
+                        }
+                        Some(Ok(InternalEvent::DropInboundConnection(addr))) => {
+                            self.outbound_messages.remove(&addr);
+                            self.connecting.remove(&addr);
+                            continue;
+                        }
+                        Some(Ok(InternalEvent::InboundJoinRequest(req))) => {
+                            return Ok(Event::InboundConnection(req));
                         }
                         Some(Err((peer_id, error))) => {
                             tracing::debug!(from=%peer_id.addr, "Outbound connection failed: {error}");
@@ -217,7 +232,7 @@ impl HandshakeHandler {
                     };
                     break r;
                 }
-                // Handle unconfirmed inbound connections (mainly for gateways)
+                // Handle unconfirmed inbound connections (only applies in gateways)
                 unconfirmed_inbound_conn = self.unconfirmed_inbound_connections.next(), if !self.unconfirmed_inbound_connections.is_empty() => {
                     let Some(res) = unconfirmed_inbound_conn else {
                         return Err(HandshakeError::ChannelClosed);
@@ -268,13 +283,16 @@ impl HandshakeHandler {
                         }
                         InternalEvent::DropInboundConnection(addr) => {
                             self.outbound_messages.remove(&addr);
-                            self.queues.remove(&addr);
                             self.connecting.remove(&addr);
                             continue;
                         }
                         InternalEvent::OutboundConnEstablished(peer_id, connection) => {
                             tracing::debug!(at=?connection.my_address(), from=%connection.remote_addr(), "Outbound connection successful");
                             return Ok(Event::OutboundConnectionSuccessful { peer_id, connection });
+                        }
+                        other => {
+                            tracing::error!("Unexpected event: {other:?}");
+                            continue;
                         }
                     }
                 }
@@ -385,7 +403,7 @@ impl HandshakeHandler {
         self.outbound_messages.insert(remote, outbound_msg_sender);
     }
 
-    /// Handles outbound messages to peers, including queueing for disconnected peers.
+    /// Handles outbound messages to peers.
     async fn outbound(&mut self, addr: SocketAddr, op: NetMessage) -> Option<Event> {
         if let Some(alive_conn) = self.outbound_messages.get_mut(&addr) {
             match &op {
@@ -409,7 +427,6 @@ impl HandshakeHandler {
             }
 
             if alive_conn.send(op).await.is_err() {
-                self.queues.remove(&addr);
                 self.outbound_messages.remove(&addr);
                 self.connecting.remove(&addr);
             }
@@ -446,10 +463,16 @@ impl HandshakeHandler {
                 return None;
             }
 
-            // if is a message to a peer which is not yet connected, just queue it
-            tracing::debug!("Queueing message to {addr}", addr = addr);
-            self.queues.entry(addr).or_default().push(op);
-            None
+            #[cfg(debug_assertions)]
+            {
+                unreachable!("Can't send messages to a peer without an established connection");
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                // we don't want to crash the node in case of a bug here
+                tracing::error!("No outbound message sender for {addr}", addr = addr);
+                Err(HandshakeError::UnexpectedMessage(op))
+            }
         }
     }
 
@@ -477,16 +500,21 @@ impl HandshakeHandler {
     }
 
     /// Waits for confirmation from a gateway after establishing a connection.
-    async fn wait_for_gw_confirmation(&mut self, peer_id: PeerId, conn: PeerConnection) {
+    async fn wait_for_gw_confirmation(
+        &mut self,
+        peer_id: PeerId,
+        conn: PeerConnection,
+    ) -> Result<()> {
         let tx = self
             .connecting
             .get(&peer_id.addr)
-            .expect("should be set")
+            .ok_or_else(|| HandshakeError::ConnectionClosed(conn.remote_addr()))?
             .clone();
         self.ongoing_outbound_connections.push(
             wait_for_gw_confirmation(peer_id, conn, self.connection_manager.max_hops_to_live, tx)
                 .boxed(),
         );
+        Ok(())
     }
 }
 
@@ -507,6 +535,7 @@ async fn wait_for_gw_confirmation(
             skip_list: vec![],
         },
     }));
+    // FIXME: why with tests `at` is printing `None`?
     tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), "Sending initial connection message to gw");
     conn.send(msg)
         .await
@@ -515,9 +544,29 @@ async fn wait_for_gw_confirmation(
     let msg = conn
         .recv()
         .await
-        .map_err(|err| (peer_id, HandshakeError::TransportError(err)))?;
-    tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), "Received answer from gw");
-    todo!()
+        .map_err(|err| (peer_id.clone(), HandshakeError::TransportError(err)))?;
+    let deserialized = decode_msg(&msg).map_err(|e| (peer_id.clone(), e.into()))?;
+    tracing::debug!(%deserialized, at=?conn.my_address(), from=%conn.remote_addr(), "Received answer from gw");
+
+    match deserialized {
+        NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
+            msg: ConnectResponse::AcceptedBy {
+                accepted, acceptor, ..
+            },
+            ..
+        })) => {
+            // the first message should always be a response to the initial connection request at the gateway
+            debug_assert_eq!(acceptor.peer.addr, conn.remote_addr());
+            if accepted {
+                return Ok(InternalEvent::OutboundGwConnConfirmed(peer_id, conn));
+            } else {
+                // under this branch we just need to wait long enough for the gateway to reply with all the downstream
+                // connection attempts, and then we can drop the connection, so keep listening to it ina loop or timeout
+                todo!()
+            }
+        }
+        other => Err((peer_id, HandshakeError::UnexpectedMessage(other))),
+    }
 }
 
 #[derive(Debug)]
@@ -531,9 +580,11 @@ pub(super) struct InboundJoinRequest {
     pub skip_list: Vec<PeerId>,
 }
 
+#[derive(Debug)]
 enum InternalEvent {
     InboundJoinRequest(InboundJoinRequest),
     OutboundConnEstablished(PeerId, PeerConnection),
+    OutboundGwConnConfirmed(PeerId, PeerConnection),
     DropInboundConnection(SocketAddr),
 }
 
@@ -883,10 +934,10 @@ mod tests {
         let outbound_conn_handler = OutboundConnectionHandler::new(outbound_sender);
         let (inbound_sender, inbound_recv) = mpsc::channel(5);
         let inbound_conn_handler = InboundConnectionHandler::new(inbound_recv);
+        let addr = ([127, 0, 0, 1], 10000).into();
         let keypair = TransportKeypair::new();
-        let peer_id = PeerId::new(([127, 0, 0, 1], 10000).into(), keypair.public().clone());
-        let mngr = ConnectionManager::default();
-        mngr.set_peer_key(peer_id.clone());
+        let mngr = ConnectionManager::default_with_key(keypair.public().clone());
+        mngr.try_set_peer_key(addr);
         let router = Router::new(&[]);
         let (handler, establish_conn, outbound_msg) = HandshakeHandler::new(
             inbound_conn_handler,
@@ -1061,7 +1112,7 @@ mod tests {
             let event =
                 tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
             match event {
-                Event::OutboundConnectionSuccessful { peer_id, .. } => {
+                Event::OutboundGatewayConnectionSuccessful { peer_id, .. } => {
                     assert_eq!(peer_id.addr, remote_addr);
                     assert_eq!(peer_id.pub_key, pub_key);
                     Ok(())
