@@ -356,7 +356,7 @@ impl P2pConnManager {
                             // Spawn a task to handle the connection messages (inbound and outbound)
                             let task = peer_connection_listener(rx, conn).boxed();
                             peer_connections.push(task);
-                            // TODO: Need to add the operation to the op_manager properly, in the correct state
+                            todo!("Need to add the operation to the op_manager properly, in the correct state")
                         }
                         Event::TransientForwardTransaction {
                             target,
@@ -417,8 +417,18 @@ impl P2pConnManager {
                             peer_connections.push(task);
                             todo!("Create a new connect op to handle the inbound forward connection attempts")
                         }
-                        _ => {
-                            //TODO: Implement the rest of the events if it applies
+                        Event::OutboundConnectionFailed { peer_id, error } => {
+                            tracing::info!(%peer_id, "Connection failed: {:?}", error);
+                            awaiting_connection.remove(&peer_id.addr);
+                        }
+                        Event::RemoveTransaction(tx) => {
+                            pending_from_executor.remove(&tx);
+                            transient_conn.remove(&tx);
+                            if let Some(cli) = tx_to_client.remove(&tx) {
+                                todo!("probably need to do something with this, signal back that it failed")
+                            }
+                        }
+                        Event::OutboundConnectionRejected { peer_id } => {
                             todo!()
                         }
                     }
@@ -473,20 +483,6 @@ impl P2pConnManager {
             }
             Err(e) => Err(e),
         }
-    }
-
-    #[inline]
-    fn print_connected_peers<'a>(&self) {
-        tracing::debug!(
-            "This peer {:?} has active connections with peers: {:?}",
-            self.bridge
-                .op_manager
-                .ring
-                .connection_manager
-                .get_peer_key()
-                .as_ref(),
-            self.connections.keys().map(|p| &p.addr).collect::<Vec<_>>()
-        );
     }
 }
 

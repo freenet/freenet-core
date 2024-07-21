@@ -233,7 +233,7 @@ impl Ring {
     const DEFAULT_RAND_WALK_ABOVE_HTL: usize = 7;
 
     /// Max hops to be performed for certain operations (e.g. propagating connection of a peer in the network).
-    const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
+    pub const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
 
     /// Max number of seeding contracts.
     const MAX_SEEDING_CONTRACTS: usize = 100;

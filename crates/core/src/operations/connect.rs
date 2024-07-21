@@ -491,31 +491,15 @@ impl Operation for ConnectOp {
                             assert!(*remaining_checks > 0);
                             let remaining_checks = remaining_checks.saturating_sub(1);
 
-                            if *accepted {
-                                tracing::debug!(
-                                    tx = %id,
-                                    at = %this_peer_id,
-                                    from = %sender.peer,
-                                    accecpted_by = %acceptor.peer,
-                                    "Connectivity check accepted",
-                                );
-                                let acceptor_loc =
-                                    acceptor.location.expect("location not found for acceptor");
-                                // FIXME: is this correct? the peer receiving the msg is always connected to the sender and is just
-                                // forwarding the reply to the joiner
-                                op_manager
-                                    .ring
-                                    .add_connection(acceptor_loc, acceptor.peer.clone())
-                                    .await;
-                            } else {
-                                tracing::debug!(
-                                    tx = %id,
-                                    at = %this_peer_id,
-                                    from = %sender.peer,
-                                    rejected_by = %acceptor.peer,
-                                    "Connectivity check rejected",
-                                );
-                            }
+                            tracing::debug!(
+                                tx = %id,
+                                at = %this_peer_id,
+                                from = %sender.peer,
+                                acceptor = %acceptor.peer,
+                                accepted = %accepted,
+                                "Connectivity check",
+                            );
+
                             if remaining_checks == 0 {
                                 tracing::debug!(
                                     tx = %id,
@@ -662,7 +646,6 @@ pub(crate) enum ConnectState {
 }
 
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub(crate) struct ConnectivityInfo {
     remaining_checks: usize,
     requester: Requester,
@@ -1115,9 +1098,9 @@ mod messages {
                     ..
                 } => write!(f, "StartRequest(id: {id})"),
                 Self::Response {
-                    msg: ConnectResponse::AcceptedBy { .. },
+                    msg: ConnectResponse::AcceptedBy { accepted, .. },
                     ..
-                } => write!(f, "AcceptedBy(id: {id})"),
+                } => write!(f, "AcceptedBy(id: {id}, accepted: {accepted})"),
                 Self::Connected { .. } => write!(f, "Connected(id: {id})"),
                 ConnectMsg::Request { id, .. } => write!(f, "Request(id: {id})"),
             }
