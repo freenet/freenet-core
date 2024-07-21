@@ -478,8 +478,13 @@ impl HandshakeHandler {
 
     /// Waits for confirmation from a gateway after establishing a connection.
     async fn wait_for_gw_confirmation(&mut self, peer_id: PeerId, conn: PeerConnection) {
+        let tx = self
+            .connecting
+            .get(&peer_id.addr)
+            .expect("should be set")
+            .clone();
         self.ongoing_outbound_connections.push(
-            wait_for_gw_confirmation(peer_id, conn, self.connection_manager.max_hops_to_live)
+            wait_for_gw_confirmation(peer_id, conn, self.connection_manager.max_hops_to_live, tx)
                 .boxed(),
         );
     }
@@ -490,8 +495,8 @@ async fn wait_for_gw_confirmation(
     peer_id: PeerId,
     mut conn: PeerConnection,
     max_hops_to_live: usize,
+    tx: Transaction,
 ) -> OutboundConnResult {
-    let tx = Transaction::new::<ConnectMsg>();
     let msg = NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
         id: tx,
         msg: ConnectRequest::StartJoinReq {
@@ -833,7 +838,6 @@ mod tests {
                 .recv()
                 .await
                 .ok_or_else(|| anyhow::Error::msg("Failed to receive packet"))?;
-            tracing::info!("Received message");
             let packet: PacketData<UnknownEncryption> = PacketData::from_buf(&*msg);
             let packet = packet
                 .try_decrypt_sym(&self.in_key)
@@ -847,7 +851,6 @@ mod tests {
                 panic!()
             };
             let msg: NetMessage = bincode::deserialize(&payload).unwrap();
-            tracing::debug!("Received message: {:?}", msg);
             Ok(msg)
         }
     }

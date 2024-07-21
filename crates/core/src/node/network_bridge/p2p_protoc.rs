@@ -1,4 +1,4 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
