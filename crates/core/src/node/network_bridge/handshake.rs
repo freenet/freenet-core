@@ -77,6 +77,11 @@ pub(super) enum Event {
     },
 }
 
+enum ForwardResult {
+    Forward(PeerId, NetMessage, ConnectivityInfo),
+    Reject(NetMessage),
+}
+
 /// Use for sending messages to a peer which has not yet been confirmed at a logical level
 /// or is just a transient connection (e.g. in case of gateways just forwarding messages).
 pub(super) struct OutboundMessage(mpsc::Sender<(SocketAddr, NetMessage)>);
@@ -256,32 +261,38 @@ impl HandshakeHandler {
                                 tracing::debug!(at=?conn.my_address(), from=%remote, "Transient connection");
                                 let mut tx = TransientConnection {
                                     tx: id,
-                                    joiner: peer_id,
+                                    joiner: peer_id.clone(),
                                     max_hops_to_live,
                                     hops_to_live,
                                     skip_list,
                                 };
-                                let (peer_id, msg, tx_info) = match self.forward_transient_connection(&mut conn, &mut tx).await {
-                                    Ok(msg) => msg,
+                                match self.forward_transient_connection(&mut conn, &mut tx).await {
+                                    Ok(ForwardResult::Forward(forward_target, msg, info)) => {
+                                        self.unconfirmed_inbound_connections.push(
+                                            gw_transient_peer_conn(
+                                                conn,
+                                                outbound_sender,
+                                                tx,
+                                                info,
+                                            ).boxed()
+                                        );
+                                        return Ok(Event::TransientForwardTransaction {
+                                            target: remote,
+                                            tx: id,
+                                            forward_to: forward_target,
+                                            msg,
+                                        });
+                                    }
+                                    Ok(ForwardResult::Reject(reject_msg)) => {
+                                        return Ok(Event::OutboundConnectionRejected {
+                                            peer_id: tx.joiner,
+                                        });
+                                    }
                                     Err(e) => {
                                         tracing::error!(from=%remote, "Error forwarding transient connection: {e}");
                                         return Err(e);
                                     }
-                                };
-                                self.unconfirmed_inbound_connections.push(
-                                    gw_transient_peer_conn(
-                                        conn,
-                                        outbound_sender,
-                                        tx,
-                                        tx_info,
-                                    ).boxed()
-                                );
-                                return Ok(Event::TransientForwardTransaction {
-                                    target: remote,
-                                    tx: id,
-                                    forward_to: peer_id,
-                                    msg,
-                                });
+                                }
                             }
                         }
                         InternalEvent::DropInboundConnection(addr) => {
@@ -323,7 +334,7 @@ impl HandshakeHandler {
         &mut self,
         conn: &mut PeerConnection,
         transaction: &mut TransientConnection,
-    ) -> Result<(PeerId, NetMessage, ConnectivityInfo)> {
+    ) -> Result<ForwardResult, HandshakeError> {
         // Attempt forwarding the connection request to the next hop and wait for answers
         // then return those answers to the transitory peer connection.
         struct ForwardPeerMessage {
@@ -370,31 +381,46 @@ impl HandshakeHandler {
         let my_peer_id = self.connection_manager.own_location();
         transaction.skip_list.push(transaction.joiner.clone());
         transaction.skip_list.push(my_peer_id.peer.clone());
-        let Ok(Some(conn_state)) = forward_conn(
+
+        match forward_conn(
             transaction.tx,
             &self.connection_manager,
             self.router.clone(),
             &mut nw_bridge,
-            (my_peer_id.clone(), joiner_pk_loc),
+            (my_peer_id.clone(), joiner_pk_loc.clone()),
             transaction.hops_to_live,
             transaction.max_hops_to_live,
             false,
             transaction.skip_list.clone(),
         )
-        .await
-        else {
-            return Err(HandshakeError::ConnectionClosed(conn.remote_addr()));
-        };
-
-        let (forward_target, msg) = nw_bridge
-            .msg
-            .into_inner()
-            .expect("target was successfully set");
-        let ConnectState::AwaitingConnectivity(info) = conn_state else {
-            unreachable!()
-        };
-
-        Ok((forward_target, msg, info))
+            .await
+        {
+            Ok(Some(conn_state)) => {
+                let (forward_target, msg) = nw_bridge
+                    .msg
+                    .into_inner()
+                    .expect("target was successfully set");
+                let ConnectState::AwaitingConnectivity(info) = conn_state else {
+                    unreachable!()
+                };
+                Ok(ForwardResult::Forward(forward_target, msg, info))
+            }
+            Ok(None) => {
+                // No hay peer disponible para reenviar, preparamos un mensaje de rechazo
+                let reject_msg = NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
+                    id: transaction.tx,
+                    sender: my_peer_id.clone(),
+                    target: joiner_pk_loc,
+                    msg: ConnectResponse::AcceptedBy {
+                        accepted: false,
+                        acceptor: my_peer_id,
+                        joiner: transaction.joiner.clone(),
+                    },
+                }));
+                Ok(ForwardResult::Reject(reject_msg))
+            }
+            Err(_) => Err(HandshakeError::ConnectionClosed(conn.remote_addr())),
+        }
     }
 
     /// Tracks a new inbound connection and sets up message handling for it.

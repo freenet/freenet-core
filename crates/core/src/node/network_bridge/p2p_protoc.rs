@@ -345,8 +345,8 @@ impl P2pConnManager {
         state: &mut EventListenerState,
     ) -> anyhow::Result<()> {
         tracing::info!(tx = %tx, remote = %peer, "Connecting to peer");
-        state.awaiting_connection.insert(peer.addr, callback);
-        match establish_connection.establish_conn(peer, tx).await {
+        state.awaiting_connection.insert(peer.addr.clone(), callback);
+        match establish_connection.establish_conn(peer.clone(), tx).await {
             Ok(()) => {
                 tracing::debug!(tx = %tx,
                     "Successfully initiated connection process for peer: {:?}",
