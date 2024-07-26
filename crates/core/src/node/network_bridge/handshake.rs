@@ -959,27 +959,6 @@ mod tests {
             .await
         }
 
-        /// A peer established a connection successfully with a gateway.
-        async fn establish_outbound_conn(&mut self, addr: SocketAddr) -> Transaction {
-            let id = Transaction::new::<ConnectMsg>();
-            let joiner_key = TransportKeypair::new();
-            let pub_key = joiner_key.public().clone();
-            let initial_join_req = ConnectMsg::Request {
-                id,
-                msg: ConnectRequest::StartJoinReq {
-                    joiner: None,
-                    joiner_key: pub_key,
-                    hops_to_live: 10,
-                    max_hops_to_live: 10,
-                    skip_list: vec![],
-                },
-            };
-            tracing::debug!("Sending initial connection message");
-            self.inbound_msg(addr, NetMessageV1::Connect(initial_join_req))
-                .await;
-            id
-        }
-
         async fn inbound_msg(&mut self, addr: SocketAddr, msg: impl Serialize) {
             let msg = bincode::serialize(&msg).unwrap();
             let (out_symm_key, packet_sender) = self.packet_senders.get_mut(&addr).unwrap();
@@ -1021,7 +1000,7 @@ mod tests {
 
     struct NodeMock {
         establish_conn: EstablishConnection,
-        outbound_msg: OutboundMessage,
+        _outbound_msg: OutboundMessage,
     }
 
     impl NodeMock {
@@ -1031,10 +1010,6 @@ mod tests {
                 .establish_conn(remote, tx)
                 .await
                 .unwrap();
-        }
-
-        async fn outbound_msg(&self, remote: SocketAddr, msg: NetMessage) {
-            self.outbound_msg.send_to(remote, msg).await.unwrap();
         }
     }
 
@@ -1053,7 +1028,7 @@ mod tests {
         let mngr = ConnectionManager::default_with_key(keypair.public().clone());
         mngr.try_set_peer_key(addr);
         let router = Router::new(&[]);
-        let (handler, establish_conn, outbound_msg) = HandshakeHandler::new(
+        let (handler, establish_conn, _outbound_msg) = HandshakeHandler::new(
             inbound_conn_handler,
             outbound_conn_handler,
             mngr,
@@ -1073,7 +1048,7 @@ mod tests {
                 },
                 node: NodeMock {
                     establish_conn,
-                    outbound_msg,
+                    _outbound_msg,
                 },
             },
         )
