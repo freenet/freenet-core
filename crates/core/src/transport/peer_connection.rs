@@ -119,6 +119,7 @@ impl PeerConnection {
     #[cfg(test)]
     pub(crate) fn new_test(
         remote_addr: SocketAddr,
+        my_address: SocketAddr,
         outbound_symmetric_key: Aes128Gcm,
         inbound_symmetric_key: Aes128Gcm,
     ) -> (Self, mpsc::Sender<PacketData<UnknownEncryption>>) {
@@ -134,7 +135,7 @@ impl PeerConnection {
             inbound_packet_recv,
             inbound_symmetric_key,
             inbound_symmetric_key_bytes: [1; 16],
-            my_address: None,
+            my_address: Some(my_address),
         };
         (Self::new(remote), inbound_packet_sender)
     }
@@ -142,6 +143,7 @@ impl PeerConnection {
     #[cfg(test)]
     pub(crate) fn new_remote_test(
         remote_addr: SocketAddr,
+        my_address: SocketAddr,
         outbound_symmetric_key: Aes128Gcm,
         inbound_symmetric_key: Aes128Gcm,
     ) -> (
@@ -162,7 +164,7 @@ impl PeerConnection {
                 inbound_packet_recv,
                 inbound_symmetric_key,
                 inbound_symmetric_key_bytes: [1; 16],
-                my_address: None,
+                my_address: Some(my_address),
             },
             inbound_packet_sender,
             outbound_packets_recv,

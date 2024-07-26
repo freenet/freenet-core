@@ -15,8 +15,7 @@ use crate::{
     message::{InnerMessage, NetMessage, NetMessageV1},
     node::NetworkBridge,
     operations::connect::{
-        forward_conn, ConnectMsg, ConnectOp, ConnectRequest, ConnectResponse, ConnectState,
-        ConnectivityInfo,
+        forward_conn, ConnectMsg, ConnectRequest, ConnectResponse, ConnectState, ConnectivityInfo,
     },
     ring::{ConnectionManager, PeerKeyLocation},
     router::Router,
@@ -231,12 +230,25 @@ impl HandshakeHandler {
                             self.connecting.remove(&peer_id.addr);
                             return Ok(Event::OutboundConnectionRejected { peer_id });
                         }
+                        Some(Ok(InternalEvent::RemoteConnectionAttempt { remote, gw_conn, remaining_checks, gw_peer_id, tx })) => {
+                            tracing::debug!(at=?gw_conn.my_address(), gw=%gw_conn.remote_addr(), "Attempting remote connection to {remote}");
+                            self.start_outbound_connection(remote.clone(), tx).await;
+                            if remaining_checks > 0 {
+                                self.ongoing_outbound_connections.push(
+                                    check_remaining_hops(tx, gw_peer_id, gw_conn, remaining_checks).boxed()
+                                );
+                                continue;
+                            } else {
+                                tracing::debug!(at=?gw_conn.my_address(), gw=%gw_conn.remote_addr(), "No more checks left, dropping connection");
+                                Ok(Event::OutboundConnectionRejected { peer_id: gw_peer_id })
+                            }
+                        }
                         Some(Err((peer_id, error))) => {
                             tracing::debug!(from=%peer_id.addr, "Outbound connection failed: {error}");
+                            // TODO: remove any ongoing transactions, channels, etc. for this peer
                             Ok(Event::OutboundConnectionFailed { peer_id, error: error.into() })
                         }
                         None => Err(HandshakeError::ChannelClosed),
-                        _ => unreachable!()
                     };
                     break r;
                 }
@@ -393,7 +405,7 @@ impl HandshakeHandler {
             false,
             transaction.skip_list.clone(),
         )
-            .await
+        .await
         {
             Ok(Some(conn_state)) => {
                 let (forward_target, msg) = nw_bridge
@@ -565,6 +577,13 @@ enum InternalEvent {
     OutboundGwConnConfirmed(PeerId, PeerConnection),
     OutboundGwConnRejected(PeerId),
     DropInboundConnection(SocketAddr),
+    RemoteConnectionAttempt {
+        tx: Transaction,
+        remote: PeerId,
+        gw_conn: PeerConnection,
+        gw_peer_id: PeerId,
+        remaining_checks: usize,
+    },
 }
 
 #[repr(transparent)]
@@ -572,7 +591,7 @@ struct PeerOutboundMessage(mpsc::Receiver<NetMessage>);
 
 /// Waits for confirmation from a gateway after initiating a connection.
 async fn wait_for_gw_confirmation(
-    peer_id: PeerId,
+    gw_peer_id: PeerId,
     mut conn: PeerConnection,
     max_hops_to_live: usize,
     tx: Transaction,
@@ -581,23 +600,22 @@ async fn wait_for_gw_confirmation(
         id: tx,
         msg: ConnectRequest::StartJoinReq {
             joiner: None,
-            joiner_key: peer_id.pub_key.clone(),
+            joiner_key: gw_peer_id.pub_key.clone(),
             hops_to_live: max_hops_to_live,
             max_hops_to_live,
             skip_list: vec![],
         },
     }));
-    // FIXME: why with tests `at` is printing `None`?
     tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), "Sending initial connection message to gw");
     conn.send(msg)
         .await
-        .map_err(|err| (peer_id.clone(), HandshakeError::TransportError(err)))?;
+        .map_err(|err| (gw_peer_id.clone(), HandshakeError::TransportError(err)))?;
     tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), "Waiting for answer from gw");
     let msg = conn
         .recv()
         .await
-        .map_err(|err| (peer_id.clone(), HandshakeError::TransportError(err)))?;
-    let deserialized = decode_msg(&msg).map_err(|e| (peer_id.clone(), e.into()))?;
+        .map_err(|err| (gw_peer_id.clone(), HandshakeError::TransportError(err)))?;
+    let deserialized = decode_msg(&msg).map_err(|e| (gw_peer_id.clone(), e.into()))?;
     tracing::debug!(%deserialized, at=?conn.my_address(), from=%conn.remote_addr(), "Received answer from gw");
 
     match deserialized {
@@ -610,28 +628,56 @@ async fn wait_for_gw_confirmation(
             // the first message should always be a response to the initial connection request at the gateway
             debug_assert_eq!(acceptor.peer.addr, conn.remote_addr());
             if accepted {
-                return Ok(InternalEvent::OutboundGwConnConfirmed(peer_id, conn));
+                return Ok(InternalEvent::OutboundGwConnConfirmed(gw_peer_id, conn));
             }
         }
-        other => return Err((peer_id, HandshakeError::UnexpectedMessage(other))),
+        other => return Err((gw_peer_id, HandshakeError::UnexpectedMessage(other))),
     }
 
     // under this branch we just need to wait long enough for the gateway to reply with all the downstream
-    // connection attempts, and then we can drop the connection, so keep listening to it ina loop or timeout
-    let mut remaining_checks = max_hops_to_live;
+    // connection attempts, and then we can drop the connection, so keep listening to it in a loop or timeout
+    let remaining_checks = max_hops_to_live;
+    check_remaining_hops(tx, gw_peer_id, conn, remaining_checks).await
+}
 
+async fn check_remaining_hops(
+    tx: Transaction,
+    gw_peer_id: PeerId,
+    mut conn: PeerConnection,
+    mut remaining_checks: usize,
+) -> OutboundConnResult {
     while remaining_checks > 0 {
         let msg = conn
             .recv()
             .await
-            .map_err(|err| (peer_id.clone(), HandshakeError::TransportError(err)))?;
-        let msg = decode_msg(&msg).map_err(|e| (peer_id.clone(), e.into()))?;
-        tracing::debug!(%msg, at=?conn.my_address(), from=%conn.remote_addr(), "Received message from gw");
+            .map_err(|err| (gw_peer_id.clone(), HandshakeError::TransportError(err)))?;
+        let msg = decode_msg(&msg).map_err(|e| (gw_peer_id.clone(), e.into()))?;
         remaining_checks -= 1;
-        // TODO: here we should inform internally via an itnernal event of a new connection attempt with that remote
-        // we need to pass remaining_checks between calls to this function
+        tracing::debug!(%msg, at=?conn.my_address(), from=%conn.remote_addr(), %remaining_checks, "Received message from gw");
+        let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
+            msg:
+                ConnectResponse::AcceptedBy {
+                    accepted,
+                    acceptor,
+                    joiner,
+                },
+            ..
+        })) = msg
+        else {
+            return Err((gw_peer_id, HandshakeError::UnexpectedMessage(msg)));
+        };
+        debug_assert_eq!(joiner.addr, conn.my_address().unwrap());
+        if accepted {
+            return Ok(InternalEvent::RemoteConnectionAttempt {
+                tx,
+                remote: acceptor.peer,
+                gw_peer_id,
+                gw_conn: conn,
+                remaining_checks,
+            });
+        }
     }
-    Ok(InternalEvent::OutboundGwConnRejected(peer_id))
+    Ok(InternalEvent::OutboundGwConnRejected(gw_peer_id))
 }
 
 /// Handles communication with a potentially transient peer connection.
@@ -838,6 +884,7 @@ mod tests {
         packet_id: u32,
         packet_receivers: Vec<mpsc::Receiver<(SocketAddr, Arc<[u8]>)>>,
         in_key: Aes128Gcm,
+        my_addr: SocketAddr,
     }
 
     impl TransportMock {
@@ -845,7 +892,7 @@ mod tests {
             let out_symm_key = Aes128Gcm::new_from_slice(&[0; 16]).unwrap();
             let in_symm_key = Aes128Gcm::new_from_slice(&[1; 16]).unwrap();
             let (conn, packet_sender) =
-                PeerConnection::new_test(addr, out_symm_key, in_symm_key.clone());
+                PeerConnection::new_test(addr, self.my_addr, out_symm_key, in_symm_key.clone());
             self.inbound_sender.send(conn).await.unwrap();
             tracing::debug!("New inbound connection established");
             self.packet_senders
@@ -859,8 +906,12 @@ mod tests {
         ) {
             let out_symm_key = Aes128Gcm::new_from_slice(&[0; 16]).unwrap();
             let in_symm_key = Aes128Gcm::new_from_slice(&[1; 16]).unwrap();
-            let (conn, packet_sender, packet_recv) =
-                PeerConnection::new_remote_test(addr, out_symm_key, in_symm_key.clone());
+            let (conn, packet_sender, packet_recv) = PeerConnection::new_remote_test(
+                addr,
+                self.my_addr,
+                out_symm_key,
+                in_symm_key.clone(),
+            );
             callback
                 .send(Ok(conn))
                 .map_err(|_| "Failed to send connection")
@@ -961,6 +1012,7 @@ mod tests {
     }
 
     impl NodeMock {
+        /// A request from node internals to establish a connection with a peer.
         async fn establish_conn(&self, remote: PeerId, tx: Transaction) {
             self.establish_conn
                 .establish_conn(remote, tx)
@@ -978,12 +1030,12 @@ mod tests {
         node: NodeMock,
     }
 
-    fn config_handler() -> (HandshakeHandler, TestVerifier) {
+    fn config_handler(addr: impl Into<SocketAddr>) -> (HandshakeHandler, TestVerifier) {
         let (outbound_sender, outbound_recv) = mpsc::channel(5);
         let outbound_conn_handler = OutboundConnectionHandler::new(outbound_sender);
         let (inbound_sender, inbound_recv) = mpsc::channel(5);
         let inbound_conn_handler = InboundConnectionHandler::new(inbound_recv);
-        let addr = ([127, 0, 0, 1], 10000).into();
+        let addr = addr.into();
         let keypair = TransportKeypair::new();
         let mngr = ConnectionManager::default_with_key(keypair.public().clone());
         mngr.try_set_peer_key(addr);
@@ -1004,6 +1056,7 @@ mod tests {
                     packet_receivers: Vec::new(),
                     in_key: Aes128Gcm::new_from_slice(&[0; 16]).unwrap(),
                     packet_id: 0,
+                    my_addr: addr,
                 },
                 node: NodeMock {
                     establish_conn,
@@ -1043,11 +1096,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_inbound_conn_success() -> anyhow::Result<()> {
-        let (mut handler, mut test) = config_handler();
+        let addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
+        let (mut handler, mut test) = config_handler(addr);
+
+        let remote_addr = ([127, 0, 0, 1], 10001).into();
         let test_controller = async {
-            let addr = ([127, 0, 0, 1], 10000).into();
-            test.transport.new_conn(addr).await;
-            test.transport.establish_inbound_conn(addr).await;
+            test.transport.new_conn(remote_addr).await;
+            test.transport.establish_inbound_conn(remote_addr).await;
             Ok::<_, anyhow::Error>(())
         };
 
@@ -1056,8 +1111,7 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
             match event {
                 Event::InboundConnection(req) => {
-                    let addr: SocketAddr = ([127u8, 0, 0, 1], 10000u16).into();
-                    assert_eq!(req.conn.remote_addr(), addr);
+                    assert_eq!(req.conn.remote_addr(), remote_addr);
                     Ok(())
                 }
                 other => bail!("Unexpected event: {:?}", other),
@@ -1069,16 +1123,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_inbound_conn_rejected() -> anyhow::Result<()> {
-        let (mut handler, mut test) = config_handler();
+        let addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
+        let (mut handler, mut test) = config_handler(addr);
 
         // Configure the handler to reject connections by setting max_connections to 0
         handler.connection_manager.max_connections = 0;
         handler.connection_manager.min_connections = 0;
 
+        let remote_addr = ([127, 0, 0, 1], 10001).into();
         let test_controller = async {
-            let addr = ([127, 0, 0, 1], 10000).into();
-            test.transport.new_conn(addr).await;
-            test.transport.establish_inbound_conn(addr).await;
+            test.transport.new_conn(remote_addr).await;
+            test.transport.establish_inbound_conn(remote_addr).await;
             Ok::<_, anyhow::Error>(())
         };
 
@@ -1087,8 +1142,7 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
             match event {
                 Event::OutboundConnectionRejected { peer_id } => {
-                    let expected_addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
-                    assert_eq!(peer_id.addr, expected_addr);
+                    assert_eq!(peer_id.addr, remote_addr);
                     Ok(())
                 }
                 other => Err(anyhow!("Unexpected event: {:?}", other)),
@@ -1101,19 +1155,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_to_gw_outbound_conn() -> anyhow::Result<()> {
-        let (mut handler, mut test) = config_handler();
+        let addr = ([127, 0, 0, 1], 10000).into();
+        let (mut handler, mut test) = config_handler(addr);
 
         let joiner_key = TransportKeypair::new();
         let pub_key = joiner_key.public().clone();
         let id = Transaction::new::<ConnectMsg>();
 
-        let remote_addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
-
+        let remote_addr: SocketAddr = ([127, 0, 0, 1], 10001).into();
         let test_controller = async {
-            let addr = ([127, 0, 0, 1], 10000).into();
-            let open_connection = start_conn(&mut test, addr, pub_key.clone(), id).await;
+            let open_connection = start_conn(&mut test, remote_addr, pub_key.clone(), id).await;
             test.transport
-                .new_outbound_conn(addr, open_connection)
+                .new_outbound_conn(remote_addr, open_connection)
                 .await;
             tracing::debug!("Outbound connection established");
             let msg = test.transport.recv_outbound_msg().await?;
@@ -1128,7 +1181,7 @@ mod tests {
                     assert_eq!(id, inbound_id);
                     assert!(joiner.is_none());
                     let sender = PeerKeyLocation {
-                        peer: PeerId::new(addr, pub_key.clone()),
+                        peer: PeerId::new(remote_addr, pub_key.clone()),
                         location: Some(Location::from_address(&remote_addr)),
                     };
                     let joiner_peer_id = PeerId::new(addr, joiner_key.clone());
@@ -1149,7 +1202,7 @@ mod tests {
                 }
                 other => bail!("Unexpected message: {:?}", other),
             };
-            test.transport.inbound_msg(addr, msg).await;
+            test.transport.inbound_msg(remote_addr, msg).await;
             Ok::<_, anyhow::Error>(())
         };
 
@@ -1171,14 +1224,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_to_gw_outbound_conn_failed() -> anyhow::Result<()> {
-        let (mut handler, mut test) = config_handler();
+        let addr = ([127, 0, 0, 1], 10000).into();
+        let (mut handler, mut test) = config_handler(addr);
 
         let joiner_key = TransportKeypair::new();
         let pub_key = joiner_key.public().clone();
         let id = Transaction::new::<ConnectMsg>();
 
         let test_controller = async {
-            let addr = ([127, 0, 0, 1], 10000).into();
             let open_connection = start_conn(&mut test, addr, pub_key.clone(), id).await;
             open_connection
                 .send(Err(TransportError::ConnectionEstablishmentFailure {
@@ -1214,7 +1267,8 @@ mod tests {
     #[tokio::test]
     async fn test_peer_to_gw_outbound_conn_rejected() -> anyhow::Result<()> {
         crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG));
-        let (mut handler, mut test) = config_handler();
+        let joiner_addr = ([127, 0, 0, 1], 10001).into();
+        let (mut handler, mut test) = config_handler(joiner_addr);
 
         let gw_key = TransportKeypair::new();
         let gw_pub_key = gw_key.public().clone();
@@ -1227,7 +1281,7 @@ mod tests {
 
         let joiner_key = TransportKeypair::new();
         let joiner_pub_key = joiner_key.public().clone();
-        let joiner_peer_id = PeerId::new(([127, 0, 0, 1], 10001).into(), joiner_pub_key.clone());
+        let joiner_peer_id = PeerId::new(joiner_addr, joiner_pub_key.clone());
         let joiner_pkloc = PeerKeyLocation {
             peer: joiner_peer_id.clone(),
             location: Some(Location::from_address(&joiner_peer_id.addr)),
@@ -1270,8 +1324,9 @@ mod tests {
                 )
                 .await;
 
-            for p in 10..Ring::DEFAULT_MAX_HOPS_TO_LIVE + 10 {
-                let addr = ([127, 0, p as u8, 1], p as u16).into();
+            for i in 0..Ring::DEFAULT_MAX_HOPS_TO_LIVE {
+                let port = i + 10;
+                let addr = ([127, 0, port as u8, 1], port as u16).into();
                 let acceptor = PeerKeyLocation {
                     location: Some(Location::from_address(&addr)),
                     peer: PeerId::new(addr, TransportKeypair::new().public().clone()),
@@ -1282,7 +1337,7 @@ mod tests {
                     sender: gw_pkloc.clone(),
                     target: joiner_pkloc.clone(),
                     msg: ConnectResponse::AcceptedBy {
-                        accepted: false,
+                        accepted: i > 4,
                         acceptor,
                         joiner: joiner_peer_id.clone(),
                     },
@@ -1295,25 +1350,42 @@ mod tests {
                     .await;
             }
 
+            for _ in 0..10 {
+                let msg = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    test.transport.recv_outbound_msg(),
+                )
+                .await??;
+                tracing::info!("Received message: {:?}", msg);
+            }
+
             Ok::<_, anyhow::Error>(())
         };
 
         let peer_inbound = async {
-            loop {
+            let mut ok = 0;
+            let mut rejected = 0;
+            let mut rejected_by_gw = false;
+            while rejected + ok < 10 {
                 let event =
                     tokio::time::timeout(Duration::from_secs(60), handler.wait_for_events())
                         .await??;
                 match event {
                     // todo: check that we get new conection events for forwarded remotes
                     Event::OutboundConnectionRejected { peer_id } => {
-                        let addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
-                        assert_eq!(peer_id.addr, addr);
-                        assert_eq!(peer_id.pub_key, gw_pub_key);
-                        break Ok(());
+                        tracing::info!(%peer_id, %rejected, %ok, "Connection rejected");
+                        if peer_id.addr == gw_addr {
+                            rejected_by_gw = true;
+                        } else {
+                            rejected += 1;
+                        }
                     }
                     other => bail!("Unexpected event: {:?}", other),
                 }
             }
+            (rejected_by_gw && rejected == 5)
+                .then_some(())
+                .ok_or(anyhow::anyhow!("Failed"))
         };
         futures::try_join!(test_controller, peer_inbound)?;
         Ok(())
