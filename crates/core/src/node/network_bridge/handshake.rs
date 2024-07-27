@@ -60,6 +60,8 @@ pub(super) enum Event {
     },
     /// An outbound connection to a gateway was rejected.
     OutboundConnectionRejected { peer_id: PeerId },
+    /// An inbound connection in a gateway was rejected.
+    InboundConnectionRejected { peer_id: PeerId },
     /// An outbound connection to a gateway was successfully established. It can be managed by the connection manager.
     OutboundGatewayConnectionSuccessful {
         peer_id: PeerId,
@@ -300,7 +302,7 @@ impl HandshakeHandler {
                                         });
                                     }
                                     Ok(ForwardResult::Rejected) => {
-                                        continue;
+                                        return Ok(Event::InboundConnectionRejected { peer_id });
                                     }
                                     Err(e) => {
                                         tracing::error!(from=%remote, "Error forwarding transient connection: {e}");
@@ -432,7 +434,9 @@ impl HandshakeHandler {
                         joiner: transaction.joiner.clone(),
                     },
                 }));
+                tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), "Rejecting connection");
                 conn.send(reject_msg).await?;
+                tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), "Connection rejected");
                 Ok(ForwardResult::Rejected)
             }
             Err(_) => Err(HandshakeError::ConnectionClosed(conn.remote_addr())),
@@ -453,8 +457,6 @@ impl HandshakeHandler {
         if let Some(alive_conn) = self.outbound_messages.get_mut(&addr) {
             match &op {
                 NetMessage::V1(NetMessageV1::Connect(op)) => {
-                    // TODO: check what the exact message is to track state of the connection and what we should do with it
-
                     let tx = *op.id();
                     if self
                         .connecting
@@ -903,12 +905,13 @@ mod tests {
         async fn new_conn(&mut self, addr: SocketAddr) {
             let out_symm_key = Aes128Gcm::new_from_slice(&[0; 16]).unwrap();
             let in_symm_key = Aes128Gcm::new_from_slice(&[1; 16]).unwrap();
-            let (conn, packet_sender) =
+            let (conn, packet_sender, packet_recv) =
                 PeerConnection::new_test(addr, self.my_addr, out_symm_key, in_symm_key.clone());
             self.inbound_sender.send(conn).await.unwrap();
             tracing::debug!("New inbound connection established");
             self.packet_senders
                 .insert(addr, (in_symm_key, packet_sender));
+            self.packet_receivers.push(packet_recv);
         }
 
         async fn new_outbound_conn(
@@ -1121,14 +1124,22 @@ mod tests {
         let test_controller = async {
             test.transport.new_conn(remote_addr).await;
             test.transport.establish_inbound_conn(remote_addr).await;
+            let msg = test.transport.recv_outbound_msg().await?;
+            tracing::debug!("Received outbound message: {:?}", msg);
+            assert!(
+                matches!(msg, NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
+                msg: ConnectResponse::AcceptedBy { accepted, .. },
+                ..
+            })) if !accepted)
+            );
             Ok::<_, anyhow::Error>(())
         };
 
         let gw_inbound = async {
             let event =
-                tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
+                tokio::time::timeout(Duration::from_secs(2), handler.wait_for_events()).await??;
             match event {
-                Event::OutboundConnectionRejected { peer_id } => {
+                Event::InboundConnectionRejected { peer_id } => {
                     assert_eq!(peer_id.addr, remote_addr);
                     Ok(())
                 }

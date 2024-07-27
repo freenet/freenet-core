@@ -345,7 +345,9 @@ impl P2pConnManager {
         state: &mut EventListenerState,
     ) -> anyhow::Result<()> {
         tracing::info!(tx = %tx, remote = %peer, "Connecting to peer");
-        state.awaiting_connection.insert(peer.addr.clone(), callback);
+        state
+            .awaiting_connection
+            .insert(peer.addr.clone(), callback);
         match establish_connection.establish_conn(peer.clone(), tx).await {
             Ok(()) => {
                 tracing::debug!(tx = %tx,
@@ -364,11 +366,7 @@ impl P2pConnManager {
         state: &mut EventListenerState,
     ) -> anyhow::Result<()> {
         match event {
-            HandshakeEvent::InboundConnection(InboundJoinRequest {
-                conn,
-                joiner,
-                ..
-            }) => {
+            HandshakeEvent::InboundConnection(InboundJoinRequest { conn, joiner, .. }) => {
                 let (tx, rx) = mpsc::channel(1);
                 self.connections
                     .insert(joiner.expect("should be set at this point"), tx);
@@ -421,8 +419,11 @@ impl P2pConnManager {
             HandshakeEvent::RemoveTransaction(tx) => {
                 state.transient_conn.remove(&tx);
             }
-            HandshakeEvent::OutboundConnectionRejected { peer_id} => {
+            HandshakeEvent::OutboundConnectionRejected { peer_id } => {
                 todo!()
+            }
+            HandshakeEvent::InboundConnectionRejected { peer_id } => {
+                tracing::debug!(%peer_id, "Inbound connection rejected");
             }
         }
         Ok(())
@@ -561,7 +562,8 @@ impl P2pConnManager {
         event_id: Result<(ClientId, Transaction), anyhow::Error>,
         state: &mut EventListenerState,
     ) -> Result<EventResult, EventLoopError> {
-        let (client_id, transaction) = event_id.map_err(|err| EventLoopError::Fatal(format!("{:?}", err)))?;
+        let (client_id, transaction) =
+            event_id.map_err(|err| EventLoopError::Fatal(format!("{:?}", err)))?;
         state.tx_to_client.insert(transaction, client_id);
         Ok(EventResult::Continue) // Continue the loop
     }
