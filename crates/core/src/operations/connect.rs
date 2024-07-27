@@ -1109,6 +1109,7 @@ mod messages {
 
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum ConnectRequest {
+        /// A request to join a gateway.
         StartJoinReq {
             // The peer who is trying to join, should be set when PeerConnection is established
             joiner: Option<PeerId>,

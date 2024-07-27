@@ -98,12 +98,12 @@ impl OutboundMessage {
 }
 
 /// Use for starting a new outboound connection to a peer.
-pub(super) struct EstablishConnection(pub(crate) mpsc::Sender<(PeerId, Transaction)>);
+pub(super) struct EstablishConnection(pub(crate) mpsc::Sender<(PeerId, Transaction, bool)>);
 
 impl EstablishConnection {
-    pub async fn establish_conn(&self, remote: PeerId, tx: Transaction) -> Result<()> {
+    pub async fn establish_conn(&self, remote: PeerId, tx: Transaction, is_gw: bool) -> Result<()> {
         self.0
-            .send((remote, tx))
+            .send((remote, tx, is_gw))
             .await
             .map_err(|_| HandshakeError::ChannelClosed)?;
         Ok(())
@@ -112,7 +112,7 @@ impl EstablishConnection {
 
 type OutboundMessageSender = mpsc::Sender<NetMessage>;
 type OutboundMessageReceiver = mpsc::Receiver<(SocketAddr, NetMessage)>;
-type EstablishConnectionReceiver = mpsc::Receiver<(PeerId, Transaction)>;
+type EstablishConnectionReceiver = mpsc::Receiver<(PeerId, Transaction, bool)>;
 
 /// Manages the handshake process for establishing connections with peers.
 /// Handles both inbound and outbound connection attempts, and manages
@@ -223,8 +223,8 @@ impl HandshakeHandler {
                             return Ok(Event::OutboundGatewayConnectionSuccessful { peer_id: id, connection  });
                         }
                         Some(Ok(InternalEvent::DropInboundConnection(addr))) => {
-                            self.outbound_messages.remove(&addr);
                             self.connecting.remove(&addr);
+                            self.outbound_messages.remove(&addr);
                             continue;
                         }
                         Some(Ok(InternalEvent::InboundJoinRequest(req))) => {
@@ -251,7 +251,8 @@ impl HandshakeHandler {
                         }
                         Some(Err((peer_id, error))) => {
                             tracing::debug!(from=%peer_id.addr, "Outbound connection failed: {error}");
-                            // TODO: remove any ongoing transactions, channels, etc. for this peer
+                            self.connecting.remove(&peer_id.addr);
+                            self.outbound_messages.remove(&peer_id.addr);
                             Ok(Event::OutboundConnectionFailed { peer_id, error: error.into() })
                         }
                         None => Err(HandshakeError::ChannelClosed),
@@ -302,6 +303,8 @@ impl HandshakeHandler {
                                         });
                                     }
                                     Ok(ForwardResult::Rejected) => {
+                                        self.outbound_messages.remove(&remote);
+                                        self.connecting.remove(&remote);
                                         return Ok(Event::InboundConnectionRejected { peer_id });
                                     }
                                     Err(e) => {
@@ -337,10 +340,9 @@ impl HandshakeHandler {
                 }
                 // Handle requests to establish new connections
                 establish_connection = self.establish_connection_rx.recv() => {
-                    let Some((peer_id, tx)) = establish_connection else {
+                    let Some((peer_id, tx, is_gw)) = establish_connection else {
                         return Err(HandshakeError::ChannelClosed);
                     };
-                    let is_gw = true; // FIXME: this should come from p2p_protocol/connection op
                     self.start_outbound_connection(peer_id, tx, is_gw).await;
                 }
             }
@@ -1007,9 +1009,9 @@ mod tests {
 
     impl NodeMock {
         /// A request from node internals to establish a connection with a peer.
-        async fn establish_conn(&self, remote: PeerId, tx: Transaction) {
+        async fn establish_conn(&self, remote: PeerId, tx: Transaction, is_gw: bool) {
             self.establish_conn
-                .establish_conn(remote, tx)
+                .establish_conn(remote, tx, is_gw)
                 .await
                 .unwrap();
         }
@@ -1061,9 +1063,10 @@ mod tests {
         addr: SocketAddr,
         pub_key: TransportPublicKey,
         id: Transaction,
+        is_gw: bool,
     ) -> oneshot::Sender<Result<RemoteConnection, TransportError>> {
         test.node
-            .establish_conn(PeerId::new(addr, pub_key.clone()), id)
+            .establish_conn(PeerId::new(addr, pub_key.clone()), id, is_gw)
             .await;
         let (
             trying_addr,
@@ -1162,7 +1165,8 @@ mod tests {
 
         let remote_addr: SocketAddr = ([127, 0, 0, 1], 10001).into();
         let test_controller = async {
-            let open_connection = start_conn(&mut test, remote_addr, pub_key.clone(), id).await;
+            let open_connection =
+                start_conn(&mut test, remote_addr, pub_key.clone(), id, true).await;
             test.transport
                 .new_outbound_conn(remote_addr, open_connection)
                 .await;
@@ -1230,7 +1234,7 @@ mod tests {
         let id = Transaction::new::<ConnectMsg>();
 
         let test_controller = async {
-            let open_connection = start_conn(&mut test, addr, pub_key.clone(), id).await;
+            let open_connection = start_conn(&mut test, addr, pub_key.clone(), id, true).await;
             open_connection
                 .send(Err(TransportError::ConnectionEstablishmentFailure {
                     cause: "Connection refused".into(),
@@ -1288,7 +1292,8 @@ mod tests {
         let tx = Transaction::new::<ConnectMsg>();
 
         let test_controller = async {
-            let open_connection = start_conn(&mut test, gw_addr, gw_pub_key.clone(), tx).await;
+            let open_connection =
+                start_conn(&mut test, gw_addr, gw_pub_key.clone(), tx, true).await;
             test.transport
                 .new_outbound_conn(gw_addr, open_connection)
                 .await;
@@ -1404,5 +1409,15 @@ mod tests {
         };
         futures::try_join!(test_controller, peer_inbound)?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_peer_to_peer_outbound_conn_failed() -> anyhow::Result<()> {
+        todo!()
+    }
+
+    #[tokio::test]
+    async fn test_peer_to_peer_outbound_conn_succeeded() -> anyhow::Result<()> {
+        todo!()
     }
 }

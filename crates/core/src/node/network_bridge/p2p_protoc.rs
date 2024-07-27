@@ -5,11 +5,9 @@ use either::{Either, Left, Right};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
-use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
 use std::{
     collections::{HashMap, HashSet},
-    fmt::{Display, Formatter, Result as FmtResult},
     sync::Arc,
 };
 use tokio::net::UdpSocket;
@@ -178,11 +176,10 @@ impl P2pConnManager {
                     &mut client_wait_for_transaction,
                     &mut executor_listener,
                 )
-                .await?;
+                .await;
 
             match event {
                 EventResult::Continue => continue,
-                EventResult::Exit => break,
                 EventResult::Event(event) => match event {
                     ConnEvent::InboundMessage(msg) => {
                         self.handle_inbound_message(
@@ -195,31 +192,57 @@ impl P2pConnManager {
                         )
                         .await?;
                     }
-                    ConnEvent::EstablishConnection { peer, callback, tx } => {
+                    ConnEvent::EstablishConnection {
+                        peer,
+                        callback,
+                        tx,
+                        is_gateway,
+                    } => {
                         self.handle_connect_peer(
                             peer,
                             callback,
                             tx,
                             &establish_connection,
                             &mut state,
+                            is_gateway,
                         )
                         .await?;
                     }
                     ConnEvent::HandshakeAction(action) => {
                         self.handle_handshake_action(action, &mut state).await?;
                     }
-                    ConnEvent::Disconnect(cause) => {
-                        self.handle_disconnect(cause);
-                        return Ok(());
-                    }
-                    ConnEvent::DropConnection(peer_id) => {
-                        self.handle_drop_connection(peer_id, &op_manager).await;
-                    }
                     ConnEvent::ClosedChannel => {
                         tracing::info!("Notification channel closed");
                         break;
                     }
-                    _ => {}
+                    ConnEvent::NodeAction(action) => match action {
+                        NodeEvent::DropConnection(peer) => {
+                            if let Some(conn) = self.connections.remove(&peer) {
+                                let _ = conn.send(Right(ConnEvent::NodeAction(
+                                    NodeEvent::DropConnection(peer),
+                                )));
+                            }
+                        }
+                        NodeEvent::ConnectPeer { peer, tx, callback } => {
+                            // self.handle_connect_peer(
+                            //     peer,
+                            //     callback,
+                            //     tx,
+                            //     &establish_connection,
+                            //     &mut state,
+                            //     false,
+                            // )
+                            // .await?;
+                            todo!()
+                        }
+                        NodeEvent::Disconnect { cause } => {
+                            tracing::info!(
+                                "Disconnecting from network{}",
+                                cause.map(|c| format!(": {}", c)).unwrap_or_default()
+                            );
+                            break;
+                        }
+                    },
                 },
             }
         }
@@ -234,7 +257,7 @@ impl P2pConnManager {
         node_controller: &mut Receiver<NodeEvent>,
         client_wait_for_transaction: &mut ContractHandlerChannel<WaitingResolution>,
         executor_listener: &mut ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
-    ) -> Result<EventResult, EventLoopError> {
+    ) -> EventResult {
         select! {
             msg = state.peer_connections.next(), if !state.peer_connections.is_empty() => {
                 self.handle_peer_connection_msg(msg, state).await
@@ -343,12 +366,16 @@ impl P2pConnManager {
         tx: Transaction,
         establish_connection: &EstablishConnection,
         state: &mut EventListenerState,
+        is_gw: bool,
     ) -> anyhow::Result<()> {
         tracing::info!(tx = %tx, remote = %peer, "Connecting to peer");
         state
             .awaiting_connection
             .insert(peer.addr.clone(), callback);
-        match establish_connection.establish_conn(peer.clone(), tx).await {
+        match establish_connection
+            .establish_conn(peer.clone(), tx, is_gw)
+            .await
+        {
             Ok(()) => {
                 tracing::debug!(tx = %tx,
                     "Successfully initiated connection process for peer: {:?}",
@@ -447,30 +474,16 @@ impl P2pConnManager {
         Ok(())
     }
 
-    fn handle_disconnect(&self, cause: Option<Cow<'static, str>>) {
-        match cause {
-            Some(cause) => tracing::warn!("Shutting down node: {cause}"),
-            None => tracing::warn!("Shutting down node"),
-        }
-    }
-
-    async fn handle_drop_connection(&mut self, peer_id: PeerId, op_manager: &Arc<OpManager>) {
-        tracing::info!(remote = %peer_id, this_peer = ?op_manager.ring.connection_manager.get_peer_key().unwrap(), "Dropping connection");
-        op_manager.ring.prune_connection(peer_id.clone()).await;
-        self.connections.remove(&peer_id);
-        tracing::info!("Dropped connection with peer {}", peer_id);
-    }
-
     async fn handle_peer_connection_msg(
         &mut self,
         msg: Option<Result<PeerConnectionInbound, TransportError>>,
         state: &mut EventListenerState,
-    ) -> Result<EventResult, EventLoopError> {
+    ) -> EventResult {
         match msg {
             Some(Ok(peer_conn)) => {
                 let task = peer_connection_listener(peer_conn.rx, peer_conn.conn).boxed();
                 state.peer_connections.push(task);
-                Ok(EventResult::Event(ConnEvent::InboundMessage(peer_conn.msg)))
+                EventResult::Event(ConnEvent::InboundMessage(peer_conn.msg))
             }
             Some(Err(err)) => {
                 if let TransportError::ConnectionClosed(socket_addr) = err {
@@ -487,11 +500,11 @@ impl P2pConnManager {
                         self.connections.remove(&peer);
                     }
                 }
-                Ok(EventResult::Continue)
+                EventResult::Continue
             }
             None => {
                 tracing::error!("All peer connections closed");
-                Ok(EventResult::Continue)
+                EventResult::Continue
             }
         }
     }
@@ -499,18 +512,15 @@ impl P2pConnManager {
     async fn handle_notification_msg(
         &self,
         msg: Option<Either<NetMessage, NodeEvent>>,
-    ) -> Result<EventResult, EventLoopError> {
+    ) -> EventResult {
         match msg {
-            Some(Left(msg)) => Ok(EventResult::Event(ConnEvent::InboundMessage(msg))),
-            Some(Right(action)) => Ok(EventResult::Event(ConnEvent::NodeAction(action))),
-            None => Ok(EventResult::Continue),
+            Some(Left(msg)) => EventResult::Event(ConnEvent::InboundMessage(msg)),
+            Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action)),
+            None => EventResult::Continue,
         }
     }
 
-    async fn handle_bridge_msg(
-        &self,
-        msg: Option<P2pBridgeEvent>,
-    ) -> Result<EventResult, EventLoopError> {
+    async fn handle_bridge_msg(&self, msg: Option<P2pBridgeEvent>) -> EventResult {
         match msg {
             Some(Left((peer, msg))) => {
                 if let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
@@ -520,40 +530,35 @@ impl P2pConnManager {
                 {
                     if self.connections.contains_key(&peer) {
                         tracing::warn!("Connection already exists with gateway {}", peer.addr);
-                        return Ok(EventResult::Continue);
+                        return EventResult::Continue;
                     }
-                    Ok(EventResult::Event(ConnEvent::EstablishConnection {
+                    EventResult::Event(ConnEvent::EstablishConnection {
                         peer,
                         callback: oneshot::channel().0,
                         tx: id,
-                    }))
+                        is_gateway: true,
+                    })
                 } else {
-                    Ok(EventResult::Event(ConnEvent::InboundMessage(*msg)))
+                    EventResult::Event(ConnEvent::InboundMessage(*msg))
                 }
             }
-            Some(Right(action)) => Ok(EventResult::Event(ConnEvent::NodeAction(action))),
-            None => Ok(EventResult::Event(ConnEvent::ClosedChannel)),
+            Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action)),
+            None => EventResult::Event(ConnEvent::ClosedChannel),
         }
     }
 
-    fn handle_handshake_msg(
-        &self,
-        msg: Result<HandshakeEvent, HandshakeError>,
-    ) -> Result<EventResult, EventLoopError> {
+    fn handle_handshake_msg(&self, msg: Result<HandshakeEvent, HandshakeError>) -> EventResult {
         match msg {
-            Ok(event) => Ok(EventResult::Event(ConnEvent::HandshakeAction(event))),
-            Err(HandshakeError::ChannelClosed) => Ok(EventResult::Event(ConnEvent::ClosedChannel)),
-            _ => Ok(EventResult::Continue),
+            Ok(event) => EventResult::Event(ConnEvent::HandshakeAction(event)),
+            Err(HandshakeError::ChannelClosed) => EventResult::Event(ConnEvent::ClosedChannel),
+            _ => EventResult::Continue,
         }
     }
 
-    fn handle_node_controller_msg(
-        &self,
-        msg: Option<NodeEvent>,
-    ) -> Result<EventResult, EventLoopError> {
+    fn handle_node_controller_msg(&self, msg: Option<NodeEvent>) -> EventResult {
         match msg {
-            Some(msg) => Ok(EventResult::Event(ConnEvent::NodeAction(msg))),
-            None => Ok(EventResult::Event(ConnEvent::ClosedChannel)),
+            Some(msg) => EventResult::Event(ConnEvent::NodeAction(msg)),
+            None => EventResult::Event(ConnEvent::ClosedChannel),
         }
     }
 
@@ -561,21 +566,28 @@ impl P2pConnManager {
         &self,
         event_id: Result<(ClientId, Transaction), anyhow::Error>,
         state: &mut EventListenerState,
-    ) -> Result<EventResult, EventLoopError> {
-        let (client_id, transaction) =
-            event_id.map_err(|err| EventLoopError::Fatal(format!("{:?}", err)))?;
+    ) -> EventResult {
+        let Ok((client_id, transaction)) = event_id.map_err(|e| {
+            tracing::debug!("Error while receiving client transaction result: {:?}", e);
+        }) else {
+            return EventResult::Continue;
+        };
         state.tx_to_client.insert(transaction, client_id);
-        Ok(EventResult::Continue) // Continue the loop
+        EventResult::Continue
     }
 
     fn handle_executor_transaction(
         &self,
         id: Result<Transaction, anyhow::Error>,
         state: &mut EventListenerState,
-    ) -> Result<EventResult, EventLoopError> {
-        let id = id.map_err(|err| EventLoopError::Fatal(format!("{:?}", err)))?;
+    ) -> EventResult {
+        let Ok(id) = id.map_err(|err| {
+            tracing::error!("Error while receiving transaction from executor: {:?}", err);
+        }) else {
+            return EventResult::Continue;
+        };
         state.pending_from_executor.insert(id);
-        Ok(EventResult::Continue) // Continue the loop
+        EventResult::Continue
     }
 }
 
@@ -602,28 +614,8 @@ impl EventListenerState {
 
 enum EventResult {
     Continue,
-    Exit,
     Event(ConnEvent),
 }
-
-#[derive(Debug)]
-enum EventLoopError {
-    Handshake(HandshakeError),
-    Connection(ConnectionError),
-    Fatal(String),
-}
-
-impl Display for EventLoopError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        match self {
-            EventLoopError::Handshake(e) => write!(f, "Handshake error: {}", e),
-            EventLoopError::Connection(e) => write!(f, "Connection error: {}", e),
-            EventLoopError::Fatal(msg) => write!(f, "Fatal error: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for EventLoopError {}
 
 #[derive(Debug)]
 enum ConnEvent {
@@ -632,11 +624,10 @@ enum ConnEvent {
         peer: PeerId,
         callback: oneshot::Sender<Result<(), HandshakeError>>,
         tx: Transaction,
+        is_gateway: bool,
     },
     HandshakeAction(HandshakeEvent),
     NodeAction(NodeEvent),
-    Disconnect(Option<Cow<'static, str>>),
-    DropConnection(PeerId),
     ClosedChannel,
 }
 
