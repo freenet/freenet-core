@@ -78,7 +78,7 @@ pub(super) enum Event {
 
 enum ForwardResult {
     Forward(PeerId, NetMessage, ConnectivityInfo),
-    Reject(NetMessage),
+    Rejected,
 }
 
 /// Use for sending messages to a peer which has not yet been confirmed at a logical level
@@ -299,10 +299,8 @@ impl HandshakeHandler {
                                             msg,
                                         });
                                     }
-                                    Ok(ForwardResult::Reject(reject_msg)) => {
-                                        return Ok(Event::OutboundConnectionRejected {
-                                            peer_id: tx.joiner,
-                                        });
+                                    Ok(ForwardResult::Rejected) => {
+                                        continue;
                                     }
                                     Err(e) => {
                                         tracing::error!(from=%remote, "Error forwarding transient connection: {e}");
@@ -423,7 +421,7 @@ impl HandshakeHandler {
                 Ok(ForwardResult::Forward(forward_target, msg, info))
             }
             Ok(None) => {
-                // No hay peer disponible para reenviar, preparamos un mensaje de rechazo
+                // No peer to forward to, reject the connection
                 let reject_msg = NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
                     id: transaction.tx,
                     sender: my_peer_id.clone(),
@@ -434,7 +432,8 @@ impl HandshakeHandler {
                         joiner: transaction.joiner.clone(),
                     },
                 }));
-                Ok(ForwardResult::Reject(reject_msg))
+                conn.send(reject_msg).await?;
+                Ok(ForwardResult::Rejected)
             }
             Err(_) => Err(HandshakeError::ConnectionClosed(conn.remote_addr())),
         }
