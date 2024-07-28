@@ -343,6 +343,7 @@ impl Operation for ConnectOp {
                                 peer: joiner.peer.clone(),
                                 tx: *id,
                                 callback,
+                                is_gw: false,
                             })
                             .await?;
                         if result
@@ -864,35 +865,51 @@ where
         "Connecting to gateway",
     );
 
-    let join_req = NetMessage::from(messages::ConnectMsg::Request {
-        id: tx,
-        msg: ConnectRequest::StartJoinReq {
-            joiner: None,
-            joiner_key: peer_pub_key.clone(),
-            hops_to_live: max_hops_to_live,
-            max_hops_to_live,
-            skip_list: vec![],
-        },
-    });
-    conn_bridge.send(&gateway.peer, join_req).await?;
+    let (callback, mut result) = tokio::sync::mpsc::channel(1);
     op_manager
-        .push(
+        .notify_node_event(NodeEvent::ConnectPeer {
+            peer: gateway.peer.clone(),
             tx,
-            OpEnum::Connect(Box::new(ConnectOp {
-                id,
-                state: Some(ConnectState::ConnectingToNode(ConnectionInfo {
-                    gateway: gateway.clone(),
-                    peer_pub_key,
-                    max_hops_to_live,
-                    accepted_by: HashSet::new(),
-                    remaining_connetions: max_hops_to_live,
-                })),
-                gateway: Some(Box::new(gateway)),
-                backoff,
-            })),
-        )
+            callback,
+            is_gw: true,
+        })
         .await?;
-    Ok(())
+    match result.recv().await.ok_or(OpError::NotificationError)? {
+        Ok(_) => {
+            let join_req = NetMessage::from(messages::ConnectMsg::Request {
+                id: tx,
+                msg: ConnectRequest::StartJoinReq {
+                    joiner: None,
+                    joiner_key: peer_pub_key.clone(),
+                    hops_to_live: max_hops_to_live,
+                    max_hops_to_live,
+                    skip_list: vec![],
+                },
+            });
+            conn_bridge.send(&gateway.peer, join_req).await?;
+            op_manager
+                .push(
+                    tx,
+                    OpEnum::Connect(Box::new(ConnectOp {
+                        id,
+                        state: Some(ConnectState::ConnectingToNode(ConnectionInfo {
+                            gateway: gateway.clone(),
+                            peer_pub_key,
+                            max_hops_to_live,
+                            accepted_by: HashSet::new(),
+                            remaining_connetions: max_hops_to_live,
+                        })),
+                        gateway: Some(Box::new(gateway)),
+                        backoff,
+                    })),
+                )
+                .await?;
+            Ok(())
+        }
+        Err(_) => Err(OpError::ConnError(
+            crate::node::ConnectionError::FailedConnectOp,
+        )),
+    }
 }
 
 pub(crate) async fn forward_conn<NB>(

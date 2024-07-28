@@ -5,7 +5,9 @@ use either::{Either, Left, Right};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -21,7 +23,6 @@ use crate::node::network_bridge::handshake::{
     InboundJoinRequest, OutboundMessage,
 };
 use crate::node::PeerId;
-use crate::operations::connect::{ConnectMsg, ConnectRequest};
 use crate::transport::{
     create_connection_handler, PeerConnection, TransportError, TransportKeypair,
 };
@@ -192,22 +193,6 @@ impl P2pConnManager {
                         )
                         .await?;
                     }
-                    ConnEvent::EstablishConnection {
-                        peer,
-                        callback,
-                        tx,
-                        is_gateway,
-                    } => {
-                        self.handle_connect_peer(
-                            peer,
-                            callback,
-                            tx,
-                            &establish_connection,
-                            &mut state,
-                            is_gateway,
-                        )
-                        .await?;
-                    }
                     ConnEvent::HandshakeAction(action) => {
                         self.handle_handshake_action(action, &mut state).await?;
                     }
@@ -223,17 +208,21 @@ impl P2pConnManager {
                                 )));
                             }
                         }
-                        NodeEvent::ConnectPeer { peer, tx, callback } => {
-                            // self.handle_connect_peer(
-                            //     peer,
-                            //     callback,
-                            //     tx,
-                            //     &establish_connection,
-                            //     &mut state,
-                            //     false,
-                            // )
-                            // .await?;
-                            todo!()
+                        NodeEvent::ConnectPeer {
+                            peer,
+                            tx,
+                            callback,
+                            is_gw,
+                        } => {
+                            self.handle_connect_peer(
+                                peer,
+                                Box::new(callback),
+                                tx,
+                                &establish_connection,
+                                &mut state,
+                                is_gw,
+                            )
+                            .await?;
                         }
                         NodeEvent::Disconnect { cause } => {
                             tracing::info!(
@@ -362,7 +351,7 @@ impl P2pConnManager {
     async fn handle_connect_peer(
         &mut self,
         peer: PeerId,
-        callback: oneshot::Sender<Result<(), HandshakeError>>,
+        callback: Box<dyn ConnectResultSender>,
         tx: Transaction,
         establish_connection: &EstablishConnection,
         state: &mut EventListenerState,
@@ -441,13 +430,18 @@ impl P2pConnManager {
             }
             HandshakeEvent::OutboundConnectionFailed { peer_id, error } => {
                 tracing::info!(%peer_id, "Connection failed: {:?}", error);
-                state.awaiting_connection.remove(&peer_id.addr);
+                if let Some(mut r) = state.awaiting_connection.remove(&peer_id.addr) {
+                    r.send_result(Err(error)).await?;
+                }
             }
             HandshakeEvent::RemoveTransaction(tx) => {
                 state.transient_conn.remove(&tx);
             }
-            HandshakeEvent::OutboundConnectionRejected { peer_id } => {
-                todo!()
+            HandshakeEvent::OutboundGatewayConnectionRejected { peer_id } => {
+                tracing::info!(%peer_id, "Connection rejected by peer");
+                if let Some(mut r) = state.awaiting_connection.remove(&peer_id.addr) {
+                    r.send_result(Err(HandshakeError::ChannelClosed)).await?;
+                }
             }
             HandshakeEvent::InboundConnectionRejected { peer_id } => {
                 tracing::debug!(%peer_id, "Inbound connection rejected");
@@ -462,8 +456,8 @@ impl P2pConnManager {
         connection: PeerConnection,
         state: &mut EventListenerState,
     ) -> anyhow::Result<()> {
-        if let Some(cb) = state.awaiting_connection.remove(&peer_id.addr) {
-            let _ = cb.send(Ok(()));
+        if let Some(mut cb) = state.awaiting_connection.remove(&peer_id.addr) {
+            let _ = cb.send_result(Ok(())).await;
         } else {
             tracing::warn!(%peer_id, "No callback for connection established");
         }
@@ -514,7 +508,7 @@ impl P2pConnManager {
         msg: Option<Either<NetMessage, NodeEvent>>,
     ) -> EventResult {
         match msg {
-            Some(Left(msg)) => EventResult::Event(ConnEvent::InboundMessage(msg)),
+            Some(Left(msg)) => EventResult::Event(ConnEvent::InboundMessage(msg)), // FIXME: this is not inbound, is outbound
             Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action)),
             None => EventResult::Continue,
         }
@@ -522,26 +516,7 @@ impl P2pConnManager {
 
     async fn handle_bridge_msg(&self, msg: Option<P2pBridgeEvent>) -> EventResult {
         match msg {
-            Some(Left((peer, msg))) => {
-                if let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
-                    id,
-                    msg: ConnectRequest::StartJoinReq { .. },
-                })) = *msg
-                {
-                    if self.connections.contains_key(&peer) {
-                        tracing::warn!("Connection already exists with gateway {}", peer.addr);
-                        return EventResult::Continue;
-                    }
-                    EventResult::Event(ConnEvent::EstablishConnection {
-                        peer,
-                        callback: oneshot::channel().0,
-                        tx: id,
-                        is_gateway: true,
-                    })
-                } else {
-                    EventResult::Event(ConnEvent::InboundMessage(*msg))
-                }
-            }
+            Some(Left((_, msg))) => EventResult::Event(ConnEvent::InboundMessage(*msg)),
             Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action)),
             None => EventResult::Event(ConnEvent::ClosedChannel),
         }
@@ -591,13 +566,47 @@ impl P2pConnManager {
     }
 }
 
+trait ConnectResultSender {
+    fn send_result(
+        &mut self,
+        result: Result<(), HandshakeError>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), HandshakeError>> + Send + '_>>;
+}
+
+impl ConnectResultSender for Option<oneshot::Sender<Result<(), HandshakeError>>> {
+    fn send_result(
+        &mut self,
+        result: Result<(), HandshakeError>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), HandshakeError>> + Send + '_>> {
+        async move {
+            let _ = self.take().expect("always set").send(result);
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+impl ConnectResultSender for mpsc::Sender<Result<(), ()>> {
+    fn send_result(
+        &mut self,
+        result: Result<(), HandshakeError>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), HandshakeError>> + Send + '_>> {
+        async move {
+            self.send(result.map_err(|_| ()))
+                .await
+                .map_err(|_| HandshakeError::ChannelClosed)
+        }
+        .boxed()
+    }
+}
+
 struct EventListenerState {
     peer_connections:
         FuturesUnordered<BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>>,
     pending_from_executor: HashSet<Transaction>,
     tx_to_client: HashMap<Transaction, ClientId>,
     transient_conn: HashMap<Transaction, SocketAddr>,
-    awaiting_connection: HashMap<SocketAddr, oneshot::Sender<Result<(), HandshakeError>>>,
+    awaiting_connection: HashMap<SocketAddr, Box<dyn ConnectResultSender>>,
 }
 
 impl EventListenerState {
@@ -620,12 +629,6 @@ enum EventResult {
 #[derive(Debug)]
 enum ConnEvent {
     InboundMessage(NetMessage),
-    EstablishConnection {
-        peer: PeerId,
-        callback: oneshot::Sender<Result<(), HandshakeError>>,
-        tx: Transaction,
-        is_gateway: bool,
-    },
     HandshakeAction(HandshakeEvent),
     NodeAction(NodeEvent),
     ClosedChannel,

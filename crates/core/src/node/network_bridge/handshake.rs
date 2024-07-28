@@ -59,7 +59,7 @@ pub(super) enum Event {
         error: HandshakeError,
     },
     /// An outbound connection to a gateway was rejected.
-    OutboundConnectionRejected { peer_id: PeerId },
+    OutboundGatewayConnectionRejected { peer_id: PeerId },
     /// An inbound connection in a gateway was rejected.
     InboundConnectionRejected { peer_id: PeerId },
     /// An outbound connection to a gateway was successfully established. It can be managed by the connection manager.
@@ -234,7 +234,7 @@ impl HandshakeHandler {
                             tracing::debug!(from=%peer_id.addr, "Outbound connection to gw rejected");
                             self.connected.insert(peer_id.addr);
                             self.connecting.remove(&peer_id.addr);
-                            return Ok(Event::OutboundConnectionRejected { peer_id });
+                            return Ok(Event::OutboundGatewayConnectionRejected { peer_id });
                         }
                         Some(Ok(InternalEvent::RemoteConnectionAttempt { remote, gw_conn, remaining_checks, gw_peer_id, tx })) => {
                             tracing::debug!(at=?gw_conn.my_address(), gw=%gw_conn.remote_addr(), "Attempting remote connection to {remote}");
@@ -246,7 +246,7 @@ impl HandshakeHandler {
                                 continue;
                             } else {
                                 tracing::debug!(at=?gw_conn.my_address(), gw=%gw_conn.remote_addr(), "No more checks left, dropping connection");
-                                Ok(Event::OutboundConnectionRejected { peer_id: gw_peer_id })
+                                Ok(Event::OutboundGatewayConnectionRejected { peer_id: gw_peer_id })
                             }
                         }
                         Some(Err((peer_id, error))) => {
@@ -1390,7 +1390,7 @@ mod tests {
                 let event = tokio::time::timeout(Duration::from_secs(5), handler.wait_for_events())
                     .await??;
                 match event {
-                    Event::OutboundConnectionRejected { peer_id } => {
+                    Event::OutboundGatewayConnectionRejected { peer_id } => {
                         tracing::info!(%peer_id, "Connection rejected");
                     }
                     Event::OutboundConnectionSuccessful {
