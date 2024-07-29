@@ -51,7 +51,7 @@ serde = { features = ["derive", "rc"], workspace = true }
 serde_json = { workspace = true }
 toml = "0.8"
 serde_with = { workspace = true }
-sqlx = { features = ["runtime-tokio-rustls", "sqlite"], optional = true, version = "0.7" }
+sqlx = { features = ["runtime-tokio-rustls", "sqlite"], optional = true, version = "0.8" }
 stretto = { features = ["async", "sync"], version = "0.8" }
 tar = { version = "0.4" }
 time = "0.3"
