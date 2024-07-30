@@ -1412,9 +1412,140 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_peer_to_peer_outbound_conn_failed() -> anyhow::Result<()> {
-        todo!()
+    async fn test_peer_to_gw_outbound_conn_forwarded() -> anyhow::Result<()> {
+        let joiner_addr = ([127, 0, 0, 1], 10001).into();
+        let (mut handler, mut test) = config_handler(joiner_addr);
+
+        let gw_key = TransportKeypair::new();
+        let gw_pub_key = gw_key.public().clone();
+        let gw_addr = ([127, 0, 0, 1], 10000).into();
+        let gw_peer_id = PeerId::new(gw_addr, gw_pub_key.clone());
+        let gw_pkloc = PeerKeyLocation {
+            location: Some(Location::from_address(&gw_peer_id.addr)),
+            peer: gw_peer_id.clone(),
+        };
+
+        let joiner_key = TransportKeypair::new();
+        let joiner_pub_key = joiner_key.public().clone();
+        let joiner_peer_id = PeerId::new(joiner_addr, joiner_pub_key.clone());
+        let joiner_pkloc = PeerKeyLocation {
+            peer: joiner_peer_id.clone(),
+            location: Some(Location::from_address(&joiner_peer_id.addr)),
+        };
+
+        let peer_key = TransportKeypair::new();
+        let peer_pub_key = peer_key.public().clone();
+        let peer_addr = ([127, 0, 0, 2], 10002).into();
+        let peer_peer_id = PeerId::new(peer_addr, peer_pub_key.clone());
+        let peer_pkloc = PeerKeyLocation {
+            peer: peer_peer_id.clone(),
+            location: Some(Location::from_address(&peer_peer_id.addr)),
+        };
+
+        handler.connection_manager.max_connections = 1;
+        handler.connection_manager.min_connections = 1;
+
+        let tx = Transaction::new::<ConnectMsg>();
+
+        let test_controller = async {
+            let open_connection_peer = start_conn(&mut test, peer_addr, peer_pub_key.clone(), tx, false).await;
+            test.transport
+                .new_outbound_conn(peer_addr, open_connection_peer)
+                .await;
+            
+            test.transport.new_conn(joiner_addr).await;
+            test.transport.establish_inbound_conn(joiner_addr).await;
+
+            Ok::<_, anyhow::Error>(())
+        };
+
+        let peer_inbound = async {
+            let mut received_outbound_successful = false;
+            let mut received_forward_transaction = false;
+
+            while !received_outbound_successful || !received_forward_transaction {
+                let event = tokio::time::timeout(Duration::from_secs(5), handler.wait_for_events()).await??;
+
+                match event {
+                    Event::OutboundConnectionSuccessful { peer_id, connection } => {
+                        assert_eq!(peer_id.addr, peer_addr);
+                        tracing::info!("Outbound connection to peer successful: {:?}", peer_id);
+                        received_outbound_successful = true;
+                    }
+                    Event::TransientForwardTransaction { target, tx, forward_to, msg } => {
+                        assert_eq!(target, peer_addr);
+                        assert_eq!(tx, tx);
+                        assert_eq!(forward_to, peer_peer_id);
+                        if let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
+                                                                        msg: ConnectRequest::CheckConnectivity { sender, joiner, .. },
+                                                                        ..
+                                                                    })) = msg
+                        {
+                            assert_eq!(sender.peer, gw_peer_id);
+                            assert_eq!(joiner.peer, joiner_peer_id);
+                        } else {
+                            panic!("Unexpected message type");
+                        }
+                        received_forward_transaction = true;
+                    }
+                    Event::InboundConnection(req) => {
+                        tracing::info!("Inbound connection request received: {:?}", req);
+                    }
+                    other => bail!("Unexpected event: {:?}", other),
+                }
+            }
+
+            Ok(())
+        };
+
+        futures::try_join!(test_controller, peer_inbound)?;
+        Ok(())
     }
+
+    #[tokio::test]
+    async fn test_peer_to_peer_outbound_conn_failed() -> anyhow::Result<()> {
+        let addr: SocketAddr = ([127, 0, 0, 1], 10001).into();
+        let (mut handler, mut test) = config_handler(addr);
+
+        let peer_key = TransportKeypair::new();
+        let peer_pub_key = peer_key.public().clone();
+        let peer_addr = ([127, 0, 0, 2], 10002).into();
+        let peer_peer_id = PeerId::new(peer_addr, peer_pub_key.clone());
+
+        let tx = Transaction::new::<ConnectMsg>();
+
+        let test_controller = async {
+            let open_connection = start_conn(&mut test, peer_addr, peer_pub_key.clone(), tx, false).await;
+            open_connection
+                .send(Err(TransportError::ConnectionEstablishmentFailure {
+                    cause: "Connection refused".into(),
+                }))
+                .map_err(|_| anyhow!("Failed to send connection"))?;
+            Ok::<_, anyhow::Error>(())
+        };
+
+        let peer_inbound = async {
+            let event = tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
+            match event {
+                Event::OutboundConnectionFailed { peer_id, error } => {
+                    assert_eq!(peer_id.addr, peer_addr);
+                    assert_eq!(peer_id.pub_key, peer_pub_key);
+                    assert!(matches!(
+                    error,
+                    HandshakeError::TransportError(
+                        TransportError::ConnectionEstablishmentFailure { .. }
+                    )
+                ));
+                    Ok(())
+                }
+                other => bail!("Unexpected event: {:?}", other),
+            }
+        };
+
+        futures::try_join!(test_controller, peer_inbound)?;
+        Ok(())
+    }
+
 
     #[tokio::test]
     async fn test_peer_to_peer_outbound_conn_succeeded() -> anyhow::Result<()> {
