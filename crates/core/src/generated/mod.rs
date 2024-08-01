@@ -35,6 +35,7 @@ impl ContractChange<'_> {
         contract: String,
         requester: String,
         target: String,
+        timestamp: u64,
     ) -> Vec<u8> {
         let mut buf = flatbuffers::FlatBufferBuilder::new();
         let transaction = buf.create_string(transaction.as_str());
@@ -48,6 +49,7 @@ impl ContractChange<'_> {
                 key: Some(contract),
                 requester: Some(requester),
                 target: Some(target),
+                timestamp,
             },
         );
         let msg = topology::ContractChange::create(
@@ -67,6 +69,7 @@ impl ContractChange<'_> {
         contract: String,
         requester: String,
         target: String,
+        timestamp: u64,
     ) -> Vec<u8> {
         let mut buf = flatbuffers::FlatBufferBuilder::new();
         let transaction = buf.create_string(transaction.as_str());
@@ -80,6 +83,7 @@ impl ContractChange<'_> {
                 key: Some(contract),
                 requester: Some(requester),
                 target: Some(target),
+                timestamp,
             },
         );
         let msg = topology::ContractChange::create(
@@ -99,6 +103,7 @@ impl ContractChange<'_> {
         contract: impl AsRef<str>,
         requester: impl AsRef<str>,
         target: impl AsRef<str>,
+        timestamp: u64,
     ) -> Vec<u8> {
         let mut buf = flatbuffers::FlatBufferBuilder::new();
         let transaction = buf.create_string(transaction.as_ref());

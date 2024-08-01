@@ -112,6 +112,7 @@ async fn push_stats(
 async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Result<()> {
     let (mut tx, mut rx) = ws.split();
     while let Some(msg) = rx.next().await {
+        let received_random_id = rand::random::<u64>();
         match msg {
             Ok(msg) => {
                 let msg = match msg {
@@ -124,6 +125,27 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     }
                     _ => continue,
                 };
+
+                let mut decoding_errors = String::new(); // TODO: change this to Vec<String>
+
+                match ContractChange::try_decode_fbs(&msg) {
+                    Ok(ContractChange::PutFailure(err)) => todo!(),
+                    Ok(change) => {
+                        if let Err(err) = state.save_record(ChangesWrapper::ContractChange(change))
+                        {
+                            tracing::error!(error = %err, "Failed saving report");
+                            tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
+                                format!("{err}"),
+                            ))))
+                            .await?;
+                        }
+                        continue;
+                    }
+                    Err(decoding_error) => {
+                        tracing::error!(%received_random_id, error = %decoding_error, "Failed to decode message from 1st ContractChange");
+                    }
+                }
+
                 match PeerChange::try_decode_fbs(&msg) {
                     Ok(PeerChange::Error(err)) => {
                         tracing::error!(error = %err.message(), "Received error from peer");
@@ -137,35 +159,20 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                             ))))
                             .await?;
                         }
+                        continue;
                     }
                     Err(decoding_error) => {
                         tracing::error!(error = %decoding_error, "Failed to decode message");
-                        tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
-                            format!("{decoding_error}"),
-                        ))))
-                        .await?;
+                        decoding_errors.push_str(", ");
+                        decoding_errors.push_str(&decoding_error.to_string());
                     }
                 }
-                match ContractChange::try_decode_fbs(&msg) {
-                    Ok(ContractChange::PutFailure(err)) => todo!(),
-                    Ok(change) => {
-                        if let Err(err) = state.save_record(ChangesWrapper::ContractChange(change))
-                        {
-                            tracing::error!(error = %err, "Failed saving report");
-                            tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
-                                format!("{err}"),
-                            ))))
-                            .await?;
-                        }
-                    }
-                    Err(decoding_error) => {
-                        tracing::error!(error = %decoding_error, "Failed to decode message");
-                        tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
-                            format!("{decoding_error}"),
-                        ))))
-                        .await?;
-                    }
-                }
+
+                tracing::error!(%received_random_id, "The message was not decoded by any fbs type");
+                tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
+                    format!("{decoding_errors}"),
+                ))))
+                .await?;
             }
             Err(e) => {
                 tracing::debug!("Websocket error: {}", e);
@@ -222,13 +229,20 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                 key,
                 requester,
                 target,
+                timestamp,
             } => {
                 tracing::debug!(%tx_id, %key, %requester, %target, "sending put request");
-                let msg = ContractChange::put_request_msg(tx_id, key, requester, target);
+                let msg = ContractChange::put_request_msg(tx_id, key, requester, target, timestamp);
                 tx.send(Message::Binary(msg)).await?;
             }
-            Change::PutSuccess { tx_id, key, target } => {
-                let msg = ContractChange::put_success_msg(tx_id, key, target.clone(), target);
+            Change::PutSuccess {
+                tx_id,
+                key,
+                target,
+                timestamp,
+            } => {
+                let msg =
+                    ContractChange::put_success_msg(tx_id, key, target.clone(), target, timestamp);
                 tx.send(Message::Binary(msg)).await?;
             }
         }
@@ -265,11 +279,13 @@ pub(crate) enum Change {
         key: String,
         requester: String,
         target: String,
+        timestamp: u64,
     },
     PutSuccess {
         tx_id: String,
         key: String,
         target: String,
+        timestamp: u64,
     },
 }
 
@@ -369,6 +385,7 @@ impl ServerState {
                 let key = change.key().to_string();
                 let requester = change.requester().to_string();
                 let target = change.target().to_string();
+                let timestamp = change.timestamp();
 
                 if let Some(mut entry) = self.transactions_data.get_mut(&tx_id) {
                     tracing::error!(
@@ -395,6 +412,7 @@ impl ServerState {
                     key,
                     requester,
                     target,
+                    timestamp,
                 });
             }
             ChangesWrapper::ContractChange(ContractChange::PutSuccess(change)) => {
@@ -402,6 +420,7 @@ impl ServerState {
                 let key = change.key().to_string();
                 let requester = change.requester().to_string();
                 let target = change.target().to_string();
+                let timestamp = change.timestamp();
 
                 if let Some(mut entry) = self.transactions_data.get_mut(&tx_id) {
                     entry.push(format!(
@@ -417,7 +436,12 @@ impl ServerState {
 
                 println!("{:?}", change);
 
-                let _ = self.changes.send(Change::PutSuccess { tx_id, key, target });
+                let _ = self.changes.send(Change::PutSuccess {
+                    tx_id,
+                    key,
+                    target,
+                    timestamp,
+                });
             }
 
             _ => unreachable!(),

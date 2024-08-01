@@ -265,6 +265,7 @@ impl<'a> NetEventLog<'a> {
                     target: *target,
                     key,
                     id: *id,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
             NetMessage::Put(PutMsg::SuccessfulPut { id, target, key }) => {
@@ -273,6 +274,7 @@ impl<'a> NetEventLog<'a> {
                     requester: op_manager.ring.peer_key,
                     target: *target,
                     key: key.clone(),
+                    timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
             NetMessage::Put(PutMsg::Broadcasting {
@@ -801,12 +803,14 @@ async fn send_to_metrics_server(
             key,
             id,
             target,
+            timestamp,
         }) => {
             let msg = ContractChange::put_request_msg(
                 send_msg.tx.to_string(),
                 key.to_string(),
                 requester.to_string(),
                 target.peer.to_string(),
+                *timestamp,
             );
             ws_stream.send(Message::Binary(msg)).await
         }
@@ -815,12 +819,14 @@ async fn send_to_metrics_server(
             requester,
             target,
             key,
+            timestamp,
         }) => {
             let msg = ContractChange::put_success_msg(
                 send_msg.tx.to_string(),
                 key.to_string(),
                 requester.to_string(),
                 target.peer.to_string(),
+                *timestamp,
             );
             ws_stream.send(Message::Binary(msg)).await
         }
@@ -1165,12 +1171,14 @@ enum PutEvent {
         requester: PeerId,
         key: ContractKey,
         target: PeerKeyLocation,
+        timestamp: u64,
     },
     PutSuccess {
         id: Transaction,
         requester: PeerId,
         target: PeerKeyLocation,
         key: ContractKey,
+        timestamp: u64,
     },
     BroadcastEmitted {
         /// subscribed peers
