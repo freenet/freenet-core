@@ -14,13 +14,15 @@ export function handlePutRequest(
     contract_id: string,
     target: string,
     requester: string,
-    change_type: ChangeType
+    change_type: ChangeType,
+    timestamp: number
 ) {
     console.log("Put Request");
     console.log("tx", transaction_id);
     console.log("contract key", contract_id);
     console.log("target", target);
     console.log("requester", requester);
+    console.log("timestamp", timestamp);
 
     let obj_data = {
         change_type,
@@ -28,11 +30,9 @@ export function handlePutRequest(
         contract_id,
         target,
         requester,
-        status: null,
-        started: null,
-        finalized: null,
         unique_id:
             transaction_id + contract_id + target + requester + change_type,
+        timestamp,
     } as TransactionData;
 
     if (
@@ -57,13 +57,15 @@ export function handlePutSuccess(
     contract_id: string,
     target: string,
     requester: string,
-    change_type: ChangeType
+    change_type: ChangeType,
+    timestamp: number
 ) {
     console.log("Put Success");
     console.log("tx", transaction_id);
     console.log("contract key", contract_id);
     console.log("target", target);
     console.log("requester", requester);
+    console.log("timestamp", timestamp);
 
     let obj_data = {
         change_type,
@@ -76,7 +78,8 @@ export function handlePutSuccess(
         finalized: null,
         unique_id:
             transaction_id + contract_id + target + requester + change_type,
-    };
+        timestamp,
+    } as TransactionData;
 
     if (
         all_tx

@@ -52,6 +52,7 @@ function handleChanges(event: MessageEvent) {
                         target,
                         requester,
                         change_type,
+                        timestamp,
                     } = parse_put_msg_data(
                         contractChange,
                         fbTopology.ContractChangeType.PutRequest
@@ -62,7 +63,8 @@ function handleChanges(event: MessageEvent) {
                         contract_id,
                         target,
                         requester,
-                        change_type
+                        change_type,
+                        timestamp
                     );
 
                     return;
@@ -78,6 +80,7 @@ function handleChanges(event: MessageEvent) {
                         target,
                         requester,
                         change_type,
+                        timestamp,
                     } = parse_put_msg_data(
                         contractChange,
                         fbTopology.ContractChangeType.PutSuccess
@@ -88,7 +91,8 @@ function handleChanges(event: MessageEvent) {
                         contract_id,
                         target,
                         requester,
-                        change_type
+                        change_type,
+                        timestamp
                     );
 
                     return;
@@ -104,18 +108,26 @@ function handleChanges(event: MessageEvent) {
                         target,
                         requester,
                         change_type,
+                        timestamp,
                     } = parse_put_msg_data(
                         contractChange,
                         fbTopology.ContractChangeType.PutFailure
                     );
 
-                    handlePutSuccess(
-                        transaction,
-                        contract_id,
-                        target,
-                        requester,
-                        change_type
-                    );
+                    console.log("Put Failure");
+                    console.log("tx", transaction);
+                    console.log("contract key", contract_id);
+                    console.log("target", target);
+                    console.log("requester", requester);
+                    console.log("timestamp", timestamp);
+
+                    // handlePutSuccess(
+                    //     transaction,
+                    //     contract_id,
+                    //     target,
+                    //     requester,
+                    //     change_type
+                    // );
 
                     return;
                 }

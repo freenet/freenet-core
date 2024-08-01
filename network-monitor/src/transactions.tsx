@@ -186,6 +186,7 @@ const TransactionsTable = ({ open_tx_detail, tx_list }: TxTableInterface) => (
                 <th>Target Peer Id</th>
                 <th>Type</th>
                 <th>Contract Key</th>
+                <th>Timestamp</th>
                 {/*<th>Status</th>
                 <th>Started</th>
                 <th>Finalized</th>*/}
@@ -200,6 +201,7 @@ const TransactionsTable = ({ open_tx_detail, tx_list }: TxTableInterface) => (
                         <td>{tx.target.slice(-8)}</td>
                         <td>{tx.change_type}</td>
                         <td>{tx.contract_id.slice(-8)}</td>
+                        <td>{tx.timestamp.toString()}</td>
                         {/*<td>{tx.status}</td>
                         <td>{tx.started}</td>
                         <td>{tx.finalized}</td>*/}
@@ -242,7 +244,7 @@ export function TransactionContainer() {
 
         updated_tx_list = updated_tx_list.flat();
 
-        console.log(updated_tx_list);
+        console.log("updated_tx_list", updated_tx_list);
         set_tx_list(updated_tx_list);
     }
 

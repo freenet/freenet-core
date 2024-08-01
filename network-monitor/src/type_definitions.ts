@@ -17,6 +17,7 @@ export type TransactionData = {
     started: string | null;
     finalized: string | null;
     unique_id: string;
+    timestamp: number;
 };
 
 export interface TransactionInterface {

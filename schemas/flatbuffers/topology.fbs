@@ -47,6 +47,7 @@ table PutRequest {
   key: string(required);
   requester: string(required);
   target: string(required);
+  timestamp: uint64;
 }
 
 table UpdateRequest {
@@ -61,6 +62,7 @@ table PutSuccess {
   requester: string(required);
   target: string(required);
   key: string(required);
+  timestamp: uint64;
 }
 
 table PutFailure {

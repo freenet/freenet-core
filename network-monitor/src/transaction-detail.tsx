@@ -201,11 +201,14 @@ const TransactionPeersHistory = ({
                                 </button>
                             )}
                         </th>
+                        <th>
+                            Timestamp
+                        </th>
                     </tr>
                 </thead>
                 <tbody id="transaction-peers-history-b">
                     {filtered_list.map((tx) => (
-                        <tr>
+                        <tr key={`${tx.requester}+${tx.change_type}+${tx.timestamp.toString()}`}>
                             <td
                                 onClick={() =>
                                     add_filter("transaction_id", tx.transaction_id)
@@ -255,6 +258,9 @@ const TransactionPeersHistory = ({
                                 }}
                             >
                                 {tx.contract_id.slice(-8)}
+                            </td>
+                            <td>
+                                {tx.timestamp.toString()}
                             </td>
                         </tr>
                     ))}

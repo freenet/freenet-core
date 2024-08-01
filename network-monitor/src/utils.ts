@@ -33,6 +33,8 @@ export const parse_put_msg_data = (
 
     let requester = put_request_obj.requester()!;
 
+    let timestamp = put_request_obj.timestamp()!;
+
     let change_type = get_change_type(changeType)!;
 
     return {
@@ -41,5 +43,6 @@ export const parse_put_msg_data = (
         target,
         requester,
         change_type,
+        timestamp,
     };
 };
