@@ -1268,7 +1268,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_to_gw_outbound_conn_rejected() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG));
+        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG));
         let joiner_addr = ([127, 0, 0, 1], 10001).into();
         let (mut handler, mut test) = config_handler(joiner_addr);
 
@@ -1390,9 +1390,9 @@ mod tests {
                 let event = tokio::time::timeout(Duration::from_secs(5), handler.wait_for_events())
                     .await??;
                 match event {
-                    Event::OutboundGatewayConnectionRejected { peer_id } => {
-                        tracing::info!(%peer_id, "Connection rejected");
-                    }
+                    // Event::OutboundGatewayConnectionRejected { peer_id } => {
+                    //     tracing::info!(%peer_id, "Connection rejected");
+                    // }
                     Event::OutboundConnectionSuccessful {
                         peer_id,
                         connection,
@@ -1403,6 +1403,14 @@ mod tests {
                     }
                     other => bail!("Unexpected event: {:?}", other),
                 }
+            }
+            let event =
+                tokio::time::timeout(Duration::from_secs(5), handler.wait_for_events()).await??;
+            match event {
+                Event::OutboundGatewayConnectionRejected { peer_id } => {
+                    tracing::info!(%peer_id, "Connection rejected");
+                }
+                _ => panic!("Unexpected event: {:?}", event),
             }
             assert_eq!(conn_count, 5);
             Ok(())

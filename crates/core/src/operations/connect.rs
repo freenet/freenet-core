@@ -224,76 +224,7 @@ impl Operation for ConnectOp {
                         return_msg = None;
                     }
                 }
-                ConnectMsg::Request {
-                    id,
-                    msg:
-                        ConnectRequest::StartJoinReq {
-                            joiner,
-                            hops_to_live,
-                            skip_list,
-                            max_hops_to_live,
-                            ..
-                        },
-                } => {
-                    let joiner: PeerId = joiner
-                        .clone()
-                        .expect("should be already set at the p2p bridge level");
-                    let this_peer = op_manager.ring.connection_manager.own_location();
-                    let assigned_location = Location::from_address(&joiner.addr);
-
-                    let new_peer_loc = PeerKeyLocation {
-                        location: Some(assigned_location),
-                        peer: joiner.clone(),
-                    };
-
-                    let accepted = op_manager
-                        .ring
-                        .connection_manager
-                        .should_accept(assigned_location, Some(&joiner));
-
-                    let mut skip_list = skip_list.clone();
-                    skip_list.push(joiner.clone());
-                    {
-                        if let Some(updated_state) = forward_conn(
-                            *id,
-                            &op_manager.ring.connection_manager,
-                            op_manager.ring.router.clone(),
-                            network_bridge,
-                            (new_peer_loc.clone(), new_peer_loc.clone()),
-                            *hops_to_live,
-                            *max_hops_to_live,
-                            accepted,
-                            skip_list,
-                        )
-                        .await?
-                        {
-                            new_state = Some(updated_state);
-                        } else {
-                            new_state = None;
-                        }
-                    }
-
-                    if accepted {
-                        op_manager
-                            .ring
-                            .add_connection(assigned_location, joiner.clone())
-                            .await;
-                        tracing::debug!(tx = %id, at = %this_peer.peer, %joiner, "Accepting connection");
-                    } else {
-                        tracing::debug!(tx = %id, at = %this_peer.peer, %joiner, "Rejecting connection");
-                    }
-
-                    return_msg = Some(ConnectMsg::Response {
-                        id: *id,
-                        sender: this_peer.clone(),
-                        target: new_peer_loc.clone(),
-                        msg: ConnectResponse::AcceptedBy {
-                            accepted,
-                            acceptor: this_peer.clone(),
-                            joiner: joiner.clone(),
-                        },
-                    });
-                }
+                
                 ConnectMsg::Request {
                     id,
                     msg:
