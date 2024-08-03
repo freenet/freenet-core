@@ -384,8 +384,7 @@ impl P2pConnManager {
         match event {
             HandshakeEvent::InboundConnection(InboundJoinRequest { conn, joiner, .. }) => {
                 let (tx, rx) = mpsc::channel(1);
-                self.connections
-                    .insert(joiner.expect("should be set at this point"), tx);
+                self.connections.insert(joiner, tx);
                 let task = peer_connection_listener(rx, conn).boxed();
                 state.peer_connections.push(task);
                 todo!("Need to add the operation to the op_manager properly, in the correct state")
