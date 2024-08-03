@@ -41,6 +41,12 @@ impl ConnectionManager {
             pub_key,
         )
     }
+    
+    pub fn add_connection(&self, conn: Connection) {
+        let loc = conn.location.location.unwrap_or_else(Location::random);
+        let mut conns = self.connections_by_location.write();
+        conns.entry(loc).or_default().push(conn);
+    }
 }
 
 impl ConnectionManager {

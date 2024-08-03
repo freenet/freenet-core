@@ -1267,6 +1267,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_gw_to_peer_outbound_conn_forwarded() -> anyhow::Result<()> {
+        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG));
+        let gw_addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
+        let peer_addr: SocketAddr = ([127, 0, 0, 1], 10001).into();
+        let joiner_addr: SocketAddr = ([127, 0, 0, 1], 10002).into();
+
+        let (mut gw_handler, mut gw_test) = config_handler(gw_addr);
+        let (mut peer_handler, mut peer_test) = config_handler(peer_addr);
+
+        gw_handler.connection_manager.max_connections = 1;
+        gw_handler.connection_manager.min_connections = 1;
+
+        let gw_key = TransportKeypair::new();
+        let peer_key = TransportKeypair::new();
+        let joiner_key = TransportKeypair::new();
+
+        let gw_pub_key = gw_key.public().clone();
+        let peer_pub_key = peer_key.public().clone();
+        let joiner_pub_key = joiner_key.public().clone();
+
+        let gw_peer_id = PeerId::new(gw_addr, gw_pub_key.clone());
+        let peer_peer_id = PeerId::new(peer_addr, peer_pub_key.clone());
+        let joiner_peer_id = PeerId::new(joiner_addr, joiner_pub_key.clone());
+
+        let test_controller = async {
+            gw_test.transport.new_conn(peer_addr).await;
+            gw_test.transport.establish_inbound_conn(peer_addr).await;
+
+            gw_test.transport.new_conn(joiner_addr).await;
+            gw_test.transport.establish_inbound_conn(joiner_addr).await;
+
+            Ok::<_, anyhow::Error>(())
+        };
+
+        let gw_controller = async {
+            let mut forward_event_received = false;
+            while !forward_event_received {
+                let event = tokio::time::timeout(Duration::from_secs(5), gw_handler.wait_for_events()).await??;
+                if let Event::TransientForwardTransaction { target, tx, forward_to, msg } = event {
+                    assert_eq!(target, joiner_addr);
+                    assert_eq!(forward_to, peer_peer_id);
+                    forward_event_received = true;
+
+                    peer_test.transport.inbound_msg(peer_addr, msg).await;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+
+        let peer_controller = async {
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(5), peer_handler.wait_for_events()).await??;
+                if let Event::InboundConnection(req) = event {
+                    assert_eq!(req.conn.remote_addr(), joiner_addr);
+                    gw_handler.connection_manager.add_connection(req.conn).await;
+                    break Ok(());
+                }
+            }
+        };
+
+        futures::try_join!(test_controller, gw_controller, peer_controller)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_peer_to_gw_outbound_conn_rejected() -> anyhow::Result<()> {
         crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG));
         let joiner_addr = ([127, 0, 0, 1], 10001).into();
