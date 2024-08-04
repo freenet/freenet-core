@@ -12,6 +12,7 @@ use futures::{Future, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tracing::{instrument, span, Instrument};
 
 mod inbound_stream;
 mod outbound_stream;
@@ -179,6 +180,7 @@ impl PeerConnection {
         )
     }
 
+    #[instrument(name = "peer_connection", skip_all)]
     pub async fn send<T>(&mut self, data: T) -> Result
     where
         T: Serialize + Send + 'static,
@@ -187,15 +189,16 @@ impl PeerConnection {
             .await
             .unwrap();
         if data.len() + SymmetricMessage::short_message_overhead() > MAX_DATA_SIZE {
-            tracing::debug!("sending as stream");
+            tracing::trace!("sending as stream");
             self.outbound_stream(data).await;
         } else {
-            tracing::debug!("sending as short message");
+            tracing::trace!("sending as short message");
             self.outbound_short_message(data).await?;
         }
         Ok(())
     }
 
+    #[instrument(name = "peer_connection", skip(self))]
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
         // listen for incoming messages or receipts or wait until is time to do anything else again
         let mut resend_check = Some(tokio::time::sleep(tokio::time::Duration::from_secs(1)));
@@ -427,15 +430,18 @@ impl PeerConnection {
 
     async fn outbound_stream(&mut self, data: SerializedMessage) {
         let stream_id = StreamId::next();
-        let task = tokio::spawn(outbound_stream::send_stream(
-            stream_id,
-            self.remote_conn.last_packet_id.clone(),
-            self.remote_conn.outbound_packets.clone(),
-            self.remote_conn.remote_addr,
-            data,
-            self.remote_conn.outbound_symmetric_key.clone(),
-            self.remote_conn.sent_tracker.clone(),
-        ));
+        let task = tokio::spawn(
+            outbound_stream::send_stream(
+                stream_id,
+                self.remote_conn.last_packet_id.clone(),
+                self.remote_conn.outbound_packets.clone(),
+                self.remote_conn.remote_addr,
+                data,
+                self.remote_conn.outbound_symmetric_key.clone(),
+                self.remote_conn.sent_tracker.clone(),
+            )
+            .instrument(span!(tracing::Level::DEBUG, "outbound_stream")),
+        );
         self.outbound_stream_futures.push(task);
     }
 }

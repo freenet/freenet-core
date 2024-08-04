@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    fmt::Write,
     net::Ipv6Addr,
     num::NonZeroUsize,
     pin::Pin,
@@ -11,7 +10,6 @@ use std::{
 use either::Either;
 use freenet_stdlib::prelude::*;
 use futures::Future;
-use itertools::Itertools;
 use rand::seq::SliceRandom;
 use tokio::sync::{mpsc, watch};
 use tracing::{info, Instrument};
@@ -25,11 +23,13 @@ use crate::{
         self, ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
         WaitingResolution,
     },
+    dev_tool::TransportKeypair,
     message::{MessageStats, NetMessage, NetMessageV1, NodeEvent, Transaction},
     node::{InitPeerNode, NetEventRegister, NodeConfig},
     operations::connect,
     ring::{Distance, Location, PeerKeyLocation},
     tracing::TestEventListener,
+    transport::TransportPublicKey,
 };
 
 mod in_memory;
@@ -105,14 +105,6 @@ impl<'a> From<&'a str> for NodeLabel {
     }
 }
 
-#[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct NodeSpecification {
-    pub owned_contracts: Vec<(ContractContainer, WrappedState, bool)>,
-    pub events_to_generate: HashMap<EventId, freenet_stdlib::client_api::ClientRequest<'static>>,
-    pub contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
-}
-
 #[derive(Clone)]
 struct GatewayConfig {
     label: NodeLabel,
@@ -120,20 +112,19 @@ struct GatewayConfig {
     location: Location,
 }
 
-pub struct EventChain<S = watch::Sender<(EventId, PeerId)>> {
-    labels: Vec<(NodeLabel, PeerId)>,
-    // user_ev_controller: Sender<(EventId, PeerId)>,
+pub struct EventChain<S = watch::Sender<(EventId, TransportPublicKey)>> {
+    labels: Vec<(NodeLabel, TransportPublicKey)>,
     user_ev_controller: S,
     total_events: u32,
     count: u32,
     rng: rand::rngs::SmallRng,
     clean_up_tmp_dirs: bool,
-    choice: Option<PeerId>,
+    choice: Option<TransportPublicKey>,
 }
 
 impl<S> EventChain<S> {
     pub fn new(
-        labels: Vec<(NodeLabel, PeerId)>,
+        labels: Vec<(NodeLabel, TransportPublicKey)>,
         user_ev_controller: S,
         total_events: u32,
         clean_up_tmp_dirs: bool,
@@ -158,7 +149,7 @@ impl<S> EventChain<S> {
         }
     }
 
-    fn choose_peer(self: Pin<&mut Self>) -> PeerId {
+    fn choose_peer(self: Pin<&mut Self>) -> TransportPublicKey {
         let this = unsafe {
             // This is safe because we're not moving the EventChain, just copying one inner valur
             self.get_unchecked_mut()
@@ -172,7 +163,7 @@ impl<S> EventChain<S> {
         id.clone()
     }
 
-    fn set_choice(self: Pin<&mut Self>, id: PeerId) {
+    fn set_choice(self: Pin<&mut Self>, id: TransportPublicKey) {
         let this = unsafe {
             // This is safe because we're not moving the EventChain, just copying one inner valur
             self.get_unchecked_mut()
@@ -185,15 +176,15 @@ trait EventSender {
     fn send(
         &self,
         cx: &mut std::task::Context<'_>,
-        value: (EventId, PeerId),
+        value: (EventId, TransportPublicKey),
     ) -> std::task::Poll<Result<(), ()>>;
 }
 
-impl EventSender for mpsc::Sender<(EventId, PeerId)> {
+impl EventSender for mpsc::Sender<(EventId, TransportPublicKey)> {
     fn send(
         &self,
         cx: &mut std::task::Context<'_>,
-        value: (EventId, PeerId),
+        value: (EventId, TransportPublicKey),
     ) -> std::task::Poll<Result<(), ()>> {
         let f = self.send(value);
         futures::pin_mut!(f);
@@ -201,11 +192,11 @@ impl EventSender for mpsc::Sender<(EventId, PeerId)> {
     }
 }
 
-impl EventSender for watch::Sender<(EventId, PeerId)> {
+impl EventSender for watch::Sender<(EventId, TransportPublicKey)> {
     fn send(
         &self,
         _cx: &mut std::task::Context<'_>,
-        value: (EventId, PeerId),
+        value: (EventId, TransportPublicKey),
     ) -> std::task::Poll<Result<(), ()>> {
         match self.send(value) {
             Ok(_) => std::task::Poll::Ready(Ok(())),
@@ -246,7 +237,7 @@ impl<S: EventSender> futures::stream::Stream for EventChain<S> {
 impl<S> Drop for EventChain<S> {
     fn drop(&mut self) {
         if self.clean_up_tmp_dirs {
-            clean_up_tmp_dirs(&self.labels)
+            clean_up_tmp_dirs(self.labels.iter().map(|(l, _)| l));
         }
     }
 }
@@ -258,8 +249,7 @@ type DefaultRegistry = CombinedRegister<2>;
 type DefaultRegistry = TestEventListener;
 
 pub(super) struct Builder<ER> {
-    pub(super) peer_key: PeerId,
-    config: NodeConfig,
+    pub config: NodeConfig,
     contract_handler_name: String,
     add_noise: bool,
     event_register: ER,
@@ -275,9 +265,7 @@ impl<ER: NetEventRegister> Builder<ER> {
         contract_handler_name: String,
         add_noise: bool,
     ) -> Builder<ER> {
-        let peer_key = builder.get_peer_id().unwrap();
         Builder {
-            peer_key,
             config: builder.clone(),
             contract_handler_name,
             add_noise,
@@ -292,10 +280,10 @@ impl<ER: NetEventRegister> Builder<ER> {
 pub struct SimNetwork {
     name: String,
     clean_up_tmp_dirs: bool,
-    labels: Vec<(NodeLabel, PeerId)>,
+    labels: Vec<(NodeLabel, TransportPublicKey)>,
     pub(crate) event_listener: TestEventListener,
-    user_ev_controller: Option<watch::Sender<(EventId, PeerId)>>,
-    receiver_ch: watch::Receiver<(EventId, PeerId)>,
+    user_ev_controller: Option<watch::Sender<(EventId, TransportPublicKey)>>,
+    receiver_ch: watch::Receiver<(EventId, TransportPublicKey)>,
     number_of_gateways: usize,
     gateways: Vec<(Builder<DefaultRegistry>, GatewayConfig)>,
     number_of_nodes: usize,
@@ -319,7 +307,8 @@ impl SimNetwork {
         min_connections: usize,
     ) -> Self {
         assert!(nodes > 0);
-        let (user_ev_controller, mut receiver_ch) = watch::channel((0, PeerId::random()));
+        let (user_ev_controller, mut receiver_ch) =
+            watch::channel((0, TransportKeypair::new().public().clone()));
         receiver_ch.borrow_and_update();
         let mut net = Self {
             name: name.into(),
@@ -382,6 +371,7 @@ impl SimNetwork {
             config.key_pair = keypair;
             config.network_listener_ip = Ipv6Addr::LOCALHOST.into();
             config.network_listener_port = port;
+            config.with_peer_id(id.clone());
             config
                 .with_location(location)
                 .max_hops_to_live(self.ring_max_htl)
@@ -389,7 +379,8 @@ impl SimNetwork {
                 .min_number_of_connections(self.min_connections)
                 .is_gateway()
                 .rnd_if_htl_above(self.rnd_if_htl_above);
-            self.event_listener.add_node(label.clone(), id.clone());
+            self.event_listener
+                .add_node(label.clone(), config.key_pair.public().clone());
             configs.push((
                 config,
                 GatewayConfig {
@@ -444,7 +435,6 @@ impl SimNetwork {
 
         for node_no in self.number_of_gateways..num + self.number_of_gateways {
             let label = NodeLabel::node(node_no);
-            let peer = PeerId::random();
 
             let mut config_args = ConfigArgs::default();
             config_args.id = Some(format!("{label}"));
@@ -455,12 +445,14 @@ impl SimNetwork {
             let port = crate::util::get_free_port().unwrap();
             config.network_listener_port = port;
             config.network_listener_ip = Ipv6Addr::LOCALHOST.into();
+            config.key_pair = crate::transport::TransportKeypair::new();
             config
                 .max_hops_to_live(self.ring_max_htl)
                 .rnd_if_htl_above(self.rnd_if_htl_above)
                 .max_number_of_connections(self.max_connections);
 
-            self.event_listener.add_node(label.clone(), peer);
+            self.event_listener
+                .add_node(label.clone(), config.key_pair.public().clone());
 
             let event_listener = {
                 #[cfg(feature = "trace-ot")]
@@ -486,43 +478,6 @@ impl SimNetwork {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) async fn start(&mut self) {
-        self.start_with_spec(HashMap::new()).await
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn start_with_spec(
-        &mut self,
-        mut specs: HashMap<NodeLabel, NodeSpecification>,
-    ) {
-        let gw = self.gateways.drain(..).map(|(n, c)| (n, c.label));
-        for (mut node, label) in gw.chain(self.nodes.drain(..)).collect::<Vec<_>>() {
-            tracing::debug!(peer = %label, "initializing");
-            let node_spec = specs.remove(&label);
-            let mut user_events =
-                MemoryEventsGen::new(self.receiver_ch.clone(), node.peer_key.clone());
-            if let Some(specs) = node_spec.clone() {
-                user_events.generate_events(specs.events_to_generate);
-            }
-            let span = if label.is_gateway() {
-                tracing::info_span!("in_mem_gateway", %node.peer_key)
-            } else {
-                tracing::info_span!("in_mem_node", %node.peer_key)
-            };
-            if let Some(specs) = node_spec {
-                node.append_contracts(specs.owned_contracts, specs.contract_subscribers);
-            }
-            self.labels.push((label, node.peer_key.clone()));
-
-            let node_task = async move { node.run_node(user_events, span).await };
-            GlobalExecutor::spawn(node_task);
-
-            tokio::time::sleep(self.start_backoff).await;
-        }
-        self.labels.sort_by(|(a, _), (b, _)| a.cmp(b));
-    }
-
     pub async fn start_with_rand_gen<R>(
         &mut self,
         seed: u64,
@@ -539,16 +494,17 @@ impl SimNetwork {
             tracing::debug!(peer = %label, "initializing");
             let mut user_events = MemoryEventsGen::<R>::new_with_seed(
                 self.receiver_ch.clone(),
-                node.peer_key.clone(),
+                node.config.key_pair.public().clone(),
                 seed,
             );
             user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
             let span = if label.is_gateway() {
-                tracing::info_span!("in_mem_gateway", %node.peer_key)
+                tracing::info_span!("in_mem_gateway", %label)
             } else {
-                tracing::info_span!("in_mem_node", %node.peer_key)
+                tracing::info_span!("in_mem_node", %label)
             };
-            self.labels.push((label, node.peer_key.clone()));
+            self.labels
+                .push((label, node.config.key_pair.public().clone()));
 
             let node_task = async move { node.run_node(user_events, span).await };
             let handle = GlobalExecutor::spawn(node_task);
@@ -565,7 +521,8 @@ impl SimNetwork {
         let gw = self.gateways.drain(..).map(|(n, c)| (n, c.label));
         let mut peers = vec![];
         for (builder, label) in gw.chain(self.nodes.drain(..)).collect::<Vec<_>>() {
-            self.labels.push((label.clone(), builder.peer_key));
+            let pub_key = builder.config.key_pair.public();
+            self.labels.push((label.clone(), pub_key.clone()));
             peers.push((label, builder.config));
         }
         self.labels.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -573,128 +530,22 @@ impl SimNetwork {
         peers
     }
 
-    pub fn get_locations_by_node(&self) -> HashMap<NodeLabel, PeerKeyLocation> {
-        let mut locations_by_node: HashMap<NodeLabel, PeerKeyLocation> = HashMap::new();
-
-        // Get node and gateways location by label
-        for (node, label) in &self.nodes {
-            locations_by_node.insert(
-                label.clone(),
-                PeerKeyLocation {
-                    peer: node.peer_key.clone(),
-                    location: None,
-                },
-            );
-        }
-        for (node, config) in &self.gateways {
-            locations_by_node.insert(
-                config.label.clone(),
-                PeerKeyLocation {
-                    peer: node.peer_key.clone(),
-                    location: config.location.into(),
-                },
-            );
-        }
-        locations_by_node
-    }
-
-    pub fn connected(&self, peer: &NodeLabel) -> bool {
-        let pos = self
-            .labels
-            .binary_search_by(|(label, _)| label.cmp(peer))
-            .expect("peer not found");
-        self.event_listener.is_connected(&self.labels[pos].1)
-    }
-
-    pub fn has_put_contract(&self, peer: impl Into<NodeLabel>, key: &ContractKey) -> bool {
-        let peer = peer.into();
-        let pos = self
-            .labels
-            .binary_search_by(|(label, _)| label.cmp(&peer))
-            .expect("peer not found");
-        self.event_listener
-            .has_put_contract(&self.labels[pos].1, key)
-    }
-
-    pub fn has_got_contract(&self, peer: impl Into<NodeLabel>, key: &ContractKey) -> bool {
-        let peer = peer.into();
-        let pos = self
-            .labels
-            .binary_search_by(|(label, _)| label.cmp(&peer))
-            .expect("peer not found");
-        self.event_listener
-            .has_got_contract(&self.labels[pos].1, key)
-    }
-
-    pub fn is_subscribed_to_contract(&self, peer: impl Into<NodeLabel>, key: &ContractKey) -> bool {
-        let peer = peer.into();
-        let pos = self
-            .labels
-            .binary_search_by(|(label, _)| label.cmp(&peer))
-            .expect("peer not found");
-        self.event_listener
-            .is_subscribed_to_contract(&self.labels[pos].1, key)
-    }
-
-    /// Builds an histogram of the distribution in the ring of each node relative to each other.
-    pub fn ring_distribution(&self, scale: i32) -> Vec<(f64, usize)> {
-        let mut all_dists = Vec::with_capacity(self.labels.len());
-        for (.., key) in &self.labels {
-            all_dists.push(self.event_listener.connections(key.clone()));
-        }
-        let mut dist_buckets = group_locations_in_buckets(
-            all_dists.into_iter().flatten().map(|(_, l)| l.as_f64()),
-            scale,
-        )
-        .collect::<Vec<_>>();
-        dist_buckets
-            .sort_by(|(d0, _), (d1, _)| d0.partial_cmp(d1).unwrap_or(std::cmp::Ordering::Equal));
-        dist_buckets
-    }
-
     /// Returns the connectivity in the network per peer (that is all the connections
     /// this peers has registered).
-    pub fn node_connectivity(&self) -> HashMap<NodeLabel, (PeerId, HashMap<NodeLabel, Distance>)> {
+    pub fn node_connectivity(
+        &self,
+    ) -> HashMap<NodeLabel, (TransportPublicKey, HashMap<NodeLabel, Distance>)> {
         let mut peers_connections = HashMap::with_capacity(self.labels.len());
         let key_to_label: HashMap<_, _> = self.labels.iter().map(|(k, v)| (v, k)).collect();
         for (label, key) in &self.labels {
             let conns = self
                 .event_listener
-                .connections(key.clone())
-                .map(|(k, d)| (key_to_label[&k].clone(), d))
+                .connections(key)
+                .map(|(k, d)| (key_to_label[&k.pub_key].clone(), d))
                 .collect::<HashMap<_, _>>();
             peers_connections.insert(label.clone(), (key.clone(), conns));
         }
         peers_connections
-    }
-
-    /// # Arguments
-    ///
-    /// - label: node for which to trigger the
-    /// - event_id: which event to trigger
-    /// - await_for: if set, wait for the duration before returning
-    #[cfg(test)]
-    pub(crate) async fn trigger_event(
-        &self,
-        label: impl Into<NodeLabel>,
-        event_id: EventId,
-        await_for: Option<Duration>,
-    ) -> anyhow::Result<()> {
-        let label = label.into();
-        let pos = self
-            .labels
-            .binary_search_by(|(other, _)| other.cmp(&label))
-            .map_err(|_| anyhow::anyhow!("peer not found"))?;
-        let (_, peer) = &self.labels[pos];
-        self.user_ev_controller
-            .as_ref()
-            .expect("should be set")
-            .send((event_id, peer.clone()))
-            .expect("node listeners disconnected");
-        if let Some(sleep_time) = await_for {
-            tokio::time::sleep(sleep_time).await;
-        }
-        Ok(())
     }
 
     /// Start an event chain for this simulation. Allows passing a different controller for the peers.
@@ -704,7 +555,7 @@ impl SimNetwork {
     pub fn event_chain(
         mut self,
         total_events: u32,
-        controller: Option<watch::Sender<(EventId, PeerId)>>,
+        controller: Option<watch::Sender<(EventId, TransportPublicKey)>>,
     ) -> EventChain {
         let user_ev_controller = controller.unwrap_or_else(|| {
             self.user_ev_controller
@@ -777,15 +628,12 @@ impl SimNetwork {
         Ok(())
     }
 
-    pub fn print_network_connections(&self) {
-        let node_connectivity = self.node_connectivity();
-        let connections = pretty_print_connections(&node_connectivity);
-        tracing::info!("{connections}");
-    }
-
-    pub fn print_ring_distribution(&self) {
-        let hist = self.ring_distribution(1);
-        tracing::info!("Ring distribution: {:?}", hist);
+    pub fn connected(&self, peer: &NodeLabel) -> bool {
+        let pos = self
+            .labels
+            .binary_search_by(|(label, _)| label.cmp(peer))
+            .expect("peer not found");
+        self.event_listener.is_connected(&self.labels[pos].1)
     }
 
     /// Recommended to calling after `check_connectivity` to ensure enough time
@@ -859,13 +707,13 @@ impl std::fmt::Debug for SimNetwork {
 impl Drop for SimNetwork {
     fn drop(&mut self) {
         if self.clean_up_tmp_dirs {
-            clean_up_tmp_dirs(&self.labels);
+            clean_up_tmp_dirs(self.labels.iter().map(|(l, _)| l));
         }
     }
 }
 
-fn clean_up_tmp_dirs(labels: &[(NodeLabel, PeerId)]) {
-    for (label, _) in labels {
+fn clean_up_tmp_dirs<'a>(labels: impl Iterator<Item = &'a NodeLabel>) {
+    for label in labels {
         let p = std::env::temp_dir().join(format!(
             "freenet-executor-{sim}-{label}",
             sim = "sim",
@@ -873,67 +721,6 @@ fn clean_up_tmp_dirs(labels: &[(NodeLabel, PeerId)]) {
         ));
         let _ = std::fs::remove_dir_all(p);
     }
-}
-
-fn group_locations_in_buckets(
-    locs: impl IntoIterator<Item = f64>,
-    scale: i32,
-) -> impl Iterator<Item = (f64, usize)> {
-    let mut distances = HashMap::new();
-    for (bucket, group) in &locs
-        .into_iter()
-        .chunk_by(|l| (l * (10.0f64).powi(scale)).floor() as u32)
-    {
-        let count = group.count();
-        distances
-            .entry(bucket)
-            .and_modify(|c| *c += count)
-            .or_insert(count);
-    }
-    distances
-        .into_iter()
-        .map(move |(k, v)| ((k as f64 / (10.0f64).powi(scale)), v))
-}
-
-fn pretty_print_connections(
-    conns: &HashMap<NodeLabel, (PeerId, HashMap<NodeLabel, Distance>)>,
-) -> String {
-    let mut connections = String::from("Node connections:\n");
-    let mut conns = conns.iter().collect::<Vec<_>>();
-    conns.sort_by(|(a, _), (b, _)| a.cmp(b));
-    for (peer, (key, conns)) in conns {
-        writeln!(&mut connections, "{peer} ({key}):").unwrap();
-        for (conn, dist) in conns {
-            let dist = dist.as_f64();
-            writeln!(&mut connections, "    {conn} (dist: {dist:.3})").unwrap();
-        }
-    }
-    connections
-}
-
-#[test]
-fn group_locations_test() -> anyhow::Result<()> {
-    let locations = vec![0.5356, 0.5435, 0.5468, 0.5597, 0.6745, 0.7309, 0.7412];
-
-    let mut grouped: Vec<_> = group_locations_in_buckets(locations.clone(), 1).collect();
-    grouped.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    assert_eq!(grouped, vec![(0.5, 4), (0.6, 1), (0.7, 2)]);
-
-    let mut grouped: Vec<_> = group_locations_in_buckets(locations, 2).collect();
-    grouped.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    assert_eq!(
-        grouped,
-        vec![
-            (0.53, 1),
-            (0.54, 2),
-            (0.55, 1),
-            (0.67, 1),
-            (0.73, 1),
-            (0.74, 1)
-        ]
-    );
-
-    Ok(())
 }
 
 use super::op_state_manager::OpManager;

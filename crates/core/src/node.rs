@@ -12,6 +12,7 @@ use std::{
     borrow::Cow,
     fmt::Display,
     fs::File,
+    hash::Hash,
     io::Read,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     sync::Arc,
@@ -704,7 +705,6 @@ async fn process_message_v1<CB>(
                 let span = tracing::info_span!(
                     parent: parent_span,
                     "handle_connect_op_request",
-                    peer = ?op_manager.ring.connection_manager.get_peer_key(),
                     transaction = %msg.id(),
                     tx_type = %msg.id().transaction_type()
                 );
@@ -919,10 +919,22 @@ where
 ///
 /// A gateway will have its `PeerId` set when it is created since it will know its own address
 /// from the start.
-#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone)]
+#[derive(Serialize, Deserialize, Eq, Clone)]
 pub struct PeerId {
     pub addr: SocketAddr,
     pub pub_key: TransportPublicKey,
+}
+
+impl Hash for PeerId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.addr.hash(state);
+    }
+}
+
+impl PartialEq<PeerId> for PeerId {
+    fn eq(&self, other: &PeerId) -> bool {
+        self.addr == other.addr
+    }
 }
 
 impl Ord for PeerId {
@@ -1010,7 +1022,7 @@ impl std::fmt::Debug for PeerId {
 
 impl Display for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.addr)
+        write!(f, "{:?}", self.pub_key)
     }
 }
 
@@ -1132,7 +1144,7 @@ pub async fn run_network_node(mut node: Node) -> anyhow::Result<()> {
             node.0
                 .peer_id
                 .clone()
-                .map(|id| Location::from_address(&id.addr()))
+                .map(|id| Location::from_address(&id.addr))
         })
         .flatten();
 

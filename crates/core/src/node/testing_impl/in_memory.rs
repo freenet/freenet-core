@@ -10,7 +10,7 @@ use crate::{
     node::{
         network_bridge::{event_loop_notification_channel, in_memory::MemoryConnManager},
         op_state_manager::OpManager,
-        NetEventRegister, NetworkBridge,
+        NetEventRegister, NetworkBridge, PeerId,
     },
     ring::{ConnectionManager, PeerKeyLocation},
 };
@@ -49,7 +49,10 @@ impl<ER> Builder<ER> {
                 .map_err(|e| anyhow::anyhow!(e))?;
 
         let conn_manager = MemoryConnManager::new(
-            self.peer_key.clone(),
+            PeerId::new(
+                ([127, 0, 0, 1], 0).into(),
+                self.config.key_pair.public().clone(),
+            ),
             self.event_register.clone(),
             op_manager.clone(),
             self.add_noise,
@@ -61,7 +64,10 @@ impl<ER> Builder<ER> {
         );
 
         let mut config = super::RunnerConfig {
-            peer_key: self.peer_key,
+            peer_key: PeerId::new(
+                ([127, 0, 0, 1], 0).into(),
+                self.config.key_pair.public().clone(),
+            ),
             gateways,
             parent_span: Some(parent_span),
             op_manager,
@@ -76,16 +82,6 @@ impl<ER> Builder<ER> {
             .append_contracts(self.contracts, self.contract_subscribers)
             .await?;
         super::run_node(config).await
-    }
-
-    #[cfg(test)]
-    pub fn append_contracts(
-        &mut self,
-        contracts: Vec<(ContractContainer, WrappedState, bool)>,
-        contract_subscribers: std::collections::HashMap<ContractKey, Vec<PeerKeyLocation>>,
-    ) {
-        self.contracts.extend(contracts);
-        self.contract_subscribers.extend(contract_subscribers);
     }
 }
 

@@ -92,6 +92,7 @@ tracing = "0.1"
 [features]
 default = ["redb", "trace", "websocket"]
 local-mode = []
+local-simulation = []
 network-mode = []
 sqlite = ["sqlx"]
 trace = ["tracing-subscriber"]

@@ -24,7 +24,7 @@ type PacketId = u32;
 
 use self::peer_connection::StreamId;
 
-pub use self::crypto::TransportKeypair;
+pub use self::crypto::{TransportKeypair, TransportPublicKey};
 #[cfg(test)]
 pub(crate) use self::{
     connection_handler::ConnectionEvent,
@@ -36,7 +36,6 @@ pub(crate) use self::{
     connection_handler::{
         create_connection_handler, InboundConnectionHandler, OutboundConnectionHandler,
     },
-    crypto::TransportPublicKey,
     peer_connection::PeerConnection,
 };
 

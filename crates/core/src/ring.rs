@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 use std::hash::Hash;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::{
     cmp::Reverse,
     collections::BTreeMap,
@@ -322,7 +322,7 @@ impl Ring {
     pub fn open_connections(&self) -> usize {
         self.connection_manager
             .open_connections
-            .load(std::sync::atomic::Ordering::Acquire)
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     async fn refresh_router<ER: NetEventRegister>(router: Arc<RwLock<Router>>, register: ER) {
@@ -426,8 +426,31 @@ impl Ring {
             .record_request(recipient, target, request_type);
     }
 
-    pub async fn add_connection(&self, loc: Location, peer: PeerId) {
-        tracing::info!(%peer, this = ?self.connection_manager.get_peer_key(), "Adding connection to peer");
+    pub async fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) {
+        tracing::info!(%peer, this = ?self.connection_manager.get_peer_key(), %was_reserved, "Adding connection to peer");
+        debug_assert!(
+            self.connection_manager
+                .get_peer_key()
+                .expect("should be set")
+                != peer
+        );
+        if was_reserved {
+            let old = self
+                .connection_manager
+                .reserved_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(debug_assertions)]
+            {
+                tracing::debug!(old, "Decremented reserved connections");
+                if old == 0 {
+                    panic!("Underflow of reserved connections");
+                }
+            }
+            let _ = old;
+        }
+        self.connection_manager
+            .open_connections
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.event_register
             .register_events(Either::Left(NetEventLog::connected(
                 self,
@@ -457,7 +480,8 @@ impl Ring {
         let _ = topology_manager.refresh_cache(&cbl);
     }
 
-    pub fn is_connected<'a>(
+    /// Returns a filtered iterator for peers that are not connected to this node already.
+    pub fn is_not_connected<'a>(
         &self,
         peers: impl Iterator<Item = &'a PeerKeyLocation>,
     ) -> impl Iterator<Item = &'a PeerKeyLocation> + Send {
@@ -531,13 +555,10 @@ impl Ring {
     }
 
     pub async fn prune_connection(&self, peer: PeerId) {
-        #[cfg(debug_assertions)]
-        {
-            tracing::info!(%peer, "Removing connection");
-        }
+        tracing::debug!(%peer, "Removing connection");
         self.live_tx_tracker.prune_transactions_from_peer(&peer);
         // This case would be when a connection is being open, so peer location hasn't been recorded yet and we can ignore everything below
-        let Some(loc) = self.connection_manager.prune_connection(&peer) else {
+        let Some(loc) = self.connection_manager.prune_alive_connection(&peer) else {
             return;
         };
         {
@@ -716,7 +737,7 @@ impl Ring {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self, notifier))]
+    #[tracing::instrument(level = "debug", skip(self, notifier), fields(peer = %self.connection_manager.pub_key))]
     async fn acquire_new(
         &self,
         ideal_location: Location,
@@ -743,14 +764,20 @@ impl Ring {
             "Adding new connections"
         );
         let missing_connections = self.connection_manager.max_connections - self.open_connections();
+        let connected = self.connection_manager.connected_peers();
         let msg = connect::ConnectMsg::Request {
             id: Transaction::new::<connect::ConnectMsg>(),
+            target: query_target.clone(),
             msg: connect::ConnectRequest::FindOptimalPeer {
                 query_target,
                 ideal_location,
                 joiner,
                 max_hops_to_live: missing_connections,
-                skip_list: skip_list.iter().map(|p| (*p).clone()).collect(),
+                skip_list: skip_list
+                    .iter()
+                    .map(|p| (*p).clone())
+                    .chain(connected)
+                    .collect(),
             },
         };
         let id = *msg.id();
@@ -765,16 +792,17 @@ impl Ring {
 pub struct Location(f64);
 
 impl Location {
+    #[cfg(not(feature = "local-simulation"))]
     pub fn from_address(addr: &SocketAddr) -> Self {
         match addr.ip() {
-            IpAddr::V4(ipv4) => {
+            std::net::IpAddr::V4(ipv4) => {
                 let octets = ipv4.octets();
                 let combined_octets = (u32::from(octets[0]) << 16)
                     | (u32::from(octets[1]) << 8)
                     | u32::from(octets[2]);
                 Location(combined_octets as f64 / (u32::MAX as f64))
             }
-            IpAddr::V6(ipv6) => {
+            std::net::IpAddr::V6(ipv6) => {
                 let segments = ipv6.segments();
                 let combined_segments = (u64::from(segments[0]) << 32)
                     | (u64::from(segments[1]) << 16)
@@ -782,6 +810,12 @@ impl Location {
                 Location(combined_segments as f64 / (u64::MAX as f64))
             }
         }
+    }
+
+    #[cfg(feature = "local-simulation")]
+    pub fn from_address(_addr: &SocketAddr) -> Self {
+        let random_component: f64 = rand::random();
+        Location(random_component)
     }
 
     pub fn new(location: f64) -> Self {

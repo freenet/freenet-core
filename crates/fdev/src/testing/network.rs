@@ -21,8 +21,8 @@ use axum::{
     Router,
 };
 use freenet::dev_tool::{
-    EventChain, MemoryEventsGen, NetworkEventGenerator, NetworkPeer, NodeConfig, NodeLabel, PeerId,
-    PeerMessage, PeerStatus, SimNetwork,
+    EventChain, MemoryEventsGen, NetworkEventGenerator, NetworkPeer, NodeConfig, NodeLabel,
+    PeerMessage, PeerStatus, SimNetwork, TransportPublicKey,
 };
 use futures::{
     stream::{SplitSink, SplitStream},
@@ -178,17 +178,13 @@ async fn start_supervisor(config: &TestConfig) -> anyhow::Result<(), Error> {
 }
 
 async fn start_child(config: &TestConfig, cmd_config: &NetworkProcessConfig) -> Result<(), Error> {
-    std::env::set_var(
-        "FREENET_PEER_ID",
-        cmd_config.clone().id.expect("id should be set"),
-    );
-    freenet::config::set_logger(None, None);
-    if let Some(peer_id) = &cmd_config.id {
-        let peer = NetworkPeer::new(peer_id.clone()).await?;
-        peer.run(config, peer_id.clone()).await?;
-    } else {
+    let Some(peer_id) = &cmd_config.id else {
         bail!("Peer id not set");
-    }
+    };
+    std::env::set_var("FREENET_PEER_ID", peer_id);
+    freenet::config::set_logger(None, None);
+    let peer = NetworkPeer::new(peer_id.clone()).await?;
+    peer.run(config, peer_id.clone()).await?;
     Ok(())
 }
 
@@ -224,11 +220,11 @@ pub async fn run_network(
     supervisor.start_peer_gateways(&cmd_args).await?;
     supervisor.start_peer_nodes(&cmd_args).await?;
 
-    let peers: Vec<(NodeLabel, PeerId)> = supervisor
+    let peers: Vec<_> = supervisor
         .get_all_peers()
         .await
         .into_iter()
-        .map(|(label, config)| (label.clone(), config.get_peer_id().unwrap()))
+        .map(|(label, config)| (label.clone(), config.key_pair.public().clone()))
         .collect();
 
     let events_sender = supervisor.user_ev_controller.lock().await.clone();
@@ -376,7 +372,7 @@ async fn handle_outgoing_messages(
 ) -> anyhow::Result<()> {
     let mut event_rx = supervisor.event_rx.lock().await;
     while let Some((event, peer_id)) = event_rx.recv().await {
-        tracing::info!("Received event {} for peer {}", event, peer_id);
+        tracing::info!("Sending event {} to peer {}", event, peer_id);
         let serialized_msg: Vec<u8> = bincode::serialize(&(event, peer_id.clone()))
             .map_err(|e| anyhow!("Failed to serialize message: {}", e))?;
 
@@ -463,11 +459,11 @@ async fn handle_peer_message(
 
 pub struct Supervisor {
     peers_config: Arc<Mutex<HashMap<NodeLabel, NodeConfig>>>,
-    processes: Mutex<HashMap<PeerId, SubProcess>>,
+    processes: Mutex<HashMap<TransportPublicKey, SubProcess>>,
     waiting_peers: Arc<Mutex<VecDeque<usize>>>,
     waiting_gateways: Arc<Mutex<VecDeque<usize>>>,
-    user_ev_controller: Arc<Mutex<tokio::sync::mpsc::Sender<(u32, PeerId)>>>,
-    event_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<(u32, PeerId)>>>,
+    user_ev_controller: Arc<Mutex<tokio::sync::mpsc::Sender<(u32, TransportPublicKey)>>>,
+    event_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<(u32, TransportPublicKey)>>>,
 }
 
 impl Supervisor {
@@ -495,7 +491,7 @@ impl Supervisor {
         self.processes
             .lock()
             .await
-            .insert(config.get_peer_id().unwrap(), process);
+            .insert(config.key_pair.public().clone(), process);
         Ok(())
     }
 
@@ -601,7 +597,7 @@ pub trait Runnable {
 
 impl Runnable for NetworkPeer {
     async fn run(&self, config: &TestConfig, peer_id: String) -> anyhow::Result<()> {
-        let peer = self.config.get_peer_id().unwrap();
+        let peer = self.config.key_pair.public().clone();
         if self.config.is_gateway {
             tracing::info!(%peer, "Starting gateway {}", peer_id);
         } else {

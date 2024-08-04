@@ -7,6 +7,7 @@ use super::*;
 #[derive(Clone)]
 pub(crate) struct ConnectionManager {
     pub(super) open_connections: Arc<AtomicUsize>,
+    pub(super) reserved_connections: Arc<AtomicUsize>,
     pub(super) location_for_peer: Arc<RwLock<BTreeMap<PeerId, Location>>>,
     pub(super) topology_manager: Arc<RwLock<TopologyManager>>,
     pub(super) connections_by_location: Arc<RwLock<BTreeMap<Location, Vec<Connection>>>>,
@@ -16,9 +17,8 @@ pub(crate) struct ConnectionManager {
     pub(super) peer_key: Arc<Mutex<Option<PeerId>>>,
     pub min_connections: usize,
     pub max_connections: usize,
-    pub max_hops_to_live: usize,
     pub rnd_if_htl_above: usize,
-    pub_key: Arc<TransportPublicKey>,
+    pub pub_key: Arc<TransportPublicKey>,
 }
 
 #[cfg(test)]
@@ -28,7 +28,6 @@ impl ConnectionManager {
         let max_connections = Ring::DEFAULT_MAX_CONNECTIONS;
         let max_upstream_bandwidth = Ring::DEFAULT_MAX_UPSTREAM_BANDWIDTH;
         let max_downstream_bandwidth = Ring::DEFAULT_MAX_DOWNSTREAM_BANDWIDTH;
-        let max_hops_to_live = Ring::DEFAULT_MAX_HOPS_TO_LIVE;
         let rnd_if_htl_above = Ring::DEFAULT_RAND_WALK_ABOVE_HTL;
 
         Self::init(
@@ -36,9 +35,9 @@ impl ConnectionManager {
             max_downstream_bandwidth,
             min_connections,
             max_connections,
-            max_hops_to_live,
             rnd_if_htl_above,
             pub_key,
+            None,
         )
     }
 
@@ -75,12 +74,6 @@ impl ConnectionManager {
             Ring::DEFAULT_MAX_DOWNSTREAM_BANDWIDTH
         };
 
-        let max_hops_to_live = if let Some(v) = config.max_hops_to_live {
-            v
-        } else {
-            Ring::DEFAULT_MAX_HOPS_TO_LIVE
-        };
-
         let rnd_if_htl_above = if let Some(v) = config.rnd_if_htl_above {
             v
         } else {
@@ -92,9 +85,9 @@ impl ConnectionManager {
             max_downstream_bandwidth,
             min_connections,
             max_connections,
-            max_hops_to_live,
             rnd_if_htl_above,
             config.key_pair.public().clone(),
+            config.peer_id.clone(),
         )
     }
 
@@ -103,12 +96,18 @@ impl ConnectionManager {
         max_downstream_bandwidth: Rate,
         min_connections: usize,
         max_connections: usize,
-        max_hops_to_live: usize,
         rnd_if_htl_above: usize,
         pub_key: TransportPublicKey,
+        peerid: Option<PeerId>,
     ) -> Self {
-        // for location here consider -1 == None
-        let own_location = AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()));
+        let own_location = if let Some(peer_key) = &peerid {
+            // if the peer id is set, then the location must be set, since it is a gateway
+            let location = Location::from_address(&peer_key.addr);
+            AtomicU64::new(u64::from_le_bytes(location.0.to_le_bytes()))
+        } else {
+            // for location here consider -1 == None
+            AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()))
+        };
 
         let topology_manager = Arc::new(RwLock::new(TopologyManager::new(Limits {
             max_upstream_bandwidth,
@@ -121,12 +120,12 @@ impl ConnectionManager {
             connections_by_location: Arc::new(RwLock::new(BTreeMap::new())),
             location_for_peer: Arc::new(RwLock::new(BTreeMap::new())),
             open_connections: Arc::new(AtomicUsize::new(0)),
+            reserved_connections: Arc::new(AtomicUsize::new(0)),
             topology_manager,
             own_location: own_location.into(),
-            peer_key: Arc::new(Mutex::new(None)),
+            peer_key: Arc::new(Mutex::new(peerid)),
             min_connections,
             max_connections,
-            max_hops_to_live,
             rnd_if_htl_above,
             pub_key: Arc::new(pub_key),
         }
@@ -139,14 +138,24 @@ impl ConnectionManager {
     /// Will panic if the node checking for this condition has no location assigned.
     // FIXME: peer here should not be optional ever
     pub fn should_accept(&self, location: Location, peer: Option<&PeerId>) -> bool {
-        let open_conn = self
+        tracing::debug!("Checking if should accept connection");
+        let open = self
             .open_connections
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let total_conn = self
+            .reserved_connections
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + open;
+
+        if open == 0 {
+            // if this is the first connection, then accept it
+            return true;
+        }
 
         if let Some(peer_id) = peer {
             if self.location_for_peer.read().get(peer_id).is_some() {
                 // avoid connecting more than once to the same peer
-                self.open_connections
+                self.reserved_connections
                     .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 tracing::debug!(%peer_id, "Peer already connected");
                 return false;
@@ -161,9 +170,9 @@ impl ConnectionManager {
             || self.connections_by_location.read().contains_key(&location)
         {
             false
-        } else if open_conn < self.min_connections {
+        } else if total_conn < self.min_connections {
             true
-        } else if open_conn >= self.max_connections {
+        } else if total_conn >= self.max_connections {
             false
         } else {
             self.topology_manager
@@ -172,9 +181,10 @@ impl ConnectionManager {
                 .unwrap_or(true)
         };
         if !accepted {
-            self.open_connections
+            self.reserved_connections
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         } else if let Some(peer_id) = peer {
+            tracing::debug!(%peer_id, "Accepted connection, reserving spot");
             self.location_for_peer
                 .write()
                 .insert(peer_id.clone(), location);
@@ -232,20 +242,44 @@ impl ConnectionManager {
         }
     }
 
-    pub fn prune_connection(&self, peer: &PeerId) -> Option<Location> {
+    pub fn prune_alive_connection(&self, peer: &PeerId) -> Option<Location> {
+        self.prune_connection(peer, true)
+    }
+
+    pub fn prune_in_transit_connection(&self, peer: &PeerId) -> Option<Location> {
+        self.prune_connection(peer, false)
+    }
+
+    fn prune_connection(&self, peer: &PeerId, is_alive: bool) -> Option<Location> {
+        let connection_type = if is_alive { "active" } else { "in transit" };
+        tracing::debug!(%peer, "Pruning {} connection", connection_type);
+
         let Some(loc) = self.location_for_peer.write().remove(&peer) else {
-            self.open_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            if is_alive {
+                self.open_connections
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                self.reserved_connections
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
             return None;
         };
+
         let conns = &mut *self.connections_by_location.write();
         if let Some(conns) = conns.get_mut(&loc) {
             if let Some(pos) = conns.iter().position(|c| &c.location.peer == peer) {
                 conns.swap_remove(pos);
             }
         }
-        self.open_connections
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+
+        if is_alive {
+            self.open_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            self.reserved_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
         Some(loc)
     }
 
@@ -303,5 +337,10 @@ impl ConnectionManager {
 
     pub fn num_connections(&self) -> usize {
         self.connections_by_location.read().len()
+    }
+
+    pub(super) fn connected_peers<'a>(&'a self) -> impl Iterator<Item = PeerId> {
+        let read = self.location_for_peer.read();
+        read.keys().cloned().collect::<Vec<_>>().into_iter()
     }
 }

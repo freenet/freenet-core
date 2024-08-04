@@ -304,7 +304,7 @@ pub(crate) enum NodeEvent {
     ConnectPeer {
         peer: PeerId,
         tx: Transaction,
-        callback: tokio::sync::mpsc::Sender<Result<(), ()>>,
+        callback: tokio::sync::mpsc::Sender<Result<PeerId, ()>>,
         is_gw: bool,
     },
     Disconnect {
