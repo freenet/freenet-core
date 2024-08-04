@@ -35,6 +35,14 @@ pub(crate) struct ConnectOp {
 }
 
 impl ConnectOp {
+    pub fn new(id: Transaction, state: Option<ConnectState>, gateway: Option<Box<PeerKeyLocation>>, backoff: Option<ExponentialBackoff>) -> Self {
+        Self {
+            id,
+            state,
+            gateway,
+            backoff,
+        }
+    }
     pub fn has_backoff(&self) -> bool {
         self.backoff.is_some()
     }
@@ -568,7 +576,7 @@ where
 type Requester = PeerKeyLocation;
 
 #[derive(Debug)]
-pub(crate) enum ConnectState {
+pub enum ConnectState {
     Initializing,
     ConnectingToNode(ConnectionInfo),
     AwaitingConnectivity(ConnectivityInfo),
@@ -584,7 +592,7 @@ pub(crate) struct ConnectivityInfo {
 }
 
 impl ConnectivityInfo {
-    fn new(requester: Requester, remaining_checks: usize) -> Self {
+    pub fn new(requester: Requester, remaining_checks: usize) -> Self {
         Self {
             requester,
             remaining_checks,

@@ -38,6 +38,9 @@ use crate::{
     ring::PeerKeyLocation,
     tracing::NetEventLog,
 };
+use crate::operations::connect::{ConnectivityInfo, ConnectMsg, ConnectOp, ConnectRequest, ConnectState};
+use crate::operations::OpEnum;
+use crate::ring::Location;
 
 type P2pBridgeEvent = Either<(PeerId, Box<NetMessage>), NodeEvent>;
 
@@ -193,6 +196,26 @@ impl P2pConnManager {
                         )
                         .await?;
                     }
+                    ConnEvent::OutboundMessage(msg) => {
+                        match msg.target() {
+                            Some(target_peer) => {
+                                match self.connections.get(&target_peer.peer) {
+                                    Some(peer_connection) => {
+                                        if let Err(e) = peer_connection.send(Left(msg)).await {
+                                            tracing::error!("Failed to send message to peer: {}", e);
+                                        }
+                                    }
+                                    None => {
+                                        tracing::error!("No existing outbound connection to forward the message to {}", target_peer.peer);
+                                    }
+                                }
+                            }
+                            None => {
+                                tracing::error!("No target peer specified to forward the message");
+                            }
+                        }
+                    }
+
                     ConnEvent::HandshakeAction(action) => {
                         self.handle_handshake_action(action, &mut state).await?;
                     }
@@ -382,12 +405,39 @@ impl P2pConnManager {
         state: &mut EventListenerState,
     ) -> anyhow::Result<()> {
         match event {
-            HandshakeEvent::InboundConnection(InboundJoinRequest { conn, joiner, .. }) => {
+            HandshakeEvent::InboundConnection(InboundJoinRequest { id, conn, joiner, hops_to_live, .. }) => {
                 let (tx, rx) = mpsc::channel(1);
-                self.connections.insert(joiner, tx);
+                self.connections.insert(joiner.clone(), tx);
                 let task = peer_connection_listener(rx, conn).boxed();
                 state.peer_connections.push(task);
-                todo!("Need to add the operation to the op_manager properly, in the correct state")
+
+                let assigned_location = Location::from_address(&joiner.addr);
+                let new_joiner_loc = PeerKeyLocation {
+                    location: Some(assigned_location),
+                    peer: joiner.clone(),
+                };
+
+                let connect_op = ConnectOp::new(
+                    id,
+                    Some(ConnectState::AwaitingConnectivity(ConnectivityInfo::new(
+                        self.bridge.op_manager.ring.connection_manager.own_location(),
+                        hops_to_live
+                    ))),
+                    None,
+                    None
+                );
+
+                let check_msg = ConnectMsg::Request {
+                    id,
+                    msg: ConnectRequest::CheckConnectivity {
+                        sender: self.bridge.op_manager.ring.connection_manager.own_location(),
+                        joiner: new_joiner_loc,
+                        hops_to_live,
+                        max_hops_to_live: hops_to_live,
+                        skip_list: vec![joiner],
+                    },
+                };
+                self.bridge.op_manager.notify_op_change(NetMessage::V1(NetMessageV1::Connect(check_msg)), OpEnum::Connect(Box::new(connect_op))).await?;
             }
             HandshakeEvent::TransientForwardTransaction {
                 target,
@@ -507,7 +557,7 @@ impl P2pConnManager {
         msg: Option<Either<NetMessage, NodeEvent>>,
     ) -> EventResult {
         match msg {
-            Some(Left(msg)) => EventResult::Event(ConnEvent::InboundMessage(msg)), // FIXME: this is not inbound, is outbound
+            Some(Left(msg)) => EventResult::Event(ConnEvent::OutboundMessage(msg)),
             Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action)),
             None => EventResult::Continue,
         }
@@ -515,7 +565,7 @@ impl P2pConnManager {
 
     async fn handle_bridge_msg(&self, msg: Option<P2pBridgeEvent>) -> EventResult {
         match msg {
-            Some(Left((_, msg))) => EventResult::Event(ConnEvent::InboundMessage(*msg)),
+            Some(Left((_, msg))) => EventResult::Event(ConnEvent::OutboundMessage(*msg)),
             Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action)),
             None => EventResult::Event(ConnEvent::ClosedChannel),
         }
@@ -628,6 +678,7 @@ enum EventResult {
 #[derive(Debug)]
 enum ConnEvent {
     InboundMessage(NetMessage),
+    OutboundMessage(NetMessage),
     HandshakeAction(HandshakeEvent),
     NodeAction(NodeEvent),
     ClosedChannel,
