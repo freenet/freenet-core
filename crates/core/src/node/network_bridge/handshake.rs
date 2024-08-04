@@ -1292,7 +1292,7 @@ mod tests {
         let peer_peer_id = PeerId::new(peer_addr, peer_pub_key.clone());
 
         let gw_test_controller = async {
-            // the connection to the gw with the third-party peer is establoshed first
+            // the connection to the gw with the third-party peer is established first
             gw_test.transport.new_conn(peer_addr).await;
             gw_test
                 .transport
@@ -1671,6 +1671,44 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_to_peer_outbound_conn_succeeded() -> anyhow::Result<()> {
-        todo!()
+        let addr: SocketAddr = ([127, 0, 0, 1], 10001).into();
+        let (mut handler, mut test) = config_handler(addr);
+
+        let peer_key = TransportKeypair::new();
+        let peer_pub_key = peer_key.public().clone();
+        let peer_addr = ([127, 0, 0, 2], 10002).into();
+        let peer_peer_id = PeerId::new(peer_addr, peer_pub_key.clone());
+
+        let tx = Transaction::new::<ConnectMsg>();
+
+        let test_controller = async {
+            let open_connection =
+                start_conn(&mut test, peer_addr, peer_pub_key.clone(), tx, false).await;
+            test.transport
+                .new_outbound_conn(peer_addr, open_connection)
+                .await;
+
+            Ok::<_, anyhow::Error>(())
+        };
+
+        let peer_inbound = async {
+            let event =
+                tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
+            match event {
+                Event::OutboundConnectionSuccessful {
+                    peer_id,
+                    connection,
+                } => {
+                    assert_eq!(peer_id.addr, peer_addr);
+                    assert_eq!(peer_id.pub_key, peer_pub_key);
+                    drop(connection);
+                    Ok(())
+                }
+                other => bail!("Unexpected event: {:?}", other),
+            }
+        };
+
+        futures::try_join!(test_controller, peer_inbound)?;
+        Ok(())
     }
 }

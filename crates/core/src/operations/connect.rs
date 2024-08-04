@@ -224,7 +224,7 @@ impl Operation for ConnectOp {
                         return_msg = None;
                     }
                 }
-                
+
                 ConnectMsg::Request {
                     id,
                     msg:
