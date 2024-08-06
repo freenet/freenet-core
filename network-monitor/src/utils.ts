@@ -37,6 +37,8 @@ export const parse_put_msg_data = (
 
     let change_type = get_change_type(changeType)!;
 
+    let contract_location = put_request_obj.contractLocation()!;
+
     return {
         transaction,
         contract_id,
@@ -44,6 +46,7 @@ export const parse_put_msg_data = (
         requester,
         change_type,
         timestamp,
+        contract_location,
     };
 };
 

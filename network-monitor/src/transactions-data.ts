@@ -15,7 +15,8 @@ export function handlePutRequest(
     target: string,
     requester: string,
     change_type: ChangeType,
-    timestamp: number
+    timestamp: number,
+    contract_location: number
 ) {
     console.log("Put Request");
     console.log("tx", transaction_id);
@@ -26,6 +27,7 @@ export function handlePutRequest(
         "formatted timestamp",
         new Date(parseInt(timestamp.toString()) * 1000).toUTCString()
     );
+    console.log("contract location", contract_location);
 
     let obj_data = {
         change_type,
@@ -36,6 +38,7 @@ export function handlePutRequest(
         unique_id:
             transaction_id + contract_id + target + requester + change_type,
         timestamp,
+        contract_location,
     } as TransactionData;
 
     if (
@@ -61,7 +64,8 @@ export function handlePutSuccess(
     target: string,
     requester: string,
     change_type: ChangeType,
-    timestamp: number
+    timestamp: number,
+    contract_location: number
 ) {
     console.log("Put Success");
     console.log("tx", transaction_id);
@@ -69,6 +73,7 @@ export function handlePutSuccess(
     console.log("target", target);
     console.log("requester", requester);
     console.log("timestamp", timestamp);
+    console.log("contract location", contract_location);
 
     let obj_data = {
         change_type,
@@ -82,6 +87,7 @@ export function handlePutSuccess(
         unique_id:
             transaction_id + contract_id + target + requester + change_type,
         timestamp,
+        contract_location,
     } as TransactionData;
 
     if (

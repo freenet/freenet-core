@@ -216,3 +216,46 @@ const mock_peers_in_tx: TxPeersTableInterface = {
         },
     ],
 };
+
+let another_ring_mock_data = [
+    {
+        id: new PeerId("1"),
+        currentLocation: 0.123485,
+        connectionTimestamp: 1234567890,
+        connections: [],
+        history: [],
+        locationHistory: [],
+    },
+    {
+        id: new PeerId("2"),
+        currentLocation: 0.183485,
+        connectionTimestamp: 1234567890,
+        connections: [],
+        history: [],
+        locationHistory: [],
+    },
+    {
+        id: new PeerId("3"),
+        currentLocation: 0.323485,
+        connectionTimestamp: 1234567890,
+        connections: [],
+        history: [],
+        locationHistory: [],
+    },
+    {
+        id: new PeerId("4"),
+        currentLocation: 0.423485,
+        connectionTimestamp: 1234567890,
+        connections: [],
+        history: [],
+        locationHistory: [],
+    },
+    {
+        id: new PeerId("5"),
+        currentLocation: 0.783285,
+        connectionTimestamp: 1234567890,
+        connections: [],
+        history: [],
+        locationHistory: [],
+    },
+];

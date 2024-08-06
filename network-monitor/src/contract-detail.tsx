@@ -134,6 +134,9 @@ const ContractPeersHistory = ({
                             )}
                         </th>
                         <th>
+                            Contract Location
+                        </th>
+                        <th>
                             Transaction Id
                             {check_if_contains_filter("transaction_id") && (
                                 <button
@@ -201,6 +204,9 @@ const ContractPeersHistory = ({
                                 }}
                             >
                                 {tx.contract_id.slice(-8)}
+                            </td>
+                            <td>
+                                {tx.contract_location}
                             </td>
                             <td
                                 onClick={() =>
@@ -336,6 +342,7 @@ export const ContractDetail = ({
             <h2>Contract Details</h2>
             <div id="transaction-detail-contents">
                 <p>Contract Key {transaction.contract_id}</p>
+                <p>Contract Location {transaction.contract_location}</p>
                 <p>Requester {transaction.requester}</p>
                 <p>Target {transaction.target}</p>
                 {/*<p>Status {transaction.status}</p>

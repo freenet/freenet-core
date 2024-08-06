@@ -18,6 +18,7 @@ export type TransactionData = {
     finalized: string | null;
     unique_id: string;
     timestamp: number;
+    contract_location: number;
 };
 
 export interface TransactionInterface {

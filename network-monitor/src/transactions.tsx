@@ -20,6 +20,7 @@ const TransactionsTable = ({ open_tx_detail, tx_list }: TxTableInterface) => (
                 <th>Target Peer Id</th>
                 <th>Type</th>
                 <th>Contract Key</th>
+                <th>Contract Location</th>
                 <th>Timestamp</th>
                 {/*<th>Status</th>
                 <th>Started</th>
@@ -28,14 +29,16 @@ const TransactionsTable = ({ open_tx_detail, tx_list }: TxTableInterface) => (
         </thead>
         <tbody id="transactions-history-b">
             {
-                tx_list?.map((tx, index) => (
+                tx_list?.map((tx: TransactionData, index) => (
                     <tr key={`${tx.transaction_id.slice(-8)}-${tx.change_type.slice(-8)}-${index}`}>
                         <td  onClick={() => open_tx_detail(tx.transaction_id)} style={{cursor: "pointer"}}>{tx.transaction_id.slice(-8)}</td>
                         <td>{tx.requester.slice(-8)}</td>
                         <td>{tx.target.slice(-8)}</td>
                         <td>{tx.change_type}</td>
                         <td>{tx.contract_id.slice(-8)}</td>
+                        <td>{tx.contract_location}</td>
                         <td>{rust_timestamp_to_utc_string(tx.timestamp)}</td>
+
                         {/*<td>{tx.status}</td>
                         <td>{tx.started}</td>
                         <td>{tx.finalized}</td>*/}

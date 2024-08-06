@@ -72,48 +72,6 @@ const TransactionPeersHistory = ({
     useEffect(() => {
         update_filtered_list();
 
-        let ring_mock_data = [
-            {
-                id: new PeerId("1"),
-                currentLocation: 0.123485,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-            {
-                id: new PeerId("2"),
-                currentLocation: 0.183485,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-            {
-                id: new PeerId("3"),
-                currentLocation: 0.323485,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-            {
-                id: new PeerId("4"),
-                currentLocation: 0.423485,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-            {
-                id: new PeerId("5"),
-                currentLocation: 0.783285,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-        ];
 
         // ringHistogram(ring_mock_data);
 
@@ -203,6 +161,9 @@ const TransactionPeersHistory = ({
                             )}
                         </th>
                         <th>
+                            Contract Location
+                        </th>
+                        <th>
                             Timestamp
                         </th>
                     </tr>
@@ -259,6 +220,9 @@ const TransactionPeersHistory = ({
                                 }}
                             >
                                 {tx.contract_id.slice(-8)}
+                            </td>
+                            <td>
+                                {tx.contract_location}
                             </td>
                             <td>
                                 {rust_timestamp_to_utc_string(tx.timestamp)}
@@ -362,6 +326,7 @@ const TransactionDetail = ({
                 <p>Requester {transaction.requester}</p>
                 <p>Target {transaction.target}</p>
                 <p>Contract Key {transaction.contract_id}</p>
+                <p>Contract Location {transaction.contract_location}</p>
             </div>
 
             <div>

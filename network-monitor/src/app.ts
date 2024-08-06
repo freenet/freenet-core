@@ -9,6 +9,8 @@ let connection_established = false;
 const ws_connection_interval = setInterval(() => {
     if (!connection_established) {
         try {
+            console.log("Attempting to establish WS Connection");
+
             const socket = new WebSocket(
                 "ws://127.0.0.1:55010/pull-stats/peer-changes/"
             );
@@ -36,11 +38,16 @@ function handleChanges(event: MessageEvent) {
         .then((uint8Array) => {
             const buf = new flatbuffers.ByteBuffer(uint8Array);
 
+            let errors = [];
+
             try {
                 const contractChange =
                     fbTopology.ContractChange.getRootAsContractChange(buf);
 
-                console.log(contractChange.changeType());
+                console.log(
+                    "contract change type =",
+                    contractChange.changeType()
+                );
 
                 if (
                     contractChange.changeType() ===
@@ -53,6 +60,7 @@ function handleChanges(event: MessageEvent) {
                         requester,
                         change_type,
                         timestamp,
+                        contract_location,
                     } = parse_put_msg_data(
                         contractChange,
                         fbTopology.ContractChangeType.PutRequest
@@ -64,7 +72,8 @@ function handleChanges(event: MessageEvent) {
                         target,
                         requester,
                         change_type,
-                        timestamp
+                        timestamp,
+                        contract_location
                     );
 
                     return;
@@ -81,6 +90,7 @@ function handleChanges(event: MessageEvent) {
                         requester,
                         change_type,
                         timestamp,
+                        contract_location,
                     } = parse_put_msg_data(
                         contractChange,
                         fbTopology.ContractChangeType.PutSuccess
@@ -92,7 +102,8 @@ function handleChanges(event: MessageEvent) {
                         target,
                         requester,
                         change_type,
-                        timestamp
+                        timestamp,
+                        contract_location
                     );
 
                     return;
@@ -132,7 +143,7 @@ function handleChanges(event: MessageEvent) {
                     return;
                 }
             } catch (e) {
-                console.error(e);
+                errors.push(e);
             }
 
             try {
@@ -141,7 +152,13 @@ function handleChanges(event: MessageEvent) {
                 handleChange(peerChange);
 
                 return;
-            } catch (e) {}
+            } catch (e) {
+                errors.push(e);
+            }
+
+            if (errors.length > 0) {
+                console.error("Failed to handle message:", errors);
+            }
         })
         .catch((error) => {
             console.error("Failed to handle message:", error);
