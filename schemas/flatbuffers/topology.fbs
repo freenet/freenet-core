@@ -48,6 +48,7 @@ table PutRequest {
   requester: string(required);
   target: string(required);
   timestamp: uint64;
+  contract_location: float64;
 }
 
 table UpdateRequest {
@@ -63,6 +64,7 @@ table PutSuccess {
   target: string(required);
   key: string(required);
   timestamp: uint64;
+  contract_location: float64;
 }
 
 table PutFailure {
