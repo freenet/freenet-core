@@ -44,28 +44,23 @@ function handleChanges(event: MessageEvent) {
                 const contractChange =
                     fbTopology.ContractChange.getRootAsContractChange(buf);
 
-                console.log(
-                    "contract change type =",
-                    contractChange.changeType()
+                let {
+                    transaction,
+                    contract_id,
+                    target,
+                    requester,
+                    change_type,
+                    timestamp,
+                    contract_location,
+                } = parse_put_msg_data(
+                    contractChange,
+                    fbTopology.ContractChangeType.PutRequest
                 );
 
                 if (
                     contractChange.changeType() ===
                     fbTopology.ContractChangeType.PutRequest
                 ) {
-                    let {
-                        transaction,
-                        contract_id,
-                        target,
-                        requester,
-                        change_type,
-                        timestamp,
-                        contract_location,
-                    } = parse_put_msg_data(
-                        contractChange,
-                        fbTopology.ContractChangeType.PutRequest
-                    );
-
                     handlePutRequest(
                         transaction,
                         contract_id,
@@ -83,19 +78,6 @@ function handleChanges(event: MessageEvent) {
                     contractChange.changeType() ===
                     fbTopology.ContractChangeType.PutSuccess
                 ) {
-                    let {
-                        transaction,
-                        contract_id,
-                        target,
-                        requester,
-                        change_type,
-                        timestamp,
-                        contract_location,
-                    } = parse_put_msg_data(
-                        contractChange,
-                        fbTopology.ContractChangeType.PutSuccess
-                    );
-
                     handlePutSuccess(
                         transaction,
                         contract_id,
@@ -113,24 +95,7 @@ function handleChanges(event: MessageEvent) {
                     contractChange.changeType() ===
                     fbTopology.ContractChangeType.PutFailure
                 ) {
-                    let {
-                        transaction,
-                        contract_id,
-                        target,
-                        requester,
-                        change_type,
-                        timestamp,
-                    } = parse_put_msg_data(
-                        contractChange,
-                        fbTopology.ContractChangeType.PutFailure
-                    );
-
                     console.log("Put Failure");
-                    console.log("tx", transaction);
-                    console.log("contract key", contract_id);
-                    console.log("target", target);
-                    console.log("requester", requester);
-                    console.log("timestamp", timestamp);
 
                     // handlePutSuccess(
                     //     transaction,

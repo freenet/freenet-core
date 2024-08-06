@@ -25,13 +25,29 @@ export const parse_put_msg_data = (
 ): any => {
     let put_request_obj = contractChange.change(new fbTopology.PutRequest());
 
-    let transaction = put_request_obj.transaction()!;
+    let transaction = put_request_obj.transaction();
 
-    let contract_id = contractChange.contractId()!;
+    if (!transaction) {
+        throw new Error("Transaction ID not found");
+    }
 
-    let target = put_request_obj.target()!;
+    let contract_id = contractChange.contractId();
 
-    let requester = put_request_obj.requester()!;
+    if (!contract_id) {
+        throw new Error("Contract ID not found");
+    }
+
+    let target = put_request_obj.target();
+
+    if (!target) {
+        throw new Error("Target Peer not found");
+    }
+
+    let requester = put_request_obj.requester();
+
+    if (!requester) {
+        throw new Error("Requester Peer not found");
+    }
 
     let timestamp = put_request_obj.timestamp()!;
 
