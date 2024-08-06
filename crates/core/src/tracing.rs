@@ -805,12 +805,14 @@ async fn send_to_metrics_server(
             target,
             timestamp,
         }) => {
+            let contract_location = Location::from_contract_key(key.as_bytes());
             let msg = ContractChange::put_request_msg(
                 send_msg.tx.to_string(),
                 key.to_string(),
                 requester.to_string(),
                 target.peer.to_string(),
                 *timestamp,
+                contract_location.as_f64(),
             );
             ws_stream.send(Message::Binary(msg)).await
         }
@@ -821,12 +823,15 @@ async fn send_to_metrics_server(
             key,
             timestamp,
         }) => {
+            let contract_location = Location::from_contract_key(key.as_bytes());
+
             let msg = ContractChange::put_success_msg(
                 send_msg.tx.to_string(),
                 key.to_string(),
                 requester.to_string(),
                 target.peer.to_string(),
                 *timestamp,
+                contract_location.as_f64(),
             );
             ws_stream.send(Message::Binary(msg)).await
         }

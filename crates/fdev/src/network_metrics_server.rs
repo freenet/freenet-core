@@ -13,7 +13,7 @@ use axum::{
 };
 use dashmap::DashMap;
 use freenet::{
-    dev_tool::{PeerId, Transaction},
+    dev_tool::{Location, PeerId, Transaction},
     generated::{
         topology::ControllerResponse, ChangesWrapper, ContractChange, PeerChange, TryFromFbs,
     },
@@ -79,6 +79,7 @@ async fn run_server(
             changes,
             peer_data: DashMap::new(),
             transactions_data: DashMap::new(),
+            _contract_data: DashMap::new(),
         }));
 
     tracing::info!("Starting metrics server on port {port}");
@@ -230,9 +231,17 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                 requester,
                 target,
                 timestamp,
+                contract_location,
             } => {
                 tracing::debug!(%tx_id, %key, %requester, %target, "sending put request");
-                let msg = ContractChange::put_request_msg(tx_id, key, requester, target, timestamp);
+                let msg = ContractChange::put_request_msg(
+                    tx_id,
+                    key,
+                    requester,
+                    target,
+                    timestamp,
+                    contract_location,
+                );
                 tx.send(Message::Binary(msg)).await?;
             }
             Change::PutSuccess {
@@ -240,9 +249,16 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                 key,
                 target,
                 timestamp,
+                contract_location,
             } => {
-                let msg =
-                    ContractChange::put_success_msg(tx_id, key, target.clone(), target, timestamp);
+                let msg = ContractChange::put_success_msg(
+                    tx_id,
+                    key,
+                    target.clone(),
+                    target,
+                    timestamp,
+                    contract_location,
+                );
                 tx.send(Message::Binary(msg)).await?;
             }
         }
@@ -254,6 +270,7 @@ struct ServerState {
     changes: tokio::sync::broadcast::Sender<Change>,
     peer_data: DashMap<PeerId, PeerData>,
     transactions_data: DashMap<String, Vec<String>>,
+    _contract_data: DashMap<String, Vec<String>>,
 }
 
 struct PeerData {
@@ -280,12 +297,14 @@ pub(crate) enum Change {
         requester: String,
         target: String,
         timestamp: u64,
+        contract_location: f64,
     },
     PutSuccess {
         tx_id: String,
         key: String,
         target: String,
         timestamp: u64,
+        contract_location: f64,
     },
 }
 
@@ -386,6 +405,19 @@ impl ServerState {
                 let requester = change.requester().to_string();
                 let target = change.target().to_string();
                 let timestamp = change.timestamp();
+                let contract_location = change.contract_location();
+
+                if tx_id.is_empty() {
+                    return Err(anyhow::anyhow!("tx_id is empty"));
+                }
+
+                if key.is_empty() {
+                    return Err(anyhow::anyhow!("key is empty"));
+                }
+
+                if requester.is_empty() {
+                    return Err(anyhow::anyhow!("requester is empty"));
+                }
 
                 if let Some(mut entry) = self.transactions_data.get_mut(&tx_id) {
                     tracing::error!(
@@ -405,14 +437,13 @@ impl ServerState {
 
                 tracing::debug!(%tx_id, %key, %requester, %target, "checking values from save_record -- putrequest");
 
-                println!("{:?}", change);
-
                 let _ = self.changes.send(Change::PutRequest {
                     tx_id,
                     key,
                     requester,
                     target,
                     timestamp,
+                    contract_location,
                 });
             }
             ChangesWrapper::ContractChange(ContractChange::PutSuccess(change)) => {
@@ -421,6 +452,19 @@ impl ServerState {
                 let requester = change.requester().to_string();
                 let target = change.target().to_string();
                 let timestamp = change.timestamp();
+                let contract_location = change.contract_location();
+
+                if tx_id.is_empty() {
+                    return Err(anyhow::anyhow!("tx_id is empty"));
+                }
+
+                if key.is_empty() {
+                    return Err(anyhow::anyhow!("key is empty"));
+                }
+
+                if requester.is_empty() {
+                    return Err(anyhow::anyhow!("requester is empty"));
+                }
 
                 if let Some(mut entry) = self.transactions_data.get_mut(&tx_id) {
                     entry.push(format!(
@@ -432,15 +476,20 @@ impl ServerState {
                     unreachable!()
                 }
 
-                tracing::debug!(%tx_id, %key, %requester, %target, "checking values from save_record -- putsuccess");
+                // if let Some(mut entry) = self.contract_data.get_mut(&key) {
+                //     entry.push();
+                // } else {
+                //     self.contract_data.insert();
+                // }
 
-                println!("{:?}", change);
+                tracing::debug!(%tx_id, %key, %requester, %target, "checking values from save_record -- putsuccess");
 
                 let _ = self.changes.send(Change::PutSuccess {
                     tx_id,
                     key,
                     target,
                     timestamp,
+                    contract_location,
                 });
             }
 
