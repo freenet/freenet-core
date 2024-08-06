@@ -7,6 +7,7 @@ import {
 } from "./type_definitions";
 import { PeerId } from "./topology";
 import { another_ring_visualization } from "./ring-visualization";
+import {rust_timestamp_to_utc_string} from "./utils";
 
 interface TransactionDetailPeersHistoryInterface {
     tx_peer_list: Array<TransactionData>;
@@ -27,6 +28,8 @@ const ContractPeersHistory = ({
 }: TransactionDetailPeersHistoryInterface) => {
     const [filter, set_filter] = useState<FilterDictionaryInterface>({});
     const [filtered_list, set_filtered_list] = useState(tx_peer_list);
+    const [order_by, set_order_by] = useState<string>("timestamp");
+    const [order_direction, set_order_direction] = useState<string>("asc");
 
     const add_filter = (filter_type: string, filter_value: string) => {
         if (check_if_contains_filter(filter_type)) {
@@ -57,6 +60,18 @@ const ContractPeersHistory = ({
             });
         });
 
+        filtered_list = filtered_list.sort((a, b) => {
+            if (order_by === "timestamp") {
+                if (order_direction === "asc") {
+                    return a.timestamp > b.timestamp ? 1 : -1;
+                } else {
+                    return a.timestamp < b.timestamp ? 1 : -1;
+                }
+            } else {
+                return 0;
+            }
+        });
+
         set_filtered_list(filtered_list);
     };
 
@@ -72,48 +87,6 @@ const ContractPeersHistory = ({
     useEffect(() => {
         update_filtered_list();
 
-        let ring_mock_data = [
-            {
-                id: new PeerId("1"),
-                currentLocation: 0.123485,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-            {
-                id: new PeerId("2"),
-                currentLocation: 0.183485,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-            {
-                id: new PeerId("3"),
-                currentLocation: 0.323485,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-            {
-                id: new PeerId("4"),
-                currentLocation: 0.423485,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-            {
-                id: new PeerId("5"),
-                currentLocation: 0.783285,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-        ];
 
         // ringHistogram(ring_mock_data);
 
@@ -122,7 +95,7 @@ const ContractPeersHistory = ({
         // );
 
         // ringVisualization(ring_mock_data[0], graphContainer, 1.25);
-    }, [filter]);
+    }, [filter, order_by, order_direction]);
 
     const check_if_contains_filter = (filter_type: string) => {
         return filter[filter_type] !== undefined;
@@ -202,6 +175,18 @@ const ContractPeersHistory = ({
                                 </button>
                             )}
                         </th>
+                        <th>
+                            Timestamp
+                            <button
+                                onClick={() => {
+                                    set_order_by("timestamp");
+                                    set_order_direction(
+                                        order_direction === "asc" ? "desc" : "asc"
+                                    );
+                                }}
+                            >{order_direction}</button>
+
+                        </th>
                     </tr>
                 </thead>
                 <tbody id="transaction-peers-history-b">
@@ -256,6 +241,9 @@ const ContractPeersHistory = ({
                                 }}
                             >
                                 {tx.change_type}
+                            </td>
+                            <td>
+                                {rust_timestamp_to_utc_string(tx.timestamp)}
                             </td>
                         </tr>
                     ))}

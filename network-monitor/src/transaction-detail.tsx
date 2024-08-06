@@ -6,6 +6,7 @@ import {
     TransactionData
 } from "./type_definitions";
 import { PeerId } from "./topology";
+import {rust_timestamp_to_utc_string} from "./utils";
 
 interface TransactionDetailPeersHistoryInterface {
     tx_peer_list: Array<TransactionData>;
@@ -260,7 +261,8 @@ const TransactionPeersHistory = ({
                                 {tx.contract_id.slice(-8)}
                             </td>
                             <td>
-                                {tx.timestamp.toString()}
+                                {rust_timestamp_to_utc_string(tx.timestamp)}
+                                
                             </td>
                         </tr>
                     ))}

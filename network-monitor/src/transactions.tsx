@@ -4,176 +4,10 @@ import TransactionDetail from "./transaction-detail";
 import { all_tx} from "./transactions-data";
 import {TransactionInterface, TransactionStatus, TransactionType, TransactionData, TxPeersTableInterface, OpState, MessageType, TxTableInterface, TransactionPeerInterface, ChangeType } from "./type_definitions";
 import {another_ring_visualization} from "./ring-visualization";
+import {rust_timestamp_to_utc_string} from "./utils";
 
 
 
-const mock_transaction: Array<TransactionInterface> = [
-    {
-        id: "123",
-        peer_id: "0xabc",
-        type: ChangeType.PUT_SUCCESS,
-        status: TransactionStatus.Finalized,
-        started: "12-01-2024",
-        finalized: "13-01-2024",
-        contract_id: "0x123",
-    },
-    {
-        id: "124",
-        peer_id: "0xdef",
-        type: ChangeType.PUT_SUCCESS,
-        status: TransactionStatus.Received,
-        started: "12-01-2024",
-        finalized: "13-01-2024",
-        contract_id: "0x4892",
-    },
-    {
-        id: "125",
-        peer_id: "0xabc",
-        type: ChangeType.PUT_REQUEST,
-        status: TransactionStatus.Ongoing,
-        started: "12-02-2024",
-        finalized: "13-02-2024",
-        contract_id: "0x783",
-    },
-];
-
-
-const mock_peers_in_tx: TxPeersTableInterface = {
-    "123": [
-        // create a mock object
-        {
-            peer_id: "0xabc",
-            location: "0.1789234",
-            last_state: OpState.BroadcastOngoing,
-            last_message: MessageType.Broadcasting,
-            started: "12-01-2024",
-            finalized: "13-01-2024",
-        },
-        {
-            peer_id: "0xdef",
-            location: "0.16234",
-            last_state: OpState.Finished,
-            last_message: MessageType.SuccessfulUpdate,
-            started: "18-01-2024",
-            finalized: "19-01-2024",
-        },
-        {
-            peer_id: "0xghi",
-            location: "0.234234",
-            last_state: OpState.AwaitingResponse,
-            last_message: MessageType.RequestUpdate,
-            started: "19-01-2024",
-            finalized: "20-01-2024",
-        },
-        {
-            peer_id: "0xjkl",
-            location: "0.267127",
-            last_state: OpState.AwaitingResponse,
-            last_message: MessageType.RequestUpdate,
-            started: "21-01-2024",
-            finalized: "22-01-2024",
-        },
-        {
-            peer_id: "0xdef",
-            location: "0.1789234",
-            last_state: OpState.BroadcastOngoing,
-            last_message: MessageType.Broadcasting,
-            started: "12-01-2024",
-            finalized: "13-01-2024",
-        },
-        {
-            peer_id: "0xabc",
-            location: "0.16234",
-            last_state: OpState.Finished,
-            last_message: MessageType.SuccessfulUpdate,
-            started: "18-01-2024",
-            finalized: "19-01-2024",
-        },
-        {
-            peer_id: "0xjkl",
-            location: "0.234234",
-            last_state: OpState.AwaitingResponse,
-            last_message: MessageType.RequestUpdate,
-            started: "19-01-2024",
-            finalized: "20-01-2024",
-        },
-        {
-            peer_id: "0xghi",
-            location: "0.267127",
-            last_state: OpState.AwaitingResponse,
-            last_message: MessageType.RequestUpdate,
-            started: "21-01-2024",
-            finalized: "22-01-2024",
-        },
-    ],
-    "124": [
-        {
-            peer_id: "0xdef",
-            location: "0.1789234",
-            last_state: OpState.BroadcastOngoing,
-            last_message: MessageType.Broadcasting,
-            started: "12-01-2024",
-            finalized: "13-01-2024",
-        },
-        {
-            peer_id: "0xabc",
-            location: "0.16234",
-            last_state: OpState.Finished,
-            last_message: MessageType.SuccessfulUpdate,
-            started: "18-01-2024",
-            finalized: "19-01-2024",
-        },
-        {
-            peer_id: "0xghi",
-            location: "0.234234",
-            last_state: OpState.ReceivedRequest,
-            last_message: MessageType.BroadcastTo,
-            started: "19-01-2024",
-            finalized: "20-01-2024",
-        },
-        {
-            peer_id: "0xjkl",
-            location: "0.267127",
-            last_state: OpState.AwaitingResponse,
-            last_message: MessageType.RequestUpdate,
-            started: "21-01-2024",
-            finalized: "22-01-2024",
-        },
-        {
-            peer_id: "0xdef",
-            location: "0.1789234",
-            last_state: OpState.Finished,
-            last_message: MessageType.SuccessfulUpdate,
-            started: "12-01-2024",
-            finalized: "13-01-2024",
-        },
-        {
-            peer_id: "0xabc",
-            location: "0.16234",
-            last_state: OpState.Finished,
-            last_message: MessageType.SuccessfulUpdate,
-            started: "18-01-2024",
-            finalized: "19-01-2024",
-        },
-        {
-            peer_id: "0xjkl",
-            location: "0.234234",
-            last_state: OpState.AwaitingResponse,
-            last_message: MessageType.RequestUpdate,
-            started: "19-01-2024",
-            finalized: "20-01-2024",
-        },
-        {
-            peer_id: "0xghi",
-            location: "0.267127",
-            last_state: OpState.BroadcastOngoing,
-            last_message: MessageType.Broadcasting,
-            started: "21-01-2024",
-            finalized: "22-01-2024",
-        },
-        
-    ],
-}
 
 
 
@@ -201,7 +35,7 @@ const TransactionsTable = ({ open_tx_detail, tx_list }: TxTableInterface) => (
                         <td>{tx.target.slice(-8)}</td>
                         <td>{tx.change_type}</td>
                         <td>{tx.contract_id.slice(-8)}</td>
-                        <td>{tx.timestamp.toString()}</td>
+                        <td>{rust_timestamp_to_utc_string(tx.timestamp)}</td>
                         {/*<td>{tx.status}</td>
                         <td>{tx.started}</td>
                         <td>{tx.finalized}</td>*/}

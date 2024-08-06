@@ -22,7 +22,10 @@ export function handlePutRequest(
     console.log("contract key", contract_id);
     console.log("target", target);
     console.log("requester", requester);
-    console.log("timestamp", timestamp);
+    console.log(
+        "formatted timestamp",
+        new Date(parseInt(timestamp.toString()) * 1000).toUTCString()
+    );
 
     let obj_data = {
         change_type,

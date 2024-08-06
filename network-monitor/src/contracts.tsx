@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { TransactionData, TransactionPeerInterface, TxTableInterface } from "./type_definitions";
 import {all_contracts} from "./transactions-data";
 import {ContractDetail} from "./contract-detail";
+import {rust_timestamp_to_utc_string} from "./utils";
 
 export const ContractsTable = ({ open_tx_detail, tx_list }: TxTableInterface) => (
     <table id="contracts" className="table is-striped block is-bordered">
@@ -12,6 +13,7 @@ export const ContractsTable = ({ open_tx_detail, tx_list }: TxTableInterface) =>
                 <th>Last Target Peer Id</th>
                 <th>Last Transaction Id</th>
                 <th>Last Type</th>
+                <th>Timestamp</th>
                 {/*<th>Status</th>
                 <th>Started</th>
                 <th>Finalized</th>*/}
@@ -26,6 +28,7 @@ export const ContractsTable = ({ open_tx_detail, tx_list }: TxTableInterface) =>
                         <td>{tx.target.slice(-8)}</td>
                         <td>{tx.transaction_id.slice(-8)}</td>
                         <td>{tx.change_type}</td>
+                        <td>{rust_timestamp_to_utc_string(tx.timestamp)}</td>
                         {/*<td>{tx.status}</td>
                         <td>{tx.started}</td>
                         <td>{tx.finalized}</td>*/}

@@ -46,3 +46,7 @@ export const parse_put_msg_data = (
         timestamp,
     };
 };
+
+export const rust_timestamp_to_utc_string = (timestamp: number): string => {
+    return new Date(parseInt(timestamp.toString()) * 1000).toUTCString();
+};
