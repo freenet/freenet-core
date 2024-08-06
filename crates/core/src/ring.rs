@@ -869,7 +869,7 @@ impl Location {
         self.0
     }
 
-    fn from_contract_key(bytes: &[u8]) -> Self {
+    pub(crate) fn from_contract_key(bytes: &[u8]) -> Self {
         let mut value = 0.0;
         let mut divisor = 256.0;
         for byte in bytes {
