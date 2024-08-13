@@ -27,6 +27,9 @@ const TransactionPeersHistory = ({
 }: TransactionDetailPeersHistoryInterface) => {
     const [filter, set_filter] = useState<FilterDictionaryInterface>({});
     const [filtered_list, set_filtered_list] = useState(tx_peer_list);
+    const [order_by, set_order_by] = useState<string>("timestamp");
+    const [order_direction, set_order_direction] = useState<string>("asc");
+    const [loading, set_loading] = useState<boolean>(true);
 
     const add_filter = (filter_type: string, filter_value: string) => {
         if (check_if_contains_filter(filter_type)) {
@@ -57,7 +60,22 @@ const TransactionPeersHistory = ({
             });
         });
 
+
+        filtered_list = filtered_list.sort((a, b) => {
+            if (order_by === "timestamp") {
+                if (order_direction === "asc") {
+                    return a.timestamp > b.timestamp ? 1 : -1;
+                } else {
+                    return a.timestamp < b.timestamp ? 1 : -1;
+                }
+            } else {
+                return 0;
+            }
+        });
+
+        
         set_filtered_list(filtered_list);
+        set_loading(false);
     };
 
     const clear_one_filter = (filter_type: string) => {
@@ -80,7 +98,7 @@ const TransactionPeersHistory = ({
         // );
 
         // ringVisualization(ring_mock_data[0], graphContainer, 1.25);
-    }, [filter]);
+    }, [filter, order_by, order_direction]);
 
     const check_if_contains_filter = (filter_type: string) => {
         return filter[filter_type] !== undefined;
@@ -164,7 +182,18 @@ const TransactionPeersHistory = ({
                             Contract Location
                         </th>
                         <th>
-                            Timestamp
+                            Timestamp 
+                            <button
+                                onClick={() => {
+                                    set_loading(true);
+                                    set_order_by("timestamp");
+                                    set_order_direction(
+                                        order_direction === "asc" ? "desc" : "asc"
+                                    );
+
+                                }}
+                            >{order_direction}</button>
+
                         </th>
                     </tr>
                 </thead>
