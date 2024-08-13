@@ -70,6 +70,7 @@ export function handlePutSuccess(
     console.log("Put Success");
     console.log("tx", transaction_id);
     console.log("contract key", contract_id);
+    console.log("change_type", change_type);
     console.log("target", target);
     console.log("requester", requester);
     console.log("timestamp", timestamp);

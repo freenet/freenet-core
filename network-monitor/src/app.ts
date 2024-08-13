@@ -2,7 +2,8 @@ import * as flatbuffers from "flatbuffers";
 import * as fbTopology from "./generated/topology";
 import { handleChange } from "./topology";
 import { handlePutRequest, handlePutSuccess } from "./transactions-data";
-import { parse_put_msg_data } from "./utils";
+import { get_change_type, parse_put_msg_data } from "./utils";
+import { ChangeType } from "./type_definitions";
 
 let connection_established = false;
 
@@ -44,6 +45,16 @@ function handleChanges(event: MessageEvent) {
                 const contractChange =
                     fbTopology.ContractChange.getRootAsContractChange(buf);
 
+                console.log(
+                    "raw contract change changeType",
+                    contractChange.changeType()
+                );
+
+                console.log(
+                    "parsed contract change changeType",
+                    get_change_type(contractChange.changeType())
+                );
+
                 let {
                     transaction,
                     contract_id,
@@ -54,13 +65,10 @@ function handleChanges(event: MessageEvent) {
                     contract_location,
                 } = parse_put_msg_data(
                     contractChange,
-                    fbTopology.ContractChangeType.PutRequest
+                    contractChange.changeType()
                 );
 
-                if (
-                    contractChange.changeType() ===
-                    fbTopology.ContractChangeType.PutRequest
-                ) {
+                if (change_type == ChangeType.PUT_REQUEST) {
                     handlePutRequest(
                         transaction,
                         contract_id,
@@ -74,10 +82,7 @@ function handleChanges(event: MessageEvent) {
                     return;
                 }
 
-                if (
-                    contractChange.changeType() ===
-                    fbTopology.ContractChangeType.PutSuccess
-                ) {
+                if (change_type == ChangeType.PUT_SUCCESS) {
                     handlePutSuccess(
                         transaction,
                         contract_id,
