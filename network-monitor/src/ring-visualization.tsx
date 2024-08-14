@@ -1,14 +1,41 @@
 import { local } from "d3";
+import React, {useEffect} from "react";
+import {createRoot} from "react-dom/client";
 
 interface RingVisualizationPoint {
     peerId: string;
     localization: number;
 }
 
-export const another_ring_visualization = (
+interface RingVisualizationProps {
     main_peer: RingVisualizationPoint,
-    other_peers: RingVisualizationPoint[]
-) => {
+    other_peers: RingVisualizationPoint[],
+}
+
+export const RingVisualization = ({main_peer, other_peers}: RingVisualizationProps) => {
+    const [peers, setPeers] = React.useState(true);
+    const [contracts, setContracts] = React.useState(false);
+
+    const togglePeers = () => {
+        setPeers(!peers);
+    }
+
+    const toggleContracts = () => {
+        setContracts(!contracts);
+    }
+
+
+    useEffect(() => {
+        console.log("Peers visibility changed");
+        console.log(peers);
+    }, [peers]);
+
+    useEffect(() => {
+        console.log("Contracts visibility changed");
+        console.log(contracts);
+    }, [contracts]);
+
+
     // Declare the chart dimensions and margins.
     const width = 640;
     const height = 400;
@@ -44,15 +71,134 @@ export const another_ring_visualization = (
     //
     let scale = 3;
 
-    console.log(calculate_point(other_peers[0].localization, scale));
-    console.log(calculate_point(other_peers[1].localization, scale));
 
     let tooltip_x = 100;
     let tooltip_y = 100;
 
     let tooltips_visibility = {};
 
-    let a = (
+    const draw_points = (internal_other_peers: RingVisualizationPoint[]) => {
+        return internal_other_peers.map((peer, index) => {
+            let return_values = (
+                <>
+                    <circle
+                        key={index}
+                        cx={calculate_point(peer.localization, scale).x}
+                        cy={calculate_point(peer.localization, scale).y}
+                        r={1.2 * scale}
+                        onMouseEnter={(e) => {
+                            document.styleSheets[2].addRule(
+                                `.svg-tooltip-${peer.localization
+                                    .toString()
+                                    .replace(".", "")}`,
+                                "display: block"
+                            );
+                        }}
+                        onMouseLeave={() => {
+                            document.styleSheets[2].addRule(
+                                `.svg-tooltip-${peer.localization
+                                    .toString()
+                                    .replace(".", "")}`,
+                                "display: none"
+                            );
+                        }}
+                    />
+
+                    <text
+                        id="svg-tooltip"
+                        x={`${
+                            calculate_point(peer.localization, scale).x + 10
+                        }`}
+                        y={`${
+                            calculate_point(peer.localization, scale).y + 10
+                        }`}
+                        className={`svg-tooltip-${peer.localization
+                            .toString()
+                            .replace(".", "")}`}
+                    >
+                        {peer.peerId}: {peer.localization}
+                    </text>
+                </>
+            );
+
+            document.styleSheets[2].addRule(
+                `.svg-tooltip-${peer.localization
+                    .toString()
+                    .replace(".", "")}`,
+                "display: none"
+            );
+            return return_values;
+        })
+    }
+
+    const draw_connecting_lines = (internal_other_peers: RingVisualizationPoint[]) => {
+
+        return internal_other_peers.map((peer, index) => {
+            let return_values = (
+                <>
+                    <path
+                        className="line"
+                        d={`M ${calculate_point(main_peer.localization, scale).x} ${
+                            calculate_point(main_peer.localization, scale).y
+                        } L ${calculate_point(peer.localization, scale).x} ${
+                            calculate_point(peer.localization, scale).y
+                        }`}
+
+                        style={{strokeWidth:3}}
+
+
+                        onMouseEnter={(e) => {
+                            document.styleSheets[2].addRule(
+                                `.svg-tooltip-distance-${peer.localization
+                                    .toString()
+                                    .replace(".", "")}`,
+                                "display: block"
+                            );
+                        }}
+                        onMouseLeave={() => {
+                            document.styleSheets[2].addRule(
+                                `.svg-tooltip-distance-${peer.localization
+                                    .toString()
+                                    .replace(".", "")}`,
+                                "display: none"
+                            );
+                        }}
+                    />
+
+                    <text
+                        id="svg-tooltip-distance"
+                        x={`${
+                            calculate_point(peer.localization, scale).x - 10
+                        }`}
+                        y={`${
+                            calculate_point(peer.localization, scale).y - 10
+                        }`}
+                        className={`svg-tooltip-distance-${peer.localization
+                            .toString()
+                            .replace(".", "")}`}
+                    >
+                        distance: {Math.abs(peer.localization - main_peer.localization)}
+                    </text>
+
+                </>
+            );
+
+
+            document.styleSheets[2].addRule(
+                `.svg-tooltip-distance-${peer.localization
+                    .toString()
+                    .replace(".", "")}`,
+                "display: none"
+            );
+
+            return return_values;
+        })
+    }
+
+
+
+    return (
+        <div>
         <svg width={400} height={100 * scale} style={{ position: "relative" }}>
             <path
                 fill="none"
@@ -75,124 +221,23 @@ export const another_ring_visualization = (
                     fill="red"
                 />
 
-                {other_peers.map((peer, index) => {
-                    let return_values = (
-                        <>
-                            <circle
-                                key={index}
-                                cx={calculate_point(peer.localization, scale).x}
-                                cy={calculate_point(peer.localization, scale).y}
-                                r={1.2 * scale}
-                                onMouseEnter={(e) => {
-                                    document.styleSheets[2].addRule(
-                                        `.svg-tooltip-${peer.localization
-                                            .toString()
-                                            .replace(".", "")}`,
-                                        "display: block"
-                                    );
-                                }}
-                                onMouseLeave={() => {
-                                    document.styleSheets[2].addRule(
-                                        `.svg-tooltip-${peer.localization
-                                            .toString()
-                                            .replace(".", "")}`,
-                                        "display: none"
-                                    );
-                                }}
-                            />
+                {draw_points(other_peers)}
 
-                            <text
-                                id="svg-tooltip"
-                                x={`${
-                                    calculate_point(peer.localization, scale).x + 10
-                                }`}
-                                y={`${
-                                    calculate_point(peer.localization, scale).y + 10
-                                }`}
-                                className={`svg-tooltip-${peer.localization
-                                    .toString()
-                                    .replace(".", "")}`}
-                            >
-                                {peer.peerId}: {peer.localization}
-                            </text>
-                        </>
-                    );
+                {draw_connecting_lines(other_peers)}
 
-                    document.styleSheets[2].addRule(
-                        `.svg-tooltip-${peer.localization
-                            .toString()
-                            .replace(".", "")}`,
-                        "display: none"
-                    );
-                    return return_values;
-                })}
-
-                {other_peers.map((peer, index) => {
-                    let return_values = (
-                        <>
-                            <path
-                                className="line"
-                                d={`M ${calculate_point(main_peer.localization, scale).x} ${
-                                    calculate_point(main_peer.localization, scale).y
-                                } L ${calculate_point(peer.localization, scale).x} ${
-                                    calculate_point(peer.localization, scale).y
-                                }`}
-
-                                style={{strokeWidth:3}}
-
-
-                                onMouseEnter={(e) => {
-                                    document.styleSheets[2].addRule(
-                                        `.svg-tooltip-distance-${peer.localization
-                                            .toString()
-                                            .replace(".", "")}`,
-                                        "display: block"
-                                    );
-                                }}
-                                onMouseLeave={() => {
-                                    document.styleSheets[2].addRule(
-                                        `.svg-tooltip-distance-${peer.localization
-                                            .toString()
-                                            .replace(".", "")}`,
-                                        "display: none"
-                                    );
-                                }}
-                            />
-
-                            <text
-                                id="svg-tooltip-distance"
-                                x={`${
-                                    calculate_point(peer.localization, scale).x - 10
-                                }`}
-                                y={`${
-                                    calculate_point(peer.localization, scale).y - 10
-                                }`}
-                                className={`svg-tooltip-distance-${peer.localization
-                                    .toString()
-                                    .replace(".", "")}`}
-                            >
-                                distance: {Math.abs(peer.localization - main_peer.localization)}
-                            </text>
-
-                        </>
-                    );
-
-
-                    document.styleSheets[2].addRule(
-                        `.svg-tooltip-distance-${peer.localization
-                            .toString()
-                            .replace(".", "")}`,
-                        "display: none"
-                    );
-
-                    return return_values;
-                })}
+                
             </g>
         </svg>
+        <div>
+
+            <button style={{marginRight: 20}} onClick={() => togglePeers()}>Peers</button>
+
+            <button onClick={() => toggleContracts()}>Contracts</button></div>
+        </div>
     );
 
-    // Append the SVG element.
-    return a;
+
+
 };
 
 const calculate_point = (localization: number, scale: number) => {

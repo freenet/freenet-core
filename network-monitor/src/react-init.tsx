@@ -1,15 +1,47 @@
 import { ContractsTable } from "./contracts";
 import { TransactionContainer } from "./transactions";
 import { ContractsContainer } from "./contracts";
-import {another_ring_visualization} from "./ring-visualization";
+import {RingVisualization} from "./ring-visualization";
+import {useEffect} from "react";
+import {createRoot} from "react-dom/client";
+import React from "react";
 
-function ReactContainer() {
+
+
+const ReactContainer = () => {
+
+
+    useEffect(() => {
+        // we need to wait here for the histogram to be initiated first. If we move all to React code we can remove this.
+        setTimeout(() => {
+
+            const ring_react_element = <RingVisualization main_peer={{peerId: "abc", localization: 0.1}}  other_peers={[{peerId: "0x593b", localization: 0.3}, {peerId: "0x593b", localization: 0.5}, {peerId: "0x593b", localization: 0.7}, {peerId: "0x593b", localization: 0.9}]}  />;
+
+
+            // Append the SVG element.
+            const peers_container = document.getElementById("peers-histogram")!;
+            
+            const ring_container = document.createElement("div");
+
+            
+            const root = createRoot(ring_container);
+            root.render(ring_react_element);
+
+            peers_container.appendChild(ring_container);
+            
+            console.log("React container mounted");
+
+        }, 6000);
+
+
+    }, []);
+
+
     return (
         <div>
 
-        {another_ring_visualization({peerId: "abc", localization: 0.1}, [{peerId: "0x593b", localization: 0.3}, {peerId: "0x593b", localization: 0.5}, {peerId: "0x593b", localization: 0.7}, {peerId: "0x593b", localization: 0.9}])}
-        <ContractsContainer />
-        <TransactionContainer />
+            <ContractsContainer />
+            <TransactionContainer />
         
         </div>
         

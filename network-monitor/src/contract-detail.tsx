@@ -6,7 +6,6 @@ import {
     TransactionData
 } from "./type_definitions";
 import { PeerId } from "./topology";
-import { another_ring_visualization } from "./ring-visualization";
 import {rust_timestamp_to_utc_string} from "./utils";
 
 interface TransactionDetailPeersHistoryInterface {
@@ -356,7 +355,6 @@ export const ContractDetail = ({
             </div>
 
             <div id="other-peer-conns-graph">
-            {/*another_ring_visualization()*/}
             </div>
 
             {tx_history && (

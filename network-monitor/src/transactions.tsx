@@ -3,7 +3,6 @@ import { createRoot } from "react-dom/client";
 import TransactionDetail from "./transaction-detail";
 import { all_tx} from "./transactions-data";
 import {TransactionInterface, TransactionStatus, TransactionType, TransactionData, TxPeersTableInterface, OpState, MessageType, TxTableInterface, TransactionPeerInterface, ChangeType } from "./type_definitions";
-import {another_ring_visualization} from "./ring-visualization";
 import {rust_timestamp_to_utc_string} from "./utils";
 
 
