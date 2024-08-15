@@ -2,6 +2,16 @@ import { ChangeType } from "./type_definitions";
 import { ContractChange } from "./generated/topology";
 import * as fbTopology from "./generated/topology";
 
+type PutMsgData = {
+    transaction: string;
+    contract_id: string;
+    target: string;
+    requester: string;
+    change_type: ChangeType;
+    timestamp: number;
+    contract_location: string;
+};
+
 export const get_change_type = (
     change_type_fbs: fbTopology.ContractChangeType
 ): ChangeType | null => {
@@ -22,7 +32,7 @@ export const get_change_type = (
 export const parse_put_msg_data = (
     contractChange: ContractChange,
     changeType: fbTopology.ContractChangeType
-): any => {
+): PutMsgData => {
     let put_request_obj = contractChange.change(new fbTopology.PutRequest());
 
     let transaction = put_request_obj.transaction();
@@ -63,7 +73,7 @@ export const parse_put_msg_data = (
         change_type,
         timestamp,
         contract_location,
-    };
+    } as PutMsgData;
 };
 
 export const rust_timestamp_to_utc_string = (timestamp: number): string => {

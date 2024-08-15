@@ -258,8 +258,13 @@ const ContractPeersHistory = ({
     );
 };
 
+interface ContractHistoryInterface {
+    contract_history: Array<TransactionData>;
+}
+
+
 // TODO: use real types
-const ContractHistory = ({ contract_history }: any) => (
+const ContractHistory = ({ contract_history }: ContractHistoryInterface) => (
     <div id="contract-history" className="block">
         <h2>Contract History</h2>
         <table

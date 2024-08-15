@@ -265,8 +265,12 @@ const TransactionPeersHistory = ({
     );
 };
 
+interface TranscationHistoryInterface {
+    tx_history: Array<TransactionData>;
+}
+
 // TODO: use real types
-const TransactionHistory = ({ tx_history }: any) => (
+const TransactionHistory = ({ tx_history }: TranscationHistoryInterface) => (
     <div id="transaction-history" className="block">
         <h2>Transaction History</h2>
         <table

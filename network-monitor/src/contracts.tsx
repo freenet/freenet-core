@@ -81,7 +81,7 @@ export function ContractsContainer() {
         set_tx_list(updated_tx_list);
     }
 
-    document.addEventListener("keydown", (e: any) => {
+    document.addEventListener("keydown", (e: KeyboardEvent) => {
         if (e.key === "Escape") {
             close_detail();
         }
