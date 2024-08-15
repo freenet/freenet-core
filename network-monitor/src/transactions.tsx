@@ -1,14 +1,9 @@
 import { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import TransactionDetail from "./transaction-detail";
-import { all_tx} from "./transactions-data";
-import {TransactionInterface, TransactionStatus, TransactionType, TransactionData, TxPeersTableInterface, OpState, MessageType, TxTableInterface, TransactionPeerInterface, ChangeType } from "./type_definitions";
-import {rust_timestamp_to_utc_string} from "./utils";
-
-
-
-
-
+import { all_tx } from "./transactions-data";
+import { TransactionData, TxTableInterface, TransactionPeerInterface } from "./type_definitions";
+import { rust_timestamp_to_utc_string } from "./utils";
 
 const TransactionsTable = ({ open_tx_detail, tx_list }: TxTableInterface) => {
     const [inner_tx_list, set_inner_tx_list] = useState<Array<TransactionData>>([]);

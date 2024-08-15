@@ -1,16 +1,6 @@
-import { ChangeType } from "./type_definitions";
+import { ChangeType, PutMsgData } from "./type_definitions";
 import { ContractChange } from "./generated/topology";
 import * as fbTopology from "./generated/topology";
-
-type PutMsgData = {
-    transaction: string;
-    contract_id: string;
-    target: string;
-    requester: string;
-    change_type: ChangeType;
-    timestamp: number;
-    contract_location: string;
-};
 
 export const get_change_type = (
     change_type_fbs: fbTopology.ContractChangeType

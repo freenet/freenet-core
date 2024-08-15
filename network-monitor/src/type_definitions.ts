@@ -85,3 +85,99 @@ export enum OpState {
     PrepareRequest = "PrepareRequest",
     BroadcastOngoing = "BroadcastOngoing",
 }
+
+export type PutMsgData = {
+    transaction: string;
+    contract_id: string;
+    target: string;
+    requester: string;
+    change_type: ChangeType;
+    timestamp: number;
+    contract_location: number;
+};
+
+export interface TransactionDetailPeersHistoryInterface {
+    tx_peer_list: Array<TransactionData>;
+}
+
+export interface FilterInterface {
+    filter_type: string;
+    filter_value: string;
+}
+
+export interface FilterDictionaryInterface {
+    [key: string]: FilterInterface;
+}
+
+export interface ContractHistoryInterface {
+    contract_history: Array<TransactionData>;
+}
+
+export interface RingVisualizationPoint {
+    peerId: string;
+    localization: number;
+}
+
+export interface RingVisualizationProps {
+    main_peer: RingVisualizationPoint;
+    other_peers: RingVisualizationPoint[];
+}
+
+export interface PeerList {
+    [id: string]: Peer;
+}
+
+export interface Peer {
+    id: PeerId;
+    currentLocation: number;
+    connectionTimestamp: number;
+    connections: Connection[];
+    history: ChangeInfo[];
+    locationHistory: { location: number; timestamp: number }[];
+}
+
+export interface Connection {
+    transaction: string | null;
+    id: PeerId;
+    location: number;
+}
+
+export interface ChangeInfo {
+    type: "Added" | "Removed";
+    from: Connection;
+    to: Connection;
+    timestamp: number;
+}
+
+export class PeerId {
+    private id: string;
+
+    constructor(id: string | Uint8Array) {
+        if (id instanceof Uint8Array) {
+            this.id = new TextDecoder().decode(id);
+        } else {
+            this.id = id;
+        }
+    }
+
+    get short() {
+        return this.id.slice(-8);
+    }
+
+    get full() {
+        return this.id;
+    }
+}
+
+export interface TransactionDetailPeersHistoryInterface {
+    tx_peer_list: Array<TransactionData>;
+}
+
+export interface FilterInterface {
+    filter_type: string;
+    filter_value: string;
+}
+
+export interface TranscationHistoryInterface {
+    tx_history: Array<TransactionData>;
+}

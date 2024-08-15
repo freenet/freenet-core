@@ -1,25 +1,13 @@
 import { useEffect, useState } from "react";
-import { createRoot } from "react-dom/client";
 import {
     TransactionDetailInterface,
-    TransactionPeerInterface,
-    TransactionData
+    TransactionData,
+    TransactionDetailPeersHistoryInterface,
+    FilterDictionaryInterface,
+    TranscationHistoryInterface,
 } from "./type_definitions";
-import { PeerId } from "./topology";
 import {rust_timestamp_to_utc_string} from "./utils";
 
-interface TransactionDetailPeersHistoryInterface {
-    tx_peer_list: Array<TransactionData>;
-}
-
-interface FilterInterface {
-    filter_type: string;
-    filter_value: string;
-}
-
-interface FilterDictionaryInterface {
-    [key: string]: FilterInterface;
-}
 
 const TransactionPeersHistory = ({
     tx_peer_list,
@@ -256,9 +244,6 @@ const TransactionPeersHistory = ({
     );
 };
 
-interface TranscationHistoryInterface {
-    tx_history: Array<TransactionData>;
-}
 
 // TODO: use real types
 const TransactionHistory = ({ tx_history }: TranscationHistoryInterface) => (

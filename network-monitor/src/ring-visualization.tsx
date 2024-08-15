@@ -1,16 +1,8 @@
 import { local } from "d3";
 import React, {useEffect} from "react";
 import {createRoot} from "react-dom/client";
+import {RingVisualizationPoint, RingVisualizationProps} from "./type_definitions";
 
-interface RingVisualizationPoint {
-    peerId: string;
-    localization: number;
-}
-
-interface RingVisualizationProps {
-    main_peer: RingVisualizationPoint,
-    other_peers: RingVisualizationPoint[],
-}
 
 export const RingVisualization = ({main_peer, other_peers}: RingVisualizationProps) => {
     const [peers, setPeers] = React.useState(true);
