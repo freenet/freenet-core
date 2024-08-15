@@ -109,7 +109,6 @@ export function TransactionContainer() {
 
         set_transaction(tx_history[0]);
         set_transaction_history(tx_history);
-        // set_peers_history(mock_peers_in_tx[tx.id]);
         set_is_detail_open(true);
         window.scrollTo(0, 0);
     };

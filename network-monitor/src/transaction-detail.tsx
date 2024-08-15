@@ -21,7 +21,6 @@ interface FilterDictionaryInterface {
     [key: string]: FilterInterface;
 }
 
-let ring_mock_data = [];
 const TransactionPeersHistory = ({
     tx_peer_list,
 }: TransactionDetailPeersHistoryInterface) => {
@@ -90,14 +89,6 @@ const TransactionPeersHistory = ({
     useEffect(() => {
         update_filtered_list();
 
-
-        // ringHistogram(ring_mock_data);
-
-        // const graphContainer = d3.select(
-        //     document.getElementById("other-peer-conns-graph")
-        // );
-
-        // ringVisualization(ring_mock_data[0], graphContainer, 1.25);
     }, [filter, order_by, order_direction]);
 
     const check_if_contains_filter = (filter_type: string) => {
