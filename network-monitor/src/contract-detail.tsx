@@ -16,6 +16,7 @@ const ContractPeersHistory = ({
     const [filtered_list, set_filtered_list] = useState(tx_peer_list);
     const [order_by, set_order_by] = useState<string>("timestamp");
     const [order_direction, set_order_direction] = useState<string>("asc");
+    const [order_is_loading, set_order_is_loading] = useState<boolean>(false);
 
     const add_filter = (filter_type: string, filter_value: string) => {
         if (check_if_contains_filter(filter_type)) {
@@ -72,8 +73,14 @@ const ContractPeersHistory = ({
 
     useEffect(() => {
         update_filtered_list();
-
+        
+        if (order_is_loading) {
+            setTimeout(() => {
+                    set_order_is_loading(false);
+            }, 500)
+        }
     }, [filter, order_by, order_direction]);
+
 
     const check_if_contains_filter = (filter_type: string) => {
         return filter[filter_type] !== undefined;
@@ -88,7 +95,7 @@ const ContractPeersHistory = ({
             <h2>Contract Transactions History </h2>
             {Object.keys(filter).length > 0 && (
                 <div>
-                    <button onClick={() => clear_all_filters()}>
+                    <button className="button is-info mb-2" onClick={() => clear_all_filters()}>
                         Clear all filters
                     </button>
                 </div>
@@ -102,7 +109,7 @@ const ContractPeersHistory = ({
                         <th>
                             Contract Id
                             {check_if_contains_filter("contract_id") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() =>
                                         clear_one_filter("contract_id")
                                     }
@@ -117,7 +124,7 @@ const ContractPeersHistory = ({
                         <th>
                             Transaction Id
                             {check_if_contains_filter("transaction_id") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() => clear_one_filter("transaction_id")}
                                 >
                                     Clear filter
@@ -127,7 +134,7 @@ const ContractPeersHistory = ({
                         <th>
                             Requester
                             {check_if_contains_filter("requester") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() => clear_one_filter("requester")}
                                 >
                                     Clear filter
@@ -137,7 +144,7 @@ const ContractPeersHistory = ({
                         <th>
                             Target
                             {check_if_contains_filter("target") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() => clear_one_filter("target")}
                                 >
                                     Clear filter
@@ -147,7 +154,7 @@ const ContractPeersHistory = ({
                         <th>
                             Change Type
                             {check_if_contains_filter("change_type") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() =>
                                         clear_one_filter("change_type")
                                     }
@@ -158,8 +165,9 @@ const ContractPeersHistory = ({
                         </th>
                         <th>
                             Timestamp
-                            <button
+                            <button className={`button is-small is-outlined ml-1 ${order_is_loading ? "is-loading" : ""}`}
                                 onClick={() => {
+                                    set_order_is_loading(true);
                                     set_order_by("timestamp");
                                     set_order_direction(
                                         order_direction === "asc" ? "desc" : "asc"

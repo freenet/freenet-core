@@ -4,7 +4,43 @@ import {all_contracts} from "./transactions-data";
 import {ContractDetail} from "./contract-detail";
 import {rust_timestamp_to_utc_string} from "./utils";
 
-export const ContractsTable = ({ open_tx_detail, tx_list }: TxTableInterface) => (
+export const ContractsTable = ({ open_tx_detail, tx_list }: TxTableInterface) => {
+    const [inner_tx_list, set_inner_tx_list] = useState<Array<TransactionData>>([]);
+    const [order_by, set_order_by] = useState<string>("timestamp");
+    const [order_direction, set_order_direction] = useState<string>("asc");
+    const [loading, set_loading] = useState<boolean>(true);
+
+    const order_tx_list = (tx_list: Array<TransactionData>) => {
+        let updated_tx_list = tx_list;
+        updated_tx_list = updated_tx_list.sort((a, b) => {
+            if (order_by === "timestamp") {
+                if (order_direction === "asc") {
+                    return a.timestamp > b.timestamp ? 1 : -1;
+                } else {
+                    return a.timestamp < b.timestamp ? 1 : -1;
+                }
+            } else {
+                return 0;
+            }
+        });
+
+        return updated_tx_list;
+    }
+
+    useEffect(() => {
+        if (tx_list) {
+            set_inner_tx_list(order_tx_list(tx_list));
+
+
+            if (loading) {
+                setTimeout(() => {
+                    set_loading(false);
+                }, 1000);
+            }
+        }
+    }, [tx_list, order_by, order_direction]);
+
+    return (
     <table id="contracts" className="table is-striped block is-bordered">
         <thead id="contract-history-h">
             <tr>
@@ -14,7 +50,18 @@ export const ContractsTable = ({ open_tx_detail, tx_list }: TxTableInterface) =>
                 <th>Last Target Peer Id</th>
                 <th>Last Transaction Id</th>
                 <th>Last Type</th>
-                <th>Timestamp</th>
+                <th>
+                    Timestamp 
+                    <button className={`button is-small is-outlined ml-1 ${loading ? "is-loading" : ""}`}
+                        onClick={() => {
+                            set_loading(true);
+                            set_order_by("timestamp");
+                            set_order_direction(
+                                order_direction === "asc" ? "desc" : "asc"
+                            );
+                        }}
+                    >{order_direction}</button>
+                </th>
                 {/*<th>Status</th>
                 <th>Started</th>
                 <th>Finalized</th>*/}
@@ -22,7 +69,7 @@ export const ContractsTable = ({ open_tx_detail, tx_list }: TxTableInterface) =>
         </thead>
         <tbody id="contract-history-b">
             {
-                tx_list?.map((tx, index) => (
+                inner_tx_list?.map((tx, index) => (
                     <tr key={`${tx.contract_id.slice(-8)}-${tx.change_type.slice(-8)}-${index}`}>
                         <td onClick={() => open_tx_detail(tx.contract_id)} style={{cursor: "pointer"}}>{tx.contract_id.slice(-8)}</td>
                         <td>{tx.contract_location}</td>
@@ -39,7 +86,7 @@ export const ContractsTable = ({ open_tx_detail, tx_list }: TxTableInterface) =>
             }
         </tbody>
     </table>
-);
+)};
 
 
 
@@ -76,7 +123,6 @@ export function ContractsContainer() {
 
         updated_tx_list = updated_tx_list.map((tx) => tx[tx.length - 1]);
 
-        console.log(updated_tx_list);
         set_tx_list(updated_tx_list);
     }
 

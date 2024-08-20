@@ -222,9 +222,9 @@ export const RingVisualization = ({main_peer, other_peers}: RingVisualizationPro
         </svg>
         <div>
 
-            <button style={{marginRight: 20}} onClick={() => togglePeers()}>Peers</button>
+            <button className="button" onClick={() => togglePeers()}>Peers</button>
 
-            <button onClick={() => toggleContracts()}>Contracts</button></div>
+            <button className="button" onClick={() => toggleContracts()}>Contracts</button></div>
         </div>
     );
 

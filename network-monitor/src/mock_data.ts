@@ -1,4 +1,4 @@
-import { PeerId } from "./topology";
+import { PeerId } from "./type_definitions";
 import {
     ChangeType,
     MessageType,

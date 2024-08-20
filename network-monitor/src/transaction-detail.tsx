@@ -16,7 +16,7 @@ const TransactionPeersHistory = ({
     const [filtered_list, set_filtered_list] = useState(tx_peer_list);
     const [order_by, set_order_by] = useState<string>("timestamp");
     const [order_direction, set_order_direction] = useState<string>("asc");
-    const [loading, set_loading] = useState<boolean>(true);
+    const [loading, set_loading] = useState<boolean>(false);
 
     const add_filter = (filter_type: string, filter_value: string) => {
         if (check_if_contains_filter(filter_type)) {
@@ -62,7 +62,6 @@ const TransactionPeersHistory = ({
 
         
         set_filtered_list(filtered_list);
-        set_loading(false);
     };
 
     const clear_one_filter = (filter_type: string) => {
@@ -76,6 +75,12 @@ const TransactionPeersHistory = ({
 
     useEffect(() => {
         update_filtered_list();
+
+        if (loading) {
+            setTimeout(() => {
+                set_loading(false);
+            }, 1000);
+        }
 
     }, [filter, order_by, order_direction]);
 
@@ -92,7 +97,7 @@ const TransactionPeersHistory = ({
             <h2>Transaction Peers History </h2>
             {Object.keys(filter).length > 0 && (
                 <div>
-                    <button onClick={() => clear_all_filters()}>
+                    <button className="button is-info mb-2" onClick={() => clear_all_filters()}>
                         Clear all filters
                     </button>
                 </div>
@@ -106,7 +111,7 @@ const TransactionPeersHistory = ({
                         <th>
                             Transaction Id
                             {check_if_contains_filter("transaction_id") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() => clear_one_filter("transaction_id")}
                                 >
                                     Clear filter
@@ -116,7 +121,7 @@ const TransactionPeersHistory = ({
                         <th>
                             Requester
                             {check_if_contains_filter("requester") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() => clear_one_filter("requester")}
                                 >
                                     Clear filter
@@ -126,7 +131,7 @@ const TransactionPeersHistory = ({
                         <th>
                             Target
                             {check_if_contains_filter("target") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() => clear_one_filter("target")}
                                 >
                                     Clear filter
@@ -136,7 +141,7 @@ const TransactionPeersHistory = ({
                         <th>
                             Change Type
                             {check_if_contains_filter("change_type") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() =>
                                         clear_one_filter("change_type")
                                     }
@@ -148,7 +153,7 @@ const TransactionPeersHistory = ({
                         <th>
                             Contract Id
                             {check_if_contains_filter("contract_id") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() =>
                                         clear_one_filter("contract_id")
                                     }
@@ -162,7 +167,7 @@ const TransactionPeersHistory = ({
                         </th>
                         <th>
                             Timestamp 
-                            <button
+                            <button className={`button is-small is-outlined ml-1 ${loading ? "is-loading" : ""}`}
                                 onClick={() => {
                                     set_loading(true);
                                     set_order_by("timestamp");
@@ -356,60 +361,5 @@ const TransactionDetail = ({
     </div>
 );
 
-const another_ring_visualization = () => {
-    // Declare the chart dimensions and margins.
-    const width = 640;
-    const height = 400;
-    const marginTop = 20;
-    const marginRight = 20;
-    const marginBottom = 30;
-    const marginLeft = 40;
-
-    // // Declare the x (horizontal position) scale.
-    // const x = d3
-    //     .scaleUtc()
-    //     .domain([new Date("2023-01-01"), new Date("2024-01-01")])
-    //     .range([marginLeft, width - marginRight]);
-
-    // // Declare the y (vertical position) scale.
-    // const y = d3
-    //     .scaleLinear()
-    //     .domain([0, 100])
-    //     .range([height - marginBottom, marginTop]);
-
-    // // Create the SVG container.
-    // const svg = d3.create("svg").attr("width", width).attr("height", height);
-
-    // // Add the x-axis.
-    // svg.append("g")
-    //     .attr("transform", `translate(0,${height - marginBottom})`)
-    //     .call(d3.axisBottom(x));
-
-    // // Add the y-axis.
-    // svg.append("g")
-    //     .attr("transform", `translate(${marginLeft},0)`)
-    //     .call(d3.axisLeft(y));
-
-    let a = (
-        <svg width={300} height={100}>
-            <path
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.5"
-                d={"20"}
-            />
-            <g fill="white" stroke="currentColor" strokeWidth="1.5">
-                <circle key={"123"} cx={60} cy={50} r="40.5" />
-
-                <circle cx={60} cy={10} r="2.5" />
-                <circle cx={10} cy={50} r="2.5" />
-                <circle cx={110} cy={50} r="2.5" />
-            </g>
-        </svg>
-    );
-
-    // Append the SVG element.
-    return a;
-};
 
 export default TransactionDetail;

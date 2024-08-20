@@ -31,9 +31,15 @@ const TransactionsTable = ({ open_tx_detail, tx_list }: TxTableInterface) => {
     useEffect(() => {
         if (tx_list) {
             set_inner_tx_list(order_tx_list(tx_list));
-            set_loading(false);
+
+
+            if (loading) {
+                setTimeout(() => {
+                    set_loading(false);
+                }, 1000);
+            }
         }
-    }, [tx_list]);
+    }, [tx_list, order_by, order_direction]);
 
     return (
     <table id="transactions" className="table is-striped block is-bordered">
@@ -46,8 +52,8 @@ const TransactionsTable = ({ open_tx_detail, tx_list }: TxTableInterface) => {
                 <th>Contract Key</th>
                 <th>Contract Location</th>
                 <th>
-                    Timestamp {order_by === "timestamp" && order_direction === "asc" ? "Λ" : "V"} {loading && "loading..."}
-                    <button
+                    Timestamp 
+                    <button className={`button is-small is-outlined ml-1 ${loading ? "is-loading" : ""}`}
                         onClick={() => {
                             set_loading(true);
                             set_order_by("timestamp");
