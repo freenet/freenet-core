@@ -1,4 +1,4 @@
-import { ChangeType, PutMsgData } from "./type_definitions";
+import { ChangeType, PutMsgData, TransactionData } from "./type_definitions";
 import { ContractChange } from "./generated/topology";
 import * as fbTopology from "./generated/topology";
 
@@ -68,4 +68,23 @@ export const parse_put_msg_data = (
 
 export const rust_timestamp_to_utc_string = (timestamp: number): string => {
     return new Date(parseInt(timestamp.toString()) * 1000).toUTCString();
+};
+
+export const transactions_per_page = 10;
+
+export const get_all_pages = (tx_list: Array<TransactionData>) => {
+    return Math.ceil(tx_list.length / transactions_per_page);
+};
+
+export const filter_by_page = (
+    tx_list: Array<TransactionData>,
+    page: number
+) => {
+    let updated_tx_list = tx_list;
+    let start = (page - 1) * transactions_per_page;
+    let end = start + transactions_per_page;
+
+    updated_tx_list = updated_tx_list.slice(start, end);
+
+    return updated_tx_list;
 };

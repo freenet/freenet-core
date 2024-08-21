@@ -3,13 +3,17 @@ import { createRoot } from "react-dom/client";
 import TransactionDetail from "./transaction-detail";
 import { all_tx } from "./transactions-data";
 import { TransactionData, TxTableInterface, TransactionPeerInterface } from "./type_definitions";
-import { rust_timestamp_to_utc_string } from "./utils";
+import { filter_by_page, get_all_pages, rust_timestamp_to_utc_string } from "./utils";
+import {Pagination} from "./pagination";
 
 const TransactionsTable = ({ open_tx_detail, tx_list }: TxTableInterface) => {
+    const [ordered_tx_list, set_ordered_tx_list] = useState<Array<TransactionData>>([]);
     const [inner_tx_list, set_inner_tx_list] = useState<Array<TransactionData>>([]);
     const [order_by, set_order_by] = useState<string>("timestamp");
     const [order_direction, set_order_direction] = useState<string>("asc");
     const [loading, set_loading] = useState<boolean>(true);
+    const [page, set_page] = useState<number>(1);
+    
 
     const order_tx_list = (tx_list: Array<TransactionData>) => {
         let updated_tx_list = tx_list;
@@ -28,9 +32,13 @@ const TransactionsTable = ({ open_tx_detail, tx_list }: TxTableInterface) => {
         return updated_tx_list;
     }
 
+
+
     useEffect(() => {
         if (tx_list) {
-            set_inner_tx_list(order_tx_list(tx_list));
+            let ordered_list = order_tx_list(tx_list);
+            set_ordered_tx_list(ordered_list);
+            set_inner_tx_list(order_tx_list(filter_by_page(ordered_list, page)));
 
 
             if (loading) {
@@ -41,55 +49,65 @@ const TransactionsTable = ({ open_tx_detail, tx_list }: TxTableInterface) => {
         }
     }, [tx_list, order_by, order_direction]);
 
+    useEffect(() => {
+        if (tx_list) {
+            set_inner_tx_list(filter_by_page(ordered_tx_list, page));
+        }
+    }, [page, ordered_tx_list]);
+
     return (
-    <table id="transactions" className="table is-striped block is-bordered">
-        <thead id="transactions-history-h">
-            <tr>
-                <th>Transaction Id</th>
-                <th>Requester Peer Id</th>
-                <th>Target Peer Id</th>
-                <th>Type</th>
-                <th>Contract Key</th>
-                <th>Contract Location</th>
-                <th>
-                    Timestamp 
-                    <button className={`button is-small is-outlined ml-1 ${loading ? "is-loading" : ""}`}
-                        onClick={() => {
-                            set_loading(true);
-                            set_order_by("timestamp");
-                            set_order_direction(
-                                order_direction === "asc" ? "desc" : "asc"
-                            );
-                        }}
-                    >{order_direction}</button>
+        <>
+        <Pagination currentPage={page} totalPages={get_all_pages(tx_list || [])} 
+                onPageChange={(page: number) => {set_page(page)}}/>
+        <table id="transactions" className="table is-striped block is-bordered">
+            <thead id="transactions-history-h">
+                <tr>
+                    <th>Transaction Id</th>
+                    <th>Requester Peer Id</th>
+                    <th>Target Peer Id</th>
+                    <th>Type</th>
+                    <th>Contract Key</th>
+                    <th>Contract Location</th>
+                    <th>
+                        Timestamp 
+                        <button className={`button is-small is-outlined ml-1 ${loading ? "is-loading" : ""}`}
+                            onClick={() => {
+                                set_loading(true);
+                                set_order_by("timestamp");
+                                set_order_direction(
+                                    order_direction === "asc" ? "desc" : "asc"
+                                );
+                            }}
+                        >{order_direction}</button>
 
-                </th>
-                {/*<th>Status</th>
-                <th>Started</th>
-                <th>Finalized</th>*/}
-            </tr>
-        </thead>
-        <tbody id="transactions-history-b">
-            {
-                inner_tx_list?.map((tx: TransactionData, index) => (
-                    <tr key={`${tx.transaction_id.slice(-8)}-${tx.change_type.slice(-8)}-${index}`}>
-                        <td  onClick={() => open_tx_detail(tx.transaction_id)} style={{cursor: "pointer"}}>{tx.transaction_id.slice(-8)}</td>
-                        <td>{tx.requester.slice(-8)}</td>
-                        <td>{tx.target.slice(-8)}</td>
-                        <td>{tx.change_type}</td>
-                        <td>{tx.contract_id.slice(-8)}</td>
-                        <td>{tx.contract_location}</td>
-                        <td>{rust_timestamp_to_utc_string(tx.timestamp)}</td>
+                    </th>
+                    {/*<th>Status</th>
+                    <th>Started</th>
+                    <th>Finalized</th>*/}
+                </tr>
+            </thead>
+            <tbody id="transactions-history-b">
+                {
+                    inner_tx_list?.map((tx: TransactionData, index) => (
+                        <tr key={`${tx.transaction_id.slice(-8)}-${tx.change_type.slice(-8)}-${index}`}>
+                            <td  onClick={() => open_tx_detail(tx.transaction_id)} style={{cursor: "pointer"}}>{tx.transaction_id.slice(-8)}</td>
+                            <td>{tx.requester.slice(-8)}</td>
+                            <td>{tx.target.slice(-8)}</td>
+                            <td>{tx.change_type}</td>
+                            <td>{tx.contract_id.slice(-8)}</td>
+                            <td>{tx.contract_location}</td>
+                            <td>{rust_timestamp_to_utc_string(tx.timestamp)}</td>
 
-                        {/*<td>{tx.status}</td>
-                        <td>{tx.started}</td>
-                        <td>{tx.finalized}</td>*/}
-                    </tr>
-                ))
-            }
-        </tbody>
-    </table>
-);
+                            {/*<td>{tx.status}</td>
+                            <td>{tx.started}</td>
+                            <td>{tx.finalized}</td>*/}
+                        </tr>
+                    ))
+                }
+            </tbody>
+        </table>
+        </>
+    );
 
 };
 

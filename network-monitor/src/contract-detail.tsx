@@ -6,7 +6,8 @@ import {
     FilterDictionaryInterface,
     ContractHistoryInterface
 } from "./type_definitions";
-import {rust_timestamp_to_utc_string} from "./utils";
+import {filter_by_page, get_all_pages, rust_timestamp_to_utc_string} from "./utils";
+import {Pagination} from "./pagination";
 
 
 const ContractPeersHistory = ({
@@ -17,6 +18,8 @@ const ContractPeersHistory = ({
     const [order_by, set_order_by] = useState<string>("timestamp");
     const [order_direction, set_order_direction] = useState<string>("asc");
     const [order_is_loading, set_order_is_loading] = useState<boolean>(false);
+    const [page, set_page] = useState<number>(1);
+    const [inner_tx_list, set_inner_tx_list] = useState<Array<TransactionData>>([]);
 
     const add_filter = (filter_type: string, filter_value: string) => {
         if (check_if_contains_filter(filter_type)) {
@@ -47,6 +50,8 @@ const ContractPeersHistory = ({
             });
         });
 
+        console.log("filtered_list", filtered_list);
+
         filtered_list = filtered_list.sort((a, b) => {
             if (order_by === "timestamp") {
                 if (order_direction === "asc") {
@@ -59,6 +64,7 @@ const ContractPeersHistory = ({
             }
         });
 
+        set_inner_tx_list(filter_by_page(filtered_list, page));
         set_filtered_list(filtered_list);
     };
 
@@ -81,6 +87,10 @@ const ContractPeersHistory = ({
         }
     }, [filter, order_by, order_direction]);
 
+    useEffect(() => {
+        set_inner_tx_list(filter_by_page(filtered_list, page));
+    }, [page, filtered_list]);   
+
 
     const check_if_contains_filter = (filter_type: string) => {
         return filter[filter_type] !== undefined;
@@ -92,6 +102,7 @@ const ContractPeersHistory = ({
             className="block"
             style={{ marginTop: 20 }}
         >
+            <Pagination currentPage={page} totalPages={get_all_pages(filtered_list)} onPageChange={(page:number) => set_page(page)}/>
             <h2>Contract Transactions History </h2>
             {Object.keys(filter).length > 0 && (
                 <div>
@@ -179,7 +190,7 @@ const ContractPeersHistory = ({
                     </tr>
                 </thead>
                 <tbody id="transaction-peers-history-b">
-                    {filtered_list.map((tx) => (
+                    {inner_tx_list.map((tx) => (
                         <tr>
                             <td
                                 onClick={() =>

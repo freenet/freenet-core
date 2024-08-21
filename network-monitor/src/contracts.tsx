@@ -2,13 +2,16 @@ import { useEffect, useState } from "react";
 import { TransactionData, TransactionPeerInterface, TxTableInterface } from "./type_definitions";
 import {all_contracts} from "./transactions-data";
 import {ContractDetail} from "./contract-detail";
-import {rust_timestamp_to_utc_string} from "./utils";
+import {filter_by_page, get_all_pages, rust_timestamp_to_utc_string} from "./utils";
+import {Pagination} from "./pagination";
 
 export const ContractsTable = ({ open_tx_detail, tx_list }: TxTableInterface) => {
+    const [ordered_tx_list, set_ordered_tx_list] = useState<Array<TransactionData>>([]);
     const [inner_tx_list, set_inner_tx_list] = useState<Array<TransactionData>>([]);
     const [order_by, set_order_by] = useState<string>("timestamp");
     const [order_direction, set_order_direction] = useState<string>("asc");
     const [loading, set_loading] = useState<boolean>(true);
+    const [page, set_page] = useState<number>(1);
 
     const order_tx_list = (tx_list: Array<TransactionData>) => {
         let updated_tx_list = tx_list;
@@ -27,9 +30,13 @@ export const ContractsTable = ({ open_tx_detail, tx_list }: TxTableInterface) =>
         return updated_tx_list;
     }
 
+
+
     useEffect(() => {
         if (tx_list) {
-            set_inner_tx_list(order_tx_list(tx_list));
+            let ordered_list = order_tx_list(tx_list);
+            set_ordered_tx_list(ordered_list);
+            set_inner_tx_list(order_tx_list(filter_by_page(tx_list, page)));
 
 
             if (loading) {
@@ -40,53 +47,67 @@ export const ContractsTable = ({ open_tx_detail, tx_list }: TxTableInterface) =>
         }
     }, [tx_list, order_by, order_direction]);
 
+
+    useEffect(() => {
+        if (tx_list) {
+            set_inner_tx_list(filter_by_page(ordered_tx_list, page));
+        }
+    }, [page]);
+
+
     return (
-    <table id="contracts" className="table is-striped block is-bordered">
-        <thead id="contract-history-h">
-            <tr>
-                <th>Contract Key</th>
-                <th>Contract Location</th>
-                <th>Last Requester Peer Id</th>
-                <th>Last Target Peer Id</th>
-                <th>Last Transaction Id</th>
-                <th>Last Type</th>
-                <th>
-                    Timestamp 
-                    <button className={`button is-small is-outlined ml-1 ${loading ? "is-loading" : ""}`}
-                        onClick={() => {
-                            set_loading(true);
-                            set_order_by("timestamp");
-                            set_order_direction(
-                                order_direction === "asc" ? "desc" : "asc"
-                            );
-                        }}
-                    >{order_direction}</button>
-                </th>
-                {/*<th>Status</th>
-                <th>Started</th>
-                <th>Finalized</th>*/}
-            </tr>
-        </thead>
-        <tbody id="contract-history-b">
-            {
-                inner_tx_list?.map((tx, index) => (
-                    <tr key={`${tx.contract_id.slice(-8)}-${tx.change_type.slice(-8)}-${index}`}>
-                        <td onClick={() => open_tx_detail(tx.contract_id)} style={{cursor: "pointer"}}>{tx.contract_id.slice(-8)}</td>
-                        <td>{tx.contract_location}</td>
-                        <td>{tx.requester.slice(-8)}</td>
-                        <td>{tx.target.slice(-8)}</td>
-                        <td>{tx.transaction_id.slice(-8)}</td>
-                        <td>{tx.change_type}</td>
-                        <td>{rust_timestamp_to_utc_string(tx.timestamp)}</td>
-                        {/*<td>{tx.status}</td>
-                        <td>{tx.started}</td>
-                        <td>{tx.finalized}</td>*/}
+        <>
+            <Pagination currentPage={page} totalPages={get_all_pages(tx_list || [])} 
+                    onPageChange={(page: number) => {set_page(page)}}/>
+            <table id="contracts" className="table is-striped block is-bordered">
+                <thead id="contract-history-h">
+                    <tr>
+                        <th>Contract Key</th>
+                        <th>Contract Location</th>
+                        <th>Last Requester Peer Id</th>
+                        <th>Last Target Peer Id</th>
+                        <th>Last Transaction Id</th>
+                        <th>Last Type</th>
+                        <th>
+                            Timestamp 
+                            <button className={`button is-small is-outlined ml-1 ${loading ? "is-loading" : ""}`}
+                                onClick={() => {
+                                    set_loading(true);
+                                    set_order_by("timestamp");
+                                    set_order_direction(
+                                        order_direction === "asc" ? "desc" : "asc"
+                                    );
+                                }}
+                            >{order_direction}</button>
+                        </th>
+                        {/*<th>Status</th>
+                        <th>Started</th>
+                        <th>Finalized</th>*/}
                     </tr>
-                ))
-            }
-        </tbody>
-    </table>
-)};
+                </thead>
+                <tbody id="contract-history-b">
+                    {
+                        inner_tx_list?.map((tx, index) => (
+                            <tr key={`${tx.contract_id.slice(-8)}-${tx.change_type.slice(-8)}-${index}`}>
+                                <td onClick={() => open_tx_detail(tx.contract_id)} style={{cursor: "pointer"}}>{tx.contract_id.slice(-8)}</td>
+                                <td>{tx.contract_location}</td>
+                                <td>{tx.requester.slice(-8)}</td>
+                                <td>{tx.target.slice(-8)}</td>
+                                <td>{tx.transaction_id.slice(-8)}</td>
+                                <td>{tx.change_type}</td>
+                                <td>{rust_timestamp_to_utc_string(tx.timestamp)}</td>
+                                {/*<td>{tx.status}</td>
+                                <td>{tx.started}</td>
+                                <td>{tx.finalized}</td>*/}
+                            </tr>
+                        ))
+                    }
+                </tbody>
+                
+            </table>
+        </>
+    )
+};
 
 
 
