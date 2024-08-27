@@ -307,6 +307,46 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                 );
                 tx.send(Message::Binary(msg)).await?;
             }
+            Change::BroadcastEmitted {
+                tx_id,
+                upstream,
+                broadcast_to,
+                broadcasted_to,
+                key,
+                sender,
+                timestamp,
+                contract_location,
+            } => {
+                let msg = ContractChange::broadcast_emitted_msg(
+                    tx_id,
+                    upstream,
+                    broadcast_to,
+                    broadcasted_to,
+                    key,
+                    sender,
+                    timestamp,
+                    contract_location,
+                );
+                tx.send(Message::Binary(msg)).await?;
+            }
+            Change::BroadcastReceived {
+                tx_id,
+                key,
+                requester,
+                target,
+                timestamp,
+                contract_location,
+            } => {
+                let msg = ContractChange::broadcast_received_msg(
+                    tx_id,
+                    target,
+                    requester,
+                    key,
+                    timestamp,
+                    contract_location,
+                );
+                tx.send(Message::Binary(msg)).await?;
+            }
         }
     }
     Ok(())
@@ -354,6 +394,24 @@ pub(crate) enum Change {
     PutSuccess {
         tx_id: String,
         key: String,
+        target: String,
+        timestamp: u64,
+        contract_location: f64,
+    },
+    BroadcastEmitted {
+        tx_id: String,
+        upstream: String,
+        broadcast_to: Vec<String>,
+        broadcasted_to: usize,
+        key: String,
+        sender: String,
+        timestamp: u64,
+        contract_location: f64,
+    },
+    BroadcastReceived {
+        tx_id: String,
+        key: String,
+        requester: String,
         target: String,
         timestamp: u64,
         contract_location: f64,
@@ -562,6 +620,132 @@ impl ServerState {
                 let _ = self.changes.send(Change::PutSuccess {
                     tx_id,
                     key,
+                    target,
+                    timestamp,
+                    contract_location,
+                });
+            }
+
+            ChangesWrapper::ContractChange(ContractChange::BroadcastEmitted(broadcast_data)) => {
+                let tx_id = broadcast_data.transaction().to_string();
+                let upstream = broadcast_data.upstream().to_string();
+                let broadcast_to = broadcast_data
+                    .broadcast_to()
+                    .unwrap()
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>();
+                let broadcasted_to = broadcast_data.broadcasted_to();
+                let key = broadcast_data.key().to_string();
+                let sender = broadcast_data.sender().to_string();
+
+                let timestamp = broadcast_data.timestamp();
+                let contract_location = broadcast_data.contract_location();
+
+                if broadcast_to.is_empty() {
+                    return Err(anyhow::anyhow!("broadcast_to is empty"));
+                }
+
+                if tx_id.is_empty() {
+                    return Err(anyhow::anyhow!("tx_id is empty"));
+                }
+
+                if key.is_empty() {
+                    return Err(anyhow::anyhow!("key is empty"));
+                }
+
+                match self.transactions_data.entry(tx_id.clone()) {
+                    dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                        tracing::info!(
+                            "found transaction data, adding BroadcastEmitted to history"
+                        );
+                        let changes = occ.get_mut();
+                        changes.push(Change::BroadcastEmitted {
+                            tx_id: tx_id.clone(),
+                            upstream: upstream.clone(),
+                            broadcast_to: broadcast_to.clone(),
+                            broadcasted_to: broadcasted_to as usize,
+                            key: key.clone(),
+                            sender: sender.clone(),
+                            timestamp,
+                            contract_location,
+                        });
+
+                        //connections.sort_unstable_by(|a, b| a.cmp(&b.0));
+                        //connections.dedup();
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(_vac) => {
+                        // this should not happen
+                        tracing::error!("this tx should be included on transactions_data. It should exists a PutRequest before BroadcastEmitted.");
+                        unreachable!();
+                    }
+                }
+
+                tracing::debug!(%tx_id, %key, %upstream, %sender, "checking values from save_record -- broadcastemitted");
+
+                let _ = self.changes.send(Change::BroadcastEmitted {
+                    tx_id,
+                    upstream,
+                    broadcast_to,
+                    broadcasted_to: broadcasted_to as usize,
+                    key,
+                    sender,
+                    timestamp,
+                    contract_location,
+                });
+            }
+
+            ChangesWrapper::ContractChange(ContractChange::BroadcastReceived(broadcast_data)) => {
+                let tx_id = broadcast_data.transaction().to_string();
+                let key = broadcast_data.key().to_string();
+                let requester = broadcast_data.requester().to_string();
+                let target = broadcast_data.target().to_string();
+                let timestamp = broadcast_data.timestamp();
+                let contract_location = broadcast_data.contract_location();
+
+                if tx_id.is_empty() {
+                    return Err(anyhow::anyhow!("tx_id is empty"));
+                }
+
+                if key.is_empty() {
+                    return Err(anyhow::anyhow!("key is empty"));
+                }
+
+                if requester.is_empty() {
+                    return Err(anyhow::anyhow!("requester is empty"));
+                }
+
+                match self.transactions_data.entry(tx_id.clone()) {
+                    dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                        tracing::info!(
+                            "found transaction data, adding BroadcastReceived to history"
+                        );
+                        let changes = occ.get_mut();
+                        changes.push(Change::BroadcastReceived {
+                            tx_id: tx_id.clone(),
+                            key: key.clone(),
+                            requester: requester.clone(),
+                            target: target.clone(),
+                            timestamp,
+                            contract_location,
+                        });
+
+                        //connections.sort_unstable_by(|a, b| a.cmp(&b.0));
+                        //connections.dedup();
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(_vac) => {
+                        // this should not happen
+                        tracing::error!("this tx should be included on transactions_data. It should exists a PutRequest before BroadcastReceived.");
+                        unreachable!();
+                    }
+                }
+
+                tracing::debug!(%tx_id, %key, %requester, %target, "checking values from save_record -- broadcastreceived");
+
+                let _ = self.changes.send(Change::BroadcastReceived {
+                    tx_id,
+                    key,
+                    requester,
                     target,
                     timestamp,
                     contract_location,

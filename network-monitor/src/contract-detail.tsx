@@ -88,6 +88,10 @@ const ContractPeersHistory = ({
     }, [filter, order_by, order_direction]);
 
     useEffect(() => {
+        update_filtered_list();
+    }, [tx_peer_list]);
+
+    useEffect(() => {
         set_inner_tx_list(filter_by_page(filtered_list, page));
     }, [page, filtered_list]);   
 

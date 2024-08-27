@@ -12,6 +12,10 @@ export const get_change_type = (
             return ChangeType.PUT_SUCCESS;
         case fbTopology.ContractChangeType.PutFailure:
             return ChangeType.PUT_FAILURE;
+        case fbTopology.ContractChangeType.BroadcastEmitted:
+            return ChangeType.BROADCAST_EMITTED;
+        case fbTopology.ContractChangeType.BroadcastReceived:
+            return ChangeType.BROADCAST_RECEIVED;
         default:
             new Error("Invalid change type");
     }
@@ -64,6 +68,114 @@ export const parse_put_msg_data = (
         timestamp,
         contract_location,
     } as PutMsgData;
+};
+
+export const parse_broadcast_emitted_msg = (
+    contractChange: ContractChange,
+    changeType: fbTopology.ContractChangeType
+) => {
+    let broadcast_emitted_obj = contractChange.change(
+        new fbTopology.BroadcastEmitted()
+    );
+
+    let transaction = broadcast_emitted_obj.transaction();
+
+    if (!transaction) {
+        throw new Error("Transaction ID not found");
+    }
+
+    let upstream = broadcast_emitted_obj.upstream();
+
+    if (!upstream) {
+        throw new Error("Upstream Peer not found");
+    }
+
+    let broadcast_to = broadcast_emitted_obj.broadcastTo();
+
+    if (!broadcast_to) {
+        throw new Error("Broadcast To Peers not found");
+    }
+
+    let broadcasted_to = broadcast_emitted_obj.broadcastedTo()!;
+
+    console.log(broadcasted_to);
+
+    let contract_key = broadcast_emitted_obj.key();
+
+    if (!contract_key) {
+        throw new Error("Contract Key not found");
+    }
+
+    let sender = broadcast_emitted_obj.sender();
+
+    if (!sender) {
+        throw new Error("Sender Peer not found");
+    }
+
+    let timestamp = broadcast_emitted_obj.timestamp()!;
+
+    let change_type = get_change_type(changeType)!;
+
+    let contract_location = broadcast_emitted_obj.contractLocation()!;
+
+    return {
+        transaction,
+        upstream,
+        broadcast_to,
+        key: contract_key,
+        requester: sender,
+        change_type,
+        timestamp,
+        contract_location,
+    };
+};
+
+export const parse_broadcast_received_msg = (
+    contractChange: ContractChange,
+    changeType: fbTopology.ContractChangeType
+) => {
+    let broadcast_received_obj = contractChange.change(
+        new fbTopology.BroadcastReceived()
+    );
+
+    let transaction = broadcast_received_obj.transaction();
+
+    if (!transaction) {
+        throw new Error("Transaction ID not found");
+    }
+
+    let target = broadcast_received_obj.target();
+    if (!target) {
+        throw new Error("Target Peer not found");
+    }
+
+    let requester = broadcast_received_obj.requester();
+
+    if (!requester) {
+        throw new Error("Requester Peer not found");
+    }
+
+    let contract_key = broadcast_received_obj.key();
+
+    if (!contract_key) {
+        throw new Error("Contract Key not found");
+    }
+
+    let timestamp = broadcast_received_obj.timestamp()!;
+
+    let change_type = get_change_type(changeType)!;
+
+    let contract_location = broadcast_received_obj.contractLocation()!;
+
+    return {
+        transaction,
+        target,
+        requester,
+        key: contract_key,
+        change_type,
+        timestamp,
+        contract_location,
+    };
 };
 
 export const rust_timestamp_to_utc_string = (timestamp: number): string => {

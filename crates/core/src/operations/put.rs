@@ -328,6 +328,7 @@ impl Operation for PutOp {
                     new_value,
                     contract,
                     sender,
+                    ..
                 } => {
                     let target = op_manager.ring.own_location();
 
@@ -375,6 +376,7 @@ impl Operation for PutOp {
                     new_value,
                     contract,
                     upstream,
+                    ..
                 } => {
                     let sender = op_manager.ring.own_location();
                     let mut broadcasted_to = *broadcasted_to;
@@ -387,6 +389,7 @@ impl Operation for PutOp {
                             new_value: new_value.clone(),
                             sender,
                             contract: contract.clone(),
+                            target: *peer,
                         };
                         let f = conn_manager.send(&peer.peer, msg.into());
                         broadcasting.push(f);
@@ -634,6 +637,7 @@ async fn try_to_broadcast(
                     key,
                     contract,
                     upstream,
+                    sender: op_manager.ring.own_location(),
                 });
 
                 let op = PutOp {
@@ -915,6 +919,7 @@ mod messages {
             new_value: WrappedState,
             contract: ContractContainer,
             upstream: PeerKeyLocation,
+            sender: PeerKeyLocation,
         },
         /// Broadcasting a change to a peer, which then will relay the changes to other peers.
         BroadcastTo {
@@ -923,6 +928,7 @@ mod messages {
             key: ContractKey,
             new_value: WrappedState,
             contract: ContractContainer,
+            target: PeerKeyLocation,
         },
     }
 

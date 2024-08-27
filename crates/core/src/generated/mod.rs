@@ -21,6 +21,8 @@ pub enum ContractChange<'a> {
     PutRequest(topology::PutRequest<'a>),
     PutSuccess(topology::PutSuccess<'a>),
     PutFailure(topology::PutFailure<'a>),
+    BroadcastEmitted(topology::BroadcastEmitted<'a>),
+    BroadcastReceived(topology::BroadcastReceived<'a>),
 }
 
 // TODO: Change this to EventWrapper
@@ -129,6 +131,91 @@ impl ContractChange<'_> {
                 contract_id: Some(contract),
                 change_type: topology::ContractChangeType::PutFailure,
                 change: Some(put_failure.as_union_value()),
+            },
+        );
+        buf.finish_minimal(msg);
+        buf.finished_data().to_vec()
+    }
+
+    pub fn broadcast_emitted_msg(
+        transaction: impl AsRef<str>,
+        upstream: impl AsRef<str>,
+        broadcast_to: Vec<String>,
+        broadcasted_to: usize,
+        contract_key: impl AsRef<str>,
+        sender: impl AsRef<str>,
+
+        timestamp: u64,
+        contract_location: f64,
+    ) -> Vec<u8> {
+        let mut buf = flatbuffers::FlatBufferBuilder::new();
+        let transaction = buf.create_string(transaction.as_ref());
+        let upstream = buf.create_string(upstream.as_ref());
+        let broadcast_to = broadcast_to
+            .iter()
+            .map(|s| buf.create_string(s.as_str()))
+            .collect::<Vec<_>>();
+        let broadcast_to = buf.create_vector(&broadcast_to);
+        let contract_key = buf.create_string(contract_key.as_ref());
+        let sender = buf.create_string(sender.as_ref());
+        let broadcast_emitted = topology::BroadcastEmitted::create(
+            &mut buf,
+            &topology::BroadcastEmittedArgs {
+                transaction: Some(transaction),
+                upstream: Some(upstream),
+                broadcast_to: Some(broadcast_to),
+                broadcasted_to: broadcasted_to as u32,
+                key: Some(contract_key),
+                sender: Some(sender),
+                timestamp,
+                contract_location,
+            },
+        );
+
+        let msg = topology::ContractChange::create(
+            &mut buf,
+            &topology::ContractChangeArgs {
+                contract_id: Some(contract_key),
+                change_type: topology::ContractChangeType::BroadcastEmitted,
+                change: Some(broadcast_emitted.as_union_value()),
+            },
+        );
+        buf.finish_minimal(msg);
+        buf.finished_data().to_vec()
+    }
+
+    pub fn broadcast_received_msg(
+        transaction: impl AsRef<str>,
+        target: impl AsRef<str>,
+        requester: impl AsRef<str>,
+        contract_key: impl AsRef<str>,
+
+        timestamp: u64,
+        contract_location: f64,
+    ) -> Vec<u8> {
+        let mut buf = flatbuffers::FlatBufferBuilder::new();
+        let transaction = buf.create_string(transaction.as_ref());
+        let target = buf.create_string(target.as_ref());
+        let requester = buf.create_string(requester.as_ref());
+        let contract_key = buf.create_string(contract_key.as_ref());
+        let broadcast_received = topology::BroadcastReceived::create(
+            &mut buf,
+            &topology::BroadcastReceivedArgs {
+                transaction: Some(transaction),
+                target: Some(target),
+                requester: Some(requester),
+                key: Some(contract_key),
+                timestamp,
+                contract_location,
+            },
+        );
+
+        let msg = topology::ContractChange::create(
+            &mut buf,
+            &topology::ContractChangeArgs {
+                contract_id: Some(contract_key),
+                change_type: topology::ContractChangeType::BroadcastReceived,
+                change: Some(broadcast_received.as_union_value()),
             },
         );
         buf.finish_minimal(msg);
@@ -325,7 +412,27 @@ impl<'a> TryFromFbs<'a> for ContractChange<'a> {
                 })?;
                 Ok(Self::PutFailure(req))
             }
-            _ => unreachable!(),
+            topology::ContractChangeType::BroadcastEmitted => {
+                let req = req.change_as_broadcast_emitted().ok_or_else(|| {
+                    flatbuffers::InvalidFlatbuffer::InconsistentUnion {
+                        field: "change_type",
+                        field_type: "ContractChangeType",
+                        error_trace: Default::default(),
+                    }
+                })?;
+                Ok(Self::BroadcastEmitted(req))
+            }
+            topology::ContractChangeType::BroadcastReceived => {
+                let req = req.change_as_broadcast_received().ok_or_else(|| {
+                    flatbuffers::InvalidFlatbuffer::InconsistentUnion {
+                        field: "change_type",
+                        field_type: "ContractChangeType",
+                        error_trace: Default::default(),
+                    }
+                })?;
+                Ok(Self::BroadcastReceived(req))
+            }
+            _ => unreachable!("Invalid contract change type"),
         }
     }
 }

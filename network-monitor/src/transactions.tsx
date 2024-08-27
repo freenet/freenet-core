@@ -143,7 +143,7 @@ export function TransactionContainer() {
 
         updated_tx_list = updated_tx_list.flat();
 
-        console.log("ordered updated_tx_list", updated_tx_list);
+        // console.log("ordered updated_tx_list", updated_tx_list);
         set_tx_list(updated_tx_list);
     }
 

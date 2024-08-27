@@ -280,22 +280,36 @@ impl<'a> NetEventLog<'a> {
             NetMessage::Put(PutMsg::Broadcasting {
                 new_value,
                 broadcast_to,
+                broadcasted_to, // broadcasted_to n peers
                 key,
+                id,
+                upstream,
+                sender,
                 ..
             }) => EventKind::Put(PutEvent::BroadcastEmitted {
+                id: *id,
+                upstream: *upstream,
                 broadcast_to: broadcast_to.clone(),
+                broadcasted_to: broadcasted_to.clone(),
                 key: key.clone(),
                 value: new_value.clone(),
+                sender: *sender,
+                timestamp: chrono::Utc::now().timestamp() as u64,
             }),
             NetMessage::Put(PutMsg::BroadcastTo {
+                id,
                 sender,
                 new_value,
                 key,
+                target,
                 ..
             }) => EventKind::Put(PutEvent::BroadcastReceived {
+                id: *id,
                 requester: sender.peer,
                 key: key.clone(),
                 value: new_value.clone(),
+                target: *target,
+                timestamp: chrono::Utc::now().timestamp() as u64,
             }),
             NetMessage::Get(GetMsg::ReturnGet {
                 key,
@@ -835,6 +849,48 @@ async fn send_to_metrics_server(
             );
             ws_stream.send(Message::Binary(msg)).await
         }
+        EventKind::Put(PutEvent::BroadcastEmitted {
+            id,
+            upstream,
+            broadcast_to, // broadcast_to n peers
+            broadcasted_to,
+            key,
+            sender,
+            timestamp,
+            ..
+        }) => {
+            let contract_location = Location::from_contract_key(key.as_bytes());
+            let msg = ContractChange::broadcast_emitted_msg(
+                id.to_string(),
+                upstream.to_string(),
+                broadcast_to.iter().map(|p| p.to_string()).collect(),
+                *broadcasted_to,
+                key.to_string(),
+                sender.to_string(),
+                *timestamp,
+                contract_location.as_f64(),
+            );
+            ws_stream.send(Message::Binary(msg)).await
+        }
+        EventKind::Put(PutEvent::BroadcastReceived {
+            id,
+            target,
+            requester,
+            key,
+            timestamp,
+            ..
+        }) => {
+            let contract_location = Location::from_contract_key(key.as_bytes());
+            let msg = ContractChange::broadcast_received_msg(
+                id.to_string(),
+                target.to_string(),
+                requester.to_string(),
+                key.to_string(),
+                *timestamp,
+                contract_location.as_f64(),
+            );
+            ws_stream.send(Message::Binary(msg)).await
+        }
         _ => Ok(()),
     };
     if let Err(error) = res {
@@ -1186,20 +1242,29 @@ enum PutEvent {
         timestamp: u64,
     },
     BroadcastEmitted {
+        id: Transaction,
+        upstream: PeerKeyLocation,
         /// subscribed peers
         broadcast_to: Vec<PeerKeyLocation>,
+        broadcasted_to: usize,
         /// key of the contract which value was being updated
         key: ContractKey,
         /// value that was put
         value: WrappedState,
+        sender: PeerKeyLocation,
+        timestamp: u64,
     },
     BroadcastReceived {
+        id: Transaction,
         /// peer who started the broadcast op
         requester: PeerId,
         /// key of the contract which value was being updated
         key: ContractKey,
         /// value that was put
         value: WrappedState,
+        /// target peer
+        target: PeerKeyLocation,
+        timestamp: u64,
     },
 }
 

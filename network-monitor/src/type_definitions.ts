@@ -5,6 +5,8 @@ export enum ChangeType {
     PUT_REQUEST = "Put Request",
     PUT_SUCCESS = "Put Success",
     PUT_FAILURE = "Put Failure",
+    BROADCAST_EMITTED = "Broadcast Emitted",
+    BROADCAST_RECEIVED = "Broadcast Received",
 }
 
 export type TransactionData = {

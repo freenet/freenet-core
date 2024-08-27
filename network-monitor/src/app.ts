@@ -1,9 +1,20 @@
 import * as flatbuffers from "flatbuffers";
 import * as fbTopology from "./generated/topology";
 import { handleChange } from "./topology";
-import { handlePutRequest, handlePutSuccess } from "./transactions-data";
-import { get_change_type, parse_put_msg_data } from "./utils";
+import {
+    handleBroadcastEmitted,
+    handleBroadcastReceived,
+    handlePutRequest,
+    handlePutSuccess,
+} from "./transactions-data";
+import {
+    get_change_type,
+    parse_broadcast_emitted_msg,
+    parse_broadcast_received_msg,
+    parse_put_msg_data,
+} from "./utils";
 import { ChangeType } from "./type_definitions";
+import { unionToContractChangeType } from "./generated/topology/contract-change-type";
 
 let connection_established = false;
 
@@ -54,6 +65,81 @@ function handleChanges(event: MessageEvent) {
                     "parsed contract change changeType",
                     get_change_type(contractChange.changeType())
                 );
+
+                let now_change_type = get_change_type(
+                    contractChange.changeType()
+                );
+
+                if (now_change_type == ChangeType.BROADCAST_EMITTED) {
+                    console.log("processing BroadcastEmitted");
+
+                    let {
+                        transaction,
+                        upstream,
+                        broadcast_to,
+                        key,
+                        requester: sender,
+                        timestamp,
+                        contract_location,
+                    } = parse_broadcast_emitted_msg(
+                        contractChange,
+                        contractChange.changeType()
+                    );
+
+                    handleBroadcastEmitted(
+                        transaction,
+                        upstream,
+                        broadcast_to,
+                        key,
+                        sender,
+                        timestamp,
+                        contract_location
+                    );
+
+                    return;
+                }
+
+                if (now_change_type == ChangeType.BROADCAST_RECEIVED) {
+                    let {
+                        transaction,
+                        target,
+                        requester,
+                        key,
+                        change_type,
+                        timestamp,
+                        contract_location,
+                    } = parse_broadcast_received_msg(
+                        contractChange,
+                        contractChange.changeType()
+                    );
+
+                    let fixed_target = target.split(" (@")[0];
+
+                    let broadcast_target_peer_location = target
+                        .split(" (@")[1]
+                        .split(")")[0];
+
+                    // console.log("original target", target);
+
+                    // console.log("fixed target peer id", fixed_target);
+
+                    // console.log(
+                    //     "broadcast target peer location",
+                    //     broadcast_target_peer_location
+                    // );
+
+                    handleBroadcastReceived(
+                        transaction,
+                        fixed_target,
+                        requester,
+                        key,
+                        change_type,
+                        timestamp,
+                        contract_location
+                    );
+
+                    return;
+                }
 
                 let {
                     transaction,
@@ -113,6 +199,7 @@ function handleChanges(event: MessageEvent) {
                     return;
                 }
             } catch (e) {
+                console.error(e);
                 errors.push(e);
             }
 

@@ -127,6 +127,8 @@ export function ContractsContainer() {
             return;
         }
 
+        console.log("Contract history: ", contract_history);
+
         set_transaction(contract_history[0]);
         set_transaction_history(contract_history);
         set_is_detail_open(true);
