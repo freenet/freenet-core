@@ -246,6 +246,47 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                         *contract_location,
                     )
                 }
+                Change::BroadcastEmitted {
+                    tx_id,
+                    upstream,
+                    broadcast_to,
+                    broadcasted_to,
+                    key,
+                    sender,
+                    timestamp,
+                    contract_location,
+                } => {
+                    tracing::info!("sending broadcast emitted");
+                    ContractChange::broadcast_emitted_msg(
+                        tx_id.clone(),
+                        upstream.to_string(),
+                        broadcast_to.iter().map(|s| s.to_string()).collect(),
+                        *broadcasted_to as usize,
+                        key.to_string(),
+                        sender.to_string(),
+                        *timestamp,
+                        *contract_location,
+                    )
+                }
+                Change::BroadcastReceived {
+                    tx_id,
+                    key,
+                    requester,
+                    target,
+                    timestamp,
+                    contract_location,
+                } => {
+                    tracing::info!("sending broadcast received");
+                    ContractChange::broadcast_received_msg(
+                        tx_id.clone(),
+                        target.to_string(),
+                        requester.to_string(),
+                        key.to_string(),
+                        *timestamp,
+                        *contract_location,
+                    )
+                }
+
                 _ => continue,
             };
             tx.send(Message::Binary(msg)).await?;
@@ -645,6 +686,8 @@ impl ServerState {
                 if broadcast_to.is_empty() {
                     return Err(anyhow::anyhow!("broadcast_to is empty"));
                 }
+
+                tracing::info!(?broadcast_to, "save_record broadcast_to");
 
                 if tx_id.is_empty() {
                     return Err(anyhow::anyhow!("tx_id is empty"));

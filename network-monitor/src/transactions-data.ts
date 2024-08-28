@@ -82,9 +82,9 @@ export function handlePutSuccess(
         contract_id,
         target,
         requester,
-        status: null,
-        started: null,
-        finalized: null,
+        status: undefined,
+        started: undefined,
+        finalized: undefined,
         unique_id:
             transaction_id + contract_id + target + requester + change_type,
         timestamp,
@@ -111,12 +111,18 @@ export function handlePutSuccess(
 export function handleBroadcastEmitted(
     transaction_id: string,
     upstream: string,
-    broadcast_to: [string],
+    broadcast_to: any[],
     key: string,
     sender: string,
     timestamp: number,
     contract_location: number
 ) {
+    let sender_location = sender.split(" (@")[1].split(")")[0];
+    sender = sender.split(" (@")[0];
+
+    let upstream_location = upstream.split(" (@")[1].split(")")[0];
+    upstream = upstream.split(" (@")[0];
+
     console.log("Broadcast Emitted");
     console.log("tx", transaction_id);
     console.log("upstream", upstream);
@@ -130,11 +136,12 @@ export function handleBroadcastEmitted(
         change_type: ChangeType.BROADCAST_EMITTED,
         transaction_id,
         contract_id: key,
-        target: `to ${broadcast_to.length} peers`,
+        target: broadcast_to,
         requester: sender,
         unique_id: transaction_id + key + broadcast_to[0] + sender,
         timestamp,
         contract_location,
+        upstream,
     } as TransactionData;
 
     if (

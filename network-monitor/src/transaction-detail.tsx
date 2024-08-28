@@ -5,6 +5,7 @@ import {
     TransactionDetailPeersHistoryInterface,
     FilterDictionaryInterface,
     TranscationHistoryInterface,
+    ChangeType,
 } from "./type_definitions";
 import {rust_timestamp_to_utc_string} from "./utils";
 
@@ -192,7 +193,7 @@ const TransactionPeersHistory = ({
                                     cursor: "pointer",
                                 }}
                             >
-                                {tx.transaction_id}
+                                {tx.transaction_id.slice(-8)}
                             </td>
                             <td
                                 onClick={() =>
@@ -212,7 +213,14 @@ const TransactionPeersHistory = ({
                                     cursor: "pointer",
                                 }}
                             >
-                                {tx.target.slice(-8)}
+                            {tx.change_type == ChangeType.BROADCAST_EMITTED ? 
+                                tx.target.map((t:string)  => {
+                                
+                                let t_location = t.split(" (@")[1].split(")")[0].slice(0, 8);
+                                t = t.split(" (@")[0].slice(-8);
+
+                                return <p>{t} @ {t_location}</p>
+                            }) : tx.target.slice(-8)}
                             </td>
                             <td
                                 onClick={() =>

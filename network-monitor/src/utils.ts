@@ -90,9 +90,15 @@ export const parse_broadcast_emitted_msg = (
         throw new Error("Upstream Peer not found");
     }
 
-    let broadcast_to = broadcast_emitted_obj.broadcastTo();
+    let broadcast_to = [];
 
-    if (!broadcast_to) {
+    for (let i = 0; i < broadcast_emitted_obj.broadcastToLength(); i++) {
+        broadcast_to.push(broadcast_emitted_obj.broadcastTo(i)!);
+    }
+
+    console.log("broadcastTo", broadcast_to);
+
+    if (broadcast_to.length == 0) {
         throw new Error("Broadcast To Peers not found");
     }
 

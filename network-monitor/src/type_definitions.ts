@@ -13,14 +13,15 @@ export type TransactionData = {
     change_type: ChangeType;
     transaction_id: string;
     contract_id: string;
-    target: string;
+    target: any;
     requester: string;
-    status: string | null;
-    started: string | null;
-    finalized: string | null;
     unique_id: string;
     timestamp: number;
     contract_location: number;
+    status?: string;
+    started?: string;
+    finalized?: string;
+    upstream?: string;
 };
 
 export interface TransactionInterface {

@@ -4,7 +4,8 @@ import {
     TransactionData,
     TransactionDetailPeersHistoryInterface,
     FilterDictionaryInterface,
-    ContractHistoryInterface
+    ContractHistoryInterface,
+    ChangeType
 } from "./type_definitions";
 import {filter_by_page, get_all_pages, rust_timestamp_to_utc_string} from "./utils";
 import {Pagination} from "./pagination";
@@ -20,6 +21,7 @@ const ContractPeersHistory = ({
     const [order_is_loading, set_order_is_loading] = useState<boolean>(false);
     const [page, set_page] = useState<number>(1);
     const [inner_tx_list, set_inner_tx_list] = useState<Array<TransactionData>>([]);
+    const [active_peer_list, set_active_peer_list] = useState<Array<String> | null>(null);
 
     const add_filter = (filter_type: string, filter_value: string) => {
         if (check_if_contains_filter(filter_type)) {
@@ -89,6 +91,7 @@ const ContractPeersHistory = ({
 
     useEffect(() => {
         update_filtered_list();
+        set_page(1);
     }, [tx_peer_list]);
 
     useEffect(() => {
@@ -118,6 +121,7 @@ const ContractPeersHistory = ({
             <table
                 id="transaction-peers-history"
                 className="table is-striped block is-bordered"
+                onMouseLeave={() => set_active_peer_list(null)}
             >
                 <thead id="transaction-peers-history-h">
                     <tr>
@@ -147,6 +151,7 @@ const ContractPeersHistory = ({
                             )}
                         </th>
                         <th>
+                            <i>(Upstream)</i><br/>
                             Requester
                             {check_if_contains_filter("requester") && (
                                 <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
@@ -193,6 +198,7 @@ const ContractPeersHistory = ({
                         </th>
                     </tr>
                 </thead>
+                <div className={`${!active_peer_list && 'is-hidden'} has-background-white p-3`} style={{position: "absolute", top: "50%", left: "40%", border: "1px solid gray"}}  onMouseLeave={() => set_active_peer_list(null)}>{active_peer_list?.map(p => <p>{p}</p>)}</div>
                 <tbody id="transaction-peers-history-b">
                     {inner_tx_list.map((tx) => (
                         <tr>
@@ -217,7 +223,7 @@ const ContractPeersHistory = ({
                                     cursor: "pointer",
                                 }}
                             >
-                                {tx.transaction_id}
+                                {tx.transaction_id.slice(-12)}
                             </td>
                             <td
                                 onClick={() =>
@@ -227,6 +233,8 @@ const ContractPeersHistory = ({
                                     cursor: "pointer",
                                 }}
                             >
+
+                            {tx.change_type == ChangeType.BROADCAST_EMITTED && <p><i>({tx.upstream?.slice(-8)})</i></p>}
                                 {tx.requester.slice(-8)}
                             </td>
                             <td
@@ -236,8 +244,9 @@ const ContractPeersHistory = ({
                                 style={{
                                     cursor: "pointer",
                                 }}
+                                onMouseEnter={() => {tx.change_type == ChangeType.BROADCAST_EMITTED && set_active_peer_list(tx.target)} }
                             >
-                                {tx.target.slice(-8)}
+                            {tx.change_type == ChangeType.BROADCAST_EMITTED ? `${tx.target.length} peers` : tx.target.slice(-8)}
                             </td>
                             <td
                                 onClick={() =>

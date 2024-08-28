@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import TransactionDetail from "./transaction-detail";
 import { all_tx } from "./transactions-data";
-import { TransactionData, TxTableInterface, TransactionPeerInterface } from "./type_definitions";
+import { TransactionData, TxTableInterface, TransactionPeerInterface, ChangeType } from "./type_definitions";
 import { filter_by_page, get_all_pages, rust_timestamp_to_utc_string } from "./utils";
 import {Pagination} from "./pagination";
 
@@ -92,7 +92,9 @@ const TransactionsTable = ({ open_tx_detail, tx_list }: TxTableInterface) => {
                         <tr key={`${tx.transaction_id.slice(-8)}-${tx.change_type.slice(-8)}-${index}`}>
                             <td  onClick={() => open_tx_detail(tx.transaction_id)} style={{cursor: "pointer"}}>{tx.transaction_id.slice(-8)}</td>
                             <td>{tx.requester.slice(-8)}</td>
-                            <td>{tx.target.slice(-8)}</td>
+                            <td>
+                                {tx.change_type == ChangeType.BROADCAST_EMITTED ? `${tx.target.length} peers` : tx.target.slice(-8)}
+                            </td>
                             <td>{tx.change_type}</td>
                             <td>{tx.contract_id.slice(-8)}</td>
                             <td>{tx.contract_location}</td>
