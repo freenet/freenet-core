@@ -85,6 +85,11 @@ const TransactionPeersHistory = ({
 
     }, [filter, order_by, order_direction]);
 
+    useEffect(() => {
+        clear_all_filters();
+    }, [tx_peer_list]);
+
+
     const check_if_contains_filter = (filter_type: string) => {
         return filter[filter_type] !== undefined;
     };
@@ -184,7 +189,7 @@ const TransactionPeersHistory = ({
                 </thead>
                 <tbody id="transaction-peers-history-b">
                     {filtered_list.map((tx) => (
-                        <tr key={`${tx.requester}+${tx.change_type}+${tx.timestamp.toString()}`}>
+                        <tr key={`${tx.requester}+${tx.change_type}+${tx.timestamp.toString()}+${tx.target}`}>
                             <td
                                 onClick={() =>
                                     add_filter("transaction_id", tx.transaction_id)
@@ -214,12 +219,12 @@ const TransactionPeersHistory = ({
                                 }}
                             >
                             {tx.change_type == ChangeType.BROADCAST_EMITTED ? 
-                                tx.target.map((t:string)  => {
+                                tx.target.map((t:string, index: number)  => {
                                 
-                                let t_location = t.split(" (@")[1].split(")")[0].slice(0, 8);
-                                t = t.split(" (@")[0].slice(-8);
+                                    let t_location = t.split(" (@")[1].split(")")[0].slice(0, 8);
+                                    t = t.split(" (@")[0].slice(-8);
 
-                                return <p>{t} @ {t_location}</p>
+                                    return <p key={t+index}>{t} @ {t_location}</p>
                             }) : tx.target.slice(-8)}
                             </td>
                             <td

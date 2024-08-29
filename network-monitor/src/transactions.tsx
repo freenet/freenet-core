@@ -128,6 +128,8 @@ export function TransactionContainer() {
             return;
         }
 
+        console.log("tx_history", tx_history);
+
         set_transaction(tx_history[0]);
         set_transaction_history(tx_history);
         set_is_detail_open(true);

@@ -123,14 +123,14 @@ export function handleBroadcastEmitted(
     let upstream_location = upstream.split(" (@")[1].split(")")[0];
     upstream = upstream.split(" (@")[0];
 
-    console.log("Broadcast Emitted");
-    console.log("tx", transaction_id);
-    console.log("upstream", upstream);
-    console.log("broadcast to", broadcast_to);
-    console.log("key", key);
-    console.log("sender", sender);
-    console.log("timestamp", timestamp);
-    console.log("contract location", contract_location);
+    // console.log("Broadcast Emitted");
+    // console.log("tx", transaction_id);
+    // console.log("upstream", upstream);
+    // console.log("broadcast to", broadcast_to);
+    // console.log("key", key);
+    // console.log("sender", sender);
+    // console.log("timestamp", timestamp);
+    // console.log("contract location", contract_location);
 
     let obj_data = {
         change_type: ChangeType.BROADCAST_EMITTED,

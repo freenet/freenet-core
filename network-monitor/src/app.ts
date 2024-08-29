@@ -56,22 +56,22 @@ function handleChanges(event: MessageEvent) {
                 const contractChange =
                     fbTopology.ContractChange.getRootAsContractChange(buf);
 
-                console.log(
-                    "raw contract change changeType",
-                    contractChange.changeType()
-                );
+                // console.log(
+                //     "raw contract change changeType",
+                //     contractChange.changeType()
+                // );
 
-                console.log(
-                    "parsed contract change changeType",
-                    get_change_type(contractChange.changeType())
-                );
+                // console.log(
+                //     "parsed contract change changeType",
+                //     get_change_type(contractChange.changeType())
+                // );
 
                 let now_change_type = get_change_type(
                     contractChange.changeType()
                 );
 
                 if (now_change_type == ChangeType.BROADCAST_EMITTED) {
-                    console.log("processing BroadcastEmitted");
+                    // console.log("processing BroadcastEmitted");
 
                     let {
                         transaction,

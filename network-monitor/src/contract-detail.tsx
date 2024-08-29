@@ -35,6 +35,8 @@ const ContractPeersHistory = ({
 
         set_filter(filter);
 
+        set_page(1);
+
         update_filtered_list();
     };
 
@@ -90,13 +92,14 @@ const ContractPeersHistory = ({
     }, [filter, order_by, order_direction]);
 
     useEffect(() => {
-        update_filtered_list();
+        clear_all_filters();
         set_page(1);
     }, [tx_peer_list]);
 
     useEffect(() => {
         set_inner_tx_list(filter_by_page(filtered_list, page));
     }, [page, filtered_list]);   
+
 
 
     const check_if_contains_filter = (filter_type: string) => {
@@ -108,6 +111,7 @@ const ContractPeersHistory = ({
             id="transaction-peers-history"
             className="block"
             style={{ marginTop: 20 }}
+            onMouseLeave={() => set_active_peer_list(null)}
         >
             <Pagination currentPage={page} totalPages={get_all_pages(filtered_list)} onPageChange={(page:number) => set_page(page)}/>
             <h2>Contract Transactions History </h2>
@@ -118,10 +122,12 @@ const ContractPeersHistory = ({
                     </button>
                 </div>
             )}
+
+            <div className={`${!active_peer_list && 'is-hidden'} has-background-white p-3`} style={{position: "absolute", top: "50%", left: "40%", border: "1px solid gray", zIndex: 2000}}  onMouseLeave={() => set_active_peer_list(null)}>{active_peer_list?.map((p, index) => <p key={`${p}${index}`}>{p}</p>)}</div>
+
             <table
                 id="transaction-peers-history"
                 className="table is-striped block is-bordered"
-                onMouseLeave={() => set_active_peer_list(null)}
             >
                 <thead id="transaction-peers-history-h">
                     <tr>
@@ -198,10 +204,9 @@ const ContractPeersHistory = ({
                         </th>
                     </tr>
                 </thead>
-                <div className={`${!active_peer_list && 'is-hidden'} has-background-white p-3`} style={{position: "absolute", top: "50%", left: "40%", border: "1px solid gray"}}  onMouseLeave={() => set_active_peer_list(null)}>{active_peer_list?.map(p => <p>{p}</p>)}</div>
                 <tbody id="transaction-peers-history-b">
                     {inner_tx_list.map((tx) => (
-                        <tr>
+                        <tr key={`${tx.requester}+${tx.change_type}+${tx.timestamp.toString()}+${tx.target}`}>
                             <td
                                 onClick={() =>
                                     add_filter("contract_id", tx.contract_id)
@@ -234,7 +239,7 @@ const ContractPeersHistory = ({
                                 }}
                             >
 
-                            {tx.change_type == ChangeType.BROADCAST_EMITTED && <p><i>({tx.upstream?.slice(-8)})</i></p>}
+                            {tx.change_type == ChangeType.BROADCAST_EMITTED && <p key={tx.upstream}><i>({tx.upstream?.slice(-8)})</i></p>}
                                 {tx.requester.slice(-8)}
                             </td>
                             <td

@@ -96,7 +96,7 @@ export const parse_broadcast_emitted_msg = (
         broadcast_to.push(broadcast_emitted_obj.broadcastTo(i)!);
     }
 
-    console.log("broadcastTo", broadcast_to);
+    // console.log("broadcastTo", broadcast_to);
 
     if (broadcast_to.length == 0) {
         throw new Error("Broadcast To Peers not found");
@@ -104,7 +104,7 @@ export const parse_broadcast_emitted_msg = (
 
     let broadcasted_to = broadcast_emitted_obj.broadcastedTo()!;
 
-    console.log(broadcasted_to);
+    // console.log(broadcasted_to);
 
     let contract_key = broadcast_emitted_obj.key();
 
