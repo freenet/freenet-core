@@ -234,13 +234,14 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     key,
                     target,
                     timestamp,
+                    requester,
                     contract_location,
                 } => {
                     tracing::info!("sending put success");
                     ContractChange::put_success_msg(
                         tx_id.clone(),
                         key.to_string(),
-                        target.to_string(),
+                        requester.to_string(),
                         target.to_string(),
                         *timestamp,
                         *contract_location,
@@ -335,13 +336,15 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                 tx_id,
                 key,
                 target,
+                requester,
                 timestamp,
                 contract_location,
             } => {
+                tracing::debug!(%tx_id, %key, %requester, %target, "sending put success");
                 let msg = ContractChange::put_success_msg(
                     tx_id,
                     key,
-                    target.clone(),
+                    requester,
                     target,
                     timestamp,
                     contract_location,
@@ -435,6 +438,7 @@ pub(crate) enum Change {
     PutSuccess {
         tx_id: String,
         key: String,
+        requester: String,
         target: String,
         timestamp: u64,
         contract_location: f64,
@@ -627,6 +631,7 @@ impl ServerState {
                             tx_id: tx_id.clone(),
                             key: key.clone(),
                             target: target.clone(),
+                            requester: requester.clone(),
                             timestamp,
                             contract_location,
                         });
@@ -662,6 +667,7 @@ impl ServerState {
                     tx_id,
                     key,
                     target,
+                    requester,
                     timestamp,
                     contract_location,
                 });

@@ -268,15 +268,18 @@ impl<'a> NetEventLog<'a> {
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
-            NetMessage::Put(PutMsg::SuccessfulPut { id, target, key }) => {
-                EventKind::Put(PutEvent::PutSuccess {
-                    id: *id,
-                    requester: op_manager.ring.peer_key,
-                    target: *target,
-                    key: key.clone(),
-                    timestamp: chrono::Utc::now().timestamp() as u64,
-                })
-            }
+            NetMessage::Put(PutMsg::SuccessfulPut {
+                id,
+                target,
+                key,
+                sender,
+            }) => EventKind::Put(PutEvent::PutSuccess {
+                id: *id,
+                requester: *sender,
+                target: *target,
+                key: key.clone(),
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
             NetMessage::Put(PutMsg::Broadcasting {
                 new_value,
                 broadcast_to,
@@ -1236,7 +1239,7 @@ enum PutEvent {
     },
     PutSuccess {
         id: Transaction,
-        requester: PeerId,
+        requester: PeerKeyLocation,
         target: PeerKeyLocation,
         key: ContractKey,
         timestamp: u64,
@@ -1465,7 +1468,7 @@ pub(super) mod test {
                         PutEvent::Request { key, .. } if key == for_key => {
                             is_expected_key = true;
                         }
-                        PutEvent::PutSuccess { requester, .. } if requester == peer => {
+                        PutEvent::PutSuccess { requester, .. } if &requester.peer == peer => {
                             is_expected_peer = true;
                         }
                         _ => {}

@@ -430,6 +430,7 @@ impl Operation for PutOp {
                         id: *id,
                         target: *upstream,
                         key: key.clone(),
+                        sender,
                     });
                     new_state = None;
                 }
@@ -459,6 +460,7 @@ impl Operation for PutOp {
                                     id: *id,
                                     target: upstream,
                                     key,
+                                    sender: op_manager.ring.own_location(),
                                 });
                             } else {
                                 return_msg = None;
@@ -655,6 +657,7 @@ async fn try_to_broadcast(
                     id,
                     target: upstream,
                     key: key.clone(),
+                    sender: op_manager.ring.own_location(),
                 });
             }
         }
@@ -897,6 +900,7 @@ mod messages {
             id: Transaction,
             target: PeerKeyLocation,
             key: ContractKey,
+            sender: PeerKeyLocation,
         },
         /// Target the node which is closest to the key
         SeekNode {
