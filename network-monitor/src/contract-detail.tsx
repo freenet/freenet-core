@@ -5,10 +5,12 @@ import {
     TransactionDetailPeersHistoryInterface,
     FilterDictionaryInterface,
     ContractHistoryInterface,
-    ChangeType
+    ChangeType,
+    RingVisualizationPoint
 } from "./type_definitions";
-import {filter_by_page, get_all_pages, rust_timestamp_to_utc_string} from "./utils";
+import {filter_by_page, get_all_pages, get_peers_caching_the_contract, rust_timestamp_to_utc_string} from "./utils";
 import {Pagination} from "./pagination";
+import {RingVisualization} from "./ring-visualization";
 
 
 const ContractPeersHistory = ({
@@ -318,7 +320,25 @@ export const ContractDetail = ({
     close_detail,
     peers_history,
     tx_history,
-}: TransactionDetailInterface) => (
+}: TransactionDetailInterface) => {
+    const [contract_location, set_contract_location] = useState<RingVisualizationPoint | null>(null);
+    const [caching_peers_locations, set_caching_peers_locations] = useState<Array<RingVisualizationPoint>>([]);
+
+    useEffect(() => {
+        if (!tx_history) {
+            return;
+        }
+
+        console.log("tx_history", tx_history);
+        let caching_locations = get_peers_caching_the_contract(tx_history);
+
+        console.log("caching_locations", caching_locations);
+
+        set_contract_location({localization: tx_history[0].contract_location, peerId: "ideal"});
+        set_caching_peers_locations(caching_locations);
+    }, [tx_history]);
+
+    return (
     <div
         id="contract-detail"
         style={{
@@ -371,6 +391,9 @@ export const ContractDetail = ({
                 <h2>Location Peers</h2>
                 <div id="peers-histogram"></div>
             </div>
+            
+            <RingVisualization main_peer={contract_location || {peerId: "null", localization: 0}}  other_peers={caching_peers_locations}  />
+
 
             <div id="other-peer-conns-graph">
             </div>
@@ -383,5 +406,6 @@ export const ContractDetail = ({
         </div>
     </div>
 );
+}
 
 

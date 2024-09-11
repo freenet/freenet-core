@@ -7,8 +7,13 @@ import {
     TranscationHistoryInterface,
     ChangeType,
 } from "./type_definitions";
-import {rust_timestamp_to_utc_string} from "./utils";
+import {get_peers_description_to_render, refresh_peers_tree, rust_timestamp_to_utc_string} from "./utils";
 
+declare global {
+    interface Window {
+        drawNomNomlCanvas: (text_to_render: string) => void;
+    }
+}
 
 const TransactionPeersHistory = ({
     tx_peer_list,
@@ -18,6 +23,7 @@ const TransactionPeersHistory = ({
     const [order_by, set_order_by] = useState<string>("timestamp");
     const [order_direction, set_order_direction] = useState<string>("asc");
     const [loading, set_loading] = useState<boolean>(false);
+    const [mermaid_text, set_mermaid_text] = useState<string>("");
 
     const add_filter = (filter_type: string, filter_value: string) => {
         if (check_if_contains_filter(filter_type)) {
@@ -75,6 +81,7 @@ const TransactionPeersHistory = ({
     };
 
     useEffect(() => {
+
         update_filtered_list();
 
         if (loading) {
@@ -86,13 +93,31 @@ const TransactionPeersHistory = ({
     }, [filter, order_by, order_direction]);
 
     useEffect(() => {
+        let transaction_description_to_render = get_peers_description_to_render(tx_peer_list);
+
+        console.log("Transaction description to render=", transaction_description_to_render);
+        set_mermaid_text(transaction_description_to_render);
+
+        setTimeout(() => {
+        }, 1000);
+
         clear_all_filters();
     }, [tx_peer_list]);
+
+
+    useEffect(() => {
+        if (mermaid_text === "") {
+            return;
+        }
+
+        refresh_peers_tree(mermaid_text);
+    }, [mermaid_text]);
 
 
     const check_if_contains_filter = (filter_type: string) => {
         return filter[filter_type] !== undefined;
     };
+
 
     return (
         <div
@@ -100,6 +125,12 @@ const TransactionPeersHistory = ({
             className="block"
             style={{ marginTop: 20 }}
         >
+
+            <div style={{display: "block"}} id="transactions-tree-graph">
+                <pre className="mermaid" id="mermaid-tree">
+                    {mermaid_text}
+                </pre>
+            </div>
             <h2>Transaction Peers History </h2>
             {Object.keys(filter).length > 0 && (
                 <div>
@@ -324,8 +355,8 @@ const TransactionDetail = ({
                 border: "2px solid black",
                 padding: 30,
                 marginTop: 20,
-                width: "75%",
-                height: "75%",
+                width: "95%",
+                height: "95%",
                 backgroundColor: "rgba(255, 255, 255, 0.95)",
                 position: "relative",
                 overflow: "scroll",

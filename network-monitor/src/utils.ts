@@ -1,4 +1,9 @@
-import { ChangeType, PutMsgData, TransactionData } from "./type_definitions";
+import {
+    ChangeType,
+    PutMsgData,
+    RingVisualizationPoint,
+    TransactionData,
+} from "./type_definitions";
 import { ContractChange } from "./generated/topology";
 import * as fbTopology from "./generated/topology";
 
@@ -23,11 +28,58 @@ export const get_change_type = (
     return null;
 };
 
-export const parse_put_msg_data = (
+export const parse_put_request_msg_data = (
     contractChange: ContractChange,
     changeType: fbTopology.ContractChangeType
 ): PutMsgData => {
     let put_request_obj = contractChange.change(new fbTopology.PutRequest());
+
+    let transaction = put_request_obj.transaction();
+
+    if (!transaction) {
+        throw new Error("Transaction ID not found");
+    }
+
+    let contract_id = contractChange.contractId();
+
+    if (!contract_id) {
+        throw new Error("Contract ID not found");
+    }
+
+    let target = put_request_obj.target();
+
+    if (!target) {
+        throw new Error("Target Peer not found");
+    }
+
+    let requester = put_request_obj.requester();
+
+    if (!requester) {
+        throw new Error("Requester Peer not found");
+    }
+
+    let timestamp = put_request_obj.timestamp()!;
+
+    let change_type = get_change_type(changeType)!;
+
+    let contract_location = put_request_obj.contractLocation()!;
+
+    return {
+        transaction,
+        contract_id,
+        target,
+        requester,
+        change_type,
+        timestamp,
+        contract_location,
+    } as PutMsgData;
+};
+
+export const parse_put_success_msg_data = (
+    contractChange: ContractChange,
+    changeType: fbTopology.ContractChangeType
+): PutMsgData => {
+    let put_request_obj = contractChange.change(new fbTopology.PutSuccess());
 
     let transaction = put_request_obj.transaction();
 
@@ -205,4 +257,91 @@ export const filter_by_page = (
     updated_tx_list = updated_tx_list.slice(start, end);
 
     return updated_tx_list;
+};
+
+export const get_peers_description_to_render = (
+    tx_peer_list: TransactionData[]
+) => {
+    let peer_description = "graph TD\n";
+
+    for (const peer of tx_peer_list) {
+        let peer_id = peer.requester;
+        let peer_location = peer.contract_location;
+        let change_type = peer.change_type;
+        let peer_target = peer.target;
+
+        if (typeof peer_target == "string") {
+            peer_target = peer_target.split(" (@")[0].slice(-8);
+        } else {
+            peer_target = peer_target
+                .map((t: string) => t.split(" (@")[0].slice(-8))
+                .join("; ");
+        }
+
+        let sliced_id = peer_id.slice(-8);
+
+        let connection_type;
+        let node_styling;
+
+        if (change_type == ChangeType.BROADCAST_EMITTED) {
+            connection_type = "-.->";
+        } else if (
+            change_type == ChangeType.PUT_REQUEST ||
+            change_type == ChangeType.PUT_SUCCESS
+        ) {
+            connection_type = "==>";
+        } else {
+            connection_type = "-->";
+        }
+
+        node_styling =
+            change_type == ChangeType.PUT_REQUEST
+                ? "style " + sliced_id + " stroke:#1B2A41,stroke-width:3px"
+                : null;
+
+        let peer_connection = `${sliced_id} ${connection_type}|${change_type}| ${peer_target}`;
+
+        if (node_styling) {
+            peer_connection += "\n" + node_styling;
+        }
+
+        peer_description += peer_connection + "\n";
+    }
+
+    return peer_description;
+};
+
+export const refresh_peers_tree = async (graph_definition: string) => {
+    let element = document.querySelector("#transactions-tree-graph")!;
+    const { svg, bindFunctions } = await window.mermaid.render(
+        "mermaid-tree",
+        graph_definition
+    );
+    element.innerHTML = svg;
+    bindFunctions?.(element);
+};
+
+export const get_peers_caching_the_contract = (
+    tx_peer_list: TransactionData[]
+): RingVisualizationPoint[] => {
+    let peers_caching_contract: RingVisualizationPoint[] = [];
+
+    for (const peer of tx_peer_list) {
+        if (peer.change_type == ChangeType.PUT_SUCCESS) {
+            if (
+                peers_caching_contract.filter(
+                    (data) => data.peerId == peer.requester
+                ).length != 0
+            ) {
+                continue;
+            }
+
+            peers_caching_contract.push({
+                localization: peer.requester_location as number,
+                peerId: peer.requester as string,
+            } as RingVisualizationPoint);
+        }
+    }
+
+    return peers_caching_contract;
 };

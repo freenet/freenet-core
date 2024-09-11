@@ -5,18 +5,51 @@ import {RingVisualization} from "./ring-visualization";
 import {useEffect} from "react";
 import {createRoot} from "react-dom/client";
 import React from "react";
+import {ring_mock_data} from "./mock_data";
 
-
+declare global {
+    interface Window {
+        mermaid: any;
+    }
+}
 
 const ReactContainer = () => {
+    const [peers, setPeers] = React.useState(true);
+    const [contracts, setContracts] = React.useState(false);
+    
+    const togglePeers = () => {
+        setPeers(!peers);
+    }
 
+    const toggleContracts = () => {
+        setContracts(!contracts);
+    }
+
+    useEffect(() => {
+        console.log("Peers visibility changed");
+        console.log(peers);
+    }, [peers]);
+
+    useEffect(() => {
+        console.log("Contracts visibility changed");
+        console.log(contracts);
+    }, [contracts]);
+
+
+    const ring_react_element = 
+    <div>
+
+        <RingVisualization main_peer={ring_mock_data[0]}  other_peers={ring_mock_data.slice(1)}  />
+
+        <ButtonsElements togglePeers={togglePeers} toggleContracts={toggleContracts} />
+
+    </div>;
 
     useEffect(() => {
         // we need to wait here for the histogram to be initiated first. If we move all to React code we can remove this.
         setTimeout(() => {
 
-            const ring_react_element = <RingVisualization main_peer={{peerId: "abc", localization: 0.1}}  other_peers={[{peerId: "0x593b", localization: 0.3}, {peerId: "0x593b", localization: 0.5}, {peerId: "0x593b", localization: 0.7}, {peerId: "0x593b", localization: 0.9}]}  />;
-
+            
 
             // Append the SVG element.
             const peers_container = document.getElementById("peers-histogram")!;
@@ -28,12 +61,14 @@ const ReactContainer = () => {
             root.render(ring_react_element);
 
             peers_container.appendChild(ring_container);
+
+
             
             console.log("React container mounted");
 
-        }, 6000);
+        }, 5000);
 
-
+        window.mermaid.contentLoaded();
     }, []);
 
 
@@ -42,6 +77,7 @@ const ReactContainer = () => {
 
             <ContractsContainer />
             <TransactionContainer />
+
         
         </div>
         
@@ -50,3 +86,14 @@ const ReactContainer = () => {
 
 export const component = <ReactContainer />;
 
+interface IButtonElements {
+    togglePeers: () => void;
+    toggleContracts: () => void;
+}
+
+const ButtonsElements = ({togglePeers, toggleContracts}: IButtonElements) => (
+                <div>
+                    <button className="button" onClick={() => togglePeers()}>Peers</button>
+                    <button className="button" onClick={() => toggleContracts()}>Contracts</button>
+                </div>
+);

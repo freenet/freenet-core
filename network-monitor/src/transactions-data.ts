@@ -71,10 +71,16 @@ export function handlePutSuccess(
     // console.log("tx", transaction_id);
     // console.log("contract key", contract_id);
     // console.log("change_type", change_type);
-    // console.log("target", target);
+    // // console.log("target", target);
     // console.log("requester", requester);
     // console.log("timestamp", timestamp);
     // console.log("contract location", contract_location);
+
+    let requester_location = parseFloat(
+        requester.split(" (@ ")[1].split(")")[0]
+    );
+
+    requester = requester.split(" (@")[0];
 
     let obj_data = {
         change_type,
@@ -82,6 +88,7 @@ export function handlePutSuccess(
         contract_id,
         target,
         requester,
+        requester_location,
         status: undefined,
         started: undefined,
         finalized: undefined,

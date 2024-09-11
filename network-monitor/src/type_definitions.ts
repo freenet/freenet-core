@@ -22,6 +22,7 @@ export type TransactionData = {
     started?: string;
     finalized?: string;
     upstream?: string;
+    requester_location?: number;
 };
 
 export interface TransactionInterface {
@@ -49,6 +50,7 @@ export interface TransactionDetailInterface {
     close_detail: () => void;
     peers_history?: Array<TransactionPeerInterface>;
     tx_history?: Array<TransactionData>;
+    mermaid_text?: string;
 }
 
 export interface TxTableInterface {

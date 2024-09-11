@@ -5,28 +5,12 @@ import {RingVisualizationPoint, RingVisualizationProps} from "./type_definitions
 
 
 export const RingVisualization = ({main_peer, other_peers}: RingVisualizationProps) => {
-    const [peers, setPeers] = React.useState(true);
-    const [contracts, setContracts] = React.useState(false);
-
-    const togglePeers = () => {
-        setPeers(!peers);
-    }
-
-    const toggleContracts = () => {
-        setContracts(!contracts);
-    }
-
+    const [selected_peer, setSelectedPeer] = React.useState(main_peer);
 
     useEffect(() => {
-        console.log("Peers visibility changed");
-        console.log(peers);
-    }, [peers]);
-
-    useEffect(() => {
-        console.log("Contracts visibility changed");
-        console.log(contracts);
-    }, [contracts]);
-
+        console.log("Selected peer changed");
+        setSelectedPeer(main_peer);
+    }, [main_peer]);
 
     // Declare the chart dimensions and margins.
     const width = 640;
@@ -77,7 +61,8 @@ export const RingVisualization = ({main_peer, other_peers}: RingVisualizationPro
                         key={index}
                         cx={calculate_point(peer.localization, scale).x}
                         cy={calculate_point(peer.localization, scale).y}
-                        r={1.2 * scale}
+                        fill="steelblue"
+                        r={1.5 * scale}
                         onMouseEnter={(e) => {
                             document.styleSheets[2].addRule(
                                 `.svg-tooltip-${peer.localization
@@ -94,7 +79,13 @@ export const RingVisualization = ({main_peer, other_peers}: RingVisualizationPro
                                 "display: none"
                             );
                         }}
+                        style={{zIndex: 999}}
+                        onClick={() => {
+                            setSelectedPeer(peer);
+                        }}
+
                     />
+
 
                     <text
                         id="svg-tooltip"
@@ -102,14 +93,21 @@ export const RingVisualization = ({main_peer, other_peers}: RingVisualizationPro
                             calculate_point(peer.localization, scale).x + 10
                         }`}
                         y={`${
-                            calculate_point(peer.localization, scale).y + 10
+                            calculate_point(peer.localization, scale).y + 0 + (peer.localization > 0.7 && peer.localization < 0.9 ? -10 : 0) + (peer.localization > 0.15 && peer.localization < 0.35 ? 30 : 0)
                         }`}
                         className={`svg-tooltip-${peer.localization
                             .toString()
                             .replace(".", "")}`}
+                        style={{backgroundColor: "white", padding: 5, zIndex: 999}}
+                        fontWeight={100}
+                        fontSize={13}
                     >
-                        {peer.peerId}: {peer.localization}
+                        {peer.peerId.slice(-8)}
+                        @ {peer.localization.toString().slice(0, 8)}
                     </text>
+
+
+                    
                 </>
             );
 
@@ -168,9 +166,12 @@ export const RingVisualization = ({main_peer, other_peers}: RingVisualizationPro
                         className={`svg-tooltip-distance-${peer.localization
                             .toString()
                             .replace(".", "")}`}
+
+                        fontWeight={100}
                     >
                         distance: {Math.abs(peer.localization - main_peer.localization)}
                     </text>
+
 
                 </>
             );
@@ -191,7 +192,7 @@ export const RingVisualization = ({main_peer, other_peers}: RingVisualizationPro
 
     return (
         <div>
-        <svg width={400} height={100 * scale} style={{ position: "relative" }}>
+        <svg width={700} height={100 * scale} style={{ position: "relative" }}>
             <path
                 fill="none"
                 stroke="currentColor"
@@ -209,22 +210,57 @@ export const RingVisualization = ({main_peer, other_peers}: RingVisualizationPro
                 <circle
                     cx={calculate_point(main_peer.localization, scale).x}
                     cy={calculate_point(main_peer.localization, scale).y}
-                    r={1.5 * scale}
+                    r={1.8 * scale}
                     fill="red"
+                    style={{zIndex: 999, padding: 10}}
+
                 />
+
+
+
+                {draw_connecting_lines(other_peers)}
 
                 {draw_points(other_peers)}
 
-                {draw_connecting_lines(other_peers)}
+                
+                <text
+                    // main peer
+                    id="svg-tooltip"
+                    x={`${
+                        calculate_point(main_peer.localization, scale).x + 10
+                    }`}
+                    y={`${calculate_point(main_peer.localization, scale).y + (main_peer.localization > 0.64 && main_peer.localization < 0.9 ? -20 : 0) + (main_peer.localization > 0.15 && main_peer.localization < 0.35 ? 30 : 0)}`}
+                    className={`svg-tooltip-${main_peer.localization
+                        .toString()
+                        .replace(".", "")}`}
+                    fontWeight={100}
+                    onClick={() => {
+                        setSelectedPeer(main_peer);
+                    }}
+                    style={{zIndex: 999}}
+                    
+                >
+                    {main_peer.peerId} 
+                     @ {main_peer.localization.toString().slice(0, 8)}
+
+                </text>
+
+
+                <text 
+                    id="selected_peer"
+                    x={350}
+                    y={30}
+                    fontSize={14}
+                    fontWeight={100}
+                >
+                    Selected peer:
+                    {selected_peer.peerId.slice(-8)}
+                    @ {selected_peer.localization.toString().slice(0, 8)}
+                </text>
 
                 
             </g>
         </svg>
-        <div>
-
-            <button className="button" onClick={() => togglePeers()}>Peers</button>
-
-            <button className="button" onClick={() => toggleContracts()}>Contracts</button></div>
         </div>
     );
 

@@ -11,7 +11,8 @@ import {
     get_change_type,
     parse_broadcast_emitted_msg,
     parse_broadcast_received_msg,
-    parse_put_msg_data,
+    parse_put_request_msg_data,
+    parse_put_success_msg_data,
 } from "./utils";
 import { ChangeType } from "./type_definitions";
 import { unionToContractChangeType } from "./generated/topology/contract-change-type";
@@ -141,45 +142,62 @@ function handleChanges(event: MessageEvent) {
                     return;
                 }
 
-                let {
-                    transaction,
-                    contract_id,
-                    target,
-                    requester,
-                    change_type,
-                    timestamp,
-                    contract_location,
-                } = parse_put_msg_data(
-                    contractChange,
-                    contractChange.changeType()
-                );
-
-                if (change_type == ChangeType.PUT_REQUEST) {
-                    handlePutRequest(
+                if (now_change_type == ChangeType.PUT_REQUEST) {
+                    let {
                         transaction,
                         contract_id,
                         target,
                         requester,
                         change_type,
                         timestamp,
-                        contract_location
+                        contract_location,
+                    } = parse_put_request_msg_data(
+                        contractChange,
+                        contractChange.changeType()
                     );
 
-                    return;
+                    if (change_type == ChangeType.PUT_REQUEST) {
+                        handlePutRequest(
+                            transaction,
+                            contract_id,
+                            target,
+                            requester,
+                            change_type,
+                            timestamp,
+                            contract_location
+                        );
+
+                        return;
+                    }
                 }
 
-                if (change_type == ChangeType.PUT_SUCCESS) {
-                    handlePutSuccess(
+                if (now_change_type == ChangeType.PUT_SUCCESS) {
+                    let {
                         transaction,
                         contract_id,
                         target,
                         requester,
                         change_type,
                         timestamp,
-                        contract_location
+                        contract_location,
+                    } = parse_put_success_msg_data(
+                        contractChange,
+                        contractChange.changeType()
                     );
 
-                    return;
+                    if (change_type == ChangeType.PUT_SUCCESS) {
+                        handlePutSuccess(
+                            transaction,
+                            contract_id,
+                            target,
+                            requester,
+                            change_type,
+                            timestamp,
+                            contract_location
+                        );
+
+                        return;
+                    }
                 }
 
                 if (
