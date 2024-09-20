@@ -116,7 +116,7 @@ pub(crate) struct NetEventLog<'a> {
 
 impl<'a> NetEventLog<'a> {
     pub fn route_event(tx: &'a Transaction, ring: &'a Ring, route_event: &RouteEvent) -> Self {
-        let peer_id = ring.get_peer_key().unwrap().clone();
+        let peer_id = ring.connection_manager.get_peer_key().unwrap().clone();
         NetEventLog {
             tx,
             peer_id,
@@ -125,12 +125,12 @@ impl<'a> NetEventLog<'a> {
     }
 
     pub fn connected(ring: &'a Ring, peer: PeerId, location: Location) -> Self {
-        let peer_id = ring.get_peer_key().unwrap().clone();
+        let peer_id = ring.connection_manager.get_peer_key().unwrap().clone();
         NetEventLog {
             tx: Transaction::NULL,
             peer_id,
             kind: EventKind::Connect(ConnectEvent::Connected {
-                this: ring.own_location(),
+                this: ring.connection_manager.own_location(),
                 connected: PeerKeyLocation {
                     peer,
                     location: Some(location),
@@ -140,7 +140,7 @@ impl<'a> NetEventLog<'a> {
     }
 
     pub fn disconnected(ring: &'a Ring, from: &'a PeerId) -> Self {
-        let peer_id = ring.get_peer_key().unwrap().clone();
+        let peer_id = ring.connection_manager.get_peer_key().unwrap().clone();
         NetEventLog {
             tx: Transaction::NULL,
             peer_id,
@@ -149,7 +149,7 @@ impl<'a> NetEventLog<'a> {
     }
 
     pub fn from_outbound_msg(msg: &'a NetMessage, ring: &'a Ring) -> Either<Self, Vec<Self>> {
-        let Some(peer_id) = ring.get_peer_key() else {
+        let Some(peer_id) = ring.connection_manager.get_peer_key() else {
             return Either::Right(vec![]);
         };
         let kind = match msg {
@@ -160,7 +160,7 @@ impl<'a> NetEventLog<'a> {
                     },
                 ..
             })) => {
-                let this_peer = ring.own_location();
+                let this_peer = ring.connection_manager.own_location();
                 if *accepted {
                     EventKind::Connect(ConnectEvent::Connected {
                         this: this_peer,
@@ -197,7 +197,7 @@ impl<'a> NetEventLog<'a> {
                     },
                 ..
             }) => {
-                let this_peer = &op_manager.ring.get_peer_key().unwrap();
+                let this_peer = &op_manager.ring.connection_manager.get_peer_key().unwrap();
                 let mut events = vec![];
                 if *accepted {
                     events.push(NetEventLog {
@@ -217,7 +217,7 @@ impl<'a> NetEventLog<'a> {
                 id,
                 ..
             }) => {
-                let this_peer = &op_manager.ring.get_peer_key().unwrap();
+                let this_peer = &op_manager.ring.connection_manager.get_peer_key().unwrap();
                 let key = contract.key();
                 EventKind::Put(PutEvent::Request {
                     requester: this_peer.clone(),
@@ -229,7 +229,7 @@ impl<'a> NetEventLog<'a> {
             NetMessageV1::Put(PutMsg::SuccessfulPut { id, target, key }) => {
                 EventKind::Put(PutEvent::PutSuccess {
                     id: *id,
-                    requester: op_manager.ring.get_peer_key().unwrap(),
+                    requester: op_manager.ring.connection_manager.get_peer_key().unwrap(),
                     target: target.clone(),
                     key: *key,
                 })
@@ -272,7 +272,12 @@ impl<'a> NetEventLog<'a> {
         };
         Either::Left(NetEventLog {
             tx: msg.id(),
-            peer_id: op_manager.ring.get_peer_key().unwrap().clone(),
+            peer_id: op_manager
+                .ring
+                .connection_manager
+                .get_peer_key()
+                .unwrap()
+                .clone(),
             kind,
         })
     }
@@ -952,7 +957,7 @@ pub(crate) mod tracer {
         let disabled_logs = std::env::var("FREENET_DISABLE_LOGS").is_ok();
         let to_stderr = std::env::var("FREENET_LOG_TO_STDERR").is_ok();
         let layers = {
-            let fmt_layer = tracing_subscriber::fmt::layer().with_level(true);
+            let fmt_layer = tracing_subscriber::fmt::layer().with_level(true).pretty();
             let fmt_layer = if cfg!(any(test, debug_assertions)) {
                 fmt_layer.with_file(true).with_line_number(true)
             } else {
@@ -1031,13 +1036,13 @@ pub(super) mod test {
     };
 
     use super::*;
-    use crate::{node::testing_impl::NodeLabel, ring::Distance};
+    use crate::{node::testing_impl::NodeLabel, ring::Distance, transport::TransportPublicKey};
 
     static LOG_ID: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Clone)]
     pub(crate) struct TestEventListener {
-        node_labels: Arc<DashMap<NodeLabel, PeerId>>,
+        node_labels: Arc<DashMap<NodeLabel, TransportPublicKey>>,
         tx_log: Arc<DashMap<Transaction, Vec<ListenerLogId>>>,
         logs: Arc<tokio::sync::Mutex<Vec<NetLogMessage>>>,
         network_metrics_server:
@@ -1056,114 +1061,25 @@ pub(super) mod test {
             }
         }
 
-        pub fn add_node(&mut self, label: NodeLabel, peer: PeerId) {
+        pub fn add_node(&mut self, label: NodeLabel, peer: TransportPublicKey) {
             self.node_labels.insert(label, peer);
         }
 
-        pub fn is_connected(&self, peer: &PeerId) -> bool {
+        pub fn is_connected(&self, peer: &TransportPublicKey) -> bool {
             let Ok(logs) = self.logs.try_lock() else {
                 return false;
             };
             logs.iter().any(|log| {
-                &log.peer_id == peer
+                &log.peer_id.pub_key == peer
                     && matches!(log.kind, EventKind::Connect(ConnectEvent::Connected { .. }))
             })
         }
 
-        pub fn has_put_contract(&self, peer: &PeerId, for_key: &ContractKey) -> bool {
-            let Ok(logs) = self.logs.try_lock() else {
-                return false;
-            };
-            let put_ops = logs.iter().filter_map(|l| match &l.kind {
-                EventKind::Put(ev) => Some((&l.tx, ev)),
-                _ => None,
-            });
-            let put_ops: HashMap<_, Vec<_>> = put_ops.fold(HashMap::new(), |mut acc, (id, ev)| {
-                acc.entry(id).or_default().push(ev);
-                acc
-            });
-
-            for (_tx, events) in put_ops {
-                let mut is_expected_key = false;
-                let mut is_expected_peer = false;
-                for ev in events {
-                    match ev {
-                        PutEvent::Request { key, .. } if key != for_key => break,
-                        PutEvent::Request { key, .. } if key == for_key => {
-                            is_expected_key = true;
-                        }
-                        PutEvent::PutSuccess { requester, .. } if requester == peer => {
-                            is_expected_peer = true;
-                        }
-                        _ => {}
-                    }
-                }
-                if is_expected_peer && is_expected_key {
-                    return true;
-                }
-            }
-            false
-        }
-
-        /// The contract was broadcasted from one peer to an other successfully.
-        #[cfg(test)]
-        pub fn contract_broadcasted(&self, for_key: &ContractKey) -> bool {
-            let Ok(logs) = self.logs.try_lock() else {
-                return false;
-            };
-            let put_broadcast_ops = logs.iter().filter_map(|l| match &l.kind {
-                EventKind::Put(ev @ PutEvent::BroadcastEmitted { .. })
-                | EventKind::Put(ev @ PutEvent::BroadcastReceived { .. }) => Some((&l.tx, ev)),
-                _ => None,
-            });
-            let put_broadcast_by_tx: HashMap<_, Vec<_>> =
-                put_broadcast_ops.fold(HashMap::new(), |mut acc, (id, ev)| {
-                    acc.entry(id).or_default().push(ev);
-                    acc
-                });
-            for (_tx, events) in put_broadcast_by_tx {
-                let mut was_emitted = false;
-                let mut was_received = false;
-                for ev in events {
-                    match ev {
-                        PutEvent::BroadcastEmitted { key, .. } if key == for_key => {
-                            was_emitted = true;
-                        }
-                        PutEvent::BroadcastReceived { key, .. } if key == for_key => {
-                            was_received = true;
-                        }
-                        _ => {}
-                    }
-                }
-                if was_emitted && was_received {
-                    return true;
-                }
-            }
-            false
-        }
-
-        pub fn has_got_contract(&self, peer: &PeerId, expected_key: &ContractKey) -> bool {
-            let Ok(logs) = self.logs.try_lock() else {
-                return false;
-            };
-            logs.iter().any(|log| {
-                &log.peer_id == peer
-                    && matches!(log.kind, EventKind::Get { ref key } if key == expected_key  )
-            })
-        }
-
-        pub fn is_subscribed_to_contract(&self, peer: &PeerId, expected_key: &ContractKey) -> bool {
-            let Ok(logs) = self.logs.try_lock() else {
-                return false;
-            };
-            logs.iter().any(|log| {
-                &log.peer_id == peer
-                    && matches!(log.kind, EventKind::Subscribed { ref key, .. } if key == expected_key  )
-            })
-        }
-
         /// Unique connections for a given peer and their relative distance to other peers.
-        pub fn connections(&self, peer: PeerId) -> Box<dyn Iterator<Item = (PeerId, Distance)>> {
+        pub fn connections(
+            &self,
+            key: &TransportPublicKey,
+        ) -> Box<dyn Iterator<Item = (PeerId, Distance)>> {
             let Ok(logs) = self.logs.try_lock() else {
                 return Box::new([].into_iter());
             };
@@ -1188,7 +1104,7 @@ pub(super) mod test {
                             .flat_map(|dcs| dcs.iter())
                             .any(|dc| dc > &l.datetime);
                         if let Some((this_loc, conn_loc)) = this.location.zip(connected.location) {
-                            if this.peer == peer && !disconnected {
+                            if &this.peer.pub_key == key && !disconnected {
                                 return Some((connected.peer.clone(), conn_loc.distance(this_loc)));
                             }
                         }
@@ -1294,7 +1210,7 @@ pub(super) mod test {
 
         futures::future::join_all(futs).await;
 
-        let distances: Vec<_> = listener.connections(peer_id).collect();
+        let distances: Vec<_> = listener.connections(&peer_id.pub_key).collect();
         assert!(distances.len() == 3);
         assert!(
             (distances.iter().map(|(_, l)| l.as_f64()).sum::<f64>() - 0.5f64).abs() < f64::EPSILON

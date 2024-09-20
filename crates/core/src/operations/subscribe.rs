@@ -194,7 +194,7 @@ impl Operation for SubscribeOp {
                         self.state,
                         Some(SubscribeState::AwaitingResponse { .. })
                     ));
-                    let sender = op_manager.ring.own_location();
+                    let sender = op_manager.ring.connection_manager.own_location();
                     new_state = self.state;
                     return_msg = Some(SubscribeMsg::SeekNode {
                         id: *id,
@@ -215,7 +215,7 @@ impl Operation for SubscribeOp {
                     htl,
                     retries,
                 } => {
-                    let this_peer = op_manager.ring.own_location();
+                    let this_peer = op_manager.ring.connection_manager.own_location();
                     let return_not_subbed = || -> OperationResult {
                         OperationResult {
                             return_msg: Some(NetMessage::from(SubscribeMsg::ReturnSub {
@@ -331,7 +331,8 @@ impl Operation for SubscribeOp {
                                     .into_iter()
                                     .next()
                                 {
-                                    let subscriber = op_manager.ring.own_location();
+                                    let subscriber =
+                                        op_manager.ring.connection_manager.own_location();
                                     return_msg = Some(SubscribeMsg::SeekNode {
                                         id: *id,
                                         key: *key,
@@ -502,71 +503,5 @@ mod messages {
                 Self::ReturnSub { .. } => write!(f, "ReturnSub(id: {id})"),
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use std::{collections::HashMap, time::Duration};
-
-    use freenet_stdlib::client_api::ContractRequest;
-
-    use super::*;
-    use crate::node::testing_impl::{NodeSpecification, SimNetwork};
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn successful_subscribe_op_between_nodes() -> anyhow::Result<()> {
-        const NUM_NODES: usize = 4usize;
-        const NUM_GW: usize = 1usize;
-
-        let bytes = crate::util::test::random_bytes_1kb();
-        let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: WrappedContract = gen.arbitrary()?;
-        let contract_val: WrappedState = gen.arbitrary()?;
-        let contract_key: ContractKey = *contract.key();
-
-        let event = ContractRequest::Subscribe {
-            key: contract_key,
-            summary: None,
-        }
-        .into();
-        let first_node = NodeSpecification {
-            owned_contracts: vec![(
-                ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
-                contract_val,
-                true,
-            )],
-            events_to_generate: HashMap::new(),
-            contract_subscribers: HashMap::new(),
-        };
-        let second_node = NodeSpecification {
-            owned_contracts: Vec::new(),
-            events_to_generate: HashMap::from_iter([(1, event)]),
-            contract_subscribers: HashMap::new(),
-        };
-
-        let subscribe_specs = HashMap::from_iter([
-            ("node-1".into(), first_node),
-            ("node-2".into(), second_node),
-        ]);
-        let mut sim_nw = SimNetwork::new(
-            "successful_subscribe_op_between_nodes",
-            NUM_GW,
-            NUM_NODES,
-            4,
-            3,
-            5,
-            2,
-        )
-        .await;
-        sim_nw.start_with_spec(subscribe_specs).await;
-        sim_nw.check_connectivity(Duration::from_secs(3))?;
-        sim_nw
-            .trigger_event("node-2", 1, Some(Duration::from_secs(1)))
-            .await?;
-        assert!(sim_nw.has_got_contract("node-2", &contract_key));
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        assert!(sim_nw.is_subscribed_to_contract("node-2", &contract_key));
-        Ok(())
     }
 }

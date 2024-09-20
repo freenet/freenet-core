@@ -170,13 +170,13 @@ pub(crate) mod test {
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-    use crate::node::{testing_impl::EventId, PeerId};
+    use crate::{node::testing_impl::EventId, transport::TransportPublicKey};
 
     use super::*;
 
     pub struct MemoryEventsGen<R = rand::rngs::SmallRng> {
-        id: PeerId,
-        signal: Receiver<(EventId, PeerId)>,
+        key: TransportPublicKey,
+        signal: Receiver<(EventId, TransportPublicKey)>,
         events_to_gen: HashMap<EventId, ClientRequest<'static>>,
         rng: Option<R>,
         internal_state: Option<InternalGeneratorState>,
@@ -186,10 +186,14 @@ pub(crate) mod test {
     where
         R: RandomEventGenerator,
     {
-        pub fn new_with_seed(signal: Receiver<(EventId, PeerId)>, id: PeerId, seed: u64) -> Self {
+        pub fn new_with_seed(
+            signal: Receiver<(EventId, TransportPublicKey)>,
+            key: TransportPublicKey,
+            seed: u64,
+        ) -> Self {
             Self {
                 signal,
-                id,
+                key,
                 events_to_gen: HashMap::new(),
                 rng: Some(R::seed_from_u64(seed)),
                 internal_state: None,
@@ -233,10 +237,13 @@ pub(crate) mod test {
 
     impl MemoryEventsGen {
         #[cfg(test)]
-        pub fn new(signal: Receiver<(EventId, PeerId)>, id: PeerId) -> Self {
+        pub fn new(
+            signal: Receiver<(EventId, TransportPublicKey)>,
+            key: TransportPublicKey,
+        ) -> Self {
             Self {
                 signal,
-                id,
+                key,
                 events_to_gen: HashMap::new(),
                 rng: None,
                 internal_state: None,
@@ -267,7 +274,7 @@ pub(crate) mod test {
                 loop {
                     if self.signal.changed().await.is_ok() {
                         let (ev_id, pk) = self.signal.borrow().clone();
-                        if self.rng.is_some() && pk == self.id {
+                        if self.rng.is_some() && pk == self.key {
                             let res = OpenRequest {
                                 client_id: ClientId::FIRST,
                                 request: self
@@ -279,7 +286,7 @@ pub(crate) mod test {
                                 token: None,
                             };
                             return Ok(res.into_owned());
-                        } else if pk == self.id {
+                        } else if pk == self.key {
                             let res = OpenRequest {
                                 client_id: ClientId::FIRST,
                                 request: self
@@ -321,7 +328,7 @@ pub(crate) mod test {
     }
 
     pub struct NetworkEventGenerator<R = rand::rngs::SmallRng> {
-        id: PeerId,
+        id: TransportPublicKey,
         memory_event_generator: MemoryEventsGen<R>,
         ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
     }
@@ -331,7 +338,7 @@ pub(crate) mod test {
         R: RandomEventGenerator,
     {
         pub fn new(
-            id: PeerId,
+            id: TransportPublicKey,
             memory_event_generator: MemoryEventsGen<R>,
             ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
         ) -> Self {
@@ -359,8 +366,11 @@ pub(crate) mod test {
 
                     match message {
                         Some(Ok(Message::Binary(data))) => {
-                            if let Ok((_, pk)) = bincode::deserialize::<(EventId, PeerId)>(&data) {
-                                if pk == self.id {
+                            if let Ok((id, pub_key)) =
+                            bincode::deserialize::<(EventId, TransportPublicKey)>(&data)
+                            {
+                                tracing::debug!(peer = %self.id, %id, "Received event from the supervisor");
+                                if &pub_key == &self.id {
                                     let res = OpenRequest {
                                         client_id: ClientId::FIRST,
                                         request: self

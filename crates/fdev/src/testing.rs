@@ -168,3 +168,38 @@ async fn config_sim_network(base_config: &TestConfig) -> anyhow::Result<SimNetwo
     }
     Ok(sim)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_config() {
+        let mut nw = config_sim_network(&TestConfig {
+            name: Some("test".to_string()),
+            seed: None,
+            gateways: 1,
+            nodes: 1,
+            ring_max_htl: 1,
+            rnd_if_htl_above: 1,
+            max_connections: 1,
+            min_connections: 1,
+            max_contract_number: None,
+            events: 1,
+            event_wait_ms: None,
+            connection_wait_ms: None,
+            peer_start_backoff_ms: None,
+            execution_data: None,
+            disable_metrics: true,
+            command: TestMode::SingleProcess,
+        })
+        .await
+        .unwrap();
+        let peers = nw.build_peers();
+        let keys = peers
+            .iter()
+            .map(|(lb, c)| (lb, format!("{}", c.key_pair.public())))
+            .collect::<Vec<_>>();
+        dbg!(keys);
+    }
+}

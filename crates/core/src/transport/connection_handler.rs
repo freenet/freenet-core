@@ -17,15 +17,15 @@ use futures::{FutureExt, TryFutureExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
+use tracing::{span, Instrument};
 
-use super::packet_data::SymmetricAES;
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
-    packet_data::MAX_PACKET_SIZE,
+    packet_data::{PacketData, SymmetricAES, MAX_PACKET_SIZE},
     peer_connection::{PeerConnection, RemoteConnection},
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
-    PacketData, Socket, TransportError,
+    Socket, TransportError,
 };
 
 const PROTOC_VERSION: [u8; 2] = 1u16.to_le_bytes();
@@ -79,8 +79,18 @@ pub(crate) async fn create_connection_handler<S: Socket>(
     ))
 }
 
+/// Receives  new inbound connections from the network.
 pub(crate) struct InboundConnectionHandler {
     new_connection_notifier: mpsc::Receiver<PeerConnection>,
+}
+
+#[cfg(test)]
+impl InboundConnectionHandler {
+    pub fn new(new_connection_notifier: mpsc::Receiver<PeerConnection>) -> Self {
+        InboundConnectionHandler {
+            new_connection_notifier,
+        }
+    }
 }
 
 impl InboundConnectionHandler {
@@ -89,9 +99,17 @@ impl InboundConnectionHandler {
     }
 }
 
+/// Requests a new outbound connection to a remote peer.
 #[derive(Clone)]
 pub(crate) struct OutboundConnectionHandler {
     send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>,
+}
+
+#[cfg(test)]
+impl OutboundConnectionHandler {
+    pub fn new(send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>) -> Self {
+        OutboundConnectionHandler { send_queue }
+    }
 }
 
 impl OutboundConnectionHandler {
@@ -132,7 +150,7 @@ impl OutboundConnectionHandler {
     }
 
     #[cfg(test)]
-    fn test_set_up(
+    fn new_test(
         socket_addr: SocketAddr,
         socket: Arc<impl Socket>,
         keypair: TransportKeypair,
@@ -229,13 +247,16 @@ impl<T> Drop for UdpPacketsListener<T> {
 }
 
 impl<S: Socket> UdpPacketsListener<S> {
+    #[tracing::instrument(level = "debug", name = "transport_listener", fields(peer = %self.this_peer_keypair.public), skip_all)]
     async fn listen(mut self) -> Result<(), TransportError> {
         let mut buf = [0u8; MAX_PACKET_SIZE];
         let mut ongoing_connections: BTreeMap<SocketAddr, OngoingConnection> = BTreeMap::new();
-        let mut gw_ongoing_connections: BTreeMap<SocketAddr, OngoingConnection> = BTreeMap::new();
+        let mut ongoing_gw_connections: BTreeMap<
+            SocketAddr,
+            mpsc::Sender<PacketData<UnknownEncryption>>,
+        > = BTreeMap::new();
         let mut connection_tasks = FuturesUnordered::new();
         let mut gw_connection_tasks = FuturesUnordered::new();
-        let (gw_outbound_tx, mut gw_inbound_rx) = tokio::sync::mpsc::channel(100);
         loop {
             tokio::select! {
                 // Handling of inbound packets
@@ -246,6 +267,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                             if let Some(remote_conn) = self.remote_connections.remove(&remote_addr){
                                 let _ = remote_conn.inbound_packet_sender.send(packet_data).await;
                                 self.remote_connections.insert(remote_addr, remote_conn);
+                                continue;
+                            }
+
+                            if let Some(inbound_packet_sender) = ongoing_gw_connections.remove(&remote_addr){
+                                let _ = inbound_packet_sender.send(packet_data).await;
+                                ongoing_gw_connections.insert(remote_addr, inbound_packet_sender);
                                 continue;
                             }
 
@@ -264,10 +291,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 continue;
                             }
                             let packet_data = PacketData::from_buf(&buf[..size]);
-                            let gw_ongoing_connection = self.gateway_connection(packet_data, remote_addr, gw_outbound_tx.clone());
-                            let task = tokio::spawn(gw_ongoing_connection.map_err(move |error| {
+                            let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr);
+                            let task = tokio::spawn(gw_ongoing_connection
+                                .instrument(tracing::span!(tracing::Level::DEBUG, "gateway_connection"))
+                                .map_err(move |error| {
                                 (error, remote_addr)
                             }));
+                            ongoing_gw_connections.insert(remote_addr, packets_sender);
                             gw_connection_tasks.push(task);
                         }
                         Err(e) => {
@@ -277,17 +307,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                         }
                     }
                 },
-                req = gw_inbound_rx.recv() => {
-                    let Some(GatewayMessage { remote_addr, packet, resp_tx }) = req else {
-                        unreachable!();
-                    };
-
-                    if let Some(remote) = self.remote_connections.remove(&remote_addr) {
-                        let _ = remote.inbound_packet_sender.send(packet).await;
-                        self.remote_connections.insert(remote_addr, remote);
-                        let _ = resp_tx.send(true);
-                    }
-                }
                 gw_connection_handshake = gw_connection_tasks.next(), if !gw_connection_tasks.is_empty() => {
                     let Some(res): GwOngoingConnectionResult = gw_connection_handshake else {
                         unreachable!();
@@ -295,6 +314,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     match res.expect("task shouldn't panic") {
                         Ok((outbound_remote_conn, inbound_remote_connection, outbound_ack_packet)) => {
                             let remote_addr = outbound_remote_conn.remote_addr;
+                            ongoing_gw_connections.remove(&remote_addr);
                             let sent_tracker = outbound_remote_conn.sent_tracker.clone();
 
                             self.remote_connections.insert(remote_addr, inbound_remote_connection);
@@ -314,9 +334,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                         }
                         Err((error, remote_addr)) => {
                             tracing::error!(%error, ?remote_addr, "Failed to establish gateway connection");
-                            if let Some((_, result_sender)) = gw_ongoing_connections.remove(&remote_addr) {
-                                let _ = result_sender.send(Err(error));
-                            }
+                            ongoing_gw_connections.remove(&remote_addr);
+                            ongoing_connections.remove(&remote_addr);
                         }
                     }
                 }
@@ -327,13 +346,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                     match res.expect("task shouldn't panic") {
                         Ok((outbound_remote_conn, inbound_remote_connection)) => {
                             if let Some((_, result_sender)) = ongoing_connections.remove(&outbound_remote_conn.remote_addr) {
-                                tracing::debug!(%outbound_remote_conn.remote_addr, "connection established");
+                                tracing::debug!(remote_addr = %outbound_remote_conn.remote_addr, "connection established");
                                 self.remote_connections.insert(outbound_remote_conn.remote_addr, inbound_remote_connection);
                                 let _ = result_sender.send(Ok(outbound_remote_conn)).map_err(|_| {
                                     tracing::error!("failed sending back peer connection");
                                 });
                             } else {
-                                tracing::error!(%outbound_remote_conn.remote_addr, "connection established but no ongoing connection found");
+                                tracing::error!(remote_addr = %outbound_remote_conn.remote_addr, "connection established but no ongoing connection found");
                             }
                         }
                         Err((error, remote_addr)) => {
@@ -347,6 +366,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                 // Handling of connection events
                 connection_event = self.connection_handler.recv() => {
                     let Some((remote_addr, event)) = connection_event else { return Ok(()); };
+                    if let Some(_conn) = self.remote_connections.remove(&remote_addr) {
+                        tracing::warn!(%remote_addr, "connection already established, dropping old connection");
+                    }
                     let ConnectionEvent::ConnectionStart { remote_public_key, open_connection } = event;
                     tracing::debug!(%remote_addr, "attempting to establish connection");
                     let (ongoing_connection, packets_sender) = self.traverse_nat(
@@ -354,7 +376,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     );
                     let task = tokio::spawn(ongoing_connection.map_err(move |error| {
                         (error, remote_addr)
-                    }));
+                    }).instrument(span!(tracing::Level::DEBUG, "traverse_nat")));
                     connection_tasks.push(task);
                     ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
                 },
@@ -366,23 +388,26 @@ impl<S: Socket> UdpPacketsListener<S> {
         &mut self,
         remote_intro_packet: PacketData<UnknownEncryption>,
         remote_addr: SocketAddr,
-        outbound_tx: mpsc::Sender<GatewayMessage>,
-    ) -> impl Future<
-        Output = Result<
-            (
-                RemoteConnection,
-                InboundRemoteConnection,
-                PacketData<SymmetricAES>,
-            ),
-            TransportError,
-        >,
-    > + Send
-           + 'static {
+    ) -> (
+        impl Future<
+                Output = Result<
+                    (
+                        RemoteConnection,
+                        InboundRemoteConnection,
+                        PacketData<SymmetricAES>,
+                    ),
+                    TransportError,
+                >,
+            > + Send
+            + 'static,
+        mpsc::Sender<PacketData<UnknownEncryption>>,
+    ) {
         let secret = self.this_peer_keypair.secret.clone();
         let outbound_packets = self.outbound_packets.clone();
-        let socket_listener = self.socket_listener.clone();
 
-        async move {
+        let (inbound_from_remote, mut next_inbound) =
+            mpsc::channel::<PacketData<UnknownEncryption>>(1);
+        let f = async move {
             let decrypted_intro_packet =
                 secret.decrypt(remote_intro_packet.data()).map_err(|err| {
                     tracing::debug!(%remote_addr, %err, "Failed to decrypt intro packet");
@@ -416,7 +441,6 @@ impl<S: Socket> UdpPacketsListener<S> {
             let outbound_ack_packet =
                 SymmetricMessage::ack_ok(&outbound_key, inbound_key_bytes, remote_addr)?;
 
-            let mut buf = [0u8; MAX_PACKET_SIZE];
             let mut waiting_time = INITIAL_INTERVAL;
             let mut attempts = 0;
             const MAX_ATTEMPTS: usize = 30;
@@ -428,34 +452,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                     .map_err(|_| TransportError::ChannelClosed)?;
 
                 // wait until the remote sends the ack packet
-                let timeout =
-                    tokio::time::timeout(waiting_time, socket_listener.recv_from(&mut buf));
+                let timeout = tokio::time::timeout(waiting_time, next_inbound.recv());
                 match timeout.await {
-                    Ok(Ok((size, remote))) => {
-                        let packet: PacketData<UnknownEncryption> =
-                            PacketData::from_buf(&buf[..size]);
-
-                        let mut should_continue = false;
-
-                        if remote != remote_addr {
-                            let (tx, rx) = tokio::sync::oneshot::channel();
-                            outbound_tx
-                                .send(GatewayMessage {
-                                    remote_addr,
-                                    packet: packet.clone(),
-                                    resp_tx: tx,
-                                })
-                                .await
-                                .map_err(|_| TransportError::ChannelClosed)?;
-
-                            should_continue =
-                                rx.await.map_err(|_| TransportError::ChannelClosed)?;
-                        }
-
-                        if should_continue {
-                            continue;
-                        }
-
+                    Ok(Some(packet)) => {
                         let _ = packet.try_decrypt_sym(&inbound_key).map_err(|_| {
                             tracing::debug!(%remote_addr, "Failed to decrypt packet with inbound key");
                             TransportError::ConnectionEstablishmentFailure {
@@ -463,8 +462,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
                         })?;
                     }
-                    Ok(Err(_)) => {
-                        return Err(TransportError::ChannelClosed);
+                    Ok(None) => {
+                        tracing::debug!(%remote_addr, "connection timed out");
+                        return Err(TransportError::ConnectionEstablishmentFailure {
+                            cause: "connection close".into(),
+                        });
                     }
                     Err(_) => {
                         attempts += 1;
@@ -505,7 +507,8 @@ impl<S: Socket> UdpPacketsListener<S> {
 
             tracing::debug!("returning connection at gw");
             Ok((remote_conn, inbound_conn, outbound_ack_packet))
-        }
+        };
+        (f, inbound_from_remote)
     }
 
     // TODO: this value should be set given exponential backoff and max timeout
@@ -643,6 +646,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     {
                                         tracing::debug!(%remote_addr, ?symmetric_message.payload, "received symmetric packet");
                                     }
+                                    #[cfg(not(test))]
+                                    {
+                                        tracing::trace!(%remote_addr, "received symmetric packet");
+                                    }
 
                                     match symmetric_message.payload {
                                         SymmetricMessagePayload::AckConnection {
@@ -672,6 +679,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 .await
                                                 .map_err(|_| TransportError::ChannelClosed)?;
                                             let (inbound_sender, inbound_recv) = mpsc::channel(100);
+                                            tracing::debug!(%remote_addr, "connection established");
                                             return Ok((
                                                 RemoteConnection {
                                                     outbound_packets: outbound_packets.clone(),
@@ -772,7 +780,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     }
                     Err(_) => {
                         failures += 1;
-                        tracing::debug!(%this_addr, %remote_addr, "failed to receive UDP response, time out");
+                        tracing::debug!(%this_addr, %remote_addr, "failed to receive UDP response in time, retrying");
                     }
                 }
 
@@ -811,7 +819,7 @@ impl<S: Socket> UdpPacketsListener<S> {
     }
 }
 
-enum ConnectionEvent {
+pub(crate) enum ConnectionEvent {
     ConnectionStart {
         remote_public_key: TransportPublicKey,
         open_connection: oneshot::Sender<Result<RemoteConnection, TransportError>>,
@@ -1026,7 +1034,7 @@ mod test {
         let socket = Arc::new(
             MockSocket::test_config(packet_drop_policy, (Ipv4Addr::LOCALHOST, port).into()).await,
         );
-        let (peer_conn, inbound_conn) = OutboundConnectionHandler::test_set_up(
+        let (peer_conn, inbound_conn) = OutboundConnectionHandler::new_test(
             (Ipv4Addr::LOCALHOST, port).into(),
             socket,
             peer_keypair,

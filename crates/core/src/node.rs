@@ -12,6 +12,7 @@ use std::{
     borrow::Cow,
     fmt::Display,
     fs::File,
+    hash::Hash,
     io::Read,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     sync::Arc,
@@ -68,7 +69,11 @@ pub struct Node(NodeP2P);
 
 impl Node {
     pub fn update_location(&mut self, location: Location) {
-        self.0.op_manager.ring.update_location(Some(location));
+        self.0
+            .op_manager
+            .ring
+            .connection_manager
+            .update_location(Some(location));
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
@@ -144,7 +149,7 @@ impl NodeConfig {
             config.network_api.port
         );
         if let Some(peer_id) = &config.peer_id {
-            tracing::info!("Node external address: {}", peer_id.addr());
+            tracing::info!("Node external address: {}", peer_id.addr);
         }
         Ok(NodeConfig {
             should_connect: true,
@@ -415,6 +420,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                 } => {
                     let peer_id = op_manager
                         .ring
+                        .connection_manager
                         .get_peer_key()
                         .expect("Peer id not found at put op, it should be set");
                     // Initialize a put op.
@@ -439,6 +445,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                 ContractRequest::Update { key, data } => {
                     let peer_id = op_manager
                         .ring
+                        .connection_manager
                         .get_peer_key()
                         .expect("Peer id not found at update op, it should be set");
                     tracing::debug!(
@@ -473,6 +480,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
                 } => {
                     let peer_id = op_manager
                         .ring
+                        .connection_manager
                         .get_peer_key()
                         .expect("Peer id not found at get op, it should be set");
                     // Initialize a get op.
@@ -604,7 +612,11 @@ async fn report_result(
                         second_trace_lines.join("\n")
                     })
                     .unwrap_or_default();
-                let peer = &op_manager.ring.get_peer_key().expect("Peer key not found");
+                let peer = &op_manager
+                    .ring
+                    .connection_manager
+                    .get_peer_key()
+                    .expect("Peer key not found");
                 let log = format!(
                     "Transaction ({tx} @ {peer}) error trace:\n {trace} \nstate:\n {state:?}\n"
                 );
@@ -693,7 +705,6 @@ async fn process_message_v1<CB>(
                 let span = tracing::info_span!(
                     parent: parent_span,
                     "handle_connect_op_request",
-                    peer = ?op_manager.ring.get_peer_key(),
                     transaction = %msg.id(),
                     tx_type = %msg.id().transaction_type()
                 );
@@ -861,7 +872,8 @@ where
             // only keep attempting to connect if the node hasn't got enough connections yet
             Ok(Some(OpEnum::Connect(op)))
                 if op.has_backoff()
-                    && op_manager.ring.open_connections() < op_manager.ring.min_connections =>
+                    && op_manager.ring.open_connections()
+                        < op_manager.ring.connection_manager.min_connections =>
             {
                 let ConnectOp {
                     gateway, backoff, ..
@@ -900,14 +912,29 @@ where
     Ok(())
 }
 
-/*
-- Cuando es un gateway: se define desde el inicio del nodo
-- Cuando es un peer regular: se define en el momento de la conexión con el gateway
-*/
-#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone)]
+/// The identifier of a peer in the network is composed of its address and public key.
+///
+/// A regular peer will have its `PeerId` set when it connects to a gateway as it get's
+/// its external address from the gateway.
+///
+/// A gateway will have its `PeerId` set when it is created since it will know its own address
+/// from the start.
+#[derive(Serialize, Deserialize, Eq, Clone)]
 pub struct PeerId {
     pub addr: SocketAddr,
     pub pub_key: TransportPublicKey,
+}
+
+impl Hash for PeerId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.addr.hash(state);
+    }
+}
+
+impl PartialEq<PeerId> for PeerId {
+    fn eq(&self, other: &PeerId) -> bool {
+        self.addr == other.addr
+    }
 }
 
 impl Ord for PeerId {
@@ -922,27 +949,9 @@ impl PartialOrd for PeerId {
     }
 }
 
-// impl FromStr for PeerId {
-//     type Err = anyhow::Error;
-//     fn from_str(s: &str) -> Result<Self, Self::Err> {
-//         Ok(Self {
-//             addr: s.parse()?,
-//             pub_key: TransportKeypair::new().public,
-//         })
-//     }
-// }
-
 impl PeerId {
     pub fn new(addr: SocketAddr, pub_key: TransportPublicKey) -> Self {
         Self { addr, pub_key }
-    }
-
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
-    }
-
-    pub fn pub_key(&self) -> &TransportPublicKey {
-        &self.pub_key
     }
 }
 
@@ -1013,7 +1022,7 @@ impl std::fmt::Debug for PeerId {
 
 impl Display for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.addr)
+        write!(f, "{:?}", self.pub_key)
     }
 }
 
@@ -1135,7 +1144,7 @@ pub async fn run_network_node(mut node: Node) -> anyhow::Result<()> {
             node.0
                 .peer_id
                 .clone()
-                .map(|id| Location::from_address(&id.addr()))
+                .map(|id| Location::from_address(&id.addr))
         })
         .flatten();
 

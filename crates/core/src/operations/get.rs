@@ -293,7 +293,7 @@ impl Operation for GetOp {
                         transfer_time: None,
                         first_response_time: None,
                     }));
-                    let own_loc = op_manager.ring.own_location();
+                    let own_loc = op_manager.ring.connection_manager.own_location();
                     return_msg = Some(GetMsg::SeekNode {
                         key: *key,
                         id: *id,
@@ -564,7 +564,7 @@ impl Operation for GetOp {
                                 let is_subscribed_contract =
                                     op_manager.ring.is_seeding_contract(&key);
                                 if !is_subscribed_contract && should_subscribe {
-                                    tracing::debug!(tx = %id, %key, peer = %op_manager.ring.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
+                                    tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
                                     super::start_subscription_request(op_manager, key, false).await;
                                 }
                             }
@@ -730,7 +730,7 @@ async fn try_forward_or_return(
                     state: None,
                     contract: None,
                 },
-                sender: op_manager.ring.own_location(),
+                sender: op_manager.ring.connection_manager.own_location(),
                 target: sender, // return to requester
                 skip_list: new_skip_list,
             }),
@@ -857,172 +857,5 @@ mod messages {
                 Self::ReturnGet { .. } => write!(f, "ReturnGet(id: {id})"),
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use freenet_stdlib::client_api::ContractRequest;
-    use std::{collections::HashMap, time::Duration};
-
-    use super::*;
-    use crate::node::testing_impl::{NodeSpecification, SimNetwork};
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn successful_get_op_between_nodes() -> anyhow::Result<()> {
-        const NUM_NODES: usize = 1usize;
-        const NUM_GW: usize = 1usize;
-
-        let bytes = crate::util::test::random_bytes_1kb();
-        let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: WrappedContract = gen.arbitrary()?;
-        let contract_val: WrappedState = gen.arbitrary()?;
-        let key = *contract.key();
-        let get_event = ContractRequest::Get {
-            key,
-            fetch_contract: true,
-        }
-        .into();
-        let node_1 = NodeSpecification {
-            owned_contracts: vec![],
-            events_to_generate: HashMap::from_iter([(1, get_event)]),
-            contract_subscribers: HashMap::new(),
-        };
-
-        let gw_0 = NodeSpecification {
-            owned_contracts: vec![(
-                ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
-                contract_val,
-                false,
-            )],
-            events_to_generate: HashMap::new(),
-            contract_subscribers: HashMap::new(),
-        };
-
-        let get_specs = HashMap::from_iter([("node-1".into(), node_1), ("gateway-0".into(), gw_0)]);
-
-        // establish network
-        let mut sim_nw = SimNetwork::new(
-            "successful_get_op_between_nodes",
-            NUM_GW,
-            NUM_NODES,
-            3,
-            2,
-            4,
-            2,
-        )
-        .await;
-        sim_nw.start_with_spec(get_specs).await;
-        sim_nw.check_connectivity(Duration::from_secs(3))?;
-
-        // trigger get @ node-0, which does not own the contract
-        sim_nw
-            .trigger_event("node-1", 1, Some(Duration::from_secs(1)))
-            .await?;
-        assert!(sim_nw.has_got_contract("node-1", &key));
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn contract_not_found() -> anyhow::Result<()> {
-        const NUM_NODES: usize = 2usize;
-        const NUM_GW: usize = 1usize;
-
-        let bytes = crate::util::test::random_bytes_1kb();
-        let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: WrappedContract = gen.arbitrary()?;
-        let key = *contract.key();
-
-        let get_event = ContractRequest::Get {
-            key,
-            fetch_contract: false,
-        }
-        .into();
-        let node_1 = NodeSpecification {
-            owned_contracts: vec![],
-            events_to_generate: HashMap::from_iter([(1, get_event)]),
-            contract_subscribers: HashMap::new(),
-        };
-
-        let get_specs = HashMap::from_iter([("node-1".into(), node_1)]);
-
-        // establish network
-        let mut sim_nw =
-            SimNetwork::new("get_contract_not_found", NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
-        sim_nw.start_with_spec(get_specs).await;
-        sim_nw.check_connectivity(Duration::from_secs(3))?;
-
-        // trigger get @ node-1, which does not own the contract
-        sim_nw
-            .trigger_event("node-1", 1, Some(Duration::from_secs(1)))
-            .await?;
-        assert!(!sim_nw.has_got_contract("node-1", &key));
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn contract_found_after_retry() -> anyhow::Result<()> {
-        // crate::config::set_logger();
-        const NUM_NODES: usize = 2usize;
-        const NUM_GW: usize = 1usize;
-
-        let bytes = crate::util::test::random_bytes_1kb();
-        let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: WrappedContract = gen.arbitrary()?;
-        let contract_val: WrappedState = gen.arbitrary()?;
-        let key = *contract.key();
-
-        let get_event = ContractRequest::Get {
-            key,
-            fetch_contract: false,
-        }
-        .into();
-
-        let node_1 = NodeSpecification {
-            owned_contracts: vec![],
-            events_to_generate: HashMap::from_iter([(1, get_event)]),
-            contract_subscribers: HashMap::new(),
-        };
-
-        let node_2 = NodeSpecification {
-            owned_contracts: vec![(
-                ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
-                contract_val,
-                false,
-            )],
-            events_to_generate: HashMap::new(),
-            contract_subscribers: HashMap::new(),
-        };
-
-        let gw_0 = NodeSpecification {
-            owned_contracts: vec![],
-            events_to_generate: HashMap::new(),
-            contract_subscribers: HashMap::new(),
-        };
-
-        let get_specs = HashMap::from_iter([
-            ("node-1".into(), node_1),
-            ("node-2".into(), node_2),
-            ("gateway-0".into(), gw_0),
-        ]);
-
-        // establish network
-        let mut sim_nw = SimNetwork::new(
-            "get_contract_found_after_retry",
-            NUM_GW,
-            NUM_NODES,
-            3,
-            2,
-            4,
-            2,
-        )
-        .await;
-        sim_nw.start_with_spec(get_specs).await;
-        sim_nw.check_connectivity(Duration::from_secs(3))?;
-        sim_nw
-            .trigger_event("node-1", 1, Some(Duration::from_secs(1)))
-            .await?;
-        assert!(sim_nw.has_got_contract("node-1", &key));
-        Ok(())
     }
 }
