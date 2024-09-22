@@ -235,7 +235,8 @@ impl ConfigArgs {
                     .gateways
             }
             Err(err) => {
-                #[cfg(not(any(test, debug_assertions)))]
+                // FIXME: Remove local-simulation feature and use runtime flags
+                #[cfg(all(not(any(test, debug_assertions)), not(feature = "local-simulation")))]
                 {
                     if peer_id.is_none() && mode == OperationMode::Network {
                         tracing::error!(file = ?gateways_file, "Failed to read gateways file: {err}");
