@@ -66,9 +66,9 @@ impl StateStorage for ReDb {
     ) -> Result<Option<Parameters<'static>>, Self::Error> {
         let txn = self.0.begin_read()?;
 
-        let val = {
-            let tbl = txn.open_table(CONTRACT_PARAMS_TABLE)?;
-            tbl.get(key.as_bytes())?
+        let val = match txn.open_table(CONTRACT_PARAMS_TABLE) {
+            Ok(tbl) => tbl.get(key.as_bytes())?,
+            Err(_) => return Ok(None),
         };
 
         match val {
