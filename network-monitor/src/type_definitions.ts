@@ -124,8 +124,9 @@ export interface RingVisualizationPoint {
 }
 
 export interface RingVisualizationProps {
-    main_peer: RingVisualizationPoint;
+    main_peer?: RingVisualizationPoint;
     other_peers: RingVisualizationPoint[];
+    selected_text?: string;
 }
 
 export interface PeerList {

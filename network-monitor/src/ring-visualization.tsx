@@ -4,8 +4,8 @@ import {createRoot} from "react-dom/client";
 import {RingVisualizationPoint, RingVisualizationProps} from "./type_definitions";
 
 
-export const RingVisualization = ({main_peer, other_peers}: RingVisualizationProps) => {
-    const [selected_peer, setSelectedPeer] = React.useState(main_peer);
+export const RingVisualization = ({main_peer, other_peers, selected_text = "Peer"}: RingVisualizationProps) => {
+    const [selected_peer, setSelectedPeer] = React.useState<RingVisualizationPoint | undefined>(main_peer);
 
     useEffect(() => {
         console.log("Selected peer changed");
@@ -63,21 +63,14 @@ export const RingVisualization = ({main_peer, other_peers}: RingVisualizationPro
                         cy={calculate_point(peer.localization, scale).y}
                         fill="steelblue"
                         r={1.5 * scale}
+                        
                         onMouseEnter={(e) => {
-                            document.styleSheets[2].addRule(
-                                `.svg-tooltip-${peer.localization
-                                    .toString()
-                                    .replace(".", "")}`,
-                                "display: block"
-                            );
+                            document.querySelector(`.svg-tooltip-${peer.peerId}`)!.removeAttribute("style");
+                            document.querySelector(`.svg-tooltip-${peer.peerId}`)!.setAttribute("style", "display: block;");
                         }}
                         onMouseLeave={() => {
-                            document.styleSheets[2].addRule(
-                                `.svg-tooltip-${peer.localization
-                                    .toString()
-                                    .replace(".", "")}`,
-                                "display: none"
-                            );
+                            document.querySelector(`.svg-tooltip-${peer.peerId}`)!.removeAttribute("style");
+                            document.querySelector(`.svg-tooltip-${peer.peerId}`)!.setAttribute("style", "display: none;");
                         }}
                         style={{zIndex: 999}}
                         onClick={() => {
@@ -90,15 +83,13 @@ export const RingVisualization = ({main_peer, other_peers}: RingVisualizationPro
                     <text
                         id="svg-tooltip"
                         x={`${
-                            calculate_point(peer.localization, scale).x + 10
+                            calculate_point(peer.localization, scale).x + (peer.localization < 0.7 && peer.localization > 0.35 ? -130 : 0) + (peer.localization > 0.9 || peer.localization < 0.15 ? 10 : 0)
                         }`}
                         y={`${
-                            calculate_point(peer.localization, scale).y + 0 + (peer.localization > 0.7 && peer.localization < 0.9 ? -10 : 0) + (peer.localization > 0.15 && peer.localization < 0.35 ? 30 : 0)
+                            calculate_point(peer.localization, scale).y + (peer.localization > 0.7 && peer.localization < 0.9 ? -10 : 0) + (peer.localization > 0.15 && peer.localization < 0.35 ? 30 : 0)
                         }`}
-                        className={`svg-tooltip-${peer.localization
-                            .toString()
-                            .replace(".", "")}`}
-                        style={{backgroundColor: "white", padding: 5, zIndex: 999}}
+                        className={`svg-tooltip-${peer.peerId}`}
+                        style={{backgroundColor: "white", padding: 5, zIndex: 999, display: "none"}}
                         fontWeight={100}
                         fontSize={13}
                     >
@@ -121,7 +112,10 @@ export const RingVisualization = ({main_peer, other_peers}: RingVisualizationPro
         })
     }
 
-    const draw_connecting_lines = (internal_other_peers: RingVisualizationPoint[]) => {
+    const draw_connecting_lines_from_main_peer_to_other_peers = (internal_other_peers: RingVisualizationPoint[]) => {
+        if (!main_peer) {
+            return <></>;
+        }
 
         return internal_other_peers.map((peer, index) => {
             let return_values = (
@@ -138,20 +132,31 @@ export const RingVisualization = ({main_peer, other_peers}: RingVisualizationPro
 
 
                         onMouseEnter={(e) => {
-                            document.styleSheets[2].addRule(
-                                `.svg-tooltip-distance-${peer.localization
-                                    .toString()
-                                    .replace(".", "")}`,
-                                "display: block"
-                            );
+                            // document.querySelector(selectors)
+
+                            document.querySelector(`.svg-tooltip-distance-${peer.peerId}`)!.removeAttribute("style");
+                            document.querySelector(`.svg-tooltip-distance-${peer.peerId}`)!.setAttribute("style", "display: block;");
+
+                            // document.styleSheets[2].addRule(
+                            //     `.svg-tooltip-distance-${peer.localization
+                            //         .toString()
+                            //         .replace(".", "")}`,
+                            //     "display: block"
+                            // );
                         }}
                         onMouseLeave={() => {
-                            document.styleSheets[2].addRule(
-                                `.svg-tooltip-distance-${peer.localization
-                                    .toString()
-                                    .replace(".", "")}`,
-                                "display: none"
-                            );
+                            // document.querySelector(selectors)
+
+                            document.querySelector(`.svg-tooltip-distance-${peer.peerId}`)!.removeAttribute("style");
+                            document.querySelector(`.svg-tooltip-distance-${peer.peerId}`)!.setAttribute("style", "display: none;");
+
+                            // document.styleSheets[2].addRule(
+                            //     `.svg-tooltip-distance-${peer.localization
+                            //         .toString()
+                            //         .replace(".", "")}`,
+                            //     "display: none"
+                            // );
+
                         }}
                     />
 
@@ -177,18 +182,87 @@ export const RingVisualization = ({main_peer, other_peers}: RingVisualizationPro
             );
 
 
-            document.styleSheets[2].addRule(
-                `.svg-tooltip-distance-${peer.localization
-                    .toString()
-                    .replace(".", "")}`,
-                "display: none"
-            );
+            // document.querySelector(selectors)
+
+
+            document.querySelector(`.svg-tooltip-distance-${peer.peerId}`)!.removeAttribute("style");
+            document.querySelector(`.svg-tooltip-distance-${peer.peerId}`)!.setAttribute("style", "display: none;");
+
+            // document.styleSheets[2].addRule(
+            //     `.svg-tooltip-distance-${peer.localization
+            //         .toString()
+            //         .replace(".", "")}`,
+            //     "display: none"
+            // );
 
             return return_values;
         })
     }
 
+    const draw_main_peer_text = (main_peer: RingVisualizationPoint | undefined, scale: number) => {
+        if (!main_peer) {
+            return <></>;
+        }
+        return (
+            <text
+                // main peer
+                id="svg-tooltip"
+                x={`${
+                    calculate_point(main_peer.localization, scale).x + 10
+                }`}
+                y={`${calculate_point(main_peer.localization, scale).y + (main_peer.localization > 0.64 && main_peer.localization < 0.9 ? -20 : 0) + (main_peer.localization > 0.15 && main_peer.localization < 0.35 ? 30 : 0)}`}
+                className={`svg-tooltip-${main_peer.localization
+                    .toString()
+                    .replace(".", "")}`}
+                fontWeight={100}
+                onClick={() => {
+                    setSelectedPeer(main_peer);
+                }}
+                style={{zIndex: 999}}
+                
+            >
+                {main_peer.peerId} 
+                 @ {main_peer.localization.toString().slice(0, 8)}
 
+            </text>
+        );
+    };
+
+    const draw_main_peer = (main_peer: RingVisualizationPoint | undefined, scale: number) => {
+        if (!main_peer) {
+            return <></>;
+        }
+
+        return (
+            <circle
+                cx={calculate_point(main_peer.localization, scale).x}
+                cy={calculate_point(main_peer.localization, scale).y}
+                r={1.8 * scale}
+                fill="red"
+                style={{zIndex: 999, padding: 10}}
+
+            />
+        );
+    }
+
+    const draw_selected_peer_text = (selected_peer: RingVisualizationPoint | undefined) => {
+        if (!selected_peer) {
+            return <></>;
+        }
+        return (
+            <text 
+                id="selected_peer"
+                x={350}
+                y={30}
+                fontSize={14}
+                fontWeight={100}
+            >
+                Selected {selected_text}: 
+                {" "}{selected_peer.peerId.slice(-8)}
+                @ {selected_peer.localization.toString().slice(0, 8)}
+            </text>
+        );
+    }
 
     return (
         <div>
@@ -207,56 +281,16 @@ export const RingVisualization = ({main_peer, other_peers}: RingVisualizationPro
                     r={40 * scale}
                 />
 
-                <circle
-                    cx={calculate_point(main_peer.localization, scale).x}
-                    cy={calculate_point(main_peer.localization, scale).y}
-                    r={1.8 * scale}
-                    fill="red"
-                    style={{zIndex: 999, padding: 10}}
+                {draw_main_peer(main_peer, scale)}
 
-                />
-
-
-
-                {draw_connecting_lines(other_peers)}
+                {draw_connecting_lines_from_main_peer_to_other_peers(other_peers)}
 
                 {draw_points(other_peers)}
 
+                {draw_main_peer_text(main_peer, scale)}
                 
-                <text
-                    // main peer
-                    id="svg-tooltip"
-                    x={`${
-                        calculate_point(main_peer.localization, scale).x + 10
-                    }`}
-                    y={`${calculate_point(main_peer.localization, scale).y + (main_peer.localization > 0.64 && main_peer.localization < 0.9 ? -20 : 0) + (main_peer.localization > 0.15 && main_peer.localization < 0.35 ? 30 : 0)}`}
-                    className={`svg-tooltip-${main_peer.localization
-                        .toString()
-                        .replace(".", "")}`}
-                    fontWeight={100}
-                    onClick={() => {
-                        setSelectedPeer(main_peer);
-                    }}
-                    style={{zIndex: 999}}
-                    
-                >
-                    {main_peer.peerId} 
-                     @ {main_peer.localization.toString().slice(0, 8)}
+                {draw_selected_peer_text(selected_peer)}
 
-                </text>
-
-
-                <text 
-                    id="selected_peer"
-                    x={350}
-                    y={30}
-                    fontSize={14}
-                    fontWeight={100}
-                >
-                    Selected peer:
-                    {selected_peer.peerId.slice(-8)}
-                    @ {selected_peer.localization.toString().slice(0, 8)}
-                </text>
 
                 
             </g>
