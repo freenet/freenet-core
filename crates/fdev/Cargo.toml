@@ -17,7 +17,6 @@ chrono = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 dashmap = { workspace = true }
 either = { workspace = true }
-fastrand = { workspace = true }
 futures = { workspace = true }
 glob = "0.3"
 pico-args = "0.5"
@@ -29,13 +28,16 @@ semver = { workspace = true }
 tar = "0.4"
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signal", "parking_lot", "process"] }
+tokio-tungstenite = "0.23"
 toml = { version = "0.8", features = ["default", "preserve_order"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 xz2 = "0.1"
+reqwest = { version = "0.12", features = ["json"] }
+http = "1.1"
 
 # internal
-freenet = { path = "../core" }
+freenet = { path = "../core", features = ["local-simulation"]}
 freenet-stdlib = { workspace = true }
 
 [features]

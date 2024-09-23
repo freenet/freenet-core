@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use freenet_stdlib::prelude::{ContractCode, DelegateCode};
+use freenet_stdlib::prelude::{ContractCode, ContractKey, DelegateCode, Parameters};
 
 use crate::Error;
 
@@ -15,6 +15,7 @@ pub struct InspectConfig {
 #[derive(clap::Subcommand, Clone)]
 enum FileType {
     Code(CodeInspection),
+    Key,
     Delegate,
 }
 
@@ -22,7 +23,7 @@ enum FileType {
 #[derive(clap::Parser, Clone)]
 struct CodeInspection {}
 
-pub fn inspect(config: InspectConfig) -> Result<(), anyhow::Error> {
+pub fn inspect(config: InspectConfig) -> anyhow::Result<()> {
     if !config.file.exists() {
         return Err(Error::CommandFailed("couldn't find file").into());
     }
@@ -33,6 +34,17 @@ pub fn inspect(config: InspectConfig) -> Result<(), anyhow::Error> {
             let hash = code.hash_str();
             println!(
                 r#"code hash: {hash}
+contract API version: {version}
+"#
+            );
+        }
+        FileType::Key => {
+            let (code, version) = ContractCode::load_versioned_from_path(&config.file)?;
+            let hash = code.hash_str();
+            let params: Parameters = vec![].into();
+            let key = ContractKey::from_params(hash.clone(), params)?;
+            println!(
+                r#"code key: {key}
 contract API version: {version}
 "#
             );

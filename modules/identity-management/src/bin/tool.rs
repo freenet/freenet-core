@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    fs,
+};
 
 use freenet_stdlib::prelude::Parameters;
 use identity_management::IdentityParams;
@@ -13,14 +16,13 @@ Options:
  -c --code      Compiles the contract and saves the code hash
 "#;
 
-type DynError = Box<dyn std::error::Error>;
 struct Args {
     path: PathBuf,
     key: Option<PathBuf>,
 }
 
 impl Args {
-    fn parse_args() -> Result<Self, DynError> {
+    fn parse_args() -> anyhow::Result<Self> {
         let mut pargs = pico_args::Arguments::from_env();
         if pargs.contains(["-h", "--help"]) {
             println!("{HELP}");
@@ -31,14 +33,16 @@ impl Args {
             None => std::env::current_dir()?,
         };
         let key = pargs.opt_value_from_str(["-k", "--key"])?;
-        if !path.is_dir() {
-            return Err("path must be a directory".into());
+        if !path.exists() {
+            fs::create_dir_all(&path)?;
+        } else if !path.is_dir() {
+            anyhow::bail!("path must be a directory")
         }
         Ok(Args { path, key })
     }
 }
 
-fn main() -> Result<(), DynError> {
+fn main() -> anyhow::Result<()> {
     let args = Args::parse_args()?;
 
     let secret_key = match args.key {

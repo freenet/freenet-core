@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{net::Ipv4Addr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -20,6 +20,8 @@ use freenet::{
 };
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+
+mod v1;
 
 /// Network metrics server. Records metrics and data from a test network that can be used for
 /// analysis and visualization.
@@ -64,38 +66,7 @@ async fn run_server(
     barrier: Arc<tokio::sync::Barrier>,
     changes: tokio::sync::broadcast::Sender<Change>,
 ) -> anyhow::Result<()> {
-    const DEFAULT_PORT: u16 = 55010;
-
-    let port = std::env::var("FDEV_NETWORK_METRICS_SERVER_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
-
-    let router = Router::new()
-        .route("/", get(home))
-        .route("/push-stats/", get(push_stats))
-        .route("/pull-stats/peer-changes/", get(pull_peer_changes))
-        .with_state(Arc::new(ServerState {
-            changes,
-            peer_data: DashMap::new(),
-            transactions_data: DashMap::new(),
-            contract_data: DashMap::new(),
-        }));
-
-    tracing::info!("Starting metrics server on port {port}");
-    barrier.wait().await;
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
-    axum::serve(listener, router).await?;
-    Ok(())
-}
-
-async fn home() -> Response {
-    Response::builder()
-        .status(StatusCode::FOUND)
-        .header("Location", "/pull-stats/")
-        .body(Body::empty())
-        .expect("should be valid response")
-        .into_response()
+    v1::run_server(barrier, changes).await
 }
 
 async fn push_stats(
@@ -200,7 +171,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
     let (mut tx, _) = ws.split();
     for peer in state.peer_data.iter() {
         let msg = PeerChange::current_state_msg(
-            *peer.key(),
+            peer.key().clone(),
             peer.value().location,
             peer.value().connections.iter(),
         );
@@ -463,27 +434,18 @@ pub(crate) enum Change {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PeerIdHumanReadable(PeerId);
-
-impl Serialize for PeerIdHumanReadable {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for PeerIdHumanReadable {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        Ok(PeerIdHumanReadable(
-            PeerId::from_str(&s).map_err(serde::de::Error::custom)?,
-        ))
-    }
-}
 
 impl From<PeerId> for PeerIdHumanReadable {
     fn from(peer_id: PeerId) -> Self {
         Self(peer_id)
+    }
+}
+
+impl std::fmt::Display for PeerIdHumanReadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.addr)
     }
 }
 
@@ -494,34 +456,34 @@ impl ServerState {
                 let from_peer_id = PeerId::from_str(added.from())?;
                 let from_loc = added.from_location();
 
-                let to_peer_id = PeerId::from_str(added.to())?;
+                let to_peer_id: PeerId = bincode::deserialize(added.to().bytes())?;
                 let to_loc = added.to_location();
 
-                match self.peer_data.entry(from_peer_id) {
+                match self.peer_data.entry(from_peer_id.clone()) {
                     dashmap::mapref::entry::Entry::Occupied(mut occ) => {
                         let connections = &mut occ.get_mut().connections;
-                        connections.push((to_peer_id, to_loc));
+                        connections.push((to_peer_id.clone(), to_loc));
                         connections.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                         connections.dedup();
                     }
                     dashmap::mapref::entry::Entry::Vacant(vac) => {
                         vac.insert(PeerData {
-                            connections: vec![(to_peer_id, to_loc)],
+                            connections: vec![(to_peer_id.clone(), to_loc)],
                             location: from_loc,
                         });
                     }
                 }
 
-                match self.peer_data.entry(to_peer_id) {
+                match self.peer_data.entry(to_peer_id.clone()) {
                     dashmap::mapref::entry::Entry::Occupied(mut occ) => {
                         let connections = &mut occ.get_mut().connections;
-                        connections.push((from_peer_id, from_loc));
+                        connections.push((from_peer_id.clone(), from_loc));
                         connections.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                         connections.dedup();
                     }
                     dashmap::mapref::entry::Entry::Vacant(vac) => {
                         vac.insert(PeerData {
-                            connections: vec![(from_peer_id, from_loc)],
+                            connections: vec![(from_peer_id.clone(), from_loc)],
                             location: to_loc,
                         });
                     }
@@ -832,7 +794,7 @@ async fn record_saver(
         change: Change,
     }
 
-    // FIXME: this ain't flushing correctly after test ends,
+    // todo: this ain't flushing correctly after test ends,
     // for now flushing each single time we get a new record
     // let mut batch = Vec::with_capacity(1024);
     while let Ok(change) = incoming_rec.recv().await {

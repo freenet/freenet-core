@@ -6,11 +6,11 @@ use std::{
     sync::Arc,
 };
 
-use blake3::traits::digest::generic_array::GenericArray;
-use chacha20poly1305::{aead::Aead, Error as EncryptionError, KeyInit, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::{aead::Aead, Error as EncryptionError, XChaCha20Poly1305, XNonce};
 use dashmap::DashMap;
-use freenet_stdlib::{client_api::DelegateRequest, prelude::*};
-use once_cell::sync::Lazy;
+use freenet_stdlib::prelude::*;
+
+use crate::config::Secrets;
 
 use super::{
     store::{SafeWriter, StoreFsManagement},
@@ -39,10 +39,13 @@ struct Encryption {
 
 pub struct SecretsStore {
     base_path: PathBuf,
+    #[allow(unused)]
+    secrets: Secrets,
     ciphers: HashMap<DelegateKey, Encryption>,
     key_to_secret_part: Arc<DashMap<DelegateKey, (u64, HashSet<SecretKey>)>>,
     index_file: SafeWriter<Self>,
     key_file: PathBuf,
+    default_encryption: Encryption,
 }
 
 pub(super) struct ConcatenatedSecretKeys(Vec<u8>);
@@ -94,21 +97,8 @@ impl StoreFsManagement for SecretsStore {
     }
 }
 
-static DEFAULT_CIPHER: Lazy<XChaCha20Poly1305> = Lazy::new(|| {
-    let arr = GenericArray::from_slice(&DelegateRequest::DEFAULT_CIPHER);
-    XChaCha20Poly1305::new(arr)
-});
-
-static DEFAULT_NONCE: Lazy<XNonce> =
-    Lazy::new(|| GenericArray::from_slice(&DelegateRequest::DEFAULT_NONCE).to_owned());
-
-static DEFAULT_ENCRYPTION: Lazy<Encryption> = Lazy::new(|| Encryption {
-    cipher: (*DEFAULT_CIPHER).clone(),
-    nonce: *DEFAULT_NONCE,
-});
-
 impl SecretsStore {
-    pub fn new(secrets_dir: PathBuf) -> RuntimeResult<Self> {
+    pub fn new(secrets_dir: PathBuf, secrets: Secrets) -> RuntimeResult<Self> {
         let mut key_to_secret_part = Arc::new(DashMap::new());
         let key_file = secrets_dir.join("KEY_DATA");
         if !key_file.exists() {
@@ -129,6 +119,11 @@ impl SecretsStore {
             key_to_secret_part,
             index_file,
             key_file,
+            default_encryption: Encryption {
+                cipher: secrets.cipher(),
+                nonce: secrets.nonce(),
+            },
+            secrets,
         })
     }
 
@@ -138,8 +133,7 @@ impl SecretsStore {
         cipher: XChaCha20Poly1305,
         nonce: XNonce,
     ) -> Result<(), SecretStoreError> {
-        // FIXME: store/initialize the cyphers from disc
-        if nonce != *DEFAULT_NONCE {
+        if nonce != self.default_encryption.nonce {
             let encryption = Encryption { cipher, nonce };
             self.ciphers.insert(delegate, encryption);
         }
@@ -155,13 +149,16 @@ impl SecretsStore {
         let delegate_path = self.base_path.join(delegate.encode());
         let secret_file_path = delegate_path.join(key.encode());
         let secret_key = *key.hash();
-        let encryption = self.ciphers.get(delegate).unwrap_or(&*DEFAULT_ENCRYPTION);
+        let encryption = self
+            .ciphers
+            .get(delegate)
+            .unwrap_or(&self.default_encryption);
 
         let ciphertext = encryption
             .cipher
             .encrypt(&encryption.nonce, plaintext.as_ref())
             .map_err(|err| {
-                if encryption.nonce == *DEFAULT_NONCE {
+                if encryption.nonce == self.default_encryption.nonce {
                     SecretStoreError::MissingCipher
                 } else {
                     SecretStoreError::Encryption(err)
@@ -224,7 +221,10 @@ impl SecretsStore {
         key: &SecretsId,
     ) -> Result<Vec<u8>, SecretStoreError> {
         let secret_path = self.base_path.join(delegate.encode()).join(key.encode());
-        let encryption = self.ciphers.get(delegate).unwrap_or(&*DEFAULT_ENCRYPTION);
+        let encryption = self
+            .ciphers
+            .get(delegate)
+            .unwrap_or(&self.default_encryption);
 
         let ciphertext =
             fs::read(secret_path).map_err(|_| SecretStoreError::MissingSecret(key.clone()))?;
@@ -232,7 +232,7 @@ impl SecretsStore {
             .cipher
             .decrypt(&encryption.nonce, ciphertext.as_ref())
             .map_err(|err| {
-                if encryption.nonce == *DEFAULT_NONCE {
+                if encryption.nonce == self.default_encryption.nonce {
                     SecretStoreError::MissingCipher
                 } else {
                     SecretStoreError::Encryption(err)
@@ -245,7 +245,8 @@ impl SecretsStore {
 #[cfg(test)]
 mod test {
     use super::*;
-    use chacha20poly1305::aead::{AeadCore, KeyInit, OsRng};
+    use aes_gcm::KeyInit;
+    use chacha20poly1305::aead::{AeadCore, OsRng};
 
     #[test]
     fn store_and_load() -> Result<(), Box<dyn std::error::Error>> {
@@ -254,7 +255,7 @@ mod test {
             .join("secrets-store-test");
         std::fs::create_dir_all(&secrets_dir)?;
 
-        let mut store = SecretsStore::new(secrets_dir)?;
+        let mut store = SecretsStore::new(secrets_dir, Default::default())?;
 
         let delegate = Delegate::from((&vec![0, 1, 2].into(), &vec![].into()));
 

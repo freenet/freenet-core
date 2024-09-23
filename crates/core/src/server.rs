@@ -3,12 +3,20 @@ pub(crate) mod errors;
 mod http_gateway;
 pub(crate) mod path_handlers;
 
+use std::net::SocketAddr;
+
 use freenet_stdlib::{
     client_api::{ClientError, ClientRequest, HostResponse},
     prelude::*,
 };
 
-use crate::client_events::{AuthToken, ClientId, HostResult};
+use http_gateway::HttpGateway;
+use tower_http::trace::TraceLayer;
+
+use crate::{
+    client_events::{websocket::WebSocketProxy, AuthToken, BoxedClient, ClientId, HostResult},
+    config::WebsocketApiConfig,
+};
 
 pub use app_packaging::WebApp;
 
@@ -42,41 +50,35 @@ pub(crate) enum HostCallbackResult {
     },
 }
 
-pub mod local_node {
-    use std::net::{IpAddr, SocketAddr};
+fn serve(socket: SocketAddr, router: axum::Router) {
+    tokio::spawn(async move {
+        tracing::info!("HTTP gateway listening on {}", socket);
+        let listener = tokio::net::TcpListener::bind(socket).await.unwrap();
+        axum::serve(listener, router).await.map_err(|e| {
+            tracing::error!("Error while running HTTP gateway server: {e}");
+        })
+    });
+}
 
-    use axum::Router;
+pub mod local_node {
     use freenet_stdlib::client_api::{ClientRequest, ErrorKind};
+    use std::net::{IpAddr, SocketAddr};
     use tower_http::trace::TraceLayer;
 
     use crate::{
         client_events::{websocket::WebSocketProxy, ClientEventsProxy, OpenRequest},
         contract::{Executor, ExecutorError},
-        DynError,
     };
 
-    use super::http_gateway::HttpGateway;
+    use super::{http_gateway::HttpGateway, serve};
 
-    fn serve(socket: SocketAddr, router: Router) {
-        tokio::spawn(async move {
-            tracing::info!("listening on {}", socket);
-            let listener = tokio::net::TcpListener::bind(socket).await.unwrap();
-            axum::serve(listener, router).await.map_err(|e| {
-                tracing::error!("Error while running HTTP gateway server: {e}");
-            })
-        });
-    }
-
-    pub async fn run_local_node(
-        mut executor: Executor,
-        socket: SocketAddr,
-    ) -> Result<(), DynError> {
+    pub async fn run_local_node(mut executor: Executor, socket: SocketAddr) -> anyhow::Result<()> {
         match socket.ip() {
             IpAddr::V4(ip) if !ip.is_loopback() => {
-                return Err(format!("invalid ip: {ip}, expecting localhost").into())
+                anyhow::bail!("invalid ip: {ip}, expecting localhost")
             }
             IpAddr::V6(ip) if !ip.is_loopback() => {
-                return Err(format!("invalid ip: {ip}, expecting localhost").into())
+                anyhow::bail!("invalid ip: {ip}, expecting localhost")
             }
             _ => {}
         }
@@ -85,7 +87,7 @@ pub mod local_node {
 
         serve(socket, ws_router.layer(TraceLayer::new_for_http()));
 
-        // FIXME: use combinator instead
+        // TODO: use combinator instead
         // let mut all_clients =
         //    ClientEventsCombinator::new([Box::new(ws_handle), Box::new(http_handle)]);
         enum Receiver {
@@ -138,7 +140,7 @@ pub mod local_node {
                     }
                     continue;
                 }
-                _ => Err(ExecutorError::other("not supported")),
+                _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
             };
 
             match res {
@@ -177,4 +179,17 @@ pub mod local_node {
             }
         }
     }
+}
+
+pub async fn serve_gateway(config: WebsocketApiConfig) -> [BoxedClient; 2] {
+    let (gw, ws_proxy) = serve_gateway_in(config).await;
+    [Box::new(gw), Box::new(ws_proxy)]
+}
+
+pub(crate) async fn serve_gateway_in(config: WebsocketApiConfig) -> (HttpGateway, WebSocketProxy) {
+    let ws_socket = (config.address, config.port).into();
+    let (gw, gw_router) = HttpGateway::as_router(&ws_socket);
+    let (ws_proxy, ws_router) = WebSocketProxy::as_router(gw_router);
+    serve(ws_socket, ws_router.layer(TraceLayer::new_for_http()));
+    (gw, ws_proxy)
 }

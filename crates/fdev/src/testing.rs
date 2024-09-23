@@ -3,11 +3,8 @@ use std::{path::PathBuf, time::Duration};
 use anyhow::Error;
 use freenet::dev_tool::SimNetwork;
 
-mod multiple_process;
-mod network;
+pub(crate) mod network;
 mod single_process;
-
-pub(crate) use multiple_process::Process;
 
 use crate::network_metrics_server::{start_server, ServerConfig};
 
@@ -106,14 +103,18 @@ fn randomize_test_name() -> String {
 pub enum TestMode {
     /// Runs multiple simulated nodes in a single process.
     SingleProcess,
-    /// Runs multiple simulated nodes in multiple processes.
-    MultiProcess(multiple_process::MultiProcessConfig),
     /// Runs multiple simulated nodes in multiple processes and multiple machines.
-    Network,
+    Network(network::NetworkProcessConfig),
 }
 
 pub(crate) async fn test_framework(base_config: TestConfig) -> anyhow::Result<(), Error> {
-    let (server, changes_recorder) = if !base_config.disable_metrics {
+    let disable_metrics = base_config.disable_metrics || {
+        match &base_config.command {
+            TestMode::Network(config) => matches!(config.mode, network::Process::Peer),
+            _ => false,
+        }
+    };
+    let (server, changes_recorder) = if !disable_metrics {
         let (s, r) = start_server(&ServerConfig {
             log_directory: base_config.execution_data.clone(),
         })
@@ -124,8 +125,7 @@ pub(crate) async fn test_framework(base_config: TestConfig) -> anyhow::Result<()
     };
     let res = match &base_config.command {
         TestMode::SingleProcess => single_process::run(&base_config).await,
-        TestMode::MultiProcess(config) => multiple_process::run(&base_config, config).await,
-        TestMode::Network => network::run(&base_config).await,
+        TestMode::Network(config) => network::run(&base_config, config).await,
     };
     if let Some(server) = server {
         server.abort();
@@ -167,4 +167,39 @@ async fn config_sim_network(base_config: &TestConfig) -> anyhow::Result<SimNetwo
         sim.with_start_backoff(Duration::from_millis(backoff));
     }
     Ok(sim)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_config() {
+        let mut nw = config_sim_network(&TestConfig {
+            name: Some("test".to_string()),
+            seed: None,
+            gateways: 1,
+            nodes: 1,
+            ring_max_htl: 1,
+            rnd_if_htl_above: 1,
+            max_connections: 1,
+            min_connections: 1,
+            max_contract_number: None,
+            events: 1,
+            event_wait_ms: None,
+            connection_wait_ms: None,
+            peer_start_backoff_ms: None,
+            execution_data: None,
+            disable_metrics: true,
+            command: TestMode::SingleProcess,
+        })
+        .await
+        .unwrap();
+        let peers = nw.build_peers();
+        let keys = peers
+            .iter()
+            .map(|(lb, c)| (lb, format!("{}", c.key_pair.public())))
+            .collect::<Vec<_>>();
+        dbg!(keys);
+    }
 }

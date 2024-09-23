@@ -8,12 +8,10 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use tar::{Archive, Builder};
 use xz2::read::{XzDecoder, XzEncoder};
 
-use crate::DynError;
-
 #[derive(Debug, thiserror::Error)]
 pub enum WebContractError {
     #[error("unpacking error: {0}")]
-    UnpackingError(DynError),
+    UnpackingError(anyhow::Error),
     #[error("{0}")]
     StoringError(std::io::Error),
     #[error("file not found: {0}")]
@@ -64,9 +62,9 @@ impl WebApp {
         let mut decoded_web = self.decode_web();
         for e in decoded_web
             .entries()
-            .map_err(|e| WebContractError::UnpackingError(Box::new(e)))?
+            .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))?
         {
-            let mut e = e.map_err(|e| WebContractError::UnpackingError(Box::new(e)))?;
+            let mut e = e.map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))?;
             if e.path()
                 .ok()
                 .filter(|p| p.to_string_lossy() == path)
@@ -74,7 +72,7 @@ impl WebApp {
             {
                 let mut bytes = vec![];
                 e.read_to_end(&mut bytes)
-                    .map_err(|e| WebContractError::UnpackingError(Box::new(e)))?;
+                    .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))?;
                 return Ok(bytes);
             }
         }
@@ -98,29 +96,31 @@ impl<'a> TryFrom<&'a [u8]> for WebApp {
 
         let metadata_size = state
             .read_u64::<BigEndian>()
-            .map_err(|e| WebContractError::UnpackingError(Box::new(e)))?;
+            .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))?;
         if metadata_size > MAX_METADATA_SIZE {
-            return Err(WebContractError::UnpackingError(
-                format!("Exceeded metadata size of 1kB: {} bytes", metadata_size).into(),
-            ));
+            return Err(WebContractError::UnpackingError(anyhow::anyhow!(
+                "Exceeded metadata size of 1kB: {} bytes",
+                metadata_size
+            )));
         }
         let mut metadata = vec![0; metadata_size as usize];
         state
             .read_exact(&mut metadata)
-            .map_err(|e| WebContractError::UnpackingError(Box::new(e)))?;
+            .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))?;
 
         let web_size = state
             .read_u64::<BigEndian>()
-            .map_err(|e| WebContractError::UnpackingError(Box::new(e)))?;
+            .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))?;
         if web_size > MAX_WEB_SIZE {
-            return Err(WebContractError::UnpackingError(
-                format!("Exceeded packed web size of 100MB: {} bytes", web_size).into(),
-            ));
+            return Err(WebContractError::UnpackingError(anyhow::anyhow!(
+                "Exceeded packed web size of 100MB: {} bytes",
+                web_size
+            )));
         }
         let mut web = vec![0; web_size as usize];
         state
             .read_exact(&mut web)
-            .map_err(|e| WebContractError::UnpackingError(Box::new(e)))?;
+            .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))?;
 
         Ok(Self { metadata, web })
     }

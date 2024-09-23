@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["deps", "container"]
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = true
+opt-level = 's'
+debug = false
+codegen-units = 1
+panic = 'abort'
+strip = true
+
+[workspace.dependencies]
+freenet-stdlib = { version = "0.0.7", default-features = false }

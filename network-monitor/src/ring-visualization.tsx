@@ -47,7 +47,6 @@ export const RingVisualization = ({main_peer, other_peers, selected_text = "Peer
     //
     let scale = 3;
 
-
     let tooltip_x = 100;
     let tooltip_y = 100;
 
@@ -297,7 +296,6 @@ export const RingVisualization = ({main_peer, other_peers, selected_text = "Peer
         </svg>
         </div>
     );
-
 
 
 };

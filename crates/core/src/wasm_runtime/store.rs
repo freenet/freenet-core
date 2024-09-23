@@ -8,8 +8,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{fs::File, io::Read};
 
-use crate::DynError;
-
 const INTERNAL_KEY: usize = 32;
 const TOMBSTONE_MARKER: usize = 1;
 
@@ -23,7 +21,11 @@ pub(super) struct SafeWriter<S> {
 impl<S: StoreFsManagement> SafeWriter<S> {
     pub fn new(path: &Path, compact: bool) -> Result<Self, io::Error> {
         let file = if compact {
-            OpenOptions::new().create(true).write(true).open(path)?
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(path)?
         } else {
             OpenOptions::new()
                 .create(true)
@@ -59,8 +61,7 @@ impl<S: StoreFsManagement> SafeWriter<S> {
             }
         }
         traversed += 1 + 32; // key + type marker
-        self.file
-            .write_u32::<BigEndian>(value.as_ref().len() as u32)?;
+        self.file.write_u32::<BigEndian>(value.len() as u32)?;
         traversed += std::mem::size_of::<u32>();
         self.file.write_all(value)?;
         traversed += value.len();
@@ -151,7 +152,7 @@ pub(super) trait StoreFsManagement: Sized {
     fn watch_changes(
         mut container: Self::MemContainer,
         key_file_path: &Path,
-    ) -> Result<(), DynError> {
+    ) -> anyhow::Result<()> {
         let key_path = key_file_path.to_path_buf();
         let key_path_cp = key_path.clone();
         let mut watcher = notify::recommended_watcher(

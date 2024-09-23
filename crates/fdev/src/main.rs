@@ -33,14 +33,13 @@ enum Error {
     CommandFailed(&'static str),
 }
 
-fn main() -> Result<(), anyhow::Error> {
+fn main() -> anyhow::Result<()> {
     let tokio_rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let config = Config::parse();
-    freenet::config::Config::set_op_mode(config.additional.mode);
     if !config.sub_command.is_child() {
-        freenet::config::set_logger();
+        freenet::config::set_logger(None, None);
     }
     tokio_rt.block_on(async move {
         let cwd = std::env::current_dir()?;

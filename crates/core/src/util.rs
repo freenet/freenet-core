@@ -1,40 +1,58 @@
+pub(crate) mod time_source;
+
 use std::{
     collections::{BTreeMap, HashSet},
+    net::{Ipv4Addr, SocketAddr, TcpListener},
+    sync::Arc,
     time::Duration,
 };
 
+use crate::{config::ConfigPaths, node::PeerId};
 use rand::{
     prelude::{Rng, StdRng},
     SeedableRng,
 };
 
-use crate::node::PeerId;
-
-pub fn set_cleanup_on_exit() -> Result<(), ctrlc::Error> {
+pub fn set_cleanup_on_exit(config: Arc<ConfigPaths>) -> Result<(), ctrlc::Error> {
     ctrlc::set_handler(move || {
         tracing::info!("Received Ctrl+C. Cleaning up...");
 
-        let Ok(path) = crate::config::ConfigPaths::app_data_dir() else {
-            std::process::exit(0);
-        };
-        tracing::info!("Removing content stored at {path:?}");
+        #[cfg(debug_assertions)]
+        {
+            let paths = config.iter();
+            for (is_dir, path) in paths {
+                if path.exists() {
+                    tracing::info!("Removing content stored at {path:?}");
+                    let rm = if is_dir {
+                        std::fs::remove_dir_all(path).map_err(|err| {
+                            tracing::warn!("Failed cleaning up directory: {err}");
+                            err
+                        })
+                    } else {
+                        std::fs::remove_file(path).map_err(|err| {
+                            tracing::warn!("Failed cleaning up file: {err}");
+                            err
+                        })
+                    };
 
-        if path.exists() {
-            let rm = std::fs::remove_dir_all(&path).map_err(|err| {
-                tracing::warn!("Failed cleaning up directory: {err}");
-                err
-            });
-            if rm.is_err() {
-                tracing::error!("Failed to remove content at {path:?}");
-                std::process::exit(-1);
+                    match rm {
+                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                            tracing::error!("Failed to remove directory at {path:?}");
+                            std::process::exit(-1);
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
+        let _ = config;
         tracing::info!("Successful cleanup");
 
         std::process::exit(0);
     })
 }
 
+#[derive(Debug)]
 pub struct ExponentialBackoff {
     attempt: usize,
     max_attempts: usize,
@@ -80,6 +98,26 @@ impl ExponentialBackoff {
         self.attempt += 1;
         delay
     }
+}
+
+#[allow(clippy::result_unit_err)]
+pub fn get_free_port() -> Result<u16, ()> {
+    let mut port;
+    for _ in 0..100 {
+        port = get_dynamic_port();
+        let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        if let Ok(conn) = TcpListener::bind(bind_addr) {
+            std::mem::drop(conn);
+            return Ok(port);
+        }
+    }
+    Err(())
+}
+
+fn get_dynamic_port() -> u16 {
+    const FIRST_DYNAMIC_PORT: u16 = 49152;
+    const LAST_DYNAMIC_PORT: u16 = 65535;
+    rand::thread_rng().gen_range(FIRST_DYNAMIC_PORT..LAST_DYNAMIC_PORT)
 }
 
 // This is extremely inefficient for large sizes but is not what
@@ -157,7 +195,6 @@ impl<T> IterExt for T where T: Iterator {}
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
-    use rand::Rng;
 
     #[test]
     fn randomize_iter() {
@@ -244,8 +281,7 @@ impl<'x> Contains<PeerId> for &'x Vec<&PeerId> {
 }
 
 #[cfg(test)]
-pub mod tests {
-
+pub(crate) mod tests {
     use tempfile::TempDir;
 
     /// Use this to guarantee unique directory names in case you are running multiple tests in parallel.

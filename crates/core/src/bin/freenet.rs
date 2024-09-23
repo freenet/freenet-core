@@ -1,30 +1,61 @@
+use anyhow::Context;
 use clap::Parser;
-use freenet::local_node::{Executor, OperationMode, PeerCliConfig};
-use std::net::SocketAddr;
+use freenet::{
+    config::{Config, ConfigArgs},
+    dev_tool::NodeConfig,
+    local_node::{Executor, OperationMode},
+    run_local_node, run_network_node,
+    server::serve_gateway,
+};
+use std::sync::Arc;
 
-type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
-
-async fn run(config: PeerCliConfig) -> Result<(), DynError> {
+async fn run(config: Config) -> anyhow::Result<()> {
     match config.mode {
         OperationMode::Local => run_local(config).await,
-        OperationMode::Network => Err("network mode not yet enabled".into()),
+        OperationMode::Network => run_network(config).await,
     }
 }
 
-async fn run_local(config: PeerCliConfig) -> Result<(), DynError> {
-    let port = config.port;
-    let ip = config.address;
-    freenet::config::Config::set_op_mode(OperationMode::Local);
-    let executor = Executor::from_config(config, None).await?;
-    let socket: SocketAddr = (ip, port).into();
-    freenet::server::local_node::run_local_node(executor, socket).await
+async fn run_local(config: Config) -> anyhow::Result<()> {
+    tracing::info!("Starting freenet node in local mode");
+    let socket = config.ws_api;
+
+    let executor = Executor::from_config(Arc::new(config), None)
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    run_local_node(executor, socket)
+        .await
+        .map_err(anyhow::Error::msg)
 }
 
-fn main() -> Result<(), DynError> {
-    freenet::config::set_logger();
-    let config = PeerCliConfig::parse();
+async fn run_network(config: Config) -> anyhow::Result<()> {
+    tracing::info!("Starting freenet node in network mode");
+
+    let clients = serve_gateway(config.ws_api).await;
+    tracing::info!("Initializing node configuration");
+
+    let node_config = NodeConfig::new(config)
+        .await
+        .with_context(|| "failed while loading node config")?;
+
+    let node = node_config
+        .build(clients)
+        .await
+        .with_context(|| "failed while building the node")?;
+
+    run_network_node(node).await
+}
+
+fn main() -> anyhow::Result<()> {
+    freenet::config::set_logger(None, None);
+    let config = ConfigArgs::parse().build()?;
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+        .worker_threads(
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1),
+        )
         .enable_all()
         .build()
         .unwrap();

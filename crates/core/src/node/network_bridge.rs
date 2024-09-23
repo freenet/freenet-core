@@ -1,17 +1,17 @@
 //! Types and definitions to handle all inter-peer communication.
 
+use std::future::Future;
 use std::ops::{Deref, DerefMut};
 
 use either::Either;
-use libp2p::swarm::StreamUpgradeError;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use super::PeerId;
 use crate::message::{NetMessage, NodeEvent};
 
+mod handshake;
 pub(crate) mod in_memory;
-pub(crate) mod inter_process;
 pub(crate) mod p2p_protoc;
 
 // TODO: use this constants when we do real net i/o
@@ -22,13 +22,11 @@ pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 
 /// Allows handling of connections to the network as well as sending messages
 /// to other peers in the network with whom connection has been established.
-#[async_trait::async_trait]
 pub(crate) trait NetworkBridge: Send + Sync {
-    async fn add_connection(&mut self, peer: PeerId) -> ConnResult<()>;
+    fn drop_connection(&mut self, peer: &PeerId) -> impl Future<Output = ConnResult<()>> + Send;
 
-    async fn drop_connection(&mut self, peer: &PeerId) -> ConnResult<()>;
-
-    async fn send(&self, target: &PeerId, msg: NetMessage) -> ConnResult<()>;
+    fn send(&self, target: &PeerId, msg: NetMessage)
+        -> impl Future<Output = ConnResult<()>> + Send;
 }
 
 #[derive(Debug, thiserror::Error, Serialize, Deserialize)]
@@ -36,20 +34,24 @@ pub(crate) enum ConnectionError {
     #[error("location unknown for this node")]
     LocationUnknown,
     #[error("unable to send message")]
-    SendNotCompleted,
+    SendNotCompleted(PeerId),
+    #[error("Unexpected connection req")]
+    UnexpectedReq,
     #[error("error while de/serializing message")]
     #[serde(skip)]
     Serialization(#[from] Option<Box<bincode::ErrorKind>>),
+    #[error("{0}")]
+    TransportError(String),
+    #[error("failed connect")]
+    FailedConnectOp,
+    #[error("unwanted connection")]
+    UnwantedConnection,
 
     // errors produced while handling the connection:
     #[error("IO error: {0}")]
     IOError(String),
-    #[error("timeout error while opening a connectio.")]
+    #[error("timeout error while waiting for a message")]
     Timeout,
-    #[error("no protocols could be agreed upon")]
-    NegotiationFailed,
-    #[error("protocol upgrade error: {0}")]
-    Upgrade(String),
 }
 
 impl From<std::io::Error> for ConnectionError {
@@ -58,14 +60,9 @@ impl From<std::io::Error> for ConnectionError {
     }
 }
 
-impl<TUpgrErr: std::error::Error> From<StreamUpgradeError<TUpgrErr>> for ConnectionError {
-    fn from(err: StreamUpgradeError<TUpgrErr>) -> Self {
-        match err {
-            StreamUpgradeError::Timeout => Self::Timeout,
-            StreamUpgradeError::Apply(err) => Self::Upgrade(format!("{err}")),
-            StreamUpgradeError::NegotiationFailed => Self::NegotiationFailed,
-            StreamUpgradeError::Io(err) => Self::IOError(format!("{err}")),
-        }
+impl From<crate::transport::TransportError> for ConnectionError {
+    fn from(err: crate::transport::TransportError) -> Self {
+        Self::TransportError(err.to_string())
     }
 }
 
@@ -74,16 +71,18 @@ impl Clone for ConnectionError {
         match self {
             Self::LocationUnknown => Self::LocationUnknown,
             Self::Serialization(_) => Self::Serialization(None),
-            Self::SendNotCompleted => Self::SendNotCompleted,
+            Self::SendNotCompleted(peer) => Self::SendNotCompleted(peer.clone()),
             Self::IOError(err) => Self::IOError(err.clone()),
             Self::Timeout => Self::Timeout,
-            Self::Upgrade(err) => Self::Upgrade(err.clone()),
-            Self::NegotiationFailed => Self::NegotiationFailed,
+            Self::UnexpectedReq => Self::UnexpectedReq,
+            Self::TransportError(err) => Self::TransportError(err.clone()),
+            Self::FailedConnectOp => Self::FailedConnectOp,
+            Self::UnwantedConnection => Self::UnwantedConnection,
         }
     }
 }
 
-pub fn event_loop_notification_channel(
+pub(crate) fn event_loop_notification_channel(
 ) -> (EventLoopNotificationsReceiver, EventLoopNotificationsSender) {
     let (notification_tx, notification_rx) = mpsc::channel(100);
     (
@@ -91,7 +90,7 @@ pub fn event_loop_notification_channel(
         EventLoopNotificationsSender(notification_tx),
     )
 }
-pub(super) struct EventLoopNotificationsReceiver(Receiver<Either<NetMessage, NodeEvent>>);
+pub(crate) struct EventLoopNotificationsReceiver(Receiver<Either<NetMessage, NodeEvent>>);
 
 impl Deref for EventLoopNotificationsReceiver {
     type Target = Receiver<Either<NetMessage, NodeEvent>>;

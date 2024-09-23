@@ -64,7 +64,7 @@ impl ContractStore {
     }
 
     /// Returns a copy of the contract bytes if available, none otherwise.
-    // FIXME: instead return Result<Option<_>, _> to handle IO errors upstream
+    // todo: instead return Result<Option<_>, _> to handle IO errors upstream
     pub fn fetch_contract(
         &self,
         key: &ContractKey,
@@ -114,7 +114,7 @@ impl ContractStore {
     pub fn store_contract(&mut self, contract: ContractContainer) -> RuntimeResult<()> {
         let (key, code) = match contract.clone() {
             ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
-                (contract_v1.key().clone(), contract_v1.code().clone())
+                (*contract_v1.key(), contract_v1.code().clone())
             }
             _ => unimplemented!(),
         };
@@ -141,7 +141,9 @@ impl ContractStore {
 
         // save on disc
         let version = APIVersion::from(contract);
-        let output: Vec<u8> = code.to_bytes_versioned(version)?;
+        let output: Vec<u8> = code
+            .to_bytes_versioned(version)
+            .map_err(|e| anyhow::anyhow!(e))?;
         let mut file = File::create(key_path)?;
         file.write_all(output.as_slice())?;
 

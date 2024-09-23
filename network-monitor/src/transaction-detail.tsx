@@ -118,7 +118,6 @@ const TransactionPeersHistory = ({
         return filter[filter_type] !== undefined;
     };
 
-
     return (
         <div
             id="transaction-peers-history"

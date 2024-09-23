@@ -1,12 +1,11 @@
+use core::future::Future;
 use freenet_stdlib::prelude::*;
 use stretto::AsyncCache;
-
-use crate::DynError;
 
 #[derive(thiserror::Error, Debug)]
 pub enum StateStoreError {
     #[error(transparent)]
-    Any(#[from] DynError),
+    Any(#[from] anyhow::Error),
     #[error("missing contract: {0}")]
     MissingContract(ContractKey),
 }
@@ -14,29 +13,36 @@ pub enum StateStoreError {
 impl From<StateStoreError> for crate::wasm_runtime::ContractError {
     fn from(value: StateStoreError) -> Self {
         match value {
-            StateStoreError::Any(err) => crate::wasm_runtime::ContractError::from(err),
+            StateStoreError::Any(err) => {
+                crate::wasm_runtime::ContractError::from(anyhow::format_err!(err))
+            }
             err @ StateStoreError::MissingContract(_) => {
-                crate::wasm_runtime::ContractError::from(Into::<DynError>::into(format!("{err}")))
+                crate::wasm_runtime::ContractError::from(anyhow::format_err!(err))
             }
         }
     }
 }
 
-#[async_trait::async_trait]
-#[allow(clippy::type_complexity)]
 pub trait StateStorage {
     type Error;
-    async fn store(&mut self, key: ContractKey, state: WrappedState) -> Result<(), Self::Error>;
-    async fn store_params(
+    fn store(
+        &mut self,
+        key: ContractKey,
+        state: WrappedState,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn store_params(
         &mut self,
         key: ContractKey,
         state: Parameters<'static>,
-    ) -> Result<(), Self::Error>;
-    async fn get(&self, key: &ContractKey) -> Result<Option<WrappedState>, Self::Error>;
-    async fn get_params<'a>(
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn get(
+        &self,
+        key: &ContractKey,
+    ) -> impl Future<Output = Result<Option<WrappedState>, Self::Error>> + Send;
+    fn get_params<'a>(
         &'a self,
         key: &'a ContractKey,
-    ) -> Result<Option<Parameters<'static>>, Self::Error>;
+    ) -> impl Future<Output = Result<Option<Parameters<'static>>, Self::Error>> + Send + 'a;
 }
 
 pub struct StateStore<S: StateStorage> {
@@ -48,7 +54,7 @@ pub struct StateStore<S: StateStorage> {
 impl<S> StateStore<S>
 where
     S: StateStorage + Send + 'static,
-    <S as StateStorage>::Error: Into<DynError>,
+    <S as StateStorage>::Error: Into<anyhow::Error>,
 {
     const AVG_STATE_SIZE: usize = 1_000;
 
@@ -58,7 +64,7 @@ where
         let counters = max_size as usize / Self::AVG_STATE_SIZE * 10;
         Ok(Self {
             state_mem_cache: AsyncCache::new(counters, max_size as i64, tokio::spawn)
-                .map_err(|err| StateStoreError::Any(Box::new(err)))?,
+                .map_err(|err| StateStoreError::Any(anyhow::anyhow!(err)))?,
             // params_mem_cache: AsyncCache::new(counters, max_size as i64)
             //     .map_err(|err| StateStoreError::Any(Box::new(err)))?,
             store,
@@ -76,14 +82,14 @@ where
                 .get(key)
                 .await
                 .map_err(Into::into)?
-                .ok_or_else(|| StateStoreError::MissingContract(key.clone()))?;
+                .ok_or_else(|| StateStoreError::MissingContract(*key))?;
         }
         self.store
-            .store(key.clone(), state.clone())
+            .store(*key, state.clone())
             .await
             .map_err(Into::into)?;
         let cost = state.size() as i64;
-        self.state_mem_cache.insert(key.clone(), state, cost).await;
+        self.state_mem_cache.insert(*key, state, cost).await;
         Ok(())
     }
 
@@ -94,11 +100,11 @@ where
         params: Parameters<'static>,
     ) -> Result<(), StateStoreError> {
         self.store
-            .store(key.clone(), state.clone())
+            .store(key, state.clone())
             .await
             .map_err(Into::into)?;
         let cost = state.size() as i64;
-        self.state_mem_cache.insert(key.clone(), state, cost).await;
+        self.state_mem_cache.insert(key, state, cost).await;
         self.store
             .store_params(key, params.clone())
             .await
@@ -113,7 +119,7 @@ where
             return Ok(v.value().clone());
         }
         let r = self.store.get(key).await.map_err(Into::into)?;
-        r.ok_or_else(|| StateStoreError::MissingContract(key.clone()))
+        r.ok_or_else(|| StateStoreError::MissingContract(*key))
     }
 
     pub async fn get_params<'a>(

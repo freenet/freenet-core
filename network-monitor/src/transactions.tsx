@@ -120,7 +120,6 @@ export function TransactionContainer() {
     const [peers_history, set_peers_history] = useState<Array<TransactionPeerInterface>>([]);
     const [tx_list, set_tx_list] = useState<Array<TransactionData>>([]);
 
-
     const open_tx_detail = (txid: string) => {
         let tx_history = all_tx.get(txid);
         if (!tx_history) {

@@ -12,7 +12,6 @@ import {filter_by_page, get_all_pages, get_peers_caching_the_contract, rust_time
 import {Pagination} from "./pagination";
 import {RingVisualization} from "./ring-visualization";
 
-
 const ContractPeersHistory = ({
     tx_peer_list,
 }: TransactionDetailPeersHistoryInterface) => {
@@ -71,6 +70,7 @@ const ContractPeersHistory = ({
         });
 
         set_inner_tx_list(filter_by_page(filtered_list, page));
+
         set_filtered_list(filtered_list);
     };
 

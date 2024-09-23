@@ -3,13 +3,13 @@ use std::backtrace::Backtrace as StdTrace;
 use std::{pin::Pin, time::Duration};
 
 use freenet_stdlib::prelude::ContractKey;
-use futures::{future::BoxFuture, Future};
+use futures::Future;
 use tokio::sync::mpsc::error::SendError;
 
 use crate::{
     client_events::HostResult,
     contract::{ContractError, ExecutorError},
-    message::{InnerMessage, NetMessage, Transaction, TransactionType},
+    message::{InnerMessage, MessageStats, NetMessage, NetMessageV1, Transaction, TransactionType},
     node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
 };
@@ -22,7 +22,7 @@ pub(crate) mod update;
 
 pub(crate) trait Operation
 where
-    Self: Sized + TryInto<Self::Result>,
+    Self: Sized,
 {
     type Message: InnerMessage + std::fmt::Display;
 
@@ -31,7 +31,7 @@ where
     fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
-    ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>>;
+    ) -> impl Future<Output = Result<OpInitialization<Self>, OpError>> + 'a;
 
     fn id(&self) -> &Transaction;
 
@@ -73,6 +73,7 @@ where
         sender = s;
         op.process_message(network_bridge, op_manager, msg).await
     };
+
     handle_op_result(op_manager, network_bridge, result, tx, sender).await
 }
 
@@ -90,28 +91,17 @@ where
     match result {
         Err(OpError::StatePushed) => {
             // do nothing and continue, the operation will just continue later on
+            tracing::debug!("entered in state pushed to continue with op");
             return Ok(None);
         }
         Err(err) => {
             if let Some(sender) = sender {
                 network_bridge
-                    .send(&sender, NetMessage::Aborted(tx_id))
+                    .send(&sender, NetMessage::V1(NetMessageV1::Aborted(tx_id)))
                     .await?;
             }
             return Err(err);
         }
-        Ok(OperationResult {
-            return_msg: Some(msg),
-            state: Some(updated_state),
-        }) => {
-            // updated op
-            let id = *msg.id();
-            if let Some(target) = msg.target().cloned() {
-                network_bridge.send(&target.peer, msg).await?;
-            }
-            op_manager.push(id, updated_state).await?;
-        }
-
         Ok(OperationResult {
             return_msg: None,
             state: Some(final_state),
@@ -120,6 +110,20 @@ where
             op_manager.completed(tx_id);
             return Ok(Some(final_state));
         }
+        Ok(OperationResult {
+            return_msg: Some(msg),
+            state: Some(updated_state),
+        }) => {
+            // updated op
+            let id = *msg.id();
+            tracing::debug!(%id, "updated op state");
+            if let Some(target) = msg.target() {
+                tracing::debug!(%id, "sending updated op state");
+                network_bridge.send(&target.peer, msg).await?;
+            }
+            op_manager.push(id, updated_state).await?;
+        }
+
         Ok(OperationResult {
             return_msg: None,
             state: Some(updated_state),
@@ -134,7 +138,8 @@ where
         }) => {
             op_manager.completed(tx_id);
             // finished the operation at this node, informing back
-            if let Some(target) = msg.target().cloned() {
+
+            if let Some(target) = msg.target() {
                 network_bridge.send(&target.peer, msg).await?;
             }
         }
@@ -169,7 +174,6 @@ impl OpEnum {
             pub fn id(&self) -> &Transaction;
             pub fn outcome(&self) -> OpOutcome;
             pub fn finalized(&self) -> bool;
-            pub fn record_transfer(&mut self);
             pub fn to_host_result(&self) -> HostResult;
         }
     }
@@ -302,7 +306,7 @@ impl<T> From<SendError<T>> for OpError {
 
 /// If the contract is not found, it will try to get it first if the `try_get` parameter is set.
 async fn start_subscription_request(op_manager: &OpManager, key: ContractKey, try_get: bool) {
-    let sub_op = subscribe::start_op(key.clone());
+    let sub_op = subscribe::start_op(key);
     if let Err(error) = subscribe::request_subscribe(op_manager, sub_op).await {
         if !try_get {
             tracing::warn!(%error, "Error subscribing to contract");
@@ -310,7 +314,7 @@ async fn start_subscription_request(op_manager: &OpManager, key: ContractKey, tr
         }
         if let OpError::ContractError(ContractError::ContractNotFound(key)) = &error {
             tracing::debug!(%key, "Contract not found, trying to get it first");
-            let get_op = get::start_op(key.clone(), true);
+            let get_op = get::start_op(*key, true);
             if let Err(error) = get::request_get(op_manager, get_op).await {
                 tracing::warn!(%error, "Error getting contract");
             }

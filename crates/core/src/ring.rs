@@ -3,12 +3,12 @@
 //! Mainly maintains a healthy and optimal pool of connections to other peers in the network
 //! and routes requests to the optimal peers.
 
+use std::collections::VecDeque;
 use std::hash::Hash;
-use std::sync::atomic::AtomicBool;
+use std::net::SocketAddr;
 use std::{
     cmp::Reverse,
     collections::BTreeMap,
-    convert::TryFrom,
     fmt::Display,
     hash::Hasher,
     ops::Add,
@@ -23,16 +23,18 @@ use anyhow::bail;
 use dashmap::{mapref::one::Ref as DmRef, DashMap};
 use either::Either;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
+use itertools::Itertools;
 use parking_lot::RwLock;
-use rand::seq::SliceRandom;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync;
 use tracing::Instrument;
 
 use crate::message::TransactionType;
-use crate::topology::{AcquisitionStrategy, TopologyManager};
+use crate::topology::rate::Rate;
+use crate::topology::TopologyAdjustment;
 use crate::tracing::{NetEventLog, NetEventRegister};
+use crate::transport::TransportPublicKey;
 use crate::util::Contains;
 use crate::{
     config::GlobalExecutor,
@@ -40,10 +42,12 @@ use crate::{
     node::{self, EventLoopNotificationsSender, NodeConfig, PeerId},
     operations::connect,
     router::Router,
-    DynError,
 };
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+mod connection_manager;
+pub(crate) use connection_manager::ConnectionManager;
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 /// The location of a peer in the ring. This location allows routing towards the peer.
 pub struct PeerKeyLocation {
@@ -86,9 +90,23 @@ impl Display for PeerKeyLocation {
     }
 }
 
-struct Connection {
+#[derive(Clone, Debug)]
+pub(crate) struct Connection {
     location: PeerKeyLocation,
     open_at: Instant,
+}
+
+#[cfg(test)]
+impl Connection {
+    pub fn new(peer: PeerId, location: Location) -> Self {
+        Connection {
+            location: PeerKeyLocation {
+                peer,
+                location: Some(location),
+            },
+            open_at: Instant::now(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -119,7 +137,7 @@ impl LiveTransactionTracker {
             .tx_per_peer
             .iter()
             .filter(|entry| entry.value().iter().any(|otx| otx == &tx))
-            .map(|entry| *entry.key())
+            .map(|entry| entry.key().clone())
             .collect();
 
         for k in keys_to_remove {
@@ -154,6 +172,23 @@ impl LiveTransactionTracker {
     }
 }
 
+#[derive(PartialEq, Clone, Copy)]
+struct Score(f64);
+
+impl PartialOrd for Score {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Score {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+impl Eq for Score {}
+
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
 ///
@@ -161,37 +196,26 @@ impl LiveTransactionTracker {
 // multithreaded maps. In the future if performance requires it some of this can be moved
 // towards a more lock-free multithreading model if necessary.
 pub(crate) struct Ring {
-    pub rnd_if_htl_above: usize,
     pub max_hops_to_live: usize,
-    pub peer_key: PeerId,
-    pub max_connections: usize,
-    pub min_connections: usize,
-    router: Arc<RwLock<Router>>,
-    topology_manager: RwLock<TopologyManager>,
-    /// Fast is for when there are less than our target number of connections so we want to acquire new connections quickly.
-    /// Slow is for when there are enough connections so we need to drop a connection in order to replace it.
-    fast_acquisition: AtomicBool,
-    connections_by_location: RwLock<BTreeMap<Location, Vec<Connection>>>,
-    location_for_peer: RwLock<BTreeMap<PeerId, Location>>,
-    own_location: AtomicU64,
+    pub connection_manager: ConnectionManager,
+    pub router: Arc<RwLock<Router>>,
+    pub live_tx_tracker: LiveTransactionTracker,
+    peer_pub_key: TransportPublicKey,
     /// The container for subscriber is a vec instead of something like a hashset
     /// that would allow for blind inserts of duplicate peers subscribing because
     /// of data locality, since we are likely to end up iterating over the whole sequence
     /// of subscribers more often than inserting, and anyways is a relatively short sequence
     /// then is more optimal to just use a vector for it's compact memory layout.
     subscribers: DashMap<ContractKey, Vec<PeerKeyLocation>>,
-    /// Contracts this peer is subscribed to.
-    subscriptions: DashMap<ContractKey, PeerKeyLocation>,
-    /// Interim connections ongoing handshake or successfully open connections
-    /// Is important to keep track of this so no more connections are accepted prematurely.
-    open_connections: AtomicUsize,
-    pub live_tx_tracker: LiveTransactionTracker,
+    /// Contracts this peer is seeding.
+    seeding_contract: DashMap<ContractKey, Score>,
     // A peer which has been blacklisted to perform actions regarding a given contract.
     // todo: add blacklist
     // contract_blacklist: Arc<DashMap<ContractKey, Vec<Blacklisted>>>,
     event_register: Box<dyn NetEventRegister>,
     /// Whether this peer is a gateway or not. This will affect behavior of the node when acquiring
     /// and dropping connections.
+    #[allow(unused)]
     is_gateway: bool,
 }
 
@@ -204,31 +228,42 @@ pub(crate) struct Ring {
 // }
 
 impl Ring {
-    const DEFAULT_MIN_CONNECTIONS: usize = 10;
+    const DEFAULT_MIN_CONNECTIONS: usize = 5;
 
-    const DEFAULT_MAX_CONNECTIONS: usize = 20;
+    const DEFAULT_MAX_CONNECTIONS: usize = 200;
+
+    const DEFAULT_MAX_UPSTREAM_BANDWIDTH: Rate = Rate::new_per_second(1_000_000.0);
+
+    const DEFAULT_MAX_DOWNSTREAM_BANDWIDTH: Rate = Rate::new_per_second(1_000_000.0);
 
     /// Max number of subscribers for a contract.
     const MAX_SUBSCRIBERS: usize = 10;
+
+    /// All subscribers, including the upstream subscriber.
+    const TOTAL_MAX_SUBSCRIPTIONS: usize = Self::MAX_SUBSCRIBERS + 1;
 
     /// Above this number of remaining hops, randomize which node a message which be forwarded to.
     const DEFAULT_RAND_WALK_ABOVE_HTL: usize = 7;
 
     /// Max hops to be performed for certain operations (e.g. propagating connection of a peer in the network).
-    const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
+    pub const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
+
+    /// Max number of seeding contracts.
+    const MAX_SEEDING_CONTRACTS: usize = 100;
+
+    /// Min number of seeding contracts.
+    const MIN_SEEDING_CONTRACTS: usize = Self::MAX_SEEDING_CONTRACTS / 4;
 
     pub fn new<ER: NetEventRegister + Clone>(
         config: &NodeConfig,
         event_loop_notifier: EventLoopNotificationsSender,
         event_register: ER,
         is_gateway: bool,
-    ) -> Result<Arc<Self>, anyhow::Error> {
+        connection_manager: ConnectionManager,
+    ) -> anyhow::Result<Arc<Self>> {
         let (live_tx_tracker, missing_candidate_rx) = LiveTransactionTracker::new();
 
-        let peer_key = config.peer_id;
-
-        // for location here consider -1 == None
-        let own_location = AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()));
+        let peer_pub_key = config.key_pair.public().clone();
 
         let max_hops_to_live = if let Some(v) = config.max_hops_to_live {
             v
@@ -236,55 +271,27 @@ impl Ring {
             Self::DEFAULT_MAX_HOPS_TO_LIVE
         };
 
-        let rnd_if_htl_above = if let Some(v) = config.rnd_if_htl_above {
-            v
-        } else {
-            Self::DEFAULT_RAND_WALK_ABOVE_HTL
-        };
-
-        let min_connections = if let Some(v) = config.min_number_conn {
-            v
-        } else {
-            Self::DEFAULT_MIN_CONNECTIONS
-        };
-
-        let max_connections = if let Some(v) = config.max_number_conn {
-            v
-        } else {
-            Self::DEFAULT_MAX_CONNECTIONS
-        };
-
         let router = Arc::new(RwLock::new(Router::new(&[])));
         GlobalExecutor::spawn(Self::refresh_router(router.clone(), event_register.clone()));
 
         // Just initialize with a fake location, this will be later updated when the peer has an actual location assigned.
-        let topology_manager = RwLock::new(TopologyManager::new(Location::new(0.0)));
-
         let ring = Ring {
-            rnd_if_htl_above,
             max_hops_to_live,
-            max_connections,
-            min_connections,
             router,
-            topology_manager,
-            fast_acquisition: AtomicBool::new(true),
-            connections_by_location: RwLock::new(BTreeMap::new()),
-            location_for_peer: RwLock::new(BTreeMap::new()),
-            own_location,
-            peer_key,
+            connection_manager,
+            peer_pub_key,
             subscribers: DashMap::new(),
-            subscriptions: DashMap::new(),
-            open_connections: AtomicUsize::new(0),
+            seeding_contract: DashMap::new(),
             live_tx_tracker: live_tx_tracker.clone(),
             event_register: Box::new(event_register),
             is_gateway,
         };
 
         if let Some(loc) = config.location {
-            if config.local_ip.is_none() || config.local_port.is_none() {
-                return Err(anyhow::anyhow!("IP and port are required for gateways"));
+            if config.peer_id.is_none() {
+                return Err(anyhow::anyhow!("PeerId is required for gateways"));
             }
-            ring.update_location(Some(loc));
+            ring.connection_manager.update_location(Some(loc));
         }
 
         let ring = Arc::new(ring);
@@ -294,17 +301,28 @@ impl Ring {
         } else {
             tracing::info_span!(parent: current_span, "connection_maintenance")
         };
+
         GlobalExecutor::spawn(
             ring.clone()
                 .connection_maintenance(event_loop_notifier, live_tx_tracker, missing_candidate_rx)
                 .instrument(span),
         );
+
         Ok(ring)
     }
 
+    pub fn get_peer_pub_key(&self) -> TransportPublicKey {
+        self.peer_pub_key.clone()
+    }
+
+    pub fn is_gateway(&self) -> bool {
+        self.is_gateway
+    }
+
     pub fn open_connections(&self) -> usize {
-        self.open_connections
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.connection_manager
+            .open_connections
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     async fn refresh_router<ER: NetEventRegister>(router: Arc<RwLock<Router>>, register: ER) {
@@ -316,7 +334,7 @@ impl Ring {
                 .get_router_events(10_000)
                 .await
                 .map_err(|error| {
-                    tracing::error!("shutting down refresh router task");
+                    tracing::error!(%error, "shutting down refresh router task");
                     error
                 })
                 .expect("todo: propagate this to main thread");
@@ -327,143 +345,154 @@ impl Ring {
         }
     }
 
-    /// Return if a location is within appropiate subscription distance.
-    pub fn within_subscribing_distance(&self, loc: &Location) -> bool {
+    /// Return if a contract is within appropiate seeding distance.
+    pub fn should_seed(&self, key: &ContractKey) -> bool {
         const CACHING_DISTANCE: f64 = 0.05;
-        const MAX_CACHED: usize = 100;
-        const MIN_CACHED: usize = MAX_CACHED / 4;
         let caching_distance = Distance::new(CACHING_DISTANCE);
-        if self.subscriptions.len() < MIN_CACHED {
+        if self.seeding_contract.len() < Self::MIN_SEEDING_CONTRACTS {
             return true;
         }
-        self.subscriptions.len() < MAX_CACHED
-            && self
-                .own_location()
-                .location
-                .map(|own_loc| own_loc.distance(loc) <= caching_distance)
-                .unwrap_or(false)
-    }
-
-    /// Whether this node already is subscribed to this contract or not.
-    #[inline]
-    pub fn is_subscribed_to_contract(&self, key: &ContractKey) -> bool {
-        self.subscriptions.contains_key(key)
-    }
-
-    #[inline]
-    pub fn subscribed_to_contract(&self, key: &ContractKey) -> Option<PeerKeyLocation> {
-        self.subscriptions.get(key).map(|v| *v.value())
-    }
-
-    /// Update this node location.
-    pub fn update_location(&self, loc: Option<Location>) {
-        if let Some(loc) = loc {
-            self.own_location.store(
-                u64::from_le_bytes(loc.0.to_le_bytes()),
-                std::sync::atomic::Ordering::Release,
-            );
-            self.topology_manager.write().this_peer_location = loc;
-        } else {
-            self.own_location.store(
-                u64::from_le_bytes((-1f64).to_le_bytes()),
-                std::sync::atomic::Ordering::Release,
-            )
-        }
-    }
-
-    /// Returns this node location in the ring, if any (must have join the ring already).
-    pub fn own_location(&self) -> PeerKeyLocation {
-        let location = f64::from_le_bytes(
-            self.own_location
-                .load(std::sync::atomic::Ordering::Acquire)
-                .to_le_bytes(),
-        );
-        let location = if (location - -1f64).abs() < f64::EPSILON {
-            None
-        } else {
-            Some(Location(location))
-        };
-        PeerKeyLocation {
-            peer: self.peer_key,
-            location,
-        }
-    }
-
-    /// Whether a node should accept a new node connection or not based
-    /// on the relative location and other conditions.
-    ///
-    /// # Panic
-    /// Will panic if the node checking for this condition has no location assigned.
-    pub fn should_accept(&self, location: Location, peer: &PeerId) -> bool {
-        let open_conn = self
-            .open_connections
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self.location_for_peer.read().get(peer).is_some() {
-            // avoid connecting mroe than once to the same peer
-            self.open_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            return false;
-        }
-        let my_location = self
+        let key_loc = Location::from(key);
+        let own_loc = self
+            .connection_manager
             .own_location()
             .location
-            .expect("this node has no location assigned!");
-        let accepted = if location == my_location
-            || self.connections_by_location.read().contains_key(&location)
-        {
-            false
-        } else if open_conn < self.min_connections {
-            true
-        } else if open_conn >= self.max_connections {
-            false
-        } else {
-            let strategy = if self
-                .fast_acquisition
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                AcquisitionStrategy::Fast
-            } else {
-                AcquisitionStrategy::Slow
-            };
-            self.topology_manager
-                .write()
-                .evaluate_new_connection(location, strategy)
-                .unwrap_or(false)
-        };
-        if !accepted {
-            self.open_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            .expect("should be set");
+        if self.seeding_contract.len() < Self::MAX_SEEDING_CONTRACTS {
+            return own_loc.distance(key_loc) <= caching_distance;
         }
-        accepted
+
+        let contract_score = self.calculate_seed_score(key);
+        let r = self
+            .seeding_contract
+            .iter()
+            .min_by_key(|v| *v.value())
+            .unwrap();
+        let min_score = *r.value();
+        contract_score > min_score
     }
 
-    pub fn record_request(&self, requested_location: Location, request_type: TransactionType) {
-        self.topology_manager
+    /// Add a new subscription for this peer.
+    pub fn seed_contract(&self, key: ContractKey) -> (Option<ContractKey>, Vec<PeerKeyLocation>) {
+        let seed_score = self.calculate_seed_score(&key);
+        let mut old_subscribers = vec![];
+        let mut contract_to_drop = None;
+        if self.seeding_contract.len() < Self::MAX_SEEDING_CONTRACTS {
+            let dropped_contract = *self
+                .seeding_contract
+                .iter()
+                .min_by_key(|v| *v.value())
+                .unwrap()
+                .key();
+            self.seeding_contract.remove(&dropped_contract);
+            if let Some((_, mut subscribers_of_contract)) =
+                self.subscribers.remove(&dropped_contract)
+            {
+                std::mem::swap(&mut subscribers_of_contract, &mut old_subscribers);
+            }
+            contract_to_drop = Some(dropped_contract);
+        }
+        self.seeding_contract.insert(key, seed_score);
+        (contract_to_drop, old_subscribers)
+    }
+
+    fn calculate_seed_score(&self, key: &ContractKey) -> Score {
+        let location = self
+            .connection_manager
+            .own_location()
+            .location
+            .expect("should be set");
+        let key_loc = Location::from(key);
+        let distance = key_loc.distance(location);
+        let score = 0.5 - distance.as_f64();
+        Score(score)
+    }
+
+    /// Whether this node already is seeding to this contract or not.
+    #[inline]
+    pub fn is_seeding_contract(&self, key: &ContractKey) -> bool {
+        self.seeding_contract.contains_key(key)
+    }
+
+    pub fn record_request(
+        &self,
+        recipient: PeerKeyLocation,
+        target: Location,
+        request_type: TransactionType,
+    ) {
+        self.connection_manager
+            .topology_manager
             .write()
-            .record_request(requested_location, request_type);
+            .record_request(recipient, target, request_type);
     }
 
-    pub fn add_connection(&self, loc: Location, peer: PeerId) {
-        let mut cbl = self.connections_by_location.write();
+    pub async fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) {
+        tracing::info!(%peer, this = ?self.connection_manager.get_peer_key(), %was_reserved, "Adding connection to peer");
+        debug_assert!(
+            self.connection_manager
+                .get_peer_key()
+                .expect("should be set")
+                != peer
+        );
+        if was_reserved {
+            let old = self
+                .connection_manager
+                .reserved_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(debug_assertions)]
+            {
+                tracing::debug!(old, "Decremented reserved connections");
+                if old == 0 {
+                    panic!("Underflow of reserved connections");
+                }
+            }
+            let _ = old;
+        }
+        self.connection_manager
+            .open_connections
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.event_register
-            .register_events(Either::Left(NetEventLog::connected(self, peer, loc)));
+            .register_events(Either::Left(NetEventLog::connected(
+                self,
+                peer.clone(),
+                loc,
+            )))
+            .await;
+        let mut cbl = self.connection_manager.connections_by_location.write();
         cbl.entry(loc).or_default().push(Connection {
             location: PeerKeyLocation {
-                peer,
+                peer: peer.clone(),
                 location: Some(loc),
             },
             open_at: Instant::now(),
         });
-        self.location_for_peer.write().insert(peer, loc);
+        self.connection_manager
+            .location_for_peer
+            .write()
+            .insert(peer.clone(), loc);
         std::mem::drop(cbl);
         self.refresh_density_request_cache()
     }
 
     fn refresh_density_request_cache(&self) {
-        let cbl = self.connections_by_location.read();
-        let current_neighbors = &Self::current_neighbors(&cbl);
-        let topology_manager = &mut *self.topology_manager.write();
-        let _ = topology_manager.refresh_cache(current_neighbors);
+        let cbl = self.connection_manager.connections_by_location.read();
+        let topology_manager = &mut self.connection_manager.topology_manager.write();
+        let _ = topology_manager.refresh_cache(&cbl);
+    }
+
+    /// Returns a filtered iterator for peers that are not connected to this node already.
+    pub fn is_not_connected<'a>(
+        &self,
+        peers: impl Iterator<Item = &'a PeerKeyLocation>,
+    ) -> impl Iterator<Item = &'a PeerKeyLocation> + Send {
+        let locs = &*self.connection_manager.location_for_peer.read();
+        let mut filtered = Vec::new();
+        for peer in peers {
+            if !locs.contains_key(&peer.peer) {
+                filtered.push(peer);
+            }
+        }
+        filtered.into_iter()
     }
 
     /// Return the most optimal peer caching a given contract.
@@ -473,62 +502,25 @@ impl Ring {
         contract_key: &ContractKey,
         skip_list: impl Contains<PeerId>,
     ) -> Option<PeerKeyLocation> {
-        self.routing(Location::from(contract_key), None, skip_list)
-    }
-
-    /// Route an op to the most optimal target.
-    pub fn routing(
-        &self,
-        target: Location,
-        requesting: Option<&PeerId>,
-        skip_list: impl Contains<PeerId>,
-    ) -> Option<PeerKeyLocation> {
-        let connections = self.connections_by_location.read();
-        let peers = connections.values().filter_map(|conns| {
-            let conn = conns.choose(&mut rand::thread_rng()).unwrap();
-            if let Some(requester) = requesting {
-                if requester == &conn.location.peer {
-                    return None;
-                }
-            }
-            (!skip_list.has_element(&conn.location.peer)).then_some(&conn.location)
-        });
-        let router = &*self.router.read();
-        router.select_peer(peers, target).cloned()
+        let router = self.router.read();
+        self.connection_manager
+            .routing(Location::from(contract_key), None, skip_list, &router)
     }
 
     pub fn routing_finished(&self, event: crate::router::RouteEvent) {
+        self.connection_manager
+            .topology_manager
+            .write()
+            .report_outbound_request(event.peer.clone(), event.contract_location);
         self.router.write().add_event(event);
     }
 
-    /// Get a random peer from the known ring connections.
-    pub fn random_peer<F>(&self, filter_fn: F) -> Option<PeerKeyLocation>
-    where
-        F: Fn(&PeerId) -> bool,
-    {
-        let peers = &*self.location_for_peer.read();
-        let amount = peers.len();
-        if amount == 0 {
-            return None;
-        }
-        let mut rng = rand::thread_rng();
-        let mut attempts = 0;
-        loop {
-            if attempts >= amount * 2 {
-                return None;
-            }
-            let selected = rng.gen_range(0..amount);
-            let (peer, loc) = peers.iter().nth(selected).expect("infallible");
-            if !filter_fn(peer) {
-                attempts += 1;
-                continue;
-            } else {
-                return Some(PeerKeyLocation {
-                    peer: *peer,
-                    location: Some(*loc),
-                });
-            }
-        }
+    pub fn register_subscription(&self, contract: &ContractKey, subscriber: PeerKeyLocation) {
+        self.subscribers
+            .entry(*contract)
+            .or_insert(Vec::with_capacity(Self::TOTAL_MAX_SUBSCRIPTIONS))
+            .value_mut()
+            .push(subscriber);
     }
 
     /// Will return an error in case the max number of subscribers has been added.
@@ -539,8 +531,8 @@ impl Ring {
     ) -> Result<(), ()> {
         let mut subs = self
             .subscribers
-            .entry(contract.clone())
-            .or_insert(Vec::with_capacity(Self::MAX_SUBSCRIBERS));
+            .entry(*contract)
+            .or_insert(Vec::with_capacity(Self::TOTAL_MAX_SUBSCRIPTIONS));
         if subs.len() >= Self::MAX_SUBSCRIBERS {
             return Err(());
         }
@@ -555,11 +547,6 @@ impl Ring {
         Ok(())
     }
 
-    /// Add a new subscription for this peer.
-    pub fn add_subscription(&self, contract: ContractKey, peer: PeerKeyLocation) {
-        self.subscriptions.insert(contract, peer);
-    }
-
     pub fn subscribers_of(
         &self,
         contract: &ContractKey,
@@ -567,21 +554,13 @@ impl Ring {
         self.subscribers.get(contract)
     }
 
-    pub fn num_connections(&self) -> usize {
-        self.connections_by_location.read().len()
-    }
-
-    pub fn prune_connection(&self, peer: PeerId) {
-        #[cfg(debug_assertions)]
-        {
-            tracing::info!(%peer, "Removing connection");
-        }
+    pub async fn prune_connection(&self, peer: PeerId) {
+        tracing::debug!(%peer, "Removing connection");
         self.live_tx_tracker.prune_transactions_from_peer(&peer);
-        let loc = self.location_for_peer.write().remove(&peer).unwrap();
-        {
-            let conns = &mut *self.connections_by_location.write();
-            conns.remove(&loc);
-        }
+        // This case would be when a connection is being open, so peer location hasn't been recorded yet and we can ignore everything below
+        let Some(loc) = self.connection_manager.prune_alive_connection(&peer) else {
+            return;
+        };
         {
             self.subscribers.alter_all(|_, mut subs| {
                 if let Some(pos) = subs.iter().position(|l| l.location == Some(loc)) {
@@ -591,9 +570,8 @@ impl Ring {
             });
         }
         self.event_register
-            .register_events(Either::Left(NetEventLog::disconnected(self, &peer)));
-        self.open_connections
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            .register_events(Either::Left(NetEventLog::disconnected(self, &peer)))
+            .await;
     }
 
     pub fn closest_to_location(
@@ -601,24 +579,24 @@ impl Ring {
         location: Location,
         skip_list: &[PeerId],
     ) -> Option<PeerKeyLocation> {
-        self.connections_by_location
+        use rand::seq::SliceRandom;
+        self.connection_manager
+            .connections_by_location
             .read()
-            .range(..location)
-            .filter_map(|(_, conns)| {
-                let conn = conns.choose(&mut rand::thread_rng()).unwrap();
-                (!skip_list.contains(&conn.location.peer)).then_some(conn.location)
-            })
-            .next_back()
-    }
-
-    fn current_neighbors(
-        connections_by_location: &BTreeMap<Location, Vec<Connection>>,
-    ) -> BTreeMap<Location, usize> {
-        connections_by_location
             .iter()
-            .fold(BTreeMap::new(), |mut map, (loc, conns)| {
-                map.insert(*loc, conns.len());
-                map
+            .sorted_by(|(loc_a, _), (loc_b, _)| {
+                loc_a.distance(location).cmp(&loc_b.distance(location))
+            })
+            .find_map(|(_, conns)| {
+                for _ in 0..conns.len() {
+                    let conn = conns.choose(&mut rand::thread_rng()).unwrap();
+                    let selected =
+                        (!skip_list.contains(&conn.location.peer)).then_some(conn.location.clone());
+                    if selected.is_some() {
+                        return selected;
+                    }
+                }
+                None
             })
     }
 
@@ -627,49 +605,37 @@ impl Ring {
         notifier: EventLoopNotificationsSender,
         live_tx_tracker: LiveTransactionTracker,
         mut missing_candidates: sync::mpsc::Receiver<PeerId>,
-    ) -> Result<(), DynError> {
-        /// Peers whose connection should be dropped.
-        fn should_swap<'a>(
-            _connections: impl Iterator<Item = &'a PeerKeyLocation>,
-            is_gateway: bool,
-        ) -> Vec<PeerId> {
-            // todo: instead we should be using ConnectionEvaluator here
-            // todo: if the peer is a gateway behaviour on how quickly we drop connections may be different
-            let _ = is_gateway;
-            vec![]
-        }
-
+    ) -> anyhow::Result<()> {
         #[cfg(not(test))]
         const CONNECTION_AGE_THRESOLD: Duration = Duration::from_secs(60 * 5);
         #[cfg(test)]
         const CONNECTION_AGE_THRESOLD: Duration = Duration::from_secs(5);
-        #[cfg(not(test))]
-        const REMOVAL_TICK_DURATION: Duration = Duration::from_secs(60 * 5);
-        #[cfg(test)]
-        const REMOVAL_TICK_DURATION: Duration = Duration::from_secs(1);
-        const ACQUIRE_CONNS_TICK_DURATION: Duration = Duration::from_secs(2);
+        const CHECK_TICK_DURATION: Duration = Duration::from_secs(10);
         const REGENERATE_DENSITY_MAP_INTERVAL: Duration = Duration::from_secs(60);
 
-        let mut check_interval = tokio::time::interval(REMOVAL_TICK_DURATION);
+        let mut check_interval = tokio::time::interval(CHECK_TICK_DURATION);
         check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut acquire_max_connections = tokio::time::interval(ACQUIRE_CONNS_TICK_DURATION);
-        acquire_max_connections.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut refresh_density_map = tokio::time::interval(REGENERATE_DENSITY_MAP_INTERVAL);
         refresh_density_map.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let mut missing = BTreeMap::new();
 
         #[cfg(not(test))]
-        let retry_interval = REMOVAL_TICK_DURATION * 2;
+        let retry_peers_missing_candidates_interval = Duration::from_secs(60 * 5) * 2;
         #[cfg(test)]
-        let retry_interval = Duration::from_secs(5);
+        let retry_peers_missing_candidates_interval = Duration::from_secs(5);
 
         // if the peer is just starting wait a bit before
         // we even attempt acquiring more connections
-        tokio::time::sleep(ACQUIRE_CONNS_TICK_DURATION).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
 
         let mut live_tx = None;
-        'outer: loop {
+        let mut pending_conn_adds = VecDeque::new();
+        loop {
+            if self.connection_manager.get_peer_key().is_none() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
             loop {
                 match missing_candidates.try_recv() {
                     Ok(missing_candidate) => {
@@ -678,112 +644,88 @@ impl Ring {
                     Err(sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(sync::mpsc::error::TryRecvError::Disconnected) => {
                         tracing::debug!("Shutting down connection maintenance");
-                        break 'outer Err("finished".into());
+                        anyhow::bail!("finished");
                     }
                 }
             }
 
             // eventually peers which failed to return candidates should be retried when enough time has passed
-            let retry_missing_candidates_until = Instant::now() - retry_interval;
+            let retry_missing_candidates_until =
+                Instant::now() - retry_peers_missing_candidates_interval;
+
+            // remove all missing candidates which have been retried
             missing.split_off(&Reverse(retry_missing_candidates_until));
 
-            let open_connections = self
-                .open_connections
-                .load(std::sync::atomic::Ordering::SeqCst);
-
-            if let Some(tx) = &live_tx {
-                if !live_tx_tracker.still_alive(tx) {
-                    let _ = live_tx.take();
-                } else if open_connections < self.max_connections {
-                    acquire_max_connections.tick().await;
-                } else {
-                    check_interval.tick().await;
-                }
-            }
-
-            if open_connections < self.max_connections {
-                self.fast_acquisition
-                    .store(true, std::sync::atomic::Ordering::Release);
-                // requires more connections
-                let ideal_location = {
-                    let loc = { self.topology_manager.read().get_best_candidate_location() };
-                    match loc {
-                        Ok(loc) => loc,
-                        Err(_) => {
-                            tracing::trace!(peer = %self.own_location(), "Insufficient data gathered by the topology manager");
-                            acquire_max_connections.tick().await;
-                            continue;
-                        }
-                    }
-                };
+            if let Some(ideal_location) = pending_conn_adds.pop_front() {
                 live_tx = self
                     .acquire_new(
                         ideal_location,
                         &missing.values().collect::<Vec<_>>(),
                         &notifier,
-                        self.max_connections - open_connections,
                     )
                     .await
                     .map_err(|error| {
                         tracing::debug!(?error, "Shutting down connection maintenance task");
                         error
                     })?;
-
-                acquire_max_connections.tick().await;
-                continue;
             }
 
-            let mut should_swap = {
-                let peers = self.connections_by_location.read();
-                should_swap(
-                    peers
-                        .values()
-                        .flatten()
-                        .filter(|conn| {
-                            conn.open_at.elapsed() > CONNECTION_AGE_THRESOLD
-                                && !live_tx_tracker.has_live_connection(&conn.location.peer)
-                        })
-                        .map(|conn| &conn.location),
-                    self.is_gateway,
-                )
-            };
-            if !should_swap.is_empty() {
-                self.fast_acquisition
-                    .store(false, std::sync::atomic::Ordering::Release);
-                let ideal_location = {
-                    let loc = { self.topology_manager.read().get_best_candidate_location() };
-                    match loc {
-                        Ok(loc) => loc,
-                        Err(_) => {
-                            tracing::debug!(peer = %self.own_location(), "Insufficient data gathered by the topology manager");
-                            check_interval.tick().await;
-                            continue;
-                        }
-                    }
-                };
-                live_tx = self
-                    .acquire_new(
-                        ideal_location,
-                        &missing.values().collect::<Vec<_>>(),
-                        &notifier,
-                        should_swap.len(),
-                    )
-                    .await
-                    .map_err(|error| {
-                        tracing::warn!(?error, "Shutting down connection maintenance task");
-                        error
-                    })?;
-                for peer in should_swap.drain(..) {
-                    notifier
-                        .send(Either::Right(crate::message::NodeEvent::DropConnection(
-                            peer,
-                        )))
-                        .await
-                        .map_err(|error| {
-                            tracing::debug!(?error, "Shutting down connection maintenance task");
-                            error
-                        })?;
+            // if there are no open connections, we need to acquire more
+            if let Some(tx) = &live_tx {
+                if !live_tx_tracker.still_alive(tx) {
+                    let _ = live_tx.take();
                 }
+            }
+
+            let neighbor_locations = {
+                let peers = self.connection_manager.connections_by_location.read();
+                peers
+                    .iter()
+                    .map(|(loc, conns)| {
+                        let conns: Vec<_> = conns
+                            .iter()
+                            .filter(|conn| {
+                                conn.open_at.elapsed() > CONNECTION_AGE_THRESOLD
+                                    && !live_tx_tracker.has_live_connection(&conn.location.peer)
+                            })
+                            .cloned()
+                            .collect();
+                        (*loc, conns)
+                    })
+                    .filter(|(_, conns)| !conns.is_empty())
+                    .collect()
+            };
+
+            let adjustment = self
+                .connection_manager
+                .topology_manager
+                .write()
+                .adjust_topology(
+                    &neighbor_locations,
+                    &self.connection_manager.own_location().location,
+                    Instant::now(),
+                );
+            match adjustment {
+                TopologyAdjustment::AddConnections(target_locs) => {
+                    pending_conn_adds.extend(target_locs);
+                }
+                TopologyAdjustment::RemoveConnections(mut should_disconnect_peers) => {
+                    for peer in should_disconnect_peers.drain(..) {
+                        notifier
+                            .send(Either::Right(crate::message::NodeEvent::DropConnection(
+                                peer.peer,
+                            )))
+                            .await
+                            .map_err(|error| {
+                                tracing::debug!(
+                                    ?error,
+                                    "Shutting down connection maintenance task"
+                                );
+                                error
+                            })?;
+                    }
+                }
+                TopologyAdjustment::NoChange => {}
             }
 
             tokio::select! {
@@ -795,32 +737,47 @@ impl Ring {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self, notifier))]
+    #[tracing::instrument(level = "debug", skip(self, notifier), fields(peer = %self.connection_manager.pub_key))]
     async fn acquire_new(
         &self,
         ideal_location: Location,
         skip_list: &[&PeerId],
         notifier: &EventLoopNotificationsSender,
-        missing_connections: usize,
-    ) -> Result<Option<Transaction>, DynError> {
+    ) -> anyhow::Result<Option<Transaction>> {
         use crate::message::InnerMessage;
-        let Some(query_target) = self.routing(ideal_location, None, skip_list) else {
-            return Ok(None);
+        let query_target = {
+            let router = self.router.read();
+            if let Some(t) =
+                self.connection_manager
+                    .routing(ideal_location, None, skip_list, &router)
+            {
+                t
+            } else {
+                return Ok(None);
+            }
         };
-        let joiner = self.own_location();
+        let joiner = self.connection_manager.own_location();
         tracing::debug!(
             this_peer = %joiner,
             %query_target,
             %ideal_location,
             "Adding new connections"
         );
+        let missing_connections = self.connection_manager.max_connections - self.open_connections();
+        let connected = self.connection_manager.connected_peers();
         let msg = connect::ConnectMsg::Request {
             id: Transaction::new::<connect::ConnectMsg>(),
+            target: query_target.clone(),
             msg: connect::ConnectRequest::FindOptimalPeer {
                 query_target,
                 ideal_location,
                 joiner,
                 max_hops_to_live: missing_connections,
+                skip_list: skip_list
+                    .iter()
+                    .map(|p| (*p).clone())
+                    .chain(connected)
+                    .collect(),
             },
         };
         let id = *msg.id();
@@ -835,6 +792,32 @@ impl Ring {
 pub struct Location(f64);
 
 impl Location {
+    #[cfg(not(feature = "local-simulation"))]
+    pub fn from_address(addr: &SocketAddr) -> Self {
+        match addr.ip() {
+            std::net::IpAddr::V4(ipv4) => {
+                let octets = ipv4.octets();
+                let combined_octets = (u32::from(octets[0]) << 16)
+                    | (u32::from(octets[1]) << 8)
+                    | u32::from(octets[2]);
+                Location(combined_octets as f64 / (u32::MAX as f64))
+            }
+            std::net::IpAddr::V6(ipv6) => {
+                let segments = ipv6.segments();
+                let combined_segments = (u64::from(segments[0]) << 32)
+                    | (u64::from(segments[1]) << 16)
+                    | u64::from(segments[2]);
+                Location(combined_segments as f64 / (u64::MAX as f64))
+            }
+        }
+    }
+
+    #[cfg(feature = "local-simulation")]
+    pub fn from_address(_addr: &SocketAddr) -> Self {
+        let random_component: f64 = rand::random();
+        Location(random_component)
+    }
+
     pub fn new(location: f64) -> Self {
         debug_assert!(
             (0.0..=1.0).contains(&location),

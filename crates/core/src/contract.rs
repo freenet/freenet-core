@@ -38,7 +38,7 @@ where
             } => {
                 match contract_handler
                     .executor()
-                    .fetch_contract(key.clone(), fetch_contract)
+                    .fetch_contract(key, fetch_contract)
                     .instrument(tracing::info_span!("fetch_contract", %key, %fetch_contract))
                     .await
                 {
@@ -89,12 +89,7 @@ where
             } => {
                 let put_result = contract_handler
                     .executor()
-                    .upsert_contract_state(
-                        key.clone(),
-                        Either::Left(state),
-                        related_contracts,
-                        contract,
-                    )
+                    .upsert_contract_state(key, Either::Left(state), related_contracts, contract)
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await;
                 contract_handler
@@ -103,6 +98,36 @@ where
                         id,
                         ContractHandlerEvent::PutResponse {
                             new_value: put_result.map_err(Into::into),
+                        },
+                    )
+                    .await
+                    .map_err(|error| {
+                        tracing::debug!(%error, "shutting down contract handler");
+                        error
+                    })?;
+            }
+            ContractHandlerEvent::UpdateQuery {
+                key,
+                state,
+                related_contracts,
+            } => {
+                let update_result = contract_handler
+                    .executor()
+                    .upsert_contract_state(
+                        key,
+                        Either::Left(state.clone()),
+                        related_contracts,
+                        None,
+                    )
+                    .instrument(tracing::info_span!("upsert_contract_state", %key))
+                    .await;
+
+                contract_handler
+                    .channel()
+                    .send_to_sender(
+                        id,
+                        ContractHandlerEvent::UpdateResponse {
+                            new_value: update_result.map_err(Into::into),
                         },
                     )
                     .await

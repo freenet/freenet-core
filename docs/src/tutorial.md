@@ -1,6 +1,8 @@
-# Getting Started
+# Introduction
 
-This tutorial will show you how to build decentralized software on Freenet. For a similar working and up to date example check the `freenet-email` app (located in under the `apps/freenet-email-app` directory in the `freenet-core` repository).
+This tutorial will show you how to build decentralized software on Freenet. For a practical 
+reference, please see the example application at [apps/freenet-email-app](https://github.com/freenet/freenet-core/tree/main/apps/freenet-email-app).
+
 
 <!-- toc -->
 
@@ -8,29 +10,45 @@ This tutorial will show you how to build decentralized software on Freenet. For 
 
 ### Rust and Cargo
 
-This will install a Rust development environment including cargo on Linux or a
-Mac (for Windows see [here](https://rustup.rs)):
+To install a Rust development environment, including Cargo, on Linux or macOS
+(for Windows installation, refer to [this guide](https://rustup.rs)), use the
+following command:
 
 ```bash
 curl https://sh.rustup.rs -sSf | sh
 ```
 
 #### Note for MacOS install
-Do not have the `brew` version of rust installed as it will cause compications with `fdev`.
 
-### Freenet development tool (fdev)
+Note: The Homebrew installation of Rust may interfere with `fdev`. It is
+recommended to use `rustup`, as shown above, to avoid these issues.
 
-Once you have a working installation of Cargo you can install the Freenet dev
-tools:
+### Installing Freenet Core and FDev from Git
 
-```bash
-cargo install freenet fdev
-```
+- Clone the Freenet Core repository and the stdlib submodule, and navigate to the application directory:
 
-This command will install `fdev` (Freenet development tool) and a working Freenet kernel that can
-be used for local development.
+*Note:* Currently these should be installed from the git repo as the code is changing rapidly, once things
+are more stable they can be installed from crates.io which will simplify this step.
+
+  ```bash
+  git clone --recurse-submodules https://github.com/freenet/freenet-core.git
+  cd freenet-core/apps/freenet-ping
+  ```
+
+### Freenet Development Tool and Kernel
+
+- Install the Freenet development tool (`fdev`) and the Freenet kernel for local development:
+
+  ```bash
+  # You should be in freenet-core/apps/freenet-ping
+  cargo install --path ../../crates/core
+  cargo install --path ../../crates/fdev
+  ```
 
 ### Add WebAssembly target
+
+To allow Rust to compile to WebAssembly, you need to add the WebAssembly target using `rustup`:
+
 ```bash
 rustup target add wasm32-unknown-unknown
 ```
@@ -38,14 +56,14 @@ rustup target add wasm32-unknown-unknown
 ### Node.js and TypeScript
 
 To build user interfaces in JavaScript or TypeScript, you need to have Node.js
-and npm installed. On Linux or Mac:
+and npm installed. For example on Ubuntu Linux:
 
 ```bash
 sudo apt update
 sudo apt install nodejs npm
 ```
 
-For Windows, you can download Node.js and npm from [here](https://nodejs.org/en/download/).
+For Mac or Windows, you can download Node.js and npm from [here](https://nodejs.org/en/download/).
 
 Once Node.js and npm are installed, you can install TypeScript globally on your
 system, which includes the `tsc` command:
@@ -65,23 +83,21 @@ This command should output the version of TypeScript that you installed.
 ## Creating a new contract
 
 You can create a new [contract](glossary.md#contract) skeleton by executing the
-`new` command with `fdev`. Two contract types are supported currently by the
-tool, regular [contracts](glossary.md#contract), and [web
-application](glossary.md#web-application) [container
-contracts](glossary.md#container-contract). Currently, the following
-technological stacks are supported (more to be added in the future):
+`new` command with `fdev`. Fdev supports two types of contracts:
+regular [contracts](glossary.md#contract), and [web application](glossary.md#web-application) [container
+contracts](glossary.md#container-contract). Fdev supports several languages:
 
 - Regular contracts:
-  - Rust (_default_)
-- Web applications:
-  - Container development:
     - Rust (_default_)
-  - Web/state development:
-    - Typescript. (_default: using npm and webpack_)
-    - JavaScript.
-    - Rust (**WIP**).
+- Web applications:
+    - Container development:
+        - Rust (_default_)
+    - Web/state development:
+        - TypeScript. (_default: using npm and webpack_)
+        - JavaScript.
+        - Rust (**WIP**).
 
-We will need to create a directory that will hold our web app and initialize it:
+We create a directory to hold our web app, and initialize it using `fdev`:
 
 ```bash
 mkdir -p my-app/web
@@ -90,7 +106,7 @@ cd my-app/web
 fdev new web-app
 ```
 
-will create the skeleton for a web application and its container contract for
+This will create the skeleton for a web application and its container contract for
 Freenet ready for development at the `my-app/web` directory.
 
 ## Making a container contract

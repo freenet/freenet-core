@@ -2,15 +2,15 @@ namespace topology;
 
 table AddedConnection {
   transaction: string;
-  from: string(required); // encoded PeerId
+  from: [ubyte](required); // encoded PeerId
   from_location: float64;
-  to: string(required);   // encoded PeerId
+  to: [ubyte](required);   // encoded PeerId
   to_location: float64;
 }
 
 table RemovedConnection {
-  at: string(required);
-  from: string(required);
+  at: [ubyte](required);
+  from: [ubyte](required);
 }
 
 table Error {

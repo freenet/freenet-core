@@ -10,9 +10,9 @@ use crate::{
     node::{
         network_bridge::{event_loop_notification_channel, in_memory::MemoryConnManager},
         op_state_manager::OpManager,
-        NetEventRegister, NetworkBridge,
+        NetEventRegister, NetworkBridge, PeerId,
     },
-    ring::PeerKeyLocation,
+    ring::{ConnectionManager, PeerKeyLocation},
 };
 
 use super::{Builder, RunnerConfig};
@@ -22,7 +22,7 @@ impl<ER> Builder<ER> {
         self,
         user_events: UsrEv,
         parent_span: tracing::Span,
-    ) -> Result<(), anyhow::Error>
+    ) -> anyhow::Result<()>
     where
         UsrEv: ClientEventsProxy + Send + 'static,
         ER: NetEventRegister + Clone,
@@ -33,11 +33,13 @@ impl<ER> Builder<ER> {
         let (ops_ch_channel, ch_channel, wait_for_event) = contract::contract_handler_channel();
 
         let _guard = parent_span.enter();
+        let connection_manager = ConnectionManager::new(&self.config);
         let op_manager = Arc::new(OpManager::new(
             notification_tx,
             ops_ch_channel,
             &self.config,
             self.event_register.clone(),
+            connection_manager.clone(),
         )?);
         std::mem::drop(_guard);
         let (executor_listener, executor_sender) = executor_channel(op_manager.clone());
@@ -47,7 +49,10 @@ impl<ER> Builder<ER> {
                 .map_err(|e| anyhow::anyhow!(e))?;
 
         let conn_manager = MemoryConnManager::new(
-            self.peer_key,
+            PeerId::new(
+                ([127, 0, 0, 1], 0).into(),
+                self.config.key_pair.public().clone(),
+            ),
             self.event_register.clone(),
             op_manager.clone(),
             self.add_noise,
@@ -57,8 +62,12 @@ impl<ER> Builder<ER> {
             contract::contract_handling(contract_handler)
                 .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
         );
+
         let mut config = super::RunnerConfig {
-            peer_key: self.peer_key,
+            peer_key: PeerId::new(
+                ([127, 0, 0, 1], 0).into(),
+                self.config.key_pair.public().clone(),
+            ),
             gateways,
             parent_span: Some(parent_span),
             op_manager,
@@ -74,16 +83,6 @@ impl<ER> Builder<ER> {
             .await?;
         super::run_node(config).await
     }
-
-    #[cfg(test)]
-    pub fn append_contracts(
-        &mut self,
-        contracts: Vec<(ContractContainer, WrappedState, Option<PeerKeyLocation>)>,
-        contract_subscribers: std::collections::HashMap<ContractKey, Vec<PeerKeyLocation>>,
-    ) {
-        self.contracts.extend(contracts);
-        self.contract_subscribers.extend(contract_subscribers);
-    }
 }
 
 impl<NB, UsrEv> RunnerConfig<NB, UsrEv>
@@ -93,15 +92,15 @@ where
 {
     async fn append_contracts(
         &mut self,
-        contracts: Vec<(ContractContainer, WrappedState, Option<PeerKeyLocation>)>,
+        contracts: Vec<(ContractContainer, WrappedState, bool)>,
         contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> anyhow::Result<()> {
         use crate::contract::ContractHandlerEvent;
         for (contract, state, subscription) in contracts {
             let key: ContractKey = contract.key();
             self.op_manager
                 .notify_contract_handler(ContractHandlerEvent::PutQuery {
-                    key: key.clone(),
+                    key,
                     state,
                     related_contracts: RelatedContracts::default(),
                     contract: Some(contract),
@@ -110,12 +109,14 @@ where
             tracing::debug!(
                 "Appended contract {} to peer {}",
                 key,
-                self.op_manager.ring.peer_key
-            );
-            if let Some(subscription) = subscription {
                 self.op_manager
                     .ring
-                    .add_subscription(key.clone(), subscription);
+                    .connection_manager
+                    .get_peer_key()
+                    .unwrap()
+            );
+            if subscription {
+                self.op_manager.ring.seed_contract(key);
             }
             if let Some(subscribers) = contract_subscribers.get(&key) {
                 // add contract subscribers
@@ -123,7 +124,7 @@ where
                     if self
                         .op_manager
                         .ring
-                        .add_subscriber(&key, *subscriber)
+                        .add_subscriber(&key, subscriber.clone())
                         .is_err()
                     {
                         tracing::warn!("Max subscribers for contract {} reached", key);

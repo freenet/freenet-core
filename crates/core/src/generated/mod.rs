@@ -230,10 +230,10 @@ impl PeerChange<'_> {
         connections: impl Iterator<Item = &'a (PeerId, f64)>,
     ) -> Vec<u8> {
         let mut buf = flatbuffers::FlatBufferBuilder::new();
-        let to = buf.create_string(to.to_string().as_str());
+        let to = buf.create_vector(&bincode::serialize(&to).unwrap());
         let connections = connections
             .map(|(from, from_location)| {
-                let from = Some(buf.create_string(from.to_string().as_str()));
+                let from = Some(buf.create_vector(&bincode::serialize(from).unwrap()));
                 topology::AddedConnection::create(
                     &mut buf,
                     &topology::AddedConnectionArgs {
@@ -265,16 +265,16 @@ impl PeerChange<'_> {
         (to, to_location): (PeerId, f64),
     ) -> Vec<u8> {
         let mut buf = flatbuffers::FlatBufferBuilder::new();
-        let from = Some(buf.create_string(from.to_string().as_str()));
-        let to = Some(buf.create_string(to.to_string().as_str()));
+        let from = buf.create_vector(&bincode::serialize(&from).unwrap());
+        let to = buf.create_vector(&bincode::serialize(&to).unwrap());
         let transaction = transaction.map(|t| buf.create_string(t.as_ref()));
         let add_conn = topology::AddedConnection::create(
             &mut buf,
             &topology::AddedConnectionArgs {
                 transaction,
-                from,
+                from: Some(from),
                 from_location,
-                to,
+                to: Some(to),
                 to_location,
             },
         );
@@ -292,11 +292,14 @@ impl PeerChange<'_> {
 
     pub fn removed_connection_msg(at: PeerId, from: PeerId) -> Vec<u8> {
         let mut buf = flatbuffers::FlatBufferBuilder::new();
-        let at = Some(buf.create_string(at.to_string().as_str()));
-        let from = Some(buf.create_string(from.to_string().as_str()));
+        let at = buf.create_vector(&bincode::serialize(&at).unwrap());
+        let from = buf.create_vector(&bincode::serialize(&from).unwrap());
         let remove_conn = topology::RemovedConnection::create(
             &mut buf,
-            &topology::RemovedConnectionArgs { at, from },
+            &topology::RemovedConnectionArgs {
+                at: Some(at),
+                from: Some(from),
+            },
         );
         let msg = topology::PeerChange::create(
             &mut buf,

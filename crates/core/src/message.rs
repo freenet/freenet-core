@@ -1,16 +1,17 @@
 //! Network messaging between peers.
 
 use std::{
-    borrow::Cow,
+    borrow::{Borrow, Cow},
     fmt::Display,
     time::{Duration, SystemTime},
 };
 
+use freenet_stdlib::prelude::ContractKey;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
-    node::{ConnectionError, PeerId},
+    node::PeerId,
     operations::{
         connect::ConnectMsg, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg, update::UpdateMsg,
     },
@@ -29,7 +30,7 @@ pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
 ///   to sweep any garbage left by a finished (or timed out) transaction.
 ///
 /// A transaction may span different messages sent across the network.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct Transaction {
     id: Ulid,
 }
@@ -37,14 +38,14 @@ pub struct Transaction {
 impl Transaction {
     pub const NULL: &'static Transaction = &Transaction { id: Ulid(0) };
 
-    pub fn new<T: TxType>() -> Self {
+    pub(crate) fn new<T: TxType>() -> Self {
         let ty = <T as TxType>::tx_type_id();
         let id = Ulid::new();
         Self::update(ty.0, id)
         // Self { id }
     }
 
-    pub fn transaction_type(&self) -> TransactionType {
+    pub(crate) fn transaction_type(&self) -> TransactionType {
         let id_byte = (self.id.0 & 0xFFu128) as u8;
         match id_byte {
             0 => TransactionType::Connect,
@@ -127,6 +128,12 @@ impl Display for Transaction {
     }
 }
 
+impl std::fmt::Debug for Transaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.id)
+    }
+}
+
 impl PartialOrd for Transaction {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -154,8 +161,6 @@ where
 }
 
 mod sealed_msg_type {
-    use crate::operations::update::UpdateMsg;
-
     use super::*;
 
     pub trait SealedTxType {
@@ -196,11 +201,11 @@ mod sealed_msg_type {
     }
 
     macro_rules! transaction_type_enumeration {
-        (decl struct { $( $var:tt -> $ty:tt),+ }) => {
+        ($variant:ident, $enum_type:ident, decl struct { $( $var:ident -> $ty:ty ),+ }) => {
             $(
                 impl From<$ty> for NetMessage {
                     fn from(msg: $ty) -> Self {
-                        Self::$var(msg)
+                        Self::$variant($enum_type::$var(msg))
                     }
                 }
 
@@ -213,7 +218,7 @@ mod sealed_msg_type {
         };
     }
 
-    transaction_type_enumeration!(decl struct {
+    transaction_type_enumeration!(V1, NetMessageV1, decl struct {
         Connect -> ConnectMsg,
         Put -> PutMsg,
         Get -> GetMsg,
@@ -222,41 +227,86 @@ mod sealed_msg_type {
     });
 }
 
+pub(crate) trait MessageStats {
+    fn id(&self) -> &Transaction;
+
+    fn target(&self) -> Option<PeerKeyLocation>;
+
+    fn requested_location(&self) -> Option<Location>;
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum NetMessage {
+    V1(NetMessageV1),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) enum NetMessageV1 {
     Connect(ConnectMsg),
     Put(PutMsg),
     Get(GetMsg),
     Subscribe(SubscribeMsg),
+    Unsubscribed {
+        transaction: Transaction,
+        key: ContractKey,
+        from: PeerId,
+    },
     Update(UpdateMsg),
-    /// Failed a transaction, informing of abortion.
     Aborted(Transaction),
+}
+
+trait Versioned {
+    fn version(&self) -> semver::Version;
+}
+
+impl Versioned for NetMessage {
+    fn version(&self) -> semver::Version {
+        match self {
+            NetMessage::V1(inner) => inner.version(),
+        }
+    }
+}
+
+impl Versioned for NetMessageV1 {
+    fn version(&self) -> semver::Version {
+        match self {
+            NetMessageV1::Connect(_) => semver::Version::new(1, 0, 0),
+            NetMessageV1::Put(_) => semver::Version::new(1, 0, 0),
+            NetMessageV1::Get(_) => semver::Version::new(1, 0, 0),
+            NetMessageV1::Subscribe(_) => semver::Version::new(1, 0, 0),
+            NetMessageV1::Unsubscribed { .. } => semver::Version::new(1, 0, 0),
+            NetMessageV1::Update(_) => semver::Version::new(1, 0, 0),
+            NetMessageV1::Aborted(_) => semver::Version::new(1, 0, 0),
+        }
+    }
+}
+
+impl From<NetMessage> for semver::Version {
+    fn from(msg: NetMessage) -> Self {
+        msg.version()
+    }
 }
 
 pub(crate) trait InnerMessage: Into<NetMessage> {
     fn id(&self) -> &Transaction;
 
-    fn target(&self) -> Option<&PeerKeyLocation>;
-
-    fn terminal(&self) -> bool;
+    fn target(&self) -> Option<impl Borrow<PeerKeyLocation>>;
 
     fn requested_location(&self) -> Option<Location>;
 }
 
 /// Internal node events emitted to the event loop.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub(crate) enum NodeEvent {
-    /// For unspecified reasons the node is gracefully shutting down.
-    ShutdownNode,
-    /// Received a confirmation from a peer that a physical connection was established.
-    ConfirmedInbound,
     /// Drop the given peer connection.
     DropConnection(PeerId),
-    /// Accept the connections from the given peer.
-    AcceptConnection(PeerId),
-    /// Error while sending a message by the connection bridge from within the ops.
-    #[serde(skip)]
-    Error(ConnectionError),
+    // Try connecting to the given peer.
+    ConnectPeer {
+        peer: PeerId,
+        tx: Transaction,
+        callback: tokio::sync::mpsc::Sender<Result<PeerId, ()>>,
+        is_gw: bool,
+    },
     Disconnect {
         cause: Option<Cow<'static, str>>,
     },
@@ -265,15 +315,12 @@ pub(crate) enum NodeEvent {
 impl Display for NodeEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NodeEvent::ShutdownNode => f.write_str("ShutdownNode"),
-            NodeEvent::ConfirmedInbound => f.write_str("ConfirmedInbound"),
             NodeEvent::DropConnection(peer) => {
                 write!(f, "DropConnection (from {peer})")
             }
-            NodeEvent::AcceptConnection(peer) => {
-                write!(f, "AcceptConnection (from {peer})")
+            NodeEvent::ConnectPeer { peer, .. } => {
+                write!(f, "ConnectPeer (to {peer})")
             }
-            NodeEvent::Error(err) => write!(f, "{err}"),
             NodeEvent::Disconnect { cause: Some(cause) } => {
                 write!(f, "Disconnect node, reason: {cause}")
             }
@@ -284,76 +331,92 @@ impl Display for NodeEvent {
     }
 }
 
-impl NetMessage {
-    pub fn id(&self) -> &Transaction {
-        use NetMessage::*;
+impl MessageStats for NetMessage {
+    fn id(&self) -> &Transaction {
         match self {
-            Connect(op) => op.id(),
-            Put(op) => op.id(),
-            Get(op) => op.id(),
-            Subscribe(op) => op.id(),
-            Update(op) => op.id(),
-            Aborted(tx) => tx,
+            NetMessage::V1(msg) => msg.id(),
         }
     }
 
-    pub fn target(&self) -> Option<&PeerKeyLocation> {
-        use NetMessage::*;
+    fn target(&self) -> Option<PeerKeyLocation> {
         match self {
-            Connect(op) => op.target(),
-            Put(op) => op.target(),
-            Get(op) => op.target(),
-            Subscribe(op) => op.target(),
-            Update(op) => op.target(),
-            Aborted(_) => None,
+            NetMessage::V1(msg) => msg.target(),
         }
     }
 
-    /// Is the last expected message for this chain of messages.
-    pub fn terminal(&self) -> bool {
-        use NetMessage::*;
+    fn requested_location(&self) -> Option<Location> {
         match self {
-            Connect(op) => op.terminal(),
-            Put(op) => op.terminal(),
-            Get(op) => op.terminal(),
-            Subscribe(op) => op.terminal(),
-            Update(op) => op.terminal(),
-            Aborted(_) => true,
+            NetMessage::V1(msg) => msg.requested_location(),
+        }
+    }
+}
+
+impl MessageStats for NetMessageV1 {
+    fn id(&self) -> &Transaction {
+        match self {
+            NetMessageV1::Connect(op) => op.id(),
+            NetMessageV1::Put(op) => op.id(),
+            NetMessageV1::Get(op) => op.id(),
+            NetMessageV1::Subscribe(op) => op.id(),
+            NetMessageV1::Update(op) => op.id(),
+            NetMessageV1::Aborted(tx) => tx,
+            NetMessageV1::Unsubscribed { transaction, .. } => transaction,
         }
     }
 
-    pub fn requested_location(&self) -> Option<Location> {
-        use NetMessage::*;
+    fn target(&self) -> Option<PeerKeyLocation> {
         match self {
-            Connect(op) => op.requested_location(),
-            Put(op) => op.requested_location(),
-            Get(op) => op.requested_location(),
-            Subscribe(op) => op.requested_location(),
-            Update(op) => op.requested_location(),
-            Aborted(_) => None,
+            NetMessageV1::Connect(op) => op.target().as_ref().map(|b| b.borrow().clone()),
+            NetMessageV1::Put(op) => op.target().as_ref().map(|b| b.borrow().clone()),
+            NetMessageV1::Get(op) => op.target().as_ref().map(|b| b.borrow().clone()),
+            NetMessageV1::Subscribe(op) => op.target().as_ref().map(|b| b.borrow().clone()),
+            NetMessageV1::Update(op) => op.target().as_ref().map(|b| b.borrow().clone()),
+            NetMessageV1::Aborted(_) => None,
+            NetMessageV1::Unsubscribed { .. } => None,
         }
     }
 
-    pub fn track_stats(&self) -> bool {
-        use NetMessage::*;
-        !matches!(self, Connect(_) | Subscribe(_) | Aborted(_))
+    fn requested_location(&self) -> Option<Location> {
+        match self {
+            NetMessageV1::Connect(op) => op.requested_location(),
+            NetMessageV1::Put(op) => op.requested_location(),
+            NetMessageV1::Get(op) => op.requested_location(),
+            NetMessageV1::Subscribe(op) => op.requested_location(),
+            NetMessageV1::Update(op) => op.requested_location(),
+            NetMessageV1::Aborted(_) => None,
+            NetMessageV1::Unsubscribed { .. } => None,
+        }
     }
 }
 
 impl Display for NetMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use NetMessage::*;
+        use NetMessageV1::*;
         write!(f, "Message {{")?;
         match self {
-            Connect(msg) => msg.fmt(f)?,
-            Put(msg) => msg.fmt(f)?,
-            Get(msg) => msg.fmt(f)?,
-            Subscribe(msg) => msg.fmt(f)?,
-            Update(msg) => msg.fmt(f)?,
-            Aborted(msg) => msg.fmt(f)?,
+            NetMessage::V1(msg) => match msg {
+                Connect(msg) => msg.fmt(f)?,
+                Put(msg) => msg.fmt(f)?,
+                Get(msg) => msg.fmt(f)?,
+                Subscribe(msg) => msg.fmt(f)?,
+                Update(msg) => msg.fmt(f)?,
+                Aborted(msg) => msg.fmt(f)?,
+                Unsubscribed { key, from, .. } => {
+                    write!(f, "Unsubscribed {{  key: {}, from: {} }}", key, from)?;
+                }
+            },
         };
         write!(f, "}}")
     }
+}
+
+/// The result of a connection attempt.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) enum ConnectionResult {
+    /// The target node for connection is valid
+    Accepted,
+    /// The target node for connection is not valid
+    Connection,
 }
 
 #[cfg(test)]

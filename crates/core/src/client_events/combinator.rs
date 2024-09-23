@@ -60,10 +60,6 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
         Box::pin(async {
             let mut futs_opt = [(); N].map(|_| None);
             let pend_futs = &mut self.pend_futs;
-            eprintln!(
-                "pending futs: {}",
-                pend_futs.iter().filter(|a| a.is_some()).count()
-            );
             for (i, pend) in pend_futs.iter_mut().enumerate() {
                 let fut = &mut futs_opt[i];
                 if let Some(pend_fut) = pend.take() {
@@ -72,9 +68,12 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
                     // this receiver ain't awaiting, queue a new one
                     // SAFETY: is safe here to extend the lifetime since clients are required to be 'static
                     //         and we take ownership, so they will be alive for the duration of the program
+                    let f = Box::pin(self.hosts_rx[i].recv())
+                        as Pin<Box<dyn Future<Output = _> + Send + Sync + '_>>;
                     let new_pend = unsafe {
-                        std::mem::transmute(Box::pin(self.hosts_rx[i].recv())
-                            as Pin<Box<dyn Future<Output = _> + Send + Sync + '_>>)
+                        std::mem::transmute::<_, Pin<Box<dyn Future<Output = _> + Send + Sync + '_>>>(
+                            f,
+                        )
                     };
                     *fut = Some(new_pend);
                 }
@@ -211,14 +210,11 @@ impl<Fut: Future + Unpin, const N: usize> Future for SelectAll<Fut, N> {
                     .flatten();
                 match item {
                     Some((idx, res)) => {
-                        eprintln!("polled {idx}");
                         self.inner[idx] = None;
                         let rest = std::mem::replace(&mut self.inner, [(); N].map(|_| None));
                         return Poll::Ready((res, idx, rest));
                     }
-                    None => {
-                        eprintln!("not found");
-                    }
+                    None => {}
                 }
             };
         }

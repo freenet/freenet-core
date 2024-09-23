@@ -330,22 +330,21 @@ impl DelegateRuntimeInterface for Runtime {
                 InboundDelegateMsg::GetSecretRequest(GetSecretRequest {
                     key: secret_key, ..
                 }) => {
-                    // FIXME: here only allow this if the application is trusted
-                    // if attested.is_some() {
-                    let secret = self.secret_store.get_secret(delegate_key, &secret_key)?;
-                    let msg = OutboundDelegateMsg::GetSecretResponse(GetSecretResponse {
-                        key: secret_key,
-                        value: Some(secret),
-                        context: Default::default(),
-                    });
-                    results.push(msg);
-                    // } else {
-                    //     return Err(DelegateExecError::UnauthorizedSecretAccess {
-                    //         secret: secret_key.clone(),
-                    //         delegate: delegate_key.clone(),
-                    //     }
-                    //     .into());
-                    // }
+                    if attested.is_some() {
+                        let secret = self.secret_store.get_secret(delegate_key, &secret_key)?;
+                        let msg = OutboundDelegateMsg::GetSecretResponse(GetSecretResponse {
+                            key: secret_key,
+                            value: Some(secret),
+                            context: Default::default(),
+                        });
+                        results.push(msg);
+                    } else {
+                        return Err(DelegateExecError::UnauthorizedSecretAccess {
+                            secret: secret_key.clone(),
+                            delegate: delegate_key.clone(),
+                        }
+                        .into());
+                    }
                 }
                 _ => {}
             }
@@ -426,7 +425,7 @@ mod test {
 
         let contract_store = ContractStore::new(contracts_dir, 10_000)?;
         let delegate_store = DelegateStore::new(delegates_dir, 10_000)?;
-        let secret_store = SecretsStore::new(secrets_dir)?;
+        let secret_store = SecretsStore::new(secrets_dir, Default::default())?;
 
         let mut runtime =
             Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
@@ -471,7 +470,7 @@ mod test {
 
         assert_eq!(outbound.len(), 1);
         assert!(matches!(
-            outbound.get(0),
+            outbound.first(),
             Some(OutboundDelegateMsg::ApplicationMessage(msg)) if *msg.payload == expected_payload
         ));
 
@@ -487,7 +486,7 @@ mod test {
             bincode::serialize(&OutboundAppMessage::MessageSigned(vec![4, 5, 2])).unwrap();
         assert_eq!(outbound.len(), 1);
         assert!(matches!(
-            outbound.get(0),
+            outbound.first(),
             Some(OutboundDelegateMsg::ApplicationMessage(msg)) if *msg.payload == expected_payload
         ));
         std::mem::drop(temp_dir);

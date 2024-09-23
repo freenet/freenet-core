@@ -1,6 +1,5 @@
 use super::*;
 
-#[async_trait::async_trait]
 impl ContractExecutor for Executor<Runtime> {
     async fn fetch_contract(
         &mut self,
@@ -17,17 +16,9 @@ impl ContractExecutor for Executor<Runtime> {
             })) => Ok((state, contract)),
             Err(err) => Err(err),
             Ok(_) => {
-                // Safety: check `perform_contract_get` to indeed check this should never happen
-                unsafe { std::hint::unreachable_unchecked() }
+                unreachable!()
             }
         }
-    }
-
-    async fn store_contract(&mut self, contract: ContractContainer) -> Result<(), ExecutorError> {
-        self.runtime
-            .contract_store
-            .store_contract(contract)
-            .map_err(ExecutorError::other)
     }
 
     async fn upsert_contract_state(
@@ -46,7 +37,7 @@ impl ContractExecutor for Executor<Runtime> {
                 .map_err(ExecutorError::other)?
                 .ok_or_else(|| {
                     ExecutorError::request(StdContractError::Put {
-                        key: key.clone(),
+                        key,
                         cause: "missing contract parameters".into(),
                     })
                 })?
@@ -59,9 +50,7 @@ impl ContractExecutor for Executor<Runtime> {
             .is_none()
         {
             let code = code.ok_or_else(|| {
-                ExecutorError::request(StdContractError::MissingContract {
-                    key: key.clone().into(),
-                })
+                ExecutorError::request(StdContractError::MissingContract { key: key.into() })
             })?;
             self.runtime
                 .contract_store
@@ -162,16 +151,16 @@ impl ContractExecutor for Executor<Runtime> {
 
 impl Executor<Runtime> {
     pub async fn from_config(
-        config: PeerCliConfig,
+        config: Arc<Config>,
         event_loop_channel: Option<ExecutorToEventLoopChannel<ExecutorHalve>>,
-    ) -> Result<Self, DynError> {
+    ) -> anyhow::Result<Self> {
         let (contract_store, delegate_store, secret_store, state_store) =
             Self::get_stores(&config).await?;
         let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
         Executor::new(
             state_store,
-            || {
-                crate::util::set_cleanup_on_exit()?;
+            move || {
+                crate::util::set_cleanup_on_exit(config.paths().clone())?;
                 Ok(())
             },
             OperationMode::Local,
@@ -188,7 +177,7 @@ impl Executor<Runtime> {
         notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
         summary: Option<StateSummary<'_>>,
     ) -> Result<(), Box<RequestError>> {
-        let channels = self.update_notifications.entry(key.clone()).or_default();
+        let channels = self.update_notifications.entry(key).or_default();
         if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
             let (_, existing_ch) = &channels[i];
             if !existing_ch.same_channel(&notification_ch) {
@@ -204,7 +193,7 @@ impl Executor<Runtime> {
 
         if self
             .subscriber_summaries
-            .entry(key.clone())
+            .entry(key)
             .or_default()
             .insert(cli_id, summary.map(StateSummary::into_owned))
             .is_some()
@@ -257,7 +246,7 @@ impl Executor<Runtime> {
                 }
                 Err(RequestError::Disconnect.into())
             }
-            _ => Err(ExecutorError::other("not supported")),
+            _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
         }
     }
 
@@ -283,11 +272,12 @@ impl Executor<Runtime> {
                 fetch_contract: contract,
             } => self.perform_contract_get(contract, key).await,
             ContractRequest::Subscribe { key, summary } => {
-                let updates =
-                    updates.ok_or_else(|| ExecutorError::other("missing update channel"))?;
-                self.register_contract_notifier(key.clone(), cli_id, updates, summary)?;
+                let updates = updates.ok_or_else(|| {
+                    ExecutorError::other(anyhow::anyhow!("missing update channel"))
+                })?;
+                self.register_contract_notifier(key, cli_id, updates, summary)?;
                 // by default a subscribe op has an implicit get
-                let res = self.perform_contract_get(false, key.clone()).await?;
+                let res = self.perform_contract_get(false, key).await?;
                 #[cfg(any(
                     all(not(feature = "local-mode"), not(feature = "network-mode")),
                     all(feature = "local-mode", feature = "network-mode"),
@@ -298,7 +288,7 @@ impl Executor<Runtime> {
                 }
                 Ok(res)
             }
-            _ => Err(ExecutorError::other("not supported")),
+            _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
         }
     }
 
@@ -392,13 +382,13 @@ impl Executor<Runtime> {
 
                     Err(err) => {
                         tracing::error!("failed executing delegate `{key}`: {err}");
-                        Err(ExecutorError::other(format!(
+                        Err(ExecutorError::other(anyhow::anyhow!(
                             "uncontrolled error while executing `{key}`"
                         )))
                     }
                 }
             }
-            _ => Err(ExecutorError::other("not supported")),
+            _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
         }
     }
 
@@ -409,9 +399,6 @@ impl Executor<Runtime> {
         related_contracts: RelatedContracts<'_>,
     ) -> Response {
         let key = contract.key();
-        if self.update_notifications.get(&key).is_none() {
-            return Ok(ContractResponse::PutResponse { key }.into());
-        }
         let params = contract.params();
 
         if self.get_local_contract(key.id()).await.is_ok() {
@@ -428,7 +415,7 @@ impl Executor<Runtime> {
             .await
             .map_err(|_| {
                 ExecutorError::request(StdContractError::Put {
-                    key: key.clone(),
+                    key,
                     cause: "failed while sending notifications".into(),
                 })
             })?;
@@ -448,7 +435,7 @@ impl Executor<Runtime> {
                 .ok_or_else(|| {
                     RequestError::ContractError(StdContractError::Update {
                         cause: "missing contract parameters".into(),
-                        key: key.clone(),
+                        key,
                     })
                 })?
         };
@@ -462,7 +449,7 @@ impl Executor<Runtime> {
 
         let updates = vec![update];
         let new_state = self
-            .get_updated_state(&parameters, current_state, key.clone(), updates)
+            .get_updated_state(&parameters, current_state, key, updates)
             .await?;
 
         // in the network impl this would be sent over the network
@@ -489,10 +476,7 @@ impl Executor<Runtime> {
                 }
             }
             // notify peers with deltas from summary in network
-            let request = UpdateContract {
-                key: key.clone(),
-                new_state,
-            };
+            let request = UpdateContract { key, new_state };
             let _op: operations::update::UpdateResult = self.op_request(request).await?;
         }
 
@@ -517,7 +501,7 @@ impl Executor<Runtime> {
                 Err(err) => {
                     return Err(ExecutorError::execution(
                         err,
-                        Some(InnerOpError::Upsert(key.clone())),
+                        Some(InnerOpError::Upsert(*key)),
                     ))
                 }
             };
@@ -674,14 +658,14 @@ impl Executor<Runtime> {
                 let Some(contract) = self.get_contract_locally(&key).await? else {
                     return Err(ExecutorError::request(RequestError::from(
                         StdContractError::Get {
-                            key: key.clone(),
+                            key,
                             cause: "Missing contract and/or parameters".into(),
                         },
                     )));
                 };
                 got_contract = Some(contract);
             } else if fetch_contract {
-                got_contract = self.get_contract_from_network(key.clone()).await?;
+                got_contract = self.get_contract_from_network(key).await?;
             }
         }
 
@@ -694,7 +678,7 @@ impl Executor<Runtime> {
             else {
                 return Err(ExecutorError::request(RequestError::from(
                     StdContractError::Get {
-                        key: key.clone(),
+                        key,
                         cause: "Missing contract or parameters".into(),
                     },
                 )));
@@ -707,7 +691,7 @@ impl Executor<Runtime> {
             if let Ok(Some(contract)) = self.get_contract_locally(&key).await {
                 got_contract = Some(fetch_contract);
             } else {
-                got_contract = self.get_contract_from_network(key.clone()).await?;
+                got_contract = self.get_contract_from_network(key).await?;
             }
         }
 
@@ -736,7 +720,7 @@ impl Executor<Runtime> {
     async fn get_local_contract(
         &self,
         id: &ContractInstanceId,
-    ) -> Result<State<'static>, Either<Box<RequestError>, DynError>> {
+    ) -> Result<State<'static>, Either<Box<RequestError>, anyhow::Error>> {
         let Ok(contract) = self.state_store.get(&(*id).into()).await else {
             return Err(Either::Right(
                 StdContractError::MissingRelated { key: *id }.into(),
@@ -761,7 +745,7 @@ impl Executor<Runtime> {
         const DEPENDENCY_CYCLE_LIMIT_GUARD: usize = 100;
         let mut iterations = 0;
 
-        let original_key = key.clone();
+        let original_key = key;
         let original_state = state.clone();
         let original_params = params.clone();
         let mut trying_key = key;
@@ -841,21 +825,17 @@ impl Executor<Runtime> {
 
             if !is_valid {
                 return Err(ExecutorError::request(StdContractError::Put {
-                    key: trying_key.clone(),
+                    key: trying_key,
                     cause: "not valid".into(),
                 }));
             }
 
             self.state_store
-                .store(
-                    trying_key.clone(),
-                    trying_state.clone(),
-                    trying_params.clone(),
-                )
+                .store(trying_key, trying_state.clone(), trying_params.clone())
                 .await
                 .map_err(ExecutorError::other)?;
             if trying_key != original_key {
-                trying_key = original_key.clone();
+                trying_key = original_key;
                 trying_params = original_params.clone();
                 trying_state = original_state.clone();
                 continue;
@@ -877,8 +857,9 @@ impl Executor<Runtime> {
         new_state: &WrappedState,
     ) -> Result<(), ExecutorError> {
         tracing::debug!(contract = %key, "notify of contract update");
-        if let Some(notifiers) = self.update_notifications.get_mut(key) {
-            let summaries = self.subscriber_summaries.get_mut(key).unwrap();
+        let key = *key;
+        if let Some(notifiers) = self.update_notifications.get_mut(&key) {
+            let summaries = self.subscriber_summaries.get_mut(&key).unwrap();
             // in general there should be less than 32 failures
             let mut failures = Vec::with_capacity(32);
             for (peer_key, notifier) in notifiers.iter() {
@@ -886,20 +867,19 @@ impl Executor<Runtime> {
                 let update = match peer_summary {
                     Some(summary) => self
                         .runtime
-                        .get_state_delta(key, params, new_state, &*summary)
+                        .get_state_delta(&key, params, new_state, &*summary)
                         .map_err(|err| {
                             tracing::error!("{err}");
-                            ExecutorError::execution(err, Some(InnerOpError::Upsert(key.clone())))
+                            ExecutorError::execution(err, Some(InnerOpError::Upsert(key)))
                         })?
                         .to_owned()
                         .into(),
                     None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
                 };
-                if let Err(err) = notifier.send(Ok(ContractResponse::UpdateNotification {
-                    key: key.clone(),
-                    update,
-                }
-                .into()))
+                if let Err(err) =
+                    notifier.send(Ok(
+                        ContractResponse::UpdateNotification { key, update }.into()
+                    ))
                 {
                     failures.push(*peer_key);
                     tracing::error!(cli_id = %peer_key, "{err}");
@@ -989,10 +969,7 @@ impl Executor<Runtime> {
                         )));
                     }
                 }
-                match self
-                    .local_state_or_from_network(&key.clone().into())
-                    .await?
-                {
+                match self.local_state_or_from_network(&key.into()).await? {
                     Either::Right(GetResult {
                         state, contract, ..
                     }) => {

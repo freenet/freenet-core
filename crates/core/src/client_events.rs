@@ -51,7 +51,7 @@ impl Display for ClientId {
 
 type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AuthToken(#[serde(deserialize_with = "AuthToken::deser_auth_token")] Arc<str>);
 
 impl AuthToken {
@@ -162,17 +162,21 @@ pub(crate) mod test {
         client_api::{ContractRequest, ErrorKind},
         prelude::*,
     };
-    use futures::FutureExt;
+    use futures::{FutureExt, StreamExt};
     use rand::{seq::SliceRandom, SeedableRng};
+    use tokio::net::TcpStream;
     use tokio::sync::watch::Receiver;
+    use tokio::sync::Mutex;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-    use crate::node::{testing_impl::EventId, PeerId};
+    use crate::{node::testing_impl::EventId, transport::TransportPublicKey};
 
     use super::*;
 
     pub struct MemoryEventsGen<R = rand::rngs::SmallRng> {
-        id: PeerId,
-        signal: Receiver<(EventId, PeerId)>,
+        key: TransportPublicKey,
+        signal: Receiver<(EventId, TransportPublicKey)>,
         events_to_gen: HashMap<EventId, ClientRequest<'static>>,
         rng: Option<R>,
         internal_state: Option<InternalGeneratorState>,
@@ -182,10 +186,14 @@ pub(crate) mod test {
     where
         R: RandomEventGenerator,
     {
-        pub fn new_with_seed(signal: Receiver<(EventId, PeerId)>, id: PeerId, seed: u64) -> Self {
+        pub fn new_with_seed(
+            signal: Receiver<(EventId, TransportPublicKey)>,
+            key: TransportPublicKey,
+            seed: u64,
+        ) -> Self {
             Self {
                 signal,
-                id,
+                key,
                 events_to_gen: HashMap::new(),
                 rng: Some(R::seed_from_u64(seed)),
                 internal_state: None,
@@ -229,10 +237,13 @@ pub(crate) mod test {
 
     impl MemoryEventsGen {
         #[cfg(test)]
-        pub fn new(signal: Receiver<(EventId, PeerId)>, id: PeerId) -> Self {
+        pub fn new(
+            signal: Receiver<(EventId, TransportPublicKey)>,
+            key: TransportPublicKey,
+        ) -> Self {
             Self {
                 signal,
-                id,
+                key,
                 events_to_gen: HashMap::new(),
                 rng: None,
                 internal_state: None,
@@ -262,8 +273,8 @@ pub(crate) mod test {
             async {
                 loop {
                     if self.signal.changed().await.is_ok() {
-                        let (ev_id, pk) = *self.signal.borrow();
-                        if self.rng.is_some() && pk == self.id {
+                        let (ev_id, pk) = self.signal.borrow().clone();
+                        if self.rng.is_some() && pk == self.key {
                             let res = OpenRequest {
                                 client_id: ClientId::FIRST,
                                 request: self
@@ -275,7 +286,7 @@ pub(crate) mod test {
                                 token: None,
                             };
                             return Ok(res.into_owned());
-                        } else if pk == self.id {
+                        } else if pk == self.key {
                             let res = OpenRequest {
                                 client_id: ClientId::FIRST,
                                 request: self
@@ -307,6 +318,99 @@ pub(crate) mod test {
             })) = response
             {
                 self.internal_state
+                    .as_mut()
+                    .expect("state should be set")
+                    .owns_contracts
+                    .insert(key);
+            }
+            async { Ok(()) }.boxed()
+        }
+    }
+
+    pub struct NetworkEventGenerator<R = rand::rngs::SmallRng> {
+        id: TransportPublicKey,
+        memory_event_generator: MemoryEventsGen<R>,
+        ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+    }
+
+    impl<R> NetworkEventGenerator<R>
+    where
+        R: RandomEventGenerator,
+    {
+        pub fn new(
+            id: TransportPublicKey,
+            memory_event_generator: MemoryEventsGen<R>,
+            ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+        ) -> Self {
+            Self {
+                id,
+                memory_event_generator,
+                ws_client,
+            }
+        }
+    }
+
+    impl<R> ClientEventsProxy for NetworkEventGenerator<R>
+    where
+        R: RandomEventGenerator + Send + Clone,
+    {
+        fn recv(&mut self) -> BoxFuture<'_, HostIncomingMsg> {
+            let ws_client_clone = self.ws_client.clone();
+
+            async move {
+                loop {
+                    let message = {
+                        let mut lock = ws_client_clone.lock().await;
+                        lock.next().await
+                    };
+
+                    match message {
+                        Some(Ok(Message::Binary(data))) => {
+                            if let Ok((id, pub_key)) =
+                            bincode::deserialize::<(EventId, TransportPublicKey)>(&data)
+                            {
+                                tracing::debug!(peer = %self.id, %id, "Received event from the supervisor");
+                                if &pub_key == &self.id {
+                                    let res = OpenRequest {
+                                        client_id: ClientId::FIRST,
+                                        request: self
+                                            .memory_event_generator
+                                            .generate_rand_event()
+                                            .await
+                                            .ok_or_else(|| {
+                                                ClientError::from(ErrorKind::Disconnect)
+                                            })?
+                                            .into(),
+                                        notification_channel: None,
+                                        token: None,
+                                    };
+                                    return Ok(res.into_owned());
+                                }
+                            } else {
+                                continue;
+                            }
+                        }
+                        None => {
+                            return Err(ClientError::from(ErrorKind::Disconnect));
+                        }
+                        _ => continue,
+                    }
+                }
+            }
+            .boxed()
+        }
+
+        fn send(
+            &mut self,
+            _id: ClientId,
+            response: Result<HostResponse, ClientError>,
+        ) -> BoxFuture<'_, Result<(), ClientError>> {
+            if let Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key, ..
+            })) = response
+            {
+                self.memory_event_generator
+                    .internal_state
                     .as_mut()
                     .expect("state should be set")
                     .owns_contracts
@@ -409,14 +513,16 @@ pub(crate) mod test {
                         }
                     }
                     val if (35..80).contains(&val) => {
+                        let new_state = UpdateData::State(State::from(self.random_byte_vec()));
                         if let Some(contract) = self.choose(&state.existing_contracts) {
-                            let delta = UpdateData::Delta(StateDelta::from(self.random_byte_vec()));
+                            // TODO: It will be used when the delta updates are available
+                            // let delta = UpdateData::Delta(StateDelta::from(self.random_byte_vec()));
                             if !for_this_peer {
                                 continue;
                             }
                             let request = ContractRequest::Update {
-                                key: contract.key().clone(),
-                                data: delta,
+                                key: contract.key(),
+                                data: new_state,
                             };
                             if state.owns_contracts.contains(&contract.key()) {
                                 return Some(request.into());
@@ -475,24 +581,6 @@ pub(crate) mod test {
 
         fn seed_from_u64(seed: u64) -> Self {
             <Self as SeedableRng>::seed_from_u64(seed)
-        }
-    }
-
-    impl RandomEventGenerator for fastrand::Rng {
-        fn gen_u8(&mut self) -> u8 {
-            self.u8(..u8::MAX)
-        }
-
-        fn gen_range(&mut self, range: std::ops::Range<usize>) -> usize {
-            self.choice(range).expect("non empty")
-        }
-
-        fn choose<'a, T>(&mut self, vec: &'a [T]) -> Option<&'a T> {
-            self.choice(0..vec.len()).and_then(|choice| vec.get(choice))
-        }
-
-        fn seed_from_u64(seed: u64) -> Self {
-            Self::with_seed(seed)
         }
     }
 

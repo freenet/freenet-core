@@ -1,23 +1,19 @@
-use std::{fs::File, io::Read, path::PathBuf};
-
-use freenet::dev_tool::{
-    ClientId, Config, ContractStore, DelegateStore, Executor, OperationMode, SecretsStore,
-    StateStore, Storage,
+use std::{
+    fs::File,
+    io::Read,
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
 };
+
+use freenet::dev_tool::OperationMode;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, DelegateRequest},
+    client_api::{ClientRequest, ContractRequest, DelegateRequest, WebApi},
     prelude::*,
 };
-// use freenet_runtime::{
-//     ContractContainer, ContractInstanceId, ContractStore, DelegateContainer, DelegateStore,
-//     Parameters, SecretsStore, StateStore,
-// };
 
 use crate::config::{BaseConfig, PutConfig, UpdateConfig};
 
-const MAX_MEM_CACHE: u32 = 10_000_000;
-const DEFAULT_MAX_CONTRACT_SIZE: i64 = 50 * 1024 * 1024;
-const DEFAULT_MAX_DELEGATE_SIZE: i64 = 50 * 1024 * 1024;
+mod v1;
 
 #[derive(Debug, Clone, clap::Subcommand)]
 pub(crate) enum PutType {
@@ -34,7 +30,7 @@ pub(crate) struct PutContract {
     pub(crate) related_contracts: Option<PathBuf>,
     /// A path to the initial state for the contract being published.
     #[arg(long)]
-    pub(crate) state: PathBuf,
+    pub(crate) state: Option<PathBuf>,
 }
 
 #[derive(clap::Parser, Clone, Debug)]
@@ -47,7 +43,7 @@ pub(crate) struct PutDelegate {
     pub(crate) cipher: String,
 }
 
-pub async fn put(config: PutConfig, other: BaseConfig) -> Result<(), anyhow::Error> {
+pub async fn put(config: PutConfig, other: BaseConfig) -> anyhow::Result<()> {
     if config.release {
         anyhow::bail!("Cannot publish contracts in the network yet");
     }
@@ -69,12 +65,15 @@ async fn put_contract(
     contract_config: &PutContract,
     other: BaseConfig,
     params: Parameters<'static>,
-) -> Result<(), anyhow::Error> {
+) -> anyhow::Result<()> {
     let contract = ContractContainer::try_from((config.code.as_path(), params))?;
-    let state = {
+    let state = if let Some(ref state_path) = contract_config.state {
         let mut buf = vec![];
-        File::open(&contract_config.state)?.read_to_end(&mut buf)?;
+        File::open(state_path)?.read_to_end(&mut buf)?;
         buf.into()
+    } else {
+        tracing::warn!("no state provided for contract, if your contract cannot handle empty state correctly, this will always cause an error.");
+        vec![].into()
     };
     let related_contracts = if let Some(_related) = &contract_config.related_contracts {
         todo!("use `related` contracts")
@@ -89,7 +88,7 @@ async fn put_contract(
         related_contracts,
     }
     .into();
-    execute_command(request, other).await
+    execute_command(request, other, config.address, config.port).await
 }
 
 async fn put_delegate(
@@ -97,7 +96,7 @@ async fn put_delegate(
     delegate_config: &PutDelegate,
     other: BaseConfig,
     params: Parameters<'static>,
-) -> Result<(), anyhow::Error> {
+) -> anyhow::Result<()> {
     let delegate = DelegateContainer::try_from((config.code.as_path(), params))?;
 
     let (cipher, nonce) = if delegate_config.cipher.is_empty() && delegate_config.nonce.is_empty() {
@@ -128,10 +127,10 @@ For additional hardening is recommended to use a different cipher and nonce to e
         nonce,
     }
     .into();
-    execute_command(request, other).await
+    execute_command(request, other, config.address, config.port).await
 }
 
-pub async fn update(config: UpdateConfig, other: BaseConfig) -> Result<(), anyhow::Error> {
+pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<()> {
     if config.release {
         anyhow::bail!("Cannot publish contracts in the network yet");
     }
@@ -143,42 +142,14 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> Result<(), anyho
         StateDelta::from(buf).into()
     };
     let request = ContractRequest::Update { key, data }.into();
-    execute_command(request, other).await
+    execute_command(request, other, config.address, config.port).await
 }
 
 async fn execute_command(
     request: ClientRequest<'static>,
     other: BaseConfig,
-) -> Result<(), anyhow::Error> {
-    let contracts_data_path = other
-        .contract_data_dir
-        .unwrap_or_else(|| Config::conf().contracts_dir());
-    let delegates_data_path = other
-        .delegate_data_dir
-        .unwrap_or_else(|| Config::conf().delegates_dir());
-    let secrets_data_path = other
-        .secret_data_dir
-        .unwrap_or_else(|| Config::conf().secrets_dir());
-    let database_path = other
-        .database_dir
-        .unwrap_or_else(|| Config::conf().db_dir());
-    let contract_store = ContractStore::new(contracts_data_path, DEFAULT_MAX_CONTRACT_SIZE)?;
-    let delegate_store = DelegateStore::new(delegates_data_path, DEFAULT_MAX_DELEGATE_SIZE)?;
-    let secret_store = SecretsStore::new(secrets_data_path)?;
-    let state_store = StateStore::new(Storage::new(Some(&database_path)).await?, MAX_MEM_CACHE)?;
-    let rt =
-        freenet::dev_tool::Runtime::build(contract_store, delegate_store, secret_store, false)?;
-    let mut executor = Executor::new(state_store, || Ok(()), OperationMode::Local, rt, None)
-        .await
-        .map_err(|err| anyhow::anyhow!(err))?;
-
-    executor
-        .handle_request(ClientId::FIRST, request, None)
-        .await
-        .map_err(|err| {
-            tracing::error!("{err}");
-            err
-        })?;
-
-    Ok(())
+    address: IpAddr,
+    port: u16,
+) -> anyhow::Result<()> {
+    v1::execute_command(request, other, address, port).await
 }

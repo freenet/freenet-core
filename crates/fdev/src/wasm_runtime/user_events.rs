@@ -9,7 +9,9 @@ use std::{
 use either::Either;
 use freenet::dev_tool::{ClientEventsProxy, ClientId, OpenRequest};
 use freenet_stdlib::{
-    client_api::{ClientError, ClientRequest, ContractRequest, ErrorKind, HostResponse},
+    client_api::{
+        ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse,
+    },
     prelude::*,
 };
 use futures::future::BoxFuture;
@@ -34,7 +36,7 @@ pub(super) async fn user_fn_handler(
     config: ExecutorConfig,
     command_sender: CommandSender,
     app_state: AppState,
-) -> Result<(), anyhow::Error> {
+) -> anyhow::Result<()> {
     let mut input = StdInput::new(config, app_state)?;
     tracing::debug!("running... send a command or write \"help\" for help");
     loop {
@@ -61,7 +63,8 @@ struct StdInput {
 }
 
 impl StdInput {
-    fn new(config: ExecutorConfig, app_state: AppState) -> Result<Self, anyhow::Error> {
+    fn new(config: ExecutorConfig, app_state: AppState) -> anyhow::Result<Self> {
+        let paths = config.paths.clone().build(None)?;
         let params = config
             .params
             .as_ref()
@@ -73,7 +76,8 @@ impl StdInput {
             })
             .transpose()?
             .unwrap_or_default();
-        let (contract_code, _ver) = ContractCode::load_versioned_from_path(&config.contract)?;
+        let (contract_code, _ver) =
+            ContractCode::load_versioned_from_path(&paths.contracts_dir(config.mode))?;
         let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
             Arc::new(contract_code),
             params.into(),
@@ -87,7 +91,7 @@ impl StdInput {
         })
     }
 
-    fn read_input<T>(&mut self) -> Result<T, anyhow::Error>
+    fn read_input<T>(&mut self) -> anyhow::Result<T>
     where
         T: DeserializeOwned,
     {
@@ -119,18 +123,6 @@ impl StdInput {
                 })?;
                 tracing::debug!("{cmd:?} value:\n{json_str}");
                 Ok(json_str.into_bytes().into())
-            }
-            #[cfg(feature = "messagepack")]
-            Some(DeserializationFmt::MessagePack) => {
-                let mut buf = vec![];
-                self.input.read_to_end(&mut buf).unwrap();
-                let state = rmpv::decode::read_value_ref(&mut buf.as_ref()).map_err(|e| {
-                    Box::new(ClientError::from(ErrorKind::Unhandled {
-                        cause: format!("deserialization error: {e}"),
-                    }))
-                })?;
-                tracing::debug!("{cmd:?} value:\n{state}");
-                Ok(buf.into())
             }
             _ => {
                 let state: Vec<u8> = self.read_input().map_err(|e| {
@@ -309,25 +301,40 @@ impl ClientEventsProxy for StdInput {
                             ));
                         }
                         Ok(Command::GetParams) => {
-                            let node = &*self.app_state.local_node.read().await;
+                            let node = &mut *self.app_state.local_node.write().await;
                             let key = self.contract.key();
-                            let p = node
-                                .state_store
-                                .get_params(&key)
-                                .await
-                                .map_err(|e| {
-                                    ClientError::from(ErrorKind::Unhandled {
-                                        cause: format!("{e}").into(),
-                                    })
-                                })?
-                                .ok_or_else(|| {
-                                    ClientError::from(ErrorKind::Unhandled {
-                                        cause: format!("missing contract parameters: {key}",)
-                                            .into(),
-                                    })
-                                })?;
-                            if let Err(e) = self.app_state.printout_deser(&p) {
-                                tracing::error!("error printing params: {e}");
+                            node.send(ClientRequest::ContractOp(ContractRequest::Get {
+                                key,
+                                fetch_contract: true,
+                            }))
+                            .await
+                            .map_err(|e| {
+                                ClientError::from(ErrorKind::Unhandled {
+                                    cause: format!("{e}").into(),
+                                })
+                            })?;
+                            let resp = node.recv().await.map_err(|e| {
+                                ClientError::from(ErrorKind::Unhandled {
+                                    cause: format!("{e}").into(),
+                                })
+                            })?;
+
+                            if let HostResponse::ContractResponse(ContractResponse::GetResponse {
+                                contract,
+                                ..
+                            }) = resp
+                            {
+                                if let Some(contract) = contract {
+                                    if let Err(e) =
+                                        self.app_state.printout_deser(&contract.params())
+                                    {
+                                        tracing::error!("error printing params: {e}");
+                                    }
+                                } else {
+                                    return Err(ClientError::from(ErrorKind::Unhandled {
+                                        cause: "missing contract container".into(),
+                                    }));
+                                }
                             }
                         }
                         Ok(cmd) => {

@@ -3,8 +3,6 @@ use std::{future::Future, time::Instant};
 
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
-use futures::future::BoxFuture;
-use futures::FutureExt;
 
 use crate::client_events::HostResult;
 use crate::{
@@ -35,13 +33,12 @@ pub(crate) fn start_op(key: ContractKey, fetch_contract: bool) -> GetOp {
         id,
         state,
         result: None,
-        stats: Some(GetStats {
+        stats: Some(Box::new(GetStats {
             contract_location,
             next_peer: None,
             transfer_time: None,
             first_response_time: None,
-            step: Default::default(),
-        }),
+        })),
     }
 }
 
@@ -87,7 +84,7 @@ pub(crate) async fn request_get(op_manager: &OpManager, get_op: GetOp) -> Result
             let msg = GetMsg::RequestGet {
                 id,
                 key,
-                target,
+                target: target.clone(),
                 fetch_contract,
             };
 
@@ -138,20 +135,9 @@ struct GetStats {
     first_response_time: Option<(Instant, Option<Instant>)>,
     /// (start, end)
     transfer_time: Option<(Instant, Option<Instant>)>,
-    step: RecordingStats,
 }
 
-/// While timing, at what particular step we are now.
-#[derive(Clone, Copy, Default)]
-enum RecordingStats {
-    #[default]
-    Uninitialized,
-    InitGet,
-    TransferNotStarted,
-    TransferStarted,
-    Completed,
-}
-
+#[derive(Clone)]
 pub(crate) struct GetResult {
     key: ContractKey,
     pub state: WrappedState,
@@ -173,7 +159,7 @@ pub(crate) struct GetOp {
     pub id: Transaction,
     state: Option<GetState>,
     pub(super) result: Option<GetResult>,
-    stats: Option<GetStats>,
+    stats: Option<Box<GetStats>>,
 }
 
 impl GetOp {
@@ -189,7 +175,7 @@ impl GetOp {
                 transfer_time: Some((transfer_start, Some(transfer_end))),
                 ..
             },
-        )) = self.result.as_ref().zip(self.stats.as_ref())
+        )) = self.result.as_ref().zip(self.stats.as_deref())
         {
             let payload_size = state.size()
                 + contract
@@ -212,34 +198,6 @@ impl GetOp {
         self.result.is_some()
     }
 
-    pub(super) fn record_transfer(&mut self) {
-        if let Some(stats) = self.stats.as_mut() {
-            match stats.step {
-                RecordingStats::Uninitialized => {
-                    stats.first_response_time = Some((Instant::now(), None));
-                    stats.step = RecordingStats::InitGet;
-                }
-                RecordingStats::InitGet => {
-                    if let Some((_, e)) = stats.first_response_time.as_mut() {
-                        *e = Some(Instant::now());
-                    }
-                    stats.step = RecordingStats::TransferNotStarted;
-                }
-                RecordingStats::TransferNotStarted => {
-                    stats.transfer_time = Some((Instant::now(), None));
-                    stats.step = RecordingStats::TransferStarted;
-                }
-                RecordingStats::TransferStarted => {
-                    if let Some((_, e)) = stats.transfer_time.as_mut() {
-                        *e = Some(Instant::now());
-                    }
-                    stats.step = RecordingStats::Completed;
-                }
-                RecordingStats::Completed => {}
-            }
-        }
-    }
-
     pub(super) fn to_host_result(&self) -> HostResult {
         match &self.result {
             Some(GetResult {
@@ -248,7 +206,7 @@ impl GetOp {
                 contract,
             }) => Ok(HostResponse::ContractResponse(
                 freenet_stdlib::client_api::ContractResponse::GetResponse {
-                    key: key.clone(),
+                    key: *key,
                     contract: contract.clone(),
                     state: state.clone(),
                 },
@@ -265,41 +223,38 @@ impl Operation for GetOp {
     type Message = GetMsg;
     type Result = GetResult;
 
-    fn load_or_init<'a>(
+    async fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
-    ) -> BoxFuture<'a, Result<OpInitialization<Self>, OpError>> {
-        async move {
-            let mut sender: Option<PeerId> = None;
-            if let Some(peer_key_loc) = msg.sender().cloned() {
-                sender = Some(peer_key_loc.peer);
-            };
-            let tx = *msg.id();
-            match op_manager.pop(msg.id()) {
-                Ok(Some(OpEnum::Get(get_op))) => {
-                    Ok(OpInitialization { op: get_op, sender })
-                    // was an existing operation, other peer messaged back
-                }
-                Ok(Some(op)) => {
-                    let _ = op_manager.push(tx, op).await;
-                    Err(OpError::OpNotPresent(tx))
-                }
-                Ok(None) => {
-                    // new request to get a value for a contract, initialize the machine
-                    Ok(OpInitialization {
-                        op: Self {
-                            state: Some(GetState::ReceivedRequest),
-                            id: tx,
-                            result: None,
-                            stats: None, // don't care about stats in target peers
-                        },
-                        sender,
-                    })
-                }
-                Err(err) => Err(err.into()),
+    ) -> Result<OpInitialization<Self>, OpError> {
+        let mut sender: Option<PeerId> = None;
+        if let Some(peer_key_loc) = msg.sender().cloned() {
+            sender = Some(peer_key_loc.peer);
+        };
+        let tx = *msg.id();
+        match op_manager.pop(msg.id()) {
+            Ok(Some(OpEnum::Get(get_op))) => {
+                Ok(OpInitialization { op: get_op, sender })
+                // was an existing operation, other peer messaged back
             }
+            Ok(Some(op)) => {
+                let _ = op_manager.push(tx, op).await;
+                Err(OpError::OpNotPresent(tx))
+            }
+            Ok(None) => {
+                // new request to get a value for a contract, initialize the machine
+                Ok(OpInitialization {
+                    op: Self {
+                        state: Some(GetState::ReceivedRequest),
+                        id: tx,
+                        result: None,
+                        stats: None, // don't care about stats in target peers
+                    },
+                    sender,
+                })
+            }
+            Err(err) => Err(err.into()),
         }
-        .boxed()
     }
 
     fn id(&self) -> &Transaction {
@@ -332,19 +287,18 @@ impl Operation for GetOp {
                     ));
                     tracing::info!(tx = %id, %key, target = %target.peer, "Seek contract");
                     new_state = self.state;
-                    stats = Some(GetStats {
+                    stats = Some(Box::new(GetStats {
                         contract_location: Location::from(key),
                         next_peer: None,
                         transfer_time: None,
                         first_response_time: None,
-                        step: Default::default(),
-                    });
-                    let own_loc = op_manager.ring.own_location();
+                    }));
+                    let own_loc = op_manager.ring.connection_manager.own_location();
                     return_msg = Some(GetMsg::SeekNode {
-                        key: key.clone(),
+                        key: *key,
                         id: *id,
-                        target: *target,
-                        sender: own_loc,
+                        target: target.clone(),
+                        sender: own_loc.clone(),
                         fetch_contract: *fetch_contract,
                         htl: op_manager.ring.max_hops_to_live,
                         skip_list: vec![own_loc.peer],
@@ -361,17 +315,17 @@ impl Operation for GetOp {
                 } => {
                     let htl = *htl;
                     let id = *id;
-                    let key: ContractKey = key.clone();
+                    let key: ContractKey = *key;
                     let fetch_contract = *fetch_contract;
-                    let this_peer = *target;
+                    let this_peer = target.clone();
 
                     if let Some(s) = stats.as_mut() {
-                        s.next_peer = Some(this_peer);
+                        s.next_peer = Some(this_peer.clone());
                     }
 
                     let get_result = op_manager
                         .notify_contract_handler(ContractHandlerEvent::GetQuery {
-                            key: key.clone(),
+                            key,
                             fetch_contract,
                         })
                         .await;
@@ -390,7 +344,7 @@ impl Operation for GetOp {
                                 id,
                                 key,
                                 (htl, fetch_contract),
-                                (this_peer, *sender),
+                                (this_peer, sender.clone()),
                                 skip_list,
                                 op_manager,
                                 stats,
@@ -413,7 +367,7 @@ impl Operation for GetOp {
                                         state: Some(state),
                                         contract,
                                     },
-                                    sender: *target,
+                                    sender: target.clone(),
                                     target: requester,
                                     skip_list: skip_list.clone(),
                                 });
@@ -437,8 +391,8 @@ impl Operation for GetOp {
                                     state: Some(state),
                                     contract,
                                 },
-                                sender: *target,
-                                target: *sender,
+                                sender: target.clone(),
+                                target: sender.clone(),
                                 skip_list: skip_list.clone(),
                             });
                         }
@@ -474,7 +428,7 @@ impl Operation for GetOp {
                             if retries < MAX_RETRIES {
                                 // no response received from this peer, so skip it in the next iteration
                                 let mut new_skip_list = skip_list.clone();
-                                new_skip_list.push(target.peer);
+                                new_skip_list.push(target.peer.clone());
                                 if let Some(target) = op_manager
                                     .ring
                                     .closest_potentially_caching(key, new_skip_list.as_slice())
@@ -483,15 +437,15 @@ impl Operation for GetOp {
                                 {
                                     return_msg = Some(GetMsg::SeekNode {
                                         id: *id,
-                                        key: key.clone(),
+                                        key: *key,
                                         target,
-                                        sender: *this_peer,
+                                        sender: this_peer.clone(),
                                         fetch_contract,
                                         htl: current_hop,
                                         skip_list: new_skip_list.clone(),
                                     });
                                 } else {
-                                    return Err(RingError::NoCachingPeers(key.clone()).into());
+                                    return Err(RingError::NoCachingPeers(*key).into());
                                 }
                                 new_state = Some(GetState::AwaitingResponse {
                                     retries: retries + 1,
@@ -516,13 +470,13 @@ impl Operation for GetOp {
                             new_state = None;
                             return_msg = Some(GetMsg::ReturnGet {
                                 id: *id,
-                                key: key.clone(),
+                                key: *key,
                                 value: StoreResponse {
                                     state: None,
                                     contract: None,
                                 },
-                                sender: *sender,
-                                target: *target,
+                                sender: sender.clone(),
+                                target: target.clone(),
                                 skip_list: skip_list.clone(),
                             });
                         }
@@ -542,7 +496,7 @@ impl Operation for GetOp {
                     skip_list,
                 } => {
                     let id = *id;
-                    let key = key.clone();
+                    let key = *key;
                     let require_contract = matches!(
                         self.state,
                         Some(GetState::AwaitingResponse {
@@ -561,7 +515,7 @@ impl Operation for GetOp {
                         );
 
                         let mut new_skip_list = skip_list.clone();
-                        new_skip_list.push(sender.peer);
+                        new_skip_list.push(sender.peer.clone());
                         op_manager
                             .notify_op_change(
                                 NetMessage::from(GetMsg::ReturnGet {
@@ -571,8 +525,8 @@ impl Operation for GetOp {
                                         state: None,
                                         contract: None,
                                     },
-                                    sender: *sender,
-                                    target: *target,
+                                    sender: sender.clone(),
+                                    target: target.clone(),
                                     skip_list: new_skip_list,
                                 }),
                                 OpEnum::Get(GetOp {
@@ -593,15 +547,13 @@ impl Operation for GetOp {
                             ..
                         })
                     );
-                    let should_subscribe = op_manager
-                        .ring
-                        .within_subscribing_distance(&Location::from(&key));
+                    let should_subscribe = op_manager.ring.should_seed(&key);
                     let should_put = is_original_requester || should_subscribe;
 
                     if should_put {
                         let res = op_manager
                             .notify_contract_handler(ContractHandlerEvent::PutQuery {
-                                key: key.clone(),
+                                key,
                                 state: value.clone(),
                                 related_contracts: RelatedContracts::default(), // fixme: i think we need to get the related contracts so the final put is ok
                                 contract: contract.clone(),
@@ -610,15 +562,10 @@ impl Operation for GetOp {
                         match res {
                             ContractHandlerEvent::PutResponse { new_value: Ok(_) } => {
                                 let is_subscribed_contract =
-                                    op_manager.ring.is_subscribed_to_contract(&key);
+                                    op_manager.ring.is_seeding_contract(&key);
                                 if !is_subscribed_contract && should_subscribe {
-                                    tracing::debug!(tx = %id, %key, peer = %op_manager.ring.peer_key, "Contract not cached @ peer, caching");
-                                    super::start_subscription_request(
-                                        op_manager,
-                                        key.clone(),
-                                        false,
-                                    )
-                                    .await;
+                                    tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
+                                    super::start_subscription_request(op_manager, key, false).await;
                                 }
                             }
                             ContractHandlerEvent::PutResponse {
@@ -629,7 +576,7 @@ impl Operation for GetOp {
                                     return Err(OpError::ExecutorError(err));
                                 } else {
                                     let mut new_skip_list = skip_list.clone();
-                                    new_skip_list.push(sender.peer);
+                                    new_skip_list.push(sender.peer.clone());
 
                                     op_manager
                                         .notify_op_change(
@@ -640,8 +587,8 @@ impl Operation for GetOp {
                                                     state: None,
                                                     contract: None,
                                                 },
-                                                sender: *sender,
-                                                target: *target,
+                                                sender: sender.clone(),
+                                                target: target.clone(),
                                                 skip_list: new_skip_list,
                                             }),
                                             OpEnum::Get(GetOp {
@@ -667,7 +614,7 @@ impl Operation for GetOp {
                             new_state = None;
                             return_msg = None;
                             result = Some(GetResult {
-                                key: key.clone(),
+                                key,
                                 state: value.clone(),
                                 contract: contract.clone(),
                             });
@@ -680,17 +627,17 @@ impl Operation for GetOp {
                             new_state = None;
                             return_msg = Some(GetMsg::ReturnGet {
                                 id,
-                                key: key.clone(),
+                                key,
                                 value: StoreResponse {
                                     state: Some(value.clone()),
                                     contract: contract.clone(),
                                 },
-                                sender: *target,
+                                sender: target.clone(),
                                 target: requester,
                                 skip_list: skip_list.clone(),
                             });
                             result = Some(GetResult {
-                                key: key.clone(),
+                                key,
                                 state: value.clone(),
                                 contract: contract.clone(),
                             });
@@ -705,8 +652,8 @@ impl Operation for GetOp {
                                     state: Some(value.clone()),
                                     contract: contract.clone(),
                                 },
-                                sender: *target,
-                                target: *sender,
+                                sender: target.clone(),
+                                target: sender.clone(),
                                 skip_list: skip_list.clone(),
                             });
                         }
@@ -731,7 +678,7 @@ fn build_op_result(
     state: Option<GetState>,
     msg: Option<GetMsg>,
     result: Option<GetResult>,
-    stats: Option<GetStats>,
+    stats: Option<Box<GetStats>>,
 ) -> Result<OperationResult, OpError> {
     let output_op = Some(GetOp {
         id,
@@ -752,7 +699,7 @@ async fn try_forward_or_return(
     (this_peer, sender): (PeerKeyLocation, PeerKeyLocation),
     skip_list: &[PeerId],
     op_manager: &OpManager,
-    stats: Option<GetStats>,
+    stats: Option<Box<GetStats>>,
 ) -> Result<OperationResult, OpError> {
     tracing::warn!(
         tx = %id,
@@ -762,7 +709,7 @@ async fn try_forward_or_return(
     );
 
     let mut new_skip_list = skip_list.to_vec();
-    new_skip_list.push(this_peer.peer);
+    new_skip_list.push(this_peer.peer.clone());
 
     let new_htl = htl - 1;
     if new_htl == 0 {
@@ -783,7 +730,7 @@ async fn try_forward_or_return(
                     state: None,
                     contract: None,
                 },
-                sender: op_manager.ring.own_location(),
+                sender: op_manager.ring.connection_manager.own_location(),
                 target: sender, // return to requester
                 skip_list: new_skip_list,
             }),
@@ -833,11 +780,9 @@ async fn try_forward_or_return(
 }
 
 mod messages {
-    use std::fmt::Display;
+    use std::{borrow::Borrow, fmt::Display};
 
     use serde::{Deserialize, Serialize};
-
-    use crate::{contract::StoreResponse, message::InnerMessage};
 
     use super::*;
 
@@ -877,17 +822,12 @@ mod messages {
             }
         }
 
-        fn target(&self) -> Option<&PeerKeyLocation> {
+        fn target(&self) -> Option<impl Borrow<PeerKeyLocation>> {
             match self {
                 Self::SeekNode { target, .. } => Some(target),
                 Self::RequestGet { target, .. } => Some(target),
                 Self::ReturnGet { target, .. } => Some(target),
             }
-        }
-
-        fn terminal(&self) -> bool {
-            use GetMsg::*;
-            matches!(self, ReturnGet { .. })
         }
 
         fn requested_location(&self) -> Option<Location> {
@@ -917,172 +857,5 @@ mod messages {
                 Self::ReturnGet { .. } => write!(f, "ReturnGet(id: {id})"),
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use freenet_stdlib::client_api::ContractRequest;
-    use std::{collections::HashMap, time::Duration};
-
-    use super::*;
-    use crate::node::testing_impl::{NodeSpecification, SimNetwork};
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn successful_get_op_between_nodes() -> Result<(), anyhow::Error> {
-        const NUM_NODES: usize = 1usize;
-        const NUM_GW: usize = 1usize;
-
-        let bytes = crate::util::test::random_bytes_1kb();
-        let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: WrappedContract = gen.arbitrary()?;
-        let contract_val: WrappedState = gen.arbitrary()?;
-        let key = contract.key().clone();
-        let get_event = ContractRequest::Get {
-            key: key.clone(),
-            fetch_contract: true,
-        }
-        .into();
-        let node_1 = NodeSpecification {
-            owned_contracts: vec![],
-            events_to_generate: HashMap::from_iter([(1, get_event)]),
-            contract_subscribers: HashMap::new(),
-        };
-
-        let gw_0 = NodeSpecification {
-            owned_contracts: vec![(
-                ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
-                contract_val,
-                None,
-            )],
-            events_to_generate: HashMap::new(),
-            contract_subscribers: HashMap::new(),
-        };
-
-        let get_specs = HashMap::from_iter([("node-1".into(), node_1), ("gateway-0".into(), gw_0)]);
-
-        // establish network
-        let mut sim_nw = SimNetwork::new(
-            "successful_get_op_between_nodes",
-            NUM_GW,
-            NUM_NODES,
-            3,
-            2,
-            4,
-            2,
-        )
-        .await;
-        sim_nw.start_with_spec(get_specs).await;
-        sim_nw.check_connectivity(Duration::from_secs(3))?;
-
-        // trigger get @ node-0, which does not own the contract
-        sim_nw
-            .trigger_event("node-1", 1, Some(Duration::from_secs(1)))
-            .await?;
-        assert!(sim_nw.has_got_contract("node-1", &key));
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn contract_not_found() -> Result<(), anyhow::Error> {
-        const NUM_NODES: usize = 2usize;
-        const NUM_GW: usize = 1usize;
-
-        let bytes = crate::util::test::random_bytes_1kb();
-        let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: WrappedContract = gen.arbitrary()?;
-        let key = contract.key().clone();
-
-        let get_event = ContractRequest::Get {
-            key: key.clone(),
-            fetch_contract: false,
-        }
-        .into();
-        let node_1 = NodeSpecification {
-            owned_contracts: vec![],
-            events_to_generate: HashMap::from_iter([(1, get_event)]),
-            contract_subscribers: HashMap::new(),
-        };
-
-        let get_specs = HashMap::from_iter([("node-1".into(), node_1)]);
-
-        // establish network
-        let mut sim_nw =
-            SimNetwork::new("get_contract_not_found", NUM_GW, NUM_NODES, 3, 2, 4, 2).await;
-        sim_nw.start_with_spec(get_specs).await;
-        sim_nw.check_connectivity(Duration::from_secs(3))?;
-
-        // trigger get @ node-1, which does not own the contract
-        sim_nw
-            .trigger_event("node-1", 1, Some(Duration::from_secs(1)))
-            .await?;
-        assert!(!sim_nw.has_got_contract("node-1", &key));
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn contract_found_after_retry() -> Result<(), anyhow::Error> {
-        // crate::config::set_logger();
-        const NUM_NODES: usize = 2usize;
-        const NUM_GW: usize = 1usize;
-
-        let bytes = crate::util::test::random_bytes_1kb();
-        let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: WrappedContract = gen.arbitrary()?;
-        let contract_val: WrappedState = gen.arbitrary()?;
-        let key = contract.key().clone();
-
-        let get_event = ContractRequest::Get {
-            key: key.clone(),
-            fetch_contract: false,
-        }
-        .into();
-
-        let node_1 = NodeSpecification {
-            owned_contracts: vec![],
-            events_to_generate: HashMap::from_iter([(1, get_event)]),
-            contract_subscribers: HashMap::new(),
-        };
-
-        let node_2 = NodeSpecification {
-            owned_contracts: vec![(
-                ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
-                contract_val,
-                None,
-            )],
-            events_to_generate: HashMap::new(),
-            contract_subscribers: HashMap::new(),
-        };
-
-        let gw_0 = NodeSpecification {
-            owned_contracts: vec![],
-            events_to_generate: HashMap::new(),
-            contract_subscribers: HashMap::new(),
-        };
-
-        let get_specs = HashMap::from_iter([
-            ("node-1".into(), node_1),
-            ("node-2".into(), node_2),
-            ("gateway-0".into(), gw_0),
-        ]);
-
-        // establish network
-        let mut sim_nw = SimNetwork::new(
-            "get_contract_found_after_retry",
-            NUM_GW,
-            NUM_NODES,
-            3,
-            2,
-            4,
-            2,
-        )
-        .await;
-        sim_nw.start_with_spec(get_specs).await;
-        sim_nw.check_connectivity(Duration::from_secs(3))?;
-        sim_nw
-            .trigger_event("node-1", 1, Some(Duration::from_secs(1)))
-            .await?;
-        assert!(sim_nw.has_got_contract("node-1", &key));
-        Ok(())
     }
 }
