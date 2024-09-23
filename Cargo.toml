@@ -12,7 +12,7 @@ chrono = { version = "0.4", default-features = true }
 clap = "4"
 crossbeam = "0.8"
 ctrlc = { version = "3" }
-dashmap = "^5.5"
+dashmap = "^6.1"
 either = "1"
 futures = "0.3"
 rand = { version = "0.8" }
