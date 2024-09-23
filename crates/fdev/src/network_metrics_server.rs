@@ -453,7 +453,7 @@ impl ServerState {
     fn save_record(&self, change: ChangesWrapper) -> Result<(), anyhow::Error> {
         match change {
             ChangesWrapper::PeerChange(PeerChange::AddedConnection(added)) => {
-                let from_peer_id = PeerId::from_str(added.from())?;
+                let from_peer_id: PeerId = bincode::deserialize(added.from().bytes())?;
                 let from_loc = added.from_location();
 
                 let to_peer_id: PeerId = bincode::deserialize(added.to().bytes())?;
@@ -496,8 +496,8 @@ impl ServerState {
                 });
             }
             ChangesWrapper::PeerChange(PeerChange::RemovedConnection(removed)) => {
-                let from_peer_id = PeerId::from_str(removed.from())?;
-                let at_peer_id = PeerId::from_str(removed.at())?;
+                let from_peer_id: PeerId = bincode::deserialize(removed.from().bytes())?;
+                let at_peer_id: PeerId = bincode::deserialize(removed.at().bytes())?;
 
                 if let Some(mut entry) = self.peer_data.get_mut(&from_peer_id) {
                     entry
@@ -610,13 +610,18 @@ impl ServerState {
                 match self.contract_data.entry(key.clone()) {
                     dashmap::mapref::entry::Entry::Occupied(mut occ) => {
                         let connections = &mut occ.get_mut().connections;
-                        connections.push(PeerId::from_str(&target)?);
+
+                        let target_peer: PeerId = bincode::deserialize(&target.as_bytes())?;
+
+                        connections.push(target_peer);
                         //connections.sort_unstable_by(|a, b| a.cmp(&b.0));
                         //connections.dedup();
                     }
                     dashmap::mapref::entry::Entry::Vacant(vac) => {
+                        let target_peer: PeerId = bincode::deserialize(target.as_bytes())?;
+
                         vac.insert(ContractData {
-                            connections: vec![PeerId::from_str(&target)?],
+                            connections: vec![target_peer],
                             location: contract_location,
                             key: key.clone(),
                         });
