@@ -15,7 +15,29 @@ impl ReDb {
     pub async fn new(data_dir: &Path) -> Result<Self, redb::Error> {
         let db_path = data_dir.join("db");
         tracing::info!("loading contract store from {db_path:?}");
-        Database::create(db_path).map(Self).map_err(Into::into)
+        match Database::create(db_path).map(Self) {
+            Ok(db) => {
+                let txn = db.0.begin_write()?;
+                {
+                    txn.open_table(STATE_TABLE).map_err(|e| {
+                        tracing::error!(error = %e, "failed to open STATE_TABLE");
+                        e
+                    })?;
+
+                    txn.open_table(CONTRACT_PARAMS_TABLE).map_err(|e| {
+                        tracing::error!(error = %e, "failed to open CONTRACT_PARAMS_TABLE");
+                        e
+                    })?;
+                }
+                txn.commit()?;
+
+                Ok(db)
+            },
+            Err(e) => {
+                tracing::info!("failed to load contract store: {e}");
+                Err(e.into())
+            }
+        }
     }
 }
 
@@ -66,9 +88,9 @@ impl StateStorage for ReDb {
     ) -> Result<Option<Parameters<'static>>, Self::Error> {
         let txn = self.0.begin_read()?;
 
-        let val = match txn.open_table(CONTRACT_PARAMS_TABLE) {
-            Ok(tbl) => tbl.get(key.as_bytes())?,
-            Err(_) => return Ok(None),
+        let val = {
+            let tbl = txn.open_table(CONTRACT_PARAMS_TABLE)?;
+            tbl.get(key.as_bytes())?
         };
 
         match val {
