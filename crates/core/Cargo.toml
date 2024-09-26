@@ -58,7 +58,7 @@ time = "0.3"
 thiserror = "1"
 tokio = { features = ["fs", "macros", "rt-multi-thread", "sync", "process"], version = "1" }
 tokio-tungstenite = "0.23"
-tower-http = { features = ["fs", "trace"], version = "0.5" }
+tower-http = { features = ["fs", "trace"], version = "0.6" }
 ulid = { features = ["serde"], version = "1.1" }
 unsigned-varint = { version = "0.8", features = ["codec", "asynchronous_codec"] }
 wasmer = { features = ["sys"], workspace = true }
