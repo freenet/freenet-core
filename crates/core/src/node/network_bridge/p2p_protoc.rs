@@ -564,7 +564,7 @@ impl P2pConnManager {
         msg: Option<Either<NetMessage, NodeEvent>>,
     ) -> EventResult {
         match msg {
-            Some(Left(msg)) => EventResult::Event(ConnEvent::OutboundMessage(msg)),
+            Some(Left(msg)) => EventResult::Event(ConnEvent::InboundMessage(msg)),
             Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action)),
             None => EventResult::Continue,
         }
