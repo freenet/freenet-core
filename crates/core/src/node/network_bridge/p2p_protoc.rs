@@ -20,8 +20,7 @@ use tracing::Instrument;
 
 use crate::dev_tool::Location;
 use crate::node::network_bridge::handshake::{
-    EstablishConnection, Event as HandshakeEvent, HandshakeError, HandshakeHandler,
-    InboundGwJoinRequest, OutboundMessage,
+    EstablishConnection, Event as HandshakeEvent, HandshakeError, HandshakeHandler, OutboundMessage,
 };
 use crate::node::PeerId;
 use crate::transport::{
@@ -398,14 +397,12 @@ impl P2pConnManager {
         state: &mut EventListenerState,
     ) -> anyhow::Result<()> {
         match event {
-            HandshakeEvent::InboundConnection(InboundGwJoinRequest {
+            HandshakeEvent::InboundConnection {
                 id,
                 conn,
                 joiner,
-                hops_to_live,
-                max_hops_to_live,
-                skip_list,
-            }) => {
+                op,
+            } => {
                 let (tx, rx) = mpsc::channel(1);
                 self.connections.insert(joiner.clone(), tx);
                 let was_reserved = {
@@ -421,6 +418,10 @@ impl P2pConnManager {
                         was_reserved,
                     )
                     .await;
+                self.bridge
+                    .op_manager
+                    .push(id, crate::operations::OpEnum::Connect(op.into()))
+                    .await?;
                 let task = peer_connection_listener(rx, conn).boxed();
                 state.peer_connections.push(task);
             }
