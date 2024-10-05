@@ -1,5 +1,6 @@
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::message::NetMessageV1;
+use crate::operations::connect::ConnectOp;
 use dashmap::DashSet;
 use either::{Either, Left, Right};
 use futures::future::BoxFuture;
@@ -306,14 +307,12 @@ impl P2pConnManager {
         executor_listener: &ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         cli_response_sender: &ClientResponsesSender,
     ) -> anyhow::Result<()> {
-        let mut cb = self.bridge.clone();
         match msg {
             NetMessage::V1(NetMessageV1::Aborted(tx)) => {
                 handle_aborted_op(
                     tx,
                     op_manager.ring.get_peer_pub_key(),
                     op_manager,
-                    &mut cb,
                     &self.gateways,
                 )
                 .await?;
@@ -411,7 +410,8 @@ impl P2pConnManager {
                 conn,
                 joiner,
                 hops_to_live,
-                ..
+                max_hops_to_live,
+                skip_list,
             }) => {
                 let (tx, rx) = mpsc::channel(1);
                 self.connections.insert(joiner.clone(), tx);
@@ -458,15 +458,21 @@ impl P2pConnManager {
                 peer_id,
                 connection,
             } => {
-                self.handle_successful_connection(peer_id, connection, state)
+                self.handle_successful_connection(peer_id, connection, state, None)
                     .await?;
             }
             HandshakeEvent::OutboundGatewayConnectionSuccessful {
                 peer_id,
                 connection,
+                remaining_checks,
             } => {
-                self.handle_successful_connection(peer_id, connection, state)
-                    .await?;
+                self.handle_successful_connection(
+                    peer_id,
+                    connection,
+                    state,
+                    Some(remaining_checks),
+                )
+                .await?;
             }
             HandshakeEvent::OutboundConnectionFailed { peer_id, error } => {
                 tracing::info!(%peer_id, "Connection failed: {:?}", error);
@@ -495,6 +501,7 @@ impl P2pConnManager {
         peer_id: PeerId,
         connection: PeerConnection,
         state: &mut EventListenerState,
+        remaining_checks: Option<usize>,
     ) -> anyhow::Result<()> {
         if let Some(mut cb) = state.awaiting_connection.remove(&peer_id.addr) {
             let peer_id = if let Some(peer_id) = self
@@ -512,7 +519,7 @@ impl P2pConnManager {
                 let key = (&*self.bridge.op_manager.ring.connection_manager.pub_key).clone();
                 PeerId::new(self_addr, key)
             };
-            let _ = cb.send_result(Ok(peer_id)).await;
+            let _ = cb.send_result(Ok((peer_id, remaining_checks))).await;
         } else {
             tracing::warn!(%peer_id, "No callback for connection established");
         }
@@ -625,27 +632,30 @@ impl P2pConnManager {
 trait ConnectResultSender {
     fn send_result(
         &mut self,
-        result: Result<PeerId, HandshakeError>,
+        result: Result<(PeerId, Option<usize>), HandshakeError>,
     ) -> Pin<Box<dyn Future<Output = Result<(), HandshakeError>> + Send + '_>>;
 }
 
 impl ConnectResultSender for Option<oneshot::Sender<Result<PeerId, HandshakeError>>> {
     fn send_result(
         &mut self,
-        result: Result<PeerId, HandshakeError>,
+        result: Result<(PeerId, Option<usize>), HandshakeError>,
     ) -> Pin<Box<dyn Future<Output = Result<(), HandshakeError>> + Send + '_>> {
         async move {
-            let _ = self.take().expect("always set").send(result);
+            let _ = self
+                .take()
+                .expect("always set")
+                .send(result.map(|(id, _)| id));
             Ok(())
         }
         .boxed()
     }
 }
 
-impl ConnectResultSender for mpsc::Sender<Result<PeerId, ()>> {
+impl ConnectResultSender for mpsc::Sender<Result<(PeerId, Option<usize>), ()>> {
     fn send_result(
         &mut self,
-        result: Result<PeerId, HandshakeError>,
+        result: Result<(PeerId, Option<usize>), HandshakeError>,
     ) -> Pin<Box<dyn Future<Output = Result<(), HandshakeError>> + Send + '_>> {
         async move {
             self.send(result.map_err(|_| ()))

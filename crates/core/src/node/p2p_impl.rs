@@ -43,7 +43,6 @@ impl NodeP2P {
         if self.should_try_connect {
             connect::initial_join_procedure(
                 self.op_manager.clone(),
-                self.conn_manager.bridge.clone(),
                 self.peer_pub_key,
                 &self.conn_manager.gateways,
             )

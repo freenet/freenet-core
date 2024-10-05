@@ -756,7 +756,6 @@ where
 {
     connect::initial_join_procedure(
         config.op_manager.clone(),
-        config.conn_manager.clone(),
         config.peer_key.pub_key.clone(),
         &config.gateways,
     )
@@ -852,14 +851,7 @@ where
         };
 
         if let Ok(Either::Left(NetMessage::V1(NetMessageV1::Aborted(tx)))) = msg {
-            super::handle_aborted_op(
-                tx,
-                peer_key.pub_key.clone(),
-                &op_manager,
-                &mut conn_manager,
-                &gateways,
-            )
-            .await?;
+            super::handle_aborted_op(tx, peer_key.pub_key.clone(), &op_manager, &gateways).await?;
         }
 
         let msg = match msg {
