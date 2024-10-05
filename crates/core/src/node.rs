@@ -855,7 +855,6 @@ async fn subscribe(op_manager: Arc<OpManager>, key: ContractKey, client_id: Opti
 
 async fn handle_aborted_op(
     tx: Transaction,
-    this_peer_pub_key: TransportPublicKey,
     op_manager: &OpManager,
     gateways: &[PeerKeyLocation],
 ) -> Result<(), OpError> {
@@ -876,8 +875,7 @@ async fn handle_aborted_op(
                 } = *op;
                 if let Some(gateway) = gateway {
                     tracing::warn!("Retry connecting to gateway {}", gateway.peer);
-                    connect::join_ring_request(backoff, this_peer_pub_key, &gateway, op_manager)
-                        .await?;
+                    connect::join_ring_request(backoff, &gateway, op_manager).await?;
                 }
             }
             Ok(Some(OpEnum::Connect(_))) => {
@@ -885,8 +883,7 @@ async fn handle_aborted_op(
                 if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
                     tracing::warn!("Retrying joining the ring with an other gateway");
                     if let Some(gateway) = gateways.iter().shuffle().next() {
-                        connect::join_ring_request(None, this_peer_pub_key, gateway, op_manager)
-                            .await?
+                        connect::join_ring_request(None, gateway, op_manager).await?
                     }
                 }
             }

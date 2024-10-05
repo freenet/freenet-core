@@ -754,12 +754,7 @@ where
     NB: NetworkBridge + NetworkBridgeExt,
     UsrEv: ClientEventsProxy + Send + 'static,
 {
-    connect::initial_join_procedure(
-        config.op_manager.clone(),
-        config.peer_key.pub_key.clone(),
-        &config.gateways,
-    )
-    .await?;
+    connect::initial_join_procedure(config.op_manager.clone(), &config.gateways).await?;
     let (client_responses, cli_response_sender) = contract::client_responses_channel();
     let span = {
         config
@@ -851,7 +846,7 @@ where
         };
 
         if let Ok(Either::Left(NetMessage::V1(NetMessageV1::Aborted(tx)))) = msg {
-            super::handle_aborted_op(tx, peer_key.pub_key.clone(), &op_manager, &gateways).await?;
+            super::handle_aborted_op(tx, &op_manager, &gateways).await?;
         }
 
         let msg = match msg {

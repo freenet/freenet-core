@@ -1,6 +1,5 @@
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::message::NetMessageV1;
-use crate::operations::connect::ConnectOp;
 use dashmap::DashSet;
 use either::{Either, Left, Right};
 use futures::future::BoxFuture;
@@ -309,13 +308,7 @@ impl P2pConnManager {
     ) -> anyhow::Result<()> {
         match msg {
             NetMessage::V1(NetMessageV1::Aborted(tx)) => {
-                handle_aborted_op(
-                    tx,
-                    op_manager.ring.get_peer_pub_key(),
-                    op_manager,
-                    &self.gateways,
-                )
-                .await?;
+                handle_aborted_op(tx, op_manager, &self.gateways).await?;
             }
             msg => {
                 if let Some(addr) = state.transient_conn.get(msg.id()) {

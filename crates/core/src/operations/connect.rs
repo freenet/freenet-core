@@ -383,8 +383,8 @@ impl Operation for ConnectOp {
 
                     match self.state.as_mut() {
                         Some(ConnectState::ConnectingToNode(info)) => {
-                            assert!(info.remaining_connetions > 0);
-                            let remaining_connetions = info.remaining_connetions.saturating_sub(1);
+                            assert!(info.remaining_connections > 0);
+                            let remaining_connetions = info.remaining_connections.saturating_sub(1);
 
                             if *accepted {
                                 tracing::debug!(
@@ -629,10 +629,8 @@ impl ConnectivityInfo {
 #[derive(Debug, Clone)]
 pub(crate) struct ConnectionInfo {
     gateway: PeerKeyLocation,
-    peer_pub_key: TransportPublicKey,
-    max_hops_to_live: usize,
     accepted_by: HashSet<PeerKeyLocation>,
-    remaining_connetions: usize,
+    remaining_connections: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -659,7 +657,6 @@ impl ConnectState {
 /// - is_gateway: Whether this peer is a gateway or not.
 pub(crate) async fn initial_join_procedure(
     op_manager: Arc<OpManager>,
-    peer_pub_key: TransportPublicKey,
     gateways: &[PeerKeyLocation],
 ) -> Result<(), OpError> {
     use crate::util::IterExt;
@@ -690,9 +687,7 @@ pub(crate) async fn initial_join_procedure(
                     .take(number_of_parallel_connections)
                 {
                     tracing::info!(%gateway, "Attempting connection to gateway");
-                    if let Err(error) =
-                        join_ring_request(None, peer_pub_key.clone(), gateway, &op_manager).await
-                    {
+                    if let Err(error) = join_ring_request(None, gateway, &op_manager).await {
                         if !matches!(
                             error,
                             OpError::ConnError(crate::node::ConnectionError::UnwantedConnection)
@@ -715,7 +710,6 @@ pub(crate) async fn initial_join_procedure(
 #[tracing::instrument(fields(peer = %op_manager.ring.connection_manager.pub_key), skip_all)]
 pub(crate) async fn join_ring_request(
     backoff: Option<ExponentialBackoff>,
-    peer_pub_key: TransportPublicKey,
     gateway: &PeerKeyLocation,
     op_manager: &OpManager,
 ) -> Result<(), OpError> {
@@ -734,13 +728,8 @@ pub(crate) async fn join_ring_request(
     }
 
     let tx_id = Transaction::new::<ConnectMsg>();
-    tracing::info!(%gateway.peer, %peer_pub_key, "Attempting network join");
-    let mut op = initial_request(
-        peer_pub_key,
-        gateway.clone(),
-        op_manager.ring.max_hops_to_live,
-        tx_id,
-    );
+    tracing::info!(%gateway.peer, "Attempting network join");
+    let mut op = initial_request(gateway.clone(), op_manager.ring.max_hops_to_live, tx_id);
     if let Some(mut backoff) = backoff {
         // backoff to retry later in case it failed
         tracing::warn!("Performing a new join, attempt {}", backoff.retries() + 1);
@@ -764,7 +753,6 @@ pub(crate) async fn join_ring_request(
 }
 
 fn initial_request(
-    peer_pub_key: TransportPublicKey,
     gateway: PeerKeyLocation,
     max_hops_to_live: usize,
     id: Transaction,
@@ -772,10 +760,8 @@ fn initial_request(
     const MAX_JOIN_RETRIES: usize = usize::MAX;
     let state = ConnectState::ConnectingToNode(ConnectionInfo {
         gateway: gateway.clone(),
-        peer_pub_key: peer_pub_key.clone(),
-        max_hops_to_live,
         accepted_by: HashSet::new(),
-        remaining_connetions: max_hops_to_live,
+        remaining_connections: max_hops_to_live,
     });
     let ceiling = if cfg!(test) {
         Duration::from_secs(1)
