@@ -808,6 +808,14 @@ async fn connect_request(
         .await?;
     match result.recv().await.ok_or(OpError::NotificationError)? {
         Ok((joiner, remaining_checks)) => {
+            op_manager
+                .ring
+                .add_connection(
+                    gateway.location.expect("location not found"),
+                    gateway.peer.clone(),
+                    true,
+                )
+                .await;
             let Some(remaining_connetions) = remaining_checks else {
                 tracing::error!(tx = %id, "Failed to connect to gateway, missing remaining checks");
                 return Err(OpError::ConnError(
