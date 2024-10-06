@@ -52,7 +52,7 @@ pub(super) enum Event {
         id: Transaction,
         conn: PeerConnection,
         joiner: PeerId,
-        op: ConnectOp,
+        op: Option<ConnectOp>,
     },
     /// An outbound connection to a peer was successfully established.
     OutboundConnectionSuccessful {
@@ -317,7 +317,7 @@ impl HandshakeHandler {
 
                                 let InboundGwJoinRequest { conn, id, joiner, hops_to_live, max_hops_to_live, skip_list } = req;
 
-                                let state = {
+                                let ok = {
                                     // TODO: refactor this so it happens in the background out of the main handler loop
                                     let mut nw_bridge = ForwardPeerMessage {
                                         msg: parking_lot::Mutex::new(None),
@@ -339,16 +339,14 @@ impl HandshakeHandler {
                                         skip_list,
                                     );
                                     match f.await {
-                                        Ok(Some(s)) => s,
-                                        Ok(None) => continue,
                                         Err(err) => {
                                                 tracing::error!(%err, "Error forwarding connection");
                                                 continue;
                                         }
+                                        Ok(ok) => ok,
                                     }
                                 };
-                                let op = ConnectOp::new(id, Some(state), None, None);
-                                return Ok(Event::InboundConnection { id, conn, joiner, op });
+                                return Ok(Event::InboundConnection { id, conn, joiner, op: ok.map(|ok| ConnectOp::new(id, Some(ok), None, None)) });
                             } else {
                                 let InboundGwJoinRequest { mut conn, id, hops_to_live, max_hops_to_live, skip_list, .. } = req;
                                 let remote = conn.remote_addr();

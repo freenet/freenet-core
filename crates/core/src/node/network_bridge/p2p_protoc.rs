@@ -418,10 +418,12 @@ impl P2pConnManager {
                         was_reserved,
                     )
                     .await;
-                self.bridge
-                    .op_manager
-                    .push(id, crate::operations::OpEnum::Connect(op.into()))
-                    .await?;
+                if let Some(op) = op {
+                    self.bridge
+                        .op_manager
+                        .push(id, crate::operations::OpEnum::Connect(op.into()))
+                        .await?;
+                }
                 let task = peer_connection_listener(rx, conn).boxed();
                 state.peer_connections.push(task);
             }
