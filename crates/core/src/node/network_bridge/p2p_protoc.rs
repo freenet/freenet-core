@@ -199,9 +199,12 @@ impl P2pConnManager {
                             tracing::error!(%tx, "Aborted transaction");
                         }
                         ConnEvent::OutboundMessage(msg) => {
-                            let target_peer = msg.target().expect(
-                                "Target peer not set, must be set for connection outbound message",
-                            );
+                            let Some(target_peer) = msg.target() else {
+                                let id = *msg.id();
+                                tracing::error!(%id, "Target peer not set, must be set for connection outbound message");
+                                self.bridge.op_manager.completed(id);
+                                continue;
+                            };
                             tracing::debug!(%target_peer, %msg, "Sending message to peer");
                             match self.connections.get(&target_peer.peer) {
                                 Some(peer_connection) => {
@@ -210,7 +213,11 @@ impl P2pConnManager {
                                     }
                                 }
                                 None => {
-                                    tracing::error!("No existing outbound connection to forward the message to {}", target_peer.peer);
+                                    tracing::error!(
+                                        id = %msg.id(),
+                                        target = %target_peer.peer,
+                                        "No existing outbound connection to forward the message"
+                                    );
                                 }
                             }
                         }
