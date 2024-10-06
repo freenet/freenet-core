@@ -48,6 +48,7 @@ impl ConnectOp {
             backoff,
         }
     }
+
     pub fn has_backoff(&self) -> bool {
         self.backoff.is_some()
     }
@@ -244,61 +245,6 @@ impl Operation for ConnectOp {
                 ConnectMsg::Request {
                     id,
                     msg:
-                        ConnectRequest::StartJoinReq {
-                            joiner,
-                            hops_to_live,
-                            max_hops_to_live,
-                            skip_list, //
-                            ..
-                        },
-                    ..
-                } => {
-                    let joiner: PeerId = joiner
-                        .clone()
-                        .expect("should be already set at the p2p bridge level");
-                    let this_peer = op_manager.ring.connection_manager.own_location();
-                    let assigned_location = Location::from_address(&joiner.addr);
-
-                    let new_peer_loc = PeerKeyLocation {
-                        location: Some(assigned_location),
-                        peer: joiner.clone(),
-                    };
-
-                    let mut skip_list = skip_list.clone();
-                    skip_list.push(joiner.clone());
-
-                    if let Some(updated_state) = forward_conn(
-                        *id,
-                        &op_manager.ring.connection_manager,
-                        op_manager.ring.router.clone(),
-                        network_bridge,
-                        (this_peer.clone(), new_peer_loc.clone()),
-                        *hops_to_live,
-                        *max_hops_to_live,
-                        true,
-                        skip_list.clone(),
-                    )
-                    .await?
-                    {
-                        new_state = Some(updated_state);
-                    } else {
-                        new_state = None
-                    }
-
-                    return_msg = Some(ConnectMsg::Response {
-                        id: *id,
-                        sender: this_peer.clone(),
-                        target: new_peer_loc.clone(),
-                        msg: ConnectResponse::AcceptedBy {
-                            accepted: true,
-                            acceptor: this_peer.clone(),
-                            joiner: joiner.clone(),
-                        },
-                    });
-                }
-                ConnectMsg::Request {
-                    id,
-                    msg:
                         ConnectRequest::CheckConnectivity {
                             sender,
                             joiner,
@@ -437,8 +383,8 @@ impl Operation for ConnectOp {
 
                     match self.state.as_mut() {
                         Some(ConnectState::ConnectingToNode(info)) => {
-                            assert!(info.remaining_connetions > 0);
-                            let remaining_connetions = info.remaining_connetions.saturating_sub(1);
+                            assert!(info.remaining_connections > 0);
+                            let remaining_connetions = info.remaining_connections.saturating_sub(1);
 
                             if *accepted {
                                 tracing::debug!(
@@ -683,10 +629,8 @@ impl ConnectivityInfo {
 #[derive(Debug, Clone)]
 pub(crate) struct ConnectionInfo {
     gateway: PeerKeyLocation,
-    peer_pub_key: TransportPublicKey,
-    max_hops_to_live: usize,
     accepted_by: HashSet<PeerKeyLocation>,
-    remaining_connetions: usize,
+    remaining_connections: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -711,15 +655,10 @@ impl ConnectState {
 ///   (to gateways or regular peers) will be treated as regular connections.
 ///
 /// - is_gateway: Whether this peer is a gateway or not.
-pub(crate) async fn initial_join_procedure<CM>(
+pub(crate) async fn initial_join_procedure(
     op_manager: Arc<OpManager>,
-    mut conn_manager: CM,
-    peer_pub_key: TransportPublicKey,
     gateways: &[PeerKeyLocation],
-) -> Result<(), OpError>
-where
-    CM: NetworkBridge + Send + 'static,
-{
+) -> Result<(), OpError> {
     use crate::util::IterExt;
     let number_of_parallel_connections = {
         let max_potential_conns_per_gw = op_manager.ring.max_hops_to_live;
@@ -748,15 +687,7 @@ where
                     .take(number_of_parallel_connections)
                 {
                     tracing::info!(%gateway, "Attempting connection to gateway");
-                    if let Err(error) = join_ring_request(
-                        None,
-                        peer_pub_key.clone(),
-                        gateway,
-                        &op_manager,
-                        &mut conn_manager,
-                    )
-                    .await
-                    {
+                    if let Err(error) = join_ring_request(None, gateway, &op_manager).await {
                         if !matches!(
                             error,
                             OpError::ConnError(crate::node::ConnectionError::UnwantedConnection)
@@ -777,16 +708,11 @@ where
 }
 
 #[tracing::instrument(fields(peer = %op_manager.ring.connection_manager.pub_key), skip_all)]
-pub(crate) async fn join_ring_request<CM>(
+pub(crate) async fn join_ring_request(
     backoff: Option<ExponentialBackoff>,
-    peer_pub_key: TransportPublicKey,
     gateway: &PeerKeyLocation,
     op_manager: &OpManager,
-    conn_manager: &mut CM,
-) -> Result<(), OpError>
-where
-    CM: NetworkBridge + Send,
-{
+) -> Result<(), OpError> {
     use crate::node::ConnectionError;
     if !op_manager.ring.connection_manager.should_accept(
         gateway.location.ok_or_else(|| {
@@ -802,13 +728,8 @@ where
     }
 
     let tx_id = Transaction::new::<ConnectMsg>();
-    tracing::info!(%gateway.peer, %peer_pub_key, "Attempting network join");
-    let mut op = initial_request(
-        peer_pub_key,
-        gateway.clone(),
-        op_manager.ring.max_hops_to_live,
-        tx_id,
-    );
+    tracing::info!(%gateway.peer, "Attempting network join");
+    let mut op = initial_request(gateway.clone(), op_manager.ring.max_hops_to_live, tx_id);
     if let Some(mut backoff) = backoff {
         // backoff to retry later in case it failed
         tracing::warn!("Performing a new join, attempt {}", backoff.retries() + 1);
@@ -827,12 +748,11 @@ where
         // passed as an argument and advanced
         op.backoff = Some(backoff);
     }
-    connect_request(tx_id, op_manager, conn_manager, op).await?;
+    connect_request(tx_id, op_manager, op).await?;
     Ok(())
 }
 
 fn initial_request(
-    peer_pub_key: TransportPublicKey,
     gateway: PeerKeyLocation,
     max_hops_to_live: usize,
     id: Transaction,
@@ -840,10 +760,8 @@ fn initial_request(
     const MAX_JOIN_RETRIES: usize = usize::MAX;
     let state = ConnectState::ConnectingToNode(ConnectionInfo {
         gateway: gateway.clone(),
-        peer_pub_key: peer_pub_key.clone(),
-        max_hops_to_live,
         accepted_by: HashSet::new(),
-        remaining_connetions: max_hops_to_live,
+        remaining_connections: max_hops_to_live,
     });
     let ceiling = if cfg!(test) {
         Duration::from_secs(1)
@@ -863,24 +781,15 @@ fn initial_request(
 }
 
 /// Join ring routine, called upon performing a join operation for this node.
-async fn connect_request<NB>(
+async fn connect_request(
     tx: Transaction,
     op_manager: &OpManager,
-    conn_bridge: &mut NB,
     join_op: ConnectOp,
-) -> Result<(), OpError>
-where
-    NB: NetworkBridge,
-{
+) -> Result<(), OpError> {
     let ConnectOp {
         id, state, backoff, ..
     } = join_op;
-    let ConnectionInfo {
-        gateway,
-        peer_pub_key,
-        max_hops_to_live,
-        ..
-    } = state.expect("infallible").try_unwrap_connecting()?;
+    let ConnectionInfo { gateway, .. } = state.expect("infallible").try_unwrap_connecting()?;
 
     tracing::info!(
         tx = %id,
@@ -898,36 +807,36 @@ where
         })
         .await?;
     match result.recv().await.ok_or(OpError::NotificationError)? {
-        Ok(joiner) => {
+        Ok((joiner, remaining_checks)) => {
+            op_manager
+                .ring
+                .add_connection(
+                    gateway.location.expect("location not found"),
+                    gateway.peer.clone(),
+                    true,
+                )
+                .await;
+            let Some(remaining_connetions) = remaining_checks else {
+                tracing::error!(tx = %id, "Failed to connect to gateway, missing remaining checks");
+                return Err(OpError::ConnError(
+                    crate::node::ConnectionError::FailedConnectOp,
+                ));
+            };
             tracing::debug!(
                 tx = %id,
                 gateway = %gateway,
                 joiner = %joiner,
                 "Sending connection request to gateway",
             );
-            let join_req = NetMessage::from(messages::ConnectMsg::Request {
-                id: tx,
-                target: gateway.clone(),
-                msg: ConnectRequest::StartJoinReq {
-                    joiner: Some(joiner.clone()),
-                    joiner_key: peer_pub_key.clone(),
-                    hops_to_live: max_hops_to_live,
-                    max_hops_to_live,
-                    skip_list: vec![joiner],
-                },
-            });
-            conn_bridge.send(&gateway.peer, join_req).await?;
+            // at this point the gateway has accepted the connection so already
+            // sent StartJoinReq to the gateway and are waiting for new upstream connections
             op_manager
                 .push(
                     tx,
                     OpEnum::Connect(Box::new(ConnectOp {
                         id,
-                        state: Some(ConnectState::ConnectingToNode(ConnectionInfo {
-                            gateway: gateway.clone(),
-                            peer_pub_key,
-                            max_hops_to_live,
-                            accepted_by: HashSet::new(),
-                            remaining_connetions: max_hops_to_live,
+                        state: Some(ConnectState::AwaitingNewConnection(NewConnectionInfo {
+                            remaining_connetions,
                         })),
                         gateway: Some(Box::new(gateway)),
                         backoff,
