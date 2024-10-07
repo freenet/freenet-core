@@ -29,6 +29,12 @@ use crate::{
 type Result<T, E = HandshakeError> = std::result::Result<T, E>;
 type OutboundConnResult = Result<InternalEvent, (PeerId, HandshakeError)>;
 
+#[derive(Debug)]
+pub(super) struct ForwardInfo {
+    pub target: PeerId,
+    pub msg: NetMessage,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(super) enum HandshakeError {
     #[error("channel closed")]
@@ -318,18 +324,21 @@ impl HandshakeHandler {
 
                                 let InboundGwJoinRequest { conn, id, joiner, hops_to_live, max_hops_to_live, skip_list } = req;
 
-                                let ok = {
+                                let (ok, forward_info) = {
                                     // TODO: refactor this so it happens in the background out of the main handler loop
                                     let mut nw_bridge = ForwardPeerMessage {
                                         msg: parking_lot::Mutex::new(None),
                                     };
+
                                     let my_peer_id = self.connection_manager.own_location();
                                     let joiner_loc = Location::from_address(&conn.remote_addr());
                                     let joiner_pk_loc = PeerKeyLocation {
                                         peer: joiner.clone(),
                                         location: Some(joiner_loc),
                                     };
-                                   let f = forward_conn(id,
+
+                                    let f = forward_conn(
+                                        id,
                                         &self.connection_manager,
                                         self.router.clone(),
                                         &mut nw_bridge,
@@ -339,15 +348,36 @@ impl HandshakeHandler {
                                         true,
                                         skip_list,
                                     );
+
                                     match f.await {
                                         Err(err) => {
-                                                tracing::error!(%err, "Error forwarding connection");
-                                                continue;
+                                            tracing::error!(%err, "Error forwarding connection");
+                                            continue;
                                         }
-                                        Ok(ok) => ok,
+                                        Ok(ok) => {
+                                            if let Some(ok_value) = ok {
+                                                let forward_info = nw_bridge.msg.lock().take().map(|(forward_target, msg)| {
+                                                    ForwardInfo {
+                                                        target: forward_target,
+                                                        msg,
+                                                    }
+                                                });
+                                                (Some(ok_value), forward_info)
+                                            } else {
+                                                (None, None)
+                                            }
+                                        }
                                     }
                                 };
-                                return Ok(Event::InboundConnection { id, conn, joiner, op: ok.map(|ok| ConnectOp::new(id, Some(ok), None, None)) });
+
+                                return Ok(Event::InboundConnection {
+                                    id,
+                                    conn,
+                                    joiner,
+                                    op: ok.map(|ok_value| ConnectOp::new(id, Some(ok_value), None, None)),
+                                    forward_info,
+                                })
+
                             } else {
                                 let InboundGwJoinRequest { mut conn, id, hops_to_live, max_hops_to_live, skip_list, .. } = req;
                                 let remote = conn.remote_addr();

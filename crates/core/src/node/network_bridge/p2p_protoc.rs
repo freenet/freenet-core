@@ -20,7 +20,8 @@ use tracing::Instrument;
 
 use crate::dev_tool::Location;
 use crate::node::network_bridge::handshake::{
-    EstablishConnection, Event as HandshakeEvent, HandshakeError, HandshakeHandler, OutboundMessage,
+    EstablishConnection, Event as HandshakeEvent, ForwardInfo, HandshakeError, HandshakeHandler,
+    OutboundMessage,
 };
 use crate::node::PeerId;
 use crate::transport::{
@@ -409,6 +410,7 @@ impl P2pConnManager {
                 conn,
                 joiner,
                 op,
+                forward_info,
             } => {
                 let (tx, rx) = mpsc::channel(1);
                 self.connections.insert(joiner.clone(), tx);
@@ -433,6 +435,14 @@ impl P2pConnManager {
                 }
                 let task = peer_connection_listener(rx, conn).boxed();
                 state.peer_connections.push(task);
+
+                if let Some(ForwardInfo {
+                    target: forward_to,
+                    msg,
+                }) = forward_info
+                {
+                    self.try_to_forward(&forward_to, msg).await?;
+                }
             }
             HandshakeEvent::TransientForwardTransaction {
                 target,
@@ -451,11 +461,7 @@ impl P2pConnManager {
                         );
                     }
                 }
-                if let Some(peer) = self.connections.get(&forward_to) {
-                    peer.send(Left(msg)).await?;
-                } else {
-                    tracing::warn!(%forward_to, "No connection to forward the message");
-                }
+                self.try_to_forward(&forward_to, msg).await?;
             }
             HandshakeEvent::OutboundConnectionSuccessful {
                 peer_id,
@@ -495,6 +501,16 @@ impl P2pConnManager {
             HandshakeEvent::InboundConnectionRejected { peer_id } => {
                 tracing::debug!(%peer_id, "Inbound connection rejected");
             }
+        }
+        Ok(())
+    }
+
+    async fn try_to_forward(&mut self, forward_to: &PeerId, msg: NetMessage) -> anyhow::Result<()> {
+        if let Some(peer) = self.connections.get(&forward_to) {
+            tracing::debug!(%forward_to, %msg, "Forwarding message to peer");
+            peer.send(Left(msg)).await?;
+        } else {
+            tracing::warn!(%forward_to, "No connection to forward the message");
         }
         Ok(())
     }
