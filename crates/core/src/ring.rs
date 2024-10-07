@@ -200,7 +200,6 @@ pub(crate) struct Ring {
     pub connection_manager: ConnectionManager,
     pub router: Arc<RwLock<Router>>,
     pub live_tx_tracker: LiveTransactionTracker,
-    peer_pub_key: TransportPublicKey,
     /// The container for subscriber is a vec instead of something like a hashset
     /// that would allow for blind inserts of duplicate peers subscribing because
     /// of data locality, since we are likely to end up iterating over the whole sequence
@@ -263,8 +262,6 @@ impl Ring {
     ) -> anyhow::Result<Arc<Self>> {
         let (live_tx_tracker, missing_candidate_rx) = LiveTransactionTracker::new();
 
-        let peer_pub_key = config.key_pair.public().clone();
-
         let max_hops_to_live = if let Some(v) = config.max_hops_to_live {
             v
         } else {
@@ -279,7 +276,6 @@ impl Ring {
             max_hops_to_live,
             router,
             connection_manager,
-            peer_pub_key,
             subscribers: DashMap::new(),
             seeding_contract: DashMap::new(),
             live_tx_tracker: live_tx_tracker.clone(),
@@ -309,10 +305,6 @@ impl Ring {
         );
 
         Ok(ring)
-    }
-
-    pub fn get_peer_pub_key(&self) -> TransportPublicKey {
-        self.peer_pub_key.clone()
     }
 
     pub fn is_gateway(&self) -> bool {
@@ -922,7 +914,6 @@ impl std::hash::Hash for Location {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let bits = self.0.to_bits();
         state.write_u64(bits);
-        state.finish();
     }
 }
 

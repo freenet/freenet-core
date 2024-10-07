@@ -9,6 +9,7 @@ use super::{
     },
     NetEventRegister, PeerId,
 };
+use crate::ring::ConnectionManager;
 use crate::{
     client_events::{combinator::ClientEventsCombinator, BoxedClient},
     config::GlobalExecutor,
@@ -20,12 +21,10 @@ use crate::{
     node::NodeConfig,
     operations::connect,
 };
-use crate::{ring::ConnectionManager, transport::TransportPublicKey};
 
 use super::OpManager;
 
 pub(crate) struct NodeP2P {
-    pub(crate) peer_pub_key: TransportPublicKey,
     pub(crate) op_manager: Arc<OpManager>,
     notification_channel: EventLoopNotificationsReceiver,
     client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
@@ -41,13 +40,8 @@ pub(crate) struct NodeP2P {
 impl NodeP2P {
     pub(super) async fn run_node(self) -> anyhow::Result<()> {
         if self.should_try_connect {
-            connect::initial_join_procedure(
-                self.op_manager.clone(),
-                self.conn_manager.bridge.clone(),
-                self.peer_pub_key,
-                &self.conn_manager.gateways,
-            )
-            .await?;
+            connect::initial_join_procedure(self.op_manager.clone(), &self.conn_manager.gateways)
+                .await?;
         }
 
         // start the p2p event loop
@@ -73,8 +67,6 @@ impl NodeP2P {
         CH: ContractHandler + Send + 'static,
         ER: NetEventRegister + Clone,
     {
-        let peer_pub_key = config.key_pair.public().clone();
-
         let (notification_channel, notification_tx) = event_loop_notification_channel();
         let (ch_outbound, ch_inbound, wait_for_event) = contract::contract_handler_channel();
         let (client_responses, cli_response_sender) = contract::client_responses_channel();
@@ -113,7 +105,6 @@ impl NodeP2P {
         );
 
         Ok(NodeP2P {
-            peer_pub_key,
             conn_manager,
             notification_channel,
             client_wait_for_transaction: wait_for_event,

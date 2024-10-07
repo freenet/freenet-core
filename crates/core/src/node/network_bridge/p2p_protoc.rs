@@ -20,8 +20,7 @@ use tracing::Instrument;
 
 use crate::dev_tool::Location;
 use crate::node::network_bridge::handshake::{
-    EstablishConnection, Event as HandshakeEvent, HandshakeError, HandshakeHandler,
-    InboundGwJoinRequest, OutboundMessage,
+    EstablishConnection, Event as HandshakeEvent, HandshakeError, HandshakeHandler, OutboundMessage,
 };
 use crate::node::PeerId;
 use crate::transport::{
@@ -200,9 +199,12 @@ impl P2pConnManager {
                             tracing::error!(%tx, "Aborted transaction");
                         }
                         ConnEvent::OutboundMessage(msg) => {
-                            let target_peer = msg.target().expect(
-                                "Target peer not set, must be set for connection outbound message",
-                            );
+                            let Some(target_peer) = msg.target() else {
+                                let id = *msg.id();
+                                tracing::error!(%id, "Target peer not set, must be set for connection outbound message");
+                                self.bridge.op_manager.completed(id);
+                                continue;
+                            };
                             tracing::debug!(%target_peer, %msg, "Sending message to peer");
                             match self.connections.get(&target_peer.peer) {
                                 Some(peer_connection) => {
@@ -211,7 +213,11 @@ impl P2pConnManager {
                                     }
                                 }
                                 None => {
-                                    tracing::error!("No existing outbound connection to forward the message to {}", target_peer.peer);
+                                    tracing::error!(
+                                        id = %msg.id(),
+                                        target = %target_peer.peer,
+                                        "No existing outbound connection to forward the message"
+                                    );
                                 }
                             }
                         }
@@ -306,17 +312,9 @@ impl P2pConnManager {
         executor_listener: &ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         cli_response_sender: &ClientResponsesSender,
     ) -> anyhow::Result<()> {
-        let mut cb = self.bridge.clone();
         match msg {
             NetMessage::V1(NetMessageV1::Aborted(tx)) => {
-                handle_aborted_op(
-                    tx,
-                    op_manager.ring.get_peer_pub_key(),
-                    op_manager,
-                    &mut cb,
-                    &self.gateways,
-                )
-                .await?;
+                handle_aborted_op(tx, op_manager, &self.gateways).await?;
             }
             msg => {
                 if let Some(addr) = state.transient_conn.get(msg.id()) {
@@ -406,13 +404,12 @@ impl P2pConnManager {
         state: &mut EventListenerState,
     ) -> anyhow::Result<()> {
         match event {
-            HandshakeEvent::InboundConnection(InboundGwJoinRequest {
+            HandshakeEvent::InboundConnection {
                 id,
                 conn,
                 joiner,
-                hops_to_live,
-                ..
-            }) => {
+                op,
+            } => {
                 let (tx, rx) = mpsc::channel(1);
                 self.connections.insert(joiner.clone(), tx);
                 let was_reserved = {
@@ -428,6 +425,12 @@ impl P2pConnManager {
                         was_reserved,
                     )
                     .await;
+                if let Some(op) = op {
+                    self.bridge
+                        .op_manager
+                        .push(id, crate::operations::OpEnum::Connect(op.into()))
+                        .await?;
+                }
                 let task = peer_connection_listener(rx, conn).boxed();
                 state.peer_connections.push(task);
             }
@@ -458,15 +461,21 @@ impl P2pConnManager {
                 peer_id,
                 connection,
             } => {
-                self.handle_successful_connection(peer_id, connection, state)
+                self.handle_successful_connection(peer_id, connection, state, None)
                     .await?;
             }
             HandshakeEvent::OutboundGatewayConnectionSuccessful {
                 peer_id,
                 connection,
+                remaining_checks,
             } => {
-                self.handle_successful_connection(peer_id, connection, state)
-                    .await?;
+                self.handle_successful_connection(
+                    peer_id,
+                    connection,
+                    state,
+                    Some(remaining_checks),
+                )
+                .await?;
             }
             HandshakeEvent::OutboundConnectionFailed { peer_id, error } => {
                 tracing::info!(%peer_id, "Connection failed: {:?}", error);
@@ -495,6 +504,7 @@ impl P2pConnManager {
         peer_id: PeerId,
         connection: PeerConnection,
         state: &mut EventListenerState,
+        remaining_checks: Option<usize>,
     ) -> anyhow::Result<()> {
         if let Some(mut cb) = state.awaiting_connection.remove(&peer_id.addr) {
             let peer_id = if let Some(peer_id) = self
@@ -512,7 +522,7 @@ impl P2pConnManager {
                 let key = (&*self.bridge.op_manager.ring.connection_manager.pub_key).clone();
                 PeerId::new(self_addr, key)
             };
-            let _ = cb.send_result(Ok(peer_id)).await;
+            let _ = cb.send_result(Ok((peer_id, remaining_checks))).await;
         } else {
             tracing::warn!(%peer_id, "No callback for connection established");
         }
@@ -625,27 +635,30 @@ impl P2pConnManager {
 trait ConnectResultSender {
     fn send_result(
         &mut self,
-        result: Result<PeerId, HandshakeError>,
+        result: Result<(PeerId, Option<usize>), HandshakeError>,
     ) -> Pin<Box<dyn Future<Output = Result<(), HandshakeError>> + Send + '_>>;
 }
 
 impl ConnectResultSender for Option<oneshot::Sender<Result<PeerId, HandshakeError>>> {
     fn send_result(
         &mut self,
-        result: Result<PeerId, HandshakeError>,
+        result: Result<(PeerId, Option<usize>), HandshakeError>,
     ) -> Pin<Box<dyn Future<Output = Result<(), HandshakeError>> + Send + '_>> {
         async move {
-            let _ = self.take().expect("always set").send(result);
+            let _ = self
+                .take()
+                .expect("always set")
+                .send(result.map(|(id, _)| id));
             Ok(())
         }
         .boxed()
     }
 }
 
-impl ConnectResultSender for mpsc::Sender<Result<PeerId, ()>> {
+impl ConnectResultSender for mpsc::Sender<Result<(PeerId, Option<usize>), ()>> {
     fn send_result(
         &mut self,
-        result: Result<PeerId, HandshakeError>,
+        result: Result<(PeerId, Option<usize>), HandshakeError>,
     ) -> Pin<Box<dyn Future<Output = Result<(), HandshakeError>> + Send + '_>> {
         async move {
             self.send(result.map_err(|_| ()))

@@ -16,7 +16,8 @@ use crate::{
     message::{InnerMessage, NetMessage, NetMessageV1},
     node::NetworkBridge,
     operations::connect::{
-        forward_conn, ConnectMsg, ConnectRequest, ConnectResponse, ConnectState, ConnectivityInfo,
+        forward_conn, ConnectMsg, ConnectOp, ConnectRequest, ConnectResponse, ConnectState,
+        ConnectivityInfo,
     },
     ring::{ConnectionManager, PeerKeyLocation, Ring},
     router::Router,
@@ -47,7 +48,12 @@ pub(super) enum Event {
     // todo: instead of returning InboundJoinReq which is an internal event
     // return a proper well formed ConnectOp and any other types needed (PeerConnection etc.)
     /// An inbound connection to a peer was successfully established at a gateway.
-    InboundConnection(InboundGwJoinRequest),
+    InboundConnection {
+        id: Transaction,
+        conn: PeerConnection,
+        joiner: PeerId,
+        op: Option<ConnectOp>,
+    },
     /// An outbound connection to a peer was successfully established.
     OutboundConnectionSuccessful {
         peer_id: PeerId,
@@ -66,6 +72,7 @@ pub(super) enum Event {
     OutboundGatewayConnectionSuccessful {
         peer_id: PeerId,
         connection: PeerConnection,
+        remaining_checks: usize,
     },
     /// Clean up a transaction that was completed or duplicate.
     RemoveTransaction(Transaction),
@@ -213,6 +220,7 @@ impl HandshakeHandler {
                             if let Some(addr) = connection.my_address() {
                                 tracing::debug!(%addr, "Attempting setting own peer key");
                                 self.connection_manager.try_set_peer_key(addr);
+                                self.connection_manager.update_location(Some(Location::from_address(&addr)));
                             }
                             tracing::debug!(at=?connection.my_address(), from=%connection.remote_addr(), "Outbound connection to gw successful");
                             self.wait_for_gw_confirmation(id, connection, Ring::DEFAULT_MAX_HOPS_TO_LIVE).await?;
@@ -224,16 +232,15 @@ impl HandshakeHandler {
                             tracing::debug!(at=?tracker.gw_conn.my_address(), gw=%tracker.gw_conn.remote_addr(), "Done checking, connection not accepted by gw, dropping connection");
                             Ok(Event::OutboundGatewayConnectionRejected { peer_id: tracker.gw_peer.peer })
                         }
-                        // Some(Ok(InternalEvent::OutboundGwConnRejected(peer_id))) => {
-                        //     tracing::debug!(from=%peer_id.addr, "Outbound connection to gw rejected");
-                        //     return Ok(Event::OutboundGatewayConnectionRejected { peer_id });
-                        // }
                         Some(Ok(InternalEvent::OutboundGwConnConfirmed(tracker))) => {
                             tracing::debug!(at=?tracker.gw_conn.my_address(), from=%tracker.gw_conn.remote_addr(), "Outbound connection to gw confirmed");
                             self.connected.insert(tracker.gw_conn.remote_addr());
                             self.connecting.remove(&tracker.gw_conn.remote_addr());
-                            // FIXME: at p2p_protoc we need to continue this transaction keeping track of the remaining checks at this point
-                            return Ok(Event::OutboundGatewayConnectionSuccessful { peer_id: tracker.gw_peer.peer, connection: tracker.gw_conn  });
+                            return Ok(Event::OutboundGatewayConnectionSuccessful {
+                                peer_id: tracker.gw_peer.peer,
+                                connection: tracker.gw_conn,
+                                remaining_checks: tracker.remaining_checks,
+                            });
                         }
                         Some(Ok(InternalEvent::NextCheck(tracker))) => {
                             self.ongoing_outbound_connections.push(
@@ -261,14 +268,15 @@ impl HandshakeHandler {
                             self.outbound_messages.remove(&addr);
                             continue;
                         }
-                        Some(Ok(InternalEvent::InboundGwJoinRequest(req))) => {
-                            return Ok(Event::InboundConnection(req));
-                        }
                         Some(Err((peer_id, error))) => {
                             tracing::debug!(from=%peer_id.addr, "Outbound connection failed: {error}");
                             self.connecting.remove(&peer_id.addr);
                             self.outbound_messages.remove(&peer_id.addr);
                             Ok(Event::OutboundConnectionFailed { peer_id, error: error.into() })
+                        }
+                        Some(Ok(other)) => {
+                            tracing::error!("Unexpected event: {other:?}");
+                            continue;
                         }
                         None => Err(HandshakeError::ChannelClosed),
                     };
@@ -308,7 +316,38 @@ impl HandshakeHandler {
                                     return Err(e.into());
                                 }
 
-                                return Ok(Event::InboundConnection(req));
+                                let InboundGwJoinRequest { conn, id, joiner, hops_to_live, max_hops_to_live, skip_list } = req;
+
+                                let ok = {
+                                    // TODO: refactor this so it happens in the background out of the main handler loop
+                                    let mut nw_bridge = ForwardPeerMessage {
+                                        msg: parking_lot::Mutex::new(None),
+                                    };
+                                    let my_peer_id = self.connection_manager.own_location();
+                                    let joiner_loc = Location::from_address(&conn.remote_addr());
+                                    let joiner_pk_loc = PeerKeyLocation {
+                                        peer: joiner.clone(),
+                                        location: Some(joiner_loc),
+                                    };
+                                   let f = forward_conn(id,
+                                        &self.connection_manager,
+                                        self.router.clone(),
+                                        &mut nw_bridge,
+                                        (my_peer_id.clone(), joiner_pk_loc.clone()),
+                                        hops_to_live,
+                                        max_hops_to_live,
+                                        true,
+                                        skip_list,
+                                    );
+                                    match f.await {
+                                        Err(err) => {
+                                                tracing::error!(%err, "Error forwarding connection");
+                                                continue;
+                                        }
+                                        Ok(ok) => ok,
+                                    }
+                                };
+                                return Ok(Event::InboundConnection { id, conn, joiner, op: ok.map(|ok| ConnectOp::new(id, Some(ok), None, None)) });
                             } else {
                                 let InboundGwJoinRequest { mut conn, id, hops_to_live, max_hops_to_live, skip_list, .. } = req;
                                 let remote = conn.remote_addr();
@@ -354,10 +393,6 @@ impl HandshakeHandler {
                             self.connecting.remove(&addr);
                             continue;
                         }
-                        InternalEvent::OutboundGwConnEstablished(peer_id, connection) => {
-                            tracing::debug!(at=?connection.my_address(), from=%connection.remote_addr(), "Outbound connection successful");
-                            return Ok(Event::OutboundConnectionSuccessful { peer_id, connection });
-                        }
                         other => {
                             tracing::error!("Unexpected event: {other:?}");
                             continue;
@@ -389,40 +424,6 @@ impl HandshakeHandler {
         conn: &mut PeerConnection,
         transaction: &mut TransientConnection,
     ) -> Result<ForwardResult, HandshakeError> {
-        // Attempt forwarding the connection request to the next hop and wait for answers
-        // then return those answers to the transitory peer connection.
-        struct ForwardPeerMessage {
-            msg: parking_lot::Mutex<Option<(PeerId, NetMessage)>>,
-        }
-
-        impl NetworkBridge for ForwardPeerMessage {
-            async fn send(
-                &self,
-                target: &PeerId,
-                forward_msg: NetMessage,
-            ) -> super::ConnResult<()> {
-                debug_assert!(matches!(
-                    forward_msg,
-                    NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
-                        msg: ConnectRequest::CheckConnectivity { .. },
-                        ..
-                    }))
-                ));
-                self.msg
-                    .try_lock()
-                    .expect("unique ref")
-                    .replace((target.clone(), forward_msg));
-                Ok(())
-            }
-
-            async fn drop_connection(&mut self, _: &PeerId) -> super::ConnResult<()> {
-                if cfg!(debug_assertions) {
-                    unreachable!()
-                }
-                Ok(())
-            }
-        }
-
         let mut nw_bridge = ForwardPeerMessage {
             msg: parking_lot::Mutex::new(None),
         };
@@ -623,8 +624,38 @@ impl HandshakeHandler {
     }
 }
 
+// Attempt forwarding the connection request to the next hop and wait for answers
+// then return those answers to the transitory peer connection.
+struct ForwardPeerMessage {
+    msg: parking_lot::Mutex<Option<(PeerId, NetMessage)>>,
+}
+
+impl NetworkBridge for ForwardPeerMessage {
+    async fn send(&self, target: &PeerId, forward_msg: NetMessage) -> super::ConnResult<()> {
+        debug_assert!(matches!(
+            forward_msg,
+            NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
+                msg: ConnectRequest::CheckConnectivity { .. },
+                ..
+            }))
+        ));
+        self.msg
+            .try_lock()
+            .expect("unique ref")
+            .replace((target.clone(), forward_msg));
+        Ok(())
+    }
+
+    async fn drop_connection(&mut self, _: &PeerId) -> super::ConnResult<()> {
+        if cfg!(debug_assertions) {
+            unreachable!()
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
-pub(super) struct InboundGwJoinRequest {
+struct InboundGwJoinRequest {
     pub conn: PeerConnection,
     pub id: Transaction,
     pub joiner: PeerId,
@@ -640,7 +671,6 @@ enum InternalEvent {
     OutboundConnEstablished(PeerId, PeerConnection),
     OutboundGwConnEstablished(PeerId, PeerConnection),
     OutboundGwConnConfirmed(AcceptedTracker),
-    // OutboundGwConnRejected(PeerId),
     DropInboundConnection(SocketAddr),
     RemoteConnectionAttempt {
         remote: PeerId,
@@ -721,49 +751,6 @@ async fn wait_for_gw_confirmation(
 }
 
 async fn check_remaining_hops(mut tracker: AcceptedTracker) -> OutboundConnResult {
-    // let mut gw_accepted = false;
-    // loop {
-    //     let msg = tokio::time::timeout(timeout_duration, conn.recv())
-    //         .await
-    //         .map_err(|_| {
-    //             tracing::debug!(from = %gw_peer_id, "Timed out waiting for response from gw");
-    //             (
-    //                 gw_peer_id.clone(),
-    //                 HandshakeError::ConnectionClosed(conn.remote_addr()),
-    //             )
-    //         })?
-    //         .map_err(|e| (gw_peer_id.clone(), HandshakeError::TransportError(e)))?;
-    //     let deserialized = decode_msg(&msg).map_err(|e| (gw_peer_id.clone(), e.into()))?;
-    //     tracing::debug!(%deserialized, at=?conn.my_address(), from=%conn.remote_addr(), "Received answer from gw");
-    //     match deserialized {
-    //         NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
-    //             msg:
-    //                 ConnectResponse::AcceptedBy {
-    //                     accepted, acceptor, ..
-    //                 },
-    //             ..
-    //         })) => {
-    //             if accepted && acceptor.peer.addr == conn.remote_addr() {
-    //                 // this is a message from the gw indicating they accept, but there could be an other remote address
-    //                 // inbound connection,
-    //                 gw_accepted = true;
-    //             } else {
-    //                 remaining_checks -= 1;
-    //             }
-    //             break;
-    //         }
-    //         NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
-    //             msg: ConnectRequest::FindOptimalPeer { query_target, .. },
-    //             ..
-    //         })) => {
-    //             debug_assert_eq!(query_target.peer, this_peer);
-    //             tracing::warn!(from=%conn.remote_addr(), "Received FindOptimalPeer request, ignoring");
-    //             continue;
-    //         }
-    //         other => return Err((gw_peer_id, HandshakeError::UnexpectedMessage(other))),
-    //     }
-    // }
-
     let remote_addr = tracker.gw_conn.remote_addr();
     let gw_peer_id = tracker.gw_peer.peer.clone();
     while tracker.remaining_checks > 0 {
@@ -1249,8 +1236,8 @@ mod tests {
             let event =
                 tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
             match event {
-                Event::InboundConnection(req) => {
-                    assert_eq!(req.conn.remote_addr(), remote_addr);
+                Event::InboundConnection { conn, .. } => {
+                    assert_eq!(conn.remote_addr(), remote_addr);
                     Ok(())
                 }
                 other => bail!("Unexpected event: {:?}", other),
@@ -1465,11 +1452,11 @@ mod tests {
                     tokio::time::timeout(Duration::from_secs(5), gw_handler.wait_for_events())
                         .await??;
                 match event {
-                    Event::InboundConnection(InboundGwJoinRequest {
+                    Event::InboundConnection {
                         conn: first_peer_conn,
                         joiner: third_party_peer,
                         ..
-                    }) => {
+                    } => {
                         tracing::info!("Received join request from joiner");
                         assert_eq!(third_party_peer.pub_key, peer_pub_key);
                         assert_eq!(first_peer_conn.remote_addr(), peer_addr);
@@ -1501,27 +1488,11 @@ mod tests {
                         ));
                         break;
                     }
-                    other => bail!("Unexpected event: {:?}", other), // FIXME: is getting rejected even though it should be able to forward
+                    other => bail!("Unexpected event: {:?}", other),
                 }
             }
 
             assert!(third_party.is_some());
-
-            // loop {
-            //     let event =
-            //         tokio::time::timeout(Duration::from_secs(5), peer_handler.wait_for_events())
-            //             .await??;
-            //     if let Event::InboundConnection(req) = event {
-            //         assert_eq!(req.conn.remote_addr(), joiner_addr);
-            //         gw_handler
-            //             .connection_manager
-            //             .add_connection(Connection::new(
-            //                 joiner_peer_id,
-            //                 Location::from_address(&joiner_addr),
-            //             ));
-            //         break Ok(());
-            //     }
-            // }
             Ok(())
         };
 
@@ -1756,8 +1727,11 @@ mod tests {
                         }
                         received_forward_transaction = true;
                     }
-                    Event::InboundConnection(req) => {
-                        tracing::info!("Inbound connection request received: {:?}", req);
+                    Event::InboundConnection { conn, .. } => {
+                        tracing::info!(
+                            "Inbound connection request received: {:?}",
+                            conn.remote_addr()
+                        );
                     }
                     other => bail!("Unexpected event: {:?}", other),
                 }
