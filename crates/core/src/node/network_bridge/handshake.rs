@@ -59,6 +59,7 @@ pub(super) enum Event {
         conn: PeerConnection,
         joiner: PeerId,
         op: Option<ConnectOp>,
+        forward_info: Option<ForwardInfo>,
     },
     /// An outbound connection to a peer was successfully established.
     OutboundConnectionSuccessful {
