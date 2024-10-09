@@ -15,8 +15,10 @@ export let peers: PeerList = {};
 
 export function handleChange(peerChange: fbTopology.PeerChange) {
     const previousPeers = Object.keys(peers).length;
+
     try {
         const unpacked = peerChange.unpack();
+
         switch (unpacked.changeType) {
             case fbTopology.PeerChangeType.AddedConnection:
                 handleAddedConnection(
@@ -61,8 +63,23 @@ export function handleAddedConnection(
         return;
     }
     const added = peerChange;
+
+    const decoder = new TextDecoder();
+
+    if (added.to instanceof Uint8Array) {
+        const decoded_to = decoder.decode(added.to!);
+        console.log("Decoded to", decoded_to);
+    }
+
+    if (added.from instanceof Uint8Array) {
+        const decoded_from = decoder.decode(added.from!);
+        console.log("Decoded from", decoded_from);
+    }
+
     const from = new PeerId(added.from!);
     const to = new PeerId(added.to!);
+
+    console.log("Added connection from", from.full, "to", to.full);
 
     let transaction: string | null;
     if (typeof added.transaction === "string") {

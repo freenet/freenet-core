@@ -167,11 +167,10 @@ export const RingVisualization = ({main_peer, other_peers, selected_text = "Peer
                         y={`${
                             calculate_point(peer.localization, scale).y - 10
                         }`}
-                        className={`svg-tooltip-distance-${peer.localization
-                            .toString()
-                            .replace(".", "")}`}
+                        className={`svg-tooltip-distance-${peer.peerId}`}
 
                         fontWeight={100}
+                        style={{display: "none"}}
                     >
                         distance: {Math.abs(peer.localization - main_peer.localization)}
                     </text>
@@ -180,19 +179,6 @@ export const RingVisualization = ({main_peer, other_peers, selected_text = "Peer
                 </>
             );
 
-
-            // document.querySelector(selectors)
-
-
-            document.querySelector(`.svg-tooltip-distance-${peer.peerId}`)!.removeAttribute("style");
-            document.querySelector(`.svg-tooltip-distance-${peer.peerId}`)!.setAttribute("style", "display: none;");
-
-            // document.styleSheets[2].addRule(
-            //     `.svg-tooltip-distance-${peer.localization
-            //         .toString()
-            //         .replace(".", "")}`,
-            //     "display: none"
-            // );
 
             return return_values;
         })

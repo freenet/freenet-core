@@ -25,7 +25,7 @@ const ws_connection_interval = setInterval(() => {
             console.log("Attempting to establish WS Connection");
 
             const socket = new WebSocket(
-                "ws://127.0.0.1:55010/pull-stats/peer-changes/"
+                "ws://127.0.0.1:55010/v1/pull-stats/peer-changes/"
             );
 
             socket.addEventListener("open", () => {

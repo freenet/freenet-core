@@ -207,8 +207,8 @@ const ContractPeersHistory = ({
                     </tr>
                 </thead>
                 <tbody id="transaction-peers-history-b">
-                    {inner_tx_list.map((tx) => (
-                        <tr key={`${tx.requester}+${tx.change_type}+${tx.timestamp.toString()}+${tx.target}`}>
+                    {inner_tx_list.map((tx, index) => (
+                        <tr key={`${tx.requester}+${tx.change_type}+${tx.timestamp.toString()}+${tx.target}+${index}`}>
                             <td
                                 onClick={() =>
                                     add_filter("contract_id", tx.contract_id)
