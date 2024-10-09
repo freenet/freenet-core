@@ -32,7 +32,7 @@ impl ReDb {
                 txn.commit()?;
 
                 Ok(db)
-            },
+            }
             Err(e) => {
                 tracing::info!("failed to load contract store: {e}");
                 Err(e.into())

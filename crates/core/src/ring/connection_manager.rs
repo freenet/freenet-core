@@ -136,8 +136,7 @@ impl ConnectionManager {
     ///
     /// # Panic
     /// Will panic if the node checking for this condition has no location assigned.
-    // FIXME: peer here should not be optional ever
-    pub fn should_accept(&self, location: Location, peer: Option<&PeerId>) -> bool {
+    pub fn should_accept(&self, location: Location, peer_id: &PeerId) -> bool {
         tracing::debug!("Checking if should accept connection");
         let open = self
             .open_connections
@@ -152,14 +151,12 @@ impl ConnectionManager {
             return true;
         }
 
-        if let Some(peer_id) = peer {
-            if self.location_for_peer.read().get(peer_id).is_some() {
-                // avoid connecting more than once to the same peer
-                self.reserved_connections
-                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                tracing::debug!(%peer_id, "Peer already connected");
-                return false;
-            }
+        if self.location_for_peer.read().get(peer_id).is_some() {
+            // avoid connecting more than once to the same peer
+            self.reserved_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            tracing::debug!(%peer_id, "Peer already connected");
+            return false;
         }
 
         let my_location = self
@@ -183,7 +180,7 @@ impl ConnectionManager {
         if !accepted {
             self.reserved_connections
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        } else if let Some(peer_id) = peer {
+        } else {
             tracing::debug!(%peer_id, "Accepted connection, reserving spot");
             self.location_for_peer
                 .write()
@@ -235,7 +232,7 @@ impl ConnectionManager {
     pub fn try_set_peer_key(&self, addr: SocketAddr) -> Option<PeerId> {
         let mut this_peer = self.peer_key.lock();
         if this_peer.is_none() {
-            *this_peer = Some(PeerId::new(addr, (&*self.pub_key).clone()));
+            *this_peer = Some(PeerId::new(addr, (*self.pub_key).clone()));
             None
         } else {
             this_peer.clone()
@@ -254,7 +251,7 @@ impl ConnectionManager {
         let connection_type = if is_alive { "active" } else { "in transit" };
         tracing::debug!(%peer, "Pruning {} connection", connection_type);
 
-        let Some(loc) = self.location_for_peer.write().remove(&peer) else {
+        let Some(loc) = self.location_for_peer.write().remove(peer) else {
             if is_alive {
                 self.open_connections
                     .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -339,7 +336,7 @@ impl ConnectionManager {
         self.connections_by_location.read().len()
     }
 
-    pub(super) fn connected_peers<'a>(&'a self) -> impl Iterator<Item = PeerId> {
+    pub(super) fn connected_peers(&self) -> impl Iterator<Item = PeerId> {
         let read = self.location_for_peer.read();
         read.keys().cloned().collect::<Vec<_>>().into_iter()
     }

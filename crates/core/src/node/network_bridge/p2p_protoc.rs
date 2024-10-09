@@ -20,7 +20,8 @@ use tracing::Instrument;
 
 use crate::dev_tool::Location;
 use crate::node::network_bridge::handshake::{
-    EstablishConnection, Event as HandshakeEvent, HandshakeError, HandshakeHandler, OutboundMessage,
+    EstablishConnection, Event as HandshakeEvent, ForwardInfo, HandshakeError, HandshakeHandler,
+    OutboundMessage,
 };
 use crate::node::PeerId;
 use crate::transport::{
@@ -233,9 +234,11 @@ impl P2pConnManager {
                             NodeEvent::DropConnection(peer) => {
                                 tracing::debug!(%peer, "Dropping connection");
                                 if let Some(conn) = self.connections.remove(&peer) {
-                                    let _ = conn.send(Right(ConnEvent::NodeAction(
-                                        NodeEvent::DropConnection(peer),
-                                    )));
+                                    let _ = conn
+                                        .send(Right(ConnEvent::NodeAction(
+                                            NodeEvent::DropConnection(peer),
+                                        )))
+                                        .await;
                                 }
                             }
                             NodeEvent::ConnectPeer {
@@ -380,9 +383,7 @@ impl P2pConnManager {
         is_gw: bool,
     ) -> anyhow::Result<()> {
         tracing::info!(tx = %tx, remote = %peer, "Connecting to peer");
-        state
-            .awaiting_connection
-            .insert(peer.addr.clone(), callback);
+        state.awaiting_connection.insert(peer.addr, callback);
         match establish_connection
             .establish_conn(peer.clone(), tx, is_gw)
             .await
@@ -409,6 +410,7 @@ impl P2pConnManager {
                 conn,
                 joiner,
                 op,
+                forward_info,
             } => {
                 let (tx, rx) = mpsc::channel(1);
                 self.connections.insert(joiner.clone(), tx);
@@ -428,11 +430,19 @@ impl P2pConnManager {
                 if let Some(op) = op {
                     self.bridge
                         .op_manager
-                        .push(id, crate::operations::OpEnum::Connect(op.into()))
+                        .push(id, crate::operations::OpEnum::Connect(op))
                         .await?;
                 }
                 let task = peer_connection_listener(rx, conn).boxed();
                 state.peer_connections.push(task);
+
+                if let Some(ForwardInfo {
+                    target: forward_to,
+                    msg,
+                }) = forward_info.map(|b| *b)
+                {
+                    self.try_to_forward(&forward_to, msg).await?;
+                }
             }
             HandshakeEvent::TransientForwardTransaction {
                 target,
@@ -451,11 +461,7 @@ impl P2pConnManager {
                         );
                     }
                 }
-                if let Some(peer) = self.connections.get(&forward_to) {
-                    peer.send(Left(msg)).await?;
-                } else {
-                    tracing::warn!(%forward_to, "No connection to forward the message");
-                }
+                self.try_to_forward(&forward_to, *msg).await?;
             }
             HandshakeEvent::OutboundConnectionSuccessful {
                 peer_id,
@@ -499,6 +505,16 @@ impl P2pConnManager {
         Ok(())
     }
 
+    async fn try_to_forward(&mut self, forward_to: &PeerId, msg: NetMessage) -> anyhow::Result<()> {
+        if let Some(peer) = self.connections.get(forward_to) {
+            tracing::debug!(%forward_to, %msg, "Forwarding message to peer");
+            peer.send(Left(msg)).await?;
+        } else {
+            tracing::warn!(%forward_to, "No connection to forward the message");
+        }
+        Ok(())
+    }
+
     async fn handle_successful_connection(
         &mut self,
         peer_id: PeerId,
@@ -519,7 +535,7 @@ impl P2pConnManager {
                 let self_addr = connection
                     .my_address()
                     .ok_or_else(|| anyhow::anyhow!("self addr should be set"))?;
-                let key = (&*self.bridge.op_manager.ring.connection_manager.pub_key).clone();
+                let key = (*self.bridge.op_manager.ring.connection_manager.pub_key).clone();
                 PeerId::new(self_addr, key)
             };
             let _ = cb.send_result(Ok((peer_id, remaining_checks))).await;

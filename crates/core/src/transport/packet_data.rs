@@ -189,7 +189,7 @@ impl<const N: usize> PacketData<Plaintext, N> {
 
 #[cfg(test)]
 impl<const N: usize> PacketData<SymmetricAES, N> {
-    pub fn as_unknown(self) -> PacketData<UnknownEncryption, N> {
+    pub fn into_unknown(self) -> PacketData<UnknownEncryption, N> {
         PacketData {
             data: self.data,
             size: self.size,

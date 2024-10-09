@@ -370,7 +370,7 @@ pub(crate) mod test {
                             bincode::deserialize::<(EventId, TransportPublicKey)>(&data)
                             {
                                 tracing::debug!(peer = %self.id, %id, "Received event from the supervisor");
-                                if &pub_key == &self.id {
+                                if pub_key == self.id {
                                     let res = OpenRequest {
                                         client_id: ClientId::FIRST,
                                         request: self

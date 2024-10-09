@@ -282,7 +282,7 @@ impl Operation for ConnectOp {
                     let should_accept = if op_manager
                         .ring
                         .connection_manager
-                        .should_accept(joiner_loc, Some(&joiner.peer))
+                        .should_accept(joiner_loc, &joiner.peer)
                     {
                         tracing::debug!(tx = %id, %joiner, "Accepting connection from");
                         let (callback, mut result) = tokio::sync::mpsc::channel(1);
@@ -330,11 +330,14 @@ impl Operation for ConnectOp {
                             &op_manager.ring.connection_manager,
                             op_manager.ring.router.clone(),
                             network_bridge,
-                            (sender.clone(), joiner.clone()),
-                            *hops_to_live,
-                            *max_hops_to_live,
-                            should_accept,
-                            skip_list.clone(),
+                            ForwardParams {
+                                left_htl: *hops_to_live,
+                                max_htl: *max_hops_to_live,
+                                accepted: should_accept,
+                                skip_list: skip_list.clone(),
+                                req_peer: sender.clone(),
+                                joiner: joiner.clone(),
+                            },
                         )
                         .await?
                         {
@@ -679,7 +682,6 @@ pub(crate) async fn initial_join_procedure(
                     "Attempting to connect to {} gateways in parallel",
                     number_of_parallel_connections
                 );
-                // FIXME: we are attempting to connect to gws which are already connected
                 for gateway in op_manager
                     .ring
                     .is_not_connected(gateways.iter())
@@ -721,7 +723,7 @@ pub(crate) async fn join_ring_request(
             );
             OpError::ConnError(ConnectionError::LocationUnknown)
         })?,
-        Some(&gateway.peer),
+        &gateway.peer,
     ) {
         // ensure that we still want to connect AND reserve an spot implicitly
         return Err(OpError::ConnError(ConnectionError::UnwantedConnection));
@@ -851,20 +853,33 @@ async fn connect_request(
     }
 }
 
+pub(crate) struct ForwardParams {
+    pub left_htl: usize,
+    pub max_htl: usize,
+    pub accepted: bool,
+    pub skip_list: Vec<PeerId>,
+    pub req_peer: PeerKeyLocation,
+    pub joiner: PeerKeyLocation,
+}
+
 pub(crate) async fn forward_conn<NB>(
     id: Transaction,
     connection_manager: &ConnectionManager,
     router: Arc<parking_lot::RwLock<Router>>,
     network_bridge: &mut NB,
-    (req_peer, joiner): (PeerKeyLocation, PeerKeyLocation),
-    left_htl: usize,
-    max_htl: usize,
-    accepted: bool,
-    mut skip_list: Vec<PeerId>,
+    params: ForwardParams,
 ) -> Result<Option<ConnectState>, OpError>
 where
     NB: NetworkBridge,
 {
+    let ForwardParams {
+        left_htl,
+        max_htl,
+        accepted,
+        mut skip_list,
+        req_peer,
+        joiner,
+    } = params;
     if left_htl == 0 {
         tracing::debug!(
             tx = %id,
