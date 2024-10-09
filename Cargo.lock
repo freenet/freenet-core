@@ -1372,7 +1372,7 @@ dependencies = [
  "opentelemetry 0.26.0",
  "opentelemetry-jaeger",
  "opentelemetry-otlp",
- "opentelemetry_sdk 0.25.0",
+ "opentelemetry_sdk 0.26.0",
  "ordered-float 4.3.0",
  "parking_lot",
  "pav_regression",
@@ -2820,10 +2820,7 @@ dependencies = [
  "opentelemetry 0.25.0",
  "percent-encoding",
  "rand",
- "serde_json",
  "thiserror",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]
@@ -2843,6 +2840,8 @@ dependencies = [
  "rand",
  "serde_json",
  "thiserror",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
