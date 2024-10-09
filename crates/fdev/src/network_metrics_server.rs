@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, path::PathBuf, sync::Arc, time::Duration};
+use std::{fmt::Display, net::Ipv4Addr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -369,19 +369,19 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
 
 struct ServerState {
     changes: tokio::sync::broadcast::Sender<Change>,
-    peer_data: DashMap<PeerId, PeerData>,
+    peer_data: DashMap<String, PeerData>,
     transactions_data: DashMap<String, Vec<Change>>,
     contract_data: DashMap<String, ContractData>,
 }
 
 struct PeerData {
-    connections: Vec<(PeerId, f64)>,
+    connections: Vec<(String, f64)>,
     location: f64,
 }
 
 struct ContractData {
     location: f64,
-    connections: Vec<PeerId>,
+    connections: Vec<String>,
     key: String,
 }
 
@@ -434,18 +434,18 @@ pub(crate) enum Change {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct PeerIdHumanReadable(PeerId);
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub(crate) struct PeerIdHumanReadable(String);
 
-impl From<PeerId> for PeerIdHumanReadable {
-    fn from(peer_id: PeerId) -> Self {
-        Self(peer_id)
+impl Display for PeerIdHumanReadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
     }
 }
 
-impl std::fmt::Display for PeerIdHumanReadable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0.addr)
+impl From<String> for PeerIdHumanReadable {
+    fn from(peer_id: String) -> Self {
+        Self(peer_id)
     }
 }
 
@@ -453,11 +453,13 @@ impl ServerState {
     fn save_record(&self, change: ChangesWrapper) -> Result<(), anyhow::Error> {
         match change {
             ChangesWrapper::PeerChange(PeerChange::AddedConnection(added)) => {
-                let from_peer_id: PeerId = bincode::deserialize(added.from().bytes())?;
+                let from_peer_id = String::from_utf8(added.from().bytes().to_vec())?;
                 let from_loc = added.from_location();
 
-                let to_peer_id: PeerId = bincode::deserialize(added.to().bytes())?;
+                let to_peer_id = String::from_utf8(added.to().bytes().to_vec())?;
                 let to_loc = added.to_location();
+
+                tracing::info!(%from_peer_id, %to_peer_id, "--addedconnection adding connection");
 
                 match self.peer_data.entry(from_peer_id.clone()) {
                     dashmap::mapref::entry::Entry::Occupied(mut occ) => {
@@ -496,8 +498,8 @@ impl ServerState {
                 });
             }
             ChangesWrapper::PeerChange(PeerChange::RemovedConnection(removed)) => {
-                let from_peer_id: PeerId = bincode::deserialize(removed.from().bytes())?;
-                let at_peer_id: PeerId = bincode::deserialize(removed.at().bytes())?;
+                let from_peer_id = String::from_utf8(removed.from().bytes().to_vec())?;
+                let at_peer_id = String::from_utf8(removed.at().bytes().to_vec())?;
 
                 if let Some(mut entry) = self.peer_data.get_mut(&from_peer_id) {
                     entry
@@ -607,28 +609,26 @@ impl ServerState {
                     }
                 }
 
+                tracing::debug!(%tx_id, %key, %requester, %target, "checking values from save_record -- putsuccess");
+
                 match self.contract_data.entry(key.clone()) {
                     dashmap::mapref::entry::Entry::Occupied(mut occ) => {
                         let connections = &mut occ.get_mut().connections;
 
-                        let target_peer: PeerId = bincode::deserialize(&target.as_bytes())?;
-
-                        connections.push(target_peer);
+                        connections.push(target.clone());
                         //connections.sort_unstable_by(|a, b| a.cmp(&b.0));
                         //connections.dedup();
                     }
                     dashmap::mapref::entry::Entry::Vacant(vac) => {
-                        let target_peer: PeerId = bincode::deserialize(target.as_bytes())?;
-
                         vac.insert(ContractData {
-                            connections: vec![target_peer],
+                            connections: vec![target.clone()],
                             location: contract_location,
                             key: key.clone(),
                         });
                     }
                 }
 
-                tracing::debug!(%tx_id, %key, %requester, %target, "checking values from save_record -- putsuccess");
+                tracing::debug!("after contract_data updates");
 
                 let _ = self.changes.send(Change::PutSuccess {
                     tx_id,

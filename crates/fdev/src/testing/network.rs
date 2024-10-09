@@ -627,6 +627,8 @@ impl Runnable for NetworkPeer {
             }
         };
 
+        tracing::info!("Starting event generator for peer {}", peer.clone());
+
         let event_generator =
             NetworkEventGenerator::new(peer.clone(), memory_event_generator, ws_client);
 

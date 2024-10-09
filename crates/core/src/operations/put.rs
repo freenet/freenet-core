@@ -182,6 +182,7 @@ impl Operation for PutOp {
                         tx = %id,
                         %key,
                         target = %target.peer,
+                        sender = %sender.peer,
                         "Puttting contract at target peer",
                     );
 

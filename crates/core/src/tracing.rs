@@ -494,7 +494,7 @@ async fn connect_to_metrics_server() -> Option<WebSocketStream<MaybeTlsStream<Tc
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_METRICS_SERVER_PORT);
 
-    tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/push-stats/"))
+    tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/v1/push-stats/"))
         .await
         .map(|(ws_stream, _)| {
             tracing::info!("Connected to network metrics server");
@@ -526,13 +526,16 @@ async fn send_to_metrics_server(
         }) => {
             let msg = PeerChange::added_connection_msg(
                 (&send_msg.tx != Transaction::NULL).then(|| send_msg.tx.to_string()),
-                (from_peer.clone(), from_loc.as_f64()),
-                (to_peer.clone(), to_loc.as_f64()),
+                (from_peer.clone().to_string(), from_loc.as_f64()),
+                (to_peer.clone().to_string(), to_loc.as_f64()),
             );
             ws_stream.send(Message::Binary(msg)).await
         }
         EventKind::Disconnected { from } => {
-            let msg = PeerChange::removed_connection_msg(from.clone(), send_msg.peer_id.clone());
+            let msg = PeerChange::removed_connection_msg(
+                from.clone().to_string(),
+                send_msg.peer_id.clone().to_string(),
+            );
             ws_stream.send(Message::Binary(msg)).await
         }
         EventKind::Put(PutEvent::Request {

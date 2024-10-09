@@ -225,15 +225,15 @@ impl ContractChange<'_> {
 
 impl PeerChange<'_> {
     pub fn current_state_msg<'a>(
-        to: PeerId,
+        to: String,
         to_location: f64,
-        connections: impl Iterator<Item = &'a (PeerId, f64)>,
+        connections: impl Iterator<Item = &'a (String, f64)>,
     ) -> Vec<u8> {
         let mut buf = flatbuffers::FlatBufferBuilder::new();
-        let to = buf.create_vector(&bincode::serialize(&to).unwrap());
+        let to = buf.create_vector(&to.to_string().as_bytes());
         let connections = connections
             .map(|(from, from_location)| {
-                let from = Some(buf.create_vector(&bincode::serialize(from).unwrap()));
+                let from = Some(buf.create_vector(&from.to_string().as_bytes()));
                 topology::AddedConnection::create(
                     &mut buf,
                     &topology::AddedConnectionArgs {
@@ -261,12 +261,12 @@ impl PeerChange<'_> {
 
     pub fn added_connection_msg(
         transaction: Option<impl AsRef<str>>,
-        (from, from_location): (PeerId, f64),
-        (to, to_location): (PeerId, f64),
+        (from, from_location): (String, f64),
+        (to, to_location): (String, f64),
     ) -> Vec<u8> {
         let mut buf = flatbuffers::FlatBufferBuilder::new();
-        let from = buf.create_vector(&bincode::serialize(&from).unwrap());
-        let to = buf.create_vector(&bincode::serialize(&to).unwrap());
+        let from = buf.create_vector(&from.to_string().as_bytes());
+        let to = buf.create_vector(&to.to_string().as_bytes());
         let transaction = transaction.map(|t| buf.create_string(t.as_ref()));
         let add_conn = topology::AddedConnection::create(
             &mut buf,
@@ -290,10 +290,10 @@ impl PeerChange<'_> {
         buf.finished_data().to_vec()
     }
 
-    pub fn removed_connection_msg(at: PeerId, from: PeerId) -> Vec<u8> {
+    pub fn removed_connection_msg(at: String, from: String) -> Vec<u8> {
         let mut buf = flatbuffers::FlatBufferBuilder::new();
-        let at = buf.create_vector(&bincode::serialize(&at).unwrap());
-        let from = buf.create_vector(&bincode::serialize(&from).unwrap());
+        let at = buf.create_vector(&at.as_bytes());
+        let from = buf.create_vector(&from.as_bytes());
         let remove_conn = topology::RemovedConnection::create(
             &mut buf,
             &topology::RemovedConnectionArgs {
