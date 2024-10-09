@@ -330,11 +330,14 @@ impl Operation for ConnectOp {
                             &op_manager.ring.connection_manager,
                             op_manager.ring.router.clone(),
                             network_bridge,
-                            (sender.clone(), joiner.clone()),
-                            *hops_to_live,
-                            *max_hops_to_live,
-                            should_accept,
-                            skip_list.clone(),
+                            ForwardParams {
+                                left_htl: *hops_to_live,
+                                max_htl: *max_hops_to_live,
+                                accepted: should_accept,
+                                skip_list: skip_list.clone(),
+                                req_peer: sender.clone(),
+                                joiner: joiner.clone(),
+                            },
                         )
                         .await?
                         {
@@ -851,20 +854,33 @@ async fn connect_request(
     }
 }
 
+pub(crate) struct ForwardParams {
+    pub left_htl: usize,
+    pub max_htl: usize,
+    pub accepted: bool,
+    pub skip_list: Vec<PeerId>,
+    pub req_peer: PeerKeyLocation,
+    pub joiner: PeerKeyLocation,
+}
+
 pub(crate) async fn forward_conn<NB>(
     id: Transaction,
     connection_manager: &ConnectionManager,
     router: Arc<parking_lot::RwLock<Router>>,
     network_bridge: &mut NB,
-    (req_peer, joiner): (PeerKeyLocation, PeerKeyLocation),
-    left_htl: usize,
-    max_htl: usize,
-    accepted: bool,
-    mut skip_list: Vec<PeerId>,
+    params: ForwardParams,
 ) -> Result<Option<ConnectState>, OpError>
 where
     NB: NetworkBridge,
 {
+    let ForwardParams {
+        left_htl,
+        max_htl,
+        accepted,
+        mut skip_list,
+        req_peer,
+        joiner,
+    } = params;
     if left_htl == 0 {
         tracing::debug!(
             tx = %id,

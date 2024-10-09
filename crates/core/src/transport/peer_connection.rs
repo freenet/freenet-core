@@ -106,6 +106,20 @@ impl std::fmt::Debug for PeerConnection {
     }
 }
 
+#[cfg(test)]
+type PeerConnectionMock = (
+    PeerConnection,
+    mpsc::Sender<PacketData<UnknownEncryption>>,
+    mpsc::Receiver<(SocketAddr, Arc<[u8]>)>,
+);
+
+#[cfg(test)]
+type RemoteConnectionMock = (
+    RemoteConnection,
+    mpsc::Sender<PacketData<UnknownEncryption>>,
+    mpsc::Receiver<(SocketAddr, Arc<[u8]>)>,
+);
+
 impl PeerConnection {
     pub(super) fn new(remote_conn: RemoteConnection) -> Self {
         Self {
@@ -123,11 +137,7 @@ impl PeerConnection {
         my_address: SocketAddr,
         outbound_symmetric_key: Aes128Gcm,
         inbound_symmetric_key: Aes128Gcm,
-    ) -> (
-        Self,
-        mpsc::Sender<PacketData<UnknownEncryption>>,
-        mpsc::Receiver<(SocketAddr, Arc<[u8]>)>,
-    ) {
+    ) -> PeerConnectionMock {
         use parking_lot::Mutex;
         let (outbound_packets, outbound_packets_recv) = mpsc::channel(1);
         let (inbound_packet_sender, inbound_packet_recv) = mpsc::channel(1);
@@ -155,11 +165,7 @@ impl PeerConnection {
         my_address: SocketAddr,
         outbound_symmetric_key: Aes128Gcm,
         inbound_symmetric_key: Aes128Gcm,
-    ) -> (
-        RemoteConnection,
-        mpsc::Sender<PacketData<UnknownEncryption>>,
-        mpsc::Receiver<(SocketAddr, Arc<[u8]>)>,
-    ) {
+    ) -> RemoteConnectionMock {
         use parking_lot::Mutex;
         let (outbound_packets, outbound_packets_recv) = mpsc::channel(1);
         let (inbound_packet_sender, inbound_packet_recv) = mpsc::channel(1);
