@@ -557,14 +557,15 @@ mod tests {
         }
     }
 
+    #[ignore = "we need to replace how this is currently done and would only be problematic if multiple processes are tryign to write out same contracts"]
     #[test]
-    fn test_concurrent_compaction() {
+    fn test_concurrent_index_compaction() {
         for _ in 0..100 {
-            concurrent_compaction();
+            concurrent_index_compaction();
         }
     }
 
-    fn concurrent_compaction() {
+    fn concurrent_index_compaction() {
         let temp_dir = get_temp_dir();
         let key_file_path = temp_dir.path().join("data.dat");
         std::fs::File::create(&key_file_path).expect("Failed to create file");

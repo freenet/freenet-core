@@ -376,7 +376,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "assertion failed: !neighbors.is_empty()")]
     fn test_empty_neighbors_error() {
         let sw = RequestDensityTracker::new(10);
         let empty_neighbors = BTreeMap::new();
