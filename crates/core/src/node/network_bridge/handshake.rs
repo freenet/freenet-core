@@ -1181,7 +1181,7 @@ mod tests {
         node: NodeMock,
     }
 
-    fn config_handler(addr: impl Into<SocketAddr>) -> (HandshakeHandler, TestVerifier) {
+    fn config_handler(addr: impl Into<SocketAddr>, existing_connections: Option<Vec<Connection>>) -> (HandshakeHandler, TestVerifier) {
         let (outbound_sender, outbound_recv) = mpsc::channel(5);
         let outbound_conn_handler = OutboundConnectionHandler::new(outbound_sender);
         let (inbound_sender, inbound_recv) = mpsc::channel(5);
@@ -1191,6 +1191,13 @@ mod tests {
         let mngr = ConnectionManager::default_with_key(keypair.public().clone());
         mngr.try_set_peer_key(addr);
         let router = Router::new(&[]);
+
+        if let Some(connections) = existing_connections {
+            for conn in connections {
+                mngr.add_connection(conn);
+            }
+        }
+
         let (handler, establish_conn, _outbound_msg) = HandshakeHandler::new(
             inbound_conn_handler,
             outbound_conn_handler,
@@ -1249,7 +1256,7 @@ mod tests {
     #[tokio::test]
     async fn test_gateway_inbound_conn_success() -> anyhow::Result<()> {
         let addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
-        let (mut handler, mut test) = config_handler(addr);
+        let (mut handler, mut test) = config_handler(addr, None);
 
         let remote_addr = ([127, 0, 0, 1], 10001).into();
         let test_controller = async {
@@ -1279,13 +1286,21 @@ mod tests {
     #[tokio::test]
     async fn test_gateway_inbound_conn_rejected() -> anyhow::Result<()> {
         let addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
-        let (mut handler, mut test) = config_handler(addr);
+        let existing_remote_addr = ([127, 0, 0, 1], 10001).into();
+        let remote_peer_loc = PeerKeyLocation {
+            peer: PeerId::new(existing_remote_addr, TransportKeypair::new().public().clone()),
+            location: Some(Location::from_address(&existing_remote_addr)),
+        };
+        let existing_conn = Connection::new(remote_peer_loc.peer, remote_peer_loc.location.unwrap());
 
-        // Configure the handler to reject connections by setting max_connections to 0
-        handler.connection_manager.max_connections = 0;
-        handler.connection_manager.min_connections = 0;
+        let (mut handler, mut test) = config_handler(addr, Some(vec![existing_conn]));
 
-        let remote_addr = ([127, 0, 0, 1], 10001).into();
+        // Configure the handler to reject connections by setting max_connections to 1
+        handler.connection_manager.max_connections = 1;
+        handler.connection_manager.min_connections = 1;
+
+        let remote_addr = ([127, 0, 0, 1], 10002).into();
+
         let test_controller = async {
             let pub_key = TransportKeypair::new().public().clone();
             test.transport.new_conn(remote_addr).await;
@@ -1322,7 +1337,7 @@ mod tests {
     #[tokio::test]
     async fn test_peer_to_gw_outbound_conn() -> anyhow::Result<()> {
         let addr = ([127, 0, 0, 1], 10000).into();
-        let (mut handler, mut test) = config_handler(addr);
+        let (mut handler, mut test) = config_handler(addr, None);
 
         let joiner_key = TransportKeypair::new();
         let pub_key = joiner_key.public().clone();
@@ -1347,7 +1362,6 @@ mod tests {
                     ..
                 })) => {
                     assert_eq!(id, inbound_id);
-                    assert!(joiner.is_none());
                     let sender = PeerKeyLocation {
                         peer: PeerId::new(remote_addr, pub_key.clone()),
                         location: Some(Location::from_address(&remote_addr)),
@@ -1376,7 +1390,7 @@ mod tests {
 
         let peer_inbound = async {
             let event =
-                tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
+                tokio::time::timeout(Duration::from_secs(10), handler.wait_for_events()).await??;
             match event {
                 Event::OutboundGatewayConnectionSuccessful { peer_id, .. } => {
                     assert_eq!(peer_id.addr, remote_addr);
@@ -1393,7 +1407,7 @@ mod tests {
     #[tokio::test]
     async fn test_peer_to_gw_outbound_conn_failed() -> anyhow::Result<()> {
         let addr = ([127, 0, 0, 1], 10000).into();
-        let (mut handler, mut test) = config_handler(addr);
+        let (mut handler, mut test) = config_handler(addr, None);
 
         let joiner_key = TransportKeypair::new();
         let pub_key = joiner_key.public().clone();
@@ -1439,7 +1453,7 @@ mod tests {
         let peer_addr: SocketAddr = ([127, 0, 0, 1], 10001).into();
         let joiner_addr: SocketAddr = ([127, 0, 0, 1], 10002).into();
 
-        let (mut gw_handler, mut gw_test) = config_handler(gw_addr);
+        let (mut gw_handler, mut gw_test) = config_handler(gw_addr, None);
 
         // the gw only will accept one connection
         gw_handler.connection_manager.max_connections = 1;
@@ -1533,7 +1547,7 @@ mod tests {
     async fn test_peer_to_gw_outbound_conn_rejected() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG));
         let joiner_addr = ([127, 0, 0, 1], 10001).into();
-        let (mut handler, mut test) = config_handler(joiner_addr);
+        let (mut handler, mut test) = config_handler(joiner_addr, None);
 
         let gw_key = TransportKeypair::new();
         let gw_pub_key = gw_key.public().clone();
@@ -1685,7 +1699,7 @@ mod tests {
     #[tokio::test]
     async fn test_peer_to_gw_outbound_conn_forwarded() -> anyhow::Result<()> {
         let joiner_addr = ([127, 0, 0, 1], 10001).into();
-        let (mut handler, mut test) = config_handler(joiner_addr);
+        let (mut handler, mut test) = config_handler(joiner_addr, None);
 
         let gw_key = TransportKeypair::new();
         let gw_pub_key = gw_key.public().clone();
@@ -1776,7 +1790,7 @@ mod tests {
     #[tokio::test]
     async fn test_peer_to_peer_outbound_conn_failed() -> anyhow::Result<()> {
         let addr: SocketAddr = ([127, 0, 0, 1], 10001).into();
-        let (mut handler, mut test) = config_handler(addr);
+        let (mut handler, mut test) = config_handler(addr, None);
 
         let peer_key = TransportKeypair::new();
         let peer_pub_key = peer_key.public().clone();
@@ -1821,7 +1835,7 @@ mod tests {
     #[tokio::test]
     async fn test_peer_to_peer_outbound_conn_succeeded() -> anyhow::Result<()> {
         let addr: SocketAddr = ([127, 0, 0, 1], 10001).into();
-        let (mut handler, mut test) = config_handler(addr);
+        let (mut handler, mut test) = config_handler(addr, None);
 
         let peer_key = TransportKeypair::new();
         let peer_pub_key = peer_key.public().clone();

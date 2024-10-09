@@ -45,6 +45,7 @@ impl ConnectionManager {
         let loc = conn.location.location.unwrap_or_else(Location::random);
         let mut conns = self.connections_by_location.write();
         conns.entry(loc).or_default().push(conn);
+        self.open_connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
