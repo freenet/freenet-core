@@ -249,6 +249,7 @@ impl<T> Drop for UdpPacketsListener<T> {
 impl<S: Socket> UdpPacketsListener<S> {
     #[tracing::instrument(level = "debug", name = "transport_listener", fields(peer = %self.this_peer_keypair.public), skip_all)]
     async fn listen(mut self) -> Result<(), TransportError> {
+        tracing::debug!(%self.this_addr, "listening for packets");
         let mut buf = [0u8; MAX_PACKET_SIZE];
         let mut ongoing_connections: BTreeMap<SocketAddr, OngoingConnection> = BTreeMap::new();
         let mut ongoing_gw_connections: BTreeMap<
@@ -365,7 +366,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                 }
                 // Handling of connection events
                 connection_event = self.connection_handler.recv() => {
-                    let Some((remote_addr, event)) = connection_event else { return Ok(()); };
+                    let Some((remote_addr, event)) = connection_event else {
+                        tracing::debug!("connection handler closed");
+                        return Ok(());
+                    };
                     if let Some(_conn) = self.remote_connections.remove(&remote_addr) {
                         tracing::warn!(%remote_addr, "connection already established, dropping old connection");
                     }
@@ -1005,14 +1009,12 @@ mod test {
     ) -> Result<
         (
             TransportPublicKey,
-            mpsc::Receiver<PeerConnection>,
+            (OutboundConnectionHandler, mpsc::Receiver<PeerConnection>),
             SocketAddr,
         ),
         anyhow::Error,
     > {
-        set_peer_connection_in(packet_drop_policy, true)
-            .await
-            .map(|(pk, (_, i), s)| (pk, i, s))
+        set_peer_connection_in(packet_drop_policy, true).await
     }
 
     async fn set_peer_connection_in(
@@ -1122,12 +1124,17 @@ mod test {
                         to.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                         to.tick().await;
                         let start = std::time::Instant::now();
-                        while messages.len() < test_gen_cp.expected_iterations() {
+                        let iters = test_gen_cp.expected_iterations();
+                        while messages.len() < iters {
                             peer_conn.send(test_gen_cp.gen_msg()).await?;
                             let msg = tokio::select! {
                                 _ = to.tick() => {
                                     return Err::<_, anyhow::Error>(
-                                        anyhow::anyhow!("timeout waiting for messages, total time: {:.2}", start.elapsed().as_secs_f64())
+                                        anyhow::anyhow!(
+                                            "timeout waiting for messages, total time: {time:.2}; done iters {iter}", 
+                                            time = start.elapsed().as_secs_f64(),
+                                            iter = messages.len()
+                                        )
                                     );
                                 }
                                 msg = peer_conn.recv() => {
@@ -1146,6 +1153,7 @@ mod test {
                                 }
                             }
                         }
+                        let _ = peer_conn.send(test_gen_cp.gen_msg()).await;
 
                         tracing::info!(%peer_addr, "finished");
                         let _ = tokio::time::timeout(extra_wait, peer_conn.recv()).await;
@@ -1260,7 +1268,7 @@ mod test {
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+            let mut conn = tokio::time::timeout(Duration::from_secs(60), peer_a_conn).await??;
             let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
             conn.send("some data").await.unwrap();
             Ok::<_, anyhow::Error>(())
@@ -1268,7 +1276,7 @@ mod test {
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            let mut conn = tokio::time::timeout(Duration::from_secs(60), peer_b_conn).await??;
             let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
             // we should receive the message
             let b = conn.recv().await.unwrap();
@@ -1296,7 +1304,7 @@ mod test {
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+            let mut conn = tokio::time::timeout(Duration::from_secs(60), peer_a_conn).await??;
             let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
             conn.send("some foo").await.unwrap();
 
@@ -1309,7 +1317,7 @@ mod test {
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            let mut conn = tokio::time::timeout(Duration::from_secs(60), peer_b_conn).await??;
             let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
 
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1333,9 +1341,11 @@ mod test {
 
     #[tokio::test]
     async fn simulate_gateway_connection() -> anyhow::Result<()> {
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE), None);
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
             set_peer_connection(Default::default()).await?;
-        let (gw_pub, mut gw_conn, gw_addr) = set_gateway_connection(Default::default()).await?;
+        let (gw_pub, (_oc, mut gw_conn), gw_addr) =
+            set_gateway_connection(Default::default()).await?;
 
         let gw = tokio::spawn(async move {
             let gw_conn = gw_conn.recv();
@@ -1347,7 +1357,7 @@ mod test {
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            let _ = tokio::time::timeout(Duration::from_secs(60), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
@@ -1362,7 +1372,7 @@ mod test {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
             set_peer_connection(Default::default()).await?;
-        let (gw_pub, mut gw_conn, gw_addr) =
+        let (gw_pub, (_oc, mut gw_conn), gw_addr) =
             set_gateway_connection(PacketDropPolicy::Range(0..1)).await?;
 
         let gw = tokio::spawn(async move {
@@ -1390,7 +1400,7 @@ mod test {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
             set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
-        let (gw_pub, mut gw_conn, gw_addr) =
+        let (gw_pub, (_oc, mut gw_conn), gw_addr) =
             set_gateway_connection(PacketDropPolicy::Range(0..1)).await?;
 
         let gw = tokio::spawn(async move {
@@ -1418,7 +1428,8 @@ mod test {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
             set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
-        let (gw_pub, mut gw_conn, gw_addr) = set_gateway_connection(Default::default()).await?;
+        let (gw_pub, (_oc, mut gw_conn), gw_addr) =
+            set_gateway_connection(Default::default()).await?;
 
         let gw = tokio::spawn(async move {
             let gw_conn = gw_conn.recv();
@@ -1442,7 +1453,7 @@ mod test {
 
     #[tokio::test]
     async fn simulate_send_short_message() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE), None);
         #[derive(Clone, Copy)]
         struct TestData(&'static str, usize);
 
@@ -1613,7 +1624,7 @@ mod test {
             .take(5)
         {
             let wait_time = Duration::from_secs((((factor * 5.0 + 1.0) * 15.0) + 10.0) as u64);
-            tracing::info!(
+            println!(
                 "packet loss factor: {factor} (wait time: {wait_time})",
                 wait_time = wait_time.as_secs()
             );
