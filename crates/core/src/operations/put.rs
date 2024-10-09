@@ -368,7 +368,7 @@ impl Operation for PutOp {
                     return_msg = Some(PutMsg::SuccessfulPut {
                         id: *id,
                         target: upstream.clone(),
-                        key: key.clone(),
+                        key: *key,
                         sender,
                     });
                     new_state = None;
@@ -387,7 +387,7 @@ impl Operation for PutOp {
                                 this_peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
                                 "Peer completed contract value put",
                             );
-                            new_state = Some(PutState::Finished { key: key.clone() });
+                            new_state = Some(PutState::Finished { key });
 
                             if let Some(upstream) = upstream {
                                 return_msg = Some(PutMsg::SuccessfulPut {
@@ -605,7 +605,7 @@ async fn try_to_broadcast(
                 return_msg = Some(PutMsg::SuccessfulPut {
                     id,
                     target: upstream,
-                    key: key.clone(),
+                    key,
                     sender: op_manager.ring.connection_manager.own_location(),
                 });
             }

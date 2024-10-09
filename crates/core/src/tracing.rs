@@ -236,7 +236,7 @@ impl<'a> NetEventLog<'a> {
                 id: *id,
                 requester: sender.clone(),
                 target: target.clone(),
-                key: key.clone(),
+                key: *key,
                 timestamp: chrono::Utc::now().timestamp() as u64,
             }),
             NetMessageV1::Put(PutMsg::Broadcasting {
@@ -252,8 +252,8 @@ impl<'a> NetEventLog<'a> {
                 id: *id,
                 upstream: upstream.clone(),
                 broadcast_to: broadcast_to.clone(),
-                broadcasted_to: broadcasted_to.clone(),
-                key: key.clone(),
+                broadcasted_to: *broadcasted_to,
+                key: *key,
                 value: new_value.clone(),
                 sender: sender.clone(),
                 timestamp: chrono::Utc::now().timestamp() as u64,
@@ -268,7 +268,7 @@ impl<'a> NetEventLog<'a> {
             }) => EventKind::Put(PutEvent::BroadcastReceived {
                 id: *id,
                 requester: sender.peer.clone(),
-                key: key.clone(),
+                key: *key,
                 value: new_value.clone(),
                 target: target.clone(),
                 timestamp: chrono::Utc::now().timestamp() as u64,
@@ -277,14 +277,14 @@ impl<'a> NetEventLog<'a> {
                 key,
                 value: StoreResponse { state: Some(_), .. },
                 ..
-            }) => EventKind::Get { key: key.clone() },
+            }) => EventKind::Get { key: *key },
             NetMessageV1::Subscribe(SubscribeMsg::ReturnSub {
                 subscribed: true,
                 key,
                 sender,
                 ..
             }) => EventKind::Subscribed {
-                key: key.clone(),
+                key: *key,
                 at: sender.clone(),
             },
             _ => EventKind::Ignored,
@@ -1156,98 +1156,6 @@ pub(super) mod test {
             logs.iter().any(|log| {
                 &log.peer_id.pub_key == peer
                     && matches!(log.kind, EventKind::Connect(ConnectEvent::Connected { .. }))
-            })
-        }
-
-        pub fn has_put_contract(&self, peer: &PeerId, for_key: &ContractKey) -> bool {
-            let Ok(logs) = self.logs.try_lock() else {
-                return false;
-            };
-            let put_ops = logs.iter().filter_map(|l| match &l.kind {
-                EventKind::Put(ev) => Some((&l.tx, ev)),
-                _ => None,
-            });
-            let put_ops: HashMap<_, Vec<_>> = put_ops.fold(HashMap::new(), |mut acc, (id, ev)| {
-                acc.entry(id).or_default().push(ev);
-                acc
-            });
-
-            for (_tx, events) in put_ops {
-                let mut is_expected_key = false;
-                let mut is_expected_peer = false;
-                for ev in events {
-                    match ev {
-                        PutEvent::Request { key, .. } if key != for_key => break,
-                        PutEvent::Request { key, .. } if key == for_key => {
-                            is_expected_key = true;
-                        }
-                        PutEvent::PutSuccess { requester, .. } if &requester.peer == peer => {
-                            is_expected_peer = true;
-                        }
-                        _ => {}
-                    }
-                }
-                if is_expected_peer && is_expected_key {
-                    return true;
-                }
-            }
-            false
-        }
-
-        /// The contract was broadcasted from one peer to an other successfully.
-        #[cfg(test)]
-        pub fn contract_broadcasted(&self, for_key: &ContractKey) -> bool {
-            let Ok(logs) = self.logs.try_lock() else {
-                return false;
-            };
-            let put_broadcast_ops = logs.iter().filter_map(|l| match &l.kind {
-                EventKind::Put(ev @ PutEvent::BroadcastEmitted { .. })
-                | EventKind::Put(ev @ PutEvent::BroadcastReceived { .. }) => Some((&l.tx, ev)),
-                _ => None,
-            });
-            let put_broadcast_by_tx: HashMap<_, Vec<_>> =
-                put_broadcast_ops.fold(HashMap::new(), |mut acc, (id, ev)| {
-                    acc.entry(id).or_default().push(ev);
-                    acc
-                });
-            for (_tx, events) in put_broadcast_by_tx {
-                let mut was_emitted = false;
-                let mut was_received = false;
-                for ev in events {
-                    match ev {
-                        PutEvent::BroadcastEmitted { key, .. } if key.clone() == *for_key => {
-                            was_emitted = true;
-                        }
-                        PutEvent::BroadcastReceived { key, .. } if key.clone() == *for_key => {
-                            was_received = true;
-                        }
-                        _ => {}
-                    }
-                }
-                if was_emitted && was_received {
-                    return true;
-                }
-            }
-            false
-        }
-
-        pub fn has_got_contract(&self, peer: &PeerId, expected_key: &ContractKey) -> bool {
-            let Ok(logs) = self.logs.try_lock() else {
-                return false;
-            };
-            logs.iter().any(|log| {
-                &log.peer_id == peer
-                    && matches!(log.kind, EventKind::Get { ref key } if key == expected_key  )
-            })
-        }
-
-        pub fn is_subscribed_to_contract(&self, peer: &PeerId, expected_key: &ContractKey) -> bool {
-            let Ok(logs) = self.logs.try_lock() else {
-                return false;
-            };
-            logs.iter().any(|log| {
-                &log.peer_id == peer
-                    && matches!(log.kind, EventKind::Subscribed { ref key, .. } if key == expected_key  )
             })
         }
 

@@ -139,7 +139,7 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
 
                 tracing::error!(%received_random_id, "The message was not decoded by any fbs type");
                 tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
-                    format!("{decoding_errors}"),
+                    decoding_errors,
                 ))))
                 .await?;
             }
@@ -228,11 +228,11 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     tracing::info!("sending broadcast emitted");
                     ContractChange::broadcast_emitted_msg(
                         tx_id.clone(),
-                        upstream.to_string(),
+                        upstream,
                         broadcast_to.iter().map(|s| s.to_string()).collect(),
-                        *broadcasted_to as usize,
-                        key.to_string(),
-                        sender.to_string(),
+                        *broadcasted_to,
+                        key,
+                        sender,
                         *timestamp,
                         *contract_location,
                     )
@@ -247,10 +247,10 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                 } => {
                     tracing::info!("sending broadcast received");
                     ContractChange::broadcast_received_msg(
-                        tx_id.clone(),
-                        target.to_string(),
-                        requester.to_string(),
-                        key.to_string(),
+                        tx_id,
+                        target,
+                        requester,
+                        key,
                         *timestamp,
                         *contract_location,
                     )
