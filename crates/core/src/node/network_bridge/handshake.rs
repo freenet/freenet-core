@@ -300,7 +300,7 @@ impl HandshakeHandler {
                         InternalEvent::InboundGwJoinRequest(mut req) => {
                             let remote = req.conn.remote_addr();
                             let location = Location::from_address(&remote);
-                            let should_accept = self.connection_manager.should_accept(location, Some(&req.joiner));
+                            let should_accept = self.connection_manager.should_accept(location, &req.joiner);
                             if should_accept {
                                 let accepted_msg = NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
                                     id: req.id,

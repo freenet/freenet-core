@@ -367,7 +367,7 @@ impl SimNetwork {
 
             let mut config_args = ConfigArgs::default();
             config_args.id = Some(format!("{label}"));
-            // FIXME: Is necessary use config_args.build() for the simulation. Related with the FXIME in Config line 238
+            // TODO: it may be unnecessary use config_args.build() for the simulation. Related with the TODO in Config line 238
             let mut config = NodeConfig::new(config_args.build().unwrap()).await.unwrap();
             config.key_pair = keypair;
             config.network_listener_ip = Ipv6Addr::LOCALHOST.into();

@@ -282,7 +282,7 @@ impl Operation for ConnectOp {
                     let should_accept = if op_manager
                         .ring
                         .connection_manager
-                        .should_accept(joiner_loc, Some(&joiner.peer))
+                        .should_accept(joiner_loc, &joiner.peer)
                     {
                         tracing::debug!(tx = %id, %joiner, "Accepting connection from");
                         let (callback, mut result) = tokio::sync::mpsc::channel(1);
@@ -682,7 +682,6 @@ pub(crate) async fn initial_join_procedure(
                     "Attempting to connect to {} gateways in parallel",
                     number_of_parallel_connections
                 );
-                // FIXME: we are attempting to connect to gws which are already connected
                 for gateway in op_manager
                     .ring
                     .is_not_connected(gateways.iter())
@@ -724,7 +723,7 @@ pub(crate) async fn join_ring_request(
             );
             OpError::ConnError(ConnectionError::LocationUnknown)
         })?,
-        Some(&gateway.peer),
+        &gateway.peer,
     ) {
         // ensure that we still want to connect AND reserve an spot implicitly
         return Err(OpError::ConnError(ConnectionError::UnwantedConnection));
