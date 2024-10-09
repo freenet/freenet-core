@@ -73,7 +73,7 @@ opentelemetry-jaeger = { features = ["collector_client", "isahc", "rt-tokio"], o
 tracing = { version = "0.1" }
 tracing-opentelemetry = { optional = true, version = "0.26" }
 tracing-subscriber = { optional = true, version = "0.3" }
-opentelemetry-otlp = { optional = true, version = "0.25" }
+opentelemetry-otlp = { optional = true, version = "0.26" }
 opentelemetry_sdk = { optional = true, version = "0.25", features = ["rt-tokio"] }
 
 # internal deps
