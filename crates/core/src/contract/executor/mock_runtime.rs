@@ -120,6 +120,7 @@ mod test {
         const MAX_MEM_CACHE: u32 = 10_000_000;
         let tmp_dir = tempfile::tempdir()?;
         let state_store_path = tmp_dir.path().join("state_store");
+        std::fs::create_dir_all(&state_store_path)?;
         let contract_store = ContractStore::new(tmp_dir.path().join("executor-test"), MAX_SIZE)?;
         let state_store =
             StateStore::new(Storage::new(&state_store_path).await?, MAX_MEM_CACHE).unwrap();

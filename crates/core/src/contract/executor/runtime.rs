@@ -6,8 +6,6 @@ impl ContractExecutor for Executor<Runtime> {
         key: ContractKey,
         fetch_contract: bool,
     ) -> Result<(WrappedState, Option<ContractContainer>), ExecutorError> {
-        // FIXME: this logic shouldn't be the same as when requested from apps
-        // since we don't have to try get from network when is not present locally!
         match self.perform_contract_get(fetch_contract, key).await {
             Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                 contract,
