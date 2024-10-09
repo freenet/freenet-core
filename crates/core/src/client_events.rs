@@ -487,14 +487,13 @@ pub(crate) mod test {
                                 continue;
                             }
 
-                            let key = contract.key();
                             let request = ContractRequest::Put {
                                 contract: contract.clone(),
                                 state: WrappedState::new(self.random_byte_vec()),
                                 related_contracts: RelatedContracts::new(),
                             };
 
-                            println!("sending put to an existing contract");
+                            tracing::debug!("sending put to an existing contract");
 
                             return Some(request.into());
                         }

@@ -12,11 +12,8 @@ use axum::{
     Router,
 };
 use dashmap::DashMap;
-use freenet::{
-    dev_tool::{Location, PeerId, Transaction},
-    generated::{
-        topology::ControllerResponse, ChangesWrapper, ContractChange, PeerChange, TryFromFbs,
-    },
+use freenet::generated::{
+    topology::ControllerResponse, ChangesWrapper, ContractChange, PeerChange, TryFromFbs,
 };
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -101,7 +98,7 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                 let mut decoding_errors = String::new(); // TODO: change this to Vec<String>
 
                 match ContractChange::try_decode_fbs(&msg) {
-                    Ok(ContractChange::PutFailure(err)) => todo!(),
+                    Ok(ContractChange::PutFailure(_err)) => todo!(),
                     Ok(change) => {
                         if let Err(err) = state.save_record(ChangesWrapper::ContractChange(change))
                         {
@@ -379,6 +376,7 @@ struct PeerData {
     location: f64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 struct ContractData {
     location: f64,
     connections: Vec<String>,
@@ -538,7 +536,7 @@ impl ServerState {
                     return Err(anyhow::anyhow!("requester is empty"));
                 }
 
-                if let Some(mut entry) = self.transactions_data.get_mut(&tx_id) {
+                if let Some(_entry) = self.transactions_data.get_mut(&tx_id) {
                     tracing::error!("this tx should not be included on transactions_data");
 
                     unreachable!();

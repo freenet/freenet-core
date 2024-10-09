@@ -541,9 +541,9 @@ async fn send_to_metrics_server(
         EventKind::Put(PutEvent::Request {
             requester,
             key,
-            id,
             target,
             timestamp,
+            ..
         }) => {
             let contract_location = Location::from_contract_key(key.as_bytes());
             let msg = ContractChange::put_request_msg(
@@ -557,11 +557,11 @@ async fn send_to_metrics_server(
             ws_stream.send(Message::Binary(msg)).await
         }
         EventKind::Put(PutEvent::PutSuccess {
-            id,
             requester,
             target,
             key,
             timestamp,
+            ..
         }) => {
             let contract_location = Location::from_contract_key(key.as_bytes());
 
