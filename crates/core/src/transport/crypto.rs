@@ -58,7 +58,7 @@ impl TransportPublicKey {
 
 impl std::fmt::Debug for TransportPublicKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        <Self as std::fmt::Display>::fmt(&self, f)
+        <Self as std::fmt::Display>::fmt(self, f)
     }
 }
 

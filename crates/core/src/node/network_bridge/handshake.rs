@@ -17,7 +17,7 @@ use crate::{
     node::NetworkBridge,
     operations::connect::{
         forward_conn, ConnectMsg, ConnectOp, ConnectRequest, ConnectResponse, ConnectState,
-        ConnectivityInfo,
+        ConnectivityInfo, ForwardParams,
     },
     ring::{ConnectionManager, PeerKeyLocation, Ring},
     router::Router,
@@ -46,7 +46,7 @@ pub(super) enum HandshakeError {
     #[error(transparent)]
     TransportError(#[from] TransportError),
     #[error("receibed an unexpected message at this point: {0}")]
-    UnexpectedMessage(NetMessage),
+    UnexpectedMessage(Box<NetMessage>),
 }
 
 #[derive(Debug)]
@@ -58,8 +58,8 @@ pub(super) enum Event {
         id: Transaction,
         conn: PeerConnection,
         joiner: PeerId,
-        op: Option<ConnectOp>,
-        forward_info: Option<ForwardInfo>,
+        op: Option<Box<ConnectOp>>,
+        forward_info: Option<Box<ForwardInfo>>,
     },
     /// An outbound connection to a peer was successfully established.
     OutboundConnectionSuccessful {
@@ -88,10 +88,11 @@ pub(super) enum Event {
         target: SocketAddr,
         tx: Transaction,
         forward_to: PeerId,
-        msg: NetMessage,
+        msg: Box<NetMessage>,
     },
 }
 
+#[allow(clippy::large_enum_variant)]
 enum ForwardResult {
     Forward(PeerId, NetMessage, ConnectivityInfo),
     Rejected,
@@ -279,7 +280,7 @@ impl HandshakeHandler {
                             tracing::debug!(from=%peer_id.addr, "Outbound connection failed: {error}");
                             self.connecting.remove(&peer_id.addr);
                             self.outbound_messages.remove(&peer_id.addr);
-                            Ok(Event::OutboundConnectionFailed { peer_id, error: error.into() })
+                            Ok(Event::OutboundConnectionFailed { peer_id, error })
                         }
                         Some(Ok(other)) => {
                             tracing::error!("Unexpected event: {other:?}");
@@ -343,11 +344,14 @@ impl HandshakeHandler {
                                         &self.connection_manager,
                                         self.router.clone(),
                                         &mut nw_bridge,
-                                        (my_peer_id.clone(), joiner_pk_loc.clone()),
-                                        hops_to_live,
-                                        max_hops_to_live,
-                                        true,
-                                        skip_list,
+                                        ForwardParams {
+                                            left_htl: hops_to_live,
+                                            max_htl: max_hops_to_live,
+                                            skip_list,
+                                            accepted: true,
+                                            req_peer: my_peer_id.clone(),
+                                            joiner: joiner_pk_loc.clone(),
+                                        }
                                     );
 
                                     match f.await {
@@ -375,8 +379,8 @@ impl HandshakeHandler {
                                     id,
                                     conn,
                                     joiner,
-                                    op: ok.map(|ok_value| ConnectOp::new(id, Some(ok_value), None, None)),
-                                    forward_info,
+                                    op: ok.map(|ok_value| Box::new(ConnectOp::new(id, Some(ok_value), None, None))),
+                                    forward_info: forward_info.map(Box::new),
                                 })
 
                             } else {
@@ -404,7 +408,7 @@ impl HandshakeHandler {
                                             target: remote,
                                             tx: id,
                                             forward_to: forward_target,
-                                            msg,
+                                            msg: Box::new(msg),
                                         });
                                     }
                                     Ok(ForwardResult::Rejected) => {
@@ -473,11 +477,14 @@ impl HandshakeHandler {
             &self.connection_manager,
             self.router.clone(),
             &mut nw_bridge,
-            (my_peer_id.clone(), joiner_pk_loc.clone()),
-            transaction.hops_to_live,
-            transaction.max_hops_to_live,
-            false,
-            transaction.skip_list.clone(),
+            ForwardParams {
+                left_htl: transaction.hops_to_live,
+                max_htl: transaction.max_hops_to_live,
+                skip_list: transaction.skip_list.clone(),
+                accepted: false,
+                req_peer: my_peer_id.clone(),
+                joiner: joiner_pk_loc.clone(),
+            },
         )
         .await
         {
@@ -524,22 +531,19 @@ impl HandshakeHandler {
     /// Handles outbound messages to peers.
     async fn outbound(&mut self, addr: SocketAddr, op: NetMessage) -> Option<Event> {
         if let Some(alive_conn) = self.outbound_messages.get_mut(&addr) {
-            match &op {
-                NetMessage::V1(NetMessageV1::Connect(op)) => {
-                    let tx = *op.id();
-                    if self
-                        .connecting
-                        .get(&addr)
-                        .filter(|current_tx| *current_tx != &tx)
-                        .is_some()
-                    {
-                        // avoid duplicate connection attempts
-                        tracing::warn!("Duplicate connection attempt to {addr}, ignoring");
-                        return Some(Event::RemoveTransaction(tx));
-                    }
-                    self.connecting.insert(addr, tx);
+            if let NetMessage::V1(NetMessageV1::Connect(op)) = &op {
+                let tx = *op.id();
+                if self
+                    .connecting
+                    .get(&addr)
+                    .filter(|current_tx| *current_tx != &tx)
+                    .is_some()
+                {
+                    // avoid duplicate connection attempts
+                    tracing::warn!("Duplicate connection attempt to {addr}, ignoring");
+                    return Some(Event::RemoveTransaction(tx));
                 }
-                _ => {}
+                self.connecting.insert(addr, tx);
             }
 
             if alive_conn.send(op).await.is_err() {
@@ -549,22 +553,15 @@ impl HandshakeHandler {
             None
         } else {
             let mut send_to_remote = None;
-            match &op {
-                NetMessage::V1(NetMessageV1::Connect(op)) => {
-                    match op {
-                        ConnectMsg::Response {
-                            msg: ConnectResponse::AcceptedBy { joiner, .. },
-                            ..
-                        } => {
-                            // this may be a reply message from a downstream peer to which it was forwarded previously
-                            // for a transient connection, in this case we must send this message to the proper
-                            // gw_transient_peer_conn future that is waiting for it
-                            send_to_remote = Some(joiner.addr);
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
+            if let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
+                msg: ConnectResponse::AcceptedBy { joiner, .. },
+                ..
+            })) = &op
+            {
+                // this may be a reply message from a downstream peer to which it was forwarded previously
+                // for a transient connection, in this case we must send this message to the proper
+                // gw_transient_peer_conn future that is waiting for it
+                send_to_remote = Some(joiner.addr);
             }
 
             if let Some(remote) = send_to_remote {
@@ -628,11 +625,10 @@ impl HandshakeHandler {
         conn: PeerConnection,
         max_hops_to_live: usize,
     ) -> Result<()> {
-        let tx = self
+        let tx = *self
             .connecting
             .get(&gw_peer_id.addr)
-            .ok_or_else(|| HandshakeError::ConnectionClosed(conn.remote_addr()))?
-            .clone();
+            .ok_or_else(|| HandshakeError::ConnectionClosed(conn.remote_addr()))?;
         let this_peer = self.connection_manager.own_location().peer;
         tracing::debug!(at=?conn.my_address(), %this_peer.addr, from=%conn.remote_addr(), remote_addr = %gw_peer_id, "Waiting for confirmation from gw");
         self.ongoing_outbound_connections.push(
@@ -767,7 +763,7 @@ async fn wait_for_gw_confirmation(
     // under this branch we just need to wait long enough for the gateway to reply with all the downstream
     // connection attempts, and then we can drop the connection, so keep listening to it in a loop or timeout
     let remote = tracker.gw_conn.remote_addr();
-    Ok(tokio::time::timeout(
+    tokio::time::timeout(
         timeout_duration,
         check_remaining_hops(tracker),
     )
@@ -778,7 +774,7 @@ async fn wait_for_gw_confirmation(
             gw_peer_id,
             HandshakeError::ConnectionClosed(remote),
         )
-    })??)
+    })?
 }
 
 async fn check_remaining_hops(mut tracker: AcceptedTracker) -> OutboundConnResult {
@@ -800,7 +796,7 @@ async fn check_remaining_hops(mut tracker: AcceptedTracker) -> OutboundConnResul
             )
         })
         .await??;
-        let msg = decode_msg(&msg).map_err(|e| (gw_peer_id.clone(), e.into()))?;
+        let msg = decode_msg(&msg).map_err(|e| (gw_peer_id.clone(), e))?;
         match msg {
             NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
                 msg:
@@ -842,7 +838,12 @@ async fn check_remaining_hops(mut tracker: AcceptedTracker) -> OutboundConnResul
                 tracing::warn!(from=%tracker.gw_conn.remote_addr(), "Received FindOptimalPeer request, ignoring");
                 continue;
             }
-            other => return Err((gw_peer_id, HandshakeError::UnexpectedMessage(other))),
+            other => {
+                return Err((
+                    gw_peer_id,
+                    HandshakeError::UnexpectedMessage(Box::new(other)),
+                ))
+            }
         }
     }
     Ok(InternalEvent::FinishedOutboundConnProcess(tracker))
@@ -1027,7 +1028,7 @@ impl TransientConnection {
 
 #[inline(always)]
 fn decode_msg(data: &[u8]) -> Result<NetMessage> {
-    bincode::deserialize(data).map_err(|err| HandshakeError::Serialization(err))
+    bincode::deserialize(data).map_err(HandshakeError::Serialization)
 }
 
 #[cfg(test)]
@@ -1130,14 +1131,11 @@ mod tests {
             let sym_msg = SymmetricMessage::serialize_msg_to_packet_data(
                 self.packet_id,
                 msg,
-                &out_symm_key,
+                out_symm_key,
                 vec![],
             )
             .unwrap();
-            packet_sender
-                .send(sym_msg.as_unknown().into())
-                .await
-                .unwrap();
+            packet_sender.send(sym_msg.into_unknown()).await.unwrap();
             self.packet_id += 1;
         }
 
@@ -1511,7 +1509,7 @@ mod tests {
                         assert_eq!(forward_to.pub_key, peer_pub_key);
                         assert_eq!(forward_to.addr, peer_peer_id.addr);
                         assert!(matches!(
-                            msg,
+                            &*msg,
                             NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
                                 msg: ConnectRequest::CheckConnectivity { .. },
                                 ..
@@ -1749,7 +1747,7 @@ mod tests {
                         if let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
                             msg: ConnectRequest::CheckConnectivity { sender, joiner, .. },
                             ..
-                        })) = msg
+                        })) = &*msg
                         {
                             assert_eq!(sender.peer, gw_peer_id);
                             assert_eq!(joiner.peer, joiner_peer_id);

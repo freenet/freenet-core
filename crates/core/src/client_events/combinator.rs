@@ -70,10 +70,17 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
                     //         and we take ownership, so they will be alive for the duration of the program
                     let f = Box::pin(self.hosts_rx[i].recv())
                         as Pin<Box<dyn Future<Output = _> + Send + Sync + '_>>;
+
+                    type ExtendedLife<'a, 'b> = Pin<
+                        Box<
+                            dyn Future<Output = Option<Result<OpenRequest<'a>, ClientError>>>
+                                + Send
+                                + Sync
+                                + 'b,
+                        >,
+                    >;
                     let new_pend = unsafe {
-                        std::mem::transmute::<_, Pin<Box<dyn Future<Output = _> + Send + Sync + '_>>>(
-                            f,
-                        )
+                        std::mem::transmute::<ExtendedLife<'_, '_>, ExtendedLife<'_, '_>>(f)
                     };
                     *fut = Some(new_pend);
                 }
