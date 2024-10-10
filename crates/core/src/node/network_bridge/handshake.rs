@@ -1101,10 +1101,11 @@ mod tests {
         /// This would happen when a new unsolicited connection is established with a gateway or
         /// when after initialising a connection with a peer via `outbound_recv`, a connection
         /// is successfully established.
-        async fn establish_inbound_conn(&mut self, addr: SocketAddr, pub_key: TransportPublicKey) {
+        async fn establish_inbound_conn(&mut self, addr: SocketAddr, pub_key: TransportPublicKey, hops_to_live: Option<usize>) {
             let id = Transaction::new::<ConnectMsg>();
             let target_peer_id = PeerId::new(addr, pub_key.clone());
             let target_peer = PeerKeyLocation::from(target_peer_id);
+            let hops_to_live = hops_to_live.unwrap_or(10);
             // let joiner_key = TransportKeypair::new();
             // let pub_key = joiner_key.public().clone();
             let initial_join_req = ConnectMsg::Request {
@@ -1113,8 +1114,8 @@ mod tests {
                 msg: ConnectRequest::StartJoinReq {
                     joiner: None,
                     joiner_key: pub_key,
-                    hops_to_live: 10,
-                    max_hops_to_live: 10,
+                    hops_to_live: hops_to_live,
+                    max_hops_to_live: hops_to_live,
                     skip_list: vec![],
                 },
             };
@@ -1194,7 +1195,9 @@ mod tests {
 
         if let Some(connections) = existing_connections {
             for conn in connections {
-                mngr.add_connection(conn);
+                let location = conn.get_location().location.unwrap();
+                let peer_id = conn.get_location().peer.clone();
+                mngr.add_connection(location, peer_id, false);
             }
         }
 
@@ -1263,7 +1266,7 @@ mod tests {
             let pub_key = TransportKeypair::new().public().clone();
             test.transport.new_conn(remote_addr).await;
             test.transport
-                .establish_inbound_conn(remote_addr, pub_key)
+                .establish_inbound_conn(remote_addr, pub_key, None)
                 .await;
             Ok::<_, anyhow::Error>(())
         };
@@ -1304,8 +1307,9 @@ mod tests {
         let test_controller = async {
             let pub_key = TransportKeypair::new().public().clone();
             test.transport.new_conn(remote_addr).await;
+            // Put hops_to_live to 0 to avoid forwarding
             test.transport
-                .establish_inbound_conn(remote_addr, pub_key)
+                .establish_inbound_conn(remote_addr, pub_key, Some(0))
                 .await;
             let msg = test.transport.recv_outbound_msg().await?;
             tracing::debug!("Received outbound message: {:?}", msg);
@@ -1390,7 +1394,7 @@ mod tests {
 
         let peer_inbound = async {
             let event =
-                tokio::time::timeout(Duration::from_secs(10), handler.wait_for_events()).await??;
+                tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
             match event {
                 Event::OutboundGatewayConnectionSuccessful { peer_id, .. } => {
                     assert_eq!(peer_id.addr, remote_addr);
@@ -1472,7 +1476,7 @@ mod tests {
             gw_test.transport.new_conn(peer_addr).await;
             gw_test
                 .transport
-                .establish_inbound_conn(peer_addr, peer_pub_key.clone())
+                .establish_inbound_conn(peer_addr, peer_pub_key.clone(), None)
                 .await;
 
             // the joiner attempts to connect to the gw, but since it's out of connections
@@ -1480,7 +1484,7 @@ mod tests {
             gw_test.transport.new_conn(joiner_addr).await;
             gw_test
                 .transport
-                .establish_inbound_conn(joiner_addr, joiner_pub_key)
+                .establish_inbound_conn(joiner_addr, joiner_pub_key, None)
                 .await;
 
             // TODO: maybe simulate forwarding back all expected responses
@@ -1506,10 +1510,11 @@ mod tests {
                         third_party = Some(third_party_peer);
                         gw_handler
                             .connection_manager
-                            .add_connection(Connection::new(
-                                peer_peer_id.clone(),
+                            .add_connection(
                                 Location::from_address(&peer_addr),
-                            ));
+                                peer_peer_id.clone(),
+                                false
+                            );
                     }
                     Event::TransientForwardTransaction {
                         target,
@@ -1729,7 +1734,7 @@ mod tests {
 
             test.transport.new_conn(joiner_addr).await;
             test.transport
-                .establish_inbound_conn(joiner_addr, joiner_pub_key)
+                .establish_inbound_conn(joiner_addr, joiner_pub_key, None)
                 .await;
 
             Ok::<_, anyhow::Error>(())

@@ -107,6 +107,10 @@ impl Connection {
             open_at: Instant::now(),
         }
     }
+    
+    pub fn get_location(&self) -> &PeerKeyLocation {
+        &self.location
+    }
 }
 
 #[derive(Clone)]
@@ -313,8 +317,7 @@ impl Ring {
 
     pub fn open_connections(&self) -> usize {
         self.connection_manager
-            .open_connections
-            .load(std::sync::atomic::Ordering::SeqCst)
+            .get_open_connections()
     }
 
     async fn refresh_router<ER: NetEventRegister>(router: Arc<RwLock<Router>>, register: ER) {
@@ -420,54 +423,19 @@ impl Ring {
 
     pub async fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) {
         tracing::info!(%peer, this = ?self.connection_manager.get_peer_key(), %was_reserved, "Adding connection to peer");
-        debug_assert!(
-            self.connection_manager
-                .get_peer_key()
-                .expect("should be set")
-                != peer
-        );
-        if was_reserved {
-            let old = self
-                .connection_manager
-                .reserved_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            #[cfg(debug_assertions)]
-            {
-                tracing::debug!(old, "Decremented reserved connections");
-                if old == 0 {
-                    panic!("Underflow of reserved connections");
-                }
-            }
-            let _ = old;
-        }
-        self.connection_manager
-            .open_connections
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.connection_manager.add_connection(loc, peer.clone(), was_reserved);
         self.event_register
             .register_events(Either::Left(NetEventLog::connected(
                 self,
-                peer.clone(),
+                peer,
                 loc,
             )))
             .await;
-        let mut cbl = self.connection_manager.connections_by_location.write();
-        cbl.entry(loc).or_default().push(Connection {
-            location: PeerKeyLocation {
-                peer: peer.clone(),
-                location: Some(loc),
-            },
-            open_at: Instant::now(),
-        });
-        self.connection_manager
-            .location_for_peer
-            .write()
-            .insert(peer.clone(), loc);
-        std::mem::drop(cbl);
         self.refresh_density_request_cache()
     }
 
     fn refresh_density_request_cache(&self) {
-        let cbl = self.connection_manager.connections_by_location.read();
+        let cbl = self.connection_manager.get_connections_by_location();
         let topology_manager = &mut self.connection_manager.topology_manager.write();
         let _ = topology_manager.refresh_cache(&cbl);
     }
@@ -573,8 +541,7 @@ impl Ring {
     ) -> Option<PeerKeyLocation> {
         use rand::seq::SliceRandom;
         self.connection_manager
-            .connections_by_location
-            .read()
+            .get_connections_by_location()
             .iter()
             .sorted_by(|(loc_a, _), (loc_b, _)| {
                 loc_a.distance(location).cmp(&loc_b.distance(location))
@@ -670,7 +637,7 @@ impl Ring {
             }
 
             let neighbor_locations = {
-                let peers = self.connection_manager.connections_by_location.read();
+                let peers = self.connection_manager.get_connections_by_location();
                 peers
                     .iter()
                     .map(|(loc, conns)| {

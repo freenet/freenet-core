@@ -6,15 +6,15 @@ use super::*;
 
 #[derive(Clone)]
 pub(crate) struct ConnectionManager {
-    pub(super) open_connections: Arc<AtomicUsize>,
-    pub(super) reserved_connections: Arc<AtomicUsize>,
+    open_connections: Arc<AtomicUsize>,
+    reserved_connections: Arc<AtomicUsize>,
     pub(super) location_for_peer: Arc<RwLock<BTreeMap<PeerId, Location>>>,
     pub(super) topology_manager: Arc<RwLock<TopologyManager>>,
-    pub(super) connections_by_location: Arc<RwLock<BTreeMap<Location, Vec<Connection>>>>,
+    connections_by_location: Arc<RwLock<BTreeMap<Location, Vec<Connection>>>>,
     /// Interim connections ongoing handshake or successfully open connections
     /// Is important to keep track of this so no more connections are accepted prematurely.
-    pub(super) own_location: Arc<AtomicU64>,
-    pub(super) peer_key: Arc<Mutex<Option<PeerId>>>,
+    own_location: Arc<AtomicU64>,
+    peer_key: Arc<Mutex<Option<PeerId>>>,
     pub min_connections: usize,
     pub max_connections: usize,
     pub rnd_if_htl_above: usize,
@@ -39,13 +39,6 @@ impl ConnectionManager {
             pub_key,
             None,
         )
-    }
-
-    pub fn add_connection(&self, conn: Connection) {
-        let loc = conn.location.location.unwrap_or_else(Location::random);
-        let mut conns = self.connections_by_location.write();
-        conns.entry(loc).or_default().push(conn);
-        self.open_connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -167,9 +160,6 @@ impl ConnectionManager {
             .own_location()
             .location
             .unwrap_or_else(Location::random);
-        println!("My location: {:?}", my_location);
-        println!("remote peer location {:?}", location);
-        println!("Connections by location: {:?}", self.connections_by_location.read().keys().clone());
         let accepted = if location == my_location
             || self.connections_by_location.read().contains_key(&location)
         {
@@ -254,6 +244,42 @@ impl ConnectionManager {
         self.prune_connection(peer, false)
     }
 
+    pub fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) {
+        tracing::info!(%peer, this = ?self.get_peer_key(), %was_reserved, "Adding connection to peer");
+        debug_assert!(
+            self.get_peer_key()
+                .expect("should be set")
+                != peer
+        );
+        if was_reserved {
+            let old = self
+                .reserved_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(debug_assertions)]
+            {
+                tracing::debug!(old, "Decremented reserved connections");
+                if old == 0 {
+                    panic!("Underflow of reserved connections");
+                }
+            }
+            let _ = old;
+        }
+        self.open_connections
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut cbl = self.connections_by_location.write();
+        cbl.entry(loc).or_default().push(Connection {
+            location: PeerKeyLocation {
+                peer: peer.clone(),
+                location: Some(loc),
+            },
+            open_at: Instant::now(),
+        });
+        self.location_for_peer
+            .write()
+            .insert(peer.clone(), loc);
+        std::mem::drop(cbl);
+    }
+
     fn prune_connection(&self, peer: &PeerId, is_alive: bool) -> Option<Location> {
         let connection_type = if is_alive { "active" } else { "in transit" };
         tracing::debug!(%peer, "Pruning {} connection", connection_type);
@@ -285,6 +311,14 @@ impl ConnectionManager {
         }
 
         Some(loc)
+    }
+    
+    pub(super) fn get_open_connections(&self) -> usize {
+        self.open_connections.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    
+    pub(super) fn get_connections_by_location(&self) -> BTreeMap<Location, Vec<Connection>> {
+        self.connections_by_location.read().clone()
     }
 
     /// Get a random peer from the known ring connections.
