@@ -1101,7 +1101,12 @@ mod tests {
         /// This would happen when a new unsolicited connection is established with a gateway or
         /// when after initialising a connection with a peer via `outbound_recv`, a connection
         /// is successfully established.
-        async fn establish_inbound_conn(&mut self, addr: SocketAddr, pub_key: TransportPublicKey, hops_to_live: Option<usize>) {
+        async fn establish_inbound_conn(
+            &mut self,
+            addr: SocketAddr,
+            pub_key: TransportPublicKey,
+            hops_to_live: Option<usize>,
+        ) {
             let id = Transaction::new::<ConnectMsg>();
             let target_peer_id = PeerId::new(addr, pub_key.clone());
             let target_peer = PeerKeyLocation::from(target_peer_id);
@@ -1182,7 +1187,10 @@ mod tests {
         node: NodeMock,
     }
 
-    fn config_handler(addr: impl Into<SocketAddr>, existing_connections: Option<Vec<Connection>>) -> (HandshakeHandler, TestVerifier) {
+    fn config_handler(
+        addr: impl Into<SocketAddr>,
+        existing_connections: Option<Vec<Connection>>,
+    ) -> (HandshakeHandler, TestVerifier) {
         let (outbound_sender, outbound_recv) = mpsc::channel(5);
         let outbound_conn_handler = OutboundConnectionHandler::new(outbound_sender);
         let (inbound_sender, inbound_recv) = mpsc::channel(5);
@@ -1291,10 +1299,14 @@ mod tests {
         let addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
         let existing_remote_addr = ([127, 0, 0, 1], 10001).into();
         let remote_peer_loc = PeerKeyLocation {
-            peer: PeerId::new(existing_remote_addr, TransportKeypair::new().public().clone()),
+            peer: PeerId::new(
+                existing_remote_addr,
+                TransportKeypair::new().public().clone(),
+            ),
             location: Some(Location::from_address(&existing_remote_addr)),
         };
-        let existing_conn = Connection::new(remote_peer_loc.peer, remote_peer_loc.location.unwrap());
+        let existing_conn =
+            Connection::new(remote_peer_loc.peer, remote_peer_loc.location.unwrap());
 
         let (mut handler, mut test) = config_handler(addr, Some(vec![existing_conn]));
 
@@ -1508,13 +1520,11 @@ mod tests {
                         assert_eq!(third_party_peer.pub_key, peer_pub_key);
                         assert_eq!(first_peer_conn.remote_addr(), peer_addr);
                         third_party = Some(third_party_peer);
-                        gw_handler
-                            .connection_manager
-                            .add_connection(
-                                Location::from_address(&peer_addr),
-                                peer_peer_id.clone(),
-                                false
-                            );
+                        gw_handler.connection_manager.add_connection(
+                            Location::from_address(&peer_addr),
+                            peer_peer_id.clone(),
+                            false,
+                        );
                     }
                     Event::TransientForwardTransaction {
                         target,

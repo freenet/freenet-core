@@ -107,7 +107,7 @@ impl Connection {
             open_at: Instant::now(),
         }
     }
-    
+
     pub fn get_location(&self) -> &PeerKeyLocation {
         &self.location
     }
@@ -316,8 +316,7 @@ impl Ring {
     }
 
     pub fn open_connections(&self) -> usize {
-        self.connection_manager
-            .get_open_connections()
+        self.connection_manager.get_open_connections()
     }
 
     async fn refresh_router<ER: NetEventRegister>(router: Arc<RwLock<Router>>, register: ER) {
@@ -423,13 +422,10 @@ impl Ring {
 
     pub async fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) {
         tracing::info!(%peer, this = ?self.connection_manager.get_peer_key(), %was_reserved, "Adding connection to peer");
-        self.connection_manager.add_connection(loc, peer.clone(), was_reserved);
+        self.connection_manager
+            .add_connection(loc, peer.clone(), was_reserved);
         self.event_register
-            .register_events(Either::Left(NetEventLog::connected(
-                self,
-                peer,
-                loc,
-            )))
+            .register_events(Either::Left(NetEventLog::connected(self, peer, loc)))
             .await;
         self.refresh_density_request_cache()
     }

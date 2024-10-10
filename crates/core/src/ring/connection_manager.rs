@@ -245,12 +245,7 @@ impl ConnectionManager {
     }
 
     pub fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) {
-        tracing::info!(%peer, this = ?self.get_peer_key(), %was_reserved, "Adding connection to peer");
-        debug_assert!(
-            self.get_peer_key()
-                .expect("should be set")
-                != peer
-        );
+        debug_assert!(self.get_peer_key().expect("should be set") != peer);
         if was_reserved {
             let old = self
                 .reserved_connections
@@ -274,9 +269,7 @@ impl ConnectionManager {
             },
             open_at: Instant::now(),
         });
-        self.location_for_peer
-            .write()
-            .insert(peer.clone(), loc);
+        self.location_for_peer.write().insert(peer.clone(), loc);
         std::mem::drop(cbl);
     }
 
@@ -312,11 +305,12 @@ impl ConnectionManager {
 
         Some(loc)
     }
-    
+
     pub(super) fn get_open_connections(&self) -> usize {
-        self.open_connections.load(std::sync::atomic::Ordering::SeqCst)
+        self.open_connections
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
-    
+
     pub(super) fn get_connections_by_location(&self) -> BTreeMap<Location, Vec<Connection>> {
         self.connections_by_location.read().clone()
     }
