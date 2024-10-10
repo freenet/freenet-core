@@ -80,7 +80,7 @@ impl ContractChange<'_> {
         let transaction = buf.create_string(transaction.as_str());
         let contract = buf.create_string(contract.as_str());
         let requester = buf.create_string(requester.as_str());
-        let target = buf.create_string(target.to_string().as_str());
+        let target = buf.create_string(target.as_str());
         let put_success = topology::PutSuccess::create(
             &mut buf,
             &topology::PutSuccessArgs {
@@ -230,10 +230,10 @@ impl PeerChange<'_> {
         connections: impl Iterator<Item = &'a (String, f64)>,
     ) -> Vec<u8> {
         let mut buf = flatbuffers::FlatBufferBuilder::new();
-        let to = buf.create_vector(&to.to_string().as_bytes());
+        let to = buf.create_vector(to.as_bytes());
         let connections = connections
             .map(|(from, from_location)| {
-                let from = Some(buf.create_vector(&from.to_string().as_bytes()));
+                let from = Some(buf.create_vector(from.as_bytes()));
                 topology::AddedConnection::create(
                     &mut buf,
                     &topology::AddedConnectionArgs {
@@ -265,8 +265,8 @@ impl PeerChange<'_> {
         (to, to_location): (String, f64),
     ) -> Vec<u8> {
         let mut buf = flatbuffers::FlatBufferBuilder::new();
-        let from = buf.create_vector(&from.to_string().as_bytes());
-        let to = buf.create_vector(&to.to_string().as_bytes());
+        let from = buf.create_vector(from.as_bytes());
+        let to = buf.create_vector(to.as_bytes());
         let transaction = transaction.map(|t| buf.create_string(t.as_ref()));
         let add_conn = topology::AddedConnection::create(
             &mut buf,
