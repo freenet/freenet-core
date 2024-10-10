@@ -784,7 +784,7 @@ impl Ring {
 pub struct Location(f64);
 
 impl Location {
-    #[cfg(not(feature = "local-simulation"))]
+    #[cfg(all(not(feature = "local-simulation"), not(test)))]
     pub fn from_address(addr: &SocketAddr) -> Self {
         match addr.ip() {
             std::net::IpAddr::V4(ipv4) => {
@@ -804,7 +804,7 @@ impl Location {
         }
     }
 
-    #[cfg(feature = "local-simulation")]
+    #[cfg(any(feature = "local-simulation", test))]
     pub fn from_address(_addr: &SocketAddr) -> Self {
         let random_component: f64 = rand::random();
         Location(random_component)

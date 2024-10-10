@@ -149,6 +149,9 @@ impl ConnectionManager {
 
         if open == 0 {
             // if this is the first connection, then accept it
+            self.location_for_peer
+                .write()
+                .insert(peer_id.clone(), location);
             return true;
         }
 
@@ -164,6 +167,9 @@ impl ConnectionManager {
             .own_location()
             .location
             .unwrap_or_else(Location::random);
+        println!("My location: {:?}", my_location);
+        println!("remote peer location {:?}", location);
+        println!("Connections by location: {:?}", self.connections_by_location.read().keys().clone());
         let accepted = if location == my_location
             || self.connections_by_location.read().contains_key(&location)
         {
