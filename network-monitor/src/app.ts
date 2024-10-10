@@ -57,23 +57,11 @@ function handleChanges(event: MessageEvent) {
                 const contractChange =
                     fbTopology.ContractChange.getRootAsContractChange(buf);
 
-                // console.log(
-                //     "raw contract change changeType",
-                //     contractChange.changeType()
-                // );
-
-                // console.log(
-                //     "parsed contract change changeType",
-                //     get_change_type(contractChange.changeType())
-                // );
-
                 let now_change_type = get_change_type(
                     contractChange.changeType()
                 );
 
                 if (now_change_type == ChangeType.BROADCAST_EMITTED) {
-                    // console.log("processing BroadcastEmitted");
-
                     let {
                         transaction,
                         upstream,
@@ -119,15 +107,6 @@ function handleChanges(event: MessageEvent) {
                     let broadcast_target_peer_location = target
                         .split(" (@")[1]
                         .split(")")[0];
-
-                    // console.log("original target", target);
-
-                    // console.log("fixed target peer id", fixed_target);
-
-                    // console.log(
-                    //     "broadcast target peer location",
-                    //     broadcast_target_peer_location
-                    // );
 
                     handleBroadcastReceived(
                         transaction,
@@ -205,14 +184,6 @@ function handleChanges(event: MessageEvent) {
                     fbTopology.ContractChangeType.PutFailure
                 ) {
                     console.log("Put Failure");
-
-                    // handlePutSuccess(
-                    //     transaction,
-                    //     contract_id,
-                    //     target,
-                    //     requester,
-                    //     change_type
-                    // );
 
                     return;
                 }

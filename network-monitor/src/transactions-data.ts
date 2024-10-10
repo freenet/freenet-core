@@ -18,17 +18,6 @@ export function handlePutRequest(
     timestamp: number,
     contract_location: number
 ) {
-    // console.log("Put Request");
-    // console.log("tx", transaction_id);
-    // console.log("contract key", contract_id);
-    // console.log("target", target);
-    // console.log("requester", requester);
-    // console.log(
-    //     "formatted timestamp",
-    //     new Date(parseInt(timestamp.toString()) * 1000).toUTCString()
-    // );
-    // console.log("contract location", contract_location);
-
     let obj_data = {
         change_type,
         transaction_id,
@@ -67,15 +56,6 @@ export function handlePutSuccess(
     timestamp: number,
     contract_location: number
 ) {
-    // console.log("Put Success");
-    // console.log("tx", transaction_id);
-    // console.log("contract key", contract_id);
-    // console.log("change_type", change_type);
-    // // console.log("target", target);
-    // console.log("requester", requester);
-    // console.log("timestamp", timestamp);
-    // console.log("contract location", contract_location);
-
     let requester_location = parseFloat(
         requester.split(" (@ ")[1].split(")")[0]
     );
@@ -130,15 +110,6 @@ export function handleBroadcastEmitted(
     let upstream_location = upstream.split(" (@")[1].split(")")[0];
     upstream = upstream.split(" (@")[0];
 
-    // console.log("Broadcast Emitted");
-    // console.log("tx", transaction_id);
-    // console.log("upstream", upstream);
-    // console.log("broadcast to", broadcast_to);
-    // console.log("key", key);
-    // console.log("sender", sender);
-    // console.log("timestamp", timestamp);
-    // console.log("contract location", contract_location);
-
     let obj_data = {
         change_type: ChangeType.BROADCAST_EMITTED,
         transaction_id,
@@ -177,15 +148,6 @@ export function handleBroadcastReceived(
     timestamp: number,
     contract_location: number
 ) {
-    // console.log("Broadcast Received");
-    // console.log("tx", transaction_id);
-    // console.log("target", target);
-    // console.log("requester", requester);
-    // console.log("key", key);
-    // console.log("change_type", change_type);
-    // console.log("timestamp", timestamp);
-    // console.log("contract location", contract_location);
-
     let obj_data = {
         change_type,
         transaction_id,
