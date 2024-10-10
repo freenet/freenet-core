@@ -1,31 +1,29 @@
 import { useEffect, useState } from "react";
-import { createRoot } from "react-dom/client";
 import {
     TransactionDetailInterface,
-    TransactionPeerInterface,
-    TransactionData
+    TransactionData,
+    TransactionDetailPeersHistoryInterface,
+    FilterDictionaryInterface,
+    TranscationHistoryInterface,
+    ChangeType,
 } from "./type_definitions";
-import { PeerId } from "./topology";
+import {get_peers_description_to_render, refresh_peers_tree, rust_timestamp_to_utc_string} from "./utils";
 
-interface TransactionDetailPeersHistoryInterface {
-    tx_peer_list: Array<TransactionData>;
+declare global {
+    interface Window {
+        drawNomNomlCanvas: (text_to_render: string) => void;
+    }
 }
 
-interface FilterInterface {
-    filter_type: string;
-    filter_value: string;
-}
-
-interface FilterDictionaryInterface {
-    [key: string]: FilterInterface;
-}
-
-let ring_mock_data = [];
 const TransactionPeersHistory = ({
     tx_peer_list,
 }: TransactionDetailPeersHistoryInterface) => {
     const [filter, set_filter] = useState<FilterDictionaryInterface>({});
     const [filtered_list, set_filtered_list] = useState(tx_peer_list);
+    const [order_by, set_order_by] = useState<string>("timestamp");
+    const [order_direction, set_order_direction] = useState<string>("asc");
+    const [loading, set_loading] = useState<boolean>(false);
+    const [mermaid_text, set_mermaid_text] = useState<string>("");
 
     const add_filter = (filter_type: string, filter_value: string) => {
         if (check_if_contains_filter(filter_type)) {
@@ -56,6 +54,20 @@ const TransactionPeersHistory = ({
             });
         });
 
+
+        filtered_list = filtered_list.sort((a, b) => {
+            if (order_by === "timestamp") {
+                if (order_direction === "asc") {
+                    return a.timestamp > b.timestamp ? 1 : -1;
+                } else {
+                    return a.timestamp < b.timestamp ? 1 : -1;
+                }
+            } else {
+                return 0;
+            }
+        });
+
+        
         set_filtered_list(filtered_list);
     };
 
@@ -69,59 +81,38 @@ const TransactionPeersHistory = ({
     };
 
     useEffect(() => {
+
         update_filtered_list();
 
-        let ring_mock_data = [
-            {
-                id: new PeerId("1"),
-                currentLocation: 0.123485,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-            {
-                id: new PeerId("2"),
-                currentLocation: 0.183485,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-            {
-                id: new PeerId("3"),
-                currentLocation: 0.323485,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-            {
-                id: new PeerId("4"),
-                currentLocation: 0.423485,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-            {
-                id: new PeerId("5"),
-                currentLocation: 0.783285,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-        ];
+        if (loading) {
+            setTimeout(() => {
+                set_loading(false);
+            }, 1000);
+        }
 
-        // ringHistogram(ring_mock_data);
+    }, [filter, order_by, order_direction]);
 
-        // const graphContainer = d3.select(
-        //     document.getElementById("other-peer-conns-graph")
-        // );
+    useEffect(() => {
+        let transaction_description_to_render = get_peers_description_to_render(tx_peer_list);
 
-        // ringVisualization(ring_mock_data[0], graphContainer, 1.25);
-    }, [filter]);
+        console.log("Transaction description to render=", transaction_description_to_render);
+        set_mermaid_text(transaction_description_to_render);
+
+        setTimeout(() => {
+        }, 1000);
+
+        clear_all_filters();
+    }, [tx_peer_list]);
+
+
+    useEffect(() => {
+        if (mermaid_text === "") {
+            return;
+        }
+
+        refresh_peers_tree(mermaid_text);
+    }, [mermaid_text]);
+
 
     const check_if_contains_filter = (filter_type: string) => {
         return filter[filter_type] !== undefined;
@@ -133,10 +124,16 @@ const TransactionPeersHistory = ({
             className="block"
             style={{ marginTop: 20 }}
         >
+
+            <div style={{display: "block"}} id="transactions-tree-graph">
+                <pre className="mermaid" id="mermaid-tree">
+                    {mermaid_text}
+                </pre>
+            </div>
             <h2>Transaction Peers History </h2>
             {Object.keys(filter).length > 0 && (
                 <div>
-                    <button onClick={() => clear_all_filters()}>
+                    <button className="button is-info mb-2" onClick={() => clear_all_filters()}>
                         Clear all filters
                     </button>
                 </div>
@@ -150,7 +147,7 @@ const TransactionPeersHistory = ({
                         <th>
                             Transaction Id
                             {check_if_contains_filter("transaction_id") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() => clear_one_filter("transaction_id")}
                                 >
                                     Clear filter
@@ -160,7 +157,7 @@ const TransactionPeersHistory = ({
                         <th>
                             Requester
                             {check_if_contains_filter("requester") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() => clear_one_filter("requester")}
                                 >
                                     Clear filter
@@ -170,7 +167,7 @@ const TransactionPeersHistory = ({
                         <th>
                             Target
                             {check_if_contains_filter("target") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() => clear_one_filter("target")}
                                 >
                                     Clear filter
@@ -180,7 +177,7 @@ const TransactionPeersHistory = ({
                         <th>
                             Change Type
                             {check_if_contains_filter("change_type") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() =>
                                         clear_one_filter("change_type")
                                     }
@@ -192,7 +189,7 @@ const TransactionPeersHistory = ({
                         <th>
                             Contract Id
                             {check_if_contains_filter("contract_id") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() =>
                                         clear_one_filter("contract_id")
                                     }
@@ -201,11 +198,28 @@ const TransactionPeersHistory = ({
                                 </button>
                             )}
                         </th>
+                        <th>
+                            Contract Location
+                        </th>
+                        <th>
+                            Timestamp 
+                            <button className={`button is-small is-outlined ml-1 ${loading ? "is-loading" : ""}`}
+                                onClick={() => {
+                                    set_loading(true);
+                                    set_order_by("timestamp");
+                                    set_order_direction(
+                                        order_direction === "asc" ? "desc" : "asc"
+                                    );
+
+                                }}
+                            >{order_direction}</button>
+
+                        </th>
                     </tr>
                 </thead>
                 <tbody id="transaction-peers-history-b">
                     {filtered_list.map((tx) => (
-                        <tr>
+                        <tr key={`${tx.requester}+${tx.change_type}+${tx.timestamp.toString()}+${tx.target}`}>
                             <td
                                 onClick={() =>
                                     add_filter("transaction_id", tx.transaction_id)
@@ -214,7 +228,7 @@ const TransactionPeersHistory = ({
                                     cursor: "pointer",
                                 }}
                             >
-                                {tx.transaction_id}
+                                {tx.transaction_id.slice(-8)}
                             </td>
                             <td
                                 onClick={() =>
@@ -234,7 +248,14 @@ const TransactionPeersHistory = ({
                                     cursor: "pointer",
                                 }}
                             >
-                                {tx.target.slice(-8)}
+                            {tx.change_type == ChangeType.BROADCAST_EMITTED ? 
+                                tx.target.map((t:string, index: number)  => {
+                                
+                                    let t_location = t.split(" (@")[1].split(")")[0].slice(0, 8);
+                                    t = t.split(" (@")[0].slice(-8);
+
+                                    return <p key={t+index}>{t} @ {t_location}</p>
+                            }) : tx.target.slice(-8)}
                             </td>
                             <td
                                 onClick={() =>
@@ -256,6 +277,13 @@ const TransactionPeersHistory = ({
                             >
                                 {tx.contract_id.slice(-8)}
                             </td>
+                            <td>
+                                {tx.contract_location}
+                            </td>
+                            <td>
+                                {rust_timestamp_to_utc_string(tx.timestamp)}
+                                
+                            </td>
                         </tr>
                     ))}
                 </tbody>
@@ -264,8 +292,9 @@ const TransactionPeersHistory = ({
     );
 };
 
+
 // TODO: use real types
-const TransactionHistory = ({ tx_history }: any) => (
+const TransactionHistory = ({ tx_history }: TranscationHistoryInterface) => (
     <div id="transaction-history" className="block">
         <h2>Transaction History</h2>
         <table
@@ -325,8 +354,8 @@ const TransactionDetail = ({
                 border: "2px solid black",
                 padding: 30,
                 marginTop: 20,
-                width: "75%",
-                height: "75%",
+                width: "95%",
+                height: "95%",
                 backgroundColor: "rgba(255, 255, 255, 0.95)",
                 position: "relative",
                 overflow: "scroll",
@@ -354,6 +383,7 @@ const TransactionDetail = ({
                 <p>Requester {transaction.requester}</p>
                 <p>Target {transaction.target}</p>
                 <p>Contract Key {transaction.contract_id}</p>
+                <p>Contract Location {transaction.contract_location}</p>
             </div>
 
             <div>
@@ -374,60 +404,5 @@ const TransactionDetail = ({
     </div>
 );
 
-const another_ring_visualization = () => {
-    // Declare the chart dimensions and margins.
-    const width = 640;
-    const height = 400;
-    const marginTop = 20;
-    const marginRight = 20;
-    const marginBottom = 30;
-    const marginLeft = 40;
-
-    // // Declare the x (horizontal position) scale.
-    // const x = d3
-    //     .scaleUtc()
-    //     .domain([new Date("2023-01-01"), new Date("2024-01-01")])
-    //     .range([marginLeft, width - marginRight]);
-
-    // // Declare the y (vertical position) scale.
-    // const y = d3
-    //     .scaleLinear()
-    //     .domain([0, 100])
-    //     .range([height - marginBottom, marginTop]);
-
-    // // Create the SVG container.
-    // const svg = d3.create("svg").attr("width", width).attr("height", height);
-
-    // // Add the x-axis.
-    // svg.append("g")
-    //     .attr("transform", `translate(0,${height - marginBottom})`)
-    //     .call(d3.axisBottom(x));
-
-    // // Add the y-axis.
-    // svg.append("g")
-    //     .attr("transform", `translate(${marginLeft},0)`)
-    //     .call(d3.axisLeft(y));
-
-    let a = (
-        <svg width={300} height={100}>
-            <path
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.5"
-                d={"20"}
-            />
-            <g fill="white" stroke="currentColor" strokeWidth="1.5">
-                <circle key={"123"} cx={60} cy={50} r="40.5" />
-
-                <circle cx={60} cy={10} r="2.5" />
-                <circle cx={10} cy={50} r="2.5" />
-                <circle cx={110} cy={50} r="2.5" />
-            </g>
-        </svg>
-    );
-
-    // Append the SVG element.
-    return a;
-};
 
 export default TransactionDetail;

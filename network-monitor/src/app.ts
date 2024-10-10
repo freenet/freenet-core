@@ -1,16 +1,31 @@
 import * as flatbuffers from "flatbuffers";
 import * as fbTopology from "./generated/topology";
 import { handleChange } from "./topology";
-import { handlePutRequest, handlePutSuccess } from "./transactions-data";
-import { parse_put_msg_data } from "./utils";
+import {
+    handleBroadcastEmitted,
+    handleBroadcastReceived,
+    handlePutRequest,
+    handlePutSuccess,
+} from "./transactions-data";
+import {
+    get_change_type,
+    parse_broadcast_emitted_msg,
+    parse_broadcast_received_msg,
+    parse_put_request_msg_data,
+    parse_put_success_msg_data,
+} from "./utils";
+import { ChangeType } from "./type_definitions";
+import { unionToContractChangeType } from "./generated/topology/contract-change-type";
 
 let connection_established = false;
 
 const ws_connection_interval = setInterval(() => {
     if (!connection_established) {
         try {
+            console.log("Attempting to establish WS Connection");
+
             const socket = new WebSocket(
-                "ws://127.0.0.1:55010/pull-stats/peer-changes/"
+                "ws://127.0.0.1:55010/v1/pull-stats/peer-changes/"
             );
 
             socket.addEventListener("open", () => {
@@ -36,91 +51,145 @@ function handleChanges(event: MessageEvent) {
         .then((uint8Array) => {
             const buf = new flatbuffers.ByteBuffer(uint8Array);
 
+            let errors = [];
+
             try {
                 const contractChange =
                     fbTopology.ContractChange.getRootAsContractChange(buf);
 
-                console.log(contractChange.changeType());
+                let now_change_type = get_change_type(
+                    contractChange.changeType()
+                );
 
-                if (
-                    contractChange.changeType() ===
-                    fbTopology.ContractChangeType.PutRequest
-                ) {
+                if (now_change_type == ChangeType.BROADCAST_EMITTED) {
                     let {
                         transaction,
-                        contract_id,
-                        target,
-                        requester,
-                        change_type,
-                    } = parse_put_msg_data(
+                        upstream,
+                        broadcast_to,
+                        key,
+                        requester: sender,
+                        timestamp,
+                        contract_location,
+                    } = parse_broadcast_emitted_msg(
                         contractChange,
-                        fbTopology.ContractChangeType.PutRequest
+                        contractChange.changeType()
                     );
 
-                    handlePutRequest(
+                    handleBroadcastEmitted(
                         transaction,
-                        contract_id,
-                        target,
-                        requester,
-                        change_type
+                        upstream,
+                        broadcast_to,
+                        key,
+                        sender,
+                        timestamp,
+                        contract_location
                     );
 
                     return;
                 }
 
-                if (
-                    contractChange.changeType() ===
-                    fbTopology.ContractChangeType.PutSuccess
-                ) {
+                if (now_change_type == ChangeType.BROADCAST_RECEIVED) {
+                    let {
+                        transaction,
+                        target,
+                        requester,
+                        key,
+                        change_type,
+                        timestamp,
+                        contract_location,
+                    } = parse_broadcast_received_msg(
+                        contractChange,
+                        contractChange.changeType()
+                    );
+
+                    let fixed_target = target.split(" (@")[0];
+
+                    let broadcast_target_peer_location = target
+                        .split(" (@")[1]
+                        .split(")")[0];
+
+                    handleBroadcastReceived(
+                        transaction,
+                        fixed_target,
+                        requester,
+                        key,
+                        change_type,
+                        timestamp,
+                        contract_location
+                    );
+
+                    return;
+                }
+
+                if (now_change_type == ChangeType.PUT_REQUEST) {
                     let {
                         transaction,
                         contract_id,
                         target,
                         requester,
                         change_type,
-                    } = parse_put_msg_data(
+                        timestamp,
+                        contract_location,
+                    } = parse_put_request_msg_data(
                         contractChange,
-                        fbTopology.ContractChangeType.PutSuccess
+                        contractChange.changeType()
                     );
 
-                    handlePutSuccess(
+                    if (change_type == ChangeType.PUT_REQUEST) {
+                        handlePutRequest(
+                            transaction,
+                            contract_id,
+                            target,
+                            requester,
+                            change_type,
+                            timestamp,
+                            contract_location
+                        );
+
+                        return;
+                    }
+                }
+
+                if (now_change_type == ChangeType.PUT_SUCCESS) {
+                    let {
                         transaction,
                         contract_id,
                         target,
                         requester,
-                        change_type
+                        change_type,
+                        timestamp,
+                        contract_location,
+                    } = parse_put_success_msg_data(
+                        contractChange,
+                        contractChange.changeType()
                     );
 
-                    return;
+                    if (change_type == ChangeType.PUT_SUCCESS) {
+                        handlePutSuccess(
+                            transaction,
+                            contract_id,
+                            target,
+                            requester,
+                            change_type,
+                            timestamp,
+                            contract_location
+                        );
+
+                        return;
+                    }
                 }
 
                 if (
                     contractChange.changeType() ===
                     fbTopology.ContractChangeType.PutFailure
                 ) {
-                    let {
-                        transaction,
-                        contract_id,
-                        target,
-                        requester,
-                        change_type,
-                    } = parse_put_msg_data(
-                        contractChange,
-                        fbTopology.ContractChangeType.PutFailure
-                    );
-
-                    handlePutSuccess(
-                        transaction,
-                        contract_id,
-                        target,
-                        requester,
-                        change_type
-                    );
+                    console.log("Put Failure");
 
                     return;
                 }
             } catch (e) {
                 console.error(e);
+                errors.push(e);
             }
 
             try {
@@ -129,7 +198,13 @@ function handleChanges(event: MessageEvent) {
                 handleChange(peerChange);
 
                 return;
-            } catch (e) {}
+            } catch (e) {
+                errors.push(e);
+            }
+
+            if (errors.length > 0) {
+                console.error("Failed to handle message:", errors);
+            }
         })
         .catch((error) => {
             console.error("Failed to handle message:", error);

@@ -3,59 +3,22 @@ import * as d3 from "d3";
 import { BaseType } from "d3-selection";
 import { createRoot } from "react-dom/client";
 import { component } from "./react-init";
+import {
+    ChangeInfo,
+    Connection,
+    Peer,
+    PeerId,
+    PeerList,
+} from "./type_definitions";
 
 export let peers: PeerList = {};
 
-interface PeerList {
-    [id: string]: Peer;
-}
-
-interface Peer {
-    id: PeerId;
-    currentLocation: number;
-    connectionTimestamp: number;
-    connections: Connection[];
-    history: ChangeInfo[];
-    locationHistory: { location: number; timestamp: number }[];
-}
-
-interface Connection {
-    transaction: string | null;
-    id: PeerId;
-    location: number;
-}
-
-interface ChangeInfo {
-    type: "Added" | "Removed";
-    from: Connection;
-    to: Connection;
-    timestamp: number;
-}
-
-export class PeerId {
-    private id: string;
-
-    constructor(id: string | Uint8Array) {
-        if (id instanceof Uint8Array) {
-            this.id = new TextDecoder().decode(id);
-        } else {
-            this.id = id;
-        }
-    }
-
-    get short() {
-        return this.id.slice(-8);
-    }
-
-    get full() {
-        return this.id;
-    }
-}
-
 export function handleChange(peerChange: fbTopology.PeerChange) {
     const previousPeers = Object.keys(peers).length;
+
     try {
         const unpacked = peerChange.unpack();
+
         switch (unpacked.changeType) {
             case fbTopology.PeerChangeType.AddedConnection:
                 handleAddedConnection(
@@ -100,6 +63,7 @@ export function handleAddedConnection(
         return;
     }
     const added = peerChange;
+
     const from = new PeerId(added.from!);
     const to = new PeerId(added.to!);
 

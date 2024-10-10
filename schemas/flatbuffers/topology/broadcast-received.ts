@@ -2,22 +2,22 @@
 
 import * as flatbuffers from 'flatbuffers';
 
-export class PutSuccess {
+export class BroadcastReceived {
   bb: flatbuffers.ByteBuffer|null = null;
   bb_pos = 0;
-  __init(i:number, bb:flatbuffers.ByteBuffer):PutSuccess {
+  __init(i:number, bb:flatbuffers.ByteBuffer):BroadcastReceived {
   this.bb_pos = i;
   this.bb = bb;
   return this;
 }
 
-static getRootAsPutSuccess(bb:flatbuffers.ByteBuffer, obj?:PutSuccess):PutSuccess {
-  return (obj || new PutSuccess()).__init(bb.readInt32(bb.position()) + bb.position(), bb);
+static getRootAsBroadcastReceived(bb:flatbuffers.ByteBuffer, obj?:BroadcastReceived):BroadcastReceived {
+  return (obj || new BroadcastReceived()).__init(bb.readInt32(bb.position()) + bb.position(), bb);
 }
 
-static getSizePrefixedRootAsPutSuccess(bb:flatbuffers.ByteBuffer, obj?:PutSuccess):PutSuccess {
+static getSizePrefixedRootAsBroadcastReceived(bb:flatbuffers.ByteBuffer, obj?:BroadcastReceived):BroadcastReceived {
   bb.setPosition(bb.position() + flatbuffers.SIZE_PREFIX_LENGTH);
-  return (obj || new PutSuccess()).__init(bb.readInt32(bb.position()) + bb.position(), bb);
+  return (obj || new BroadcastReceived()).__init(bb.readInt32(bb.position()) + bb.position(), bb);
 }
 
 transaction():string|null
@@ -27,16 +27,16 @@ transaction(optionalEncoding?:any):string|Uint8Array|null {
   return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
 }
 
-requester():string|null
-requester(optionalEncoding:flatbuffers.Encoding):string|Uint8Array|null
-requester(optionalEncoding?:any):string|Uint8Array|null {
+target():string|null
+target(optionalEncoding:flatbuffers.Encoding):string|Uint8Array|null
+target(optionalEncoding?:any):string|Uint8Array|null {
   const offset = this.bb!.__offset(this.bb_pos, 6);
   return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
 }
 
-target():string|null
-target(optionalEncoding:flatbuffers.Encoding):string|Uint8Array|null
-target(optionalEncoding?:any):string|Uint8Array|null {
+requester():string|null
+requester(optionalEncoding:flatbuffers.Encoding):string|Uint8Array|null
+requester(optionalEncoding?:any):string|Uint8Array|null {
   const offset = this.bb!.__offset(this.bb_pos, 8);
   return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
 }
@@ -58,7 +58,7 @@ contractLocation():number {
   return offset ? this.bb!.readFloat64(this.bb_pos + offset) : 0.0;
 }
 
-static startPutSuccess(builder:flatbuffers.Builder) {
+static startBroadcastReceived(builder:flatbuffers.Builder) {
   builder.startObject(6);
 }
 
@@ -66,12 +66,12 @@ static addTransaction(builder:flatbuffers.Builder, transactionOffset:flatbuffers
   builder.addFieldOffset(0, transactionOffset, 0);
 }
 
-static addRequester(builder:flatbuffers.Builder, requesterOffset:flatbuffers.Offset) {
-  builder.addFieldOffset(1, requesterOffset, 0);
+static addTarget(builder:flatbuffers.Builder, targetOffset:flatbuffers.Offset) {
+  builder.addFieldOffset(1, targetOffset, 0);
 }
 
-static addTarget(builder:flatbuffers.Builder, targetOffset:flatbuffers.Offset) {
-  builder.addFieldOffset(2, targetOffset, 0);
+static addRequester(builder:flatbuffers.Builder, requesterOffset:flatbuffers.Offset) {
+  builder.addFieldOffset(2, requesterOffset, 0);
 }
 
 static addKey(builder:flatbuffers.Builder, keyOffset:flatbuffers.Offset) {
@@ -86,23 +86,23 @@ static addContractLocation(builder:flatbuffers.Builder, contractLocation:number)
   builder.addFieldFloat64(5, contractLocation, 0.0);
 }
 
-static endPutSuccess(builder:flatbuffers.Builder):flatbuffers.Offset {
+static endBroadcastReceived(builder:flatbuffers.Builder):flatbuffers.Offset {
   const offset = builder.endObject();
   builder.requiredField(offset, 4) // transaction
-  builder.requiredField(offset, 6) // requester
-  builder.requiredField(offset, 8) // target
+  builder.requiredField(offset, 6) // target
+  builder.requiredField(offset, 8) // requester
   builder.requiredField(offset, 10) // key
   return offset;
 }
 
-static createPutSuccess(builder:flatbuffers.Builder, transactionOffset:flatbuffers.Offset, requesterOffset:flatbuffers.Offset, targetOffset:flatbuffers.Offset, keyOffset:flatbuffers.Offset, timestamp:bigint, contractLocation:number):flatbuffers.Offset {
-  PutSuccess.startPutSuccess(builder);
-  PutSuccess.addTransaction(builder, transactionOffset);
-  PutSuccess.addRequester(builder, requesterOffset);
-  PutSuccess.addTarget(builder, targetOffset);
-  PutSuccess.addKey(builder, keyOffset);
-  PutSuccess.addTimestamp(builder, timestamp);
-  PutSuccess.addContractLocation(builder, contractLocation);
-  return PutSuccess.endPutSuccess(builder);
+static createBroadcastReceived(builder:flatbuffers.Builder, transactionOffset:flatbuffers.Offset, targetOffset:flatbuffers.Offset, requesterOffset:flatbuffers.Offset, keyOffset:flatbuffers.Offset, timestamp:bigint, contractLocation:number):flatbuffers.Offset {
+  BroadcastReceived.startBroadcastReceived(builder);
+  BroadcastReceived.addTransaction(builder, transactionOffset);
+  BroadcastReceived.addTarget(builder, targetOffset);
+  BroadcastReceived.addRequester(builder, requesterOffset);
+  BroadcastReceived.addKey(builder, keyOffset);
+  BroadcastReceived.addTimestamp(builder, timestamp);
+  BroadcastReceived.addContractLocation(builder, contractLocation);
+  return BroadcastReceived.endBroadcastReceived(builder);
 }
 }

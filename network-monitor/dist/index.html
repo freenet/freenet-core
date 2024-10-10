@@ -74,6 +74,11 @@
       <div id="react-init-point">
       </div>
     </section>
+    <script type="module">
+      import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+      mermaid.initialize({ startOnLoad: true });
+      window.mermaid = mermaid;
+    </script>
     <script src="./bundle.js"></script>
   </body>
 </html>

@@ -493,6 +493,8 @@ pub(crate) mod test {
                                 related_contracts: RelatedContracts::new(),
                             };
 
+                            tracing::debug!("sending put to an existing contract");
+
                             return Some(request.into());
                         }
                     }
