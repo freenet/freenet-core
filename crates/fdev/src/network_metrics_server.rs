@@ -95,7 +95,7 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     _ => continue,
                 };
 
-                let mut decoding_errors = String::new(); // TODO: change this to Vec<String>
+                let mut decoding_errors = vec![];
 
                 match ContractChange::try_decode_fbs(&msg) {
                     Ok(ContractChange::PutFailure(_err)) => todo!(),
@@ -111,7 +111,8 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                         continue;
                     }
                     Err(decoding_error) => {
-                        tracing::error!(%received_random_id, error = %decoding_error, "Failed to decode message from 1st ContractChange");
+                        tracing::warn!(%received_random_id, error = %decoding_error, "Failed to decode message from 1st ContractChange");
+                        decoding_errors.push(decoding_error.to_string());
                     }
                 }
 
@@ -131,15 +132,14 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                         continue;
                     }
                     Err(decoding_error) => {
-                        tracing::error!(error = %decoding_error, "Failed to decode message");
-                        decoding_errors.push_str(", ");
-                        decoding_errors.push_str(&decoding_error.to_string());
+                        tracing::warn!(error = %decoding_error, "Failed to decode message");
+                        decoding_errors.push(decoding_error.to_string());
                     }
                 }
 
                 tracing::error!(%received_random_id, "The message was not decoded by any fbs type");
                 tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
-                    decoding_errors,
+                    decoding_errors.join(", "),
                 ))))
                 .await?;
             }
