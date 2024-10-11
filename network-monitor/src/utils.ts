@@ -271,11 +271,8 @@ export const get_peers_description_to_render = (
         let peer_target = peer.target;
 
         if (typeof peer_target == "string") {
-            peer_target = peer_target.split(" (@")[0].slice(-8);
-        } else {
-            peer_target = peer_target
-                .map((t: string) => t.split(" (@")[0].slice(-8))
-                .join("; ");
+            //peer_target = peer_target.split(" (@")[0].slice(-8);
+            peer_target = [peer_target];
         }
 
         let sliced_id = peer_id.slice(-8);
@@ -299,13 +296,17 @@ export const get_peers_description_to_render = (
                 ? "style " + sliced_id + " stroke:#1B2A41,stroke-width:3px"
                 : null;
 
-        let peer_connection = `${sliced_id} ${connection_type}|${change_type}| ${peer_target}`;
+        for (let one_peer of peer_target) {
+            one_peer = one_peer.split(" (@")[0].slice(-8);
 
-        if (node_styling) {
-            peer_connection += "\n" + node_styling;
+            let peer_connection = `${sliced_id} ${connection_type}|${change_type}| ${one_peer}`;
+
+            if (node_styling) {
+                peer_connection += "\n" + node_styling;
+            }
+
+            peer_description += peer_connection + "\n";
         }
-
-        peer_description += peer_connection + "\n";
     }
 
     return peer_description;
