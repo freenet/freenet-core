@@ -217,7 +217,7 @@ impl<'a> NetEventLog<'a> {
                 id,
                 ..
             }) => {
-                let this_peer = &op_manager.ring.connection_manager.get_peer_key().unwrap();
+                let this_peer = &op_manager.ring.connection_manager.own_location();
                 let key = contract.key();
                 EventKind::Put(PutEvent::Request {
                     requester: this_peer.clone(),
@@ -267,7 +267,7 @@ impl<'a> NetEventLog<'a> {
                 ..
             }) => EventKind::Put(PutEvent::BroadcastReceived {
                 id: *id,
-                requester: sender.peer.clone(),
+                requester: sender.clone(),
                 key: *key,
                 value: new_value.clone(),
                 target: target.clone(),
@@ -978,7 +978,7 @@ enum ConnectEvent {
 enum PutEvent {
     Request {
         id: Transaction,
-        requester: PeerId,
+        requester: PeerKeyLocation,
         key: ContractKey,
         target: PeerKeyLocation,
         timestamp: u64,
@@ -1006,7 +1006,7 @@ enum PutEvent {
     BroadcastReceived {
         id: Transaction,
         /// peer who started the broadcast op
-        requester: PeerId,
+        requester: PeerKeyLocation,
         /// key of the contract which value was being updated
         key: ContractKey,
         /// value that was put

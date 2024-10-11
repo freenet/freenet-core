@@ -146,7 +146,8 @@ const ContractPeersHistory = ({
                             )}
                         </th>
                         <th>
-                            Contract Location
+                            Requester <br /> 
+                            Peer Location
                         </th>
                         <th>
                             Transaction Id
@@ -220,7 +221,7 @@ const ContractPeersHistory = ({
                                 {tx.contract_id.slice(-8)}
                             </td>
                             <td>
-                                {tx.contract_location}
+                                {tx.requester_location}
                             </td>
                             <td
                                 onClick={() =>
@@ -379,7 +380,7 @@ export const ContractDetail = ({
             <h2>Contract Details</h2>
             <div id="transaction-detail-contents">
                 <p>Contract Key {transaction.contract_id}</p>
-                <p>Contract Location {transaction.contract_location}</p>
+                <p><b>Contract Location</b> {transaction.contract_location}</p>
                 <p>Requester {transaction.requester}</p>
                 <p>Target {transaction.target}</p>
                 {/*<p>Status {transaction.status}</p>

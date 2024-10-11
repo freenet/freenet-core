@@ -18,12 +18,19 @@ export function handlePutRequest(
     timestamp: number,
     contract_location: number
 ) {
+    let requester_location = parseFloat(
+        requester.split(" (@ ")[1].split(")")[0]
+    );
+
+    requester = requester.split(" (@")[0];
+
     let obj_data = {
         change_type,
         transaction_id,
         contract_id,
         target,
         requester,
+        requester_location,
         unique_id:
             transaction_id + contract_id + target + requester + change_type,
         timestamp,
@@ -104,7 +111,7 @@ export function handleBroadcastEmitted(
     timestamp: number,
     contract_location: number
 ) {
-    let sender_location = sender.split(" (@")[1].split(")")[0];
+    let sender_location = parseFloat(sender.split(" (@")[1].split(")")[0]);
     sender = sender.split(" (@")[0];
 
     let upstream_location = upstream.split(" (@")[1].split(")")[0];
@@ -116,6 +123,7 @@ export function handleBroadcastEmitted(
         contract_id: key,
         target: broadcast_to,
         requester: sender,
+        requester_location: sender_location,
         unique_id: transaction_id + key + broadcast_to[0] + sender,
         timestamp,
         contract_location,
@@ -148,12 +156,19 @@ export function handleBroadcastReceived(
     timestamp: number,
     contract_location: number
 ) {
+    let requester_location = parseFloat(
+        requester.split(" (@")[1].split(")")[0]
+    );
+
+    requester = requester.split(" (@")[0];
+
     let obj_data = {
         change_type,
         transaction_id,
         contract_id: key,
         target,
         requester,
+        requester_location,
         unique_id: transaction_id + key + target + requester,
         timestamp,
         contract_location,
