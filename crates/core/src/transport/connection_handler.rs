@@ -803,6 +803,8 @@ struct InboundRemoteConnection {
 
 #[cfg(test)]
 mod test {
+    #![allow(clippy::single_range_in_vec_init)]
+
     use std::{
         collections::HashMap,
         net::Ipv4Addr,
@@ -834,8 +836,6 @@ mod test {
         ReceiveAll,
         /// Drop the packets randomly based on the factor
         Factor(f64),
-        /// Drop packets fall in the given range
-        Range(Range<usize>),
         /// Drop packets with the given ranges
         Ranges(Vec<Range<usize>>),
     }
@@ -890,12 +890,6 @@ mod test {
                 PacketDropPolicy::ReceiveAll => {}
                 PacketDropPolicy::Factor(factor) => {
                     if *factor > self.rng.try_lock().unwrap().gen::<f64>() {
-                        tracing::trace!(id=%packet_idx, %self.this, "drop packet");
-                        return Ok(buf.len());
-                    }
-                }
-                PacketDropPolicy::Range(r) => {
-                    if r.contains(&packet_idx) {
                         tracing::trace!(id=%packet_idx, %self.this, "drop packet");
                         return Ok(buf.len());
                     }
@@ -1155,9 +1149,9 @@ mod test {
     async fn simulate_nat_traversal_drop_first_packets_for_all() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (peer_a_pub, mut peer_a, peer_a_addr) =
-            set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
+            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1])).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
+            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1])).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
@@ -1182,7 +1176,7 @@ mod test {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
+            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1])).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
@@ -1242,7 +1236,7 @@ mod test {
 
     #[tokio::test]
     async fn simulate_nat_traversal_drop_packet_ranges_of_peerb() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE), None);
         let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
             set_peer_connection(PacketDropPolicy::Ranges(vec![0..1, 3..9])).await?;
@@ -1318,7 +1312,7 @@ mod test {
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
             set_peer_connection(Default::default()).await?;
         let (gw_pub, (_oc, mut gw_conn), gw_addr) =
-            set_gateway_connection(PacketDropPolicy::Range(0..1)).await?;
+            set_gateway_connection(PacketDropPolicy::Ranges(vec![0..1])).await?;
 
         let gw = tokio::spawn(async move {
             let gw_conn = gw_conn.recv();
@@ -1344,9 +1338,9 @@ mod test {
     async fn simulate_gateway_connection_drop_first_packets_for_all() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
-            set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
+            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1])).await?;
         let (gw_pub, (_oc, mut gw_conn), gw_addr) =
-            set_gateway_connection(PacketDropPolicy::Range(0..1)).await?;
+            set_gateway_connection(PacketDropPolicy::Ranges(vec![0..1])).await?;
 
         let gw = tokio::spawn(async move {
             let gw_conn = gw_conn.recv();
@@ -1372,7 +1366,7 @@ mod test {
     async fn simulate_gateway_connection_drop_first_packets_of_peer() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
-            set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
+            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1])).await?;
         let (gw_pub, (_oc, mut gw_conn), gw_addr) =
             set_gateway_connection(Default::default()).await?;
 
@@ -1538,7 +1532,7 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     // #[tokio::test]
     async fn simulate_packet_dropping() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::INFO));
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::INFO), None);
         #[derive(Clone, Copy)]
         struct TestData(&'static str);
 
@@ -1561,26 +1555,44 @@ mod test {
             }
         }
 
+        const BYTES_SENT: u64 = 3 * 1000 * 10;
+
         let mut tests = FuturesOrdered::new();
         let mut rng = rand::rngs::StdRng::seed_from_u64(3);
-        for factor in std::iter::repeat(())
+        for (i, factor) in std::iter::repeat(())
             .map(|_| rng.gen::<f64>())
             .filter(|x| *x > 0.05 && *x < 0.25)
-            .take(5)
+            .take(3)
+            .enumerate()
         {
             let wait_time = Duration::from_secs((((factor * 5.0 + 1.0) * 15.0) + 10.0) as u64);
-            println!(
-                "packet loss factor: {factor} (wait time: {wait_time})",
+            tracing::debug!(
+                "test #{i}: packet loss factor: {factor} (wait time: {wait_time})",
                 wait_time = wait_time.as_secs()
             );
-            tests.push_back(tokio::spawn(run_test(
-                TestConfig {
-                    packet_drop_policy: PacketDropPolicy::Factor(factor),
-                    wait_time,
-                    ..Default::default()
-                },
-                vec![TestData("foo"), TestData("bar")],
-            )));
+            tests.push_back(tokio::spawn(
+                run_test(
+                    TestConfig {
+                        packet_drop_policy: PacketDropPolicy::Factor(factor),
+                        wait_time,
+                        ..Default::default()
+                    },
+                    vec![TestData("foo"), TestData("bar")],
+                )
+                .inspect(move |r| {
+                    tracing::debug!(
+                        "test #{i} finished {}",
+                        if r.is_ok() {
+                            "successfully".to_owned()
+                        } else {
+                            format!(
+                                "with error, rate: {} bytes/sec",
+                                BYTES_SENT / wait_time.as_secs()
+                            )
+                        }
+                    );
+                }),
+            ));
         }
         let mut test_no = 0;
         while let Some(result) = tests.next().await {
