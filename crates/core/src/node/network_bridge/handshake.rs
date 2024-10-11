@@ -259,7 +259,7 @@ impl HandshakeHandler {
                         Some(Ok(InternalEvent::RemoteConnectionAttempt { remote, tracker })) => {
                              // this shouldn't happen as the tx would exit this module
                              // see: OutboundGwConnConfirmed
-                            debug_assert!(tracker.gw_accepted_processed && tracker.gw_accepted);
+                            debug_assert!(!tracker.gw_accepted);
                             tracing::debug!(
                                 at=?tracker.gw_conn.my_address(),
                                 gw=%tracker.gw_conn.remote_addr(),
