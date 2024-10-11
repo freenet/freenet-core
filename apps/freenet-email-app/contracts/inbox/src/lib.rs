@@ -395,13 +395,6 @@ impl ContractInterface for Inbox {
         }
     }
 
-    fn validate_delta(
-        _parameters: Parameters<'static>,
-        delta: StateDelta<'static>,
-    ) -> Result<bool, ContractError> {
-        Ok(UpdateInbox::try_from(delta).ok().is_some())
-    }
-
     fn update_state(
         parameters: Parameters<'static>,
         state: State<'static>,

@@ -23,20 +23,6 @@ impl ContractInterface for Contract {
         }
     }
 
-    fn validate_delta(
-        _parameters: Parameters<'static>,
-        delta: StateDelta<'static>,
-    ) -> Result<bool, ContractError> {
-        let bytes = delta.as_ref();
-        if bytes.len() == 4 && bytes == [1, 2, 3, 4] {
-            Ok(true)
-        } else if bytes.len() != 4 {
-            Err(ContractError::InvalidDelta)
-        } else {
-            Ok(false)
-        }
-    }
-
     fn update_state(
         _parameters: Parameters<'static>,
         state: State<'static>,

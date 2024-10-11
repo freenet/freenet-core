@@ -89,20 +89,6 @@ impl ContractExecutor for Executor<Runtime> {
                 vec![UpdateData::State(incoming_state.clone().into())]
             }
             Either::Right(delta) => {
-                let valid = self
-                    .runtime
-                    .validate_delta(&key, &params, &delta)
-                    .map_err(|err| {
-                        if remove_if_fail {
-                            let _ = self.runtime.contract_store.remove_contract(&key);
-                        }
-                        ExecutorError::other(err)
-                    })?;
-                if !valid {
-                    return Err(ExecutorError::request(StdContractError::invalid_update(
-                        key,
-                    )));
-                }
                 // todo: forward delta like we are doing with puts
                 vec![UpdateData::Delta(delta)]
             }
