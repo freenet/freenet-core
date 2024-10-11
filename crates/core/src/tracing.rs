@@ -217,42 +217,61 @@ impl<'a> NetEventLog<'a> {
                 id,
                 ..
             }) => {
-                let this_peer = &op_manager.ring.connection_manager.get_peer_key().unwrap();
+                let this_peer = &op_manager.ring.connection_manager.own_location();
                 let key = contract.key();
                 EventKind::Put(PutEvent::Request {
                     requester: this_peer.clone(),
                     target: target.clone(),
                     key,
                     id: *id,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
-            NetMessageV1::Put(PutMsg::SuccessfulPut { id, target, key }) => {
-                EventKind::Put(PutEvent::PutSuccess {
-                    id: *id,
-                    requester: op_manager.ring.connection_manager.get_peer_key().unwrap(),
-                    target: target.clone(),
-                    key: *key,
-                })
-            }
+            NetMessageV1::Put(PutMsg::SuccessfulPut {
+                id,
+                target,
+                key,
+                sender,
+            }) => EventKind::Put(PutEvent::PutSuccess {
+                id: *id,
+                requester: sender.clone(),
+                target: target.clone(),
+                key: *key,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
             NetMessageV1::Put(PutMsg::Broadcasting {
                 new_value,
                 broadcast_to,
+                broadcasted_to, // broadcasted_to n peers
                 key,
+                id,
+                upstream,
+                sender,
                 ..
             }) => EventKind::Put(PutEvent::BroadcastEmitted {
+                id: *id,
+                upstream: upstream.clone(),
                 broadcast_to: broadcast_to.clone(),
+                broadcasted_to: *broadcasted_to,
                 key: *key,
                 value: new_value.clone(),
+                sender: sender.clone(),
+                timestamp: chrono::Utc::now().timestamp() as u64,
             }),
             NetMessageV1::Put(PutMsg::BroadcastTo {
                 sender,
                 new_value,
                 key,
+                target,
+                id,
                 ..
             }) => EventKind::Put(PutEvent::BroadcastReceived {
-                requester: sender.peer.clone(),
+                id: *id,
+                requester: sender.clone(),
                 key: *key,
                 value: new_value.clone(),
+                target: target.clone(),
+                timestamp: chrono::Utc::now().timestamp() as u64,
             }),
             NetMessageV1::Get(GetMsg::ReturnGet {
                 key,
@@ -475,7 +494,7 @@ async fn connect_to_metrics_server() -> Option<WebSocketStream<MaybeTlsStream<Tc
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_METRICS_SERVER_PORT);
 
-    tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/push-stats/"))
+    tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/v1/push-stats/"))
         .await
         .map(|(ws_stream, _)| {
             tracing::info!("Connected to network metrics server");
@@ -507,26 +526,33 @@ async fn send_to_metrics_server(
         }) => {
             let msg = PeerChange::added_connection_msg(
                 (&send_msg.tx != Transaction::NULL).then(|| send_msg.tx.to_string()),
-                (from_peer.clone(), from_loc.as_f64()),
-                (to_peer.clone(), to_loc.as_f64()),
+                (from_peer.clone().to_string(), from_loc.as_f64()),
+                (to_peer.clone().to_string(), to_loc.as_f64()),
             );
             ws_stream.send(Message::Binary(msg)).await
         }
         EventKind::Disconnected { from } => {
-            let msg = PeerChange::removed_connection_msg(from.clone(), send_msg.peer_id.clone());
+            let msg = PeerChange::removed_connection_msg(
+                from.clone().to_string(),
+                send_msg.peer_id.clone().to_string(),
+            );
             ws_stream.send(Message::Binary(msg)).await
         }
         EventKind::Put(PutEvent::Request {
             requester,
             key,
             target,
+            timestamp,
             ..
         }) => {
+            let contract_location = Location::from_contract_key(key.as_bytes());
             let msg = ContractChange::put_request_msg(
                 send_msg.tx.to_string(),
                 key.to_string(),
                 requester.to_string(),
                 target.peer.to_string(),
+                *timestamp,
+                contract_location.as_f64(),
             );
             ws_stream.send(Message::Binary(msg)).await
         }
@@ -534,13 +560,60 @@ async fn send_to_metrics_server(
             requester,
             target,
             key,
+            timestamp,
             ..
         }) => {
+            let contract_location = Location::from_contract_key(key.as_bytes());
+
             let msg = ContractChange::put_success_msg(
                 send_msg.tx.to_string(),
                 key.to_string(),
                 requester.to_string(),
                 target.peer.to_string(),
+                *timestamp,
+                contract_location.as_f64(),
+            );
+            ws_stream.send(Message::Binary(msg)).await
+        }
+        EventKind::Put(PutEvent::BroadcastEmitted {
+            id,
+            upstream,
+            broadcast_to, // broadcast_to n peers
+            broadcasted_to,
+            key,
+            sender,
+            timestamp,
+            ..
+        }) => {
+            let contract_location = Location::from_contract_key(key.as_bytes());
+            let msg = ContractChange::broadcast_emitted_msg(
+                id.to_string(),
+                upstream.to_string(),
+                broadcast_to.iter().map(|p| p.to_string()).collect(),
+                *broadcasted_to,
+                key.to_string(),
+                sender.to_string(),
+                *timestamp,
+                contract_location.as_f64(),
+            );
+            ws_stream.send(Message::Binary(msg)).await
+        }
+        EventKind::Put(PutEvent::BroadcastReceived {
+            id,
+            target,
+            requester,
+            key,
+            timestamp,
+            ..
+        }) => {
+            let contract_location = Location::from_contract_key(key.as_bytes());
+            let msg = ContractChange::broadcast_received_msg(
+                id.to_string(),
+                target.to_string(),
+                requester.to_string(),
+                key.to_string(),
+                *timestamp,
+                contract_location.as_f64(),
             );
             ws_stream.send(Message::Binary(msg)).await
         }
@@ -905,31 +978,42 @@ enum ConnectEvent {
 enum PutEvent {
     Request {
         id: Transaction,
-        requester: PeerId,
+        requester: PeerKeyLocation,
         key: ContractKey,
         target: PeerKeyLocation,
+        timestamp: u64,
     },
     PutSuccess {
         id: Transaction,
-        requester: PeerId,
+        requester: PeerKeyLocation,
         target: PeerKeyLocation,
         key: ContractKey,
+        timestamp: u64,
     },
     BroadcastEmitted {
+        id: Transaction,
+        upstream: PeerKeyLocation,
         /// subscribed peers
         broadcast_to: Vec<PeerKeyLocation>,
+        broadcasted_to: usize,
         /// key of the contract which value was being updated
         key: ContractKey,
         /// value that was put
         value: WrappedState,
+        sender: PeerKeyLocation,
+        timestamp: u64,
     },
     BroadcastReceived {
+        id: Transaction,
         /// peer who started the broadcast op
-        requester: PeerId,
+        requester: PeerKeyLocation,
         /// key of the contract which value was being updated
         key: ContractKey,
         /// value that was put
         value: WrappedState,
+        /// target peer
+        target: PeerKeyLocation,
+        timestamp: u64,
     },
 }
 

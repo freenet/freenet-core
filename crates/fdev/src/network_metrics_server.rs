@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, path::PathBuf, sync::Arc, time::Duration};
+use std::{fmt::Display, net::Ipv4Addr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -12,11 +12,8 @@ use axum::{
     Router,
 };
 use dashmap::DashMap;
-use freenet::{
-    dev_tool::PeerId,
-    generated::{
-        topology::ControllerResponse, ChangesWrapper, ContractChange, PeerChange, TryFromFbs,
-    },
+use freenet::generated::{
+    topology::ControllerResponse, ChangesWrapper, ContractChange, PeerChange, TryFromFbs,
 };
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -84,6 +81,7 @@ async fn push_stats(
 async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Result<()> {
     let (mut tx, mut rx) = ws.split();
     while let Some(msg) = rx.next().await {
+        let received_random_id = rand::random::<u64>();
         match msg {
             Ok(msg) => {
                 let msg = match msg {
@@ -96,6 +94,28 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     }
                     _ => continue,
                 };
+
+                let mut decoding_errors = vec![];
+
+                match ContractChange::try_decode_fbs(&msg) {
+                    Ok(ContractChange::PutFailure(_err)) => todo!(),
+                    Ok(change) => {
+                        if let Err(err) = state.save_record(ChangesWrapper::ContractChange(change))
+                        {
+                            tracing::error!(error = %err, "Failed saving report");
+                            tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
+                                format!("{err}"),
+                            ))))
+                            .await?;
+                        }
+                        continue;
+                    }
+                    Err(decoding_error) => {
+                        tracing::warn!(%received_random_id, error = %decoding_error, "Failed to decode message from 1st ContractChange");
+                        decoding_errors.push(decoding_error.to_string());
+                    }
+                }
+
                 match PeerChange::try_decode_fbs(&msg) {
                     Ok(PeerChange::Error(err)) => {
                         tracing::error!(error = %err.message(), "Received error from peer");
@@ -109,38 +129,19 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                             ))))
                             .await?;
                         }
+                        continue;
                     }
                     Err(decoding_error) => {
-                        tracing::error!(error = %decoding_error, "Failed to decode message");
-                        tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
-                            format!("{decoding_error}"),
-                        ))))
-                        .await?;
+                        tracing::warn!(error = %decoding_error, "Failed to decode message");
+                        decoding_errors.push(decoding_error.to_string());
                     }
                 }
-                match ContractChange::try_decode_fbs(&msg) {
-                    Ok(ContractChange::PutFailure(_err)) => {
-                        // FIXME: handle put failure
-                        tracing::error!(error = "Failed to put contract");
-                    }
-                    Ok(change) => {
-                        if let Err(err) = state.save_record(ChangesWrapper::ContractChange(change))
-                        {
-                            tracing::error!(error = %err, "Failed saving report");
-                            tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
-                                format!("{err}"),
-                            ))))
-                            .await?;
-                        }
-                    }
-                    Err(decoding_error) => {
-                        tracing::error!(error = %decoding_error, "Failed to decode message");
-                        tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
-                            format!("{decoding_error}"),
-                        ))))
-                        .await?;
-                    }
-                }
+
+                tracing::error!(%received_random_id, "The message was not decoded by any fbs type");
+                tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
+                    decoding_errors.join(", "),
+                ))))
+                .await?;
             }
             Err(e) => {
                 tracing::debug!("Websocket error: {}", e);
@@ -173,6 +174,94 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
         );
         tx.send(Message::Binary(msg)).await?;
     }
+
+    for transaction in state.transactions_data.iter() {
+        tracing::info!("sending transaction data");
+        for change in transaction.value() {
+            let msg = match change {
+                Change::PutRequest {
+                    tx_id,
+                    key,
+                    requester,
+                    target,
+                    timestamp,
+                    contract_location,
+                } => {
+                    tracing::info!("sending put request");
+                    ContractChange::put_request_msg(
+                        tx_id.clone(),
+                        key.to_string(),
+                        requester.to_string(),
+                        target.to_string(),
+                        *timestamp,
+                        *contract_location,
+                    )
+                }
+                Change::PutSuccess {
+                    tx_id,
+                    key,
+                    target,
+                    timestamp,
+                    requester,
+                    contract_location,
+                } => {
+                    tracing::info!("sending put success");
+                    ContractChange::put_success_msg(
+                        tx_id.clone(),
+                        key.to_string(),
+                        requester.to_string(),
+                        target.to_string(),
+                        *timestamp,
+                        *contract_location,
+                    )
+                }
+                Change::BroadcastEmitted {
+                    tx_id,
+                    upstream,
+                    broadcast_to,
+                    broadcasted_to,
+                    key,
+                    sender,
+                    timestamp,
+                    contract_location,
+                } => {
+                    tracing::info!("sending broadcast emitted");
+                    ContractChange::broadcast_emitted_msg(
+                        tx_id.clone(),
+                        upstream,
+                        broadcast_to.iter().map(|s| s.to_string()).collect(),
+                        *broadcasted_to,
+                        key,
+                        sender,
+                        *timestamp,
+                        *contract_location,
+                    )
+                }
+                Change::BroadcastReceived {
+                    tx_id,
+                    key,
+                    requester,
+                    target,
+                    timestamp,
+                    contract_location,
+                } => {
+                    tracing::info!("sending broadcast received");
+                    ContractChange::broadcast_received_msg(
+                        tx_id,
+                        target,
+                        requester,
+                        key,
+                        *timestamp,
+                        *contract_location,
+                    )
+                }
+
+                _ => continue,
+            };
+            tx.send(Message::Binary(msg)).await?;
+        }
+    }
+
     let mut changes = state.changes.subscribe();
     while let Ok(msg) = changes.recv().await {
         match msg {
@@ -197,13 +286,77 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                 key,
                 requester,
                 target,
+                timestamp,
+                contract_location,
             } => {
                 tracing::debug!(%tx_id, %key, %requester, %target, "sending put request");
-                let msg = ContractChange::put_request_msg(tx_id, key, requester, target);
+                let msg = ContractChange::put_request_msg(
+                    tx_id,
+                    key,
+                    requester,
+                    target,
+                    timestamp,
+                    contract_location,
+                );
                 tx.send(Message::Binary(msg)).await?;
             }
-            Change::PutSuccess { tx_id, key, target } => {
-                let msg = ContractChange::put_success_msg(tx_id, key, target.clone(), target);
+            Change::PutSuccess {
+                tx_id,
+                key,
+                target,
+                requester,
+                timestamp,
+                contract_location,
+            } => {
+                tracing::debug!(%tx_id, %key, %requester, %target, "sending put success");
+                let msg = ContractChange::put_success_msg(
+                    tx_id,
+                    key,
+                    requester,
+                    target,
+                    timestamp,
+                    contract_location,
+                );
+                tx.send(Message::Binary(msg)).await?;
+            }
+            Change::BroadcastEmitted {
+                tx_id,
+                upstream,
+                broadcast_to,
+                broadcasted_to,
+                key,
+                sender,
+                timestamp,
+                contract_location,
+            } => {
+                let msg = ContractChange::broadcast_emitted_msg(
+                    tx_id,
+                    upstream,
+                    broadcast_to,
+                    broadcasted_to,
+                    key,
+                    sender,
+                    timestamp,
+                    contract_location,
+                );
+                tx.send(Message::Binary(msg)).await?;
+            }
+            Change::BroadcastReceived {
+                tx_id,
+                key,
+                requester,
+                target,
+                timestamp,
+                contract_location,
+            } => {
+                let msg = ContractChange::broadcast_received_msg(
+                    tx_id,
+                    target,
+                    requester,
+                    key,
+                    timestamp,
+                    contract_location,
+                );
                 tx.send(Message::Binary(msg)).await?;
             }
         }
@@ -213,13 +366,21 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
 
 struct ServerState {
     changes: tokio::sync::broadcast::Sender<Change>,
-    peer_data: DashMap<PeerId, PeerData>,
-    transactions_data: DashMap<String, Vec<String>>,
+    peer_data: DashMap<String, PeerData>,
+    transactions_data: DashMap<String, Vec<Change>>,
+    contract_data: DashMap<String, ContractData>,
 }
 
 struct PeerData {
-    connections: Vec<(PeerId, f64)>,
+    connections: Vec<(String, f64)>,
     location: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ContractData {
+    location: f64,
+    connections: Vec<String>,
+    key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,38 +401,63 @@ pub(crate) enum Change {
         key: String,
         requester: String,
         target: String,
+        timestamp: u64,
+        contract_location: f64,
     },
     PutSuccess {
         tx_id: String,
         key: String,
+        requester: String,
         target: String,
+        timestamp: u64,
+        contract_location: f64,
+    },
+    BroadcastEmitted {
+        tx_id: String,
+        upstream: String,
+        broadcast_to: Vec<String>,
+        broadcasted_to: usize,
+        key: String,
+        sender: String,
+        timestamp: u64,
+        contract_location: f64,
+    },
+    BroadcastReceived {
+        tx_id: String,
+        key: String,
+        requester: String,
+        target: String,
+        timestamp: u64,
+        contract_location: f64,
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct PeerIdHumanReadable(PeerId);
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub(crate) struct PeerIdHumanReadable(String);
 
-impl From<PeerId> for PeerIdHumanReadable {
-    fn from(peer_id: PeerId) -> Self {
+impl Display for PeerIdHumanReadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl From<String> for PeerIdHumanReadable {
+    fn from(peer_id: String) -> Self {
         Self(peer_id)
     }
 }
 
-impl std::fmt::Display for PeerIdHumanReadable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0.addr)
-    }
-}
-
 impl ServerState {
-    fn save_record(&self, change: ChangesWrapper) -> anyhow::Result<()> {
+    fn save_record(&self, change: ChangesWrapper) -> Result<(), anyhow::Error> {
         match change {
             ChangesWrapper::PeerChange(PeerChange::AddedConnection(added)) => {
-                let from_peer_id: PeerId = bincode::deserialize(added.from().bytes())?;
+                let from_peer_id = String::from_utf8(added.from().bytes().to_vec())?;
                 let from_loc = added.from_location();
 
-                let to_peer_id: PeerId = bincode::deserialize(added.to().bytes())?;
+                let to_peer_id = String::from_utf8(added.to().bytes().to_vec())?;
                 let to_loc = added.to_location();
+
+                tracing::info!(%from_peer_id, %to_peer_id, "--addedconnection adding connection");
 
                 match self.peer_data.entry(from_peer_id.clone()) {
                     dashmap::mapref::entry::Entry::Occupied(mut occ) => {
@@ -310,8 +496,8 @@ impl ServerState {
                 });
             }
             ChangesWrapper::PeerChange(PeerChange::RemovedConnection(removed)) => {
-                let from_peer_id = bincode::deserialize(removed.from().bytes())?;
-                let at_peer_id = bincode::deserialize(removed.at().bytes())?;
+                let from_peer_id = String::from_utf8(removed.from().bytes().to_vec())?;
+                let at_peer_id = String::from_utf8(removed.at().bytes().to_vec())?;
 
                 if let Some(mut entry) = self.peer_data.get_mut(&from_peer_id) {
                     entry
@@ -335,18 +521,36 @@ impl ServerState {
                 let key = change.key().to_string();
                 let requester = change.requester().to_string();
                 let target = change.target().to_string();
+                let timestamp = change.timestamp();
+                let contract_location = change.contract_location();
 
-                if self.transactions_data.get_mut(&tx_id).is_some() {
-                    unreachable!(
-                        "found an already included in logs transaction when it should create it."
-                    );
+                if tx_id.is_empty() {
+                    return Err(anyhow::anyhow!("tx_id is empty"));
+                }
+
+                if key.is_empty() {
+                    return Err(anyhow::anyhow!("key is empty"));
+                }
+
+                if requester.is_empty() {
+                    return Err(anyhow::anyhow!("requester is empty"));
+                }
+
+                if let Some(_entry) = self.transactions_data.get_mut(&tx_id) {
+                    tracing::error!("this tx should not be included on transactions_data");
+
+                    unreachable!();
                 } else {
                     self.transactions_data.insert(
                         tx_id.clone(),
-                        vec![format!(
-                            "tx_id {} key {} req {} target {} state PutRequest",
-                            tx_id, key, requester, target
-                        )],
+                        vec![Change::PutRequest {
+                            tx_id: tx_id.clone(),
+                            key: key.clone(),
+                            requester: requester.clone(),
+                            target: target.clone(),
+                            timestamp,
+                            contract_location,
+                        }],
                     );
                 }
 
@@ -357,6 +561,8 @@ impl ServerState {
                     key,
                     requester,
                     target,
+                    timestamp,
+                    contract_location,
                 });
             }
             ChangesWrapper::ContractChange(ContractChange::PutSuccess(change)) => {
@@ -364,20 +570,200 @@ impl ServerState {
                 let key = change.key().to_string();
                 let requester = change.requester().to_string();
                 let target = change.target().to_string();
+                let timestamp = change.timestamp();
+                let contract_location = change.contract_location();
 
-                if let Some(mut entry) = self.transactions_data.get_mut(&tx_id) {
-                    entry.push(format!(
-                        "tx_id {} key {} req {} target {} state PutSuccess",
-                        tx_id, key, requester, target
-                    ));
-                } else {
-                    tracing::error!("transaction data not found for this tx when it should.");
-                    unreachable!()
+                if tx_id.is_empty() {
+                    return Err(anyhow::anyhow!("tx_id is empty"));
+                }
+
+                if key.is_empty() {
+                    return Err(anyhow::anyhow!("key is empty"));
+                }
+
+                if requester.is_empty() {
+                    return Err(anyhow::anyhow!("requester is empty"));
+                }
+
+                match self.transactions_data.entry(tx_id.clone()) {
+                    dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                        tracing::info!("found transaction data, adding PutSuccess to changes");
+                        let changes = occ.get_mut();
+                        changes.push(Change::PutSuccess {
+                            tx_id: tx_id.clone(),
+                            key: key.clone(),
+                            target: target.clone(),
+                            requester: requester.clone(),
+                            timestamp,
+                            contract_location,
+                        });
+                        //connections.sort_unstable_by(|a, b| a.cmp(&b.0));
+                        //connections.dedup();
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(_vac) => {
+                        // this should not happen
+                        tracing::error!("this tx should be included on transactions_data. It should exists a PutRequest before the PutSuccess.");
+                        unreachable!();
+                    }
                 }
 
                 tracing::debug!(%tx_id, %key, %requester, %target, "checking values from save_record -- putsuccess");
 
-                let _ = self.changes.send(Change::PutSuccess { tx_id, key, target });
+                match self.contract_data.entry(key.clone()) {
+                    dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                        let connections = &mut occ.get_mut().connections;
+
+                        connections.push(target.clone());
+                        //connections.sort_unstable_by(|a, b| a.cmp(&b.0));
+                        //connections.dedup();
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(vac) => {
+                        vac.insert(ContractData {
+                            connections: vec![target.clone()],
+                            location: contract_location,
+                            key: key.clone(),
+                        });
+                    }
+                }
+
+                tracing::debug!("after contract_data updates");
+
+                let _ = self.changes.send(Change::PutSuccess {
+                    tx_id,
+                    key,
+                    target,
+                    requester,
+                    timestamp,
+                    contract_location,
+                });
+            }
+
+            ChangesWrapper::ContractChange(ContractChange::BroadcastEmitted(broadcast_data)) => {
+                let tx_id = broadcast_data.transaction().to_string();
+                let upstream = broadcast_data.upstream().to_string();
+                let broadcast_to = broadcast_data
+                    .broadcast_to()
+                    .unwrap()
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>();
+                let broadcasted_to = broadcast_data.broadcasted_to();
+                let key = broadcast_data.key().to_string();
+                let sender = broadcast_data.sender().to_string();
+
+                let timestamp = broadcast_data.timestamp();
+                let contract_location = broadcast_data.contract_location();
+
+                if broadcast_to.is_empty() {
+                    return Err(anyhow::anyhow!("broadcast_to is empty"));
+                }
+
+                tracing::info!(?broadcast_to, "save_record broadcast_to");
+
+                if tx_id.is_empty() {
+                    return Err(anyhow::anyhow!("tx_id is empty"));
+                }
+
+                if key.is_empty() {
+                    return Err(anyhow::anyhow!("key is empty"));
+                }
+
+                match self.transactions_data.entry(tx_id.clone()) {
+                    dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                        tracing::info!(
+                            "found transaction data, adding BroadcastEmitted to history"
+                        );
+                        let changes = occ.get_mut();
+                        changes.push(Change::BroadcastEmitted {
+                            tx_id: tx_id.clone(),
+                            upstream: upstream.clone(),
+                            broadcast_to: broadcast_to.clone(),
+                            broadcasted_to: broadcasted_to as usize,
+                            key: key.clone(),
+                            sender: sender.clone(),
+                            timestamp,
+                            contract_location,
+                        });
+
+                        //connections.sort_unstable_by(|a, b| a.cmp(&b.0));
+                        //connections.dedup();
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(_vac) => {
+                        // this should not happen
+                        tracing::error!("this tx should be included on transactions_data. It should exists a PutRequest before BroadcastEmitted.");
+                        unreachable!();
+                    }
+                }
+
+                tracing::debug!(%tx_id, %key, %upstream, %sender, "checking values from save_record -- broadcastemitted");
+
+                let _ = self.changes.send(Change::BroadcastEmitted {
+                    tx_id,
+                    upstream,
+                    broadcast_to,
+                    broadcasted_to: broadcasted_to as usize,
+                    key,
+                    sender,
+                    timestamp,
+                    contract_location,
+                });
+            }
+
+            ChangesWrapper::ContractChange(ContractChange::BroadcastReceived(broadcast_data)) => {
+                let tx_id = broadcast_data.transaction().to_string();
+                let key = broadcast_data.key().to_string();
+                let requester = broadcast_data.requester().to_string();
+                let target = broadcast_data.target().to_string();
+                let timestamp = broadcast_data.timestamp();
+                let contract_location = broadcast_data.contract_location();
+
+                if tx_id.is_empty() {
+                    return Err(anyhow::anyhow!("tx_id is empty"));
+                }
+
+                if key.is_empty() {
+                    return Err(anyhow::anyhow!("key is empty"));
+                }
+
+                if requester.is_empty() {
+                    return Err(anyhow::anyhow!("requester is empty"));
+                }
+
+                match self.transactions_data.entry(tx_id.clone()) {
+                    dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                        tracing::info!(
+                            "found transaction data, adding BroadcastReceived to history"
+                        );
+                        let changes = occ.get_mut();
+                        changes.push(Change::BroadcastReceived {
+                            tx_id: tx_id.clone(),
+                            key: key.clone(),
+                            requester: requester.clone(),
+                            target: target.clone(),
+                            timestamp,
+                            contract_location,
+                        });
+
+                        //connections.sort_unstable_by(|a, b| a.cmp(&b.0));
+                        //connections.dedup();
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(_vac) => {
+                        // this should not happen
+                        tracing::error!("this tx should be included on transactions_data. It should exists a PutRequest before BroadcastReceived.");
+                        unreachable!();
+                    }
+                }
+
+                tracing::debug!(%tx_id, %key, %requester, %target, "checking values from save_record -- broadcastreceived");
+
+                let _ = self.changes.send(Change::BroadcastReceived {
+                    tx_id,
+                    key,
+                    requester,
+                    target,
+                    timestamp,
+                    contract_location,
+                });
             }
 
             _ => unreachable!(),

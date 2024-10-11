@@ -182,6 +182,7 @@ impl Operation for PutOp {
                         tx = %id,
                         %key,
                         target = %target.peer,
+                        sender = %sender.peer,
                         "Puttting contract at target peer",
                     );
 
@@ -266,6 +267,7 @@ impl Operation for PutOp {
                     new_value,
                     contract,
                     sender,
+                    ..
                 } => {
                     let target = op_manager.ring.connection_manager.own_location();
 
@@ -313,6 +315,7 @@ impl Operation for PutOp {
                     new_value,
                     contract,
                     upstream,
+                    ..
                 } => {
                     let sender = op_manager.ring.connection_manager.own_location();
                     let mut broadcasted_to = *broadcasted_to;
@@ -325,6 +328,7 @@ impl Operation for PutOp {
                             new_value: new_value.clone(),
                             sender: sender.clone(),
                             contract: contract.clone(),
+                            target: peer.clone(),
                         };
                         let f = conn_manager.send(&peer.peer, msg.into());
                         broadcasting.push(f);
@@ -365,6 +369,7 @@ impl Operation for PutOp {
                         id: *id,
                         target: upstream.clone(),
                         key: *key,
+                        sender,
                     });
                     new_state = None;
                 }
@@ -383,11 +388,13 @@ impl Operation for PutOp {
                                 "Peer completed contract value put",
                             );
                             new_state = Some(PutState::Finished { key });
+
                             if let Some(upstream) = upstream {
                                 return_msg = Some(PutMsg::SuccessfulPut {
                                     id: *id,
                                     target: upstream,
                                     key,
+                                    sender: op_manager.ring.connection_manager.own_location(),
                                 });
                             } else {
                                 return_msg = None;
@@ -581,6 +588,7 @@ async fn try_to_broadcast(
                     key,
                     contract,
                     upstream,
+                    sender: op_manager.ring.connection_manager.own_location(),
                 });
 
                 let op = PutOp {
@@ -598,6 +606,7 @@ async fn try_to_broadcast(
                     id,
                     target: upstream,
                     key,
+                    sender: op_manager.ring.connection_manager.own_location(),
                 });
             }
         }
@@ -832,6 +841,7 @@ mod messages {
             id: Transaction,
             target: PeerKeyLocation,
             key: ContractKey,
+            sender: PeerKeyLocation,
         },
         /// Target the node which is closest to the key
         SeekNode {
@@ -854,6 +864,7 @@ mod messages {
             new_value: WrappedState,
             contract: ContractContainer,
             upstream: PeerKeyLocation,
+            sender: PeerKeyLocation,
         },
         /// Broadcasting a change to a peer, which then will relay the changes to other peers.
         BroadcastTo {
@@ -862,6 +873,7 @@ mod messages {
             key: ContractKey,
             new_value: WrappedState,
             contract: ContractContainer,
+            target: PeerKeyLocation,
         },
     }
 

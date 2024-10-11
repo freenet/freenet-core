@@ -192,6 +192,7 @@ impl Operation for UpdateOp {
                         tx = %id,
                         %key,
                         target = %target.peer,
+                        sender = %sender.peer,
                         "Updating contract at target peer",
                     );
 
