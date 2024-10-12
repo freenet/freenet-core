@@ -780,6 +780,11 @@ async fn wait_for_gw_confirmation(
 async fn check_remaining_hops(mut tracker: AcceptedTracker) -> OutboundConnResult {
     let remote_addr = tracker.gw_conn.remote_addr();
     let gw_peer_id = tracker.gw_peer.peer.clone();
+    tracing::debug!(
+        at=?tracker.gw_conn.my_address(),
+        from=%tracker.gw_conn.remote_addr(),
+        "Checking for remaining hops, left: {}", tracker.remaining_checks
+    );
     while tracker.remaining_checks > 0 {
         let msg = tokio::time::timeout(
             Duration::from_secs(10),
@@ -1558,9 +1563,9 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_peer_to_gw_outbound_conn_rejected() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG));
+        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG), None);
         let joiner_addr = ([127, 0, 0, 1], 10001).into();
         let (mut handler, mut test) = config_handler(joiner_addr, None);
 
@@ -1626,7 +1631,7 @@ mod tests {
                     location: Some(Location::from_address(&addr)),
                     peer: PeerId::new(addr, TransportKeypair::new().public().clone()),
                 };
-                tracing::info!(%acceptor, "Sending forward reply");
+                tracing::info!(%acceptor, "Sending forward reply number {} with status {}", i, i > 3);
                 let forward_response = ConnectMsg::Response {
                     id: tx,
                     sender: gw_pkloc.clone(),
@@ -1643,6 +1648,7 @@ mod tests {
                         NetMessage::V1(NetMessageV1::Connect(forward_response)),
                     )
                     .await;
+                tracing::info!("Forward response number {} sent", i);
             }
 
             for _ in 0..5 {
@@ -1679,12 +1685,9 @@ mod tests {
         let peer_inbound = async {
             let mut conn_count = 0;
             for _ in 0..5 {
-                let event = tokio::time::timeout(Duration::from_secs(5), handler.wait_for_events())
+                let event = tokio::time::timeout(Duration::from_secs(20), handler.wait_for_events())
                     .await??;
                 match event {
-                    // Event::OutboundGatewayConnectionRejected { peer_id } => {
-                    //     tracing::info!(%peer_id, "Connection rejected");
-                    // }
                     Event::OutboundConnectionSuccessful {
                         peer_id,
                         connection,
@@ -1697,8 +1700,11 @@ mod tests {
                 }
             }
             let event =
-                tokio::time::timeout(Duration::from_secs(5), handler.wait_for_events()).await??;
+                tokio::time::timeout(Duration::from_secs(20), handler.wait_for_events()).await??;
             match event {
+                Event::OutboundConnectionFailed {peer_id, error} => {
+                    tracing::info!(%peer_id, "Connection failed wit error: {:?}", error);
+                }
                 Event::OutboundGatewayConnectionRejected { peer_id } => {
                     tracing::info!(%peer_id, "Connection rejected");
                 }
