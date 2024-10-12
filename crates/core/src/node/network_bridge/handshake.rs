@@ -1723,7 +1723,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_to_gw_outbound_conn_forwarded() -> anyhow::Result<()> {
-        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG), None);
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG), None);
         let joiner_addr = ([127, 0, 0, 1], 10001).into();
         let (mut handler, mut test) = config_handler(joiner_addr, None);
 
