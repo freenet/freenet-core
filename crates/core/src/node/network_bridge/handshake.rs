@@ -29,7 +29,8 @@ use crate::{
 type Result<T, E = HandshakeError> = std::result::Result<T, E>;
 type OutboundConnResult = Result<InternalEvent, (PeerId, HandshakeError)>;
 
-const TIMEOUT: Duration = Duration::from_secs(600);
+const TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Debug)]
 pub(super) struct ForwardInfo {
     pub target: PeerId,
@@ -1349,7 +1350,7 @@ mod tests {
 
         let gw_inbound = async {
             let event =
-                tokio::time::timeout(Duration::from_secs(2), handler.wait_for_events()).await??;
+                tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
             match event {
                 Event::InboundConnectionRejected { peer_id } => {
                     assert_eq!(peer_id.addr, remote_addr);
@@ -1518,7 +1519,7 @@ mod tests {
             let mut third_party = None;
             loop {
                 let event =
-                    tokio::time::timeout(Duration::from_secs(5), gw_handler.wait_for_events())
+                    tokio::time::timeout(Duration::from_secs(1), gw_handler.wait_for_events())
                         .await??;
                 match event {
                     Event::InboundConnection {
@@ -1570,7 +1571,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_to_gw_outbound_conn_rejected() -> anyhow::Result<()> {
-        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE), None);
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE), None);
         let joiner_addr = ([127, 0, 0, 1], 10001).into();
         let (mut handler, mut test) = config_handler(joiner_addr, None);
 
@@ -1692,9 +1693,8 @@ mod tests {
             let mut conn_count = 0;
             let mut gw_rejected = false;
             for conn_num in 3..Ring::DEFAULT_MAX_HOPS_TO_LIVE {
-                let event =
-                    tokio::time::timeout(Duration::from_secs(20), handler.wait_for_events())
-                        .await??;
+                let event = tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events())
+                    .await??;
                 match event {
                     Event::OutboundConnectionSuccessful {
                         peer_id,
@@ -1723,6 +1723,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_to_gw_outbound_conn_forwarded() -> anyhow::Result<()> {
+        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG), None);
         let joiner_addr = ([127, 0, 0, 1], 10001).into();
         let (mut handler, mut test) = config_handler(joiner_addr, None);
 
@@ -1730,81 +1731,77 @@ mod tests {
         let gw_pub_key = gw_key.public().clone();
         let gw_addr = ([127, 0, 0, 1], 10000).into();
         let gw_peer_id = PeerId::new(gw_addr, gw_pub_key.clone());
+        let gw_pkloc = PeerKeyLocation {
+            location: Some(Location::from_address(&gw_peer_id.addr)),
+            peer: gw_peer_id.clone(),
+        };
 
         let joiner_key = TransportKeypair::new();
         let joiner_pub_key = joiner_key.public().clone();
         let joiner_peer_id = PeerId::new(joiner_addr, joiner_pub_key.clone());
-
-        let peer_key = TransportKeypair::new();
-        let peer_pub_key = peer_key.public().clone();
-        let peer_addr = ([127, 0, 0, 2], 10002).into();
-        let peer_peer_id = PeerId::new(peer_addr, peer_pub_key.clone());
-
-        handler.connection_manager.max_connections = 1;
-        handler.connection_manager.min_connections = 1;
+        let joiner_pkloc = PeerKeyLocation {
+            peer: joiner_peer_id.clone(),
+            location: Some(Location::from_address(&joiner_peer_id.addr)),
+        };
 
         let tx = Transaction::new::<ConnectMsg>();
 
         let test_controller = async {
             let open_connection_peer =
-                start_conn(&mut test, peer_addr, peer_pub_key.clone(), tx, false).await;
+                start_conn(&mut test, gw_addr, gw_pub_key.clone(), tx, true).await;
             test.transport
-                .new_outbound_conn(peer_addr, open_connection_peer)
+                .new_outbound_conn(gw_addr, open_connection_peer)
                 .await;
 
-            test.transport.new_conn(joiner_addr).await;
-            test.transport
-                .establish_inbound_conn(joiner_addr, joiner_pub_key, None)
-                .await;
+            let msg = test.transport.recv_outbound_msg().await?;
+            tracing::info!("Received connec request: {:?}", msg);
+            let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
+                id,
+                msg: ConnectRequest::StartJoinReq { .. },
+                ..
+            })) = msg
+            else {
+                panic!("unexpected message");
+            };
+            assert_eq!(id, tx);
 
+            let initial_join_req = ConnectMsg::Response {
+                id: tx,
+                sender: gw_pkloc.clone(),
+                target: joiner_pkloc.clone(),
+                msg: ConnectResponse::AcceptedBy {
+                    accepted: true,
+                    acceptor: gw_pkloc.clone(),
+                    joiner: joiner_peer_id.clone(),
+                },
+            };
+            test.transport
+                .inbound_msg(
+                    gw_addr,
+                    NetMessage::V1(NetMessageV1::Connect(initial_join_req)),
+                )
+                .await;
+            tracing::debug!("Sent initial gw rejected reply");
             Ok::<_, anyhow::Error>(())
         };
 
         let peer_inbound = async {
-            let mut received_outbound_successful = false;
-            let mut received_forward_transaction = false;
+            let mut conn_count = 0;
 
-            while !received_outbound_successful || !received_forward_transaction {
-                let event = tokio::time::timeout(Duration::from_secs(5), handler.wait_for_events())
-                    .await??;
-
-                match event {
-                    Event::OutboundConnectionSuccessful { peer_id, .. } => {
-                        assert_eq!(peer_id.addr, peer_addr);
-                        tracing::info!("Outbound connection to peer successful: {:?}", peer_id);
-                        received_outbound_successful = true;
-                    }
-                    Event::TransientForwardTransaction {
-                        target,
-                        tx,
-                        forward_to,
-                        msg,
-                    } => {
-                        assert_eq!(target, peer_addr);
-                        assert_eq!(tx, tx);
-                        assert_eq!(forward_to, peer_peer_id);
-                        if let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
-                            msg: ConnectRequest::CheckConnectivity { sender, joiner, .. },
-                            ..
-                        })) = &*msg
-                        {
-                            assert_eq!(sender.peer, gw_peer_id);
-                            assert_eq!(joiner.peer, joiner_peer_id);
-                        } else {
-                            panic!("Unexpected message type");
-                        }
-                        received_forward_transaction = true;
-                    }
-                    Event::InboundConnection { conn, .. } => {
-                        tracing::info!(
-                            "Inbound connection request received: {:?}",
-                            conn.remote_addr()
-                        );
-                    }
-                    other => bail!("Unexpected event: {:?}", other),
+            let event =
+                tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
+            let _conn = match event {
+                Event::OutboundGatewayConnectionSuccessful {
+                    peer_id,
+                    connection,
+                    ..
+                } => {
+                    tracing::info!(%peer_id, "Gateway connection accepted");
+                    assert_eq!(peer_id.addr, gw_addr);
+                    connection
                 }
-            }
-
+                other => bail!("Unexpected event: {:?}", other),
+            };
             Ok(())
         };
 

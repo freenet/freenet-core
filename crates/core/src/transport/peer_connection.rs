@@ -273,7 +273,7 @@ impl PeerConnection {
                         tracing::error!(%error, %packet_id, remote = %self.remote_conn.remote_addr, "error processing inbound packet");
                         error
                     })? {
-                        tracing::debug!(%packet_id, "returning full stream message");
+                        tracing::trace!(%packet_id, "returning full stream message");
                         return Ok(msg);
                     }
                 }
