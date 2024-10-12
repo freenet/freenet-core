@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 use tokio::time::{timeout, Duration};
-use tracing::instrument;
+use tracing::{instrument, Instrument};
 
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt, TryFutureExt};
 use tokio::sync::mpsc::{self};
@@ -29,6 +29,7 @@ use crate::{
 type Result<T, E = HandshakeError> = std::result::Result<T, E>;
 type OutboundConnResult = Result<InternalEvent, (PeerId, HandshakeError)>;
 
+const TIMEOUT: Duration = Duration::from_secs(600);
 #[derive(Debug)]
 pub(super) struct ForwardInfo {
     pub target: PeerId,
@@ -266,8 +267,10 @@ impl HandshakeHandler {
                                 "Attempting remote connection to {remote}"
                             );
                             self.start_outbound_connection(remote.clone(), tracker.tx, false).await;
+                            let current_span = tracing::Span::current();
+                            let checking_hops_span = tracing::info_span!(parent: current_span, "checking_hops");
                             self.ongoing_outbound_connections.push(
-                                check_remaining_hops(tracker).boxed()
+                                check_remaining_hops(tracker).instrument(checking_hops_span).boxed()
                             );
                             continue;
                         }
@@ -610,8 +613,14 @@ impl HandshakeHandler {
             .connect(remote.pub_key.clone(), remote.addr)
             .await
             .map(move |c| match c {
-                Ok(conn) if is_gw => Ok(InternalEvent::OutboundGwConnEstablished(remote, conn)),
-                Ok(conn) => Ok(InternalEvent::OutboundConnEstablished(remote, conn)),
+                Ok(conn) if is_gw => {
+                    tracing::debug!(%remote, "established outbound gw connection");
+                    Ok(InternalEvent::OutboundGwConnEstablished(remote, conn))
+                }
+                Ok(conn) => {
+                    tracing::debug!(%remote, "established outbound connection");
+                    Ok(InternalEvent::OutboundConnEstablished(remote, conn))
+                }
                 Err(e) => Err((remote, e.into())),
             })
             .boxed();
@@ -758,13 +767,11 @@ async fn wait_for_gw_confirmation(
         "Waiting for answer from gw"
     );
 
-    let timeout_duration = Duration::from_secs(10);
-
     // under this branch we just need to wait long enough for the gateway to reply with all the downstream
     // connection attempts, and then we can drop the connection, so keep listening to it in a loop or timeout
     let remote = tracker.gw_conn.remote_addr();
     tokio::time::timeout(
-        timeout_duration,
+        TIMEOUT,
         check_remaining_hops(tracker),
     )
     .await
@@ -787,7 +794,7 @@ async fn check_remaining_hops(mut tracker: AcceptedTracker) -> OutboundConnResul
     );
     while tracker.remaining_checks > 0 {
         let msg = tokio::time::timeout(
-            Duration::from_secs(10),
+            TIMEOUT,
             tracker
                 .gw_conn
                 .recv()
@@ -827,13 +834,16 @@ async fn check_remaining_hops(mut tracker: AcceptedTracker) -> OutboundConnResul
                     if accepted {
                         return Ok(InternalEvent::OutboundGwConnConfirmed(tracker));
                     } else {
+                        tracing::debug!("Rejected by gateway, waiting for forward replies");
                         return Ok(InternalEvent::NextCheck(tracker));
                     }
-                } else {
+                } else if accepted {
                     return Ok(InternalEvent::RemoteConnectionAttempt {
                         remote: acceptor.peer,
                         tracker,
                     });
+                } else {
+                    continue;
                 }
             }
             NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
@@ -921,11 +931,9 @@ async fn gw_transient_peer_conn(
     mut info: ConnectivityInfo,
 ) -> Result<(InternalEvent, PeerOutboundMessage), HandshakeError> {
     // TODO: should be the same timeout as the one used for any other tx
-    let timeout_duration = Duration::from_secs(10);
-
     loop {
         tokio::select! {
-            incoming_result = timeout(timeout_duration, conn.recv()) => {
+            incoming_result = timeout(TIMEOUT, conn.recv()) => {
                 match incoming_result {
                     Ok(Ok(msg)) => {
                         let net_msg = decode_msg(&msg).unwrap();
@@ -952,7 +960,7 @@ async fn gw_transient_peer_conn(
                     }
                 }
             }
-            outbound_msg = timeout(timeout_duration, outbound.0.recv()) => {
+            outbound_msg = timeout(TIMEOUT, outbound.0.recv()) => {
                 match outbound_msg {
                     Ok(Some(msg)) => {
                         if matches!(
@@ -1124,7 +1132,7 @@ mod tests {
                 msg: ConnectRequest::StartJoinReq {
                     joiner: None,
                     joiner_key: pub_key,
-                    hops_to_live: hops_to_live,
+                    hops_to_live,
                     max_hops_to_live: hops_to_live,
                     skip_list: vec![],
                 },
@@ -1376,10 +1384,7 @@ mod tests {
             let msg = match msg {
                 NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
                     id: inbound_id,
-                    msg:
-                        ConnectRequest::StartJoinReq {
-                            joiner, joiner_key, ..
-                        },
+                    msg: ConnectRequest::StartJoinReq { joiner_key, .. },
                     ..
                 })) => {
                     assert_eq!(id, inbound_id);
@@ -1563,9 +1568,9 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[tokio::test]
     async fn test_peer_to_gw_outbound_conn_rejected() -> anyhow::Result<()> {
-        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG), None);
+        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE), None);
         let joiner_addr = ([127, 0, 0, 1], 10001).into();
         let (mut handler, mut test) = config_handler(joiner_addr, None);
 
@@ -1623,15 +1628,16 @@ mod tests {
                     NetMessage::V1(NetMessageV1::Connect(initial_join_req)),
                 )
                 .await;
+            tracing::debug!("Sent initial gw rejected reply");
 
-            for i in 0..Ring::DEFAULT_MAX_HOPS_TO_LIVE {
+            for i in 1..Ring::DEFAULT_MAX_HOPS_TO_LIVE {
                 let port = i + 10;
                 let addr = ([127, 0, port as u8, 1], port as u16).into();
                 let acceptor = PeerKeyLocation {
                     location: Some(Location::from_address(&addr)),
                     peer: PeerId::new(addr, TransportKeypair::new().public().clone()),
                 };
-                tracing::info!(%acceptor, "Sending forward reply number {} with status {}", i, i > 3);
+                tracing::info!(%acceptor, "Sending forward reply number {i} with status `{}`", i > 3);
                 let forward_response = ConnectMsg::Response {
                     id: tx,
                     sender: gw_pkloc.clone(),
@@ -1648,35 +1654,35 @@ mod tests {
                         NetMessage::V1(NetMessageV1::Connect(forward_response)),
                     )
                     .await;
-                tracing::info!("Forward response number {} sent", i);
-            }
 
-            for _ in 0..5 {
-                let (remote, ev) = tokio::time::timeout(
-                    Duration::from_secs(1),
-                    test.transport.outbound_recv.recv(),
-                )
-                .await?
-                .ok_or(anyhow!("Failed to receive event"))?;
-                let ConnectionEvent::ConnectionStart {
-                    open_connection, ..
-                } = ev;
-                let out_symm_key = Aes128Gcm::new_from_slice(&[0; 16]).unwrap();
-                let in_symm_key = Aes128Gcm::new_from_slice(&[1; 16]).unwrap();
-                let (conn, out, inb) = PeerConnection::new_remote_test(
-                    remote,
-                    joiner_addr,
-                    out_symm_key,
-                    in_symm_key.clone(),
-                );
-                test.transport
-                    .packet_senders
-                    .insert(remote, (in_symm_key, out));
-                test.transport.packet_receivers.push(inb);
-                tracing::info!("Received open conn to {}", remote);
-                open_connection
-                    .send(Ok(conn))
-                    .map_err(|_| anyhow!("failed to open conn"))?;
+                if i > 3 {
+                    // Create the successful connection
+                    let (remote, ev) = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        test.transport.outbound_recv.recv(),
+                    )
+                    .await?
+                    .ok_or(anyhow!("Failed to receive event"))?;
+                    let ConnectionEvent::ConnectionStart {
+                        open_connection, ..
+                    } = ev;
+                    let out_symm_key = Aes128Gcm::new_from_slice(&[0; 16]).unwrap();
+                    let in_symm_key = Aes128Gcm::new_from_slice(&[1; 16]).unwrap();
+                    let (conn, out, inb) = PeerConnection::new_remote_test(
+                        remote,
+                        joiner_addr,
+                        out_symm_key,
+                        in_symm_key.clone(),
+                    );
+                    test.transport
+                        .packet_senders
+                        .insert(remote, (in_symm_key, out));
+                    test.transport.packet_receivers.push(inb);
+                    open_connection
+                        .send(Ok(conn))
+                        .map_err(|_| anyhow!("failed to open conn"))?;
+                    tracing::info!(conn_num = %i, %remote, "Forward response sent");
+                }
             }
 
             Ok::<_, anyhow::Error>(())
@@ -1684,33 +1690,31 @@ mod tests {
 
         let peer_inbound = async {
             let mut conn_count = 0;
-            for _ in 0..5 {
-                let event = tokio::time::timeout(Duration::from_secs(20), handler.wait_for_events())
-                    .await??;
+            let mut gw_rejected = false;
+            for conn_num in 3..Ring::DEFAULT_MAX_HOPS_TO_LIVE {
+                let event =
+                    tokio::time::timeout(Duration::from_secs(20), handler.wait_for_events())
+                        .await??;
                 match event {
                     Event::OutboundConnectionSuccessful {
                         peer_id,
                         connection,
                     } => {
-                        tracing::info!(%peer_id, "Connection established");
+                        tracing::info!(%peer_id, %conn_num, "Connection established");
                         conn_count += 1;
                         drop(connection);
+                    }
+                    Event::OutboundGatewayConnectionRejected { peer_id } => {
+                        tracing::info!(%peer_id, "Gateway connection rejected");
+                        assert_eq!(peer_id.addr, gw_addr);
+                        gw_rejected = true;
                     }
                     other => bail!("Unexpected event: {:?}", other),
                 }
             }
-            let event =
-                tokio::time::timeout(Duration::from_secs(20), handler.wait_for_events()).await??;
-            match event {
-                Event::OutboundConnectionFailed {peer_id, error} => {
-                    tracing::info!(%peer_id, "Connection failed wit error: {:?}", error);
-                }
-                Event::OutboundGatewayConnectionRejected { peer_id } => {
-                    tracing::info!(%peer_id, "Connection rejected");
-                }
-                _ => panic!("Unexpected event: {:?}", event),
-            }
-            assert_eq!(conn_count, 5);
+            tracing::debug!("Completed all checks, connection count: {conn_count}");
+            assert!(gw_rejected);
+            assert_eq!(conn_count, 6);
             Ok(())
         };
         futures::try_join!(test_controller, peer_inbound)?;
