@@ -71,7 +71,7 @@ pkcs8 = { version = "0.10", features = ["std", "pem"] }
 opentelemetry = "0.26"
 opentelemetry-jaeger = { features = ["collector_client", "isahc", "rt-tokio"], optional = true, version = "0.22" }
 tracing = { version = "0.1" }
-tracing-opentelemetry = { optional = true, version = "0.26" }
+tracing-opentelemetry = { optional = true, version = "0.27" }
 tracing-subscriber = { optional = true, version = "0.3" }
 opentelemetry-otlp = { optional = true, version = "0.26" }
 opentelemetry_sdk = { optional = true, version = "0.26", features = ["rt-tokio"] }
