@@ -1786,8 +1786,6 @@ mod tests {
         };
 
         let peer_inbound = async {
-            let mut conn_count = 0;
-
             let event =
                 tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
             let _conn = match event {
