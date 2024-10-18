@@ -190,9 +190,8 @@ impl ConfigArgs {
             if self.config_paths.data_dir.is_none() {
                 self.config_paths.data_dir = Some(data);
             }
-            Self::read_config(&config)?.map(|cfg| {
+            Self::read_config(&config)?.inspect(|_| {
                 tracing::info!("Found configuration file in default directory");
-                cfg
             })
         };
 

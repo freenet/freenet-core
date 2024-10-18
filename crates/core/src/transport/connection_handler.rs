@@ -1639,9 +1639,8 @@ mod test {
         }
         let mut test_no = 0;
         while let Some(result) = tests.next().await {
-            result?.map_err(|e| {
+            result?.inspect_err(|_| {
                 tracing::error!(%test_no, "error in test");
-                e
             })?;
             test_no += 1;
         }

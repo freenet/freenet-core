@@ -360,7 +360,11 @@ pub(crate) mod test {
             async move {
                 loop {
                     let message = {
-                        let mut lock = ws_client_clone.lock().await;
+                        let mut lock = ws_client_clone.try_lock().inspect_err(|_| {
+                            tracing::error!(peer = %self.id, "failed to lock ws client");
+                        }).inspect(|_| {
+                            tracing::debug!(peer = %self.id, "locked ws client");
+                        }).unwrap();
                         lock.next().await
                     };
 

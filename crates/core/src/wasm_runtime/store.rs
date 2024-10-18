@@ -323,11 +323,10 @@ fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Re
 
     // Read the original file and compact data into the temp file
     let mut original_reader = BufReader::new(original_file);
-    let mut temp_writer = SafeWriter::<S>::new(&temp_file_path, true).map_err(|e| {
+    let mut temp_writer = SafeWriter::<S>::new(&temp_file_path, true).inspect_err(|_| {
         if let Err(e) = fs::remove_file(&lock_file_path) {
             eprintln!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
         }
-        e
     })?;
 
     let mut any_deleted = false; // Track if any deleted records were found

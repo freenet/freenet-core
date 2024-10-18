@@ -231,9 +231,8 @@ impl ExecutorToEventLoopChannel<ExecutorHalve> {
     {
         let op = message.initiate_op(&self.op_manager);
         let tx = *op.id();
-        self.end.waiting_for_op_tx.send(tx).await.map_err(|e| {
+        self.end.waiting_for_op_tx.send(tx).await.inspect_err(|_| {
             tracing::debug!("failed to send request to executor, channel closed");
-            e
         })?;
         <T as ComposeNetworkMessage<Op>>::resume_op(op, &self.op_manager)
             .await

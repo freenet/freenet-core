@@ -339,9 +339,8 @@ impl LogFile {
         let deserialized_records = tokio::task::spawn_blocking(move || {
             let mut filtered = vec![];
             for buf in records {
-                let record: NetLogMessage = bincode::deserialize(&buf).map_err(|e| {
+                let record: NetLogMessage = bincode::deserialize(&buf).inspect_err(|_| {
                     tracing::error!(?buf, "deserialization error");
-                    e
                 })?;
                 // tracing::info!(?record);
                 if let EventKind::Route(outcome) = record.kind {
