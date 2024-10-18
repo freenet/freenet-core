@@ -11,7 +11,7 @@ use either::Either;
 use freenet_stdlib::prelude::*;
 use futures::Future;
 use rand::seq::SliceRandom;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{info, Instrument};
 
 #[cfg(feature = "trace-ot")]
@@ -193,6 +193,19 @@ impl EventSender for mpsc::Sender<(EventId, TransportPublicKey)> {
 }
 
 impl EventSender for watch::Sender<(EventId, TransportPublicKey)> {
+    fn send(
+        &self,
+        _cx: &mut std::task::Context<'_>,
+        value: (EventId, TransportPublicKey),
+    ) -> std::task::Poll<Result<(), ()>> {
+        match self.send(value) {
+            Ok(_) => std::task::Poll::Ready(Ok(())),
+            Err(_) => std::task::Poll::Ready(Err(())),
+        }
+    }
+}
+
+impl EventSender for broadcast::Sender<(EventId, TransportPublicKey)> {
     fn send(
         &self,
         _cx: &mut std::task::Context<'_>,

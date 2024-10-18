@@ -308,6 +308,7 @@ async fn config_handler(
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, supervisor: Arc<Supervisor>) -> axum::response::Response {
+    tracing::info!("WebSocket connection received");
     let on_upgrade = move |ws: WebSocket| async move {
         let cloned_supervisor = supervisor.clone();
         if let Err(error) = handle_socket(ws, cloned_supervisor).await {
@@ -370,8 +371,8 @@ async fn handle_outgoing_messages(
     supervisor: &Arc<Supervisor>,
     sender: &mut SplitSink<WebSocket, Message>,
 ) -> anyhow::Result<()> {
-    let mut event_rx = supervisor.event_rx.lock().await;
-    while let Some((event, peer_id)) = event_rx.recv().await {
+    let mut event_rx = supervisor.user_ev_controller.lock().await.subscribe();
+    while let Ok((event, peer_id)) = event_rx.recv().await {
         tracing::info!("Sending event {} to peer {}", event, peer_id);
         let serialized_msg: Vec<u8> = bincode::serialize(&(event, peer_id.clone()))
             .map_err(|e| anyhow!("Failed to serialize message: {}", e))?;
@@ -462,23 +463,21 @@ pub struct Supervisor {
     processes: Mutex<HashMap<TransportPublicKey, SubProcess>>,
     waiting_peers: Arc<Mutex<VecDeque<usize>>>,
     waiting_gateways: Arc<Mutex<VecDeque<usize>>>,
-    user_ev_controller: Arc<Mutex<tokio::sync::mpsc::Sender<(u32, TransportPublicKey)>>>,
-    event_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<(u32, TransportPublicKey)>>>,
+    user_ev_controller: Mutex<tokio::sync::broadcast::Sender<(u32, TransportPublicKey)>>,
 }
 
 impl Supervisor {
     pub async fn new(network: &mut SimNetwork) -> Self {
         let peers = network.build_peers();
         let peers_config = Arc::new(Mutex::new(peers.into_iter().collect::<HashMap<_, _>>()));
-        let (user_ev_controller, event_rx) = tokio::sync::mpsc::channel(1);
+        let (user_ev_controller, _) = tokio::sync::broadcast::channel(1);
 
         Supervisor {
             peers_config,
             processes: Mutex::new(HashMap::new()),
             waiting_peers: Arc::new(Mutex::new(VecDeque::new())),
             waiting_gateways: Arc::new(Mutex::new(VecDeque::new())),
-            user_ev_controller: Arc::new(Mutex::new(user_ev_controller)),
-            event_rx: Arc::new(Mutex::new(event_rx)),
+            user_ev_controller: Mutex::new(user_ev_controller),
         }
     }
     async fn start_process(
