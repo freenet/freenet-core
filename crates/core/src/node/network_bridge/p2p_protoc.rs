@@ -202,7 +202,7 @@ impl P2pConnManager {
                         ConnEvent::OutboundMessage(msg) => {
                             let Some(target_peer) = msg.target() else {
                                 let id = *msg.id();
-                                tracing::error!(%id, "Target peer not set, must be set for connection outbound message");
+                                tracing::error!(%id, %msg, "Target peer not set, must be set for connection outbound message");
                                 self.bridge.op_manager.completed(id);
                                 continue;
                             };
