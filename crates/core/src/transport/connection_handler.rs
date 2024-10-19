@@ -803,29 +803,25 @@ struct InboundRemoteConnection {
 
 #[cfg(test)]
 mod test {
+    #![allow(clippy::single_range_in_vec_init)]
+
     use std::{
-        collections::HashMap,
         net::Ipv4Addr,
         ops::Range,
-        sync::{
-            atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
-            OnceLock,
-        },
+        sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
     };
 
+    use dashmap::DashMap;
     use futures::{stream::FuturesOrdered, TryStreamExt};
     use rand::{Rng, SeedableRng};
     use serde::{de::DeserializeOwned, Serialize};
-    use tokio::sync::{Mutex, RwLock};
+    use tokio::sync::Mutex;
     use tracing::info;
 
     use super::*;
     use crate::transport::packet_data::MAX_DATA_SIZE;
 
-    #[allow(clippy::type_complexity)]
-    static CHANNELS: OnceLock<
-        Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>>>,
-    > = OnceLock::new();
+    type Channels = Arc<DashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>>;
 
     #[derive(Default, Clone)]
     enum PacketDropPolicy {
@@ -834,8 +830,6 @@ mod test {
         ReceiveAll,
         /// Drop the packets randomly based on the factor
         Factor(f64),
-        /// Drop packets fall in the given range
-        Range(Range<usize>),
         /// Drop packets with the given ranges
         Ranges(Vec<Range<usize>>),
     }
@@ -845,25 +839,28 @@ mod test {
         this: SocketAddr,
         packet_drop_policy: PacketDropPolicy,
         num_packets_sent: AtomicUsize,
-        rng: Mutex<rand::rngs::SmallRng>,
+        rng: std::sync::Mutex<rand::rngs::SmallRng>,
+        channels: Channels,
     }
 
     impl MockSocket {
-        async fn test_config(packet_drop_policy: PacketDropPolicy, addr: SocketAddr) -> Self {
-            let channels = CHANNELS
-                .get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
-                .clone();
+        async fn test_config(
+            packet_drop_policy: PacketDropPolicy,
+            addr: SocketAddr,
+            channels: Channels,
+        ) -> Self {
             let (outbound, inbound) = mpsc::unbounded_channel();
-            channels.write().await.insert(addr, outbound);
+            channels.insert(addr, outbound);
             static SEED: AtomicU64 = AtomicU64::new(0xfeedbeef);
             MockSocket {
                 inbound: Mutex::new(inbound),
                 this: addr,
                 packet_drop_policy,
                 num_packets_sent: AtomicUsize::new(0),
-                rng: Mutex::new(rand::rngs::SmallRng::seed_from_u64(
+                rng: std::sync::Mutex::new(rand::rngs::SmallRng::seed_from_u64(
                     SEED.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
                 )),
+                channels,
             }
         }
     }
@@ -894,12 +891,6 @@ mod test {
                         return Ok(buf.len());
                     }
                 }
-                PacketDropPolicy::Range(r) => {
-                    if r.contains(&packet_idx) {
-                        tracing::trace!(id=%packet_idx, %self.this, "drop packet");
-                        return Ok(buf.len());
-                    }
-                }
                 PacketDropPolicy::Ranges(ranges) => {
                     if ranges.iter().any(|r| r.contains(&packet_idx)) {
                         tracing::trace!(id=%packet_idx, %self.this, "drop packet");
@@ -909,11 +900,7 @@ mod test {
             }
 
             assert!(self.this != target, "cannot send to self");
-            let channels = CHANNELS
-                .get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
-                .clone();
-            let channels = channels.read().await;
-            let Some(sender) = channels.get(&target) else {
+            let Some(sender) = self.channels.get(&target).map(|v| v.value().clone()) else {
                 return Ok(0);
             };
             // tracing::trace!(?target, ?self.this, "sending packet to remote");
@@ -927,30 +914,22 @@ mod test {
 
     impl Drop for MockSocket {
         fn drop(&mut self) {
-            let channels = CHANNELS
-                .get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
-                .clone();
-            loop {
-                if let Ok(mut channels) = channels.try_write() {
-                    channels.remove(&self.this);
-                    break;
-                }
-                // unorthodox blocking here but shouldn't be a problem for testing
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            self.channels.remove(&self.this);
         }
     }
 
     async fn set_peer_connection(
         packet_drop_policy: PacketDropPolicy,
+        channels: Channels,
     ) -> anyhow::Result<(TransportPublicKey, OutboundConnectionHandler, SocketAddr)> {
-        set_peer_connection_in(packet_drop_policy, false)
+        set_peer_connection_in(packet_drop_policy, false, channels)
             .await
             .map(|(pk, (o, _), s)| (pk, o, s))
     }
 
     async fn set_gateway_connection(
         packet_drop_policy: PacketDropPolicy,
+        channels: Channels,
     ) -> Result<
         (
             TransportPublicKey,
@@ -959,12 +938,13 @@ mod test {
         ),
         anyhow::Error,
     > {
-        set_peer_connection_in(packet_drop_policy, true).await
+        set_peer_connection_in(packet_drop_policy, true, channels).await
     }
 
     async fn set_peer_connection_in(
         packet_drop_policy: PacketDropPolicy,
         gateway: bool,
+        channels: Channels,
     ) -> Result<
         (
             TransportPublicKey,
@@ -979,7 +959,12 @@ mod test {
         let peer_pub = peer_keypair.public.clone();
         let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let socket = Arc::new(
-            MockSocket::test_config(packet_drop_policy, (Ipv4Addr::LOCALHOST, port).into()).await,
+            MockSocket::test_config(
+                packet_drop_policy,
+                (Ipv4Addr::LOCALHOST, port).into(),
+                channels,
+            )
+            .await,
         );
         let (peer_conn, inbound_conn) = OutboundConnectionHandler::new_test(
             (Ipv4Addr::LOCALHOST, port).into(),
@@ -1025,9 +1010,10 @@ mod test {
         assert_eq!(generators.len(), config.peers);
         let mut peer_keys_and_addr = vec![];
         let mut peer_conns = vec![];
+        let channels = Arc::new(DashMap::new());
         for _ in 0..config.peers {
             let (peer_pub, peer, peer_addr) =
-                set_peer_connection(config.packet_drop_policy.clone()).await?;
+                set_peer_connection(config.packet_drop_policy.clone(), channels.clone()).await?;
             peer_keys_and_addr.push((peer_pub, peer_addr));
             peer_conns.push(peer);
         }
@@ -1130,8 +1116,11 @@ mod test {
     #[tokio::test]
     async fn simulate_nat_traversal() -> anyhow::Result<()> {
         // crate::config::set_logger();
-        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
-        let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection(Default::default()).await?;
+        let channels = Arc::new(DashMap::new());
+        let (peer_a_pub, mut peer_a, peer_a_addr) =
+            set_peer_connection(Default::default(), channels.clone()).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) =
+            set_peer_connection(Default::default(), channels).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
@@ -1154,10 +1143,11 @@ mod test {
     #[tokio::test]
     async fn simulate_nat_traversal_drop_first_packets_for_all() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        let channels = Arc::new(DashMap::new());
         let (peer_a_pub, mut peer_a, peer_a_addr) =
-            set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
+            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
+            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1]), channels).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
@@ -1180,9 +1170,11 @@ mod test {
     #[tokio::test]
     async fn simulate_nat_traversal_drop_first_packets_of_peerb() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
-        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
+        let channels = Arc::new(DashMap::new());
+        let (peer_a_pub, mut peer_a, peer_a_addr) =
+            set_peer_connection(Default::default(), channels.clone()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
+            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1]), channels).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
@@ -1207,9 +1199,14 @@ mod test {
     #[tokio::test]
     async fn simulate_nat_traversal_drop_packet_ranges_of_peerb_killed() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
-        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
-        let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1, 3..usize::MAX])).await?;
+        let channels = Arc::new(DashMap::new());
+        let (peer_a_pub, mut peer_a, peer_a_addr) =
+            set_peer_connection(Default::default(), channels.clone()).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection(
+            PacketDropPolicy::Ranges(vec![0..1, 3..usize::MAX]),
+            channels,
+        )
+        .await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
@@ -1242,10 +1239,12 @@ mod test {
 
     #[tokio::test]
     async fn simulate_nat_traversal_drop_packet_ranges_of_peerb() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
-        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE), None);
+        let channels = Arc::new(DashMap::new());
+        let (peer_a_pub, mut peer_a, peer_a_addr) =
+            set_peer_connection(Default::default(), channels.clone()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1, 3..9])).await?;
+            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1, 3..9]), channels).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
@@ -1287,10 +1286,11 @@ mod test {
     #[tokio::test]
     async fn simulate_gateway_connection() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE), None);
+        let channels = Arc::new(DashMap::new());
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
-            set_peer_connection(Default::default()).await?;
+            set_peer_connection(Default::default(), channels.clone()).await?;
         let (gw_pub, (_oc, mut gw_conn), gw_addr) =
-            set_gateway_connection(Default::default()).await?;
+            set_gateway_connection(Default::default(), channels).await?;
 
         let gw = tokio::spawn(async move {
             let gw_conn = gw_conn.recv();
@@ -1315,10 +1315,11 @@ mod test {
     #[tokio::test]
     async fn simulate_gateway_connection_drop_first_packets_of_gateway() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        let channels = Arc::new(DashMap::new());
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
-            set_peer_connection(Default::default()).await?;
+            set_peer_connection(Default::default(), channels.clone()).await?;
         let (gw_pub, (_oc, mut gw_conn), gw_addr) =
-            set_gateway_connection(PacketDropPolicy::Range(0..1)).await?;
+            set_gateway_connection(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
 
         let gw = tokio::spawn(async move {
             let gw_conn = gw_conn.recv();
@@ -1343,10 +1344,11 @@ mod test {
     #[tokio::test]
     async fn simulate_gateway_connection_drop_first_packets_for_all() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        let channels = Arc::new(DashMap::new());
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
-            set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
+            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
         let (gw_pub, (_oc, mut gw_conn), gw_addr) =
-            set_gateway_connection(PacketDropPolicy::Range(0..1)).await?;
+            set_gateway_connection(PacketDropPolicy::Ranges(vec![0..1]), channels).await?;
 
         let gw = tokio::spawn(async move {
             let gw_conn = gw_conn.recv();
@@ -1371,10 +1373,11 @@ mod test {
     #[tokio::test]
     async fn simulate_gateway_connection_drop_first_packets_of_peer() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        let channels = Arc::new(DashMap::new());
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
-            set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
+            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
         let (gw_pub, (_oc, mut gw_conn), gw_addr) =
-            set_gateway_connection(Default::default()).await?;
+            set_gateway_connection(Default::default(), channels).await?;
 
         let gw = tokio::spawn(async move {
             let gw_conn = gw_conn.recv();
@@ -1432,8 +1435,11 @@ mod test {
     #[tokio::test]
     async fn simulate_send_max_short_message() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::ERROR));
-        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
-        let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection(Default::default()).await?;
+        let channels = Arc::new(DashMap::new());
+        let (peer_a_pub, mut peer_a, peer_a_addr) =
+            set_peer_connection(Default::default(), channels.clone()).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) =
+            set_peer_connection(Default::default(), channels).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
@@ -1460,46 +1466,35 @@ mod test {
         Ok(())
     }
 
-    #[test]
-    #[should_panic]
-    fn simulate_send_max_short_message_plus_1() {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::ERROR));
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async move {
-                let (peer_a_pub, mut peer_a, peer_a_addr) =
-                    set_peer_connection(Default::default()).await?;
-                let (peer_b_pub, mut peer_b, peer_b_addr) =
-                    set_peer_connection(Default::default()).await?;
+    #[tokio::test]
+    async fn simulate_send_max_short_message_plus_1() -> anyhow::Result<()> {
+        let channels = Arc::new(DashMap::new());
+        let (peer_a_pub, mut peer_a, peer_a_addr) =
+            set_peer_connection(Default::default(), channels.clone()).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) =
+            set_peer_connection(Default::default(), channels).await?;
 
-                let peer_b = tokio::spawn(async move {
-                    let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-                    let mut conn =
-                        tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
-                    let data = vec![0u8; 1433];
-                    let data =
-                        tokio::task::spawn_blocking(move || bincode::serialize(&data).unwrap())
-                            .await
-                            .unwrap();
-                    conn.outbound_short_message(data).await?;
-                    Ok::<_, anyhow::Error>(())
-                });
+        let peer_a = tokio::spawn(async move {
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
+            let mut conn = tokio::time::timeout(Duration::from_secs(1), peer_b_conn).await??;
+            let _ = tokio::time::timeout(Duration::from_secs(1), conn.recv()).await??;
+            Ok::<_, anyhow::Error>(())
+        });
 
-                let peer_a = tokio::spawn(async move {
-                    let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-                    let mut conn =
-                        tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
-                    let msg = conn.recv().await?;
-                    assert!(msg.len() <= MAX_DATA_SIZE);
-                    Ok::<_, anyhow::Error>(())
-                });
+        let peer_b = tokio::spawn(async move {
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
+            let mut conn = tokio::time::timeout(Duration::from_secs(1), peer_a_conn).await??;
+            let data = vec![0u8; MAX_DATA_SIZE + 1];
+            let data =
+                tokio::task::spawn_blocking(move || bincode::serialize(&data).unwrap()).await?;
+            conn.outbound_short_message(data).await?;
+            Ok::<_, anyhow::Error>(())
+        });
 
-                let (a, b) = tokio::try_join!(peer_a, peer_b)?;
-                a?;
-                b?;
-                Result::<(), anyhow::Error>::Ok(())
-            })
-            .unwrap();
+        let (a, b) = tokio::join!(peer_a, peer_b);
+        assert!(a?.is_err());
+        assert!(b.is_err());
+        Ok(())
     }
 
     #[tokio::test]
@@ -1534,11 +1529,8 @@ mod test {
         .await
     }
 
-    // #[ignore]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
-    // #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn simulate_packet_dropping() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::INFO));
         #[derive(Clone, Copy)]
         struct TestData(&'static str);
 
@@ -1563,32 +1555,50 @@ mod test {
 
         let mut tests = FuturesOrdered::new();
         let mut rng = rand::rngs::StdRng::seed_from_u64(3);
-        for factor in std::iter::repeat(())
-            .map(|_| rng.gen::<f64>())
-            .filter(|x| *x > 0.05 && *x < 0.25)
-            .take(5)
-        {
-            let wait_time = Duration::from_secs((((factor * 5.0 + 1.0) * 15.0) + 10.0) as u64);
-            println!(
-                "packet loss factor: {factor} (wait time: {wait_time})",
-                wait_time = wait_time.as_secs()
-            );
-            tests.push_back(tokio::spawn(run_test(
-                TestConfig {
-                    packet_drop_policy: PacketDropPolicy::Factor(factor),
-                    wait_time,
-                    ..Default::default()
-                },
-                vec![TestData("foo"), TestData("bar")],
-            )));
-        }
         let mut test_no = 0;
-        while let Some(result) = tests.next().await {
-            result?.inspect_err(|_| {
-                tracing::error!(%test_no, "error in test");
-            })?;
-            test_no += 1;
+        for _ in 0..2 {
+            for factor in std::iter::repeat(())
+                .map(|_| rng.gen::<f64>())
+                .filter(|x| *x > 0.05 && *x < 0.25)
+                .take(3)
+            {
+                let wait_time = Duration::from_secs(((factor * 5.0 * 15.0) + 15.0) as u64);
+                tracing::info!(
+                    "test #{test_no}: packet loss factor: {factor} (wait time: {wait_time})",
+                    wait_time = wait_time.as_secs()
+                );
+
+                let now = std::time::Instant::now();
+                tests.push_back(tokio::spawn(
+                    run_test(
+                        TestConfig {
+                            packet_drop_policy: PacketDropPolicy::Factor(factor),
+                            wait_time,
+                            ..Default::default()
+                        },
+                        vec![TestData("foo"), TestData("bar")],
+                    )
+                    .inspect(move |r| {
+                        let msg = if r.is_ok() {
+                            format!("successfully, total time: {}s (t/o: {}s, factor: {factor:.3})", now.elapsed().as_secs(), wait_time.as_secs())
+                        } else {
+                            format!("with error, total time: {}s (t/o: {}s, factor: {factor:.3})", now.elapsed().as_secs(), wait_time.as_secs())
+                        };
+                        if r.is_err() {
+                            tracing::error!("test #{test_no} finished {}", msg);
+                        } else {
+                            tracing::info!("test #{test_no} finished {}", msg);
+                        }
+                    }),
+                ));
+                test_no += 1;
+            }
+
+            while let Some(result) = tests.next().await {
+                result??;
+            }
         }
+
         Ok(())
     }
 }
