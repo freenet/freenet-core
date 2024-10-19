@@ -1659,7 +1659,7 @@ mod tests {
                 if i > 3 {
                     // Create the successful connection
                     let (remote, ev) = tokio::time::timeout(
-                        Duration::from_secs(1),
+                        Duration::from_secs(2),
                         test.transport.outbound_recv.recv(),
                     )
                     .await?
@@ -1693,7 +1693,7 @@ mod tests {
             let mut conn_count = 0;
             let mut gw_rejected = false;
             for conn_num in 3..Ring::DEFAULT_MAX_HOPS_TO_LIVE {
-                let event = tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events())
+                let event = tokio::time::timeout(Duration::from_secs(2), handler.wait_for_events())
                     .await??;
                 match event {
                     Event::OutboundConnectionSuccessful {

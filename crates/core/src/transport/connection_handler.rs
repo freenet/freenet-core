@@ -1529,10 +1529,8 @@ mod test {
         .await
     }
 
-    // #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn simulate_packet_dropping() -> anyhow::Result<()> {
-        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::INFO), None);
         #[derive(Clone, Copy)]
         struct TestData(&'static str);
 
@@ -1543,7 +1541,7 @@ mod test {
             }
 
             fn gen_msg(&mut self) -> Self::Message {
-                self.0.repeat(500)
+                self.0.repeat(1000)
             }
 
             fn assert_message_ok(&self, _: usize, msg: Self::Message) -> bool {
@@ -1555,53 +1553,52 @@ mod test {
             }
         }
 
-        const BYTES_SENT: u64 = 3 * 1000 * 10;
-
         let mut tests = FuturesOrdered::new();
         let mut rng = rand::rngs::StdRng::seed_from_u64(3);
-        for (i, factor) in std::iter::repeat(())
-            .map(|_| rng.gen::<f64>())
-            .filter(|x| *x > 0.05 && *x < 0.25)
-            .skip(1)
-            .take(1)
-            .enumerate()
-        {
-            let wait_time = Duration::from_secs((((factor * 5.0 + 1.0) * 15.0) + 10.0) as u64);
-            tracing::debug!(
-                "test #{i}: packet loss factor: {factor} (wait time: {wait_time})",
-                wait_time = wait_time.as_secs()
-            );
-            tests.push_back(tokio::spawn(
-                run_test(
-                    TestConfig {
-                        packet_drop_policy: PacketDropPolicy::Factor(factor),
-                        wait_time,
-                        ..Default::default()
-                    },
-                    vec![TestData("foo"), TestData("bar")],
-                )
-                .inspect(move |r| {
-                    tracing::debug!(
-                        "test #{i} finished {}",
-                        if r.is_ok() {
-                            "successfully".to_owned()
-                        } else {
-                            format!(
-                                "with error, rate: {} bytes/sec",
-                                BYTES_SENT / wait_time.as_secs()
-                            )
-                        }
-                    );
-                }),
-            ));
-        }
         let mut test_no = 0;
-        while let Some(result) = tests.next().await {
-            result?.inspect_err(|_| {
-                tracing::error!(%test_no, "error in test");
-            })?;
-            test_no += 1;
+        for _ in 0..2 {
+            for factor in std::iter::repeat(())
+                .map(|_| rng.gen::<f64>())
+                .filter(|x| *x > 0.05 && *x < 0.25)
+                .take(3)
+            {
+                let wait_time = Duration::from_secs(((factor * 5.0 * 15.0) + 15.0) as u64);
+                tracing::info!(
+                    "test #{test_no}: packet loss factor: {factor} (wait time: {wait_time})",
+                    wait_time = wait_time.as_secs()
+                );
+
+                let now = std::time::Instant::now();
+                tests.push_back(tokio::spawn(
+                    run_test(
+                        TestConfig {
+                            packet_drop_policy: PacketDropPolicy::Factor(factor),
+                            wait_time,
+                            ..Default::default()
+                        },
+                        vec![TestData("foo"), TestData("bar")],
+                    )
+                    .inspect(move |r| {
+                        let msg = if r.is_ok() {
+                            format!("successfully, total time: {}s (t/o: {}s, factor: {factor:.3})", now.elapsed().as_secs(), wait_time.as_secs())
+                        } else {
+                            format!("with error, total time: {}s (t/o: {}s, factor: {factor:.3})", now.elapsed().as_secs(), wait_time.as_secs())
+                        };
+                        if r.is_err() {
+                            tracing::error!("test #{test_no} finished {}", msg);
+                        } else {
+                            tracing::info!("test #{test_no} finished {}", msg);
+                        }
+                    }),
+                ));
+                test_no += 1;
+            }
+
+            while let Some(result) = tests.next().await {
+                result??;
+            }
         }
+
         Ok(())
     }
 }

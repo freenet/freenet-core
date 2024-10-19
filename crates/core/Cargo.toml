@@ -88,6 +88,7 @@ pico-args = "0.5"
 statrs = "0.17"
 tempfile = "3"
 tracing = "0.1"
+console-subscriber = { version = "0.4" }
 
 [features]
 default = ["redb", "trace", "websocket"]

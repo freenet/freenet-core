@@ -205,7 +205,7 @@ impl PeerConnection {
     #[instrument(name = "peer_connection", skip(self))]
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
         // listen for incoming messages or receipts or wait until is time to do anything else again
-        let mut resend_check = Some(tokio::time::sleep(tokio::time::Duration::from_secs(1)));
+        let mut resend_check = Some(tokio::time::sleep(tokio::time::Duration::from_millis(10)));
 
         // #[cfg(debug_assertions)]
         // const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(2);
@@ -304,7 +304,7 @@ impl PeerConnection {
                     tracing::trace!(remote = ?self.remote_conn.remote_addr, "sending keep-alive");
                     self.noop(vec![]).await?;
                 }
-                _ = resend_check.take().unwrap_or(tokio::time::sleep(Duration::from_secs(5))) => {
+                _ = resend_check.take().unwrap_or(tokio::time::sleep(Duration::from_millis(10))) => {
                     loop {
                         tracing::trace!(remote = ?self.remote_conn.remote_addr, "checking for resends");
                         let maybe_resend = self.remote_conn
