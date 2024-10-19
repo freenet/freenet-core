@@ -39,7 +39,7 @@ const PACKET_LOSS_DECAY_FACTOR: f64 = 1.0 / 1000.0;
 /// The expectation is that get_resend will be called as part of a loop that looks something like
 /// this:
 ///
-/// ```rust,no_run
+/// ```ignore
 /// let mut sent_packet_tracker = todo!();
 /// loop {
 ///   match sent_packet_tracker.get_resend() {

@@ -20,7 +20,7 @@ const MAX_PENDING_RECEIPTS: usize = 20;
 /// if the returned list is not empty, the list should be sent as receipts immediately in a noop.
 /// This may look something like this:
 ///
-/// ```rust,no_run
+/// ```ignore
 /// use super::MAX_CONFIRMATION_DELAY;
 /// use std::thread::sleep;
 /// let mut received_packet_tracker = todo!();
