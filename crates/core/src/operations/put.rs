@@ -410,6 +410,7 @@ impl Operation for PutOp {
                     htl,
                     sender,
                     skip_list,
+                    ..
                 } => {
                     let key = contract.key();
                     let peer_loc = op_manager.ring.connection_manager.own_location();
@@ -790,6 +791,7 @@ where
                     (PutMsg::PutForward {
                         id,
                         sender: own_pkloc,
+                        target: peer.clone(),
                         contract: contract.clone(),
                         new_value: new_value.clone(),
                         htl,
@@ -830,6 +832,7 @@ mod messages {
         PutForward {
             id: Transaction,
             sender: PeerKeyLocation,
+            target: PeerKeyLocation,
             contract: ContractContainer,
             new_value: WrappedState,
             /// current htl, reduced by one at each hop
@@ -895,6 +898,8 @@ mod messages {
                 Self::SeekNode { target, .. } => Some(target),
                 Self::RequestPut { target, .. } => Some(target),
                 Self::SuccessfulPut { target, .. } => Some(target),
+                Self::PutForward { target, .. } => Some(target),
+                Self::BroadcastTo { target, .. } => Some(target),
                 _ => None,
             }
         }
