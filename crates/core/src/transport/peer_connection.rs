@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +7,7 @@ use std::time::Duration;
 use crate::transport::packet_data::UnknownEncryption;
 use aes_gcm::Aes128Gcm;
 use futures::stream::FuturesUnordered;
-use futures::{Future, StreamExt};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -67,7 +66,6 @@ impl std::fmt::Display for StreamId {
 }
 
 type InboundStreamResult = Result<(StreamId, SerializedMessage), StreamId>;
-type InboundStreamFut = Pin<Box<dyn Future<Output = InboundStreamResult> + Send>>;
 
 /// The `PeerConnection` struct is responsible for managing the connection with a remote peer.
 /// It provides methods for sending and receiving messages to and from the remote peer.
@@ -593,7 +591,7 @@ mod tests {
             while let Some((_, network_packet)) = receiver.recv().await {
                 let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&network_packet)
                     .try_decrypt_sym(&cipher)
-                    .map_err(TransportError::PrivateKeyDecryptionError)?;
+                    .map_err(|e| e.to_string())?;
                 let SymmetricMessage {
                     payload:
                         SymmetricMessagePayload::StreamFragment {

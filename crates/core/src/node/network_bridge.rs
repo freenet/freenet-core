@@ -14,10 +14,6 @@ mod handshake;
 pub(crate) mod in_memory;
 pub(crate) mod p2p_protoc;
 
-// TODO: use this constants when we do real net i/o
-// const PING_EVERY: Duration = Duration::from_secs(30);
-// const DROP_CONN_AFTER: Duration = Duration::from_secs(30 * 10);
-
 pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 
 /// Allows handling of connections to the network as well as sending messages

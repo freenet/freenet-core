@@ -38,24 +38,7 @@ const MAX_INTERVAL: Duration = Duration::from_millis(5000); // Maximum interval 
 const DEFAULT_BW_TRACKER_WINDOW_SIZE: Duration = Duration::from_secs(10);
 const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
 
-type ConnectionHandlerMessage = (SocketAddr, Vec<u8>);
 pub type SerializedMessage = Vec<u8>;
-type PeerChannel = (
-    mpsc::Sender<SerializedMessage>,
-    mpsc::Receiver<SymmetricMessagePayload>,
-);
-
-struct OutboundMessage {
-    remote_addr: SocketAddr,
-    msg: SerializedMessage,
-    recv: mpsc::Receiver<SerializedMessage>,
-}
-
-struct GatewayMessage {
-    remote_addr: SocketAddr,
-    packet: PacketData<UnknownEncryption>,
-    resp_tx: oneshot::Sender<bool>,
-}
 
 pub(crate) async fn create_connection_handler<S: Socket>(
     keypair: TransportKeypair,
@@ -189,16 +172,6 @@ impl OutboundConnectionHandler {
             })
             .boxed()
     }
-}
-
-pub enum Message {
-    Short(Vec<u8>),
-    Streamed(Vec<u8>, mpsc::Receiver<StreamFragment>),
-}
-
-pub struct StreamFragment {
-    pub fragment_number: u32,
-    pub fragment: Vec<u8>,
 }
 
 /// Handles UDP transport internally.
@@ -505,8 +478,6 @@ impl<S: Socket> UdpPacketsListener<S> {
 
             let inbound_conn = InboundRemoteConnection {
                 inbound_packet_sender: inbound_packet_tx,
-                inbound_intro_packet: None,
-                inbound_checked_times: 0,
             };
 
             tracing::debug!("returning connection at gw");
@@ -701,8 +672,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 },
                                                 InboundRemoteConnection {
                                                     inbound_packet_sender: inbound_sender,
-                                                    inbound_intro_packet: None,
-                                                    inbound_checked_times: 0,
                                                 },
                                             ));
                                         }
@@ -771,8 +740,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     },
                                     InboundRemoteConnection {
                                         inbound_packet_sender: inbound_sender,
-                                        inbound_intro_packet: Some(intro_packet.clone()),
-                                        inbound_checked_times: 0,
                                     },
                                 ));
                             }
@@ -832,28 +799,6 @@ pub(crate) enum ConnectionEvent {
 
 struct InboundRemoteConnection {
     inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
-    inbound_intro_packet: Option<PacketData<AssymetricRSA>>,
-    inbound_checked_times: usize,
-}
-
-impl InboundRemoteConnection {
-    fn check_inbound_packet(&mut self, packet: &PacketData<UnknownEncryption>) -> bool {
-        let mut inbound = false;
-        if let Some(inbound_intro_packet) = self.inbound_intro_packet.as_ref() {
-            if packet.is_intro_packet(inbound_intro_packet) {
-                inbound = true;
-            }
-        }
-        if self.inbound_checked_times >= UdpPacketsListener::<UdpSocket>::NAT_TRAVERSAL_MAX_ATTEMPTS
-        {
-            // no point in checking more than the max attemps since they won't be sending
-            // the intro packet more than this amount of times
-            self.inbound_intro_packet = None;
-        } else {
-            self.inbound_checked_times += 1;
-        }
-        inbound
-    }
 }
 
 #[cfg(test)]
@@ -1455,7 +1400,7 @@ mod test {
     async fn simulate_send_short_message() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE), None);
         #[derive(Clone, Copy)]
-        struct TestData(&'static str, usize);
+        struct TestData(&'static str);
 
         impl TestFixture for TestData {
             type Message = String;
@@ -1477,7 +1422,7 @@ mod test {
                 peers: 10,
                 ..Default::default()
             },
-            Vec::from_iter((0..10).map(|i| TestData("foo", i))),
+            Vec::from_iter((0..10).map(|_| TestData("foo"))),
         )
         .await
     }

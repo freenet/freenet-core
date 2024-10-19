@@ -1,4 +1,3 @@
-#![allow(dead_code)] // TODO: Remove before integration
 //! Freenet Transport protocol implementation.
 //!
 //! Please see `docs/architecture/transport.md` for more information.
@@ -21,8 +20,6 @@ mod symmetric_message;
 type MessagePayload = Vec<u8>;
 
 type PacketId = u32;
-
-use self::peer_connection::StreamId;
 
 pub use self::crypto::{TransportKeypair, TransportPublicKey};
 #[cfg(test)]
@@ -47,20 +44,14 @@ pub(crate) enum TransportError {
     ConnectionClosed(SocketAddr),
     #[error("failed while establishing connection, reason: {cause}")]
     ConnectionEstablishmentFailure { cause: Cow<'static, str> },
-    #[error("incomplete inbound stream: {0}")]
-    IncompleteInboundStream(StreamId),
     #[error(transparent)]
     IO(#[from] std::io::Error),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
-    #[error("{0}")]
-    PrivateKeyDecryptionError(aes_gcm::aead::Error),
     #[error(transparent)]
     PubKeyDecryptionError(#[from] rsa::errors::Error),
     #[error(transparent)]
     Serialization(#[from] bincode::Error),
-    #[error("received unexpected message from remote: {0}")]
-    UnexpectedMessage(Cow<'static, str>),
 }
 
 /// Make connection handler more testable
