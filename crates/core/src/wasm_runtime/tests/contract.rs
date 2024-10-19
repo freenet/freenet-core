@@ -38,34 +38,6 @@ fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn validate_delta() -> Result<(), Box<dyn std::error::Error>> {
-    let TestSetup {
-        contract_store,
-        delegate_store,
-        secrets_store,
-        contract_key,
-        temp_dir,
-    } = super::setup_test_contract(TEST_CONTRACT_1)?;
-    let mut runtime = Runtime::build(contract_store, delegate_store, secrets_store, false).unwrap();
-
-    let is_valid = runtime.validate_delta(
-        &contract_key,
-        &Parameters::from([].as_ref()),
-        &StateDelta::from([1, 2, 3, 4].as_ref()),
-    )?;
-    assert!(is_valid);
-
-    let not_valid = !runtime.validate_delta(
-        &contract_key,
-        &Parameters::from([].as_ref()),
-        &StateDelta::from([1, 0, 0, 1].as_ref()),
-    )?;
-    assert!(not_valid);
-    std::mem::drop(temp_dir);
-    Ok(())
-}
-
-#[test]
 fn update_state() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {
         contract_store,

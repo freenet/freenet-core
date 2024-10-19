@@ -13,14 +13,7 @@ impl ContractInterface for Contract {
     ) -> Result<ValidateResult, ContractError> {
         Ok(ValidateResult::Valid)
     }
-
-    fn validate_delta(
-        _parameters: Parameters<'static>,
-        _delta: StateDelta<'static>,
-    ) -> Result<bool, ContractError> {
-        Ok(true)
-    }
-
+    
     fn update_state(
         _parameters: Parameters<'static>,
         state: State<'static>,
