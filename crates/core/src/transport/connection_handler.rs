@@ -1030,7 +1030,7 @@ mod test {
                 barrier_cp.wait().await;
                 for (peer_pub, peer_addr) in &peer_keys_and_addr {
                     let peer_conn = tokio::time::timeout(
-                        Duration::from_secs(10),
+                        Duration::from_secs(2),
                         peer.connect(peer_pub.clone(), *peer_addr).await,
                     );
                     establish_conns.push(peer_conn);
@@ -1043,7 +1043,7 @@ mod test {
                 let extra_wait = if config.wait_time.as_secs() > 10 {
                     Duration::from_secs(3)
                 } else {
-                    Duration::from_secs(1)
+                    Duration::from_millis(200)
                 };
                 for ((_, peer_addr), mut peer_conn) in
                     peer_keys_and_addr.into_iter().zip(connections)
@@ -1115,7 +1115,6 @@ mod test {
 
     #[tokio::test]
     async fn simulate_nat_traversal() -> anyhow::Result<()> {
-        // crate::config::set_logger();
         let channels = Arc::new(DashMap::new());
         let (peer_a_pub, mut peer_a, peer_a_addr) =
             set_peer_connection(Default::default(), channels.clone()).await?;
@@ -1142,7 +1141,6 @@ mod test {
 
     #[tokio::test]
     async fn simulate_nat_traversal_drop_first_packets_for_all() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let channels = Arc::new(DashMap::new());
         let (peer_a_pub, mut peer_a, peer_a_addr) =
             set_peer_connection(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
@@ -1169,7 +1167,6 @@ mod test {
 
     #[tokio::test]
     async fn simulate_nat_traversal_drop_first_packets_of_peerb() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let channels = Arc::new(DashMap::new());
         let (peer_a_pub, mut peer_a, peer_a_addr) =
             set_peer_connection(Default::default(), channels.clone()).await?;
@@ -1198,7 +1195,6 @@ mod test {
 
     #[tokio::test]
     async fn simulate_nat_traversal_drop_packet_ranges_of_peerb_killed() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE), None);
         let channels = Arc::new(DashMap::new());
         let (peer_a_pub, mut peer_a, peer_a_addr) =
             set_peer_connection(Default::default(), channels.clone()).await?;
@@ -1299,7 +1295,6 @@ mod test {
 
     #[tokio::test]
     async fn simulate_gateway_connection() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE), None);
         let channels = Arc::new(DashMap::new());
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
             set_peer_connection(Default::default(), channels.clone()).await?;
@@ -1328,7 +1323,6 @@ mod test {
 
     #[tokio::test]
     async fn simulate_gateway_connection_drop_first_packets_of_gateway() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let channels = Arc::new(DashMap::new());
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
             set_peer_connection(Default::default(), channels.clone()).await?;
@@ -1357,7 +1351,6 @@ mod test {
 
     #[tokio::test]
     async fn simulate_gateway_connection_drop_first_packets_for_all() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let channels = Arc::new(DashMap::new());
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
             set_peer_connection(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
@@ -1386,7 +1379,6 @@ mod test {
 
     #[tokio::test]
     async fn simulate_gateway_connection_drop_first_packets_of_peer() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         let channels = Arc::new(DashMap::new());
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
             set_peer_connection(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
@@ -1415,7 +1407,6 @@ mod test {
 
     #[tokio::test]
     async fn simulate_send_short_message() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE), None);
         #[derive(Clone, Copy)]
         struct TestData(&'static str);
 
@@ -1448,7 +1439,6 @@ mod test {
     /// by using public send API can be directly sent
     #[tokio::test]
     async fn simulate_send_max_short_message() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::ERROR));
         let channels = Arc::new(DashMap::new());
         let (peer_a_pub, mut peer_a, peer_a_addr) =
             set_peer_connection(Default::default(), channels.clone()).await?;
@@ -1457,7 +1447,7 @@ mod test {
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+            let mut conn = tokio::time::timeout(Duration::from_secs(5), peer_a_conn).await??;
             let data = vec![0u8; 1324];
             let data = tokio::task::spawn_blocking(move || bincode::serialize(&data).unwrap())
                 .await
@@ -1468,7 +1458,7 @@ mod test {
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            let mut conn = tokio::time::timeout(Duration::from_secs(5), peer_b_conn).await??;
             let msg = conn.recv().await?;
             assert!(msg.len() <= MAX_DATA_SIZE);
             Ok::<_, anyhow::Error>(())
@@ -1513,7 +1503,6 @@ mod test {
 
     #[tokio::test]
     async fn simulate_send_streamed_message() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         #[derive(Clone, Copy)]
         struct TestData(&'static str);
 
