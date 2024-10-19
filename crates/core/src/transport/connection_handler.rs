@@ -1580,9 +1580,17 @@ mod test {
                     )
                     .inspect(move |r| {
                         let msg = if r.is_ok() {
-                            format!("successfully, total time: {}s (t/o: {}s, factor: {factor:.3})", now.elapsed().as_secs(), wait_time.as_secs())
+                            format!(
+                                "successfully, total time: {}s (t/o: {}s, factor: {factor:.3})",
+                                now.elapsed().as_secs(),
+                                wait_time.as_secs()
+                            )
                         } else {
-                            format!("with error, total time: {}s (t/o: {}s, factor: {factor:.3})", now.elapsed().as_secs(), wait_time.as_secs())
+                            format!(
+                                "with error, total time: {}s (t/o: {}s, factor: {factor:.3})",
+                                now.elapsed().as_secs(),
+                                wait_time.as_secs()
+                            )
                         };
                         if r.is_err() {
                             tracing::error!("test #{test_no} finished {}", msg);
