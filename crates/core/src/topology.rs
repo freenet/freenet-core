@@ -348,12 +348,10 @@ impl TopologyManager {
         let decrease_usage_if_above: RateProportion =
             RateProportion::new(MAXIMUM_DESIRED_RESOURCE_USAGE_PROPORTION);
 
-        let usage_rates = self.calculate_usage_proportion(at_time);
-
-        let (resource_type, usage_proportion) = usage_rates.max_usage_rate;
+        let (resource_type, usage_proportion) = self.calculate_usage_proportion(at_time);
 
         // Detailed resource usage information
-        debug!("Usage proportions: {:?}", usage_rates);
+        debug!(?usage_proportion, "Resource usage information");
 
         let adjustment: anyhow::Result<TopologyAdjustment> =
             if neighbor_locations.len() > self.limits.max_connections {
@@ -405,7 +403,7 @@ impl TopologyManager {
         adjustment.unwrap_or(TopologyAdjustment::NoChange)
     }
 
-    fn calculate_usage_proportion(&mut self, at_time: Instant) -> UsageRates {
+    fn calculate_usage_proportion(&mut self, at_time: Instant) -> (ResourceType, RateProportion) {
         let mut usage_rate_per_type = HashMap::new();
         for resource_type in ResourceType::all() {
             let usage = self.extrapolated_usage(&resource_type, at_time);
@@ -418,11 +416,7 @@ impl TopologyManager {
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
             .unwrap();
 
-        UsageRates {
-            // TODO: Is there a way to avoid this clone()?
-            usage_rate_per_type: usage_rate_per_type.clone(),
-            max_usage_rate: (*max_usage_rate.0, *max_usage_rate.1),
-        }
+        (*max_usage_rate.0, *max_usage_rate.1)
     }
 
     /// modify the current connection acquisition strategy
@@ -969,11 +963,4 @@ impl Limits {
             ResourceType::InboundBandwidthBytes => self.max_downstream_bandwidth,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-struct UsageRates {
-    #[allow(unused)]
-    usage_rate_per_type: HashMap<ResourceType, RateProportion>,
-    max_usage_rate: (ResourceType, RateProportion),
 }

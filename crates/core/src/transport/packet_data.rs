@@ -73,10 +73,6 @@ impl Encryption for SymmetricAES {}
 impl Encryption for AssymetricRSA {}
 impl Encryption for UnknownEncryption {}
 
-pub(super) const fn packet_size<const DATA_SIZE: usize>() -> usize {
-    DATA_SIZE + NONCE_SIZE + TAG_SIZE
-}
-
 fn internal_sym_decryption<const N: usize>(
     data: &[u8],
     size: usize,
@@ -135,10 +131,6 @@ impl<const N: usize> PacketData<AssymetricRSA, N> {
             size: encrypted_data.len(),
             data_type: PhantomData,
         }
-    }
-
-    pub fn preparef_send(self) -> Arc<[u8]> {
-        self.data[..self.size].into()
     }
 }
 

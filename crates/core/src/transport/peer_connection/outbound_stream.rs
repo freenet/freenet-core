@@ -127,7 +127,7 @@ mod tests {
         while let Some((_, packet)) = outbound_receiver.recv().await {
             let decrypted_packet = PacketData::<_, MAX_PACKET_SIZE>::from_buf(packet.as_ref())
                 .try_decrypt_sym(&cipher)
-                .map_err(TransportError::PrivateKeyDecryptionError)?;
+                .map_err(|e| e.to_string())?;
             let deserialized = SymmetricMessage::deser(decrypted_packet.data())?;
             let SymmetricMessagePayload::StreamFragment { payload, .. } = deserialized.payload
             else {

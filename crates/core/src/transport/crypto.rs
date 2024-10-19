@@ -38,6 +38,7 @@ impl TransportKeypair {
         &self.public
     }
 
+    #[cfg(test)]
     pub(crate) fn secret(&self) -> &TransportSecretKey {
         &self.secret
     }
@@ -93,6 +94,7 @@ impl TransportSecretKey {
         self.0.decrypt(Pkcs1v15Encrypt, data)
     }
 
+    #[cfg(test)]
     pub fn to_pkcs8_pem(&self) -> Result<Vec<u8>, pkcs8::Error> {
         use pkcs8::EncodePrivateKey;
 

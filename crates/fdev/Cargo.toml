@@ -2,7 +2,7 @@
 name = "fdev"
 version = "0.0.7"
 edition = "2021"
-rust-version = "1.71.1"
+rust-version = "1.80"
 publish = true
 description = "Freenet development tool"
 license = "MIT OR Apache-2.0"

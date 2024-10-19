@@ -75,15 +75,6 @@ impl SentPacketTracker<InstantTimeSrc> {
 }
 
 impl<T: TimeSource> SentPacketTracker<T> {
-    /// Get an estimate of the proportion of outbound packets that were lost This is a value
-    /// between 0.0 and 1.0, where 0.0 means no packets are lost and 1.0 means all packets are
-    /// lost. This estimate will be biased towards 0.0 initially, and will converge to the
-    /// true value over time. It's accuracy will be approximately
-    /// `PACKET_LOSS_DECAY_FACTOR` (0.001).
-    pub(super) fn get_recent_packet_loss(&self) -> f64 {
-        self.packet_loss_proportion
-    }
-
     pub(super) fn report_sent_packet(&mut self, packet_id: PacketId, payload: Arc<[u8]>) {
         self.pending_receipts.insert(packet_id, payload);
         self.resend_queue.push_back(ResendQueueEntry {

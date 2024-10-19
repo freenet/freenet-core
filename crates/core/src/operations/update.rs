@@ -1,5 +1,5 @@
-use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 // TODO: complete update logic in the network
+use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
@@ -28,24 +28,6 @@ impl UpdateOp {
         matches!(self.state, None | Some(UpdateState::Finished { .. }))
     }
 
-    // pub(super) fn record_transfer(&mut self) {
-    //     if let Some(stats) = self.stats.as_mut() {
-    //         match stats.step {
-    //             RecordingStats::Uninitialized => {
-    //                 stats.transfer_time = Some((Instant::now(), None));
-    //                 stats.step = RecordingStats::InitUpdate;
-    //             }
-    //             RecordingStats::InitUpdate => {
-    //                 if let Some((_, e)) = stats.transfer_time.as_mut() {
-    //                     *e = Some(Instant::now());
-    //                 }
-    //                 stats.step = RecordingStats::Completed;
-    //             }
-    //             RecordingStats::Completed => {}
-    //         }
-    //     }
-    // }
-
     pub(super) fn to_host_result(&self) -> HostResult {
         if let Some(UpdateState::Finished { key, summary }) = &self.state {
             Ok(HostResponse::ContractResponse(
@@ -65,16 +47,7 @@ impl UpdateOp {
 
 struct UpdateStats {
     target: Option<PeerKeyLocation>,
-    // step: RecordingStats,
 }
-
-// /// While timing, at what particular step we are now.
-// #[derive(Clone, Copy, Default)]
-// enum RecordingStats {
-//     #[default]
-//     Uninitialized,
-//     Completed,
-// }
 
 pub(crate) struct UpdateResult {}
 

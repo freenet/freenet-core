@@ -26,14 +26,13 @@ use freenet::dev_tool::{
 };
 use futures::{
     stream::{SplitSink, SplitStream},
-    SinkExt, StreamExt,
+    FutureExt, SinkExt, StreamExt,
 };
 use http::{Response, StatusCode};
 use thiserror::Error;
 use tokio::{
     process::Command,
     sync::{oneshot, Mutex},
-    task::JoinHandle,
 };
 
 use super::{Error, TestConfig};
@@ -324,45 +323,18 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<Supervisor>) -> anyhow
     let (mut sender, mut receiver): (SplitSink<WebSocket, Message>, SplitStream<WebSocket>) =
         socket.split();
 
-    // Spawn a task for handling outgoing messages.
-    let mut sender_task: JoinHandle<Result<(), Error>> =
-        tokio::spawn(
-            async move { handle_outgoing_messages(&cloned_supervisor, &mut sender).await },
-        );
-
-    // Spawn a task for handling incoming messages.
-    let mut receiver_task: JoinHandle<Result<(), Error>> =
-        tokio::spawn(async move { handle_incoming_messages(&supervisor, &mut receiver).await });
-
-    // Wait for either the sender or receiver task to complete and then clean up.
+    let mut sender_task = handle_outgoing_messages(&cloned_supervisor, &mut sender).boxed();
+    let mut receiver_task = handle_incoming_messages(&supervisor, &mut receiver).boxed();
     tokio::select! {
         event_s = &mut sender_task => {
-            match event_s {
-                Ok(_) => {
-                    tracing::info!("Sender task finished");
-                    receiver_task.abort();
-                    Ok(())
-                }
-                Err(e) => {
-                    tracing::error!("Sender task failed: {}", e);
-                    receiver_task.abort();
-                    Err(e.into())
-                }
-            }
+            event_s
+            .inspect_err(|e| tracing::error!("Sender task failed: {e}"))
+            .inspect(|_| tracing::info!("Sender task finished"))
         }
         peer_r = &mut receiver_task => {
-            match peer_r {
-                Ok(_) => {
-                    tracing::info!("Receiver task finished");
-                    sender_task.abort();
-                    Ok(())
-                }
-                Err(e) => {
-                    tracing::error!("Receiver task failed: {}", e);
-                    sender_task.abort();
-                    Err(e.into())
-                }
-            }
+            peer_r
+                .inspect_err(|e| tracing::error!("Receiver task failed: {e}"))
+                .inspect(|_| tracing::info!("Receiver task finished"))
         }
     }
 }
@@ -373,7 +345,6 @@ async fn handle_outgoing_messages(
 ) -> anyhow::Result<()> {
     let mut event_rx = supervisor.user_ev_controller.lock().await.subscribe();
     while let Ok((event, peer_id)) = event_rx.recv().await {
-        tracing::info!("Sending event {} to peer {}", event, peer_id);
         let serialized_msg: Vec<u8> = bincode::serialize(&(event, peer_id.clone()))
             .map_err(|e| anyhow!("Failed to serialize message: {}", e))?;
 
