@@ -29,7 +29,7 @@ use crate::{
 type Result<T, E = HandshakeError> = std::result::Result<T, E>;
 type OutboundConnResult = Result<InternalEvent, (PeerId, HandshakeError)>;
 
-const TIMEOUT: Duration = Duration::from_secs(60);
+const TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub(super) struct ForwardInfo {
@@ -120,9 +120,8 @@ pub(super) enum ExternConnection {
         tx: Transaction,
         is_gw: bool,
     },
-    #[cfg(test)]
-    Abort { peer: PeerId },
 }
+
 /// Use for starting a new outboound connection to a peer.
 pub(super) struct EstablishConnection(pub(crate) mpsc::Sender<ExternConnection>);
 
@@ -134,15 +133,6 @@ impl EstablishConnection {
                 tx,
                 is_gw,
             })
-            .await
-            .map_err(|_| HandshakeError::ChannelClosed)?;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub async fn abort(&self, remote: PeerId) -> Result<()> {
-        self.0
-            .send(ExternConnection::Abort { peer: remote })
             .await
             .map_err(|_| HandshakeError::ChannelClosed)?;
         Ok(())
@@ -472,12 +462,6 @@ impl HandshakeHandler {
                 // Handle requests to establish new connections
                 establish_connection = self.establish_connection_rx.recv() => {
                     match establish_connection {
-                        #[cfg(test)]
-                        Some(ExternConnection::Abort { peer }) => {
-                            tracing::debug!(from=%peer.addr, "Aborting connection attempt");
-                            self.connecting.remove(&peer.addr);
-                            self.outbound_messages.remove(&peer.addr);
-                        }
                         Some(ExternConnection::Establish { peer, tx, is_gw }) => {
                             self.start_outbound_connection(peer, tx, is_gw).await;
                         }
@@ -1081,7 +1065,6 @@ mod tests {
 
     use aes_gcm::{Aes128Gcm, KeyInit};
     use anyhow::{anyhow, bail};
-    use backon::BackoffBuilder;
     use serde::Serialize;
     use tokio::sync::{mpsc, oneshot};
 
@@ -1186,7 +1169,9 @@ mod tests {
                 vec![],
             )
             .unwrap();
+            tracing::trace!(at=?self.my_addr, to=%addr, "Sending message to peer");
             packet_sender.send(sym_msg.into_unknown()).await.unwrap();
+            tracing::trace!(at=?self.my_addr, from=%addr, "Message sent");
             self.packet_id += 1;
         }
 
@@ -1236,9 +1221,9 @@ mod tests {
         addr: impl Into<SocketAddr>,
         existing_connections: Option<Vec<Connection>>,
     ) -> (HandshakeHandler, TestVerifier) {
-        let (outbound_sender, outbound_recv) = mpsc::channel(5);
+        let (outbound_sender, outbound_recv) = mpsc::channel(100);
         let outbound_conn_handler = OutboundConnectionHandler::new(outbound_sender);
-        let (inbound_sender, inbound_recv) = mpsc::channel(5);
+        let (inbound_sender, inbound_recv) = mpsc::channel(100);
         let inbound_conn_handler = InboundConnectionHandler::new(inbound_recv);
         let addr = addr.into();
         let keypair = TransportKeypair::new();
@@ -1602,7 +1587,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_peer_to_gw_outbound_conn_rejected() -> anyhow::Result<()> {
-        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE), None);
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE), None);
         let joiner_addr = ([127, 0, 0, 1], 10001).into();
         let (mut handler, mut test) = config_handler(joiner_addr, None);
 
@@ -1689,21 +1674,21 @@ mod tests {
 
                 if i > 3 {
                     // Create the successful connection
-                    async fn retry(
+                    async fn establish_conn(
                         test: &mut TestVerifier,
                         i: usize,
                         joiner_addr: SocketAddr,
-                    ) -> Result<(), (bool, anyhow::Error)> {
+                    ) -> Result<(), anyhow::Error> {
                         let (remote, ev) = tokio::time::timeout(
-                            Duration::from_secs(2),
+                            Duration::from_secs(10),
                             test.transport.outbound_recv.recv(),
                         )
                         .await
                         .inspect_err(|error| {
                             tracing::error!(%error, conn_num = %i, "failed while receiving connection events");
                         })
-                        .map_err(|_| (false, anyhow!("time out")))?
-                        .ok_or((false, anyhow!("Failed to receive event")))?;
+                        .map_err(|_| anyhow!("time out"))?
+                        .ok_or( anyhow!("Failed to receive event"))?;
                         let ConnectionEvent::ConnectionStart {
                             open_connection, ..
                         } = ev;
@@ -1719,46 +1704,15 @@ mod tests {
                             .packet_senders
                             .insert(remote, (in_symm_key, out));
                         test.transport.packet_receivers.push(inb);
-                        tracing::info!(conn_num = %i, %remote, "Connection established");
+                        tracing::info!(conn_num = %i, %remote, "Connection established at remote");
                         open_connection
                             .send(Ok(conn))
-                            .map_err(|_| (true, anyhow!("failed to open conn")))?;
+                            .map_err(|_| anyhow!("failed to open conn"))?;
+                        tracing::info!(conn_num = %i, "Returned open conn");
                         Ok(())
                     }
 
-                    let retries = backon::ExponentialBuilder::default()
-                        .with_max_delay(Duration::from_secs(5))
-                        .with_max_times(5)
-                        .build();
-                    for (j, wait) in retries.enumerate() {
-                        match retry(&mut test, i, joiner_addr).await {
-                            Ok(_) => break,
-                            Err((_, error)) if j >= 4 => {
-                                tracing::error!(%error, conn_num = %i, "failed to establish connection");
-                                return Err(error);
-                            }
-                            Err((rm, error)) => {
-                                if rm {
-                                    test.transport.packet_receivers.pop();
-                                    test.transport.packet_senders.remove(&joiner_addr);
-                                }
-                                test.node
-                                    .establish_conn
-                                    .abort(acceptor.peer.clone())
-                                    .await?;
-                                test.transport
-                                    .inbound_msg(
-                                        gw_addr,
-                                        NetMessage::V1(NetMessageV1::Connect(
-                                            forward_response.clone(),
-                                        )),
-                                    )
-                                    .await;
-                                tracing::warn!(%error, conn_num = %i, "failed to establish connection, retrying in {}ms", wait.as_millis());
-                            }
-                        }
-                        tokio::time::sleep(wait).await;
-                    }
+                    establish_conn(&mut test, i, joiner_addr).await?;
                 }
             }
 
@@ -1769,8 +1723,9 @@ mod tests {
             let mut conn_count = 0;
             let mut gw_rejected = false;
             for conn_num in 3..Ring::DEFAULT_MAX_HOPS_TO_LIVE {
+                let conn_num = conn_num + 2;
                 let event =
-                    tokio::time::timeout(Duration::from_secs(10), handler.wait_for_events())
+                    tokio::time::timeout(Duration::from_secs(60), handler.wait_for_events())
                         .await
                         .inspect_err(|_| {
                             tracing::error!(%conn_num, "failed while waiting for events");
@@ -1779,13 +1734,9 @@ mod tests {
                             tracing::error!(%error, %conn_num, "failed while receiving events");
                         })?;
                 match event {
-                    Event::OutboundConnectionSuccessful {
-                        peer_id,
-                        connection,
-                    } => {
-                        tracing::info!(%peer_id, %conn_num, "Connection established");
+                    Event::OutboundConnectionSuccessful { peer_id, .. } => {
+                        tracing::info!(%peer_id, %conn_num, "Connection established at peer");
                         conn_count += 1;
-                        drop(connection);
                     }
                     Event::OutboundGatewayConnectionRejected { peer_id } => {
                         tracing::info!(%peer_id, "Gateway connection rejected");
