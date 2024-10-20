@@ -18,6 +18,7 @@ arc-swap = "1"
 asynchronous-codec = "0.7"
 aes-gcm = "0.10"
 axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws", "json"], workspace = true }
+backon = "1.2"
 bincode = "1"
 blake3 = { workspace = true }
 bs58 = "0.5"
