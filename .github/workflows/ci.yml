@@ -38,6 +38,7 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
+        if: always()
 
       - name: Install stdlib packages
         working-directory: stdlib/typescript
