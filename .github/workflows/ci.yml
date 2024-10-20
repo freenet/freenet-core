@@ -38,7 +38,9 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
-        if: always()
+        if: success() || steps.test.conclusion == 'failure'
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Install stdlib packages
         working-directory: stdlib/typescript
