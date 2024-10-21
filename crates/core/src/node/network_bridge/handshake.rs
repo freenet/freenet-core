@@ -1585,7 +1585,6 @@ mod tests {
         Ok(())
     }
 
-    #[ignore = "flaky in ci"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_peer_to_gw_outbound_conn_rejected() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE), None);
