@@ -12,7 +12,7 @@ jobs:
   test_all:
     name: Test
 
-    runs-on: 64-core-256-gb-ubuntu-latest
+    runs-on: freenet-core-ci
 
     strategy:
       max-parallel: 1
