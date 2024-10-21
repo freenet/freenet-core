@@ -12,6 +12,7 @@ jobs:
   test_all:
     name: Test
 
+    # Use more powerful runner
     runs-on: freenet-core-ci
 
     strategy:
