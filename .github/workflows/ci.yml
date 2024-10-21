@@ -40,7 +40,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: success() || steps.test.conclusion == 'failure'
         with:
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install stdlib packages
         working-directory: stdlib/typescript
