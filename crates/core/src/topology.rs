@@ -543,7 +543,7 @@ pub(crate) enum ConnectionAcquisitionStrategy {
 mod tests {
     #[test]
     fn test_topology() {
-        const NUM_REQUESTS: usize = 1_000;
+        const NUM_REQUESTS: usize = 5_000;
         let mut topology_manager = TopologyManager::new(Limits {
             max_upstream_bandwidth: Rate::new_per_second(1000.0),
             max_downstream_bandwidth: Rate::new_per_second(1000.0),
