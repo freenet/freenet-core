@@ -20,6 +20,21 @@ impl ContractInterface for Contract {
         Ok(ValidateResult::Valid)
     }
 
+    fn validate_delta(
+        _parameters: Parameters<'static>,
+        delta: StateDelta<'static>,
+    ) -> Result<bool, ContractError> {
+        let bytes = delta.as_ref();
+        // allow empty delta
+        if bytes.is_empty() {
+            return Ok(true);
+        }
+        let _ = serde_json::from_slice::<Ping>(bytes)
+            .map_err(|e| ContractError::Deser(e.to_string()))?;
+        Ok(true)
+    }
+
+
     fn update_state(
         parameters: Parameters<'static>,
         state: State<'static>,
