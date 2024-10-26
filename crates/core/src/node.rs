@@ -22,12 +22,14 @@ use std::{
 use anyhow::Context;
 use either::Either;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ErrorKind},
+    client_api::{ClientRequest, ContractRequest, ErrorKind, HostResponse, QueryResponse},
     prelude::{ContractKey, RelatedContracts, WrappedState},
 };
 
+use futures::{stream::FuturesUnordered, StreamExt};
 use rsa::pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 use tracing::Instrument;
 
 use self::p2p_impl::NodeP2P;
@@ -39,7 +41,7 @@ use crate::{
         ExecutorToEventLoopChannel, NetworkContractHandler,
     },
     local_node::Executor,
-    message::{NetMessage, NodeEvent, Transaction, TransactionType},
+    message::{NetMessage, NodeEvent, QueryResult, Transaction, TransactionType},
     operations::{
         connect::{self, ConnectOp},
         get, put, subscribe, update, OpEnum, OpError, OpOutcome,
@@ -365,6 +367,7 @@ async fn client_event_handling<ClientEv>(
 ) where
     ClientEv: ClientEventsProxy + Send + 'static,
 {
+    let mut callbacks = FuturesUnordered::new();
     loop {
         tokio::select! {
             client_request = client_events.recv() => {
@@ -387,7 +390,10 @@ async fn client_event_handling<ClientEv>(
                     node_controller.send(NodeEvent::Disconnect { cause: cause.clone() }).await.ok();
                     break;
                 }
-                process_open_request(req, op_manager.clone()).await;
+                let cli_id = req.client_id;
+                if let Some(mut cb) = process_open_request(req, op_manager.clone()).await {
+                    callbacks.push(async move { cb.recv().await.map(|r| (cli_id, r)) });
+                }
             }
             res = client_responses.recv() => {
                 if let Some((cli_id, res)) = res {
@@ -400,12 +406,33 @@ async fn client_event_handling<ClientEv>(
                     }
                 }
             }
+            res = callbacks.next(), if !callbacks.is_empty() => {
+                if let Some(Some((cli_id, res))) = res {
+                    let QueryResult::Connections(conns) = res;
+                    let res = Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers {
+                        peers: conns.into_iter().map(|p| (p.pub_key.to_string(), p.addr)).collect() }
+                    ));
+                    if let Err(err) = client_events.send(cli_id, res).await {
+                        tracing::debug!("channel closed: {err}");
+                        break;
+                    }
+                }
+            }
         }
     }
 }
 
 #[inline]
-async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpManager>) {
+async fn process_open_request(
+    request: OpenRequest<'static>,
+    op_manager: Arc<OpManager>,
+) -> Option<mpsc::Receiver<QueryResult>> {
+    let (callback_tx, callback_rx) = if matches!(&*request.request, ClientRequest::NodeQueries(_)) {
+        let (tx, rx) = mpsc::channel(1);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     // this will indirectly start actions on the local contract executor
     let fut = async move {
         let client_id = request.client_id;
@@ -506,6 +533,14 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
             },
             ClientRequest::DelegateOp(_op) => todo!("FIXME: delegate op"),
             ClientRequest::Disconnect { .. } => unreachable!(),
+            ClientRequest::NodeQueries(_) => {
+                tracing::debug!("Received node queries from user event");
+                let _ = op_manager
+                    .notify_node_event(NodeEvent::QueryConnections {
+                        callback: callback_tx.expect("should be set"),
+                    })
+                    .await;
+            }
             _ => {
                 tracing::error!("Op not supported");
             }
@@ -514,6 +549,7 @@ async fn process_open_request(request: OpenRequest<'static>, op_manager: Arc<OpM
     GlobalExecutor::spawn(fut.instrument(
         tracing::info_span!(parent: tracing::Span::current(), "process_client_request"),
     ));
+    callback_rx
 }
 
 #[allow(unused)]
