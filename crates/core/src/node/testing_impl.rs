@@ -888,6 +888,9 @@ where
                     tracing::info!(peer = %peer_key, "Shutting down node");
                     return Ok(());
                 }
+                NodeEvent::QueryConnections { .. } => {
+                    unimplemented!()
+                }
             },
             Err(err) => {
                 super::report_result(

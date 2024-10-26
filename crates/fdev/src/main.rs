@@ -9,6 +9,7 @@ mod config;
 mod inspect;
 pub(crate) mod network_metrics_server;
 mod new_package;
+mod query;
 mod testing;
 mod util;
 mod wasm_runtime;
@@ -64,6 +65,10 @@ fn main() -> anyhow::Result<()> {
                     _ = tokio::signal::ctrl_c() => {}
                     _ = server => {}
                 }
+                Ok(())
+            }
+            SubCommand::Query {} => {
+                query::query(config.additional).await?;
                 Ok(())
             }
         };
