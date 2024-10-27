@@ -42,6 +42,7 @@ pub enum SubCommand {
     Build(BuildToolConfig),
     Inspect(crate::inspect::InspectConfig),
     Publish(PutConfig),
+    /// Query the local node for information. Currently only shows open connections.
     Query {},
     WasmRuntime(ExecutorConfig),
     Execute(RunCliConfig),
