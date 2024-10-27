@@ -144,6 +144,7 @@ async fn client_fn(
             host_msg = rx.recv() => {
                 if let Some((client_id, response)) = host_msg {
                     if client.send(client_id, response).await.is_err() {
+                        eprintln!("disconnected host");
                         break;
                     }
                 } else {
@@ -177,6 +178,7 @@ async fn client_fn(
 #[cfg(test)]
 mod test {
     use freenet_stdlib::client_api::ClientRequest;
+    use futures::try_join;
 
     use super::*;
     use crate::client_events::ClientEventsProxy;
@@ -184,11 +186,12 @@ mod test {
     struct SampleProxy {
         id: usize,
         rx: Receiver<usize>,
+        tx: Sender<usize>,
     }
 
     impl SampleProxy {
-        fn new(id: usize, rx: Receiver<usize>) -> Self {
-            Self { id, rx }
+        fn new(id: usize, rx: Receiver<usize>, tx: Sender<usize>) -> Self {
+            Self { id, rx, tx }
         }
     }
 
@@ -211,24 +214,39 @@ mod test {
 
         fn send(
             &mut self,
-            _id: ClientId,
+            id: ClientId,
             _response: Result<HostResponse, ClientError>,
         ) -> BoxFuture<'_, Result<(), ClientError>> {
-            todo!()
+            assert_eq!(id.0, self.id);
+            async {
+                self.tx
+                    .send(self.id)
+                    .await
+                    .map_err(|_| ErrorKind::ChannelClosed.into())
+            }
+            .boxed()
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn combinator_recv() {
+    fn setup_proxies() -> ([BoxedClient; 3], Vec<Sender<usize>>, Vec<Receiver<usize>>) {
         let mut cnt = 0;
         let mut senders = vec![];
-        let proxies = [None::<()>; 3].map(|_| {
-            let (tx, rx) = channel(1);
-            senders.push(tx);
-            let r = Box::new(SampleProxy::new(cnt, rx)) as _;
+        let mut receivers = vec![];
+        let clients = [None::<()>; 3].map(|_| {
+            let (tx1, rx1) = channel(1);
+            let (tx2, rx2) = channel(1);
+            let r = Box::new(SampleProxy::new(cnt, rx1, tx2)) as _;
+            senders.push(tx1);
+            receivers.push(rx2);
             cnt += 1;
             r
         });
+        (clients, senders, receivers)
+    }
+
+    #[tokio::test]
+    async fn combinator_recv() {
+        let (proxies, mut senders, _) = setup_proxies();
         let mut combinator = ClientEventsCombinator::new(proxies);
 
         let _senders: Vec<Sender<usize>> = tokio::task::spawn(async move {
@@ -251,5 +269,50 @@ mod test {
                 assert_eq!(ClientId::new(i), id);
             }
         }
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn test_send() {
+        let (proxies, _, mut receivers) = setup_proxies();
+        let mut combinator = ClientEventsCombinator::new(proxies);
+
+        for idx in 0..3 {
+            let client_id = ClientId::new(idx);
+            // Insert each client ID mapping into the combinator's internal clients.
+            combinator
+                .internal_clients
+                .insert(client_id, (idx, client_id));
+        }
+
+        let receivers = async move {
+            // Test sending a response through the combinator for each proxy.
+            for (idx, receiver) in receivers.iter_mut().enumerate() {
+                // Assert that the receiver received the expected message.
+                let received_id = receiver
+                    .recv()
+                    .await
+                    .ok_or(format!("missing {idx} sender"))?;
+                assert_eq!(received_id, idx);
+                println!(
+                    "Receiver {} confirmed send for client ID: {}",
+                    idx, received_id
+                );
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        };
+
+        let senders = async {
+            for idx in 0..3 {
+                // Send a sample response through the combinator.
+                combinator
+                    .send(ClientId::new(idx), Ok(HostResponse::Ok))
+                    .await
+                    .map_err(|err| format!("Send failed for client {idx}: {err}",))?;
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        };
+
+        try_join!(senders, receivers).unwrap();
     }
 }
