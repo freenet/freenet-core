@@ -1,9 +1,4 @@
-use std::{
-    fs::File,
-    io::Read,
-    net::{IpAddr, SocketAddr},
-    path::PathBuf,
-};
+use std::{fs::File, io::Read, net::SocketAddr, path::PathBuf};
 
 use freenet::dev_tool::OperationMode;
 use freenet_stdlib::{
@@ -88,7 +83,8 @@ async fn put_contract(
         related_contracts,
     }
     .into();
-    execute_command(request, other, config.address, config.port).await
+    let mut client = start_api_client(other).await?;
+    execute_command(request, &mut client).await
 }
 
 async fn put_delegate(
@@ -127,7 +123,8 @@ For additional hardening is recommended to use a different cipher and nonce to e
         nonce,
     }
     .into();
-    execute_command(request, other, config.address, config.port).await
+    let mut client = start_api_client(other).await?;
+    execute_command(request, &mut client).await
 }
 
 pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<()> {
@@ -142,14 +139,17 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<(
         StateDelta::from(buf).into()
     };
     let request = ContractRequest::Update { key, data }.into();
-    execute_command(request, other, config.address, config.port).await
+    let mut client = start_api_client(other).await?;
+    execute_command(request, &mut client).await
 }
 
-async fn execute_command(
+pub(crate) async fn start_api_client(cfg: BaseConfig) -> anyhow::Result<WebApi> {
+    v1::start_api_client(cfg).await
+}
+
+pub(crate) async fn execute_command(
     request: ClientRequest<'static>,
-    other: BaseConfig,
-    address: IpAddr,
-    port: u16,
+    api_client: &mut WebApi,
 ) -> anyhow::Result<()> {
-    v1::execute_command(request, other, address, port).await
+    v1::execute_command(request, api_client).await
 }

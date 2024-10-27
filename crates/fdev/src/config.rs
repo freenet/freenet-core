@@ -27,6 +27,13 @@ pub struct BaseConfig {
     /// Node operation mode.
     #[arg(value_enum, default_value_t=OperationMode::Local, env = "MODE")]
     pub mode: OperationMode,
+    /// The port of the running local freenet node websocket API.
+    #[arg(short, long, default_value = "50509", env = "WS_API_PORT")]
+    pub(crate) port: u16,
+    /// The ip address of freenet node to publish the contract to. If the node is running in local mode,
+    /// The default value is `127.0.0.1`.
+    #[arg(short, long, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
+    pub(crate) address: IpAddr,
 }
 
 #[derive(clap::Subcommand, Clone)]
@@ -35,6 +42,8 @@ pub enum SubCommand {
     Build(BuildToolConfig),
     Inspect(crate::inspect::InspectConfig),
     Publish(PutConfig),
+    /// Query the local node for information. Currently only shows open connections.
+    Query {},
     WasmRuntime(ExecutorConfig),
     Execute(RunCliConfig),
     Test(crate::testing::TestConfig),
@@ -78,9 +87,6 @@ pub struct UpdateConfig {
     /// The default value is `127.0.0.1`
     #[arg(short, long, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
     pub(crate) address: IpAddr,
-    /// The port of the running local freenet node.
-    #[arg(short, long, default_value = "50509")]
-    pub(crate) port: u16,
     /// A path to the update/delta being pushed to the contract.
     pub(crate) delta: PathBuf,
     /// Whether this contract will be updated in the network or is just a dry run
@@ -96,15 +102,6 @@ pub struct PutConfig {
     /// (built using the `fdev` tool). Not an arbitrary WASM file.
     #[arg(long)]
     pub(crate) code: PathBuf,
-
-    /// The ip address of freenet node to publish the contract to. If the node is running in local mode,
-    /// The default value is `127.0.0.1`.
-    #[arg(short, long, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
-    pub(crate) address: IpAddr,
-
-    /// The port of the running local freenet node.
-    #[arg(short, long, default_value = "50509")]
-    pub(crate) port: u16,
 
     /// A path to the file parameters for the contract/delegate. If not specified, will be published
     /// with empty parameters.
