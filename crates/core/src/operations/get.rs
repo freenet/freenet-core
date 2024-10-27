@@ -712,15 +712,66 @@ async fn try_forward_or_return(
     new_skip_list.push(this_peer.peer.clone());
 
     let new_htl = htl - 1;
-    if new_htl == 0 {
+
+    let new_target = if new_htl == 0 {
         tracing::warn!(
             tx = %id,
             sender = %sender.peer,
-            "The maximum hops has been exceeded, sending error \
-             back to the node",
+            "The maximum hops have been exceeded, sending response back to the node",
+        );
+        None
+    } else {
+        match op_manager
+            .ring
+            .closest_potentially_caching(&key, new_skip_list.as_slice())
+        {
+            Some(target) => Some(target),
+            None => {
+                tracing::warn!(
+                    tx = %id,
+                    %key,
+                    this_peer = %this_peer.peer,
+                    "No other peers found while trying to get the contract",
+                );
+                None
+            }
+        }
+    };
+
+    if let Some(target) = new_target {
+        tracing::debug!(
+            tx = %id,
+            "Forwarding get request to {}",
+            target.peer
+        );
+        build_op_result(
+            id,
+            Some(GetState::AwaitingResponse {
+                requester: Some(sender),
+                retries: 0,
+                fetch_contract,
+                current_hop: new_htl,
+            }),
+            Some(GetMsg::SeekNode {
+                id,
+                key,
+                fetch_contract,
+                sender: this_peer,
+                target,
+                htl: new_htl,
+                skip_list: new_skip_list,
+            }),
+            None,
+            stats,
+        )
+    } else {
+        tracing::debug!(
+            tx = %id,
+            "Cannot find any other peers to forward the get request to, returning get response to {}",
+            sender.peer
         );
 
-        return build_op_result(
+        build_op_result(
             id,
             None,
             Some(GetMsg::ReturnGet {
@@ -731,53 +782,15 @@ async fn try_forward_or_return(
                     contract: None,
                 },
                 sender: op_manager.ring.connection_manager.own_location(),
-                target: sender, // return to requester
+                target: sender,
                 skip_list: new_skip_list,
             }),
             None,
             stats,
-        );
+        )
     }
-
-    let Some(new_target) = op_manager
-        .ring
-        .closest_potentially_caching(&key, new_skip_list.as_slice())
-    else {
-        tracing::warn!(
-            tx = %id,
-            %key,
-            this_peer = %this_peer.peer,
-            "No other peers found while trying getting contract",
-        );
-        return Err(OpError::RingError(RingError::NoCachingPeers(key)));
-    };
-
-    tracing::debug!(
-        tx = %id,
-        "Forwarding get request to {}",
-        new_target.peer
-    );
-    build_op_result(
-        id,
-        Some(GetState::AwaitingResponse {
-            requester: Some(sender),
-            retries: 0,
-            fetch_contract,
-            current_hop: new_htl,
-        }),
-        Some(GetMsg::SeekNode {
-            id,
-            key,
-            fetch_contract,
-            sender: this_peer,
-            target: new_target,
-            htl: new_htl,
-            skip_list: new_skip_list,
-        }),
-        None,
-        stats,
-    )
 }
+
 
 mod messages {
     use std::{borrow::Borrow, fmt::Display};
