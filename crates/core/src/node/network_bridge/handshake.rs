@@ -763,7 +763,7 @@ async fn wait_for_gw_confirmation(
             joiner_key: this_peer.pub_key.clone(),
             hops_to_live: tracker.total_checks,
             max_hops_to_live: tracker.total_checks,
-            skip_list: vec![],
+            skip_list: vec![this_peer],
         },
     }));
     tracing::debug!(
