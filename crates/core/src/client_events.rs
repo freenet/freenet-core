@@ -33,11 +33,6 @@ static CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
 impl ClientId {
     pub const FIRST: Self = ClientId(0);
 
-    #[cfg(test)]
-    pub(crate) const fn new(id: usize) -> ClientId {
-        Self(id)
-    }
-
     pub fn next() -> Self {
         ClientId(CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
     }
