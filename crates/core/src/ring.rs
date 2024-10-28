@@ -611,6 +611,11 @@ impl Ring {
             // remove all missing candidates which have been retried
             missing.split_off(&Reverse(retry_missing_candidates_until));
 
+            // avoid connecting to the same peer multiple times
+            let mut skip_list = missing.values().collect::<Vec<_>>();
+            let this_peer = self.connection_manager.get_peer_key().unwrap();
+            skip_list.push(&this_peer);
+
             if let Some(ideal_location) = pending_conn_adds.pop_front() {
                 live_tx = self
                     .acquire_new(

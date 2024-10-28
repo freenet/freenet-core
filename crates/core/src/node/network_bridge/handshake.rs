@@ -769,6 +769,7 @@ async fn wait_for_gw_confirmation(
     tracing::debug!(
         at=?tracker.gw_conn.my_address(),
         from=%tracker.gw_conn.remote_addr(),
+        msg = ?msg,
         "Sending initial connection message to gw"
     );
     tracker
