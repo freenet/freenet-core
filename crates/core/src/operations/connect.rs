@@ -172,7 +172,7 @@ impl Operation for ConnectOp {
                         return Err(OpError::RingError(crate::ring::RingError::NoLocation));
                     };
                     let mut skip_list = skip_list.clone();
-                    skip_list.push(query_target.peer.clone());
+                    skip_list.extend([this_peer.clone(), query_target.peer.clone()]);
                     if this_peer == &query_target.peer {
                         // this peer should be the original target queries
                         tracing::debug!(

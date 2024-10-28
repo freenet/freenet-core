@@ -620,7 +620,7 @@ impl Ring {
                 live_tx = self
                     .acquire_new(
                         ideal_location,
-                        &missing.values().collect::<Vec<_>>(),
+                        &skip_list,
                         &notifier,
                     )
                     .await

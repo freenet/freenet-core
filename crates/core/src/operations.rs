@@ -118,7 +118,7 @@ where
             let id = *msg.id();
             tracing::debug!(%id, "updated op state");
             if let Some(target) = msg.target() {
-                tracing::debug!(%id, "sending updated op state");
+                tracing::debug!(%id, %target, "sending updated op state");
                 network_bridge.send(&target.peer, msg).await?;
             }
             op_manager.push(id, updated_state).await?;
