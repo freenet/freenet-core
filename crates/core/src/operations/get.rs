@@ -445,7 +445,28 @@ impl Operation for GetOp {
                                         skip_list: new_skip_list.clone(),
                                     });
                                 } else {
-                                    return Err(RingError::NoCachingPeers(*key).into());
+                                    if let Some(requester_peer) = requester.clone() {
+                                        tracing::warn!(
+                                            tx = %id,
+                                            %key,
+                                            %this_peer,
+                                            target = %requester_peer,
+                                            "No other peers found while trying to get the contract, returning response to requester"
+                                        );
+                                        return_msg = Some(GetMsg::ReturnGet {
+                                            id: *id,
+                                            key: *key,
+                                            value: StoreResponse {
+                                                state: None,
+                                                contract: None,
+                                            },
+                                            sender: this_peer.clone(),
+                                            target: requester_peer,
+                                            skip_list: new_skip_list.clone(),
+                                        });
+                                    } else {
+                                        return Err(RingError::NoCachingPeers(*key).into());
+                                    }
                                 }
                                 new_state = Some(GetState::AwaitingResponse {
                                     retries: retries + 1,
@@ -459,10 +480,32 @@ impl Operation for GetOp {
                                     "Failed getting a value for contract {}, reached max retries",
                                     key
                                 );
-                                return Err(OpError::MaxRetriesExceeded(
-                                    *id,
-                                    id.transaction_type(),
-                                ));
+                                if let Some(requester_peer) = requester.clone() {
+                                    tracing::warn!(
+                                        tx = %id,
+                                        %key,
+                                        %this_peer,
+                                        target = %requester_peer,
+                                        "No other peers found while trying to get the contract, returning response to requester"
+                                    );
+                                    return_msg = Some(GetMsg::ReturnGet {
+                                        id: *id,
+                                        key: *key,
+                                        value: StoreResponse {
+                                            state: None,
+                                            contract: None,
+                                        },
+                                        sender: this_peer.clone(),
+                                        target: requester_peer,
+                                        skip_list: skip_list.clone(),
+                                    });
+                                    new_state = None;
+                                } else {
+                                    return Err(OpError::MaxRetriesExceeded(
+                                        *id,
+                                        id.transaction_type(),
+                                    ));
+                                }
                             }
                         }
                         Some(GetState::ReceivedRequest) => {
@@ -475,8 +518,8 @@ impl Operation for GetOp {
                                     state: None,
                                     contract: None,
                                 },
-                                sender: sender.clone(),
-                                target: target.clone(),
+                                sender: this_peer.clone(),
+                                target: sender.clone(),
                                 skip_list: skip_list.clone(),
                             });
                         }
@@ -505,6 +548,16 @@ impl Operation for GetOp {
                         })
                     );
 
+                    let requester = if let Some(GetState::AwaitingResponse { requester, .. }) = self.state.as_ref() {
+                        if let Some(requester) = requester {
+                            requester.clone()
+                        } else {
+                            return Err(OpError::UnexpectedOpState);
+                        }
+                    } else {
+                        return Err(OpError::UnexpectedOpState);
+                    };
+
                     // received a response with a contract value
                     if require_contract && contract.is_none() {
                         // no contract, consider this like an error ignoring the incoming update value
@@ -516,6 +569,15 @@ impl Operation for GetOp {
 
                         let mut new_skip_list = skip_list.clone();
                         new_skip_list.push(sender.peer.clone());
+
+                        tracing::warn!(
+                            tx = %id,
+                            %key,
+                            at = %sender.peer,
+                            target = %requester,
+                            "Contract not received while required, returning response to requester",
+                        );
+
                         op_manager
                             .notify_op_change(
                                 NetMessage::from(GetMsg::ReturnGet {
@@ -526,7 +588,7 @@ impl Operation for GetOp {
                                         contract: None,
                                     },
                                     sender: sender.clone(),
-                                    target: target.clone(),
+                                    target: requester.clone(),
                                     skip_list: new_skip_list,
                                 }),
                                 OpEnum::Get(GetOp {
@@ -578,6 +640,14 @@ impl Operation for GetOp {
                                     let mut new_skip_list = skip_list.clone();
                                     new_skip_list.push(sender.peer.clone());
 
+                                    tracing::warn!(
+                                        tx = %id,
+                                        %key,
+                                        %sender.peer,
+                                        target = %requester,
+                                        "Failed put at executor, returning response to requester",
+                                    );
+
                                     op_manager
                                         .notify_op_change(
                                             NetMessage::from(GetMsg::ReturnGet {
@@ -588,7 +658,7 @@ impl Operation for GetOp {
                                                     contract: None,
                                                 },
                                                 sender: sender.clone(),
-                                                target: target.clone(),
+                                                target: requester.clone(),
                                                 skip_list: new_skip_list,
                                             }),
                                             OpEnum::Get(GetOp {
@@ -633,9 +703,10 @@ impl Operation for GetOp {
                                     contract: contract.clone(),
                                 },
                                 sender: target.clone(),
-                                target: requester,
+                                target: requester.clone(),
                                 skip_list: skip_list.clone(),
                             });
+                            tracing::debug!(tx = %id, %key, target = %requester, "Returning contract to requester");
                             result = Some(GetResult {
                                 key,
                                 state: value.clone(),
