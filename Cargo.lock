@@ -1422,7 +1422,7 @@ dependencies = [
  "opentelemetry-jaeger",
  "opentelemetry-otlp",
  "opentelemetry_sdk 0.26.0",
- "ordered-float 4.4.0",
+ "ordered-float 4.5.0",
  "parking_lot",
  "pav_regression",
  "pico-args",
@@ -2869,7 +2869,7 @@ dependencies = [
  "lazy_static",
  "once_cell",
  "opentelemetry 0.23.0",
- "ordered-float 4.4.0",
+ "ordered-float 4.5.0",
  "percent-encoding",
  "rand",
  "thiserror",
@@ -2942,9 +2942,9 @@ dependencies = [
 
 [[package]]
 name = "ordered-float"
-version = "4.4.0"
+version = "4.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83e7ccb95e240b7c9506a3d544f10d935e142cc90b0a1d56954fb44d89ad6b97"
+checksum = "c65ee1f9701bf938026630b455d5315f490640234259037edb259798b3bcf85e"
 dependencies = [
  "num-traits",
 ]
