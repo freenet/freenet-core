@@ -465,7 +465,17 @@ impl Operation for GetOp {
                                             skip_list: new_skip_list.clone(),
                                         });
                                     } else {
-                                        return Err(RingError::NoCachingPeers(*key).into());
+                                        tracing::error!(
+                                            tx = %id,
+                                            "Failed getting a value for contract {}, reached max retries",
+                                            key
+                                        );
+                                        return_msg = None;
+                                        result = Some(GetResult {
+                                            key: key.clone(),
+                                            state: WrappedState::new(vec![]),
+                                            contract: None,
+                                        });
                                     }
                                 }
                                 new_state = Some(GetState::AwaitingResponse {
@@ -501,10 +511,23 @@ impl Operation for GetOp {
                                     });
                                     new_state = None;
                                 } else {
-                                    return Err(OpError::MaxRetriesExceeded(
-                                        *id,
-                                        id.transaction_type(),
-                                    ));
+                                    tracing::error!(
+                                        tx = %id,
+                                        "Failed getting a value for contract {}, reached max retries",
+                                        key
+                                    );
+                                    return_msg = None;
+                                    new_state = Some(GetState::AwaitingResponse {
+                                        retries: retries + 1,
+                                        fetch_contract,
+                                        requester,
+                                        current_hop,
+                                    });
+                                    result = Some(GetResult {
+                                        key: key.clone(),
+                                        state: WrappedState::new(vec![]),
+                                        contract: None,
+                                    });
                                 }
                             }
                         }
