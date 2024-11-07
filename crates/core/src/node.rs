@@ -23,7 +23,7 @@ use anyhow::Context;
 use either::Either;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ErrorKind, HostResponse, QueryResponse},
-    prelude::{ContractKey, RelatedContracts, WrappedState},
+    prelude::{ContractKey, RelatedContracts},
 };
 
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -61,6 +61,7 @@ pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, N
 use crate::topology::rate::Rate;
 use crate::transport::{TransportKeypair, TransportPublicKey};
 pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
+use crate::contract::ContractHandlerEvent;
 
 mod network_bridge;
 mod op_state_manager;
@@ -479,18 +480,31 @@ async fn process_open_request(
                         this_peer = %peer_id,
                         "Received update from user event",
                     );
-                    let state = match data {
-                        freenet_stdlib::prelude::UpdateData::State(s) => s,
-                        _ => {
-                            unreachable!();
-                        }
-                    };
-
-                    let wrapped_state = WrappedState::from(state.into_bytes());
 
                     let related_contracts = RelatedContracts::default();
 
-                    let op = update::start_op(key, wrapped_state, related_contracts);
+                    let new_state = match op_manager
+                        .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
+                            key,
+                            data,
+                            related_contracts: related_contracts.clone(),
+                        })
+                        .await
+                    {
+                        Ok(ContractHandlerEvent::UpdateResponse {
+                               new_value: Ok(new_val),
+                           }) => Ok(new_val),
+                        Ok(ContractHandlerEvent::UpdateResponse {
+                               new_value: Err(err),
+                           }) => {
+                            Err(OpError::from(err))
+                        }
+                        Err(err) => Err(err.into()),
+                        Ok(_) => Err(OpError::UnexpectedOpState),
+                    }.expect("update query failed");
+
+
+                    let op = update::start_op(key, new_state, related_contracts);
 
                     let _ = op_manager
                         .ch_outbound

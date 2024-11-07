@@ -315,7 +315,7 @@ pub(crate) enum ContractHandlerEvent {
     /// Updates a supposedly existing contract in this node
     UpdateQuery {
         key: ContractKey,
-        state: WrappedState,
+        data: UpdateData<'static>,
         related_contracts: RelatedContracts<'static>,
     },
     /// The response to an update query

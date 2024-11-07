@@ -108,14 +108,23 @@ where
             }
             ContractHandlerEvent::UpdateQuery {
                 key,
-                state,
+                data,
                 related_contracts,
             } => {
+                let update_value: Either<WrappedState, StateDelta<'static>> = match data {
+                    freenet_stdlib::prelude::UpdateData::State(state) => {
+                        Either::Left(WrappedState::from(state.into_bytes()))
+                    }
+                    freenet_stdlib::prelude::UpdateData::Delta(delta) => {
+                        Either::Right(delta)
+                    }
+                    _ => unreachable!()
+                };
                 let update_result = contract_handler
                     .executor()
                     .upsert_contract_state(
                         key,
-                        Either::Left(state.clone()),
+                        update_value,
                         related_contracts,
                         None,
                     )
