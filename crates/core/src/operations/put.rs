@@ -235,6 +235,14 @@ impl Operation for PutOp {
                     }
 
                     let broadcast_to = op_manager.get_broadcast_targets(&key, &sender.peer);
+                    
+                    tracing::debug!(
+                        tx = %id,
+                        %key,
+                        "Broadcasting put into contract to {} peers: {:?}",
+                        broadcast_to.len(),
+                        broadcast_to.clone().iter().map(|pk| pk.peer.clone()).collect::<Vec<_>>()
+                    );
 
                     match try_to_broadcast(
                         *id,
@@ -416,6 +424,7 @@ impl Operation for PutOp {
 
                     let should_seed = op_manager.ring.should_seed(&key);
                     if should_seed {
+                        tracing::debug!(%key, "Seeding contracting");
                         // after the contract has been cached, push the update query
                         put_contract(
                             op_manager,
@@ -927,7 +936,7 @@ mod messages {
                 Self::SeekNode { .. } => write!(f, "SeekNode(id: {id})"),
                 Self::RequestPut { .. } => write!(f, "RequestPut(id: {id})"),
                 Self::Broadcasting { .. } => write!(f, "Broadcasting(id: {id})"),
-                Self::SuccessfulPut { .. } => write!(f, "SusscessfulUpdate(id: {id})"),
+                Self::SuccessfulPut { .. } => write!(f, "SusscessfulPut(id: {id})"),
                 Self::PutForward { .. } => write!(f, "PutForward(id: {id})"),
                 Self::AwaitPut { .. } => write!(f, "AwaitPut(id: {id})"),
                 Self::BroadcastTo { .. } => write!(f, "BroadcastTo(id: {id})"),

@@ -64,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
             contract: _,
             state,
         })) => {
+            tracing::info!(key=%key, "fetched state successfully!");
             if contract_key != key || state.is_empty() {
                 client
                     .send(ClientRequest::ContractOp(ContractRequest::Put {
@@ -94,6 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
             }
         }
         _ => {
+            tracing::info!("failed to fetch state, putting a new contract...");
             client
                 .send(ClientRequest::ContractOp(ContractRequest::Put {
                     contract: container,
@@ -147,13 +149,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                               Err(e) => return Err(e),
                             }
                           };
-  
+
                           for (name, created) in ping.iter() {
                             if !local_state.contains_key(name) && (*created + chrono::Duration::hours(1) > Utc::now()) {
                               tracing::info!("Hello, {}!", name);
                             }
                           }
-  
+
                           local_state.merge(ping, args.parameters.ttl);
                           Ok(())
                         };
