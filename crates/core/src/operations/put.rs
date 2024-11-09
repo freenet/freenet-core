@@ -195,7 +195,7 @@ impl Operation for PutOp {
                             related_contracts.clone(),
                             contract,
                         )
-                        .await?;
+                            .await?;
                         tracing::debug!(
                             tx = %id,
                             "Successfully updated a value for contract {} @ {:?}",
@@ -206,7 +206,7 @@ impl Operation for PutOp {
 
                     let last_hop = if let Some(new_htl) = htl.checked_sub(1) {
                         // forward changes in the contract to nodes closer to the contract location, if possible
-                        let put_here = forward_put(
+                        forward_put(
                             op_manager,
                             conn_manager,
                             contract,
@@ -215,21 +215,15 @@ impl Operation for PutOp {
                             new_htl,
                             vec![sender.peer.clone()],
                         )
-                        .await;
-                        if put_here && !is_subscribed_contract {
-                            // if already subscribed the value was already put and merging succeeded
-                            put_contract(
-                                op_manager,
-                                key,
-                                value.clone(),
-                                RelatedContracts::default(),
-                                contract,
-                            )
-                            .await?;
-                        }
-                        put_here
+                            .await
                     } else {
                         // should put in this location, no hops left
+                        true
+                    };
+
+                    if last_hop && !is_subscribed_contract {
+                        tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
+                        // if already subscribed the value was already put and merging succeeded
                         put_contract(
                             op_manager,
                             key,
@@ -237,9 +231,8 @@ impl Operation for PutOp {
                             RelatedContracts::default(),
                             contract,
                         )
-                        .await?;
-                        true
-                    };
+                            .await?;
+                    }
 
                     let broadcast_to = op_manager.get_broadcast_targets(&key, &sender.peer);
 
@@ -744,10 +737,11 @@ async fn put_contract(
             new_value: Ok(new_val),
         }) => Ok(new_val),
         Ok(ContractHandlerEvent::PutResponse {
-            new_value: Err(_err),
+            new_value: Err(err),
         }) => {
-            // return Err(OpError::from(ContractError::StorageError(err)));
-            todo!("not a valid value update, notify back to requester")
+            tracing::error!(%key, "Failed to update contract value: {}", err);
+            Err(OpError::from(err))
+            // TODO: not a valid value update, notify back to requester
         }
         Err(err) => Err(err.into()),
         Ok(_) => Err(OpError::UnexpectedOpState),

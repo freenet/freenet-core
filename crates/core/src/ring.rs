@@ -371,21 +371,24 @@ impl Ring {
         let seed_score = self.calculate_seed_score(&key);
         let mut old_subscribers = vec![];
         let mut contract_to_drop = None;
-        if self.seeding_contract.len() < Self::MAX_SEEDING_CONTRACTS {
-            let dropped_contract = *self
+
+        if self.seeding_contract.len() <= Self::MAX_SEEDING_CONTRACTS {
+            if let Some(dropped_contract) = self
                 .seeding_contract
                 .iter()
                 .min_by_key(|v| *v.value())
-                .unwrap()
-                .key();
-            self.seeding_contract.remove(&dropped_contract);
-            if let Some((_, mut subscribers_of_contract)) =
-                self.subscribers.remove(&dropped_contract)
+                .map(|entry| *entry.key())
             {
-                std::mem::swap(&mut subscribers_of_contract, &mut old_subscribers);
+                self.seeding_contract.remove(&dropped_contract);
+                if let Some((_, mut subscribers_of_contract)) =
+                    self.subscribers.remove(&dropped_contract)
+                {
+                    std::mem::swap(&mut subscribers_of_contract, &mut old_subscribers);
+                }
+                contract_to_drop = Some(dropped_contract);
             }
-            contract_to_drop = Some(dropped_contract);
         }
+
         self.seeding_contract.insert(key, seed_score);
         (contract_to_drop, old_subscribers)
     }
