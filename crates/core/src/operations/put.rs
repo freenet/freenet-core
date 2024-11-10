@@ -190,8 +190,8 @@ impl Operation for PutOp {
                     let mut already_put = false;
                     if is_subscribed_contract || should_seed {
                         if !is_subscribed_contract {
-                            // FIXME: we start subscription request, but that does not mean we are already seeding
                             super::start_subscription_request(op_manager, key, true).await;
+                            // FIXME: we start subscription request, but that does not mean we are already seeding
                             op_manager.ring.seed_contract(key);
                             is_subscribed_contract = true;
                         }
@@ -241,8 +241,8 @@ impl Operation for PutOp {
                         );
 
                         if should_seed && !is_subscribed_contract {
-                            // FIXME: we start subscription request, but that does not mean we are already seeding
                             super::start_subscription_request(op_manager, key, true).await;
+                            // FIXME: we start subscription request, but that does not mean we are already seeding
                             op_manager.ring.seed_contract(key);
                         }
 
@@ -483,8 +483,8 @@ impl Operation for PutOp {
                                 .await?;
                             }
                             let (dropped_contract, old_subscribers) = {
-                                // FIXME: we start subscription request, but that does not mean we are already seeding
                                 super::start_subscription_request(op_manager, key, true).await;
+                                // FIXME: we start subscription request, but that does not mean we are already seeding
                                 op_manager.ring.seed_contract(key)
                             };
                             if let Some(key) = dropped_contract {

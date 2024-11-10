@@ -236,132 +236,146 @@ async fn process_open_request(
         (None, None)
     };
     // this will indirectly start actions on the local contract executor
-    let fut = async move {
-        let client_id = request.client_id;
+    let fut =
+        async move {
+            let client_id = request.client_id;
 
-        // fixme: communicate back errors in this loop to the client somehow
-        match *request.request {
-            ClientRequest::ContractOp(ops) => match ops {
-                ContractRequest::Put {
-                    state,
-                    contract,
-                    related_contracts,
-                } => {
-                    let peer_id = op_manager
-                        .ring
-                        .connection_manager
-                        .get_peer_key()
-                        .expect("Peer id not found at put op, it should be set");
-                    // Initialize a put op.
-                    tracing::debug!(
-                        this_peer = %peer_id,
-                        "Received put from user event",
-                    );
-                    let op = put::start_op(
+            // fixme: communicate back errors in this loop to the client somehow
+            match *request.request {
+                ClientRequest::ContractOp(ops) => match ops {
+                    ContractRequest::Put {
+                        state,
                         contract,
                         related_contracts,
-                        state,
-                        op_manager.ring.max_hops_to_live,
-                    );
-                    let op_id = op.id;
-                    let _ = op_manager
-                        .ch_outbound
-                        .waiting_for_transaction_result(op_id, client_id)
-                        .await;
-                    if let Err(err) = put::request_put(&op_manager, op).await {
-                        tracing::error!("{}", err);
+                    } => {
+                        let peer_id = op_manager
+                            .ring
+                            .connection_manager
+                            .get_peer_key()
+                            .expect("Peer id not found at put op, it should be set");
+                        // Initialize a put op.
+                        tracing::debug!(
+                            this_peer = %peer_id,
+                            "Received put from user event",
+                        );
+                        let op = put::start_op(
+                            contract,
+                            related_contracts,
+                            state,
+                            op_manager.ring.max_hops_to_live,
+                        );
+                        let op_id = op.id;
+                        let _ = op_manager
+                            .ch_outbound
+                            .waiting_for_transaction_result(op_id, client_id)
+                            .await;
+                        if let Err(err) = put::request_put(&op_manager, op).await {
+                            tracing::error!("{}", err);
+                        }
                     }
-                }
-                ContractRequest::Update { key, data } => {
-                    let peer_id = op_manager
-                        .ring
-                        .connection_manager
-                        .get_peer_key()
-                        .expect("Peer id not found at update op, it should be set");
-                    tracing::debug!(
-                        this_peer = %peer_id,
-                        "Received update from user event",
-                    );
+                    ContractRequest::Update { key, data } => {
+                        let peer_id = op_manager
+                            .ring
+                            .connection_manager
+                            .get_peer_key()
+                            .expect("Peer id not found at update op, it should be set");
+                        tracing::debug!(
+                            this_peer = %peer_id,
+                            "Received update from user event",
+                        );
 
-                    let related_contracts = RelatedContracts::default();
+                        let related_contracts = RelatedContracts::default();
 
-                    // FIXME: maybe we should allow blind updates through the network
-                    // we are doing this so we can propagate state instead of delta (cause delta implies other changes)
-                    let new_state = match op_manager
-                        .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
-                            key,
-                            data,
-                            related_contracts: related_contracts.clone(),
+                        // FIXME: maybe we should allow blind updates through the network
+                        // we are doing this so we can propagate state instead of delta (cause delta implies other changes)
+                        let new_state = match op_manager
+                            .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
+                                key,
+                                data,
+                                related_contracts: related_contracts.clone(),
+                            })
+                            .await
+                        {
+                            Ok(ContractHandlerEvent::UpdateResponse {
+                                new_value: Ok(new_val),
+                            }) => Ok(new_val),
+                            Ok(ContractHandlerEvent::UpdateResponse {
+                                new_value: Err(err),
+                            }) => Err(OpError::from(err)),
+                            Err(err) => Err(err.into()),
+                            Ok(_) => Err(OpError::UnexpectedOpState),
+                        }
+                        .expect("update query failed");
+
+                        let op = update::start_op(key, new_state, related_contracts);
+
+                        let _ = op_manager
+                            .ch_outbound
+                            .waiting_for_transaction_result(op.id, client_id)
+                            .await;
+
+                        if let Err(err) = update::request_update(&op_manager, op).await {
+                            tracing::error!("request update error {}", err)
+                        }
+                    }
+                    ContractRequest::Get {
+                        key,
+                        fetch_contract: contract,
+                    } => {
+                        let peer_id = op_manager
+                            .ring
+                            .connection_manager
+                            .get_peer_key()
+                            .expect("Peer id not found at get op, it should be set");
+                        // Initialize a get op.
+                        tracing::debug!(
+                            this_peer = %peer_id,
+                            "Received get from user event",
+                        );
+                        let op = get::start_op(key, contract);
+                        let _ = op_manager
+                            .ch_outbound
+                            .waiting_for_transaction_result(op.id, client_id)
+                            .await;
+                        if let Err(err) = get::request_get(&op_manager, op).await {
+                            tracing::error!("{}", err);
+                        }
+                    }
+                    ContractRequest::Subscribe { key, .. } => {
+                        let op_id =
+                            match crate::node::subscribe(op_manager.clone(), key, Some(client_id))
+                                .await
+                            {
+                                Ok(op_id) => op_id,
+                                Err(err) => {
+                                    tracing::error!("Subscribe error: {}", err);
+                                    return;
+                                }
+                            };
+                        let _ = op_manager
+                            .ch_outbound
+                            .waiting_for_transaction_result(op_id, client_id)
+                            .await;
+                    }
+                    _ => {
+                        tracing::error!("Op not supported");
+                    }
+                },
+                ClientRequest::DelegateOp(_op) => todo!("FIXME: delegate op"),
+                ClientRequest::Disconnect { .. } => unreachable!(),
+                ClientRequest::NodeQueries(_) => {
+                    tracing::debug!("Received node queries from user event");
+                    let _ = op_manager
+                        .notify_node_event(NodeEvent::QueryConnections {
+                            callback: callback_tx.expect("should be set"),
                         })
-                        .await
-                    {
-                        Ok(ContractHandlerEvent::UpdateResponse {
-                            new_value: Ok(new_val),
-                        }) => Ok(new_val),
-                        Ok(ContractHandlerEvent::UpdateResponse {
-                            new_value: Err(err),
-                        }) => Err(OpError::from(err)),
-                        Err(err) => Err(err.into()),
-                        Ok(_) => Err(OpError::UnexpectedOpState),
-                    }
-                    .expect("update query failed");
-
-                    let op = update::start_op(key, new_state, related_contracts);
-
-                    let _ = op_manager
-                        .ch_outbound
-                        .waiting_for_transaction_result(op.id, client_id)
                         .await;
-
-                    if let Err(err) = update::request_update(&op_manager, op).await {
-                        tracing::error!("request update error {}", err)
-                    }
-                }
-                ContractRequest::Get {
-                    key,
-                    fetch_contract: contract,
-                } => {
-                    let peer_id = op_manager
-                        .ring
-                        .connection_manager
-                        .get_peer_key()
-                        .expect("Peer id not found at get op, it should be set");
-                    // Initialize a get op.
-                    tracing::debug!(
-                        this_peer = %peer_id,
-                        "Received get from user event",
-                    );
-                    let op = get::start_op(key, contract);
-                    let _ = op_manager
-                        .ch_outbound
-                        .waiting_for_transaction_result(op.id, client_id)
-                        .await;
-                    if let Err(err) = get::request_get(&op_manager, op).await {
-                        tracing::error!("{}", err);
-                    }
-                }
-                ContractRequest::Subscribe { key, .. } => {
-                    crate::node::subscribe(op_manager, key, Some(client_id)).await;
                 }
                 _ => {
                     tracing::error!("Op not supported");
                 }
-            },
-            ClientRequest::DelegateOp(_op) => todo!("FIXME: delegate op"),
-            ClientRequest::Disconnect { .. } => unreachable!(),
-            ClientRequest::NodeQueries(_) => {
-                tracing::debug!("Received node queries from user event");
-                let _ = op_manager
-                    .notify_node_event(NodeEvent::QueryConnections {
-                        callback: callback_tx.expect("should be set"),
-                    })
-                    .await;
             }
-            _ => {
-                tracing::error!("Op not supported");
-            }
-        }
-    };
+        };
     GlobalExecutor::spawn(fut.instrument(
         tracing::info_span!(parent: tracing::Span::current(), "process_client_request"),
     ));

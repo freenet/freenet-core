@@ -380,7 +380,10 @@ impl Operation for SubscribeOp {
                             provider = %sender.peer,
                             "Subscribed to contract"
                         );
-                        op_manager.ring.register_subscription(key, sender.clone());
+                        if op_manager.ring.add_subscriber(key, sender.clone()).is_err() {
+                            // concurrently it reached max number of subscribers for this contract
+                            return Err(OpError::UnexpectedOpState);
+                        }
 
                         new_state = Some(SubscribeState::Completed {});
                         if let Some(upstream_subscriber) = upstream_subscriber {

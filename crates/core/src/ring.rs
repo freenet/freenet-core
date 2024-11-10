@@ -474,14 +474,6 @@ impl Ring {
         self.router.write().add_event(event);
     }
 
-    pub fn register_subscription(&self, contract: &ContractKey, subscriber: PeerKeyLocation) {
-        self.subscribers
-            .entry(*contract)
-            .or_insert(Vec::with_capacity(Self::TOTAL_MAX_SUBSCRIPTIONS))
-            .value_mut()
-            .push(subscriber);
-    }
-
     /// Will return an error in case the max number of subscribers has been added.
     pub fn add_subscriber(
         &self,
@@ -621,11 +613,7 @@ impl Ring {
 
             if let Some(ideal_location) = pending_conn_adds.pop_front() {
                 live_tx = self
-                    .acquire_new(
-                        ideal_location,
-                        &skip_list,
-                        &notifier,
-                    )
+                    .acquire_new(ideal_location, &skip_list, &notifier)
                     .await
                     .map_err(|error| {
                         tracing::debug!(?error, "Shutting down connection maintenance task");
