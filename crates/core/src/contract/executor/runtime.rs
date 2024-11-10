@@ -29,10 +29,16 @@ impl ContractExecutor for Executor<Runtime> {
         let params = if let Some(code) = &code {
             code.params()
         } else {
-            match self.state_store.get_params(&key).await {
-                Ok(Some(params)) => params,
-                _ => Parameters::from(vec![]),
-            }
+            self.state_store
+                .get_params(&key)
+                .await
+                .map_err(ExecutorError::other)?
+                .ok_or_else(|| {
+                    ExecutorError::request(StdContractError::Put {
+                        key,
+                        cause: "missing contract parameters".into(),
+                    })
+                })?
         };
 
         let remove_if_fail = if self
@@ -65,7 +71,12 @@ impl ContractExecutor for Executor<Runtime> {
                         ExecutorError::other(err)
                     })?;
                 match result {
-                    ValidateResult::Valid => {}
+                    ValidateResult::Valid => {
+                        self.state_store
+                            .store(key, incoming_state.clone(), params.clone())
+                            .await
+                            .map_err(ExecutorError::other)?;
+                    }
                     ValidateResult::Invalid => {
                         return Err(ExecutorError::request(StdContractError::invalid_put(key)));
                     }
@@ -91,14 +102,10 @@ impl ContractExecutor for Executor<Runtime> {
         let current_state = match self.state_store.get(&key).await {
             Ok(s) => s,
             Err(StateStoreError::MissingContract(_)) => {
-                // TODO: Try to fetch the contract state from the network
-                // If state is not found for the contract, state is assumed to be empty
-                let empty_state = WrappedState::new(vec![]);
-                self.state_store
-                    .store(key, empty_state.clone(), params.clone())
-                    .await
-                    .map_err(ExecutorError::other)?;
-                empty_state
+                tracing::warn!("Missing contract {key} for upsert");
+                return Err(ExecutorError::request(StdContractError::MissingContract {
+                    key: key.into(),
+                }));
             }
             Err(StateStoreError::Any(err)) => return Err(ExecutorError::other(err)),
         };

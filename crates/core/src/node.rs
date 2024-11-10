@@ -462,9 +462,10 @@ async fn process_open_request(
                         state,
                         op_manager.ring.max_hops_to_live,
                     );
+                    let op_id = op.id;
                     let _ = op_manager
                         .ch_outbound
-                        .waiting_for_transaction_result(op.id, client_id)
+                        .waiting_for_transaction_result(op_id, client_id)
                         .await;
                     if let Err(err) = put::request_put(&op_manager, op).await {
                         tracing::error!("{}", err);
@@ -483,6 +484,8 @@ async fn process_open_request(
 
                     let related_contracts = RelatedContracts::default();
 
+                    // FIXME: maybe we should allow blind updates through the network
+                    // we are doing this so we can propagate state instead of delta (cause delta implies other changes)
                     let new_state = match op_manager
                         .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
                             key,

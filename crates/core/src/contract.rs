@@ -92,6 +92,7 @@ where
                     .upsert_contract_state(key, Either::Left(state), related_contracts, contract)
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await;
+                
                 contract_handler
                     .channel()
                     .send_to_sender(

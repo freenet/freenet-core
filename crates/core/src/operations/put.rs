@@ -187,7 +187,9 @@ impl Operation for PutOp {
                     );
 
                     if is_subscribed_contract || op_manager.ring.should_seed(&key) {
+                        op_manager.ring.seed_contract(key);
                         tracing::debug!(tx = %id, "Attempting contract value update");
+
                         put_contract(
                             op_manager,
                             key,
@@ -196,9 +198,10 @@ impl Operation for PutOp {
                             contract,
                         )
                             .await?;
+
                         tracing::debug!(
                             tx = %id,
-                            "Successfully updated a value for contract {} @ {:?}",
+                            "Successfully updated value for contract {} @ {:?}",
                             key,
                             target.location
                         );
@@ -221,8 +224,14 @@ impl Operation for PutOp {
                         true
                     };
 
-                    if last_hop && !is_subscribed_contract {
-                        tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
+                    if last_hop && !op_manager.ring.is_seeding_contract(&key) {
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
+                            "Caching contract locally as it's not already seeded"
+                        );
+
                         // if already subscribed the value was already put and merging succeeded
                         put_contract(
                             op_manager,
@@ -233,16 +242,8 @@ impl Operation for PutOp {
                         )
                             .await?;
                     }
-
-                    let broadcast_to = op_manager.get_broadcast_targets(&key, &sender.peer);
                     
-                    tracing::debug!(
-                        tx = %id,
-                        %key,
-                        "Broadcasting put into contract to {} peers: {:?}",
-                        broadcast_to.len(),
-                        broadcast_to.clone().iter().map(|pk| pk.peer.clone()).collect::<Vec<_>>()
-                    );
+                    let broadcast_to = op_manager.get_broadcast_targets(&key, &sender.peer);
 
                     match try_to_broadcast(
                         *id,
