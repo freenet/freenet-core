@@ -176,7 +176,8 @@ impl Operation for PutOp {
                     sender,
                 } => {
                     let key = contract.key();
-                    let is_subscribed_contract = op_manager.ring.is_seeding_contract(&key);
+                    let mut is_subscribed_contract = op_manager.ring.is_seeding_contract(&key);
+                    let should_seed = op_manager.ring.should_seed(&key);
 
                     tracing::debug!(
                         tx = %id,
@@ -186,8 +187,14 @@ impl Operation for PutOp {
                         "Puttting contract at target peer",
                     );
 
-                    if is_subscribed_contract || op_manager.ring.should_seed(&key) {
-                        op_manager.ring.seed_contract(key);
+                    let mut already_put = false;
+                    if is_subscribed_contract || should_seed {
+                        if !is_subscribed_contract {
+                            // FIXME: we start subscription request, but that does not mean we are already seeding
+                            super::start_subscription_request(op_manager, key, true).await;
+                            op_manager.ring.seed_contract(key);
+                            is_subscribed_contract = true;
+                        }
                         tracing::debug!(tx = %id, "Attempting contract value update");
 
                         put_contract(
@@ -197,7 +204,8 @@ impl Operation for PutOp {
                             related_contracts.clone(),
                             contract,
                         )
-                            .await?;
+                        .await?;
+                        already_put = true;
 
                         tracing::debug!(
                             tx = %id,
@@ -218,13 +226,13 @@ impl Operation for PutOp {
                             new_htl,
                             vec![sender.peer.clone()],
                         )
-                            .await
+                        .await
                     } else {
                         // should put in this location, no hops left
                         true
                     };
 
-                    if last_hop && !op_manager.ring.is_seeding_contract(&key) {
+                    if last_hop && !is_subscribed_contract {
                         tracing::debug!(
                             tx = %id,
                             %key,
@@ -232,17 +240,24 @@ impl Operation for PutOp {
                             "Caching contract locally as it's not already seeded"
                         );
 
-                        // if already subscribed the value was already put and merging succeeded
-                        put_contract(
-                            op_manager,
-                            key,
-                            value.clone(),
-                            RelatedContracts::default(),
-                            contract,
-                        )
+                        if should_seed && !is_subscribed_contract {
+                            // FIXME: we start subscription request, but that does not mean we are already seeding
+                            super::start_subscription_request(op_manager, key, true).await;
+                            op_manager.ring.seed_contract(key);
+                        }
+
+                        if !already_put {
+                            put_contract(
+                                op_manager,
+                                key,
+                                value.clone(),
+                                related_contracts.clone(),
+                                contract,
+                            )
                             .await?;
+                        }
                     }
-                    
+
                     let broadcast_to = op_manager.get_broadcast_targets(&key, &sender.peer);
 
                     match try_to_broadcast(
@@ -424,6 +439,7 @@ impl Operation for PutOp {
                     );
 
                     let should_seed = op_manager.ring.should_seed(&key);
+                    let mut already_put = false;
                     if should_seed {
                         tracing::debug!(%key, "Seeding contracting");
                         // after the contract has been cached, push the update query
@@ -435,6 +451,7 @@ impl Operation for PutOp {
                             contract,
                         )
                         .await?;
+                        already_put = true;
                     }
 
                     // if successful, forward to the next closest peers (if any)
@@ -454,17 +471,22 @@ impl Operation for PutOp {
                         .await;
                         let is_seeding_contract = op_manager.ring.is_seeding_contract(&key);
                         if put_here && !is_seeding_contract && should_seed {
-                            // if already subscribed the value was already put and merging succeeded
-                            put_contract(
-                                op_manager,
-                                key,
-                                new_value.clone(),
-                                RelatedContracts::default(),
-                                contract,
-                            )
-                            .await?;
-                            let (dropped_contract, old_subscribers) =
-                                op_manager.ring.seed_contract(key);
+                            if !already_put {
+                                // if already subscribed the value was already put and merging succeeded
+                                put_contract(
+                                    op_manager,
+                                    key,
+                                    new_value.clone(),
+                                    RelatedContracts::default(),
+                                    contract,
+                                )
+                                .await?;
+                            }
+                            let (dropped_contract, old_subscribers) = {
+                                // FIXME: we start subscription request, but that does not mean we are already seeding
+                                super::start_subscription_request(op_manager, key, true).await;
+                                op_manager.ring.seed_contract(key)
+                            };
                             if let Some(key) = dropped_contract {
                                 for subscriber in old_subscribers {
                                     conn_manager
@@ -485,7 +507,7 @@ impl Operation for PutOp {
                             }
                         }
                         put_here
-                    } else {
+                    } else if !already_put {
                         // should put in this location, no hops left
                         put_contract(
                             op_manager,
@@ -495,6 +517,8 @@ impl Operation for PutOp {
                             contract,
                         )
                         .await?;
+                        true
+                    } else {
                         true
                     };
 
