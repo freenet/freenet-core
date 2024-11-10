@@ -1,4 +1,3 @@
-use wasmer::IntoBytes;
 // TODO: complete update logic in the network
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;

@@ -444,39 +444,37 @@ impl Operation for GetOp {
                                         htl: current_hop,
                                         skip_list: new_skip_list.clone(),
                                     });
-                                } else {
-                                    if let Some(requester_peer) = requester.clone() {
-                                        tracing::warn!(
-                                            tx = %id,
-                                            %key,
-                                            %this_peer,
-                                            target = %requester_peer,
-                                            "No other peers found while trying to get the contract, returning response to requester"
-                                        );
-                                        return_msg = Some(GetMsg::ReturnGet {
-                                            id: *id,
-                                            key: *key,
-                                            value: StoreResponse {
-                                                state: None,
-                                                contract: None,
-                                            },
-                                            sender: this_peer.clone(),
-                                            target: requester_peer,
-                                            skip_list: new_skip_list.clone(),
-                                        });
-                                    } else {
-                                        tracing::error!(
-                                            tx = %id,
-                                            "Failed getting a value for contract {}, reached max retries",
-                                            key
-                                        );
-                                        return_msg = None;
-                                        result = Some(GetResult {
-                                            key: key.clone(),
-                                            state: WrappedState::new(vec![]),
+                                } else if let Some(requester_peer) = requester.clone() {
+                                    tracing::warn!(
+                                        tx = %id,
+                                        %key,
+                                        %this_peer,
+                                        target = %requester_peer,
+                                        "No other peers found while trying to get the contract, returning response to requester"
+                                    );
+                                    return_msg = Some(GetMsg::ReturnGet {
+                                        id: *id,
+                                        key: *key,
+                                        value: StoreResponse {
+                                            state: None,
                                             contract: None,
-                                        });
-                                    }
+                                        },
+                                        sender: this_peer.clone(),
+                                        target: requester_peer,
+                                        skip_list: new_skip_list.clone(),
+                                    });
+                                } else {
+                                    tracing::error!(
+                                        tx = %id,
+                                        "Failed getting a value for contract {}, reached max retries",
+                                        key
+                                    );
+                                    return_msg = None;
+                                    result = Some(GetResult {
+                                        key: *key,
+                                        state: WrappedState::new(vec![]),
+                                        contract: None,
+                                    });
                                 }
                                 new_state = Some(GetState::AwaitingResponse {
                                     retries: retries + 1,
@@ -524,7 +522,7 @@ impl Operation for GetOp {
                                         current_hop,
                                     });
                                     result = Some(GetResult {
-                                        key: key.clone(),
+                                        key: *key,
                                         state: WrappedState::new(vec![]),
                                         contract: None,
                                     });
@@ -571,12 +569,12 @@ impl Operation for GetOp {
                         })
                     );
 
-                    let requester = if let Some(GetState::AwaitingResponse { requester, .. }) = self.state.as_ref() {
-                        if let Some(requester) = requester {
-                            requester.clone()
-                        } else {
-                            return Err(OpError::UnexpectedOpState);
-                        }
+                    let requester = if let Some(GetState::AwaitingResponse {
+                        requester: Some(requestester),
+                        ..
+                    }) = self.state.as_ref()
+                    {
+                        requestester.clone()
                     } else {
                         return Err(OpError::UnexpectedOpState);
                     };
@@ -884,7 +882,6 @@ async fn try_forward_or_return(
         )
     }
 }
-
 
 mod messages {
     use std::{borrow::Borrow, fmt::Display};
