@@ -92,7 +92,7 @@ where
                     .upsert_contract_state(key, Either::Left(state), related_contracts, contract)
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await;
-                
+
                 contract_handler
                     .channel()
                     .send_to_sender(
@@ -116,19 +116,12 @@ where
                     freenet_stdlib::prelude::UpdateData::State(state) => {
                         Either::Left(WrappedState::from(state.into_bytes()))
                     }
-                    freenet_stdlib::prelude::UpdateData::Delta(delta) => {
-                        Either::Right(delta)
-                    }
-                    _ => unreachable!()
+                    freenet_stdlib::prelude::UpdateData::Delta(delta) => Either::Right(delta),
+                    _ => unreachable!(),
                 };
                 let update_result = contract_handler
                     .executor()
-                    .upsert_contract_state(
-                        key,
-                        update_value,
-                        related_contracts,
-                        None,
-                    )
+                    .upsert_contract_state(key, update_value, related_contracts, None)
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await;
 
