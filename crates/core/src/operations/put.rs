@@ -57,7 +57,7 @@ impl PutOp {
     }
 
     pub(super) fn finalized(&self) -> bool {
-        self.state.is_none()
+        self.state.is_none() || matches!(self.state, Some(PutState::Finished { .. }))
     }
 
     pub(super) fn to_host_result(&self) -> HostResult {
@@ -961,7 +961,7 @@ mod messages {
                 Self::SeekNode { .. } => write!(f, "SeekNode(id: {id})"),
                 Self::RequestPut { .. } => write!(f, "RequestPut(id: {id})"),
                 Self::Broadcasting { .. } => write!(f, "Broadcasting(id: {id})"),
-                Self::SuccessfulPut { .. } => write!(f, "SusscessfulPut(id: {id})"),
+                Self::SuccessfulPut { .. } => write!(f, "SuccessfulPut(id: {id})"),
                 Self::PutForward { .. } => write!(f, "PutForward(id: {id})"),
                 Self::AwaitPut { .. } => write!(f, "AwaitPut(id: {id})"),
                 Self::BroadcastTo { .. } => write!(f, "BroadcastTo(id: {id})"),
