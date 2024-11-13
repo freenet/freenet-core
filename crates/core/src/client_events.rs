@@ -337,7 +337,7 @@ async fn process_open_request(
                             .ch_outbound
                             .waiting_for_transaction_result(op.id, client_id)
                             .await;
-                        if let Err(err) = get::request_get(&op_manager, op).await {
+                        if let Err(err) = get::request_get(&op_manager, op, vec![]).await {
                             tracing::error!("{}", err);
                         }
                     }

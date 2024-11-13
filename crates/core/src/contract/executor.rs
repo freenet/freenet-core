@@ -349,7 +349,7 @@ impl ComposeNetworkMessage<operations::get::GetOp> for GetContract {
     }
 
     async fn resume_op(op: operations::get::GetOp, op_manager: &OpManager) -> Result<(), OpError> {
-        operations::get::request_get(op_manager, op).await
+        operations::get::request_get(op_manager, op, vec![]).await
     }
 }
 

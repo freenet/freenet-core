@@ -315,7 +315,7 @@ async fn start_subscription_request(op_manager: &OpManager, key: ContractKey, tr
         if let OpError::ContractError(ContractError::ContractNotFound(key)) = &error {
             tracing::debug!(%key, "Contract not found, trying to get it first");
             let get_op = get::start_op(*key, true);
-            if let Err(error) = get::request_get(op_manager, get_op).await {
+            if let Err(error) = get::request_get(op_manager, get_op, skip_list).await {
                 tracing::warn!(%error, "Error getting contract");
             }
         } else {
@@ -336,10 +336,6 @@ async fn has_contract(op_manager: &OpManager, key: ContractKey) -> Result<bool, 
             response: Ok(crate::contract::StoreResponse { state: Some(_), .. }),
             ..
         } => Ok(true),
-        crate::contract::ContractHandlerEvent::GetResponse {
-            response: Ok(crate::contract::StoreResponse { state: None, .. }),
-            ..
-        } => Ok(false),
-        _ => Err(OpError::UnexpectedOpState),
+        _ => Ok(false),
     }
 }
