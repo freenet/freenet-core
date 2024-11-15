@@ -210,10 +210,20 @@ pub async fn client_event_handling<ClientEv>(
             }
             res = callbacks.next(), if !callbacks.is_empty() => {
                 if let Some(Some((cli_id, res))) = res {
-                    let QueryResult::Connections(conns) = res;
-                    let res = Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers {
-                        peers: conns.into_iter().map(|p| (p.pub_key.to_string(), p.addr)).collect() }
-                    ));
+                    let res = match res {
+                        QueryResult::Connections(conns) => {
+                            Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers {
+                                peers: conns.into_iter().map(|p| (p.pub_key.to_string(), p.addr)).collect() }
+                            ))
+                        }
+                        QueryResult::GetResult { key, state, contract } => {
+                            Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                                key,
+                                state,
+                                contract,
+                            }))
+                        }
+                    };
                     if let Err(err) = client_events.send(cli_id, res).await {
                         tracing::debug!("channel closed: {err}");
                         break;
@@ -229,12 +239,16 @@ async fn process_open_request(
     request: OpenRequest<'static>,
     op_manager: Arc<OpManager>,
 ) -> Option<mpsc::Receiver<QueryResult>> {
-    let (callback_tx, callback_rx) = if matches!(&*request.request, ClientRequest::NodeQueries(_)) {
+    let (callback_tx, callback_rx) = if matches!(
+        &*request.request,
+        ClientRequest::NodeQueries(_) | ClientRequest::ContractOp(ContractRequest::Get { .. })
+    ) {
         let (tx, rx) = mpsc::channel(1);
         (Some(tx), Some(rx))
     } else {
         (None, None)
     };
+
     // this will indirectly start actions on the local contract executor
     let fut =
         async move {
@@ -335,17 +349,32 @@ async fn process_open_request(
                             .await
                         {
                             Ok(ContractHandlerEvent::GetResponse {
-                                key,
                                 response: Ok(StoreResponse { state, contract }),
+                                ..
                             }) => Ok((state, contract)),
                             Ok(ContractHandlerEvent::GetResponse {
-                                key,
-                                response: Err(err),
+                                response: Err(err), ..
                             }) => Err(err.into()),
                             Err(err) => Err(err.into()),
                             Ok(_) => Err(OpError::UnexpectedOpState),
                         }
                         .expect("get query failed");
+
+                        if (!return_contract_code && state.is_some())
+                            || (return_contract_code && state.is_some() && contract.is_some())
+                        {
+                            if let Some(state) = state {
+                                callback_tx
+                                    .unwrap()
+                                    .send(QueryResult::GetResult {
+                                        key,
+                                        state,
+                                        contract,
+                                    })
+                                    .await
+                                    .ok();
+                            }
+                        }
 
                         // Initialize a get op.
                         tracing::debug!(

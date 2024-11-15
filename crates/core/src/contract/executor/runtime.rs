@@ -529,6 +529,7 @@ impl Executor<Runtime> {
     ) -> Result<WrappedState, ExecutorError> {
         let new_state = {
             let start = Instant::now();
+            #[cfg(all(not(feature = "local-mode"), feature = "network-mode"))]
             let original_state = current_state.clone();
             loop {
                 let state_update_res = self

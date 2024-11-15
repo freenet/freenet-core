@@ -6,7 +6,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use freenet_stdlib::prelude::ContractKey;
+use freenet_stdlib::prelude::{ContractContainer, ContractKey, WrappedState};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -320,6 +320,11 @@ pub(crate) enum NodeEvent {
 
 pub(crate) enum QueryResult {
     Connections(Vec<PeerId>),
+    GetResult {
+        key: ContractKey,
+        state: WrappedState,
+        contract: Option<ContractContainer>,
+    },
 }
 
 impl Display for NodeEvent {
