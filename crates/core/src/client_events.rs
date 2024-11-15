@@ -18,11 +18,11 @@ use tracing::Instrument;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use crate::config::GlobalExecutor;
 use crate::contract::{ClientResponsesReceiver, ContractHandlerEvent};
 use crate::message::{NodeEvent, QueryResult};
 use crate::node::OpManager;
 use crate::operations::{get, put, update, OpError};
+use crate::{config::GlobalExecutor, contract::StoreResponse};
 
 pub(crate) mod combinator;
 #[cfg(feature = "websocket")]
@@ -320,19 +320,39 @@ async fn process_open_request(
                     }
                     ContractRequest::Get {
                         key,
-                        return_contract_code: contract,
+                        return_contract_code,
                     } => {
                         let peer_id = op_manager
                             .ring
                             .connection_manager
                             .get_peer_key()
                             .expect("Peer id not found at get op, it should be set");
+                        let (state, contract) = match op_manager
+                            .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                                key,
+                                return_contract_code,
+                            })
+                            .await
+                        {
+                            Ok(ContractHandlerEvent::GetResponse {
+                                key,
+                                response: Ok(StoreResponse { state, contract }),
+                            }) => Ok((state, contract)),
+                            Ok(ContractHandlerEvent::GetResponse {
+                                key,
+                                response: Err(err),
+                            }) => Err(err.into()),
+                            Err(err) => Err(err.into()),
+                            Ok(_) => Err(OpError::UnexpectedOpState),
+                        }
+                        .expect("get query failed");
+
                         // Initialize a get op.
                         tracing::debug!(
                             this_peer = %peer_id,
                             "Received get from user event",
                         );
-                        let op = get::start_op(key, contract);
+                        let op = get::start_op(key, return_contract_code);
                         let _ = op_manager
                             .ch_outbound
                             .waiting_for_transaction_result(op.id, client_id)

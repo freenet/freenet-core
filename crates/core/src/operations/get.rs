@@ -1,6 +1,6 @@
+use std::fmt::Display;
 use std::pin::Pin;
 use std::{future::Future, time::Instant};
-use std::fmt::Display;
 
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
@@ -44,7 +44,11 @@ pub(crate) fn start_op(key: ContractKey, fetch_contract: bool) -> GetOp {
 }
 
 /// Request to get the current value from a contract.
-pub(crate) async fn request_get(op_manager: &OpManager, get_op: GetOp, skip_list: Vec<PeerId>) -> Result<(), OpError> {
+pub(crate) async fn request_get(
+    op_manager: &OpManager,
+    get_op: GetOp,
+    skip_list: Vec<PeerId>,
+) -> Result<(), OpError> {
     let (target, id) = if let Some(GetState::PrepareRequest { key, id, .. }) = &get_op.state {
         // the initial request must provide:
         // - a location in the network where the contract resides
@@ -132,10 +136,23 @@ impl Display for GetState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             GetState::ReceivedRequest => write!(f, "ReceivedRequest"),
-            GetState::PrepareRequest { key, id, fetch_contract } => {
-                write!(f, "PrepareRequest(key: {}, id: {}, fetch_contract: {})", key, id, fetch_contract)
+            GetState::PrepareRequest {
+                key,
+                id,
+                fetch_contract,
+            } => {
+                write!(
+                    f,
+                    "PrepareRequest(key: {}, id: {}, fetch_contract: {})",
+                    key, id, fetch_contract
+                )
             }
-            GetState::AwaitingResponse { requester, fetch_contract, retries, current_hop } => {
+            GetState::AwaitingResponse {
+                requester,
+                fetch_contract,
+                retries,
+                current_hop,
+            } => {
                 write!(f, "AwaitingResponse(requester: {:?}, fetch_contract: {}, retries: {}, current_hop: {})", requester, fetch_contract, retries, current_hop)
             }
         }
@@ -348,7 +365,6 @@ impl Operation for GetOp {
                         .notify_contract_handler(ContractHandlerEvent::GetQuery {
                             key,
                             return_contract_code: fetch_contract,
-                            should_start_transaction: false,
                         })
                         .await;
 
@@ -600,10 +616,8 @@ impl Operation for GetOp {
                         })
                     );
 
-                    let requester = if let Some(GetState::AwaitingResponse {
-                        requester,
-                        ..
-                    }) = self.state.as_ref()
+                    let requester = if let Some(GetState::AwaitingResponse { requester, .. }) =
+                        self.state.as_ref()
                     {
                         requester.clone()
                     } else {
@@ -621,7 +635,7 @@ impl Operation for GetOp {
 
                         let mut new_skip_list = skip_list.clone();
                         new_skip_list.push(sender.peer.clone());
-                        
+
                         let requester = requester.unwrap();
 
                         tracing::warn!(
@@ -683,7 +697,13 @@ impl Operation for GetOp {
                                     tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
                                     let mut new_skip_list = skip_list.clone();
                                     new_skip_list.push(sender.peer.clone());
-                                    super::start_subscription_request(op_manager, key, false, new_skip_list).await;
+                                    super::start_subscription_request(
+                                        op_manager,
+                                        key,
+                                        false,
+                                        new_skip_list,
+                                    )
+                                    .await;
                                 }
                             }
                             ContractHandlerEvent::PutResponse {
@@ -695,7 +715,7 @@ impl Operation for GetOp {
                                 } else {
                                     let mut new_skip_list = skip_list.clone();
                                     new_skip_list.push(sender.peer.clone());
-                                    
+
                                     let requester = requester.unwrap();
 
                                     tracing::warn!(

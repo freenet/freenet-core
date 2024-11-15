@@ -305,7 +305,12 @@ impl<T> From<SendError<T>> for OpError {
 }
 
 /// If the contract is not found, it will try to get it first if the `try_get` parameter is set.
-async fn start_subscription_request(op_manager: &OpManager, key: ContractKey, try_get: bool, skip_list: Vec<PeerId>) {
+async fn start_subscription_request(
+    op_manager: &OpManager,
+    key: ContractKey,
+    try_get: bool,
+    skip_list: Vec<PeerId>,
+) {
     let sub_op = subscribe::start_op(key);
     if let Err(error) = subscribe::request_subscribe(op_manager, sub_op).await {
         if !try_get {
@@ -328,8 +333,7 @@ async fn has_contract(op_manager: &OpManager, key: ContractKey) -> Result<bool, 
     match op_manager
         .notify_contract_handler(crate::contract::ContractHandlerEvent::GetQuery {
             key,
-            fetch_contract: false,
-            skip_list: vec![],
+            return_contract_code: false,
         })
         .await?
     {

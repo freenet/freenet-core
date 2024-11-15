@@ -37,7 +37,6 @@ use crate::{
     client_events::{ClientId, HostResult},
     operations::{self, Operation},
 };
-use crate::dev_tool::PeerId;
 
 use super::storages::Storage;
 
@@ -425,8 +424,8 @@ pub(crate) trait ContractExecutor: Send + 'static {
         &mut self,
         key: ContractKey,
         return_contract_code: bool,
-        should_start_transaction_if_missing: bool,
-    ) -> impl Future<Output = Result<(WrappedState, Option<ContractContainer>), ExecutorError>> + Send;
+    ) -> impl Future<Output = Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError>>
+           + Send;
 
     fn upsert_contract_state(
         &mut self,

@@ -35,12 +35,11 @@ where
             ContractHandlerEvent::GetQuery {
                 key,
                 return_contract_code,
-                should_start_transaction,
             } => {
                 match contract_handler
                     .executor()
-                    .fetch_contract(key, return_contract_code, should_start_transaction)
-                    .instrument(tracing::info_span!("fetch_contract", %key, %return_contract_code, %should_start_transaction))
+                    .fetch_contract(key, return_contract_code)
+                    .instrument(tracing::info_span!("fetch_contract", %key, %return_contract_code))
                     .await
                 {
                     Ok((state, contract)) => {
@@ -51,10 +50,7 @@ where
                                 id,
                                 ContractHandlerEvent::GetResponse {
                                     key,
-                                    response: Ok(StoreResponse {
-                                        state: Some(state),
-                                        contract,
-                                    }),
+                                    response: Ok(StoreResponse { state, contract }),
                                 },
                             )
                             .await

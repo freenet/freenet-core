@@ -49,8 +49,7 @@ impl ContractExecutor for Executor<MockRuntime> {
         &mut self,
         key: ContractKey,
         return_contract_code: bool,
-        should_start_transaction_if_missing: bool,
-    ) -> Result<(WrappedState, Option<ContractContainer>), ExecutorError> {
+    ) -> Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError> {
         let Some(parameters) = self
             .state_store
             .get_params(&key)
@@ -61,7 +60,7 @@ impl ContractExecutor for Executor<MockRuntime> {
                 "missing state and/or parameters for contract {key}"
             )));
         };
-        let contract = if fetch_contract {
+        let contract = if return_contract_code {
             self.runtime
                 .contract_store
                 .fetch_contract(&key, &parameters)
@@ -73,7 +72,7 @@ impl ContractExecutor for Executor<MockRuntime> {
                 "missing state for contract {key}"
             )));
         };
-        Ok((state, contract))
+        Ok((Some(state), contract))
     }
 
     async fn upsert_contract_state(
