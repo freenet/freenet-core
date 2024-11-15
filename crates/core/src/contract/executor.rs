@@ -22,11 +22,6 @@ use tokio::sync::mpsc::{self};
 use crate::config::Config;
 use crate::message::Transaction;
 use crate::node::OpManager;
-#[cfg(any(
-    not(feature = "local-mode"),
-    feature = "network-mode",
-    all(not(feature = "local-mode"), not(feature = "network-mode"))
-))]
 use crate::operations::get::GetResult;
 use crate::operations::{OpEnum, OpError};
 use crate::wasm_runtime::{
@@ -442,10 +437,6 @@ pub(crate) trait ContractExecutor: Send + 'static {
 /// Consumers of the executor are required to poll for new changes in order to be notified
 /// of changes or can alternatively use the notification channel.
 pub struct Executor<R = Runtime> {
-    #[cfg(any(
-        all(feature = "local-mode", feature = "network-mode"),
-        all(not(feature = "local-mode"), not(feature = "network-mode")),
-    ))]
     mode: OperationMode,
     runtime: R,
     pub state_store: StateStore<Storage>,
@@ -470,10 +461,6 @@ impl<R> Executor<R> {
         ctrl_handler()?;
 
         Ok(Self {
-            #[cfg(any(
-                all(feature = "local-mode", feature = "network-mode"),
-                all(not(feature = "local-mode"), not(feature = "network-mode")),
-            ))]
             mode,
             runtime,
             state_store,

@@ -268,14 +268,7 @@ impl Executor<Runtime> {
 
                 // by default a subscribe op has an implicit get
                 let _res = self.perform_contract_get(true, key).await?;
-                #[cfg(any(
-                    all(not(feature = "local-mode"), not(feature = "network-mode")),
-                    all(feature = "local-mode", feature = "network-mode"),
-                    all(feature = "network-mode", not(feature = "network-mode"))
-                ))]
-                {
-                    self.subscribe(key).await?;
-                }
+                self.subscribe(key).await?;
                 // FIXME
                 todo!()
             }
@@ -451,25 +444,12 @@ impl Executor<Runtime> {
         self.send_update_notification(&key, &parameters, &new_state)
             .await?;
 
-        #[cfg(any(
-            not(feature = "local-mode"),
-            feature = "network-mode",
-            all(not(feature = "local-mode"), not(feature = "network-mode"))
-        ))]
-        {
-            #[cfg(any(
-                all(feature = "local-mode", feature = "network-mode"),
-                all(not(feature = "local-mode"), not(feature = "network-mode"))
-            ))]
-            {
-                if self.mode == OperationMode::Local {
-                    return Ok(ContractResponse::UpdateResponse { key, summary }.into());
-                }
-            }
-            // notify peers with deltas from summary in network
-            let request = UpdateContract { key, new_state };
-            let _op: operations::update::UpdateResult = self.op_request(request).await?;
+        if self.mode == OperationMode::Local {
+            return Ok(ContractResponse::UpdateResponse { key, summary }.into());
         }
+        // notify peers with deltas from summary in network
+        let request = UpdateContract { key, new_state };
+        let _op: operations::update::UpdateResult = self.op_request(request).await?;
 
         Ok(ContractResponse::UpdateResponse { key, summary }.into())
     }
@@ -529,8 +509,6 @@ impl Executor<Runtime> {
     ) -> Result<WrappedState, ExecutorError> {
         let new_state = {
             let start = Instant::now();
-            #[cfg(all(not(feature = "local-mode"), feature = "network-mode"))]
-            let original_state = current_state.clone();
             loop {
                 let state_update_res = self
                     .attempt_state_update(parameters, &current_state, &key, &updates)
@@ -561,13 +539,8 @@ impl Executor<Runtime> {
                                 state: state.into(),
                             });
                         }
-                        #[cfg(any(
-                            all(not(feature = "local-mode"), not(feature = "network-mode")),
-                            all(feature = "local-mode", feature = "network-mode")
-                        ))]
-                        Err(StateStoreError::MissingContract(_))
-                            if self.mode == OperationMode::Network =>
-                        {
+
+                        Err(StateStoreError::MissingContract(_)) => {
                             let state = match self.local_state_or_from_network(&id, false).await? {
                                 Either::Left(state) => state,
                                 Either::Right(GetResult {
@@ -577,7 +550,7 @@ impl Executor<Runtime> {
                                         return Err(ExecutorError::request(
                                             RequestError::ContractError(StdContractError::Get {
                                                 key,
-                                                cause: "missing-contract".into(),
+                                                cause: "Missing contract".into(),
                                             }),
                                         ));
                                     };
@@ -591,39 +564,6 @@ impl Executor<Runtime> {
                                 }
                             };
                             updates.push(UpdateData::State(state.into()));
-                            match mode {
-                                RelatedMode::StateOnce => {}
-                                RelatedMode::StateThenSubscribe => {
-                                    self.subscribe(id.into()).await?;
-                                }
-                            }
-                        }
-                        #[cfg(all(not(feature = "local-mode"), feature = "network-mode"))]
-                        Err(StateStoreError::MissingContract(_)) => {
-                            let state = match self.local_state_or_from_network(&id).await? {
-                                Either::Left(state) => original_state.clone(),
-                                Either::Right(GetResult {
-                                    state, contract, ..
-                                }) => {
-                                    if let Some(contract) = contract {
-                                        self.verify_and_store_contract(
-                                            original_state.clone(),
-                                            contract,
-                                            RelatedContracts::default(),
-                                        )
-                                        .await?;
-                                    } else {
-                                        return Err(ExecutorError::request(
-                                            RequestError::ContractError(StdContractError::Get {
-                                                key,
-                                                cause: "Missing contract".into(),
-                                            }),
-                                        ));
-                                    }
-                                    original_state.clone()
-                                }
-                            };
-                            updates.push(UpdateData::State(original_state.clone().into()));
                             match mode {
                                 RelatedMode::StateOnce => {}
                                 RelatedMode::StateThenSubscribe => {
@@ -740,39 +680,24 @@ impl Executor<Runtime> {
                     related_contracts.missing(related);
                     for (id, related) in related_contracts.update() {
                         if related.is_none() {
-                            #[cfg(all(feature = "local-mode", not(feature = "network-mode")))]
-                            {
-                                let current_state = self.get_local_contract(id).await?;
-                                *related = Some(current_state);
-                            }
-
-                            #[cfg(any(
-                                all(not(feature = "local-mode"), not(feature = "network-mode")),
-                                all(feature = "local-mode", feature = "network-mode"),
-                                all(not(feature = "local-mode"), feature = "network-mode")
-                            ))]
-                            {
-                                match self.local_state_or_from_network(id, false).await? {
-                                    Either::Left(state) => {
-                                        *related = Some(state.into());
-                                    }
-                                    Either::Right(result) => {
-                                        let Some(contract) = result.contract else {
-                                            return Err(ExecutorError::request(
-                                                RequestError::ContractError(
-                                                    StdContractError::Get {
-                                                        key: (*id).into(),
-                                                        cause: "missing-contract".into(),
-                                                    },
-                                                ),
-                                            ));
-                                        };
-                                        trying_key = (*id).into();
-                                        trying_params = contract.params();
-                                        trying_state = result.state;
-                                        trying_contract = Some(contract);
-                                        continue;
-                                    }
+                            match self.local_state_or_from_network(id, false).await? {
+                                Either::Left(state) => {
+                                    *related = Some(state.into());
+                                }
+                                Either::Right(result) => {
+                                    let Some(contract) = result.contract else {
+                                        return Err(ExecutorError::request(
+                                            RequestError::ContractError(StdContractError::Get {
+                                                key: (*id).into(),
+                                                cause: "missing-contract".into(),
+                                            }),
+                                        ));
+                                    };
+                                    trying_key = (*id).into();
+                                    trying_params = contract.params();
+                                    trying_state = result.state;
+                                    trying_contract = Some(contract);
+                                    continue;
                                 }
                             }
                         }
@@ -871,21 +796,10 @@ impl Executor<Runtime> {
     }
 }
 
-#[cfg(any(
-    not(feature = "local-mode"),
-    feature = "network-mode",
-    all(not(feature = "local-mode"), not(feature = "network-mode"))
-))]
 impl Executor<Runtime> {
     async fn subscribe(&mut self, key: ContractKey) -> Result<(), ExecutorError> {
-        #[cfg(any(
-            all(not(feature = "local-mode"), not(feature = "network-mode")),
-            all(feature = "local-mode", feature = "network-mode")
-        ))]
-        {
-            if self.mode == OperationMode::Local {
-                return Ok(());
-            }
+        if self.mode == OperationMode::Local {
+            return Ok(());
         }
         let request = SubscribeContract { key };
         let _sub: operations::subscribe::SubscribeResult = self.op_request(request).await?;
