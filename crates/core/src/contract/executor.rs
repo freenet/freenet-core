@@ -37,6 +37,7 @@ use crate::{
     client_events::{ClientId, HostResult},
     operations::{self, Operation},
 };
+use crate::dev_tool::PeerId;
 
 use super::storages::Storage;
 
@@ -340,12 +341,12 @@ where
 #[allow(unused)]
 struct GetContract {
     key: ContractKey,
-    fetch_contract: bool,
+    return_contract_code: bool,
 }
 
 impl ComposeNetworkMessage<operations::get::GetOp> for GetContract {
     fn initiate_op(self, _op_manager: &OpManager) -> operations::get::GetOp {
-        operations::get::start_op(self.key, self.fetch_contract)
+        operations::get::start_op(self.key, self.return_contract_code)
     }
 
     async fn resume_op(op: operations::get::GetOp, op_manager: &OpManager) -> Result<(), OpError> {
@@ -423,7 +424,8 @@ pub(crate) trait ContractExecutor: Send + 'static {
     fn fetch_contract(
         &mut self,
         key: ContractKey,
-        fetch_contract: bool,
+        return_contract_code: bool,
+        should_start_transaction_if_missing: bool,
     ) -> impl Future<Output = Result<(WrappedState, Option<ContractContainer>), ExecutorError>> + Send;
 
     fn upsert_contract_state(

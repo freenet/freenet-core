@@ -34,16 +34,17 @@ where
         match event {
             ContractHandlerEvent::GetQuery {
                 key,
-                fetch_contract,
+                return_contract_code,
+                should_start_transaction,
             } => {
                 match contract_handler
                     .executor()
-                    .fetch_contract(key, fetch_contract)
-                    .instrument(tracing::info_span!("fetch_contract", %key, %fetch_contract))
+                    .fetch_contract(key, return_contract_code, should_start_transaction)
+                    .instrument(tracing::info_span!("fetch_contract", %key, %return_contract_code, %should_start_transaction))
                     .await
                 {
                     Ok((state, contract)) => {
-                        tracing::debug!(with_contract = %fetch_contract, has_contract = %contract.is_some(), "Fetched contract {key}");
+                        tracing::debug!(with_contract_code = %return_contract_code, has_contract = %contract.is_some(), "Fetched contract {key}");
                         contract_handler
                             .channel()
                             .send_to_sender(

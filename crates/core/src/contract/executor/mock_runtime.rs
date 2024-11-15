@@ -48,7 +48,8 @@ impl ContractExecutor for Executor<MockRuntime> {
     async fn fetch_contract(
         &mut self,
         key: ContractKey,
-        fetch_contract: bool,
+        return_contract_code: bool,
+        should_start_transaction_if_missing: bool,
     ) -> Result<(WrappedState, Option<ContractContainer>), ExecutorError> {
         let Some(parameters) = self
             .state_store

@@ -68,6 +68,7 @@ pub(crate) async fn request_subscribe(
 ) -> Result<(), OpError> {
     let (target, _id) = if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
         if !super::has_contract(op_manager, *key).await? {
+            tracing::debug!(%key, "Contract not found, trying other peer");
             return Err(OpError::ContractError(ContractError::ContractNotFound(
                 *key,
             )));

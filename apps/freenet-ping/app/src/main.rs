@@ -167,56 +167,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                                                 }
                                             };
 
-                          for (name, created) in ping.iter() {
-                            if !local_state.contains_key(name) && (*created + chrono::Duration::hours(1) > Utc::now()) {
-                              tracing::info!("Hello, {}!", name);
-                            }
-                          }
+                                            for (name, created) in ping.iter() {
+                                                if !local_state.contains_key(name) && (*created + chrono::Duration::hours(1) > Utc::now()) {
+                                                    tracing::info!("Hello, {}!", name);
+                                                }
+                                            }
 
-                          local_state.merge(ping, args.parameters.ttl);
-                          Ok(())
-                        };
+                                            local_state.merge(ping, args.parameters.ttl);
+                                            Ok(())
+                                        };
 
-                        match update {
-                          UpdateData::State(state) =>  {
-                            if let Err(e) = handle_update(&state) {
-                              tracing::error!(err=%e);
-                            }
-                          },
-                          UpdateData::Delta(delta) => {
-                            if let Err(e) = handle_update(&delta) {
-                              tracing::error!(err=%e);
-                            }
-                          },
-                          UpdateData::StateAndDelta { state, delta } => {
-                            if let Err(e) = handle_update(&state) {
-                              tracing::error!(err=%e);
-                            }
+                                        match update {
+                                            UpdateData::State(state) =>  {
+                                                if let Err(e) = handle_update(&state) {
+                                                    tracing::error!(err=%e);
+                                                }
+                                            },
+                                            UpdateData::Delta(delta) => {
+                                                if let Err(e) = handle_update(&delta) {
+                                                    tracing::error!(err=%e);
+                                                }
+                                            },
+                                            UpdateData::StateAndDelta { state, delta } => {
+                                                if let Err(e) = handle_update(&state) {
+                                                    tracing::error!(err=%e);
+                                                }
 
-                            if let Err(e) = handle_update(&delta) {
-                              tracing::error!(err=%e);
+                                                if let Err(e) = handle_update(&delta) {
+                                                    tracing::error!(err=%e);
+                                                }
+                                            },
+                                            _ => unreachable!("unknown state"),
+                                        }
+                                    }
+                                },
+                                _ => {},
                             }
-                          },
-                          _ => unreachable!("unknown state"),
-                        }
-                      }
+                        },
+                        HostResponse::DelegateResponse { .. } => {},
+                        HostResponse::Ok => {},
+                        _ => unreachable!(),
                     },
-                    _ => {},
-                  }
-                },
-                HostResponse::DelegateResponse { .. } => {},
-                HostResponse::Ok => {},
-                _ => unreachable!(),
-              },
-              Err(e) => {
-                tracing::error!(err=%e);
-              },
+                    Err(e) => {
+                        tracing::error!(err=%e);
+                    },
+                }
             }
-          }
-          _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutting down...");
-            break;
-          }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("shutting down...");
+                break;
+            }
         }
     }
     Ok(())

@@ -320,7 +320,7 @@ async fn process_open_request(
                     }
                     ContractRequest::Get {
                         key,
-                        fetch_contract: contract,
+                        return_contract_code: contract,
                     } => {
                         let peer_id = op_manager
                             .ring
@@ -740,7 +740,7 @@ pub(crate) mod test {
                             let key = contract.key();
                             let request = ContractRequest::Get {
                                 key,
-                                fetch_contract: true,
+                                return_contract_code: true,
                             };
                             return Some(request.into());
                         }

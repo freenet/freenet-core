@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::hash::Hash;
+use std::iter::Skip;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,7 @@ use crate::client_events::HostResult;
 use crate::config::Config;
 use crate::message::Transaction;
 use crate::{client_events::ClientId, wasm_runtime::Runtime};
+use crate::node::PeerId;
 
 pub(crate) struct ClientResponsesReceiver(UnboundedReceiver<(ClientId, HostResult)>);
 
@@ -305,7 +307,8 @@ pub(crate) enum ContractHandlerEvent {
     /// Fetch a supposedly existing contract value in this node, and optionally the contract itself
     GetQuery {
         key: ContractKey,
-        fetch_contract: bool,
+        return_contract_code: bool,
+        should_start_transaction: bool,
     },
     /// The response to a get query event
     GetResponse {
@@ -351,7 +354,8 @@ impl std::fmt::Display for ContractHandlerEvent {
             },
             ContractHandlerEvent::GetQuery {
                 key,
-                fetch_contract,
+                return_contract_code,
+                ..
             } => {
                 write!(f, "get query {{ {key}, fetch contract: {fetch_contract} }}",)
             }

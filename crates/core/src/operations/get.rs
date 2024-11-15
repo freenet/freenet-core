@@ -1,5 +1,6 @@
 use std::pin::Pin;
 use std::{future::Future, time::Instant};
+use std::fmt::Display;
 
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
@@ -340,10 +341,14 @@ impl Operation for GetOp {
                         s.next_peer = Some(this_peer.clone());
                     }
 
+                    let mut new_skip_list = skip_list.clone();
+                    new_skip_list.push(this_peer.clone().peer);
+
                     let get_result = op_manager
                         .notify_contract_handler(ContractHandlerEvent::GetQuery {
                             key,
-                            fetch_contract: false,
+                            return_contract_code: fetch_contract,
+                            should_start_transaction: false,
                         })
                         .await;
 
@@ -357,6 +362,13 @@ impl Operation for GetOp {
                                 }),
                         }) => (key, contract, state),
                         _ => {
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                %this_peer,
+                                "Contract not found @ peer {}, retrying with other peers",
+                                sender.peer
+                            );
                             return try_forward_or_return(
                                 id,
                                 key,
@@ -578,6 +590,8 @@ impl Operation for GetOp {
                 } => {
                     let id = *id;
                     let key = *key;
+
+                    tracing::info!(tx = %id, %key, "Received get response with state: {:?}", self.state.as_ref().unwrap());
                     let require_contract = matches!(
                         self.state,
                         Some(GetState::AwaitingResponse {
