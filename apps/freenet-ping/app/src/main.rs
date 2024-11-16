@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     client
         .send(ClientRequest::ContractOp(ContractRequest::Get {
             key: contract_key.clone(),
-            fetch_contract: false,
+            return_contract_code: false,
         }))
         .await?;
 

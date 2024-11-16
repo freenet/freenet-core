@@ -364,6 +364,10 @@ async fn process_open_request(
                             || (return_contract_code && state.is_some() && contract.is_some())
                         {
                             if let Some(state) = state {
+                                tracing::debug!(
+                                    this_peer = %peer_id,
+                                    "Contract found, returning get result",
+                                );
                                 callback_tx
                                     .unwrap()
                                     .send(QueryResult::GetResult {
@@ -374,20 +378,20 @@ async fn process_open_request(
                                     .await
                                     .ok();
                             }
-                        }
-
-                        // Initialize a get op.
-                        tracing::debug!(
-                            this_peer = %peer_id,
-                            "Received get from user event",
-                        );
-                        let op = get::start_op(key, return_contract_code);
-                        let _ = op_manager
-                            .ch_outbound
-                            .waiting_for_transaction_result(op.id, client_id)
-                            .await;
-                        if let Err(err) = get::request_get(&op_manager, op, vec![]).await {
-                            tracing::error!("{}", err);
+                        } else {
+                            // Initialize a get op.
+                            tracing::debug!(
+                                this_peer = %peer_id,
+                                "Contract not found, starting get op",
+                            );
+                            let op = get::start_op(key, return_contract_code);
+                            let _ = op_manager
+                                .ch_outbound
+                                .waiting_for_transaction_result(op.id, client_id)
+                                .await;
+                            if let Err(err) = get::request_get(&op_manager, op, vec![]).await {
+                                tracing::error!("{}", err);
+                            }
                         }
                     }
                     ContractRequest::Subscribe { key, .. } => {
