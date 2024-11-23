@@ -429,6 +429,14 @@ pub(crate) trait ContractExecutor: Send + 'static {
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
     ) -> impl Future<Output = Result<WrappedState, ExecutorError>> + Send;
+
+    fn register_contract_notifier(
+        &mut self,
+        key: ContractKey,
+        cli_id: ClientId,
+        notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
+        summary: Option<StateSummary<'_>>,
+    ) -> Result<(), Box<RequestError>>;
 }
 
 /// A WASM executor which will run any contracts, delegates, etc. registered.

@@ -66,7 +66,7 @@ setup: build-freenet create-dirs generate-keys
 
 build-freenet:
 	@echo "→ Building Freenet..."
-	@cargo install --path $(FREENET_CORE_PATH) --features "local-simulation,network-mode"
+	@cargo install --path $(FREENET_CORE_PATH) --features "local-simulation"
 
 create-dirs:
 	@echo "→ Creating directories..."

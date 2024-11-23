@@ -131,6 +131,41 @@ impl ContractExecutor for Executor<Runtime> {
         };
         Ok(updated_state)
     }
+
+    fn register_contract_notifier(
+        &mut self,
+        key: ContractKey,
+        cli_id: ClientId,
+        notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
+        summary: Option<StateSummary<'_>>,
+    ) -> Result<(), Box<RequestError>> {
+        let channels = self.update_notifications.entry(key).or_default();
+        if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
+            let (_, existing_ch) = &channels[i];
+            if !existing_ch.same_channel(&notification_ch) {
+                return Err(RequestError::from(StdContractError::Subscribe {
+                    key,
+                    cause: format!("Peer {cli_id} already subscribed").into(),
+                })
+                    .into());
+            }
+        } else {
+            channels.push((cli_id, notification_ch));
+        }
+
+        if self
+            .subscriber_summaries
+            .entry(key)
+            .or_default()
+            .insert(cli_id, summary.map(StateSummary::into_owned))
+            .is_some()
+        {
+            tracing::warn!(
+                "contract {key} already was registered for peer {cli_id}; replaced summary"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Executor<Runtime> {

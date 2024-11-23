@@ -226,7 +226,7 @@ async fn websocket_interface(
     ws: WebSocket,
 ) -> anyhow::Result<()> {
     let (mut response_rx, client_id) = new_client_connection(&request_sender).await?;
-    let (mut tx, mut rx) = ws.split();
+    let (mut server_sink, mut client_stream) = ws.split();
     let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::UnboundedReceiver<HostResult>)>>> =
         Arc::new(Mutex::new(VecDeque::new()));
     loop {
@@ -246,6 +246,7 @@ async fn websocket_interface(
                                 active_listeners.push_back((key, listener));
                             }
                             Err(err @ mpsc::error::TryRecvError::Disconnected) => {
+                                tracing::debug!(err = ?err, "listener channel disconnected");
                                 return Err(anyhow::anyhow!(err))
                             }
                         }
@@ -257,7 +258,7 @@ async fn websocket_interface(
         };
 
         let client_req_task = async {
-            let next_msg = match rx
+            let next_msg = match client_stream
                 .next()
                 .await
                 .ok_or_else::<ClientError, _>(|| ErrorKind::Disconnect.into())
@@ -279,7 +280,7 @@ async fn websocket_interface(
         };
 
         tokio::select! { biased;
-            msg = async { process_host_response(response_rx.recv().await, client_id, encoding_protoc, &mut tx).await } => {
+            msg = async { process_host_response(response_rx.recv().await, client_id, encoding_protoc, &mut server_sink).await } => {
                 let active_listeners = contract_updates.clone();
                 if let Some(NewSubscription { key, callback }) = msg? {
                     tracing::debug!(cli_id = %client_id, contract = %key, "added new notification listener");
@@ -290,11 +291,19 @@ async fn websocket_interface(
             process_client_request = client_req_task => {
                 match process_client_request {
                     Ok(Some(error)) => {
-                        tx.send(error).await?;
+                        server_sink.send(error).await.inspect_err(|err| {
+                            tracing::debug!(err = %err, "error sending message to client");
+                        })?;
                     }
                     Ok(None) => continue,
-                    Err(None) => return Ok(()),
-                    Err(Some(err)) => return Err(err),
+                    Err(None) => {
+                        tracing::debug!("client channel closed on request");   
+                        return Ok(())
+                    },
+                    Err(Some(err)) => {
+                        tracing::debug!(err = %err, "client channel error on request");
+                        return Err(err)
+                    },
                 }
             }
             response = listeners_task => {
@@ -310,7 +319,9 @@ async fn websocket_interface(
                     },
                     EncodingProtocol::Native => bincode::serialize(&response)?,
                 };
-                tx.send(Message::Binary(serialized_res)).await?;
+                server_sink.send(Message::Binary(serialized_res)).await.inspect_err(|err| {
+                    tracing::debug!(err = %err, "error sending message to client");
+                })?;
             }
         }
     }

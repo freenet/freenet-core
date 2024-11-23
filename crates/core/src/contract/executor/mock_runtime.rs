@@ -1,3 +1,4 @@
+use tokio::sync::mpsc::UnboundedSender;
 use super::*;
 
 pub(crate) struct MockRuntime {
@@ -107,6 +108,10 @@ impl ContractExecutor for Executor<MockRuntime> {
             }
             (update, contract) => unreachable!("{update:?}, {contract:?}"),
         }
+    }
+
+    fn register_contract_notifier(&mut self, key: ContractKey, cli_id: ClientId, notification_ch: UnboundedSender<HostResult>, summary: Option<StateSummary<'_>>) -> Result<(), Box<RequestError>> {
+        todo!()
     }
 }
 

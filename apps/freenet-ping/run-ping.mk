@@ -2,12 +2,22 @@
 # Freenet Ping Application Builder
 # ==========================================
 
+# Use bash shell
+SHELL := /bin/bash
+
 # Project Structure
 # ------------------------------------------
 PROJECT_ROOT    := $(shell pwd)
 PING_CONTRACT  := $(PROJECT_ROOT)/contracts/ping
 PING_APP       := $(PROJECT_ROOT)/app
 BUILD_DIR      := $(PING_CONTRACT)/target
+
+
+# Log Command with ANSI color removal
+# ------------------------------------------
+define LOG_CMD
+1> >(stdbuf -o0 sed 's/\x1b\[[0-9;]*m//g' >> $(1)) 2>&1
+endef
 
 # Build Tools
 # ------------------------------------------

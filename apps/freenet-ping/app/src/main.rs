@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
             state,
         })) => {
             tracing::info!(key=%key, "fetched state successfully!");
-            if contract_key != key || state.is_empty() {
+            if contract_key != key || state.to_vec().is_empty() {
                 client
                     .send(ClientRequest::ContractOp(ContractRequest::Put {
                         contract: container,
@@ -74,13 +74,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                         related_contracts: RelatedContracts::new(),
                     }))
                     .await?;
-
-                // client
-                //     .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
-                //         key: contract_key.clone(),
-                //         summary: None,
-                //     }))
-                //     .await?;
                 Ping::default()
             } else {
                 let old_ping = serde_json::from_slice::<Ping>(&state)?;
@@ -148,8 +141,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                                         }
                                     }
                                 },
-                                ContractResponse::GetResponse { key, .. } => {
-                                    tracing::debug!(key=%key, "Received get response");
+                                ContractResponse::SubscribeResponse { key, .. } => {
+                                    tracing::debug!(key=%key, "Received subscribe response");
                                     if key == contract_key {
                                         tracing::debug!(key=%key, "Marking as subscribed");
                                         is_subcribed = true;

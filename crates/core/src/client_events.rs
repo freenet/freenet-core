@@ -236,7 +236,7 @@ pub async fn client_event_handling<ClientEv>(
 
 #[inline]
 async fn process_open_request(
-    request: OpenRequest<'static>,
+    mut request: OpenRequest<'static>,
     op_manager: Arc<OpManager>,
 ) -> Option<mpsc::Receiver<QueryResult>> {
     let (callback_tx, callback_rx) = if matches!(
@@ -255,6 +255,7 @@ async fn process_open_request(
             let client_id = request.client_id;
 
             // fixme: communicate back errors in this loop to the client somehow
+            let subscription_listener: Option<UnboundedSender<HostResult>> = request.notification_channel.take();
             match *request.request {
                 ClientRequest::ContractOp(ops) => match ops {
                     ContractRequest::Put {
@@ -394,7 +395,7 @@ async fn process_open_request(
                             }
                         }
                     }
-                    ContractRequest::Subscribe { key, .. } => {
+                    ContractRequest::Subscribe { key, summary } => {
                         let op_id =
                             match crate::node::subscribe(op_manager.clone(), key, Some(client_id))
                                 .await
@@ -405,6 +406,20 @@ async fn process_open_request(
                                     return;
                                 }
                             };
+                        let Some(subscriber_listener) = subscription_listener else {
+                            tracing::error!(%op_id, %client_id, "No subscriber listener");
+                            return
+                        };
+                        let _ = op_manager
+                            .notify_contract_handler(ContractHandlerEvent::RegisterSubscriberListener {
+                                key,
+                                client_id,
+                                summary,
+                                subscriber_listener,
+                            })
+                            .await.inspect_err(|err| {
+                                tracing::error!(%op_id, %client_id, "Register subscriber listener error: {}", err);
+                            });
                         let _ = op_manager
                             .ch_outbound
                             .waiting_for_transaction_result(op_id, client_id)

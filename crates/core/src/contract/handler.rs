@@ -322,6 +322,12 @@ pub(crate) enum ContractHandlerEvent {
     UpdateResponse {
         new_value: Result<WrappedState, ExecutorError>,
     },
+    RegisterSubscriberListener {
+        key: ContractKey,
+        client_id: ClientId,
+        summary: Option<StateSummary<'static>>,
+        subscriber_listener: UnboundedSender<HostResult>,
+    },
 }
 
 impl std::fmt::Display for ContractHandlerEvent {
@@ -378,6 +384,9 @@ impl std::fmt::Display for ContractHandlerEvent {
                     write!(f, "update query failed {{ {e} }}",)
                 }
             },
+            ContractHandlerEvent::RegisterSubscriberListener { key, client_id, .. } => {
+                write!(f, "register subscriber listener {{ {key}, client_id: {client_id} }}",)
+            }
         }
     }
 }
