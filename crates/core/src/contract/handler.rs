@@ -385,7 +385,10 @@ impl std::fmt::Display for ContractHandlerEvent {
                 }
             },
             ContractHandlerEvent::RegisterSubscriberListener { key, client_id, .. } => {
-                write!(f, "register subscriber listener {{ {key}, client_id: {client_id} }}",)
+                write!(
+                    f,
+                    "register subscriber listener {{ {key}, client_id: {client_id} }}",
+                )
             }
         }
     }

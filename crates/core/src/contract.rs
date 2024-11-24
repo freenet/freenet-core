@@ -140,16 +140,12 @@ where
                 key,
                 client_id,
                 summary,
-                subscriber_listener
+                subscriber_listener,
             } => {
                 let _ = contract_handler
                     .executor()
-                    .register_contract_notifier(
-                        key,
-                        client_id,
-                        subscriber_listener,
-                        summary,
-                    ).inspect_err(|err| {
+                    .register_contract_notifier(key, client_id, subscriber_listener, summary)
+                    .inspect_err(|err| {
                         tracing::warn!("Error while registering subscriber listener: {err}");
                     });
             }

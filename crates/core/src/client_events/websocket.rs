@@ -247,7 +247,7 @@ async fn websocket_interface(
                             }
                             Err(err @ mpsc::error::TryRecvError::Disconnected) => {
                                 tracing::debug!(err = ?err, "listener channel disconnected");
-                                return Err(anyhow::anyhow!(err))
+                                return Err(anyhow::anyhow!(err));
                             }
                         }
                     }
@@ -297,7 +297,7 @@ async fn websocket_interface(
                     }
                     Ok(None) => continue,
                     Err(None) => {
-                        tracing::debug!("client channel closed on request");   
+                        tracing::debug!("client channel closed on request");
                         return Ok(())
                     },
                     Err(Some(err)) => {

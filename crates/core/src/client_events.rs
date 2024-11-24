@@ -250,14 +250,15 @@ async fn process_open_request(
     };
 
     // this will indirectly start actions on the local contract executor
-    let fut =
-        async move {
-            let client_id = request.client_id;
+    let fut = async move {
+        let client_id = request.client_id;
 
-            // fixme: communicate back errors in this loop to the client somehow
-            let subscription_listener: Option<UnboundedSender<HostResult>> = request.notification_channel.take();
-            match *request.request {
-                ClientRequest::ContractOp(ops) => match ops {
+        // fixme: communicate back errors in this loop to the client somehow
+        let subscription_listener: Option<UnboundedSender<HostResult>> =
+            request.notification_channel.take();
+        match *request.request {
+            ClientRequest::ContractOp(ops) => {
+                match ops {
                     ContractRequest::Put {
                         state,
                         contract,
@@ -406,7 +407,7 @@ async fn process_open_request(
                             };
                         let Some(subscriber_listener) = subscription_listener else {
                             tracing::error!(%op_id, %client_id, "No subscriber listener");
-                            return
+                            return;
                         };
                         let _ = op_manager
                             .notify_contract_handler(ContractHandlerEvent::RegisterSubscriberListener {
@@ -426,22 +427,23 @@ async fn process_open_request(
                     _ => {
                         tracing::error!("Op not supported");
                     }
-                },
-                ClientRequest::DelegateOp(_op) => todo!("FIXME: delegate op"),
-                ClientRequest::Disconnect { .. } => unreachable!(),
-                ClientRequest::NodeQueries(_) => {
-                    tracing::debug!("Received node queries from user event");
-                    let _ = op_manager
-                        .notify_node_event(NodeEvent::QueryConnections {
-                            callback: callback_tx.expect("should be set"),
-                        })
-                        .await;
-                }
-                _ => {
-                    tracing::error!("Op not supported");
                 }
             }
-        };
+            ClientRequest::DelegateOp(_op) => todo!("FIXME: delegate op"),
+            ClientRequest::Disconnect { .. } => unreachable!(),
+            ClientRequest::NodeQueries(_) => {
+                tracing::debug!("Received node queries from user event");
+                let _ = op_manager
+                    .notify_node_event(NodeEvent::QueryConnections {
+                        callback: callback_tx.expect("should be set"),
+                    })
+                    .await;
+            }
+            _ => {
+                tracing::error!("Op not supported");
+            }
+        }
+    };
     GlobalExecutor::spawn(fut.instrument(
         tracing::info_span!(parent: tracing::Span::current(), "process_client_request"),
     ));

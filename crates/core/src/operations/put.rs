@@ -191,7 +191,8 @@ impl Operation for PutOp {
                     if is_subscribed_contract || should_seed {
                         if !is_subscribed_contract {
                             let skip_list = vec![sender.peer.clone(), target.peer.clone()];
-                            super::start_subscription_request(op_manager, key, true, skip_list).await;
+                            super::start_subscription_request(op_manager, key, true, skip_list)
+                                .await;
                             // FIXME: we start subscription request, but that does not mean we are already seeding
                             op_manager.ring.seed_contract(key);
                             is_subscribed_contract = true;
@@ -243,7 +244,8 @@ impl Operation for PutOp {
 
                         if should_seed && !is_subscribed_contract {
                             let skip_list = vec![sender.peer.clone()];
-                            super::start_subscription_request(op_manager, key, true, skip_list).await;
+                            super::start_subscription_request(op_manager, key, true, skip_list)
+                                .await;
                             // FIXME: we start subscription request, but that does not mean we are already seeding
                             op_manager.ring.seed_contract(key);
                         }
@@ -398,7 +400,8 @@ impl Operation for PutOp {
                             let is_subscribed_contract = op_manager.ring.is_seeding_contract(&key);
                             if !is_subscribed_contract && op_manager.ring.should_seed(&key) {
                                 tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
-                                super::start_subscription_request(op_manager, key, true, vec![]).await;
+                                super::start_subscription_request(op_manager, key, true, vec![])
+                                    .await;
                             }
                             tracing::info!(
                                 tx = %id,
@@ -485,7 +488,13 @@ impl Operation for PutOp {
                                 .await?;
                             }
                             let (dropped_contract, old_subscribers) = {
-                                super::start_subscription_request(op_manager, key, true, new_skip_list).await;
+                                super::start_subscription_request(
+                                    op_manager,
+                                    key,
+                                    true,
+                                    new_skip_list,
+                                )
+                                .await;
                                 // FIXME: we start subscription request, but that does not mean we are already seeding
                                 op_manager.ring.seed_contract(key)
                             };
