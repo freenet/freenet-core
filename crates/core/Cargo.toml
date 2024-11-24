@@ -40,7 +40,7 @@ semver = { version = "1",  features = ["serde"] }
 headers = "0.4"
 hickory-resolver = { version = "0.24", features = ["dns-over-rustls"] }
 itertools = "0.13"
-notify = "6"
+notify = "7"
 once_cell = "1"
 ordered-float = "4"
 pav_regression = "0.4.0"
