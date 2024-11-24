@@ -49,10 +49,10 @@ jobs:
 
       - name: Build
         run: |
-          cargo build --locked 
           cargo install --locked --path ./crates/core
           cargo install --locked --path ./crates/fdev
           make -C apps/freenet-ping -f run-ping.mk build
+          cargo build --locked 
 
       - name: Test - features
         run: cargo test --workspace ${{ matrix.args }}
