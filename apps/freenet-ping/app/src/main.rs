@@ -1,4 +1,3 @@
-use chrono::Utc;
 use clap::Parser;
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
@@ -51,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     // try to fetch the old state from the host.
     client
         .send(ClientRequest::ContractOp(ContractRequest::Get {
-            key: contract_key.clone(),
+            key: contract_key,
             return_contract_code: false,
         }))
         .await?;
@@ -66,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
             state,
         })) => {
             tracing::info!(key=%key, "fetched state successfully!");
-            if contract_key != key || state.to_vec().is_empty() {
+            if contract_key != key || (*state).is_empty() {
                 client
                     .send(ClientRequest::ContractOp(ContractRequest::Put {
                         contract: container,
@@ -87,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                 // the contract already put, so we subscribe to the contract.
                 client
                     .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
-                        key: contract_key.clone(),
+                        key: contract_key,
                         summary: None,
                     }))
                     .await?;
@@ -119,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                     let mut ping = Ping::default();
                     ping.insert(name.clone());
                     if let Err(e) = client.send(ClientRequest::ContractOp(ContractRequest::Update {
-                        key: contract_key.clone(),
+                        key: contract_key,
                         data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&ping).unwrap())),
                     })).await {
                         tracing::error!(err=%e, "failed to send update request");
@@ -161,8 +160,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                                             };
 
                                             for (name, created) in ping.iter() {
-                                                if !local_state.contains_key(name) && (*created + chrono::Duration::hours(1) > Utc::now()) {
-                                                    tracing::info!("Hello, {}!", name);
+                                                if !local_state.contains_key(name) {
+                                                    tracing::info!("Hello, {}! @ ({created})", name);
                                                 }
                                             }
 

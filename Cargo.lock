@@ -1465,6 +1465,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "freenet-ping"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "freenet-ping-types",
+ "freenet-stdlib",
+ "futures",
+ "names",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "freenet-ping-contract"
+version = "0.1.0"
+dependencies = [
+ "freenet-ping-types",
+ "freenet-stdlib",
+ "serde_json",
+]
+
+[[package]]
+name = "freenet-ping-types"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "freenet-stdlib",
+ "humantime",
+ "humantime-serde",
+ "serde",
+]
+
+[[package]]
 name = "freenet-stdlib"
 version = "0.0.8"
 dependencies = [
@@ -1952,6 +1990,22 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
+name = "humantime"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a3a5bfb195931eeb336b2a7b4d761daec841b97f947d34394601737a7bba5e4"
+
+[[package]]
+name = "humantime-serde"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57a3db5ea5923d99402c94e9feb261dc5ee9b4efa158b0315f788cf549cc200c"
+dependencies = [
+ "humantime",
+ "serde",
+]
 
 [[package]]
 name = "hyper"
@@ -2529,6 +2583,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.80",
+]
+
+[[package]]
+name = "names"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bddcd3bf5144b6392de80e04c347cd7fab2508f6df16a85fc496ecd5cec39bc"
+dependencies = [
+ "rand",
 ]
 
 [[package]]

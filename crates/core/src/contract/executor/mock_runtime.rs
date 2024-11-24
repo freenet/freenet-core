@@ -1,5 +1,5 @@
-use tokio::sync::mpsc::UnboundedSender;
 use super::*;
+use tokio::sync::mpsc::UnboundedSender;
 
 pub(crate) struct MockRuntime {
     pub contract_store: ContractStore,
@@ -110,8 +110,14 @@ impl ContractExecutor for Executor<MockRuntime> {
         }
     }
 
-    fn register_contract_notifier(&mut self, key: ContractKey, cli_id: ClientId, notification_ch: UnboundedSender<HostResult>, summary: Option<StateSummary<'_>>) -> Result<(), Box<RequestError>> {
-        todo!()
+    fn register_contract_notifier(
+        &mut self,
+        _key: ContractKey,
+        _cli_id: ClientId,
+        _notification_ch: UnboundedSender<HostResult>,
+        _summary: Option<StateSummary<'_>>,
+    ) -> Result<(), Box<RequestError>> {
+        Ok(())
     }
 }
 

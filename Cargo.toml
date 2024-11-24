@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = [
+	"crates/*",
+	"apps/freenet-ping/app",
+	"apps/freenet-ping/types",
+	"apps/freenet-ping/contracts/ping"
+]
 
 [workspace.dependencies]
 arrayvec = { version = "0.7", features = ["serde"] }
