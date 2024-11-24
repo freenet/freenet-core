@@ -301,8 +301,6 @@ async fn process_open_request(
 
                         let related_contracts = RelatedContracts::default();
 
-                        // FIXME: maybe we should allow blind updates through the network
-                        // we are doing this so we can propagate state instead of delta (cause delta implies other changes)
                         let new_state = match op_manager
                             .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
                                 key,

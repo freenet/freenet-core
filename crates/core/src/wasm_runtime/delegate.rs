@@ -203,7 +203,6 @@ impl Runtime {
                     break;
                 }
                 OutboundDelegateMsg::RequestUserInput(req) => {
-                    //results.push(OutboundDelegateMsg::RequestUserInput(req));
                     // Simulate user response changes after receiving the RequestUserInput
                     let user_response =
                         ClientResponse::new(serde_json::to_vec(&Response::Allowed).unwrap());

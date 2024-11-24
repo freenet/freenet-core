@@ -147,7 +147,7 @@ impl ContractExecutor for Executor<Runtime> {
                     key,
                     cause: format!("Peer {cli_id} already subscribed").into(),
                 })
-                    .into());
+                .into());
             }
         } else {
             channels.push((cli_id, notification_ch));
@@ -269,7 +269,7 @@ impl Executor<Runtime> {
         }
     }
 
-    /// Responde to requests made through any API's from client applications locally.
+    /// Responde to requests made through any API's from client applications in local mode.
     pub async fn contract_requests(
         &mut self,
         req: ContractRequest<'_>,
