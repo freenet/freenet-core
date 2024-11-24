@@ -305,7 +305,7 @@ pub(crate) enum ContractHandlerEvent {
     /// Fetch a supposedly existing contract value in this node, and optionally the contract itself
     GetQuery {
         key: ContractKey,
-        fetch_contract: bool,
+        return_contract_code: bool,
     },
     /// The response to a get query event
     GetResponse {
@@ -315,12 +315,18 @@ pub(crate) enum ContractHandlerEvent {
     /// Updates a supposedly existing contract in this node
     UpdateQuery {
         key: ContractKey,
-        state: WrappedState,
+        data: UpdateData<'static>,
         related_contracts: RelatedContracts<'static>,
     },
     /// The response to an update query
     UpdateResponse {
         new_value: Result<WrappedState, ExecutorError>,
+    },
+    RegisterSubscriberListener {
+        key: ContractKey,
+        client_id: ClientId,
+        summary: Option<StateSummary<'static>>,
+        subscriber_listener: UnboundedSender<HostResult>,
     },
 }
 
@@ -351,9 +357,13 @@ impl std::fmt::Display for ContractHandlerEvent {
             },
             ContractHandlerEvent::GetQuery {
                 key,
-                fetch_contract,
+                return_contract_code,
+                ..
             } => {
-                write!(f, "get query {{ {key}, fetch contract: {fetch_contract} }}",)
+                write!(
+                    f,
+                    "get query {{ {key}, return contract code: {return_contract_code} }}",
+                )
             }
             ContractHandlerEvent::GetResponse { key, response } => match response {
                 Ok(_) => {
@@ -374,6 +384,12 @@ impl std::fmt::Display for ContractHandlerEvent {
                     write!(f, "update query failed {{ {e} }}",)
                 }
             },
+            ContractHandlerEvent::RegisterSubscriberListener { key, client_id, .. } => {
+                write!(
+                    f,
+                    "register subscriber listener {{ {key}, client_id: {client_id} }}",
+                )
+            }
         }
     }
 }

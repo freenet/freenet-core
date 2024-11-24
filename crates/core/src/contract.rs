@@ -34,26 +34,23 @@ where
         match event {
             ContractHandlerEvent::GetQuery {
                 key,
-                fetch_contract,
+                return_contract_code,
             } => {
                 match contract_handler
                     .executor()
-                    .fetch_contract(key, fetch_contract)
-                    .instrument(tracing::info_span!("fetch_contract", %key, %fetch_contract))
+                    .fetch_contract(key, return_contract_code)
+                    .instrument(tracing::info_span!("fetch_contract", %key, %return_contract_code))
                     .await
                 {
                     Ok((state, contract)) => {
-                        tracing::debug!(with_contract = %fetch_contract, has_contract = %contract.is_some(), "Fetched contract {key}");
+                        tracing::debug!(with_contract_code = %return_contract_code, has_contract = %contract.is_some(), "Fetched contract {key}");
                         contract_handler
                             .channel()
                             .send_to_sender(
                                 id,
                                 ContractHandlerEvent::GetResponse {
                                     key,
-                                    response: Ok(StoreResponse {
-                                        state: Some(state),
-                                        contract,
-                                    }),
+                                    response: Ok(StoreResponse { state, contract }),
                                 },
                             )
                             .await
@@ -92,6 +89,7 @@ where
                     .upsert_contract_state(key, Either::Left(state), related_contracts, contract)
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await;
+
                 contract_handler
                     .channel()
                     .send_to_sender(
@@ -108,17 +106,19 @@ where
             }
             ContractHandlerEvent::UpdateQuery {
                 key,
-                state,
+                data,
                 related_contracts,
             } => {
+                let update_value: Either<WrappedState, StateDelta<'static>> = match data {
+                    freenet_stdlib::prelude::UpdateData::State(state) => {
+                        Either::Left(WrappedState::from(state.into_bytes()))
+                    }
+                    freenet_stdlib::prelude::UpdateData::Delta(delta) => Either::Right(delta),
+                    _ => unreachable!(),
+                };
                 let update_result = contract_handler
                     .executor()
-                    .upsert_contract_state(
-                        key,
-                        Either::Left(state.clone()),
-                        related_contracts,
-                        None,
-                    )
+                    .upsert_contract_state(key, update_value, related_contracts, None)
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await;
 
@@ -135,6 +135,19 @@ where
                         tracing::debug!(%error, "shutting down contract handler");
                         error
                     })?;
+            }
+            ContractHandlerEvent::RegisterSubscriberListener {
+                key,
+                client_id,
+                summary,
+                subscriber_listener,
+            } => {
+                let _ = contract_handler
+                    .executor()
+                    .register_contract_notifier(key, client_id, subscriber_listener, summary)
+                    .inspect_err(|err| {
+                        tracing::warn!("Error while registering subscriber listener: {err}");
+                    });
             }
             _ => unreachable!(),
         }

@@ -1,4 +1,5 @@
 use super::*;
+use tokio::sync::mpsc::UnboundedSender;
 
 pub(crate) struct MockRuntime {
     pub contract_store: ContractStore,
@@ -48,8 +49,8 @@ impl ContractExecutor for Executor<MockRuntime> {
     async fn fetch_contract(
         &mut self,
         key: ContractKey,
-        fetch_contract: bool,
-    ) -> Result<(WrappedState, Option<ContractContainer>), ExecutorError> {
+        return_contract_code: bool,
+    ) -> Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError> {
         let Some(parameters) = self
             .state_store
             .get_params(&key)
@@ -60,7 +61,7 @@ impl ContractExecutor for Executor<MockRuntime> {
                 "missing state and/or parameters for contract {key}"
             )));
         };
-        let contract = if fetch_contract {
+        let contract = if return_contract_code {
             self.runtime
                 .contract_store
                 .fetch_contract(&key, &parameters)
@@ -72,7 +73,7 @@ impl ContractExecutor for Executor<MockRuntime> {
                 "missing state for contract {key}"
             )));
         };
-        Ok((state, contract))
+        Ok((Some(state), contract))
     }
 
     async fn upsert_contract_state(
@@ -107,6 +108,16 @@ impl ContractExecutor for Executor<MockRuntime> {
             }
             (update, contract) => unreachable!("{update:?}, {contract:?}"),
         }
+    }
+
+    fn register_contract_notifier(
+        &mut self,
+        _key: ContractKey,
+        _cli_id: ClientId,
+        _notification_ch: UnboundedSender<HostResult>,
+        _summary: Option<StateSummary<'_>>,
+    ) -> Result<(), Box<RequestError>> {
+        Ok(())
     }
 }
 
