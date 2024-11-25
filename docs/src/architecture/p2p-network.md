@@ -21,7 +21,7 @@ location is derived from the peer's IP address.
 
 Every Freenet peer, also referred to as a node, forms two-way connections with a
 set of other peers, termed "neighbors." These connections utilize the User
-Datagram Protocol (UDP) and can do [Frewall hole punching](<https://en.wikipedia.org/wiki/Hole_punching_(networking)>) when necessary. Peers manage their resource usage —
+Datagram Protocol (UDP) and can do [Firewall hole punching](<https://en.wikipedia.org/wiki/Hole_punching_(networking)>) when necessary. Peers manage their resource usage —
 bandwidth, memory, CPU, and storage — based on limits set by the user.
 
 ## Adaptive behavior
