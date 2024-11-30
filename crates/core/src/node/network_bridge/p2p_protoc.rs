@@ -2,6 +2,7 @@ use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::message::{NetMessageV1, QueryResult};
 use dashmap::DashSet;
 use either::{Either, Left, Right};
+use freenet_stdlib::client_api::ErrorKind;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -260,6 +261,13 @@ impl P2pConnManager {
                             NodeEvent::QueryConnections { callback } => {
                                 let connections = self.connections.keys().cloned().collect();
                                 callback.send(QueryResult::Connections(connections)).await?;
+                            }
+                            NodeEvent::TransactionTimedOut(tx) => {
+                                let Some(client) = state.tx_to_client.remove(&tx) else {
+                                    continue;
+                                };
+                                cli_response_sender
+                                    .send((client, Err(ErrorKind::FailedOperation.into())))?;
                             }
                             NodeEvent::Disconnect { cause } => {
                                 tracing::info!(
