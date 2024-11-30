@@ -97,15 +97,17 @@ start-gateways: generate-gw-config
 	@echo "→ Starting gateways..."
 	@for i in $$(seq 1 $(N_GATEWAYS)); do \
 		port=$$(( $(BASE_PORT) + $$i )); \
+		ws_port=$$(( $(WS_BASE_PORT) + $$i )); \
 		($(ENV_VARS) freenet network \
 			--is-gateway \
+			--ws-api-port $$ws_port \
 			--public-network-address 127.0.0.1 \
 			--public-network-port $$port \
 			--db-dir $(BASE_DIR)/gw$$i \
 			--transport-keypair $(KEYS_DIR)/gw$${i}_private_key.pem \
 			--network-port $$port $(call LOG_CMD,$(LOGS_DIR)/gw$$i.log)) & \
 		echo $$! > $(PID_DIR)/gw$$i.pid; \
-		echo "  Gateway $$i: port=$$port (PID: $$!)"; \
+		echo "  Gateway $$i: port=$$port, ws=$$ws_port (PID: $$!)"; \
 	done
 	@echo "  Waiting 2 seconds for gateways to initialize..."
 	@sleep 2
@@ -114,7 +116,7 @@ start-nodes:
 	@echo "→ Starting nodes..."
 	@for i in $$(seq 1 $(N_NODES)); do \
 		network_port=$$(( $(BASE_PORT) + $(N_GATEWAYS) + $$i )); \
-		ws_port=$$(( $(WS_BASE_PORT) + $$i )); \
+		ws_port=$$(( $(WS_BASE_PORT) + $(N_GATEWAYS) + $$i )); \
 		public_port=$$(( $(WS_BASE_PORT) + $(N_NODES) + $$i )); \
 		($(ENV_VARS) freenet network \
 			--config-dir $(BASE_DIR) \

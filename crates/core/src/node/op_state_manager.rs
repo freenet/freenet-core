@@ -84,6 +84,7 @@ impl OpManager {
                 rx,
                 ops.clone(),
                 ring.live_tx_tracker.clone(),
+                notification_channel.clone(),
                 event_register,
             )
             .instrument(garbage_span),
@@ -229,6 +230,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     mut new_transactions: tokio::sync::mpsc::Receiver<Transaction>,
     ops: Arc<Ops>,
     live_tx_tracker: LiveTransactionTracker,
+    event_loop_notifier: EventLoopNotificationsSender,
     mut event_register: ER,
 ) {
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
@@ -299,6 +301,8 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     };
                     if removed {
                         live_tx_tracker.remove_finished_transaction(tx);
+                        tracing::debug!("Transaction timed out: {tx}");
+                        event_loop_notifier.send(Either::Right(NodeEvent::TransactionTimedOut(tx))).await.unwrap();
                     }
                 }
             }

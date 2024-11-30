@@ -316,6 +316,7 @@ pub(crate) enum NodeEvent {
     QueryConnections {
         callback: tokio::sync::mpsc::Sender<QueryResult>,
     },
+    TransactionTimedOut(Transaction),
 }
 
 pub(crate) enum QueryResult {
@@ -344,6 +345,9 @@ impl Display for NodeEvent {
             }
             NodeEvent::QueryConnections { .. } => {
                 write!(f, "QueryConnections")
+            }
+            NodeEvent::TransactionTimedOut(transaction) => {
+                write!(f, "Transaction timed out ({})", transaction)
             }
         }
     }
