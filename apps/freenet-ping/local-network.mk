@@ -89,7 +89,7 @@ generate-keys:
 
 # Network Management
 # ------------------------------------------
-start: start-gateways start-nodes
+start: stop start-gateways start-nodes
 	@echo "→ Network started successfully"
 	@$(MAKE) -f local-network.mk status
 
@@ -231,6 +231,9 @@ stop:
 		done; \
 	fi
 	@echo "→ All processes stopped"
+	@echo "→ Cleaning all log files..."
+	@rm -rf $(LOGS_DIR)/*.log
+	@echo "→ Logs cleanup complete"
 
 clean: stop
 	@echo "→ Cleaning all files..."

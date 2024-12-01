@@ -7,16 +7,17 @@ SHELL := /bin/bash
 
 # Project Structure
 # ------------------------------------------
-PROJECT_ROOT    := $(shell pwd)
+PROJECT_ROOT   := $(shell pwd)
 PING_CONTRACT  := $(PROJECT_ROOT)/contracts/ping
 PING_APP       := $(PROJECT_ROOT)/app
 BUILD_DIR      := $(PING_CONTRACT)/target
+BASE_DIR 	   := $(HOME_DIR)/.cache/freenet
 
 
 # Log Command with ANSI color removal
 # ------------------------------------------
 define LOG_CMD
-1> >(stdbuf -o0 sed 's/\x1b\[[0-9;]*m//g' >> $(1)) 2>&1
+1> >(stdbuf -o0 sed 's/\x1b\[[0-9;]*m//g' > $(1)) 2>&1
 endef
 
 # Build Tools
@@ -95,16 +96,18 @@ install: build
 
 # Run Application
 # ------------------------------------------
-run: install
+run:
 	@echo "→ Running freenet-ping..."
 	@echo "  WebSocket Port: $(WS_PORT)"
 	@echo "  Update Frequency: $(FREQUENCY)"
 	@echo "  TTL: $(TTL)"
+	@mkdir -p $(BASE_DIR)/apps
 	@freenet-ping \
 		--host "localhost:$(WS_PORT)" \
 		--log-level $(LOG_LEVEL) \
 		--frequency $(FREQUENCY) \
-		--ttl $(TTL)
+		--ttl $(TTL) \
+		$(call LOG_CMD,$(BASE_DIR)/apps/ping_$(WS_PORT).log)
 
 # Cleanup
 # ------------------------------------------
