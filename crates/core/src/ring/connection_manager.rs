@@ -261,16 +261,19 @@ impl ConnectionManager {
         }
         self.open_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let mut cbl = self.connections_by_location.write();
-        cbl.entry(loc).or_default().push(Connection {
-            location: PeerKeyLocation {
-                peer: peer.clone(),
-                location: Some(loc),
-            },
-            open_at: Instant::now(),
-        });
-        self.location_for_peer.write().insert(peer.clone(), loc);
-        std::mem::drop(cbl);
+        let mut lop = self.location_for_peer.write();
+        lop.insert(peer.clone(), loc);
+        {
+            let mut cbl = self.connections_by_location.write();
+            cbl.entry(loc).or_default().push(Connection {
+                location: PeerKeyLocation {
+                    peer: peer.clone(),
+                    location: Some(loc),
+                },
+                open_at: Instant::now(),
+            });
+        }
+        std::mem::drop(lop);
     }
 
     fn prune_connection(&self, peer: &PeerId, is_alive: bool) -> Option<Location> {
@@ -279,8 +282,8 @@ impl ConnectionManager {
 
         let Some(loc) = self.location_for_peer.write().remove(peer) else {
             if is_alive {
-                self.open_connections
-                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                tracing::debug!("no location found for peer, skip pruning");
+                return None;
             } else {
                 self.reserved_connections
                     .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);

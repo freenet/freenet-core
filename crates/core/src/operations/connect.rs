@@ -255,7 +255,6 @@ impl Operation for ConnectOp {
                         },
                     ..
                 } => {
-                    //debug_assert_ne!(sender.peer, joiner.peer);
                     if sender.peer == joiner.peer {
                         tracing::warn!(
                             tx = %id,
