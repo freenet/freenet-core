@@ -7,6 +7,7 @@ SHELL := /bin/bash
 
 # Project Structure
 # ------------------------------------------
+HOME_DIR := $(HOME)
 PROJECT_ROOT   := $(shell pwd)
 PING_CONTRACT  := $(PROJECT_ROOT)/contracts/ping
 PING_APP       := $(PROJECT_ROOT)/app

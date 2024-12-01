@@ -25,15 +25,15 @@ use super::OpManager;
 
 pub(crate) struct NodeP2P {
     pub(crate) op_manager: Arc<OpManager>,
+    pub(super) conn_manager: P2pConnManager,
+    pub(super) peer_id: Option<PeerId>,
+    pub(super) is_gateway: bool,
     notification_channel: EventLoopNotificationsReceiver,
     client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
-    pub(super) conn_manager: P2pConnManager,
     executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
     cli_response_sender: ClientResponsesSender,
     node_controller: tokio::sync::mpsc::Receiver<NodeEvent>,
     should_try_connect: bool,
-    pub(super) peer_id: Option<PeerId>,
-    pub(super) is_gateway: bool,
 }
 
 impl NodeP2P {

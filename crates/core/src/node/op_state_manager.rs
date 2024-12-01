@@ -265,14 +265,13 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         TransactionType::Subscribe => ops.subscribe.remove(&tx).is_none(),
                         TransactionType::Update => ops.update.remove(&tx).is_none(),
                     };
-                    let timed_out = tx.timed_out();
-                    if still_waiting && !timed_out {
+                    if still_waiting  {
                         delayed.push(tx);
                     } else {
-                        if still_waiting && timed_out {
-                            ops.under_progress.remove(&tx);
-                            ops.completed.remove(&tx);
-                        }
+                        ops.under_progress.remove(&tx);
+                        ops.completed.remove(&tx);
+                        tracing::debug!("Transaction timed out: {tx}");
+                        event_loop_notifier.send(Either::Right(NodeEvent::TransactionTimedOut(tx))).await.unwrap();
                         live_tx_tracker.remove_finished_transaction(tx);
                     }
                 }
@@ -285,12 +284,12 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         continue;
                     }
                     if let Some(tx) = ops.completed.remove(&tx) {
+                        tracing::debug!("Clean up timed out: {tx}");
                         if cfg!(feature = "trace-ot") {
                             event_register.notify_of_time_out(tx).await;
                         } else {
                             _ = tx;
                         }
-                        continue;
                     }
                     let removed = match tx.transaction_type() {
                         TransactionType::Connect => ops.connect.remove(&tx).is_some(),
@@ -300,9 +299,9 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         TransactionType::Update => ops.update.remove(&tx).is_some(),
                     };
                     if removed {
-                        live_tx_tracker.remove_finished_transaction(tx);
                         tracing::debug!("Transaction timed out: {tx}");
                         event_loop_notifier.send(Either::Right(NodeEvent::TransactionTimedOut(tx))).await.unwrap();
+                        live_tx_tracker.remove_finished_transaction(tx);
                     }
                 }
             }
