@@ -210,13 +210,12 @@ impl Operation for UpdateOp {
                     key,
                     new_value,
                     sender,
+                    target,
                 } => {
                     if let Some(UpdateState::AwaitingResponse { .. }) = self.state {
                         tracing::debug!("Trying to broadcast to a peer that was the initiator of the op because it received the client request, or is in the middle of a seek node process");
                         return Err(OpError::StatePushed);
-                    };
-
-                    let target = op_manager.ring.connection_manager.own_location();
+                    }
 
                     tracing::debug!("Attempting contract value update - BroadcastTo - update");
                     let new_value = update_contract(
@@ -274,6 +273,7 @@ impl Operation for UpdateOp {
                             key: *key,
                             new_value: new_value.clone(),
                             sender: sender.clone(),
+                            target: peer.clone(),
                         };
                         let f = conn_manager.send(&peer.peer, msg.into());
                         broadcasting.push(f);
@@ -628,6 +628,7 @@ mod messages {
 
     use freenet_stdlib::prelude::{ContractKey, RelatedContracts, StateSummary, WrappedState};
     use serde::{Deserialize, Serialize};
+    use wasmer::Target;
 
     use crate::{
         message::{InnerMessage, Transaction},
@@ -679,6 +680,7 @@ mod messages {
             sender: PeerKeyLocation,
             key: ContractKey,
             new_value: WrappedState,
+            target: PeerKeyLocation,
         },
     }
 
@@ -699,6 +701,7 @@ mod messages {
                 UpdateMsg::RequestUpdate { target, .. } => Some(target),
                 UpdateMsg::SuccessfulUpdate { target, .. } => Some(target),
                 UpdateMsg::SeekNode { target, .. } => Some(target),
+                UpdateMsg::BroadcastTo { target, .. } => Some(target),
                 _ => None,
             }
         }
