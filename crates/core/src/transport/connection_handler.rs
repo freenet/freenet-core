@@ -643,6 +643,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                         cause: "invalid symmetric key".into(),
                                                     }
                                                 })?;
+                                            tracing::debug!(%remote_addr, "Sending back ack connection: {:?}", key);
                                             outbound_packets
                                                 .send((
                                                     remote_addr,
