@@ -417,6 +417,8 @@ impl<S: Socket> UdpPacketsListener<S> {
             let inbound_key = Aes128Gcm::new(&inbound_key_bytes.into());
             let outbound_ack_packet =
                 SymmetricMessage::ack_ok(&outbound_key, inbound_key_bytes, remote_addr)?;
+            
+            tracing::debug!(%remote_addr, "Sending outbound ack packet: {:?}", outbound_ack_packet.data());
 
             let mut waiting_time = INITIAL_INTERVAL;
             let mut attempts = 0;
@@ -433,7 +435,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 match timeout.await {
                     Ok(Some(packet)) => {
                         let _ = packet.try_decrypt_sym(&inbound_key).map_err(|_| {
-                            tracing::debug!(%remote_addr, "Failed to decrypt packet with inbound key");
+                            tracing::debug!(%remote_addr, "Failed to decrypt packet with inbound key: {:?}", packet.data());
                             TransportError::ConnectionEstablishmentFailure {
                                 cause: "invalid symmetric key".into(),
                             }
@@ -610,6 +612,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             ConnectionState::StartOutbound { .. } => {
                                 // at this point it's either the remote sending us an intro packet or a symmetric packet
                                 // cause is the first packet that passes through the NAT
+                                tracing::debug!(%remote_addr, "received packet from remote: {:?}", packet.data());
                                 if let Ok(decrypted_packet) =
                                     packet.try_decrypt_sym(&inbound_sym_key)
                                 {
