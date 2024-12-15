@@ -14,9 +14,11 @@ use futures::{
     Future,
 };
 use futures::{FutureExt, TryFutureExt};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task;
+use tokio::{task, task_local};
 use tracing::{span, Instrument};
 
 use super::{
@@ -127,7 +129,7 @@ impl OutboundConnectionHandler {
         };
 
         task::spawn(bw_tracker.rate_limiter(BANDWITH_LIMIT, socket));
-        task::spawn(transport.listen());
+        task::spawn(RANDOM_U64.scope(StdRng::from_entropy().gen(), transport.listen()));
 
         Ok((connection_handler, new_connection_notifier))
     }
@@ -218,6 +220,9 @@ impl<T> Drop for UdpPacketsListener<T> {
         tracing::info!(%self.this_addr, "Dropping UdpPacketsListener");
     }
 }
+task_local! {
+    static RANDOM_U64: [u8; 8];
+}
 
 impl<S: Socket> UdpPacketsListener<S> {
     #[tracing::instrument(level = "debug", name = "transport_listener", fields(peer = %self.this_peer_keypair.public), skip_all)]
@@ -231,6 +236,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         > = BTreeMap::new();
         let mut connection_tasks = FuturesUnordered::new();
         let mut gw_connection_tasks = FuturesUnordered::new();
+
         loop {
             tokio::select! {
                 // Handling of inbound packets
@@ -265,7 +271,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 continue;
                             }
                             let packet_data = PacketData::from_buf(&buf[..size]);
-                            let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr);
+                            let inbound_key_bytes = key_from_addr(&remote_addr);
+                            let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
                             let task = tokio::spawn(gw_ongoing_connection
                                 .instrument(tracing::span!(tracing::Level::DEBUG, "gateway_connection"))
                                 .map_err(move |error| {
@@ -365,6 +372,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         &mut self,
         remote_intro_packet: PacketData<UnknownEncryption>,
         remote_addr: SocketAddr,
+        inbound_key_bytes: [u8; 16],
     ) -> (
         impl Future<
                 Output = Result<
@@ -413,11 +421,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                 });
             }
 
-            let inbound_key_bytes = rand::random::<[u8; 16]>();
             let inbound_key = Aes128Gcm::new(&inbound_key_bytes.into());
             let outbound_ack_packet =
                 SymmetricMessage::ack_ok(&outbound_key, inbound_key_bytes, remote_addr)?;
-            
+
             tracing::debug!(%remote_addr, "Sending outbound ack packet: {:?}", outbound_ack_packet.data());
 
             let mut waiting_time = INITIAL_INTERVAL;
@@ -792,6 +799,35 @@ impl<S: Socket> UdpPacketsListener<S> {
         };
         (f, inbound_from_remote)
     }
+}
+
+fn key_from_addr(addr: &SocketAddr) -> [u8; 16] {
+    let current_time = chrono::Utc::now();
+    let mut hasher = blake3::Hasher::new();
+    match addr {
+        SocketAddr::V4(v4) => {
+            hasher.update(&v4.ip().octets());
+            hasher.update(&v4.port().to_le_bytes());
+        }
+        SocketAddr::V6(v6) => {
+            hasher.update(&v6.ip().octets());
+            hasher.update(&v6.port().to_le_bytes());
+        }
+    }
+    hasher.update(
+        current_time
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp()
+            .to_le_bytes()
+            .as_ref(),
+    );
+    RANDOM_U64.with(|&random_value| {
+        hasher.update(random_value.as_ref());
+    });
+    hasher.finalize().as_bytes()[..16].try_into().unwrap()
 }
 
 pub(crate) enum ConnectionEvent {
