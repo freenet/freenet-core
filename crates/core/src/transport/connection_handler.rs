@@ -513,7 +513,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         // Constants for exponential backoff
-        const INITIAL_TIMEOUT: Duration = Duration::from_millis(15);
+        const INITIAL_TIMEOUT: Duration = Duration::from_millis(200);
         const TIMEOUT_MULTIPLIER: f64 = 1.2;
         #[cfg(not(test))]
         const MAX_TIMEOUT: Duration = Duration::from_secs(60); // Maximum timeout limit
