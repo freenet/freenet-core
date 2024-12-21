@@ -558,15 +558,16 @@ fn build_op_result(
     backoff: Option<ExponentialBackoff>,
 ) -> Result<OperationResult, OpError> {
     tracing::debug!(tx = %id, ?msg, "Connect operation result");
-    let output_op = Some(OpEnum::Connect(Box::new(ConnectOp {
-        id,
-        state,
-        gateway,
-        backoff,
-    })));
     Ok(OperationResult {
         return_msg: msg.map(NetMessage::from),
-        state: output_op,
+        state: state.map(|state| {
+            OpEnum::Connect(Box::new(ConnectOp {
+                id,
+                state: Some(state),
+                gateway,
+                backoff,
+            }))
+        }),
     })
 }
 

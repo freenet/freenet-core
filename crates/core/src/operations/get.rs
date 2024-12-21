@@ -829,9 +829,9 @@ fn build_op_result(
     result: Option<GetResult>,
     stats: Option<Box<GetStats>>,
 ) -> Result<OperationResult, OpError> {
-    let output_op = Some(GetOp {
+    let output_op = state.map(|state| GetOp {
         id,
-        state,
+        state: Some(state),
         result,
         stats,
     });
