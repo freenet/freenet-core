@@ -472,24 +472,15 @@ fn build_op_result(
     return_msg: Option<UpdateMsg>,
     stats: Option<UpdateStats>,
 ) -> Result<super::OperationResult, OpError> {
-    let mut state_is_none = false;
-    if state.as_ref().is_none() {
-        state_is_none = true;
-    }
-
-    let output_op = Some(UpdateOp { id, state, stats });
-
-    let op_enum_update = output_op.map(OpEnum::Update);
-
+    let output_op = state.map(|op| UpdateOp {
+        id,
+        state: Some(op),
+        stats,
+    });
+    let state = output_op.map(OpEnum::Update);
     Ok(OperationResult {
         return_msg: return_msg.map(NetMessage::from),
-        state: {
-            if state_is_none {
-                None
-            } else {
-                op_enum_update
-            }
-        },
+        state,
     })
 }
 
@@ -628,7 +619,6 @@ mod messages {
 
     use freenet_stdlib::prelude::{ContractKey, RelatedContracts, StateSummary, WrappedState};
     use serde::{Deserialize, Serialize};
-    use wasmer::Target;
 
     use crate::{
         message::{InnerMessage, Transaction},

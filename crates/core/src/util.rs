@@ -262,19 +262,19 @@ pub(crate) trait Contains<T> {
     fn has_element(&self, target: &T) -> bool;
 }
 
-impl<'x> Contains<PeerId> for &'x [PeerId] {
+impl Contains<PeerId> for &[PeerId] {
     fn has_element(&self, target: &PeerId) -> bool {
         self.contains(target)
     }
 }
 
-impl<'x> Contains<PeerId> for &'x [&PeerId] {
+impl Contains<PeerId> for &[&PeerId] {
     fn has_element(&self, target: &PeerId) -> bool {
         self.contains(&target)
     }
 }
 
-impl<'x> Contains<PeerId> for &'x Vec<&PeerId> {
+impl Contains<PeerId> for &Vec<&PeerId> {
     fn has_element(&self, target: &PeerId) -> bool {
         self.contains(&target)
     }

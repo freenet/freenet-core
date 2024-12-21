@@ -752,7 +752,7 @@ impl<'a> Iterator for ConfigPathsIter<'a> {
     }
 }
 
-impl<'a> core::iter::FusedIterator for ConfigPathsIter<'a> {}
+impl core::iter::FusedIterator for ConfigPathsIter<'_> {}
 
 impl Config {
     pub fn db_dir(&self) -> PathBuf {
