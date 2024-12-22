@@ -243,7 +243,10 @@ impl ConfigArgs {
                 // TODO: remove local-simulation feature and use runtime flags
                 #[cfg(all(not(any(test, debug_assertions)), not(feature = "local-simulation")))]
                 {
-                    if peer_id.is_none() && mode == OperationMode::Network {
+                    if peer_id.is_none()
+                        && mode == OperationMode::Network
+                        && remotely_loaded_gateways.gateways.is_empty()
+                    {
                         tracing::error!(file = ?gateways_file, "Failed to read gateways file: {err}");
 
                         return Err(anyhow::Error::new(std::io::Error::new(
