@@ -1,9 +1,10 @@
 use std::{
+    collections::HashSet,
     fs::{self, File},
     future::Future,
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
@@ -223,15 +224,18 @@ impl ConfigArgs {
                 )
             });
         let gateways_file = config_paths.config_dir.join("gateways.toml");
-        let gateways = match File::open(&*gateways_file) {
+        let remotely_loaded_gateways = futures::executor::block_on(load_gateways_from_index(
+            "https://freenet.org/gateways.toml",
+            &config_paths.secrets_dir,
+        ))
+        .unwrap_or_default();
+        let mut gateways = match File::open(&*gateways_file) {
             Ok(mut file) => {
                 let mut content = String::new();
                 file.read_to_string(&mut content)?;
-                toml::from_str::<Gateways>(&content)
-                    .map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                    })?
-                    .gateways
+                toml::from_str::<Gateways>(&content).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })?
             }
             Err(err) => {
                 // TODO: remove local-simulation feature and use runtime flags
@@ -248,9 +252,11 @@ impl ConfigArgs {
                 }
                 let _ = err;
                 tracing::warn!("No gateways file found, initializing disjoint gateway.");
-                vec![]
+                Gateways { gateways: vec![] }
             }
         };
+        gateways.merge_and_deduplicate(remotely_loaded_gateways);
+        gateways.save_to_file(&gateways_file)?;
 
         let this = Config {
             mode,
@@ -280,7 +286,7 @@ impl ConfigArgs {
             secrets,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
             config_paths: Arc::new(config_paths),
-            gateways,
+            gateways: gateways.gateways,
             is_gateway: self.network_listener.is_gateway,
         };
 
@@ -772,12 +778,28 @@ impl Config {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 struct Gateways {
     pub gateways: Vec<GatewayConfig>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+impl Gateways {
+    pub fn merge_and_deduplicate(&mut self, other: Gateways) {
+        let mut existing_gateways: HashSet<_> = self.gateways.drain(..).collect();
+        for gateway in other.gateways {
+            existing_gateways.insert(gateway);
+        }
+        self.gateways = existing_gateways.into_iter().collect();
+    }
+
+    pub fn save_to_file(&self, path: &Path) -> anyhow::Result<()> {
+        let content = toml::to_string(self)?;
+        fs::write(path, content)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct GatewayConfig {
     /// Address of the gateway. It can be either a hostname or an IP address and port.
     pub address: Address,
@@ -787,7 +809,7 @@ pub struct GatewayConfig {
     pub public_key_path: PathBuf,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Address {
     #[serde(rename = "hostname")]
     Hostname(String),
@@ -847,8 +869,33 @@ pub fn set_logger(level: Option<tracing::level_filters::LevelFilter>, endpoint: 
     }
 }
 
+async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Result<Gateways> {
+    let response = reqwest::get(url).await?.error_for_status()?.text().await?;
+    let mut gateways: Gateways = toml::from_str(&response)?;
+    let mut base_url = reqwest::Url::parse(url)?;
+    base_url.set_path("");
+
+    for gateway in &mut gateways.gateways {
+        let public_key_url = base_url.join(&gateway.public_key_path.to_string_lossy())?;
+        let public_key_response = reqwest::get(public_key_url).await?.error_for_status()?;
+        let file_name = gateway
+            .public_key_path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("Invalid public key path"))?;
+        let local_path = pub_keys_dir.join(file_name);
+        let mut public_key_file = File::create(&local_path)?;
+        let content = public_key_response.bytes().await?;
+        std::io::copy(&mut content.as_ref(), &mut public_key_file)?;
+        gateway.public_key_path = local_path;
+    }
+
+    Ok(gateways)
+}
+
 #[cfg(test)]
 mod tests {
+    use httptest::{matchers::*, responders::*, Expectation, Server};
+
     use super::*;
 
     #[test]
@@ -857,6 +904,44 @@ mod tests {
         let cfg = args.build().unwrap();
         let serialized = toml::to_string(&cfg).unwrap();
         let _: Config = toml::from_str(&serialized).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_load_gateways_from_index() {
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of!(request::method("GET"), request::path("/gateways")))
+                .respond_with(status_code(200).body(
+                    r#"
+                    [[gateways]]
+                    address = { hostname = "example.com" }
+                    public_key = "/path/to/public_key.pem"
+                    "#,
+                )),
+        );
+
+        let url = server.url_str("/gateways");
+
+        server.expect(
+            Expectation::matching(request::path("/path/to/public_key.pem"))
+                .respond_with(status_code(200).body("-----BEGIN PUBLIC KEY-----\n...")),
+        );
+
+        let pub_keys_dir = tempfile::tempdir().unwrap();
+        let gateways = load_gateways_from_index(&url, pub_keys_dir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(gateways.gateways.len(), 1);
+        assert_eq!(
+            gateways.gateways[0].address,
+            Address::Hostname("example.com".to_string())
+        );
+        assert_eq!(
+            gateways.gateways[0].public_key_path,
+            pub_keys_dir.path().join("public_key.pem")
+        );
+        assert!(pub_keys_dir.path().join("public_key.pem").exists());
     }
 
     #[test]
