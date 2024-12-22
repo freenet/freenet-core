@@ -1,5 +1,5 @@
 #!/bin/bash
-# freenet-node-setup.sh - Unified Gateway and Node setup script
+# freenet-setup.sh - Unified Gateway and Node setup script
 
 # Check if required parameters are provided
 if [ -z "$1" ] || [ -z "$2" ]; then
