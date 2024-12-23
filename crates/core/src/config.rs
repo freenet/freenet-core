@@ -924,6 +924,8 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
 mod tests {
     use httptest::{matchers::*, responders::*, Expectation, Server};
 
+    use pkcs8::EncodePublicKey;
+
     use super::*;
 
     #[test]
@@ -950,9 +952,14 @@ mod tests {
 
         let url = server.url_str("/gateways");
 
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 256).unwrap();
+        let key = key
+            .to_public_key()
+            .to_public_key_pem(pkcs8::LineEnding::LF)
+            .unwrap();
         server.expect(
             Expectation::matching(request::path("/path/to/public_key.pem"))
-                .respond_with(status_code(200).body("-----BEGIN PUBLIC KEY-----\n...")),
+                .respond_with(status_code(200).body(key.as_str().to_string())),
         );
 
         let pub_keys_dir = tempfile::tempdir().unwrap();
