@@ -9,9 +9,11 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context;
 use directories::ProjectDirs;
 use either::Either;
 use once_cell::sync::Lazy;
+use pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
@@ -799,7 +801,7 @@ impl Gateways {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone)]
 pub struct GatewayConfig {
     /// Address of the gateway. It can be either a hostname or an IP address and port.
     pub address: Address,
@@ -809,7 +811,7 @@ pub struct GatewayConfig {
     pub public_key_path: PathBuf,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone)]
 pub enum Address {
     #[serde(rename = "hostname")]
     Hostname(String),
@@ -874,6 +876,7 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
     let mut gateways: Gateways = toml::from_str(&response)?;
     let mut base_url = reqwest::Url::parse(url)?;
     base_url.set_path("");
+    let mut valid_gateways = Vec::new();
 
     for gateway in &mut gateways.gateways {
         let public_key_url = base_url.join(&gateway.public_key_path.to_string_lossy())?;
@@ -886,9 +889,27 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
         let mut public_key_file = File::create(&local_path)?;
         let content = public_key_response.bytes().await?;
         std::io::copy(&mut content.as_ref(), &mut public_key_file)?;
-        gateway.public_key_path = local_path;
+
+        // Validate the public key
+        let mut key_file = File::open(&local_path).with_context(|| {
+            format!(
+                "failed loading gateway pubkey from {:?}",
+                gateway.public_key_path
+            )
+        })?;
+        let mut buf = String::new();
+        key_file.read_to_string(&mut buf)?;
+        if rsa::RsaPublicKey::from_public_key_pem(&buf).is_ok() {
+            tracing::warn!(
+                "Invalid public key found in remote gateway file: {:?}, ignoring",
+                gateway.public_key_path
+            );
+            gateway.public_key_path = local_path;
+            valid_gateways.push(gateway.clone());
+        }
     }
 
+    gateways.gateways = valid_gateways;
     Ok(gateways)
 }
 

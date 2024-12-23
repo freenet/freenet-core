@@ -392,6 +392,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn gateway_connection(
         &mut self,
         remote_intro_packet: PacketData<UnknownEncryption>,
@@ -514,6 +515,7 @@ impl<S: Socket> UdpPacketsListener<S> {
     #[cfg(test)]
     const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
 
+    #[allow(clippy::type_complexity)]
     fn traverse_nat(
         &mut self,
         remote_addr: SocketAddr,
