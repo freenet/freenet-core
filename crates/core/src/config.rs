@@ -226,11 +226,15 @@ impl ConfigArgs {
                 )
             });
         let gateways_file = config_paths.config_dir.join("gateways.toml");
-        let remotely_loaded_gateways = futures::executor::block_on(load_gateways_from_index(
-            "https://freenet.org/gateways.toml",
-            &config_paths.secrets_dir,
-        ))
-        .unwrap_or_default();
+        let remotely_loaded_gateways = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(load_gateways_from_index(
+                "https://freenet.org/gateways.toml",
+                &config_paths.secrets_dir,
+            ))
+            .unwrap_or_default();
         let mut gateways = match File::open(&*gateways_file) {
             Ok(mut file) => {
                 let mut content = String::new();
@@ -930,8 +934,8 @@ mod tests {
         let _: Config = toml::from_str(&serialized).unwrap();
     }
 
-    #[tokio::test]
-    async fn test_load_gateways_from_index() {
+    #[test]
+    fn test_load_gateways_from_index() {
         let server = Server::run();
         server.expect(
             Expectation::matching(all_of!(request::method("GET"), request::path("/gateways")))
@@ -952,8 +956,11 @@ mod tests {
         );
 
         let pub_keys_dir = tempfile::tempdir().unwrap();
-        let gateways = load_gateways_from_index(&url, pub_keys_dir.path())
-            .await
+        let gateways = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(load_gateways_from_index(&url, pub_keys_dir.path()))
             .unwrap();
 
         assert_eq!(gateways.gateways.len(), 1);
