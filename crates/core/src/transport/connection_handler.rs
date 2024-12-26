@@ -361,22 +361,24 @@ impl<S: Socket> UdpPacketsListener<S> {
         }
     }
 
+    type GatewayConnFuture = impl Future<
+            Output = Result<
+                (
+                    RemoteConnection,
+                    InboundRemoteConnection,
+                    PacketData<SymmetricAES>,
+                ),
+                TransportError,
+            >,
+        > + Send
+        + 'static;
+
     fn gateway_connection(
         &mut self,
         remote_intro_packet: PacketData<UnknownEncryption>,
         remote_addr: SocketAddr,
     ) -> (
-        impl Future<
-                Output = Result<
-                    (
-                        RemoteConnection,
-                        InboundRemoteConnection,
-                        PacketData<SymmetricAES>,
-                    ),
-                    TransportError,
-                >,
-            > + Send
-            + 'static,
+        Self::GatewayConnFuture,
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         let secret = self.this_peer_keypair.secret.clone();
@@ -493,14 +495,17 @@ impl<S: Socket> UdpPacketsListener<S> {
     #[cfg(test)]
     const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
 
+    type TraverseNatFuture = impl Future<
+            Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>
+        > + Send
+        + 'static;
+
     fn traverse_nat(
         &mut self,
         remote_addr: SocketAddr,
         remote_public_key: TransportPublicKey,
     ) -> (
-        impl Future<Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>>
-            + Send
-            + 'static,
+        Self::TraverseNatFuture,
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         // Constants for exponential backoff
