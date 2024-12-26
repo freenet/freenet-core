@@ -291,7 +291,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             let task = tokio::spawn({
                                 let span = tracing::span!(tracing::Level::DEBUG, "gateway_connection");
                                 async move {
-                                    match Box::pin(gw_ongoing_connection).await {
+                                    match Box::pin(gw_ongoing_connection).as_mut().await {
                                         Ok(result) => Ok(result),
                                         Err(error) => Err((error, remote_addr))
                                     }
@@ -380,7 +380,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     let task = tokio::spawn({
                         let span = span!(tracing::Level::DEBUG, "traverse_nat");
                         async move {
-                            match Box::pin(ongoing_connection).await {
+                            match Box::pin(ongoing_connection).as_mut().await {
                                 Ok(result) => Ok(result),
                                 Err(error) => Err((error, remote_addr))
                             }
