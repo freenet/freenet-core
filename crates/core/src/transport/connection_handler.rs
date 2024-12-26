@@ -33,7 +33,7 @@ use aes_gcm::{Aes128Gcm, KeyInit};
 use futures::FutureExt;
 use futures::{
     stream::{FuturesUnordered, StreamExt},
-    Future, TryFutureExt,
+    Future,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
@@ -291,7 +291,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                             let task = tokio::spawn({
                                 let span = tracing::span!(tracing::Level::DEBUG, "gateway_connection");
                                 async move {
-                                    gw_ongoing_connection.await.map_err(|error| (error, remote_addr))
+                                    async move {
+                                        match gw_ongoing_connection.await {
+                                            Ok(result) => Ok(result),
+                                            Err(error) => Err((error, remote_addr))
+                                        }
+                                    }
                                 }
                                 .instrument(span)
                             });
@@ -378,7 +383,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                     let task = tokio::spawn({
                         let span = span!(tracing::Level::DEBUG, "traverse_nat");
                         async move {
-                            ongoing_connection.await.map_err(|error| (error, remote_addr))
+                            async move {
+                                match ongoing_connection.await {
+                                    Ok(result) => Ok(result),
+                                    Err(error) => Err((error, remote_addr))
+                                }
+                            }
                         }
                         .instrument(span)
                     });
