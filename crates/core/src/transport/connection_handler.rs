@@ -1,4 +1,21 @@
 use std::collections::BTreeMap;
+
+type GatewayConnectionFuture = impl Future<
+    Output = Result<
+        (
+            RemoteConnection,
+            InboundRemoteConnection,
+            PacketData<SymmetricAES>,
+        ),
+        TransportError,
+    >,
+> + Send
+    + 'static;
+
+type TraverseNatFuture = impl Future<
+    Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>,
+> + Send
+    + 'static;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
@@ -366,20 +383,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         &mut self,
         remote_intro_packet: PacketData<UnknownEncryption>,
         remote_addr: SocketAddr,
-    ) -> (
-        impl Future<
-                Output = Result<
-                    (
-                        RemoteConnection,
-                        InboundRemoteConnection,
-                        PacketData<SymmetricAES>,
-                    ),
-                    TransportError,
-                >,
-            > + Send
-            + 'static,
-        mpsc::Sender<PacketData<UnknownEncryption>>,
-    ) {
+    ) -> (GatewayConnectionFuture, mpsc::Sender<PacketData<UnknownEncryption>>) {
         let secret = self.this_peer_keypair.secret.clone();
         let outbound_packets = self.outbound_packets.clone();
 
@@ -498,12 +502,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         &mut self,
         remote_addr: SocketAddr,
         remote_public_key: TransportPublicKey,
-    ) -> (
-        impl Future<Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>>
-            + Send
-            + 'static,
-        mpsc::Sender<PacketData<UnknownEncryption>>,
-    ) {
+    ) -> (TraverseNatFuture, mpsc::Sender<PacketData<UnknownEncryption>>) {
         // Constants for exponential backoff
         const INITIAL_TIMEOUT: Duration = Duration::from_millis(15);
         const TIMEOUT_MULTIPLIER: f64 = 1.2;

@@ -24,7 +24,7 @@ pub use executor::{Executor, ExecutorError, OperationMode};
 use executor::ContractExecutor;
 use tracing::Instrument;
 
-pub(crate) async fn contract_handling<'a, CH>(mut contract_handler: CH) -> Result<(), ContractError>
+pub(crate) async fn contract_handling<CH>(mut contract_handler: CH) -> Result<(), ContractError>
 where
     CH: ContractHandler + Send + 'static,
 {
