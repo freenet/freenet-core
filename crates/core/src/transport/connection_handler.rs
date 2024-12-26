@@ -9,11 +9,11 @@ use crate::transport::crypto::TransportSecretKey;
 use crate::transport::packet_data::{AssymetricRSA, UnknownEncryption};
 use crate::transport::symmetric_message::OutboundConnection;
 use aes_gcm::{Aes128Gcm, KeyInit};
+use futures::FutureExt;
 use futures::{
     stream::{FuturesUnordered, StreamExt},
     Future,
 };
-use futures::FutureExt;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
@@ -367,16 +367,16 @@ impl<S: Socket> UdpPacketsListener<S> {
         remote_addr: SocketAddr,
     ) -> (
         impl Future<
-            Output = Result<
-                (
-                    RemoteConnection,
-                    InboundRemoteConnection,
-                    PacketData<SymmetricAES>,
-                ),
-                TransportError,
-            >,
-        > + Send
-        + 'static,
+                Output = Result<
+                    (
+                        RemoteConnection,
+                        InboundRemoteConnection,
+                        PacketData<SymmetricAES>,
+                    ),
+                    TransportError,
+                >,
+            > + Send
+            + 'static,
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         let secret = self.this_peer_keypair.secret.clone();
