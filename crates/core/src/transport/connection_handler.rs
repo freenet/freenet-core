@@ -14,11 +14,11 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
     Future, TryFutureExt,
 };
-use tracing::Instrument;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
 use tracing::span;
+use tracing::Instrument;
 
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
