@@ -12,8 +12,9 @@ use aes_gcm::{Aes128Gcm, KeyInit};
 use futures::FutureExt;
 use futures::{
     stream::{FuturesUnordered, StreamExt},
-    Future,
+    Future, TryFutureExt,
 };
+use tracing::Instrument;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
