@@ -493,16 +493,14 @@ impl<S: Socket> UdpPacketsListener<S> {
     #[cfg(test)]
     const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
 
-    type TraverseNatFuture = impl Future<Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>>
-        + Send
-        + 'static;
-
     fn traverse_nat(
         &mut self,
         remote_addr: SocketAddr,
         remote_public_key: TransportPublicKey,
     ) -> (
-        Self::TraverseNatFuture,
+        impl Future<Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>>
+            + Send
+            + 'static,
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         // Constants for exponential backoff
