@@ -292,6 +292,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 let span = tracing::span!(tracing::Level::DEBUG, "gateway_connection");
                                 async move {
                                     async move {
+                                        let gw_ongoing_connection = Box::pin(gw_ongoing_connection);
                                         match gw_ongoing_connection.await {
                                             Ok(result) => Ok(result),
                                             Err(error) => Err((error, remote_addr))
@@ -384,6 +385,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                         let span = span!(tracing::Level::DEBUG, "traverse_nat");
                         async move {
                             async move {
+                                let ongoing_connection = Box::pin(ongoing_connection);
                                 match ongoing_connection.await {
                                     Ok(result) => Ok(result),
                                     Err(error) => Err((error, remote_addr))
