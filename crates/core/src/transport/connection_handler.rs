@@ -291,16 +291,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                             let task = tokio::spawn({
                                 let span = tracing::span!(tracing::Level::DEBUG, "gateway_connection");
                                 async move {
-                                    let future = Box::pin(gw_ongoing_connection);
-                                    match futures::Future::poll(Box::pin(&mut future).as_mut(), &mut std::task::Context::from_waker(futures::task::noop_waker_ref())) {
-                                        std::task::Poll::Ready(Ok(result)) => Ok(result),
-                                        std::task::Poll::Ready(Err(error)) => Err((error, remote_addr)),
-                                        std::task::Poll::Pending => Err((TransportError::ConnectionEstablishmentFailure {
-                                            cause: "Future not ready".into()
-                                        }, remote_addr))
+                                    match gw_ongoing_connection.await {
+                                        Ok(result) => Ok(result),
+                                        Err(error) => Err((error, remote_addr))
                                     }
-                                }
-                                .instrument(span)
+                                }.instrument(span)
                             });
                             ongoing_gw_connections.insert(remote_addr, packets_sender);
                             gw_connection_tasks.push(task);
@@ -385,16 +380,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                     let task = tokio::spawn({
                         let span = span!(tracing::Level::DEBUG, "traverse_nat");
                         async move {
-                            let future = Box::pin(ongoing_connection);
-                            match futures::Future::poll(Box::pin(&mut future).as_mut(), &mut std::task::Context::from_waker(futures::task::noop_waker_ref())) {
-                                std::task::Poll::Ready(Ok(result)) => Ok(result),
-                                std::task::Poll::Ready(Err(error)) => Err((error, remote_addr)),
-                                std::task::Poll::Pending => Err((TransportError::ConnectionEstablishmentFailure {
-                                    cause: "Future not ready".into()
-                                }, remote_addr))
+                            match ongoing_connection.await {
+                                Ok(result) => Ok(result),
+                                Err(error) => Err((error, remote_addr))
                             }
-                        }
-                        .instrument(span)
+                        }.instrument(span)
                     });
                     connection_tasks.push(task);
                     ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
