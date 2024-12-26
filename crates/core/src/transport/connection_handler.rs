@@ -495,9 +495,8 @@ impl<S: Socket> UdpPacketsListener<S> {
     #[cfg(test)]
     const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
 
-    type TraverseNatFuture = impl Future<
-            Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>
-        > + Send
+    type TraverseNatFuture = impl Future<Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>>
+        + Send
         + 'static;
 
     fn traverse_nat(
