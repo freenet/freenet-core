@@ -288,11 +288,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
                             let packet_data = PacketData::from_buf(&buf[..size]);
                             let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr);
-                            let task = tokio::spawn(gw_ongoing_connection
-                                .instrument(tracing::span!(tracing::Level::DEBUG, "gateway_connection"))
-                                .map_err(move |error| {
-                                (error, remote_addr)
-                            }));
+                            let task = tokio::spawn(
+                                gw_ongoing_connection
+                                    .map_err(move |error| (error, remote_addr))
+                                    .instrument(tracing::span!(tracing::Level::DEBUG, "gateway_connection"))
+                            );
                             ongoing_gw_connections.insert(remote_addr, packets_sender);
                             gw_connection_tasks.push(task);
                         }
@@ -373,9 +373,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                     let (ongoing_connection, packets_sender) = self.traverse_nat(
                         remote_addr,  remote_public_key,
                     );
-                    let task = tokio::spawn(ongoing_connection.map_err(move |error| {
-                        (error, remote_addr)
-                    }).instrument(span!(tracing::Level::DEBUG, "traverse_nat")));
+                    let task = tokio::spawn(
+                        ongoing_connection
+                            .map_err(move |error| (error, remote_addr))
+                            .instrument(span!(tracing::Level::DEBUG, "traverse_nat"))
+                    );
                     connection_tasks.push(task);
                     ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
                 },
