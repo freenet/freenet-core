@@ -292,10 +292,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 let span = tracing::span!(tracing::Level::DEBUG, "gateway_connection");
                                 async move {
                                     let future = Box::pin(gw_ongoing_connection);
-                                    match futures::Future::poll(unsafe { Pin::new_unchecked(&mut future) }, &mut std::task::Context::from_waker(futures::task::noop_waker_ref())) {
+                                    match futures::Future::poll(Box::pin(&mut future).as_mut(), &mut std::task::Context::from_waker(futures::task::noop_waker_ref())) {
                                         std::task::Poll::Ready(Ok(result)) => Ok(result),
                                         std::task::Poll::Ready(Err(error)) => Err((error, remote_addr)),
-                                        std::task::Poll::Pending => Ok(result)
+                                        std::task::Poll::Pending => Err((TransportError::ConnectionEstablishmentFailure {
+                                            cause: "Future not ready".into()
+                                        }, remote_addr))
                                     }
                                 }
                                 .instrument(span)
@@ -384,10 +386,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                         let span = span!(tracing::Level::DEBUG, "traverse_nat");
                         async move {
                             let future = Box::pin(ongoing_connection);
-                            match futures::Future::poll(unsafe { Pin::new_unchecked(&mut future) }, &mut std::task::Context::from_waker(futures::task::noop_waker_ref())) {
+                            match futures::Future::poll(Box::pin(&mut future).as_mut(), &mut std::task::Context::from_waker(futures::task::noop_waker_ref())) {
                                 std::task::Poll::Ready(Ok(result)) => Ok(result),
                                 std::task::Poll::Ready(Err(error)) => Err((error, remote_addr)),
-                                std::task::Poll::Pending => Ok(result)
+                                std::task::Poll::Pending => Err((TransportError::ConnectionEstablishmentFailure {
+                                    cause: "Future not ready".into()
+                                }, remote_addr))
                             }
                         }
                         .instrument(span)
