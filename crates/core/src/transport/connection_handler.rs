@@ -13,11 +13,11 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
     Future,
 };
-use futures::{FutureExt, TryFutureExt};
+use futures::FutureExt;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
-use tracing::{span, Instrument};
+use tracing::span;
 
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
@@ -361,7 +361,12 @@ impl<S: Socket> UdpPacketsListener<S> {
         }
     }
 
-    type GatewayConnFuture = impl Future<
+    fn gateway_connection(
+        &mut self,
+        remote_intro_packet: PacketData<UnknownEncryption>,
+        remote_addr: SocketAddr,
+    ) -> (
+        impl Future<
             Output = Result<
                 (
                     RemoteConnection,
@@ -371,14 +376,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 TransportError,
             >,
         > + Send
-        + 'static;
-
-    fn gateway_connection(
-        &mut self,
-        remote_intro_packet: PacketData<UnknownEncryption>,
-        remote_addr: SocketAddr,
-    ) -> (
-        Self::GatewayConnFuture,
+        + 'static,
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         let secret = self.this_peer_keypair.secret.clone();
