@@ -1,21 +1,25 @@
 use std::collections::BTreeMap;
 
-type GatewayConnectionFuture = impl Future<
-    Output = Result<
-        (
-            RemoteConnection,
-            InboundRemoteConnection,
-            PacketData<SymmetricAES>,
-        ),
-        TransportError,
-    >,
-> + Send
-    + 'static;
+type GatewayConnectionFuture = Box<
+    dyn Future<
+        Output = Result<
+            (
+                RemoteConnection,
+                InboundRemoteConnection,
+                PacketData<SymmetricAES>,
+            ),
+            TransportError,
+        >,
+    > + Send
+        + 'static,
+>;
 
-type TraverseNatFuture = impl Future<
-    Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>,
-> + Send
-    + 'static;
+type TraverseNatFuture = Box<
+    dyn Future<
+        Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>,
+    > + Send
+        + 'static,
+>;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
@@ -488,7 +492,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             tracing::debug!("returning connection at gw");
             Ok((remote_conn, inbound_conn, outbound_ack_packet))
         };
-        (f, inbound_from_remote)
+        (Box::new(f), inbound_from_remote)
     }
 
     // TODO: this value should be set given exponential backoff and max timeout
@@ -786,7 +790,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 cause: "max connection attempts reached".into(),
             })
         };
-        (f, inbound_from_remote)
+        (Box::new(f), inbound_from_remote)
     }
 }
 
