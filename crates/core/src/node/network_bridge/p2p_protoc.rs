@@ -6,6 +6,7 @@ use freenet_stdlib::client_api::ErrorKind;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
+use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -151,7 +152,7 @@ impl P2pConnManager {
         mut executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         cli_response_sender: ClientResponsesSender,
         mut node_controller: Receiver<NodeEvent>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Infallible> {
         tracing::info!(%self.listening_port, %self.listening_ip, %self.is_gateway, key = %self.key_pair.public(), "Opening network listener");
 
         let mut state = EventListenerState::new();
@@ -172,16 +173,21 @@ impl P2pConnManager {
         );
 
         loop {
-            let event = self
-                .wait_for_event(
+            let event = timeout(
+                Duration::from_secs(120),
+                self.wait_for_event(
                     &mut state,
                     &mut handshake_handler,
                     &mut notification_channel,
                     &mut node_controller,
                     &mut client_wait_for_transaction,
                     &mut executor_listener,
-                )
-                .await;
+                ),
+            )
+            .await
+            .inspect_err(|e| {
+                tracing::error!("Error while waiting for event: {:?}", e);
+            })?;
 
             match event {
                 EventResult::Continue => continue,
@@ -302,7 +308,9 @@ impl P2pConnManager {
                 }
             }
         }
-        Ok(())
+        Err(anyhow::anyhow!(
+            "Network event listener exited unexpectedly"
+        ))
     }
 
     async fn wait_for_event(
@@ -319,10 +327,10 @@ impl P2pConnManager {
                 self.handle_peer_connection_msg(msg, state).await
             }
             msg = notification_channel.0.recv() => {
-                self.handle_notification_msg(msg).await
+                self.handle_notification_msg(msg)
             }
             msg = self.conn_bridge_rx.recv() => {
-                self.handle_bridge_msg(msg).await
+                self.handle_bridge_msg(msg)
             }
             msg = handshake_handler.wait_for_events() => {
                 self.handle_handshake_msg(msg)
@@ -635,10 +643,7 @@ impl P2pConnManager {
         }
     }
 
-    async fn handle_notification_msg(
-        &self,
-        msg: Option<Either<NetMessage, NodeEvent>>,
-    ) -> EventResult {
+    fn handle_notification_msg(&self, msg: Option<Either<NetMessage, NodeEvent>>) -> EventResult {
         match msg {
             Some(Left(msg)) => EventResult::Event(ConnEvent::InboundMessage(msg)),
             Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action)),
@@ -646,7 +651,7 @@ impl P2pConnManager {
         }
     }
 
-    async fn handle_bridge_msg(&self, msg: Option<P2pBridgeEvent>) -> EventResult {
+    fn handle_bridge_msg(&self, msg: Option<P2pBridgeEvent>) -> EventResult {
         match msg {
             Some(Left((_, msg))) => EventResult::Event(ConnEvent::OutboundMessage(*msg)),
             Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action)),

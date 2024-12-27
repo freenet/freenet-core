@@ -9,10 +9,10 @@ use freenet_stdlib::{
 };
 use futures::stream::FuturesUnordered;
 use futures::{future::BoxFuture, StreamExt};
-use std::fmt::Debug;
 use std::fmt::Display;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::{convert::Infallible, fmt::Debug};
 use tracing::Instrument;
 
 use serde::{Deserialize, Serialize};
@@ -166,7 +166,8 @@ pub async fn client_event_handling<ClientEv>(
     mut client_events: ClientEv,
     mut client_responses: ClientResponsesReceiver,
     node_controller: tokio::sync::mpsc::Sender<NodeEvent>,
-) where
+) -> anyhow::Result<Infallible>
+where
     ClientEv: ClientEventsProxy + Send + 'static,
 {
     let mut callbacks = FuturesUnordered::new();
@@ -180,7 +181,7 @@ pub async fn client_event_handling<ClientEv>(
                     }
                     Err(error) if matches!(error.kind(), ErrorKind::Shutdown) => {
                         node_controller.send(NodeEvent::Disconnect { cause: None }).await.ok();
-                        break;
+                        anyhow::bail!("shutdown event");
                     }
                     Err(error) => {
                         tracing::debug!(%error, "client error");
@@ -190,7 +191,7 @@ pub async fn client_event_handling<ClientEv>(
                 // fixme: only allow in certain modes (e.g. while testing)
                 if let ClientRequest::Disconnect { cause } = &*req.request {
                     node_controller.send(NodeEvent::Disconnect { cause: cause.clone() }).await.ok();
-                    break;
+                    anyhow::bail!("shutdown event");
                 }
                 let cli_id = req.client_id;
                 if let Some(mut cb) = process_open_request(req, op_manager.clone()).await {
@@ -204,7 +205,7 @@ pub async fn client_event_handling<ClientEv>(
                     }
                     if let Err(err) = client_events.send(cli_id, res).await {
                         tracing::debug!("channel closed: {err}");
-                        break;
+                        anyhow::bail!(err);
                     }
                 }
             }
@@ -226,7 +227,7 @@ pub async fn client_event_handling<ClientEv>(
                     };
                     if let Err(err) = client_events.send(cli_id, res).await {
                         tracing::debug!("channel closed: {err}");
-                        break;
+                        anyhow::bail!(err);
                     }
                 }
             }

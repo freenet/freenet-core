@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::{convert::Infallible, sync::Arc};
 
+use futures::{future::BoxFuture, FutureExt};
 use tracing::Instrument;
 
 use super::{
@@ -34,26 +35,38 @@ pub(crate) struct NodeP2P {
     cli_response_sender: ClientResponsesSender,
     node_controller: tokio::sync::mpsc::Receiver<NodeEvent>,
     should_try_connect: bool,
+    client_events_task: BoxFuture<'static, anyhow::Error>,
+    contract_executor_task: BoxFuture<'static, anyhow::Error>,
 }
 
 impl NodeP2P {
-    pub(super) async fn run_node(self) -> anyhow::Result<()> {
+    pub(super) async fn run_node(self) -> anyhow::Result<Infallible> {
         if self.should_try_connect {
             connect::initial_join_procedure(self.op_manager.clone(), &self.conn_manager.gateways)
                 .await?;
         }
 
-        // start the p2p event loop
-        self.conn_manager
-            .run_event_listener(
-                self.op_manager.clone(),
-                self.client_wait_for_transaction,
-                self.notification_channel,
-                self.executor_listener,
-                self.cli_response_sender,
-                self.node_controller,
-            )
-            .await
+        let f = self.conn_manager.run_event_listener(
+            self.op_manager.clone(),
+            self.client_wait_for_transaction,
+            self.notification_channel,
+            self.executor_listener,
+            self.cli_response_sender,
+            self.node_controller,
+        );
+
+        tokio::select!(
+            r = f => {
+               let Err(e) = r;
+               Err(e)
+            }
+            e = self.client_events_task => {
+                Err(e)
+            }
+            e = self.contract_executor_task => {
+                Err(e)
+            }
+        )
     }
 
     pub(crate) async fn build<CH, const CLIENTS: usize, ER>(
@@ -87,13 +100,19 @@ impl NodeP2P {
             P2pConnManager::build(&config, op_manager.clone(), event_register).await?;
 
         let parent_span = tracing::Span::current();
-        GlobalExecutor::spawn(
+        let contract_executor_task = GlobalExecutor::spawn(
             contract::contract_handling(contract_handler)
                 .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
-        );
+        )
+        .map(|r| match r {
+            Ok(Err(e)) => anyhow::anyhow!("Error in contract handling task: {e}"),
+            Ok(Ok(_)) => anyhow::anyhow!("Contract handling task exited unexpectedly"),
+            Err(e) => anyhow::anyhow!(e),
+        })
+        .boxed();
         let clients = ClientEventsCombinator::new(clients);
         let (node_controller_tx, node_controller_rx) = tokio::sync::mpsc::channel(1);
-        GlobalExecutor::spawn(
+        let client_events_task = GlobalExecutor::spawn(
             client_event_handling(
                 op_manager.clone(),
                 clients,
@@ -101,7 +120,12 @@ impl NodeP2P {
                 node_controller_tx,
             )
             .instrument(tracing::info_span!(parent: parent_span, "client_event_handling")),
-        );
+        )
+        .map(|r| match r {
+            Ok(_) => anyhow::anyhow!("Client event handling task exited unexpectedly"),
+            Err(e) => anyhow::anyhow!(e),
+        })
+        .boxed();
 
         Ok(NodeP2P {
             conn_manager,
@@ -114,6 +138,8 @@ impl NodeP2P {
             should_try_connect: config.should_connect,
             peer_id: config.peer_id,
             is_gateway: config.is_gateway,
+            client_events_task,
+            contract_executor_task,
         })
     }
 }
