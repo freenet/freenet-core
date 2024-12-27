@@ -244,19 +244,21 @@ impl P2pConnManager {
                                 tracing::debug!(%peer, "Dropping connection");
                                 if let Some(conn) = self.connections.remove(&peer) {
                                     // TODO: review: this could potentially leave garbage tasks in the background with peer listener
-                                    let _ = timeout(
+                                    timeout(
                                         Duration::from_secs(1),
                                         conn.send(Right(ConnEvent::NodeAction(
                                             NodeEvent::DropConnection(peer),
                                         ))),
                                     )
                                     .await
-                                    .inspect_err(|error| {
-                                        tracing::error!(
-                                            "Failed to send drop connection message: {:?}",
-                                            error
-                                        );
-                                    });
+                                    .inspect_err(
+                                        |error| {
+                                            tracing::error!(
+                                                "Failed to send drop connection message: {:?}",
+                                                error
+                                            );
+                                        },
+                                    )??;
                                 }
                             }
                             NodeEvent::ConnectPeer {
@@ -277,7 +279,7 @@ impl P2pConnManager {
                             }
                             NodeEvent::QueryConnections { callback } => {
                                 let connections = self.connections.keys().cloned().collect();
-                                let _ = timeout(
+                                timeout(
                                     Duration::from_secs(1),
                                     callback.send(QueryResult::Connections(connections)),
                                 )
@@ -287,7 +289,7 @@ impl P2pConnManager {
                                         "Failed to send connections query result: {:?}",
                                         error
                                     );
-                                });
+                                })??;
                             }
                             NodeEvent::TransactionTimedOut(tx) => {
                                 let Some(client) = state.tx_to_client.remove(&tx) else {
@@ -589,14 +591,14 @@ impl P2pConnManager {
                 let key = (*self.bridge.op_manager.ring.connection_manager.pub_key).clone();
                 PeerId::new(self_addr, key)
             };
-            let _ = timeout(
+            timeout(
                 Duration::from_secs(60),
                 cb.send_result(Ok((peer_id, remaining_checks))),
             )
             .await
             .inspect_err(|error| {
                 tracing::error!("Failed to send connection result: {:?}", error);
-            });
+            })??;
         } else {
             tracing::warn!(%peer_id, "No callback for connection established");
         }
@@ -716,10 +718,10 @@ impl ConnectResultSender for Option<oneshot::Sender<Result<PeerId, HandshakeErro
         result: Result<(PeerId, Option<usize>), HandshakeError>,
     ) -> Pin<Box<dyn Future<Output = Result<(), HandshakeError>> + Send + '_>> {
         async move {
-            let _ = self
-                .take()
+            self.take()
                 .expect("always set")
-                .send(result.map(|(id, _)| id));
+                .send(result.map(|(id, _)| id))
+                .map_err(|_| HandshakeError::ChannelClosed)?;
             Ok(())
         }
         .boxed()
