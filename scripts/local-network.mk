@@ -26,7 +26,7 @@ GW_CONFIG   := $(BASE_DIR)/gateways.toml
 # Environment
 # ------------------------------------------
 ENV_VARS := RUST_BACKTRACE=1 RUST_LOG="info,freenet=debug,freenet-stdlib=debug,fdev=debug"
-FREENET_CORE_PATH := ../../crates/core/
+FREENET_CORE_PATH := ../crates/core/
 
 # Log Command with ANSI color removal
 # ------------------------------------------
