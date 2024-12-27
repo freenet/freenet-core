@@ -9,6 +9,7 @@ use futures::{FutureExt, StreamExt};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -16,7 +17,8 @@ use std::{
 use tokio::net::UdpSocket;
 use tokio::select;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::sync::oneshot;
+use tokio::sync::oneshot::{self};
+use tokio::time::timeout;
 use tracing::Instrument;
 
 use crate::dev_tool::Location;
@@ -235,11 +237,20 @@ impl P2pConnManager {
                             NodeEvent::DropConnection(peer) => {
                                 tracing::debug!(%peer, "Dropping connection");
                                 if let Some(conn) = self.connections.remove(&peer) {
-                                    let _ = conn
-                                        .send(Right(ConnEvent::NodeAction(
+                                    // TODO: review: this could potentially leave garbage tasks in the background with peer listener
+                                    let _ = timeout(
+                                        Duration::from_secs(1),
+                                        conn.send(Right(ConnEvent::NodeAction(
                                             NodeEvent::DropConnection(peer),
-                                        )))
-                                        .await;
+                                        ))),
+                                    )
+                                    .await
+                                    .inspect_err(|error| {
+                                        tracing::error!(
+                                            "Failed to send drop connection message: {:?}",
+                                            error
+                                        );
+                                    });
                                 }
                             }
                             NodeEvent::ConnectPeer {
@@ -260,7 +271,17 @@ impl P2pConnManager {
                             }
                             NodeEvent::QueryConnections { callback } => {
                                 let connections = self.connections.keys().cloned().collect();
-                                callback.send(QueryResult::Connections(connections)).await?;
+                                let _ = timeout(
+                                    Duration::from_secs(1),
+                                    callback.send(QueryResult::Connections(connections)),
+                                )
+                                .await
+                                .inspect_err(|error| {
+                                    tracing::error!(
+                                        "Failed to send connections query result: {:?}",
+                                        error
+                                    );
+                                });
                             }
                             NodeEvent::TransactionTimedOut(tx) => {
                                 let Some(client) = state.tx_to_client.remove(&tx) else {
@@ -396,10 +417,15 @@ impl P2pConnManager {
     ) -> anyhow::Result<()> {
         tracing::info!(tx = %tx, remote = %peer, "Connecting to peer");
         state.awaiting_connection.insert(peer.addr, callback);
-        match establish_connection
-            .establish_conn(peer.clone(), tx, is_gw)
-            .await
-        {
+        let res = timeout(
+            Duration::from_secs(10),
+            establish_connection.establish_conn(peer.clone(), tx, is_gw),
+        )
+        .await
+        .inspect_err(|error| {
+            tracing::error!(tx = %tx, "Failed to establish connection: {:?}", error);
+        })?;
+        match res {
             Ok(()) => {
                 tracing::debug!(tx = %tx,
                     "Successfully initiated connection process for peer: {:?}",
@@ -520,7 +546,12 @@ impl P2pConnManager {
     async fn try_to_forward(&mut self, forward_to: &PeerId, msg: NetMessage) -> anyhow::Result<()> {
         if let Some(peer) = self.connections.get(forward_to) {
             tracing::debug!(%forward_to, %msg, "Forwarding message to peer");
-            peer.send(Left(msg)).await?;
+            // TODO: review: this could potentially leave garbage tasks in the background with peer listener
+            timeout(Duration::from_secs(1), peer.send(Left(msg)))
+                .await
+                .inspect_err(|error| {
+                    tracing::error!("Failed to forward message to peer: {:?}", error);
+                })??;
         } else {
             tracing::warn!(%forward_to, "No connection to forward the message");
         }
@@ -550,7 +581,14 @@ impl P2pConnManager {
                 let key = (*self.bridge.op_manager.ring.connection_manager.pub_key).clone();
                 PeerId::new(self_addr, key)
             };
-            let _ = cb.send_result(Ok((peer_id, remaining_checks))).await;
+            let _ = timeout(
+                Duration::from_secs(60),
+                cb.send_result(Ok((peer_id, remaining_checks))),
+            )
+            .await
+            .inspect_err(|error| {
+                tracing::error!("Failed to send connection result: {:?}", error);
+            });
         } else {
             tracing::warn!(%peer_id, "No callback for connection established");
         }

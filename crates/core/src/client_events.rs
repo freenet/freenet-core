@@ -249,6 +249,7 @@ async fn process_open_request(
         (None, None)
     };
 
+    // TODO: wait until we have a peer_id to attempt (should be connected)
     // this will indirectly start actions on the local contract executor
     let fut = async move {
         let client_id = request.client_id;
@@ -302,7 +303,7 @@ async fn process_open_request(
 
                         let related_contracts = RelatedContracts::default();
 
-                        let new_state = match op_manager
+                        let Ok(new_state) = match op_manager
                             .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
                                 key,
                                 data,
@@ -319,7 +320,9 @@ async fn process_open_request(
                             Err(err) => Err(err.into()),
                             Ok(_) => Err(OpError::UnexpectedOpState),
                         }
-                        .expect("update query failed");
+                        .inspect_err(|err| tracing::error!(%key, "update query failed: {}", err)) else {
+                            return;
+                        };
 
                         let op = update::start_op(key, new_state, related_contracts);
 

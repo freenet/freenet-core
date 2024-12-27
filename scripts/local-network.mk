@@ -14,7 +14,7 @@ LOGS_DIR := $(BASE_DIR)/logs
 
 # Network Configuration
 # ------------------------------------------
-N_NODES     := 2
+N_NODES     := 1
 N_GATEWAYS  := 1
 BASE_PORT   := 3100
 WS_BASE_PORT:= 3000

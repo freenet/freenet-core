@@ -3,7 +3,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::transport::crypto::TransportSecretKey;
 use crate::transport::packet_data::{AssymetricRSA, UnknownEncryption};
@@ -257,6 +257,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                             break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
                         }
                     }
+                } else {
+                    break 'inner;
                 }
             }
             tokio::select! {
@@ -376,6 +378,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                         tracing::debug!(%self.this_addr, "connection handler closed");
                         return Ok(());
                     };
+                    tracing::debug!(%remote_addr, "received connection event");
                     if let Some(_conn) = self.remote_connections.remove(&remote_addr) {
                         tracing::warn!(%remote_addr, "connection already established, dropping old connection");
                     }
