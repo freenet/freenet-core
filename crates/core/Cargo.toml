@@ -40,7 +40,7 @@ semver = { version = "1",  features = ["serde"] }
 headers = "0.4"
 hickory-resolver = { version = "0.24", features = ["dns-over-rustls"] }
 itertools = "0.13"
-notify = "6"
+notify = "7"
 once_cell = "1"
 ordered-float = "4"
 pav_regression = "0.5.1"
@@ -55,7 +55,7 @@ sqlx = { features = ["runtime-tokio-rustls", "sqlite"], optional = true, version
 stretto = { features = ["async", "sync"], version = "0.8" }
 tar = { version = "0.4" }
 time = "0.3"
-thiserror = "1"
+thiserror = "2"
 tokio = { features = ["fs", "macros", "rt-multi-thread", "sync", "process"], version = "1" }
 tokio-tungstenite = "0.24"
 tower-http = { features = ["fs", "trace"], version = "0.6" }
@@ -68,13 +68,13 @@ rsa = { version = "0.9", features = ["serde", "pem"] }
 pkcs8 = { version = "0.10", features = ["std", "pem"] }
 
 # Tracing deps
-opentelemetry = "0.26"
+opentelemetry = "0.27"
 opentelemetry-jaeger = { features = ["collector_client", "isahc", "rt-tokio"], optional = true, version = "0.22" }
 tracing = { version = "0.1" }
 tracing-opentelemetry = { optional = true, version = "0.26" }
 tracing-subscriber = { optional = true, version = "0.3" }
 opentelemetry-otlp = { optional = true, version = "0.26" }
-opentelemetry_sdk = { optional = true, version = "0.26", features = ["rt-tokio"] }
+opentelemetry_sdk = { optional = true, version = "0.27", features = ["rt-tokio"] }
 
 # internal deps
 freenet-stdlib = { features = ["net"], workspace = true }
@@ -85,7 +85,7 @@ chrono = { features = ["arbitrary"], workspace = true }
 freenet-stdlib = { features = ["net", "testing"], workspace = true }
 pav_regression = "0.5.1"
 pico-args = "0.5"
-statrs = "0.17"
+statrs = "0.18"
 tempfile = "3"
 tracing = "0.1"
 # console-subscriber = { version = "0.4" }
