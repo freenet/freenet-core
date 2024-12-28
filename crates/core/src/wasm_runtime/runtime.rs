@@ -230,7 +230,7 @@ impl Runtime {
             .as_ref()
             .map(Ok)
             .unwrap_or_else(|| instance.exports.get_memory("memory"))?;
-        let req_pages = Bytes::from(req_bytes).try_into().unwrap();
+        let req_pages: wasmer::Pages = Bytes::from(req_bytes).try_into().unwrap();
         if memory.view(&self.wasm_store).size() < req_pages {
             if let Err(err) = memory.grow(&mut self.wasm_store, req_pages) {
                 tracing::error!("wasm runtime failed with memory error: {err}");
