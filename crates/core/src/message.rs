@@ -6,7 +6,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use freenet_stdlib::prelude::ContractKey;
+use freenet_stdlib::prelude::{ContractContainer, ContractKey, WrappedState};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -313,6 +313,18 @@ pub(crate) enum NodeEvent {
     Disconnect {
         cause: Option<Cow<'static, str>>,
     },
+    QueryConnections {
+        callback: tokio::sync::mpsc::Sender<QueryResult>,
+    },
+}
+
+pub(crate) enum QueryResult {
+    Connections(Vec<PeerId>),
+    GetResult {
+        key: ContractKey,
+        state: WrappedState,
+        contract: Option<ContractContainer>,
+    },
 }
 
 impl Display for NodeEvent {
@@ -329,6 +341,9 @@ impl Display for NodeEvent {
             }
             NodeEvent::Disconnect { cause: None } => {
                 write!(f, "Disconnect node, reason: unknown")
+            }
+            NodeEvent::QueryConnections { .. } => {
+                write!(f, "QueryConnections")
             }
         }
     }

@@ -66,7 +66,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
         while self
             .packets
             .front()
-            .map_or(false, |&(_, time)| now - time > self.window_size)
+            .is_some_and(|&(_, time)| now - time > self.window_size)
         {
             let expired = self.packets.pop_front();
             if let Some((size, _)) = expired {

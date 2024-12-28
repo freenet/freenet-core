@@ -217,7 +217,7 @@ impl From<CommandInfo> for OpenRequest<'static> {
         let req = match cmd.cmd {
             Command::Get => ContractRequest::Get {
                 key,
-                fetch_contract: false,
+                return_contract_code: false,
             }
             .into(),
             Command::Put => {
@@ -305,7 +305,7 @@ impl ClientEventsProxy for StdInput {
                             let key = self.contract.key();
                             node.send(ClientRequest::ContractOp(ContractRequest::Get {
                                 key,
-                                fetch_contract: true,
+                                return_contract_code: true,
                             }))
                             .await
                             .map_err(|e| {
