@@ -3,13 +3,12 @@ use std::sync::Arc;
 use tracing::Instrument;
 
 use super::{
-    client_event_handling,
     network_bridge::{
         event_loop_notification_channel, p2p_protoc::P2pConnManager, EventLoopNotificationsReceiver,
     },
     NetEventRegister, PeerId,
 };
-use crate::ring::ConnectionManager;
+use crate::{client_events::client_event_handling, ring::ConnectionManager};
 use crate::{
     client_events::{combinator::ClientEventsCombinator, BoxedClient},
     config::GlobalExecutor,

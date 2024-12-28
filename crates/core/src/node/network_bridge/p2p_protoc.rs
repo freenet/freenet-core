@@ -1,5 +1,5 @@
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
-use crate::message::NetMessageV1;
+use crate::message::{NetMessageV1, QueryResult};
 use dashmap::DashSet;
 use either::{Either, Left, Right};
 use futures::future::BoxFuture;
@@ -256,6 +256,10 @@ impl P2pConnManager {
                                     is_gw,
                                 )
                                 .await?;
+                            }
+                            NodeEvent::QueryConnections { callback } => {
+                                let connections = self.connections.keys().cloned().collect();
+                                callback.send(QueryResult::Connections(connections)).await?;
                             }
                             NodeEvent::Disconnect { cause } => {
                                 tracing::info!(

@@ -22,11 +22,6 @@ use tokio::sync::mpsc::{self};
 use crate::config::Config;
 use crate::message::Transaction;
 use crate::node::OpManager;
-#[cfg(any(
-    not(feature = "local-mode"),
-    feature = "network-mode",
-    all(not(feature = "local-mode"), not(feature = "network-mode"))
-))]
 use crate::operations::get::GetResult;
 use crate::operations::{OpEnum, OpError};
 use crate::wasm_runtime::{
@@ -340,16 +335,16 @@ where
 #[allow(unused)]
 struct GetContract {
     key: ContractKey,
-    fetch_contract: bool,
+    return_contract_code: bool,
 }
 
 impl ComposeNetworkMessage<operations::get::GetOp> for GetContract {
     fn initiate_op(self, _op_manager: &OpManager) -> operations::get::GetOp {
-        operations::get::start_op(self.key, self.fetch_contract)
+        operations::get::start_op(self.key, self.return_contract_code)
     }
 
     async fn resume_op(op: operations::get::GetOp, op_manager: &OpManager) -> Result<(), OpError> {
-        operations::get::request_get(op_manager, op).await
+        operations::get::request_get(op_manager, op, vec![]).await
     }
 }
 
@@ -423,8 +418,9 @@ pub(crate) trait ContractExecutor: Send + 'static {
     fn fetch_contract(
         &mut self,
         key: ContractKey,
-        fetch_contract: bool,
-    ) -> impl Future<Output = Result<(WrappedState, Option<ContractContainer>), ExecutorError>> + Send;
+        return_contract_code: bool,
+    ) -> impl Future<Output = Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError>>
+           + Send;
 
     fn upsert_contract_state(
         &mut self,
@@ -433,6 +429,14 @@ pub(crate) trait ContractExecutor: Send + 'static {
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
     ) -> impl Future<Output = Result<WrappedState, ExecutorError>> + Send;
+
+    fn register_contract_notifier(
+        &mut self,
+        key: ContractKey,
+        cli_id: ClientId,
+        notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
+        summary: Option<StateSummary<'_>>,
+    ) -> Result<(), Box<RequestError>>;
 }
 
 /// A WASM executor which will run any contracts, delegates, etc. registered.
@@ -441,10 +445,6 @@ pub(crate) trait ContractExecutor: Send + 'static {
 /// Consumers of the executor are required to poll for new changes in order to be notified
 /// of changes or can alternatively use the notification channel.
 pub struct Executor<R = Runtime> {
-    #[cfg(any(
-        all(feature = "local-mode", feature = "network-mode"),
-        all(not(feature = "local-mode"), not(feature = "network-mode")),
-    ))]
     mode: OperationMode,
     runtime: R,
     pub state_store: StateStore<Storage>,
@@ -469,10 +469,6 @@ impl<R> Executor<R> {
         ctrl_handler()?;
 
         Ok(Self {
-            #[cfg(any(
-                all(feature = "local-mode", feature = "network-mode"),
-                all(not(feature = "local-mode"), not(feature = "network-mode")),
-            ))]
             mode,
             runtime,
             state_store,

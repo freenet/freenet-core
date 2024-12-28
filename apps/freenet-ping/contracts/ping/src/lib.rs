@@ -68,9 +68,9 @@ impl ContractInterface for Contract {
                 _ => return Err(ContractError::InvalidUpdate),
             }
         }
-        return Ok(UpdateModification::valid(State::from(
+        Ok(UpdateModification::valid(State::from(
             serde_json::to_vec(&ping).map_err(|e| ContractError::Other(e.to_string()))?,
-        )));
+        )))
     }
 
     fn summarize_state(
