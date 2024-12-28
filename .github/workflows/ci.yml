@@ -47,12 +47,15 @@ jobs:
         working-directory: stdlib/typescript
         run: npm run dev.package
 
+      - name: Update Cargo.lock
+        run: cargo update
+
       - name: Build
         run: |
           cargo install --locked --force --path ./crates/core
           cargo install --locked --force --path ./crates/fdev
           make -C apps/freenet-ping -f run-ping.mk build
-          cargo build --locked 
+          cargo build --locked
 
       - name: Test - features
         run: cargo test --workspace ${{ matrix.args }}
