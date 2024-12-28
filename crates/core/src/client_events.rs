@@ -1,15 +1,28 @@
 //! Clients events related logic and type definitions. For example, receival of client events from applications throught the HTTP gateway.
 
-use freenet_stdlib::client_api::ClientRequest;
-use freenet_stdlib::client_api::{ClientError, ContractResponse, HostResponse};
-use futures::future::BoxFuture;
+use freenet_stdlib::{
+    client_api::{
+        ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse,
+        QueryResponse,
+    },
+    prelude::*,
+};
+use futures::stream::FuturesUnordered;
+use futures::{future::BoxFuture, StreamExt};
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use tracing::Instrument;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{self, UnboundedSender};
+
+use crate::contract::{ClientResponsesReceiver, ContractHandlerEvent};
+use crate::message::{NodeEvent, QueryResult};
+use crate::node::OpManager;
+use crate::operations::{get, put, update, OpError};
+use crate::{config::GlobalExecutor, contract::StoreResponse};
 
 pub(crate) mod combinator;
 #[cfg(feature = "websocket")]
@@ -32,11 +45,6 @@ static CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
 
 impl ClientId {
     pub const FIRST: Self = ClientId(0);
-
-    #[cfg(test)]
-    pub(crate) const fn new(id: usize) -> ClientId {
-        Self(id)
-    }
 
     pub fn next() -> Self {
         ClientId(CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
@@ -152,6 +160,296 @@ pub trait ClientEventsProxy {
     ) -> BoxFuture<Result<(), ClientError>>;
 }
 
+/// Process client events.
+pub async fn client_event_handling<ClientEv>(
+    op_manager: Arc<OpManager>,
+    mut client_events: ClientEv,
+    mut client_responses: ClientResponsesReceiver,
+    node_controller: tokio::sync::mpsc::Sender<NodeEvent>,
+) where
+    ClientEv: ClientEventsProxy + Send + 'static,
+{
+    let mut callbacks = FuturesUnordered::new();
+    loop {
+        tokio::select! {
+            client_request = client_events.recv() => {
+                let req = match client_request {
+                    Ok(request) => {
+                        tracing::debug!(%request, "got client request event");
+                        request
+                    }
+                    Err(error) if matches!(error.kind(), ErrorKind::Shutdown) => {
+                        node_controller.send(NodeEvent::Disconnect { cause: None }).await.ok();
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "client error");
+                        continue;
+                    }
+                };
+                // fixme: only allow in certain modes (e.g. while testing)
+                if let ClientRequest::Disconnect { cause } = &*req.request {
+                    node_controller.send(NodeEvent::Disconnect { cause: cause.clone() }).await.ok();
+                    break;
+                }
+                let cli_id = req.client_id;
+                if let Some(mut cb) = process_open_request(req, op_manager.clone()).await {
+                    callbacks.push(async move { cb.recv().await.map(|r| (cli_id, r)) });
+                }
+            }
+            res = client_responses.recv() => {
+                if let Some((cli_id, res)) = res {
+                    if let Ok(result) = &res {
+                        tracing::debug!(%result, "sending client response");
+                    }
+                    if let Err(err) = client_events.send(cli_id, res).await {
+                        tracing::debug!("channel closed: {err}");
+                        break;
+                    }
+                }
+            }
+            res = callbacks.next(), if !callbacks.is_empty() => {
+                if let Some(Some((cli_id, res))) = res {
+                    let res = match res {
+                        QueryResult::Connections(conns) => {
+                            Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers {
+                                peers: conns.into_iter().map(|p| (p.pub_key.to_string(), p.addr)).collect() }
+                            ))
+                        }
+                        QueryResult::GetResult { key, state, contract } => {
+                            Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                                key,
+                                state,
+                                contract,
+                            }))
+                        }
+                    };
+                    if let Err(err) = client_events.send(cli_id, res).await {
+                        tracing::debug!("channel closed: {err}");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[inline]
+async fn process_open_request(
+    mut request: OpenRequest<'static>,
+    op_manager: Arc<OpManager>,
+) -> Option<mpsc::Receiver<QueryResult>> {
+    let (callback_tx, callback_rx) = if matches!(
+        &*request.request,
+        ClientRequest::NodeQueries(_) | ClientRequest::ContractOp(ContractRequest::Get { .. })
+    ) {
+        let (tx, rx) = mpsc::channel(1);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    // this will indirectly start actions on the local contract executor
+    let fut = async move {
+        let client_id = request.client_id;
+
+        // fixme: communicate back errors in this loop to the client somehow
+        let subscription_listener: Option<UnboundedSender<HostResult>> =
+            request.notification_channel.take();
+        match *request.request {
+            ClientRequest::ContractOp(ops) => {
+                match ops {
+                    ContractRequest::Put {
+                        state,
+                        contract,
+                        related_contracts,
+                    } => {
+                        let peer_id = op_manager
+                            .ring
+                            .connection_manager
+                            .get_peer_key()
+                            .expect("Peer id not found at put op, it should be set");
+                        // Initialize a put op.
+                        tracing::debug!(
+                            this_peer = %peer_id,
+                            "Received put from user event",
+                        );
+                        let op = put::start_op(
+                            contract,
+                            related_contracts,
+                            state,
+                            op_manager.ring.max_hops_to_live,
+                        );
+                        let op_id = op.id;
+                        let _ = op_manager
+                            .ch_outbound
+                            .waiting_for_transaction_result(op_id, client_id)
+                            .await;
+                        if let Err(err) = put::request_put(&op_manager, op).await {
+                            tracing::error!("{}", err);
+                        }
+                    }
+                    ContractRequest::Update { key, data } => {
+                        let peer_id = op_manager
+                            .ring
+                            .connection_manager
+                            .get_peer_key()
+                            .expect("Peer id not found at update op, it should be set");
+                        tracing::debug!(
+                            this_peer = %peer_id,
+                            "Received update from user event",
+                        );
+
+                        let related_contracts = RelatedContracts::default();
+
+                        let new_state = match op_manager
+                            .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
+                                key,
+                                data,
+                                related_contracts: related_contracts.clone(),
+                            })
+                            .await
+                        {
+                            Ok(ContractHandlerEvent::UpdateResponse {
+                                new_value: Ok(new_val),
+                            }) => Ok(new_val),
+                            Ok(ContractHandlerEvent::UpdateResponse {
+                                new_value: Err(err),
+                            }) => Err(OpError::from(err)),
+                            Err(err) => Err(err.into()),
+                            Ok(_) => Err(OpError::UnexpectedOpState),
+                        }
+                        .expect("update query failed");
+
+                        let op = update::start_op(key, new_state, related_contracts);
+
+                        let _ = op_manager
+                            .ch_outbound
+                            .waiting_for_transaction_result(op.id, client_id)
+                            .await;
+
+                        if let Err(err) = update::request_update(&op_manager, op).await {
+                            tracing::error!("request update error {}", err)
+                        }
+                    }
+                    ContractRequest::Get {
+                        key,
+                        return_contract_code,
+                    } => {
+                        let peer_id = op_manager
+                            .ring
+                            .connection_manager
+                            .get_peer_key()
+                            .expect("Peer id not found at get op, it should be set");
+                        let (state, contract) = match op_manager
+                            .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                                key,
+                                return_contract_code,
+                            })
+                            .await
+                        {
+                            Ok(ContractHandlerEvent::GetResponse {
+                                response: Ok(StoreResponse { state, contract }),
+                                ..
+                            }) => Ok((state, contract)),
+                            Ok(ContractHandlerEvent::GetResponse {
+                                response: Err(err), ..
+                            }) => Err(err.into()),
+                            Err(err) => Err(err.into()),
+                            Ok(_) => Err(OpError::UnexpectedOpState),
+                        }
+                        .expect("get query failed");
+
+                        if (!return_contract_code && state.is_some())
+                            || (return_contract_code && state.is_some() && contract.is_some())
+                        {
+                            if let Some(state) = state {
+                                tracing::debug!(
+                                    this_peer = %peer_id,
+                                    "Contract found, returning get result",
+                                );
+                                callback_tx
+                                    .unwrap()
+                                    .send(QueryResult::GetResult {
+                                        key,
+                                        state,
+                                        contract,
+                                    })
+                                    .await
+                                    .ok();
+                            }
+                        } else {
+                            // Initialize a get op.
+                            tracing::debug!(
+                                this_peer = %peer_id,
+                                "Contract not found, starting get op",
+                            );
+                            let op = get::start_op(key, return_contract_code);
+                            let _ = op_manager
+                                .ch_outbound
+                                .waiting_for_transaction_result(op.id, client_id)
+                                .await;
+                            if let Err(err) = get::request_get(&op_manager, op, vec![]).await {
+                                tracing::error!("{}", err);
+                            }
+                        }
+                    }
+                    ContractRequest::Subscribe { key, summary } => {
+                        let op_id =
+                            match crate::node::subscribe(op_manager.clone(), key, Some(client_id))
+                                .await
+                            {
+                                Ok(op_id) => op_id,
+                                Err(err) => {
+                                    tracing::error!("Subscribe error: {}", err);
+                                    return;
+                                }
+                            };
+                        let Some(subscriber_listener) = subscription_listener else {
+                            tracing::error!(%op_id, %client_id, "No subscriber listener");
+                            return;
+                        };
+                        let _ = op_manager
+                            .notify_contract_handler(ContractHandlerEvent::RegisterSubscriberListener {
+                                key,
+                                client_id,
+                                summary,
+                                subscriber_listener,
+                            })
+                            .await.inspect_err(|err| {
+                                tracing::error!(%op_id, %client_id, "Register subscriber listener error: {}", err);
+                            });
+                        let _ = op_manager
+                            .ch_outbound
+                            .waiting_for_transaction_result(op_id, client_id)
+                            .await;
+                    }
+                    _ => {
+                        tracing::error!("Op not supported");
+                    }
+                }
+            }
+            ClientRequest::DelegateOp(_op) => todo!("FIXME: delegate op"),
+            ClientRequest::Disconnect { .. } => unreachable!(),
+            ClientRequest::NodeQueries(_) => {
+                tracing::debug!("Received node queries from user event");
+                let _ = op_manager
+                    .notify_node_event(NodeEvent::QueryConnections {
+                        callback: callback_tx.expect("should be set"),
+                    })
+                    .await;
+            }
+            _ => {
+                tracing::error!("Op not supported");
+            }
+        }
+    };
+    GlobalExecutor::spawn(fut.instrument(
+        tracing::info_span!(parent: tracing::Span::current(), "process_client_request"),
+    ));
+    callback_rx
+}
+
 pub(crate) mod test {
     use std::{
         collections::{HashMap, HashSet},
@@ -170,13 +468,13 @@ pub(crate) mod test {
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-    use crate::node::{testing_impl::EventId, PeerId};
+    use crate::{node::testing_impl::EventId, transport::TransportPublicKey};
 
     use super::*;
 
     pub struct MemoryEventsGen<R = rand::rngs::SmallRng> {
-        id: PeerId,
-        signal: Receiver<(EventId, PeerId)>,
+        key: TransportPublicKey,
+        signal: Receiver<(EventId, TransportPublicKey)>,
         events_to_gen: HashMap<EventId, ClientRequest<'static>>,
         rng: Option<R>,
         internal_state: Option<InternalGeneratorState>,
@@ -186,10 +484,14 @@ pub(crate) mod test {
     where
         R: RandomEventGenerator,
     {
-        pub fn new_with_seed(signal: Receiver<(EventId, PeerId)>, id: PeerId, seed: u64) -> Self {
+        pub fn new_with_seed(
+            signal: Receiver<(EventId, TransportPublicKey)>,
+            key: TransportPublicKey,
+            seed: u64,
+        ) -> Self {
             Self {
                 signal,
-                id,
+                key,
                 events_to_gen: HashMap::new(),
                 rng: Some(R::seed_from_u64(seed)),
                 internal_state: None,
@@ -233,10 +535,13 @@ pub(crate) mod test {
 
     impl MemoryEventsGen {
         #[cfg(test)]
-        pub fn new(signal: Receiver<(EventId, PeerId)>, id: PeerId) -> Self {
+        pub fn new(
+            signal: Receiver<(EventId, TransportPublicKey)>,
+            key: TransportPublicKey,
+        ) -> Self {
             Self {
                 signal,
-                id,
+                key,
                 events_to_gen: HashMap::new(),
                 rng: None,
                 internal_state: None,
@@ -267,7 +572,7 @@ pub(crate) mod test {
                 loop {
                     if self.signal.changed().await.is_ok() {
                         let (ev_id, pk) = self.signal.borrow().clone();
-                        if self.rng.is_some() && pk == self.id {
+                        if self.rng.is_some() && pk == self.key {
                             let res = OpenRequest {
                                 client_id: ClientId::FIRST,
                                 request: self
@@ -279,7 +584,7 @@ pub(crate) mod test {
                                 token: None,
                             };
                             return Ok(res.into_owned());
-                        } else if pk == self.id {
+                        } else if pk == self.key {
                             let res = OpenRequest {
                                 client_id: ClientId::FIRST,
                                 request: self
@@ -321,7 +626,7 @@ pub(crate) mod test {
     }
 
     pub struct NetworkEventGenerator<R = rand::rngs::SmallRng> {
-        id: PeerId,
+        id: TransportPublicKey,
         memory_event_generator: MemoryEventsGen<R>,
         ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
     }
@@ -331,7 +636,7 @@ pub(crate) mod test {
         R: RandomEventGenerator,
     {
         pub fn new(
-            id: PeerId,
+            id: TransportPublicKey,
             memory_event_generator: MemoryEventsGen<R>,
             ws_client: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
         ) -> Self {
@@ -353,14 +658,21 @@ pub(crate) mod test {
             async move {
                 loop {
                     let message = {
-                        let mut lock = ws_client_clone.lock().await;
+                        let mut lock = ws_client_clone.try_lock().inspect_err(|_| {
+                            tracing::error!(peer = %self.id, "failed to lock ws client");
+                        }).inspect(|_| {
+                            tracing::debug!(peer = %self.id, "locked ws client");
+                        }).unwrap();
                         lock.next().await
                     };
 
                     match message {
                         Some(Ok(Message::Binary(data))) => {
-                            if let Ok((_, pk)) = bincode::deserialize::<(EventId, PeerId)>(&data) {
-                                if pk == self.id {
+                            if let Ok((id, pub_key)) =
+                            bincode::deserialize::<(EventId, TransportPublicKey)>(&data)
+                            {
+                                tracing::debug!(peer = %self.id, %id, "Received event from the supervisor");
+                                if pub_key == self.id {
                                     let res = OpenRequest {
                                         client_id: ClientId::FIRST,
                                         request: self
@@ -483,6 +795,8 @@ pub(crate) mod test {
                                 related_contracts: RelatedContracts::new(),
                             };
 
+                            tracing::debug!("sending put to an existing contract");
+
                             return Some(request.into());
                         }
                     }
@@ -494,7 +808,7 @@ pub(crate) mod test {
                             let key = contract.key();
                             let request = ContractRequest::Get {
                                 key,
-                                fetch_contract: true,
+                                return_contract_code: true,
                             };
                             return Some(request.into());
                         }

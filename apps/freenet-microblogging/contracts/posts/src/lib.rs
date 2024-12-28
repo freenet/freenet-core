@@ -115,14 +115,6 @@ impl ContractInterface for PostsFeed {
         PostsFeed::try_from(state).map(|_| ValidateResult::Valid)
     }
 
-    fn validate_delta(
-        _parameters: Parameters<'static>,
-        delta: StateDelta<'static>,
-    ) -> Result<bool, ContractError> {
-        serde_json::from_slice::<Vec<Post>>(&delta).map_err(|_| ContractError::InvalidDelta)?;
-        Ok(true)
-    }
-
     fn update_state(
         parameters: Parameters<'static>,
         state: State<'static>,
@@ -259,24 +251,6 @@ mod test {
             RelatedContracts::new(),
         )?;
         assert!(matches!(valid, ValidateResult::Valid));
-        Ok(())
-    }
-
-    #[test]
-    fn validate_delta() -> Result<(), Box<dyn std::error::Error>> {
-        let json = r#"[
-            {
-                "author": "IDG",
-                "date": "2022-05-10T00:00:00Z",
-                "title": "Lore ipsum",
-                "content": "..."
-            }
-        ]"#;
-        let valid = PostsFeed::validate_delta(
-            [].as_ref().into(),
-            StateDelta::from(json.as_bytes().to_vec()),
-        )?;
-        assert!(valid);
         Ok(())
     }
 

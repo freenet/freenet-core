@@ -19,6 +19,7 @@ pub(super) async fn run_server(
             changes,
             peer_data: DashMap::new(),
             transactions_data: DashMap::new(),
+            contract_data: DashMap::new(),
         }));
 
     tracing::info!("Starting metrics server on port {port}");

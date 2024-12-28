@@ -28,25 +28,6 @@ impl ContractInterface for TokenAllocContract {
         Ok(ValidateResult::Valid)
     }
 
-    /// The contract verifies that the release times for a tier matches the tier.
-    ///
-    /// For example, a 15:30 UTC release time isn't permitted for hour_1 tier, but 15:00 UTC is permitted.
-    fn validate_delta(
-        parameters: Parameters<'static>,
-        delta: StateDelta<'static>,
-    ) -> Result<bool, ContractError> {
-        let assigned_token = TokenAssignment::try_from(delta)?;
-        let params = TokenDelegateParameters::try_from(parameters)?;
-        #[allow(clippy::redundant_clone)]
-        let verifying_key = VerifyingKey::<Sha256>::new(params.generator_public_key.clone());
-        let verification = assigned_token.is_valid(&verifying_key);
-        if verification.is_err() {
-            log_verification_err(&params.generator_public_key, "validate delta");
-        }
-        log_succesful_ver(&params.generator_public_key, "validate delta");
-        Ok(verification.is_ok())
-    }
-
     fn update_state(
         parameters: Parameters<'static>,
         state: State<'static>,
@@ -142,9 +123,8 @@ impl ContractInterface for TokenAllocContract {
         state: State<'static>,
         _summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
-        // FIXME: this will be broken because problem with node
         let assigned_tokens = TokenAllocationRecord::try_from(state)?;
-        //let summary = TokenAllocationSummary::try_from(summary)?;
+        // FIXME: this will be broken because problem with node
         //let delta = assigned_tokens.delta(&summary);
         assigned_tokens.try_into()
     }

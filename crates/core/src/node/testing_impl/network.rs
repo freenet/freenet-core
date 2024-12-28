@@ -1,5 +1,6 @@
 use crate::client_events::BoxedClient;
 use crate::contract::MemoryContractHandler;
+use crate::dev_tool::TransportPublicKey;
 use crate::node::p2p_impl::NodeP2P;
 use crate::node::Node;
 use crate::tracing::EventRegister;
@@ -16,8 +17,8 @@ pub struct NetworkPeer {
     pub id: String,
     pub config: crate::node::NodeConfig,
     pub ws_client: Option<Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
-    pub user_ev_controller: Arc<Sender<(u32, crate::node::PeerId)>>,
-    pub receiver_ch: Arc<Receiver<(u32, crate::node::PeerId)>>,
+    pub user_ev_controller: Arc<Sender<(u32, TransportPublicKey)>>,
+    pub receiver_ch: Arc<Receiver<(u32, TransportPublicKey)>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -34,23 +35,23 @@ pub enum PeerMessage {
     Info(String),
 }
 
-type PeerEventSender = Sender<(u32, crate::node::PeerId)>;
-type PeerEventReceiver = Receiver<(u32, crate::node::PeerId)>;
+type PeerEventSender = Sender<(u32, TransportPublicKey)>;
+type PeerEventReceiver = Receiver<(u32, TransportPublicKey)>;
 
 impl NetworkPeer {
     pub async fn new(peer_id: String) -> Result<Self, Error> {
-        let (ws_stream, _) = tokio_tungstenite::connect_async("ws://localhost:3000/ws")
+        let (ws_stream, _) = tokio_tungstenite::connect_async("ws://localhost:3000/v1/ws")
             .await
             .expect("Failed to connect to supervisor");
 
-        let config_url = format!("http://127.0.0.1:3000/config/{}", peer_id);
+        let config_url = format!("http://127.0.0.1:3000/v1/config/{}", peer_id);
         let response = reqwest::get(&config_url).await?;
         let peer_config = response.json::<crate::node::NodeConfig>().await?;
 
         tracing::debug!(?peer_config.network_listener_port, %peer_config.is_gateway, key = ?peer_config.key_pair.public(), "Received peer config");
 
         let (user_ev_controller, receiver_ch): (PeerEventSender, PeerEventReceiver) =
-            tokio::sync::watch::channel((0, peer_config.get_peer_id().unwrap()));
+            tokio::sync::watch::channel((0, peer_config.key_pair.public().clone()));
 
         Ok(NetworkPeer {
             id: peer_id,

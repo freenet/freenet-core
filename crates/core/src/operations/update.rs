@@ -1,5 +1,5 @@
-use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 // TODO: complete update logic in the network
+use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
@@ -28,24 +28,6 @@ impl UpdateOp {
         matches!(self.state, None | Some(UpdateState::Finished { .. }))
     }
 
-    // pub(super) fn record_transfer(&mut self) {
-    //     if let Some(stats) = self.stats.as_mut() {
-    //         match stats.step {
-    //             RecordingStats::Uninitialized => {
-    //                 stats.transfer_time = Some((Instant::now(), None));
-    //                 stats.step = RecordingStats::InitUpdate;
-    //             }
-    //             RecordingStats::InitUpdate => {
-    //                 if let Some((_, e)) = stats.transfer_time.as_mut() {
-    //                     *e = Some(Instant::now());
-    //                 }
-    //                 stats.step = RecordingStats::Completed;
-    //             }
-    //             RecordingStats::Completed => {}
-    //         }
-    //     }
-    // }
-
     pub(super) fn to_host_result(&self) -> HostResult {
         if let Some(UpdateState::Finished { key, summary }) = &self.state {
             Ok(HostResponse::ContractResponse(
@@ -65,16 +47,7 @@ impl UpdateOp {
 
 struct UpdateStats {
     target: Option<PeerKeyLocation>,
-    // step: RecordingStats,
 }
-
-// /// While timing, at what particular step we are now.
-// #[derive(Clone, Copy, Default)]
-// enum RecordingStats {
-//     #[default]
-//     Uninitialized,
-//     Completed,
-// }
 
 pub(crate) struct UpdateResult {}
 
@@ -157,7 +130,7 @@ impl Operation for UpdateOp {
                     related_contracts,
                     value,
                 } => {
-                    let sender = op_manager.ring.own_location();
+                    let sender = op_manager.ring.connection_manager.own_location();
 
                     tracing::debug!(
                         "Requesting update for contract {} from {} to {}",
@@ -192,6 +165,7 @@ impl Operation for UpdateOp {
                         tx = %id,
                         %key,
                         target = %target.peer,
+                        sender = %sender.peer,
                         "Updating contract at target peer",
                     );
 
@@ -242,7 +216,7 @@ impl Operation for UpdateOp {
                         return Err(OpError::StatePushed);
                     };
 
-                    let target = op_manager.ring.own_location();
+                    let target = op_manager.ring.connection_manager.own_location();
 
                     tracing::debug!("Attempting contract value update - BroadcastTo - update");
                     let new_value = update_contract(
@@ -289,7 +263,7 @@ impl Operation for UpdateOp {
                     new_value,
                     upstream,
                 } => {
-                    let sender = op_manager.ring.own_location();
+                    let sender = op_manager.ring.connection_manager.own_location();
                     let mut broadcasted_to = *broadcasted_to;
 
                     let mut broadcasting = Vec::with_capacity(broadcast_to.len());
@@ -354,7 +328,7 @@ impl Operation for UpdateOp {
                             tracing::debug!(
                                 tx = %id,
                                 %key,
-                                this_peer = ?op_manager.ring.get_peer_key(),
+                                this_peer = ?op_manager.ring.connection_manager.get_peer_key(),
                                 "Peer completed contract value update - SuccessfulUpdate",
                             );
 
@@ -525,10 +499,11 @@ async fn update_contract(
     state: WrappedState,
     related_contracts: RelatedContracts<'static>,
 ) -> Result<WrappedState, OpError> {
+    let update_data = UpdateData::State(State::from(state));
     match op_manager
         .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
             key,
-            state,
+            data: update_data,
             related_contracts,
         })
         .await
@@ -583,7 +558,7 @@ pub(crate) async fn request_update(
         return Err(OpError::UnexpectedOpState);
     };
 
-    let sender = op_manager.ring.own_location();
+    let sender = op_manager.ring.connection_manager.own_location();
 
     // the initial request must provide:
     // - a peer as close as possible to the contract location

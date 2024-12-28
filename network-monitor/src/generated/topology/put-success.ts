@@ -48,8 +48,18 @@ key(optionalEncoding?:any):string|Uint8Array|null {
   return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
 }
 
+timestamp():bigint {
+  const offset = this.bb!.__offset(this.bb_pos, 12);
+  return offset ? this.bb!.readUint64(this.bb_pos + offset) : BigInt('0');
+}
+
+contractLocation():number {
+  const offset = this.bb!.__offset(this.bb_pos, 14);
+  return offset ? this.bb!.readFloat64(this.bb_pos + offset) : 0.0;
+}
+
 static startPutSuccess(builder:flatbuffers.Builder) {
-  builder.startObject(4);
+  builder.startObject(6);
 }
 
 static addTransaction(builder:flatbuffers.Builder, transactionOffset:flatbuffers.Offset) {
@@ -68,6 +78,14 @@ static addKey(builder:flatbuffers.Builder, keyOffset:flatbuffers.Offset) {
   builder.addFieldOffset(3, keyOffset, 0);
 }
 
+static addTimestamp(builder:flatbuffers.Builder, timestamp:bigint) {
+  builder.addFieldInt64(4, timestamp, BigInt('0'));
+}
+
+static addContractLocation(builder:flatbuffers.Builder, contractLocation:number) {
+  builder.addFieldFloat64(5, contractLocation, 0.0);
+}
+
 static endPutSuccess(builder:flatbuffers.Builder):flatbuffers.Offset {
   const offset = builder.endObject();
   builder.requiredField(offset, 4) // transaction
@@ -77,12 +95,14 @@ static endPutSuccess(builder:flatbuffers.Builder):flatbuffers.Offset {
   return offset;
 }
 
-static createPutSuccess(builder:flatbuffers.Builder, transactionOffset:flatbuffers.Offset, requesterOffset:flatbuffers.Offset, targetOffset:flatbuffers.Offset, keyOffset:flatbuffers.Offset):flatbuffers.Offset {
+static createPutSuccess(builder:flatbuffers.Builder, transactionOffset:flatbuffers.Offset, requesterOffset:flatbuffers.Offset, targetOffset:flatbuffers.Offset, keyOffset:flatbuffers.Offset, timestamp:bigint, contractLocation:number):flatbuffers.Offset {
   PutSuccess.startPutSuccess(builder);
   PutSuccess.addTransaction(builder, transactionOffset);
   PutSuccess.addRequester(builder, requesterOffset);
   PutSuccess.addTarget(builder, targetOffset);
   PutSuccess.addKey(builder, keyOffset);
+  PutSuccess.addTimestamp(builder, timestamp);
+  PutSuccess.addContractLocation(builder, contractLocation);
   return PutSuccess.endPutSuccess(builder);
 }
 }

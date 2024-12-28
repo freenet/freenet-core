@@ -1,5 +1,5 @@
 {
   "tabWidth": 4,
-  "bracketSpacing": true,
-  "useTabs": false
+  "useTabs": false,
+  "semi": true
 }
