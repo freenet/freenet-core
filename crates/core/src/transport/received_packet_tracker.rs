@@ -88,7 +88,7 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
         while self
             .packet_id_time
             .front()
-            .map_or(false, |&(_, time)| time < remove_before)
+            .is_some_and(|&(_, time)| time < remove_before)
         {
             let expired = self.packet_id_time.pop_front();
             if let Some((packet_id, _)) = expired {

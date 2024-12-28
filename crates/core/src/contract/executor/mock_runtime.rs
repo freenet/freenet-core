@@ -35,10 +35,10 @@ impl Executor<MockRuntime> {
         Ok(executor)
     }
 
-    pub async fn handle_request<'a>(
+    pub async fn handle_request(
         &mut self,
         _id: ClientId,
-        _req: ClientRequest<'a>,
+        _req: ClientRequest<'_>,
         _updates: Option<mpsc::UnboundedSender<Result<HostResponse, WsClientError>>>,
     ) -> Response {
         unreachable!()

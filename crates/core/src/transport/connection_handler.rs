@@ -1,4 +1,24 @@
 use std::collections::BTreeMap;
+
+type GatewayConnectionFuture = Box<
+    dyn Future<
+            Output = Result<
+                (
+                    RemoteConnection,
+                    InboundRemoteConnection,
+                    PacketData<SymmetricAES>,
+                ),
+                TransportError,
+            >,
+        > + Send
+        + 'static,
+>;
+
+type TraverseNatFuture = Box<
+    dyn Future<Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>>
+        + Send
+        + 'static,
+>;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
@@ -9,15 +29,16 @@ use crate::transport::crypto::TransportSecretKey;
 use crate::transport::packet_data::{AssymetricRSA, UnknownEncryption};
 use crate::transport::symmetric_message::OutboundConnection;
 use aes_gcm::{Aes128Gcm, KeyInit};
+use futures::FutureExt;
 use futures::{
     stream::{FuturesUnordered, StreamExt},
     Future,
 };
-use futures::{FutureExt, TryFutureExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
-use tracing::{span, Instrument};
+use tracing::span;
+use tracing::Instrument;
 
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
@@ -266,11 +287,15 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
                             let packet_data = PacketData::from_buf(&buf[..size]);
                             let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr);
-                            let task = tokio::spawn(gw_ongoing_connection
-                                .instrument(tracing::span!(tracing::Level::DEBUG, "gateway_connection"))
-                                .map_err(move |error| {
-                                (error, remote_addr)
-                            }));
+                            let task = tokio::spawn({
+                                let span = tracing::span!(tracing::Level::DEBUG, "gateway_connection");
+                                async move {
+                                    match Pin::from(gw_ongoing_connection).await {
+                                        Ok(result) => Ok(result),
+                                        Err(error) => Err((error, remote_addr))
+                                    }
+                                }.instrument(span)
+                            });
                             ongoing_gw_connections.insert(remote_addr, packets_sender);
                             gw_connection_tasks.push(task);
                         }
@@ -351,9 +376,15 @@ impl<S: Socket> UdpPacketsListener<S> {
                     let (ongoing_connection, packets_sender) = self.traverse_nat(
                         remote_addr,  remote_public_key,
                     );
-                    let task = tokio::spawn(ongoing_connection.map_err(move |error| {
-                        (error, remote_addr)
-                    }).instrument(span!(tracing::Level::DEBUG, "traverse_nat")));
+                    let task = tokio::spawn({
+                        let span = span!(tracing::Level::DEBUG, "traverse_nat");
+                        async move {
+                            match Pin::from(ongoing_connection).await {
+                                Ok(result) => Ok(result),
+                                Err(error) => Err((error, remote_addr))
+                            }
+                        }.instrument(span)
+                    });
                     connection_tasks.push(task);
                     ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
                 },
@@ -366,17 +397,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         remote_intro_packet: PacketData<UnknownEncryption>,
         remote_addr: SocketAddr,
     ) -> (
-        impl Future<
-                Output = Result<
-                    (
-                        RemoteConnection,
-                        InboundRemoteConnection,
-                        PacketData<SymmetricAES>,
-                    ),
-                    TransportError,
-                >,
-            > + Send
-            + 'static,
+        GatewayConnectionFuture,
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         let secret = self.this_peer_keypair.secret.clone();
@@ -483,7 +504,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             tracing::debug!("returning connection at gw");
             Ok((remote_conn, inbound_conn, outbound_ack_packet))
         };
-        (f, inbound_from_remote)
+        (Box::new(f), inbound_from_remote)
     }
 
     // TODO: this value should be set given exponential backoff and max timeout
@@ -498,9 +519,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         remote_addr: SocketAddr,
         remote_public_key: TransportPublicKey,
     ) -> (
-        impl Future<Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>>
-            + Send
-            + 'static,
+        TraverseNatFuture,
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         // Constants for exponential backoff
@@ -786,7 +805,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 cause: "max connection attempts reached".into(),
             })
         };
-        (f, inbound_from_remote)
+        (Box::new(f), inbound_from_remote)
     }
 }
 

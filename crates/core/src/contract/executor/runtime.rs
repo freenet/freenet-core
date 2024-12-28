@@ -250,10 +250,10 @@ impl Executor<Runtime> {
         }
     }
 
-    pub async fn handle_request<'a>(
+    pub async fn handle_request(
         &mut self,
         id: ClientId,
-        req: ClientRequest<'a>,
+        req: ClientRequest<'_>,
         updates: Option<mpsc::UnboundedSender<Result<HostResponse, WsClientError>>>,
     ) -> Response {
         match req {
@@ -666,11 +666,11 @@ impl Executor<Runtime> {
         Ok(State::from(state))
     }
 
-    async fn verify_and_store_contract<'a>(
+    async fn verify_and_store_contract(
         &mut self,
         state: WrappedState,
         trying_container: ContractContainer,
-        mut related_contracts: RelatedContracts<'a>,
+        mut related_contracts: RelatedContracts<'_>,
     ) -> Result<(), ExecutorError> {
         let key = trying_container.key();
         let params = trying_container.params();
@@ -768,10 +768,10 @@ impl Executor<Runtime> {
         Ok(())
     }
 
-    async fn send_update_notification<'a>(
+    async fn send_update_notification(
         &mut self,
         key: &ContractKey,
-        params: &Parameters<'a>,
+        params: &Parameters<'_>,
         new_state: &WrappedState,
     ) -> Result<(), ExecutorError> {
         tracing::debug!(contract = %key, "notify of contract update");
