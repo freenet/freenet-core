@@ -85,7 +85,7 @@ chrono = { features = ["arbitrary"], workspace = true }
 freenet-stdlib = { features = ["net", "testing"], workspace = true }
 pav_regression = "0.4"
 pico-args = "0.5"
-statrs = "0.17"
+statrs = "0.18"
 tempfile = "3"
 tracing = "0.1"
 # console-subscriber = { version = "0.4" }
