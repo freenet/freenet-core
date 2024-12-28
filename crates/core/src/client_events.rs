@@ -258,6 +258,7 @@ async fn process_open_request(
         // fixme: communicate back errors in this loop to the client somehow
         let subscription_listener: Option<UnboundedSender<HostResult>> =
             request.notification_channel.take();
+
         match *request.request {
             ClientRequest::ContractOp(ops) => {
                 match ops {
@@ -266,16 +267,17 @@ async fn process_open_request(
                         contract,
                         related_contracts,
                     } => {
-                        let peer_id = op_manager
-                            .ring
-                            .connection_manager
-                            .get_peer_key()
-                            .expect("Peer id not found at put op, it should be set");
-                        // Initialize a put op.
+                        let Some(peer_id) = op_manager.ring.connection_manager.get_peer_key()
+                        else {
+                            tracing::error!("Peer id not found at put op, it should be set");
+                            return;
+                        };
+
                         tracing::debug!(
                             this_peer = %peer_id,
                             "Received put from user event",
                         );
+
                         let op = put::start_op(
                             contract,
                             related_contracts,
@@ -283,20 +285,27 @@ async fn process_open_request(
                             op_manager.ring.max_hops_to_live,
                         );
                         let op_id = op.id;
-                        let _ = op_manager
+
+                        if let Err(err) = op_manager
                             .ch_outbound
                             .waiting_for_transaction_result(op_id, client_id)
-                            .await;
+                            .await
+                        {
+                            tracing::error!("Error waiting for transaction result: {}", err);
+                            return;
+                        }
+
                         if let Err(err) = put::request_put(&op_manager, op).await {
-                            tracing::error!("{}", err);
+                            tracing::error!("Put request error: {}", err);
                         }
                     }
                     ContractRequest::Update { key, data } => {
-                        let peer_id = op_manager
-                            .ring
-                            .connection_manager
-                            .get_peer_key()
-                            .expect("Peer id not found at update op, it should be set");
+                        let Some(peer_id) = op_manager.ring.connection_manager.get_peer_key()
+                        else {
+                            tracing::error!("Peer id not found at update op, it should be set");
+                            return;
+                        };
+
                         tracing::debug!(
                             this_peer = %peer_id,
                             "Received update from user event",
@@ -327,10 +336,14 @@ async fn process_open_request(
 
                         let op = update::start_op(key, new_state, related_contracts);
 
-                        let _ = op_manager
+                        if let Err(err) = op_manager
                             .ch_outbound
                             .waiting_for_transaction_result(op.id, client_id)
-                            .await;
+                            .await
+                        {
+                            tracing::error!("Error waiting for transaction result: {}", err);
+                            return;
+                        }
 
                         if let Err(err) = update::request_update(&op_manager, op).await {
                             tracing::error!("request update error {}", err)
@@ -340,11 +353,12 @@ async fn process_open_request(
                         key,
                         return_contract_code,
                     } => {
-                        let peer_id = op_manager
-                            .ring
-                            .connection_manager
-                            .get_peer_key()
-                            .expect("Peer id not found at get op, it should be set");
+                        let Some(peer_id) = op_manager.ring.connection_manager.get_peer_key()
+                        else {
+                            tracing::error!("Peer id not found at get op, it should be set");
+                            return;
+                        };
+
                         let (state, contract) = match op_manager
                             .notify_contract_handler(ContractHandlerEvent::GetQuery {
                                 key,
@@ -355,14 +369,22 @@ async fn process_open_request(
                             Ok(ContractHandlerEvent::GetResponse {
                                 response: Ok(StoreResponse { state, contract }),
                                 ..
-                            }) => Ok((state, contract)),
+                            }) => (state, contract),
                             Ok(ContractHandlerEvent::GetResponse {
                                 response: Err(err), ..
-                            }) => Err(err.into()),
-                            Err(err) => Err(err.into()),
-                            Ok(_) => Err(OpError::UnexpectedOpState),
-                        }
-                        .expect("get query failed");
+                            }) => {
+                                tracing::error!("get query failed: {}", err);
+                                return;
+                            }
+                            Err(err) => {
+                                tracing::error!("get query failed: {}", err);
+                                return;
+                            }
+                            Ok(_) => {
+                                tracing::error!("get query failed: UnexpectedOpState");
+                                return;
+                            }
+                        };
 
                         if (!return_contract_code && state.is_some())
                             || (return_contract_code && state.is_some() && contract.is_some())
@@ -372,15 +394,21 @@ async fn process_open_request(
                                     this_peer = %peer_id,
                                     "Contract found, returning get result",
                                 );
-                                callback_tx
-                                    .unwrap()
-                                    .send(QueryResult::GetResult {
-                                        key,
-                                        state,
-                                        contract,
-                                    })
-                                    .await
-                                    .ok();
+                                if let Some(tx) = &callback_tx {
+                                    if let Err(err) = tx
+                                        .send(QueryResult::GetResult {
+                                            key,
+                                            state,
+                                            contract,
+                                        })
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            "Error sending QueryResult::GetResult: {}",
+                                            err
+                                        );
+                                    }
+                                }
                             }
                         } else {
                             // Initialize a get op.
@@ -388,13 +416,23 @@ async fn process_open_request(
                                 this_peer = %peer_id,
                                 "Contract not found, starting get op",
                             );
+
                             let op = get::start_op(key, return_contract_code);
-                            let _ = op_manager
+
+                            if let Err(err) = op_manager
                                 .ch_outbound
                                 .waiting_for_transaction_result(op.id, client_id)
-                                .await;
+                                .await
+                            {
+                                tracing::error!(
+                                    "Error waiting for transaction result (get): {}",
+                                    err
+                                );
+                                return;
+                            }
+
                             if let Err(err) = get::request_get(&op_manager, op, vec![]).await {
-                                tracing::error!("{}", err);
+                                tracing::error!("get::request_get error: {}", err);
                             }
                         }
                     }
@@ -409,48 +447,76 @@ async fn process_open_request(
                                     return;
                                 }
                             };
+
                         let Some(subscriber_listener) = subscription_listener else {
                             tracing::error!(%op_id, %client_id, "No subscriber listener");
                             return;
                         };
-                        let _ = op_manager
-                            .notify_contract_handler(ContractHandlerEvent::RegisterSubscriberListener {
-                                key,
-                                client_id,
-                                summary,
-                                subscriber_listener,
-                            })
-                            .await.inspect_err(|err| {
-                                tracing::error!(%op_id, %client_id, "Register subscriber listener error: {}", err);
-                            });
-                        let _ = op_manager
+
+                        if let Err(err) = op_manager
+                            .notify_contract_handler(
+                                ContractHandlerEvent::RegisterSubscriberListener {
+                                    key,
+                                    client_id,
+                                    summary,
+                                    subscriber_listener,
+                                },
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                %op_id, %client_id,
+                                "Register subscriber listener error: {}", err
+                            );
+                            return;
+                        }
+
+                        if let Err(err) = op_manager
                             .ch_outbound
                             .waiting_for_transaction_result(op_id, client_id)
-                            .await;
+                            .await
+                        {
+                            tracing::error!("Error waiting for transaction result: {}", err);
+                            return;
+                        }
                     }
                     _ => {
                         tracing::error!("Op not supported");
                     }
                 }
             }
-            ClientRequest::DelegateOp(_op) => todo!("FIXME: delegate op"),
-            ClientRequest::Disconnect { .. } => unreachable!(),
+            ClientRequest::DelegateOp(_op) => {
+                todo!("FIXME: delegate op");
+            }
+            ClientRequest::Disconnect { .. } => {
+                unreachable!();
+            }
             ClientRequest::NodeQueries(_) => {
                 tracing::debug!("Received node queries from user event");
-                let _ = op_manager
-                    .notify_node_event(NodeEvent::QueryConnections {
-                        callback: callback_tx.expect("should be set"),
-                    })
-                    .await;
+
+                let Some(tx) = callback_tx else {
+                    tracing::error!("callback_tx not available for NodeQueries");
+                    return;
+                };
+
+                if let Err(err) = op_manager
+                    .notify_node_event(NodeEvent::QueryConnections { callback: tx })
+                    .await
+                {
+                    tracing::error!("notify_node_event(QueryConnections) error: {}", err);
+                }
             }
             _ => {
                 tracing::error!("Op not supported");
             }
         }
     };
-    GlobalExecutor::spawn(fut.instrument(
-        tracing::info_span!(parent: tracing::Span::current(), "process_client_request"),
-    ));
+
+    GlobalExecutor::spawn(fut.instrument(tracing::info_span!(
+        parent: tracing::Span::current(),
+        "process_client_request"
+    )));
+
     callback_rx
 }
 

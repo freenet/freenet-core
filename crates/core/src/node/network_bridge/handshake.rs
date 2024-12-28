@@ -640,7 +640,7 @@ impl HandshakeHandler {
                 Err(e) => {
                     tracing::debug!(%remote, "failed to establish outbound connection: {e}");
                     Err((remote, e.into()))
-                },
+                }
             })
             .boxed();
         self.ongoing_outbound_connections.push(f);

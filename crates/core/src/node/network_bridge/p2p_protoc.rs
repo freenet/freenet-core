@@ -821,10 +821,12 @@ async fn peer_connection_listener(
                 }
             }
             msg = conn.recv() => {
-                let Ok(msg) = msg.map_err(|error| {
-                    tracing::error!(from=%conn.remote_addr(), "Error while receiving message: {error}");
-                }) else {
-                     break Err(TransportError::ConnectionClosed(conn.remote_addr()));
+                let Ok(msg) = msg
+                    .inspect_err(|error| {
+                        tracing::error!(from=%conn.remote_addr(), "Error while receiving message: {error}");
+                    })
+                else {
+                    break Err(TransportError::ConnectionClosed(conn.remote_addr()));
                 };
                 let net_message = decode_msg(&msg).unwrap();
                 tracing::debug!(from=%conn.remote_addr() ,"Received message from peer. Msg: {net_message}");

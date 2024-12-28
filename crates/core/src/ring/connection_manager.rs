@@ -274,7 +274,7 @@ impl ConnectionManager {
     fn prune_connection(&self, peer: &PeerId, is_alive: bool) -> Option<Location> {
         let connection_type = if is_alive { "active" } else { "in transit" };
         tracing::debug!(%peer, "Pruning {} connection", connection_type);
-        
+
         let mut locations_for_peer = self.location_for_peer.write();
 
         let Some(loc) = locations_for_peer.remove(peer) else {
