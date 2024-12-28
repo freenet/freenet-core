@@ -12,7 +12,8 @@ use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
 use crate::message::{NetMessageV1, NodeEvent};
-use crate::ring::Ring;
+use crate::ring::ConnectionManager;
+use crate::router::Router;
 use crate::transport::TransportPublicKey;
 use crate::{
     message::{InnerMessage, NetMessage, Transaction},
@@ -34,6 +35,20 @@ pub(crate) struct ConnectOp {
 }
 
 impl ConnectOp {
+    pub fn new(
+        id: Transaction,
+        state: Option<ConnectState>,
+        gateway: Option<Box<PeerKeyLocation>>,
+        backoff: Option<ExponentialBackoff>,
+    ) -> Self {
+        Self {
+            id,
+            state,
+            gateway,
+            backoff,
+        }
+    }
+
     pub fn has_backoff(&self) -> bool {
         self.backoff.is_some()
     }
@@ -94,7 +109,7 @@ impl Operation for ConnectOp {
                         ..
                     }
                 ) {
-                    Some(Box::new(op_manager.ring.own_location()))
+                    Some(Box::new(op_manager.ring.connection_manager.own_location()))
                 } else {
                     None
                 };
@@ -146,8 +161,9 @@ impl Operation for ConnectOp {
                             skip_list,
                         },
                     id,
+                    ..
                 } => {
-                    let own_loc = op_manager.ring.own_location();
+                    let own_loc = op_manager.ring.connection_manager.own_location();
                     let PeerKeyLocation {
                         peer: this_peer,
                         location: Some(_),
@@ -156,13 +172,14 @@ impl Operation for ConnectOp {
                         return Err(OpError::RingError(crate::ring::RingError::NoLocation));
                     };
                     let mut skip_list = skip_list.clone();
-                    skip_list.push(query_target.peer.clone());
+                    skip_list.extend([this_peer.clone(), query_target.peer.clone()]);
                     if this_peer == &query_target.peer {
                         // this peer should be the original target queries
                         tracing::debug!(
                             tx = %id,
                             query_target = %query_target.peer,
                             joiner = %joiner.peer,
+                            skip_list = ?skip_list,
                             "Got queried for new connections from joiner",
                         );
                         if let Some(desirable_peer) = op_manager
@@ -176,19 +193,16 @@ impl Operation for ConnectOp {
                                 desirable_peer = %desirable_peer.peer,
                                 "Found a desirable peer to connect to",
                             );
-                            let msg = ConnectMsg::Request {
-                                id: *id,
-                                msg: ConnectRequest::CheckConnectivity {
-                                    sender: own_loc.clone(),
-                                    joiner: joiner.clone(),
-                                    hops_to_live: *max_hops_to_live,
-                                    max_hops_to_live: *max_hops_to_live,
-                                    skip_list,
-                                },
-                            };
-                            network_bridge
-                                .send(&desirable_peer.peer, msg.into())
-                                .await?;
+                            let msg = create_forward_message(
+                                *id,
+                                &own_loc,
+                                joiner,
+                                &desirable_peer,
+                                *max_hops_to_live,
+                                *max_hops_to_live,
+                                skip_list,
+                            );
+                            network_bridge.send(&desirable_peer.peer, msg).await?;
                             return_msg = None;
                             new_state = Some(ConnectState::AwaitingConnectionAcquisition {});
                         } else {
@@ -215,6 +229,7 @@ impl Operation for ConnectOp {
                         }));
                         let msg = ConnectMsg::Request {
                             id: *id,
+                            target: query_target.clone(),
                             msg: ConnectRequest::FindOptimalPeer {
                                 query_target: query_target.clone(),
                                 ideal_location: *ideal_location,
@@ -230,77 +245,15 @@ impl Operation for ConnectOp {
                 ConnectMsg::Request {
                     id,
                     msg:
-                        ConnectRequest::StartJoinReq {
-                            joiner,
-                            hops_to_live,
-                            skip_list, //
-                            ..
-                        },
-                } => {
-                    let joiner: PeerId = joiner
-                        .clone()
-                        .expect("should be already set at the p2p bridge level");
-                    let this_peer = op_manager.ring.own_location();
-                    let assigned_location = Location::from_address(&joiner.addr);
-
-                    let new_peer_loc = PeerKeyLocation {
-                        location: Some(assigned_location),
-                        peer: joiner.clone(),
-                    };
-
-                    let accepted = op_manager
-                        .ring
-                        .should_accept(assigned_location, Some(&joiner));
-
-                    let mut skip_list = skip_list.clone();
-                    skip_list.push(joiner.clone());
-                    if let Some(updated_state) = forward_conn(
-                        *id,
-                        &op_manager.ring,
-                        network_bridge,
-                        (new_peer_loc.clone(), new_peer_loc.clone()),
-                        *hops_to_live,
-                        accepted, // gateway always accept the first connection
-                        skip_list,
-                    )
-                    .await?
-                    {
-                        new_state = Some(updated_state);
-                    } else {
-                        new_state = None;
-                    }
-
-                    if accepted {
-                        op_manager
-                            .ring
-                            .add_connection(assigned_location, joiner.clone())
-                            .await;
-                        tracing::debug!(tx = %id, at = %this_peer.peer, %joiner, "Accepting connection");
-                    } else {
-                        tracing::debug!(tx = %id, at = %this_peer.peer, %joiner, "Rejecting connection");
-                    }
-
-                    return_msg = Some(ConnectMsg::Response {
-                        id: *id,
-                        sender: this_peer.clone(),
-                        target: new_peer_loc.clone(),
-                        msg: ConnectResponse::AcceptedBy {
-                            accepted,
-                            acceptor: this_peer.clone(),
-                            joiner: joiner.clone(),
-                        },
-                    });
-                }
-                ConnectMsg::Request {
-                    id,
-                    msg:
                         ConnectRequest::CheckConnectivity {
                             sender,
                             joiner,
                             hops_to_live,
+                            max_hops_to_live,
                             skip_list,
                             ..
                         },
+                    ..
                 } => {
                     //debug_assert_ne!(sender.peer, joiner.peer);
                     if sender.peer == joiner.peer {
@@ -308,12 +261,12 @@ impl Operation for ConnectOp {
                             tx = %id,
                             sender = %sender.peer,
                             joiner = %joiner.peer,
-                            at = %op_manager.ring.own_location().peer,
+                            at = %op_manager.ring.connection_manager.own_location().peer,
                             "Connectivity check from self, aborting"
                         );
                         std::process::exit(1);
                     }
-                    let this_peer = op_manager.ring.own_location();
+                    let this_peer = op_manager.ring.connection_manager.own_location();
                     let joiner_loc = joiner
                         .location
                         .expect("should be already set at the p2p bridge level");
@@ -328,7 +281,8 @@ impl Operation for ConnectOp {
 
                     let should_accept = if op_manager
                         .ring
-                        .should_accept(joiner_loc, Some(&joiner.peer))
+                        .connection_manager
+                        .should_accept(joiner_loc, &joiner.peer)
                     {
                         tracing::debug!(tx = %id, %joiner, "Accepting connection from");
                         let (callback, mut result) = tokio::sync::mpsc::channel(1);
@@ -336,7 +290,9 @@ impl Operation for ConnectOp {
                         op_manager
                             .notify_node_event(NodeEvent::ConnectPeer {
                                 peer: joiner.peer.clone(),
+                                tx: *id,
                                 callback,
+                                is_gw: false,
                             })
                             .await?;
                         if result
@@ -345,13 +301,22 @@ impl Operation for ConnectOp {
                             .ok_or(OpError::NotificationError)?
                             .is_ok()
                         {
+                            let was_reserved = {
+                                // reserved just above in call to should_accept
+                                true
+                            };
                             // Add the connection to the ring
                             op_manager
                                 .ring
-                                .add_connection(joiner_loc, joiner.peer.clone())
+                                .add_connection(joiner_loc, joiner.peer.clone(), was_reserved)
                                 .await;
                             true
                         } else {
+                            // If the connection was not completed, prune the reserved connection
+                            op_manager
+                                .ring
+                                .connection_manager
+                                .prune_in_transit_connection(&joiner.peer);
                             false
                         }
                     } else {
@@ -359,21 +324,27 @@ impl Operation for ConnectOp {
                         false
                     };
 
-                    if let Some(updated_state) = forward_conn(
-                        *id,
-                        &op_manager.ring,
-                        network_bridge,
-                        (sender.clone(), joiner.clone()),
-                        *hops_to_live,
-                        should_accept,
-                        skip_list.clone(),
-                    )
-                    .await?
                     {
-                        new_state = Some(updated_state);
-                    } else {
-                        tracing::debug!(tx = %id, at = %this_peer.peer, "Rejecting connection from {:?}", joiner);
-                        new_state = None
+                        if let Some(updated_state) = forward_conn(
+                            *id,
+                            &op_manager.ring.connection_manager,
+                            op_manager.ring.router.clone(),
+                            network_bridge,
+                            ForwardParams {
+                                left_htl: *hops_to_live,
+                                max_htl: *max_hops_to_live,
+                                accepted: should_accept,
+                                skip_list: skip_list.clone(),
+                                req_peer: sender.clone(),
+                                joiner: joiner.clone(),
+                            },
+                        )
+                        .await?
+                        {
+                            new_state = Some(updated_state);
+                        } else {
+                            new_state = None
+                        }
                     }
 
                     let response = ConnectResponse::AcceptedBy {
@@ -407,12 +378,16 @@ impl Operation for ConnectOp {
                         "Connect response received",
                     );
 
-                    let this_peer_id = op_manager.ring.get_peer_key().expect("peer id not found");
+                    let this_peer_id = op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_key()
+                        .expect("peer id not found");
 
                     match self.state.as_mut() {
                         Some(ConnectState::ConnectingToNode(info)) => {
-                            assert!(info.remaining_connetions > 0);
-                            let remaining_connetions = info.remaining_connetions.saturating_sub(1);
+                            assert!(info.remaining_connections > 0);
+                            let remaining_connetions = info.remaining_connections.saturating_sub(1);
 
                             if *accepted {
                                 tracing::debug!(
@@ -428,6 +403,7 @@ impl Operation for ConnectOp {
                                     .add_connection(
                                         acceptor.location.expect("location not found"),
                                         acceptor.peer.clone(),
+                                        true, // we reserved the connection to this peer before asking to join
                                     )
                                     .await;
                             } else {
@@ -448,7 +424,10 @@ impl Operation for ConnectOp {
                                 location = %your_location,
                                 "Updating assigned location"
                             );
-                            op_manager.ring.update_location(target.location);
+                            op_manager
+                                .ring
+                                .connection_manager
+                                .update_location(target.location);
 
                             if remaining_connetions == 0 {
                                 tracing::debug!(
@@ -474,29 +453,15 @@ impl Operation for ConnectOp {
                             assert!(*remaining_checks > 0);
                             let remaining_checks = remaining_checks.saturating_sub(1);
 
-                            if *accepted {
-                                tracing::debug!(
-                                    tx = %id,
-                                    at = %this_peer_id,
-                                    from = %sender.peer,
-                                    accecpted_by = %acceptor.peer,
-                                    "Connectivity check accepted",
-                                );
-                                let acceptor_loc =
-                                    acceptor.location.expect("location not found for acceptor");
-                                op_manager
-                                    .ring
-                                    .add_connection(acceptor_loc, acceptor.peer.clone())
-                                    .await;
-                            } else {
-                                tracing::debug!(
-                                    tx = %id,
-                                    at = %this_peer_id,
-                                    from = %sender.peer,
-                                    rejected_by = %acceptor.peer,
-                                    "Connectivity check rejected",
-                                );
-                            }
+                            tracing::debug!(
+                                tx = %id,
+                                at = %this_peer_id,
+                                from = %sender.peer,
+                                acceptor = %acceptor.peer,
+                                accepted = %accepted,
+                                "Connectivity check",
+                            );
+
                             if remaining_checks == 0 {
                                 tracing::debug!(
                                     tx = %id,
@@ -623,6 +588,7 @@ where
     if need_to_clean_gw_conn {
         let msg = ConnectMsg::Request {
             id,
+            target: state.gateway.clone(),
             msg: ConnectRequest::CleanConnection { joiner },
         };
         conn_bridge.send(&state.gateway.peer, msg.into()).await?;
@@ -633,7 +599,7 @@ where
 type Requester = PeerKeyLocation;
 
 #[derive(Debug)]
-enum ConnectState {
+pub enum ConnectState {
     Initializing,
     ConnectingToNode(ConnectionInfo),
     AwaitingConnectivity(ConnectivityInfo),
@@ -643,31 +609,35 @@ enum ConnectState {
 }
 
 #[derive(Debug, Clone)]
-struct ConnectivityInfo {
+pub(crate) struct ConnectivityInfo {
     remaining_checks: usize,
     requester: Requester,
 }
 
 impl ConnectivityInfo {
-    fn new(requester: Requester, remaining_checks: usize) -> Self {
+    pub fn new(requester: Requester, remaining_checks: usize) -> Self {
         Self {
             requester,
             remaining_checks,
         }
     }
+
+    /// Decrements the remaining checks and returns whether the checks are complete.
+    pub fn decrement_check(&mut self) -> bool {
+        self.remaining_checks = self.remaining_checks.saturating_sub(1);
+        self.remaining_checks == 0
+    }
 }
 
 #[derive(Debug, Clone)]
-struct ConnectionInfo {
+pub(crate) struct ConnectionInfo {
     gateway: PeerKeyLocation,
-    peer_pub_key: TransportPublicKey,
-    max_hops_to_live: usize,
     accepted_by: HashSet<PeerKeyLocation>,
-    remaining_connetions: usize,
+    remaining_connections: usize,
 }
 
 #[derive(Debug, Clone)]
-struct NewConnectionInfo {
+pub(crate) struct NewConnectionInfo {
     remaining_connetions: usize,
 }
 
@@ -688,20 +658,16 @@ impl ConnectState {
 ///   (to gateways or regular peers) will be treated as regular connections.
 ///
 /// - is_gateway: Whether this peer is a gateway or not.
-pub(crate) async fn initial_join_procedure<CM>(
+pub(crate) async fn initial_join_procedure(
     op_manager: Arc<OpManager>,
-    mut conn_manager: CM,
-    peer_pub_key: TransportPublicKey,
     gateways: &[PeerKeyLocation],
-) -> Result<(), OpError>
-where
-    CM: NetworkBridge + Send + 'static,
-{
+) -> Result<(), OpError> {
     use crate::util::IterExt;
     let number_of_parallel_connections = {
         let max_potential_conns_per_gw = op_manager.ring.max_hops_to_live;
         // e.g. 10 gateways and htl 5 -> only need 2 connections in parallel
-        let needed_to_cover_max = op_manager.ring.max_connections / max_potential_conns_per_gw;
+        let needed_to_cover_max =
+            op_manager.ring.connection_manager.max_connections / max_potential_conns_per_gw;
         gateways.iter().take(needed_to_cover_max).count().max(1)
     };
     let gateways = gateways.to_vec();
@@ -718,21 +684,18 @@ where
                 );
                 for gateway in op_manager
                     .ring
-                    .is_connected(gateways.iter())
+                    .is_not_connected(gateways.iter())
                     .shuffle()
                     .take(number_of_parallel_connections)
                 {
                     tracing::info!(%gateway, "Attempting connection to gateway");
-                    if let Err(error) = join_ring_request(
-                        None,
-                        peer_pub_key.clone(),
-                        gateway,
-                        &op_manager,
-                        &mut conn_manager,
-                    )
-                    .await
-                    {
-                        tracing::error!(%error, "Failed while attempting connection to gateway");
+                    if let Err(error) = join_ring_request(None, gateway, &op_manager).await {
+                        if !matches!(
+                            error,
+                            OpError::ConnError(crate::node::ConnectionError::UnwantedConnection)
+                        ) {
+                            tracing::error!(%error, "Failed while attempting connection to gateway");
+                        }
                     }
                 }
             }
@@ -746,35 +709,29 @@ where
     Ok(())
 }
 
-#[tracing::instrument(fields(peer = ?op_manager.ring.get_peer_key()), skip_all)]
-pub(crate) async fn join_ring_request<CM>(
+#[tracing::instrument(fields(peer = %op_manager.ring.connection_manager.pub_key), skip_all)]
+pub(crate) async fn join_ring_request(
     backoff: Option<ExponentialBackoff>,
-    peer_pub_key: TransportPublicKey,
     gateway: &PeerKeyLocation,
     op_manager: &OpManager,
-    conn_manager: &mut CM,
-) -> Result<(), OpError>
-where
-    CM: NetworkBridge + Send,
-{
-    if op_manager.ring.num_connections() > 0 {
-        use crate::node::ConnectionError;
-        if !op_manager.ring.should_accept(
-            gateway.location.unwrap_or_else(Location::random),
-            Some(&gateway.peer),
-        ) {
-            // ensure that we still want to connect AND reserve an spot implicitly
-            return Err(OpError::ConnError(ConnectionError::FailedConnectOp));
-        }
+) -> Result<(), OpError> {
+    use crate::node::ConnectionError;
+    if !op_manager.ring.connection_manager.should_accept(
+        gateway.location.ok_or_else(|| {
+            tracing::error!(
+                "Gateway location not found, this should not be possible, report an error"
+            );
+            OpError::ConnError(ConnectionError::LocationUnknown)
+        })?,
+        &gateway.peer,
+    ) {
+        // ensure that we still want to connect AND reserve an spot implicitly
+        return Err(OpError::ConnError(ConnectionError::UnwantedConnection));
     }
+
     let tx_id = Transaction::new::<ConnectMsg>();
-    tracing::info!(%gateway.peer, %peer_pub_key, "Attempting network join");
-    let mut op = initial_request(
-        peer_pub_key,
-        gateway.clone(),
-        op_manager.ring.max_hops_to_live,
-        tx_id,
-    );
+    tracing::info!(%gateway.peer, "Attempting network join");
+    let mut op = initial_request(gateway.clone(), op_manager.ring.max_hops_to_live, tx_id);
     if let Some(mut backoff) = backoff {
         // backoff to retry later in case it failed
         tracing::warn!("Performing a new join, attempt {}", backoff.retries() + 1);
@@ -793,12 +750,11 @@ where
         // passed as an argument and advanced
         op.backoff = Some(backoff);
     }
-    connect_request(tx_id, op_manager, conn_manager, op).await?;
+    connect_request(tx_id, op_manager, op).await?;
     Ok(())
 }
 
 fn initial_request(
-    peer_pub_key: TransportPublicKey,
     gateway: PeerKeyLocation,
     max_hops_to_live: usize,
     id: Transaction,
@@ -806,10 +762,8 @@ fn initial_request(
     const MAX_JOIN_RETRIES: usize = usize::MAX;
     let state = ConnectState::ConnectingToNode(ConnectionInfo {
         gateway: gateway.clone(),
-        peer_pub_key: peer_pub_key.clone(),
-        max_hops_to_live,
         accepted_by: HashSet::new(),
-        remaining_connetions: max_hops_to_live,
+        remaining_connections: max_hops_to_live,
     });
     let ceiling = if cfg!(test) {
         Duration::from_secs(1)
@@ -829,24 +783,15 @@ fn initial_request(
 }
 
 /// Join ring routine, called upon performing a join operation for this node.
-async fn connect_request<NB>(
+async fn connect_request(
     tx: Transaction,
     op_manager: &OpManager,
-    conn_bridge: &mut NB,
     join_op: ConnectOp,
-) -> Result<(), OpError>
-where
-    NB: NetworkBridge,
-{
+) -> Result<(), OpError> {
     let ConnectOp {
         id, state, backoff, ..
     } = join_op;
-    let ConnectionInfo {
-        gateway,
-        peer_pub_key,
-        max_hops_to_live,
-        ..
-    } = state.expect("infallible").try_unwrap_connecting()?;
+    let ConnectionInfo { gateway, .. } = state.expect("infallible").try_unwrap_connecting()?;
 
     tracing::info!(
         tx = %id,
@@ -854,49 +799,87 @@ where
         "Connecting to gateway",
     );
 
-    let join_req = NetMessage::from(messages::ConnectMsg::Request {
-        id: tx,
-        msg: ConnectRequest::StartJoinReq {
-            joiner: None,
-            joiner_key: peer_pub_key.clone(),
-            hops_to_live: max_hops_to_live,
-            max_hops_to_live,
-            skip_list: vec![],
-        },
-    });
-    conn_bridge.send(&gateway.peer, join_req).await?;
+    let (callback, mut result) = tokio::sync::mpsc::channel(1);
     op_manager
-        .push(
+        .notify_node_event(NodeEvent::ConnectPeer {
+            peer: gateway.peer.clone(),
             tx,
-            OpEnum::Connect(Box::new(ConnectOp {
-                id,
-                state: Some(ConnectState::ConnectingToNode(ConnectionInfo {
-                    gateway: gateway.clone(),
-                    peer_pub_key,
-                    max_hops_to_live,
-                    accepted_by: HashSet::new(),
-                    remaining_connetions: max_hops_to_live,
-                })),
-                gateway: Some(Box::new(gateway)),
-                backoff,
-            })),
-        )
+            callback,
+            is_gw: true,
+        })
         .await?;
-    Ok(())
+    match result.recv().await.ok_or(OpError::NotificationError)? {
+        Ok((joiner, remaining_checks)) => {
+            op_manager
+                .ring
+                .add_connection(
+                    gateway.location.expect("location not found"),
+                    gateway.peer.clone(),
+                    true,
+                )
+                .await;
+            let Some(remaining_connetions) = remaining_checks else {
+                tracing::error!(tx = %id, "Failed to connect to gateway, missing remaining checks");
+                return Err(OpError::ConnError(
+                    crate::node::ConnectionError::FailedConnectOp,
+                ));
+            };
+            tracing::debug!(
+                tx = %id,
+                gateway = %gateway,
+                joiner = %joiner,
+                "Sending connection request to gateway",
+            );
+            // at this point the gateway has accepted the connection so already
+            // sent StartJoinReq to the gateway and are waiting for new upstream connections
+            op_manager
+                .push(
+                    tx,
+                    OpEnum::Connect(Box::new(ConnectOp {
+                        id,
+                        state: Some(ConnectState::AwaitingNewConnection(NewConnectionInfo {
+                            remaining_connetions,
+                        })),
+                        gateway: Some(Box::new(gateway)),
+                        backoff,
+                    })),
+                )
+                .await?;
+            Ok(())
+        }
+        Err(_) => Err(OpError::ConnError(
+            crate::node::ConnectionError::FailedConnectOp,
+        )),
+    }
 }
 
-async fn forward_conn<NB>(
+pub(crate) struct ForwardParams {
+    pub left_htl: usize,
+    pub max_htl: usize,
+    pub accepted: bool,
+    pub skip_list: Vec<PeerId>,
+    pub req_peer: PeerKeyLocation,
+    pub joiner: PeerKeyLocation,
+}
+
+pub(crate) async fn forward_conn<NB>(
     id: Transaction,
-    ring: &Ring,
+    connection_manager: &ConnectionManager,
+    router: Arc<parking_lot::RwLock<Router>>,
     network_bridge: &mut NB,
-    (req_peer, joiner): (PeerKeyLocation, PeerKeyLocation),
-    left_htl: usize,
-    accepted: bool,
-    skip_list: Vec<PeerId>,
+    params: ForwardParams,
 ) -> Result<Option<ConnectState>, OpError>
 where
     NB: NetworkBridge,
 {
+    let ForwardParams {
+        left_htl,
+        max_htl,
+        accepted,
+        mut skip_list,
+        req_peer,
+        joiner,
+    } = params;
     if left_htl == 0 {
         tracing::debug!(
             tx = %id,
@@ -906,7 +889,7 @@ where
         return Ok(None);
     }
 
-    if ring.num_connections() == 0 {
+    if connection_manager.num_connections() == 0 {
         tracing::warn!(
             tx = %id,
             joiner = %joiner.peer,
@@ -915,11 +898,30 @@ where
         return Ok(None);
     }
 
-    let target_peer = select_forward_target(id, ring, &req_peer, &joiner, left_htl, &skip_list);
+    let target_peer = {
+        let router = router.read();
+        select_forward_target(
+            id,
+            connection_manager,
+            &router,
+            &req_peer,
+            &joiner,
+            left_htl,
+            &skip_list,
+        )
+    };
+    skip_list.push(req_peer.peer.clone());
     match target_peer {
         Some(target_peer) => {
-            let forward_msg =
-                create_forward_message(id, &req_peer, &joiner, left_htl, &[req_peer.peer.clone()]);
+            let forward_msg = create_forward_message(
+                id,
+                &req_peer,
+                &joiner,
+                &target_peer,
+                left_htl,
+                max_htl,
+                skip_list,
+            );
             tracing::debug!(target: "network", "Forwarding connection request to {:?}", target_peer);
             network_bridge.send(&target_peer.peer, forward_msg).await?;
             update_state_with_forward_info(&req_peer, left_htl)
@@ -930,31 +932,34 @@ where
 
 fn select_forward_target(
     id: Transaction,
-    ring: &Ring,
+    connection_manager: &ConnectionManager,
+    router: &Router,
     request_peer: &PeerKeyLocation,
     joiner: &PeerKeyLocation,
     left_htl: usize,
     skip_list: &[PeerId],
 ) -> Option<PeerKeyLocation> {
-    if left_htl >= ring.rnd_if_htl_above {
+    if left_htl >= connection_manager.rnd_if_htl_above {
         tracing::debug!(
             tx = %id,
             joiner = %joiner.peer,
             "Randomly selecting peer to forward connect request",
         );
-        ring.random_peer(|p| !skip_list.contains(p))
+        connection_manager.random_peer(|p| !skip_list.contains(p))
     } else {
         tracing::debug!(
             tx = %id,
             joiner = %joiner.peer,
             "Selecting close peer to forward request",
         );
-        ring.routing(
-            joiner.location.unwrap(),
-            Some(&request_peer.peer),
-            skip_list,
-        )
-        .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))
+        connection_manager
+            .routing(
+                joiner.location.unwrap(),
+                Some(&request_peer.peer),
+                skip_list,
+                router,
+            )
+            .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))
     }
 }
 
@@ -962,17 +967,20 @@ fn create_forward_message(
     id: Transaction,
     request_peer: &PeerKeyLocation,
     joiner: &PeerKeyLocation,
+    target: &PeerKeyLocation,
     hops_to_live: usize,
-    skip_list: &[PeerId],
+    max_hops_to_live: usize,
+    skip_list: Vec<PeerId>,
 ) -> NetMessage {
     NetMessage::from(ConnectMsg::Request {
         id,
+        target: target.clone(),
         msg: ConnectRequest::CheckConnectivity {
             sender: request_peer.clone(),
             joiner: joiner.clone(),
-            hops_to_live,
-            max_hops_to_live: hops_to_live,
-            skip_list: skip_list.to_vec(),
+            hops_to_live: hops_to_live.saturating_sub(1), // decrement the hops to live for the next hop
+            max_hops_to_live,
+            skip_list,
         },
     })
 }
@@ -1012,6 +1020,7 @@ mod messages {
     pub(crate) enum ConnectMsg {
         Request {
             id: Transaction,
+            target: PeerKeyLocation,
             msg: ConnectRequest,
         },
         Response {
@@ -1039,9 +1048,9 @@ mod messages {
         fn target(&self) -> Option<impl Borrow<PeerKeyLocation>> {
             use ConnectMsg::*;
             match self {
+                Request { target, .. } => Some(target),
                 Response { target, .. } => Some(target),
                 Connected { target, .. } => Some(target),
-                _ => None,
             }
         }
 
@@ -1066,21 +1075,42 @@ mod messages {
             let id = self.id();
             match self {
                 Self::Request {
+                    target,
                     msg: ConnectRequest::StartJoinReq { .. },
                     ..
-                } => write!(f, "StartRequest(id: {id})"),
-                Self::Response {
-                    msg: ConnectResponse::AcceptedBy { .. },
+                } => write!(f, "StartRequest(id: {id}, target: {target})"),
+                Self::Request {
+                    target,
+                    msg: ConnectRequest::CheckConnectivity {
+                        sender,
+                        joiner,
+                        ..
+                    },
                     ..
-                } => write!(f, "AcceptedBy(id: {id})"),
+                } => write!(
+                    f,
+                    "CheckConnectivity(id: {id}, target: {target}, sender: {sender}, joiner: {joiner})"
+                ),
+                Self::Response {
+                    target,
+                    msg:
+                        ConnectResponse::AcceptedBy {
+                            accepted, acceptor, ..
+                        },
+                    ..
+                } => write!(
+                    f,
+                    "AcceptedBy(id: {id}, target: {target}, accepted: {accepted}, acceptor: {acceptor})"
+                ),
                 Self::Connected { .. } => write!(f, "Connected(id: {id})"),
-                ConnectMsg::Request { id, .. } => write!(f, "Request(id: {id})"),
+                ConnectMsg::Request { id, target, .. } => write!(f, "Request(id: {id}, target: {target})"),
             }
         }
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub(crate) enum ConnectRequest {
+        /// A request to join a gateway.
         StartJoinReq {
             // The peer who is trying to join, should be set when PeerConnection is established
             joiner: Option<PeerId>,
@@ -1120,101 +1150,5 @@ mod messages {
             acceptor: PeerKeyLocation,
             joiner: PeerId,
         },
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use std::time::Duration;
-
-    use crate::node::testing_impl::SimNetwork;
-
-    /// Given a network of one node and one gateway test that both are connected.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn one_node_connects_to_gw() -> anyhow::Result<()> {
-        const NUM_NODES: usize = 1usize;
-        const NUM_GW: usize = 1usize;
-        const MAX_HTL: usize = 1usize;
-        const RAND_IF_HTL_ABOVE: usize = 1usize;
-        const MAX_CONNS: usize = 1usize;
-        const MIN_CONNS: usize = 1usize;
-        let mut sim_nw = SimNetwork::new(
-            "join_one_node_connects_to_gw",
-            NUM_NODES,
-            NUM_GW,
-            MAX_HTL,
-            RAND_IF_HTL_ABOVE,
-            MAX_CONNS,
-            MIN_CONNS,
-        )
-        .await;
-        sim_nw.start().await;
-        sim_nw.check_connectivity(Duration::from_secs(1))?;
-        assert!(sim_nw.connected(&"node-1".into()));
-        Ok(())
-    }
-
-    /// Once a gateway is left without remaining open slots, ensure forwarding connects
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn forward_connection_to_node() -> anyhow::Result<()> {
-        const NUM_NODES: usize = 3usize;
-        const NUM_GW: usize = 1usize;
-        const MAX_HTL: usize = 2usize;
-        const RAND_IF_HTL_ABOVE: usize = 1usize;
-        const MAX_CONNS: usize = 2usize;
-        const MIN_CONNS: usize = 1usize;
-        let mut sim_nw = SimNetwork::new(
-            "join_forward_connection_to_node",
-            NUM_GW,
-            NUM_NODES,
-            MAX_HTL,
-            RAND_IF_HTL_ABOVE,
-            MAX_CONNS,
-            MIN_CONNS,
-        )
-        .await;
-        // sim_nw.with_start_backoff(Duration::from_millis(100));
-        sim_nw.start().await;
-        sim_nw.check_connectivity(Duration::from_secs(3))?;
-        let some_forwarded = sim_nw
-            .node_connectivity()
-            .into_iter()
-            .flat_map(|(_this, (_, conns))| conns.into_keys())
-            .any(|c| c.is_node());
-        assert!(
-            some_forwarded,
-            "didn't find any connection succesfully forwarded"
-        );
-        Ok(())
-    }
-
-    /// Given a network of N peers all good connectivity
-    #[tokio::test(flavor = "multi_thread")]
-    async fn network_should_achieve_good_connectivity() -> anyhow::Result<()> {
-        // crate::config::set_logger();
-        const NUM_NODES: usize = 10usize;
-        const NUM_GW: usize = 2usize;
-        const MAX_HTL: usize = 5usize;
-        const RAND_IF_HTL_ABOVE: usize = 3usize;
-        const MAX_CONNS: usize = 4usize;
-        const MIN_CONNS: usize = 2usize;
-        let mut sim_nw = SimNetwork::new(
-            "join_all_nodes_should_connect",
-            NUM_GW,
-            NUM_NODES,
-            MAX_HTL,
-            RAND_IF_HTL_ABOVE,
-            MAX_CONNS,
-            MIN_CONNS,
-        )
-        .await;
-        sim_nw.start().await;
-        sim_nw.check_connectivity(Duration::from_secs(10))?;
-        // wait for a bit so peers can acquire more connections
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        sim_nw.network_connectivity_quality()?;
-        sim_nw.print_network_connections();
-        sim_nw.print_ring_distribution();
-        Ok(())
     }
 }

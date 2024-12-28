@@ -2,7 +2,7 @@
 name = "fdev"
 version = "0.0.7"
 edition = "2021"
-rust-version = "1.71.1"
+rust-version = "1.80"
 publish = true
 description = "Freenet development tool"
 license = "MIT OR Apache-2.0"
@@ -20,6 +20,7 @@ either = { workspace = true }
 futures = { workspace = true }
 glob = "0.3"
 pico-args = "0.5"
+prettytable-rs = "0.10"
 rand = { workspace = true }
 serde = "1"
 serde_json = "1"
@@ -28,7 +29,7 @@ semver = { workspace = true }
 tar = "0.4"
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signal", "parking_lot", "process"] }
-tokio-tungstenite = "0.23"
+tokio-tungstenite = "0.24"
 toml = { version = "0.8", features = ["default", "preserve_order"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
@@ -37,7 +38,7 @@ reqwest = { version = "0.12", features = ["json"] }
 http = "1.1"
 
 # internal
-freenet = { path = "../core" }
+freenet = { path = "../core", features = ["local-simulation"]}
 freenet-stdlib = { workspace = true }
 
 [features]

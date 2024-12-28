@@ -10,12 +10,9 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use super::PeerId;
 use crate::message::{NetMessage, NodeEvent};
 
+mod handshake;
 pub(crate) mod in_memory;
 pub(crate) mod p2p_protoc;
-
-// TODO: use this constants when we do real net i/o
-// const PING_EVERY: Duration = Duration::from_secs(30);
-// const DROP_CONN_AFTER: Duration = Duration::from_secs(30 * 10);
 
 pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 
@@ -41,8 +38,10 @@ pub(crate) enum ConnectionError {
     Serialization(#[from] Option<Box<bincode::ErrorKind>>),
     #[error("{0}")]
     TransportError(String),
-    #[error("unwanted connection")]
+    #[error("failed connect")]
     FailedConnectOp,
+    #[error("unwanted connection")]
+    UnwantedConnection,
 
     // errors produced while handling the connection:
     #[error("IO error: {0}")]
@@ -74,6 +73,7 @@ impl Clone for ConnectionError {
             Self::UnexpectedReq => Self::UnexpectedReq,
             Self::TransportError(err) => Self::TransportError(err.clone()),
             Self::FailedConnectOp => Self::FailedConnectOp,
+            Self::UnwantedConnection => Self::UnwantedConnection,
         }
     }
 }

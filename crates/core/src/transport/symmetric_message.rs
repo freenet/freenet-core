@@ -7,17 +7,18 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use super::{
-    packet_data::MAX_DATA_SIZE, peer_connection::StreamId, MessagePayload, PacketData, PacketId,
+    packet_data::PacketData, packet_data::MAX_DATA_SIZE, peer_connection::StreamId, MessagePayload,
+    PacketId,
 };
 
 #[serde_as]
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, Debug, Clone))]
-pub(super) struct SymmetricMessage {
-    pub packet_id: PacketId,
+pub(crate) struct SymmetricMessage {
+    pub(super) packet_id: PacketId,
     // #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub confirm_receipt: Vec<PacketId>,
-    pub payload: SymmetricMessagePayload,
+    pub(super) confirm_receipt: Vec<PacketId>,
+    pub(crate) payload: SymmetricMessagePayload,
 }
 
 impl SymmetricMessage {
@@ -114,7 +115,7 @@ impl SymmetricMessage {
     }
 
     #[allow(clippy::type_complexity)]
-    pub fn try_serialize_msg_to_packet_data(
+    pub(super) fn try_serialize_msg_to_packet_data(
         packet_id: PacketId,
         payload: impl Into<SymmetricMessagePayload>,
         outbound_sym_key: &Aes128Gcm,
@@ -178,6 +179,13 @@ impl From<()> for SymmetricMessagePayload {
 
 pub(super) struct ShortMessage(pub MessagePayload);
 
+#[cfg(test)]
+impl From<Vec<u8>> for SymmetricMessagePayload {
+    fn from(payload: Vec<u8>) -> Self {
+        Self::ShortMessage { payload }
+    }
+}
+
 impl From<ShortMessage> for SymmetricMessagePayload {
     fn from(short_message: ShortMessage) -> Self {
         Self::ShortMessage {
@@ -206,14 +214,14 @@ impl From<StreamFragment> for SymmetricMessagePayload {
 
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, Debug, Clone))]
-pub(super) struct OutboundConnection {
-    pub key: [u8; 16],
-    pub remote_addr: SocketAddr,
+pub(crate) struct OutboundConnection {
+    pub(super) key: [u8; 16],
+    pub(super) remote_addr: SocketAddr,
 }
 
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, Debug, Clone))]
-pub(super) enum SymmetricMessagePayload {
+pub(crate) enum SymmetricMessagePayload {
     AckConnection {
         // a remote acknowledges a connection and returns the private key to use
         // for communication and the remote address

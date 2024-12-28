@@ -224,17 +224,19 @@ pub mod topology {
         since = "2.0.0",
         note = "Use associated constants instead. This will no longer be generated in 2021."
     )]
-    pub const ENUM_MAX_CONTRACT_CHANGE_TYPE: u8 = 6;
+    pub const ENUM_MAX_CONTRACT_CHANGE_TYPE: u8 = 8;
     #[deprecated(
         since = "2.0.0",
         note = "Use associated constants instead. This will no longer be generated in 2021."
     )]
     #[allow(non_camel_case_types)]
-    pub const ENUM_VALUES_CONTRACT_CHANGE_TYPE: [ContractChangeType; 7] = [
+    pub const ENUM_VALUES_CONTRACT_CHANGE_TYPE: [ContractChangeType; 9] = [
         ContractChangeType::NONE,
         ContractChangeType::PutRequest,
         ContractChangeType::PutSuccess,
         ContractChangeType::PutFailure,
+        ContractChangeType::BroadcastEmitted,
+        ContractChangeType::BroadcastReceived,
         ContractChangeType::UpdateRequest,
         ContractChangeType::UpdateSuccess,
         ContractChangeType::UpdateFailure,
@@ -249,17 +251,21 @@ pub mod topology {
         pub const PutRequest: Self = Self(1);
         pub const PutSuccess: Self = Self(2);
         pub const PutFailure: Self = Self(3);
-        pub const UpdateRequest: Self = Self(4);
-        pub const UpdateSuccess: Self = Self(5);
-        pub const UpdateFailure: Self = Self(6);
+        pub const BroadcastEmitted: Self = Self(4);
+        pub const BroadcastReceived: Self = Self(5);
+        pub const UpdateRequest: Self = Self(6);
+        pub const UpdateSuccess: Self = Self(7);
+        pub const UpdateFailure: Self = Self(8);
 
         pub const ENUM_MIN: u8 = 0;
-        pub const ENUM_MAX: u8 = 6;
+        pub const ENUM_MAX: u8 = 8;
         pub const ENUM_VALUES: &'static [Self] = &[
             Self::NONE,
             Self::PutRequest,
             Self::PutSuccess,
             Self::PutFailure,
+            Self::BroadcastEmitted,
+            Self::BroadcastReceived,
             Self::UpdateRequest,
             Self::UpdateSuccess,
             Self::UpdateFailure,
@@ -271,6 +277,8 @@ pub mod topology {
                 Self::PutRequest => Some("PutRequest"),
                 Self::PutSuccess => Some("PutSuccess"),
                 Self::PutFailure => Some("PutFailure"),
+                Self::BroadcastEmitted => Some("BroadcastEmitted"),
+                Self::BroadcastReceived => Some("BroadcastReceived"),
                 Self::UpdateRequest => Some("UpdateRequest"),
                 Self::UpdateSuccess => Some("UpdateSuccess"),
                 Self::UpdateFailure => Some("UpdateFailure"),
@@ -1411,6 +1419,8 @@ pub mod topology {
         pub const VT_KEY: flatbuffers::VOffsetT = 6;
         pub const VT_REQUESTER: flatbuffers::VOffsetT = 8;
         pub const VT_TARGET: flatbuffers::VOffsetT = 10;
+        pub const VT_TIMESTAMP: flatbuffers::VOffsetT = 12;
+        pub const VT_CONTRACT_LOCATION: flatbuffers::VOffsetT = 14;
 
         #[inline]
         pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -1422,6 +1432,8 @@ pub mod topology {
             args: &'args PutRequestArgs<'args>,
         ) -> flatbuffers::WIPOffset<PutRequest<'bldr>> {
             let mut builder = PutRequestBuilder::new(_fbb);
+            builder.add_contract_location(args.contract_location);
+            builder.add_timestamp(args.timestamp);
             if let Some(x) = args.target {
                 builder.add_target(x);
             }
@@ -1481,6 +1493,28 @@ pub mod topology {
                     .unwrap()
             }
         }
+        #[inline]
+        pub fn timestamp(&self) -> u64 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<u64>(PutRequest::VT_TIMESTAMP, Some(0))
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn contract_location(&self) -> f64 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<f64>(PutRequest::VT_CONTRACT_LOCATION, Some(0.0))
+                    .unwrap()
+            }
+        }
     }
 
     impl flatbuffers::Verifiable for PutRequest<'_> {
@@ -1503,6 +1537,8 @@ pub mod topology {
                     true,
                 )?
                 .visit_field::<flatbuffers::ForwardsUOffset<&str>>("target", Self::VT_TARGET, true)?
+                .visit_field::<u64>("timestamp", Self::VT_TIMESTAMP, false)?
+                .visit_field::<f64>("contract_location", Self::VT_CONTRACT_LOCATION, false)?
                 .finish();
             Ok(())
         }
@@ -1512,6 +1548,8 @@ pub mod topology {
         pub key: Option<flatbuffers::WIPOffset<&'a str>>,
         pub requester: Option<flatbuffers::WIPOffset<&'a str>>,
         pub target: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub timestamp: u64,
+        pub contract_location: f64,
     }
     impl<'a> Default for PutRequestArgs<'a> {
         #[inline]
@@ -1521,6 +1559,8 @@ pub mod topology {
                 key: None,         // required field
                 requester: None,   // required field
                 target: None,      // required field
+                timestamp: 0,
+                contract_location: 0.0,
             }
         }
     }
@@ -1553,6 +1593,16 @@ pub mod topology {
                 .push_slot_always::<flatbuffers::WIPOffset<_>>(PutRequest::VT_TARGET, target);
         }
         #[inline]
+        pub fn add_timestamp(&mut self, timestamp: u64) {
+            self.fbb_
+                .push_slot::<u64>(PutRequest::VT_TIMESTAMP, timestamp, 0);
+        }
+        #[inline]
+        pub fn add_contract_location(&mut self, contract_location: f64) {
+            self.fbb_
+                .push_slot::<f64>(PutRequest::VT_CONTRACT_LOCATION, contract_location, 0.0);
+        }
+        #[inline]
         pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> PutRequestBuilder<'a, 'b> {
             let start = _fbb.start_table();
             PutRequestBuilder {
@@ -1579,6 +1629,8 @@ pub mod topology {
             ds.field("key", &self.key());
             ds.field("requester", &self.requester());
             ds.field("target", &self.target());
+            ds.field("timestamp", &self.timestamp());
+            ds.field("contract_location", &self.contract_location());
             ds.finish()
         }
     }
@@ -1802,6 +1854,8 @@ pub mod topology {
         pub const VT_REQUESTER: flatbuffers::VOffsetT = 6;
         pub const VT_TARGET: flatbuffers::VOffsetT = 8;
         pub const VT_KEY: flatbuffers::VOffsetT = 10;
+        pub const VT_TIMESTAMP: flatbuffers::VOffsetT = 12;
+        pub const VT_CONTRACT_LOCATION: flatbuffers::VOffsetT = 14;
 
         #[inline]
         pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -1813,6 +1867,8 @@ pub mod topology {
             args: &'args PutSuccessArgs<'args>,
         ) -> flatbuffers::WIPOffset<PutSuccess<'bldr>> {
             let mut builder = PutSuccessBuilder::new(_fbb);
+            builder.add_contract_location(args.contract_location);
+            builder.add_timestamp(args.timestamp);
             if let Some(x) = args.key {
                 builder.add_key(x);
             }
@@ -1872,6 +1928,28 @@ pub mod topology {
                     .unwrap()
             }
         }
+        #[inline]
+        pub fn timestamp(&self) -> u64 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<u64>(PutSuccess::VT_TIMESTAMP, Some(0))
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn contract_location(&self) -> f64 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<f64>(PutSuccess::VT_CONTRACT_LOCATION, Some(0.0))
+                    .unwrap()
+            }
+        }
     }
 
     impl flatbuffers::Verifiable for PutSuccess<'_> {
@@ -1894,6 +1972,8 @@ pub mod topology {
                 )?
                 .visit_field::<flatbuffers::ForwardsUOffset<&str>>("target", Self::VT_TARGET, true)?
                 .visit_field::<flatbuffers::ForwardsUOffset<&str>>("key", Self::VT_KEY, true)?
+                .visit_field::<u64>("timestamp", Self::VT_TIMESTAMP, false)?
+                .visit_field::<f64>("contract_location", Self::VT_CONTRACT_LOCATION, false)?
                 .finish();
             Ok(())
         }
@@ -1903,6 +1983,8 @@ pub mod topology {
         pub requester: Option<flatbuffers::WIPOffset<&'a str>>,
         pub target: Option<flatbuffers::WIPOffset<&'a str>>,
         pub key: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub timestamp: u64,
+        pub contract_location: f64,
     }
     impl<'a> Default for PutSuccessArgs<'a> {
         #[inline]
@@ -1912,6 +1994,8 @@ pub mod topology {
                 requester: None,   // required field
                 target: None,      // required field
                 key: None,         // required field
+                timestamp: 0,
+                contract_location: 0.0,
             }
         }
     }
@@ -1944,6 +2028,16 @@ pub mod topology {
                 .push_slot_always::<flatbuffers::WIPOffset<_>>(PutSuccess::VT_KEY, key);
         }
         #[inline]
+        pub fn add_timestamp(&mut self, timestamp: u64) {
+            self.fbb_
+                .push_slot::<u64>(PutSuccess::VT_TIMESTAMP, timestamp, 0);
+        }
+        #[inline]
+        pub fn add_contract_location(&mut self, contract_location: f64) {
+            self.fbb_
+                .push_slot::<f64>(PutSuccess::VT_CONTRACT_LOCATION, contract_location, 0.0);
+        }
+        #[inline]
         pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> PutSuccessBuilder<'a, 'b> {
             let start = _fbb.start_table();
             PutSuccessBuilder {
@@ -1970,6 +2064,8 @@ pub mod topology {
             ds.field("requester", &self.requester());
             ds.field("target", &self.target());
             ds.field("key", &self.key());
+            ds.field("timestamp", &self.timestamp());
+            ds.field("contract_location", &self.contract_location());
             ds.finish()
         }
     }
@@ -2562,6 +2658,567 @@ pub mod topology {
             ds.finish()
         }
     }
+    pub enum BroadcastEmittedOffset {}
+    #[derive(Copy, Clone, PartialEq)]
+
+    pub struct BroadcastEmitted<'a> {
+        pub _tab: flatbuffers::Table<'a>,
+    }
+
+    impl<'a> flatbuffers::Follow<'a> for BroadcastEmitted<'a> {
+        type Inner = BroadcastEmitted<'a>;
+        #[inline]
+        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+            Self {
+                _tab: flatbuffers::Table::new(buf, loc),
+            }
+        }
+    }
+
+    impl<'a> BroadcastEmitted<'a> {
+        pub const VT_TRANSACTION: flatbuffers::VOffsetT = 4;
+        pub const VT_UPSTREAM: flatbuffers::VOffsetT = 6;
+        pub const VT_BROADCAST_TO: flatbuffers::VOffsetT = 8;
+        pub const VT_BROADCASTED_TO: flatbuffers::VOffsetT = 10;
+        pub const VT_KEY: flatbuffers::VOffsetT = 12;
+        pub const VT_SENDER: flatbuffers::VOffsetT = 14;
+        pub const VT_TIMESTAMP: flatbuffers::VOffsetT = 16;
+        pub const VT_CONTRACT_LOCATION: flatbuffers::VOffsetT = 18;
+
+        #[inline]
+        pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+            BroadcastEmitted { _tab: table }
+        }
+        #[allow(unused_mut)]
+        pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+            _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+            args: &'args BroadcastEmittedArgs<'args>,
+        ) -> flatbuffers::WIPOffset<BroadcastEmitted<'bldr>> {
+            let mut builder = BroadcastEmittedBuilder::new(_fbb);
+            builder.add_contract_location(args.contract_location);
+            builder.add_timestamp(args.timestamp);
+            if let Some(x) = args.sender {
+                builder.add_sender(x);
+            }
+            if let Some(x) = args.key {
+                builder.add_key(x);
+            }
+            builder.add_broadcasted_to(args.broadcasted_to);
+            if let Some(x) = args.broadcast_to {
+                builder.add_broadcast_to(x);
+            }
+            if let Some(x) = args.upstream {
+                builder.add_upstream(x);
+            }
+            if let Some(x) = args.transaction {
+                builder.add_transaction(x);
+            }
+            builder.finish()
+        }
+
+        #[inline]
+        pub fn transaction(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(
+                        BroadcastEmitted::VT_TRANSACTION,
+                        None,
+                    )
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn upstream(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(BroadcastEmitted::VT_UPSTREAM, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn broadcast_to(
+            &self,
+        ) -> Option<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<&'a str>>> {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab.get::<flatbuffers::ForwardsUOffset<
+                    flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<&'a str>>,
+                >>(BroadcastEmitted::VT_BROADCAST_TO, None)
+            }
+        }
+        #[inline]
+        pub fn broadcasted_to(&self) -> u32 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<u32>(BroadcastEmitted::VT_BROADCASTED_TO, Some(0))
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn key(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(BroadcastEmitted::VT_KEY, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn sender(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(BroadcastEmitted::VT_SENDER, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn timestamp(&self) -> u64 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<u64>(BroadcastEmitted::VT_TIMESTAMP, Some(0))
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn contract_location(&self) -> f64 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<f64>(BroadcastEmitted::VT_CONTRACT_LOCATION, Some(0.0))
+                    .unwrap()
+            }
+        }
+    }
+
+    impl flatbuffers::Verifiable for BroadcastEmitted<'_> {
+        #[inline]
+        fn run_verifier(
+            v: &mut flatbuffers::Verifier,
+            pos: usize,
+        ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+            use self::flatbuffers::Verifiable;
+            v.visit_table(pos)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "transaction",
+                    Self::VT_TRANSACTION,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "upstream",
+                    Self::VT_UPSTREAM,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<
+                    flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<&'_ str>>,
+                >>("broadcast_to", Self::VT_BROADCAST_TO, false)?
+                .visit_field::<u32>("broadcasted_to", Self::VT_BROADCASTED_TO, false)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("key", Self::VT_KEY, true)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("sender", Self::VT_SENDER, true)?
+                .visit_field::<u64>("timestamp", Self::VT_TIMESTAMP, false)?
+                .visit_field::<f64>("contract_location", Self::VT_CONTRACT_LOCATION, false)?
+                .finish();
+            Ok(())
+        }
+    }
+    pub struct BroadcastEmittedArgs<'a> {
+        pub transaction: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub upstream: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub broadcast_to: Option<
+            flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<&'a str>>>,
+        >,
+        pub broadcasted_to: u32,
+        pub key: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub sender: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub timestamp: u64,
+        pub contract_location: f64,
+    }
+    impl<'a> Default for BroadcastEmittedArgs<'a> {
+        #[inline]
+        fn default() -> Self {
+            BroadcastEmittedArgs {
+                transaction: None, // required field
+                upstream: None,    // required field
+                broadcast_to: None,
+                broadcasted_to: 0,
+                key: None,    // required field
+                sender: None, // required field
+                timestamp: 0,
+                contract_location: 0.0,
+            }
+        }
+    }
+
+    pub struct BroadcastEmittedBuilder<'a: 'b, 'b> {
+        fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+        start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+    }
+    impl<'a: 'b, 'b> BroadcastEmittedBuilder<'a, 'b> {
+        #[inline]
+        pub fn add_transaction(&mut self, transaction: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                BroadcastEmitted::VT_TRANSACTION,
+                transaction,
+            );
+        }
+        #[inline]
+        pub fn add_upstream(&mut self, upstream: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                BroadcastEmitted::VT_UPSTREAM,
+                upstream,
+            );
+        }
+        #[inline]
+        pub fn add_broadcast_to(
+            &mut self,
+            broadcast_to: flatbuffers::WIPOffset<
+                flatbuffers::Vector<'b, flatbuffers::ForwardsUOffset<&'b str>>,
+            >,
+        ) {
+            self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                BroadcastEmitted::VT_BROADCAST_TO,
+                broadcast_to,
+            );
+        }
+        #[inline]
+        pub fn add_broadcasted_to(&mut self, broadcasted_to: u32) {
+            self.fbb_
+                .push_slot::<u32>(BroadcastEmitted::VT_BROADCASTED_TO, broadcasted_to, 0);
+        }
+        #[inline]
+        pub fn add_key(&mut self, key: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(BroadcastEmitted::VT_KEY, key);
+        }
+        #[inline]
+        pub fn add_sender(&mut self, sender: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(BroadcastEmitted::VT_SENDER, sender);
+        }
+        #[inline]
+        pub fn add_timestamp(&mut self, timestamp: u64) {
+            self.fbb_
+                .push_slot::<u64>(BroadcastEmitted::VT_TIMESTAMP, timestamp, 0);
+        }
+        #[inline]
+        pub fn add_contract_location(&mut self, contract_location: f64) {
+            self.fbb_.push_slot::<f64>(
+                BroadcastEmitted::VT_CONTRACT_LOCATION,
+                contract_location,
+                0.0,
+            );
+        }
+        #[inline]
+        pub fn new(
+            _fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+        ) -> BroadcastEmittedBuilder<'a, 'b> {
+            let start = _fbb.start_table();
+            BroadcastEmittedBuilder {
+                fbb_: _fbb,
+                start_: start,
+            }
+        }
+        #[inline]
+        pub fn finish(self) -> flatbuffers::WIPOffset<BroadcastEmitted<'a>> {
+            let o = self.fbb_.end_table(self.start_);
+            self.fbb_
+                .required(o, BroadcastEmitted::VT_TRANSACTION, "transaction");
+            self.fbb_
+                .required(o, BroadcastEmitted::VT_UPSTREAM, "upstream");
+            self.fbb_.required(o, BroadcastEmitted::VT_KEY, "key");
+            self.fbb_.required(o, BroadcastEmitted::VT_SENDER, "sender");
+            flatbuffers::WIPOffset::new(o.value())
+        }
+    }
+
+    impl core::fmt::Debug for BroadcastEmitted<'_> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let mut ds = f.debug_struct("BroadcastEmitted");
+            ds.field("transaction", &self.transaction());
+            ds.field("upstream", &self.upstream());
+            ds.field("broadcast_to", &self.broadcast_to());
+            ds.field("broadcasted_to", &self.broadcasted_to());
+            ds.field("key", &self.key());
+            ds.field("sender", &self.sender());
+            ds.field("timestamp", &self.timestamp());
+            ds.field("contract_location", &self.contract_location());
+            ds.finish()
+        }
+    }
+    pub enum BroadcastReceivedOffset {}
+    #[derive(Copy, Clone, PartialEq)]
+
+    pub struct BroadcastReceived<'a> {
+        pub _tab: flatbuffers::Table<'a>,
+    }
+
+    impl<'a> flatbuffers::Follow<'a> for BroadcastReceived<'a> {
+        type Inner = BroadcastReceived<'a>;
+        #[inline]
+        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+            Self {
+                _tab: flatbuffers::Table::new(buf, loc),
+            }
+        }
+    }
+
+    impl<'a> BroadcastReceived<'a> {
+        pub const VT_TRANSACTION: flatbuffers::VOffsetT = 4;
+        pub const VT_TARGET: flatbuffers::VOffsetT = 6;
+        pub const VT_REQUESTER: flatbuffers::VOffsetT = 8;
+        pub const VT_KEY: flatbuffers::VOffsetT = 10;
+        pub const VT_TIMESTAMP: flatbuffers::VOffsetT = 12;
+        pub const VT_CONTRACT_LOCATION: flatbuffers::VOffsetT = 14;
+
+        #[inline]
+        pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+            BroadcastReceived { _tab: table }
+        }
+        #[allow(unused_mut)]
+        pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+            _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+            args: &'args BroadcastReceivedArgs<'args>,
+        ) -> flatbuffers::WIPOffset<BroadcastReceived<'bldr>> {
+            let mut builder = BroadcastReceivedBuilder::new(_fbb);
+            builder.add_contract_location(args.contract_location);
+            builder.add_timestamp(args.timestamp);
+            if let Some(x) = args.key {
+                builder.add_key(x);
+            }
+            if let Some(x) = args.requester {
+                builder.add_requester(x);
+            }
+            if let Some(x) = args.target {
+                builder.add_target(x);
+            }
+            if let Some(x) = args.transaction {
+                builder.add_transaction(x);
+            }
+            builder.finish()
+        }
+
+        #[inline]
+        pub fn transaction(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(
+                        BroadcastReceived::VT_TRANSACTION,
+                        None,
+                    )
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn target(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(BroadcastReceived::VT_TARGET, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn requester(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(
+                        BroadcastReceived::VT_REQUESTER,
+                        None,
+                    )
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn key(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(BroadcastReceived::VT_KEY, None)
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn timestamp(&self) -> u64 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<u64>(BroadcastReceived::VT_TIMESTAMP, Some(0))
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn contract_location(&self) -> f64 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<f64>(BroadcastReceived::VT_CONTRACT_LOCATION, Some(0.0))
+                    .unwrap()
+            }
+        }
+    }
+
+    impl flatbuffers::Verifiable for BroadcastReceived<'_> {
+        #[inline]
+        fn run_verifier(
+            v: &mut flatbuffers::Verifier,
+            pos: usize,
+        ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+            use self::flatbuffers::Verifiable;
+            v.visit_table(pos)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "transaction",
+                    Self::VT_TRANSACTION,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("target", Self::VT_TARGET, true)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "requester",
+                    Self::VT_REQUESTER,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("key", Self::VT_KEY, true)?
+                .visit_field::<u64>("timestamp", Self::VT_TIMESTAMP, false)?
+                .visit_field::<f64>("contract_location", Self::VT_CONTRACT_LOCATION, false)?
+                .finish();
+            Ok(())
+        }
+    }
+    pub struct BroadcastReceivedArgs<'a> {
+        pub transaction: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub target: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub requester: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub key: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub timestamp: u64,
+        pub contract_location: f64,
+    }
+    impl<'a> Default for BroadcastReceivedArgs<'a> {
+        #[inline]
+        fn default() -> Self {
+            BroadcastReceivedArgs {
+                transaction: None, // required field
+                target: None,      // required field
+                requester: None,   // required field
+                key: None,         // required field
+                timestamp: 0,
+                contract_location: 0.0,
+            }
+        }
+    }
+
+    pub struct BroadcastReceivedBuilder<'a: 'b, 'b> {
+        fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+        start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+    }
+    impl<'a: 'b, 'b> BroadcastReceivedBuilder<'a, 'b> {
+        #[inline]
+        pub fn add_transaction(&mut self, transaction: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                BroadcastReceived::VT_TRANSACTION,
+                transaction,
+            );
+        }
+        #[inline]
+        pub fn add_target(&mut self, target: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                BroadcastReceived::VT_TARGET,
+                target,
+            );
+        }
+        #[inline]
+        pub fn add_requester(&mut self, requester: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                BroadcastReceived::VT_REQUESTER,
+                requester,
+            );
+        }
+        #[inline]
+        pub fn add_key(&mut self, key: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(BroadcastReceived::VT_KEY, key);
+        }
+        #[inline]
+        pub fn add_timestamp(&mut self, timestamp: u64) {
+            self.fbb_
+                .push_slot::<u64>(BroadcastReceived::VT_TIMESTAMP, timestamp, 0);
+        }
+        #[inline]
+        pub fn add_contract_location(&mut self, contract_location: f64) {
+            self.fbb_.push_slot::<f64>(
+                BroadcastReceived::VT_CONTRACT_LOCATION,
+                contract_location,
+                0.0,
+            );
+        }
+        #[inline]
+        pub fn new(
+            _fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+        ) -> BroadcastReceivedBuilder<'a, 'b> {
+            let start = _fbb.start_table();
+            BroadcastReceivedBuilder {
+                fbb_: _fbb,
+                start_: start,
+            }
+        }
+        #[inline]
+        pub fn finish(self) -> flatbuffers::WIPOffset<BroadcastReceived<'a>> {
+            let o = self.fbb_.end_table(self.start_);
+            self.fbb_
+                .required(o, BroadcastReceived::VT_TRANSACTION, "transaction");
+            self.fbb_
+                .required(o, BroadcastReceived::VT_TARGET, "target");
+            self.fbb_
+                .required(o, BroadcastReceived::VT_REQUESTER, "requester");
+            self.fbb_.required(o, BroadcastReceived::VT_KEY, "key");
+            flatbuffers::WIPOffset::new(o.value())
+        }
+    }
+
+    impl core::fmt::Debug for BroadcastReceived<'_> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let mut ds = f.debug_struct("BroadcastReceived");
+            ds.field("transaction", &self.transaction());
+            ds.field("target", &self.target());
+            ds.field("requester", &self.requester());
+            ds.field("key", &self.key());
+            ds.field("timestamp", &self.timestamp());
+            ds.field("contract_location", &self.contract_location());
+            ds.finish()
+        }
+    }
     pub enum ContractChangeOffset {}
     #[derive(Copy, Clone, PartialEq)]
 
@@ -2689,6 +3346,36 @@ pub mod topology {
 
         #[inline]
         #[allow(non_snake_case)]
+        pub fn change_as_broadcast_emitted(&self) -> Option<BroadcastEmitted<'a>> {
+            if self.change_type() == ContractChangeType::BroadcastEmitted {
+                self.change().map(|t| {
+                    // Safety:
+                    // Created from a valid Table for this object
+                    // Which contains a valid union in this slot
+                    unsafe { BroadcastEmitted::init_from_table(t) }
+                })
+            } else {
+                None
+            }
+        }
+
+        #[inline]
+        #[allow(non_snake_case)]
+        pub fn change_as_broadcast_received(&self) -> Option<BroadcastReceived<'a>> {
+            if self.change_type() == ContractChangeType::BroadcastReceived {
+                self.change().map(|t| {
+                    // Safety:
+                    // Created from a valid Table for this object
+                    // Which contains a valid union in this slot
+                    unsafe { BroadcastReceived::init_from_table(t) }
+                })
+            } else {
+                None
+            }
+        }
+
+        #[inline]
+        #[allow(non_snake_case)]
         pub fn change_as_update_request(&self) -> Option<UpdateRequest<'a>> {
             if self.change_type() == ContractChangeType::UpdateRequest {
                 self.change().map(|t| {
@@ -2741,52 +3428,21 @@ pub mod topology {
         ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
             use self::flatbuffers::Verifiable;
             v.visit_table(pos)?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "contract_id",
-                    Self::VT_CONTRACT_ID,
-                    true,
-                )?
-                .visit_union::<ContractChangeType, _>(
-                    "change_type",
-                    Self::VT_CHANGE_TYPE,
-                    "change",
-                    Self::VT_CHANGE,
-                    false,
-                    |key, v, pos| match key {
-                        ContractChangeType::PutRequest => v
-                            .verify_union_variant::<flatbuffers::ForwardsUOffset<PutRequest>>(
-                                "ContractChangeType::PutRequest",
-                                pos,
-                            ),
-                        ContractChangeType::PutSuccess => v
-                            .verify_union_variant::<flatbuffers::ForwardsUOffset<PutSuccess>>(
-                                "ContractChangeType::PutSuccess",
-                                pos,
-                            ),
-                        ContractChangeType::PutFailure => v
-                            .verify_union_variant::<flatbuffers::ForwardsUOffset<PutFailure>>(
-                                "ContractChangeType::PutFailure",
-                                pos,
-                            ),
-                        ContractChangeType::UpdateRequest => v
-                            .verify_union_variant::<flatbuffers::ForwardsUOffset<UpdateRequest>>(
-                                "ContractChangeType::UpdateRequest",
-                                pos,
-                            ),
-                        ContractChangeType::UpdateSuccess => v
-                            .verify_union_variant::<flatbuffers::ForwardsUOffset<UpdateSuccess>>(
-                                "ContractChangeType::UpdateSuccess",
-                                pos,
-                            ),
-                        ContractChangeType::UpdateFailure => v
-                            .verify_union_variant::<flatbuffers::ForwardsUOffset<UpdateFailure>>(
-                                "ContractChangeType::UpdateFailure",
-                                pos,
-                            ),
-                        _ => Ok(()),
-                    },
-                )?
-                .finish();
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("contract_id", Self::VT_CONTRACT_ID, true)?
+     .visit_union::<ContractChangeType, _>("change_type", Self::VT_CHANGE_TYPE, "change", Self::VT_CHANGE, false, |key, v, pos| {
+        match key {
+          ContractChangeType::PutRequest => v.verify_union_variant::<flatbuffers::ForwardsUOffset<PutRequest>>("ContractChangeType::PutRequest", pos),
+          ContractChangeType::PutSuccess => v.verify_union_variant::<flatbuffers::ForwardsUOffset<PutSuccess>>("ContractChangeType::PutSuccess", pos),
+          ContractChangeType::PutFailure => v.verify_union_variant::<flatbuffers::ForwardsUOffset<PutFailure>>("ContractChangeType::PutFailure", pos),
+          ContractChangeType::BroadcastEmitted => v.verify_union_variant::<flatbuffers::ForwardsUOffset<BroadcastEmitted>>("ContractChangeType::BroadcastEmitted", pos),
+          ContractChangeType::BroadcastReceived => v.verify_union_variant::<flatbuffers::ForwardsUOffset<BroadcastReceived>>("ContractChangeType::BroadcastReceived", pos),
+          ContractChangeType::UpdateRequest => v.verify_union_variant::<flatbuffers::ForwardsUOffset<UpdateRequest>>("ContractChangeType::UpdateRequest", pos),
+          ContractChangeType::UpdateSuccess => v.verify_union_variant::<flatbuffers::ForwardsUOffset<UpdateSuccess>>("ContractChangeType::UpdateSuccess", pos),
+          ContractChangeType::UpdateFailure => v.verify_union_variant::<flatbuffers::ForwardsUOffset<UpdateFailure>>("ContractChangeType::UpdateFailure", pos),
+          _ => Ok(()),
+        }
+     })?
+     .finish();
             Ok(())
         }
     }
@@ -2878,6 +3534,26 @@ pub mod topology {
                 }
                 ContractChangeType::PutFailure => {
                     if let Some(x) = self.change_as_put_failure() {
+                        ds.field("change", &x)
+                    } else {
+                        ds.field(
+                            "change",
+                            &"InvalidFlatbuffer: Union discriminant does not match value.",
+                        )
+                    }
+                }
+                ContractChangeType::BroadcastEmitted => {
+                    if let Some(x) = self.change_as_broadcast_emitted() {
+                        ds.field("change", &x)
+                    } else {
+                        ds.field(
+                            "change",
+                            &"InvalidFlatbuffer: Union discriminant does not match value.",
+                        )
+                    }
+                }
+                ContractChangeType::BroadcastReceived => {
+                    if let Some(x) = self.change_as_broadcast_received() {
                         ds.field("change", &x)
                     } else {
                         ds.field(

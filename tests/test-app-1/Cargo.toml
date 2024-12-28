@@ -14,4 +14,4 @@ panic = 'abort'
 strip = true
 
 [workspace.dependencies]
-freenet-stdlib = { version = "0.0.7", default-features = false }
+freenet-stdlib = { path = "../../stdlib/rust", default-features = false }

@@ -1,32 +1,28 @@
 import { useEffect, useState } from "react";
-import { createRoot } from "react-dom/client";
 import {
     TransactionDetailInterface,
-    TransactionPeerInterface,
-    TransactionData
+    TransactionData,
+    TransactionDetailPeersHistoryInterface,
+    FilterDictionaryInterface,
+    ContractHistoryInterface,
+    ChangeType,
+    RingVisualizationPoint
 } from "./type_definitions";
-import { PeerId } from "./topology";
-import { another_ring_visualization } from "./ring-visualization";
+import {filter_by_page, get_all_pages, get_peers_caching_the_contract, rust_timestamp_to_utc_string} from "./utils";
+import {Pagination} from "./pagination";
+import {RingVisualization} from "./ring-visualization";
 
-interface TransactionDetailPeersHistoryInterface {
-    tx_peer_list: Array<TransactionData>;
-}
-
-interface FilterInterface {
-    filter_type: string;
-    filter_value: string;
-}
-
-interface FilterDictionaryInterface {
-    [key: string]: FilterInterface;
-}
-
-let ring_mock_data = [];
 const ContractPeersHistory = ({
     tx_peer_list,
 }: TransactionDetailPeersHistoryInterface) => {
     const [filter, set_filter] = useState<FilterDictionaryInterface>({});
     const [filtered_list, set_filtered_list] = useState(tx_peer_list);
+    const [order_by, set_order_by] = useState<string>("timestamp");
+    const [order_direction, set_order_direction] = useState<string>("asc");
+    const [order_is_loading, set_order_is_loading] = useState<boolean>(false);
+    const [page, set_page] = useState<number>(1);
+    const [inner_tx_list, set_inner_tx_list] = useState<Array<TransactionData>>([]);
+    const [active_peer_list, set_active_peer_list] = useState<Array<String> | null>(null);
 
     const add_filter = (filter_type: string, filter_value: string) => {
         if (check_if_contains_filter(filter_type)) {
@@ -39,6 +35,8 @@ const ContractPeersHistory = ({
         };
 
         set_filter(filter);
+
+        set_page(1);
 
         update_filtered_list();
     };
@@ -57,6 +55,22 @@ const ContractPeersHistory = ({
             });
         });
 
+        console.log("filtered_list", filtered_list);
+
+        filtered_list = filtered_list.sort((a, b) => {
+            if (order_by === "timestamp") {
+                if (order_direction === "asc") {
+                    return a.timestamp > b.timestamp ? 1 : -1;
+                } else {
+                    return a.timestamp < b.timestamp ? 1 : -1;
+                }
+            } else {
+                return 0;
+            }
+        });
+
+        set_inner_tx_list(filter_by_page(filtered_list, page));
+
         set_filtered_list(filtered_list);
     };
 
@@ -71,58 +85,24 @@ const ContractPeersHistory = ({
 
     useEffect(() => {
         update_filtered_list();
+        
+        if (order_is_loading) {
+            setTimeout(() => {
+                    set_order_is_loading(false);
+            }, 500)
+        }
+    }, [filter, order_by, order_direction]);
 
-        let ring_mock_data = [
-            {
-                id: new PeerId("1"),
-                currentLocation: 0.123485,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-            {
-                id: new PeerId("2"),
-                currentLocation: 0.183485,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-            {
-                id: new PeerId("3"),
-                currentLocation: 0.323485,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-            {
-                id: new PeerId("4"),
-                currentLocation: 0.423485,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-            {
-                id: new PeerId("5"),
-                currentLocation: 0.783285,
-                connectionTimestamp: 1234567890,
-                connections: [],
-                history: [],
-                locationHistory: [],
-            },
-        ];
+    useEffect(() => {
+        clear_all_filters();
+        set_page(1);
+    }, [tx_peer_list]);
 
-        // ringHistogram(ring_mock_data);
+    useEffect(() => {
+        set_inner_tx_list(filter_by_page(filtered_list, page));
+    }, [page, filtered_list]);   
 
-        // const graphContainer = d3.select(
-        //     document.getElementById("other-peer-conns-graph")
-        // );
 
-        // ringVisualization(ring_mock_data[0], graphContainer, 1.25);
-    }, [filter]);
 
     const check_if_contains_filter = (filter_type: string) => {
         return filter[filter_type] !== undefined;
@@ -133,15 +113,20 @@ const ContractPeersHistory = ({
             id="transaction-peers-history"
             className="block"
             style={{ marginTop: 20 }}
+            onMouseLeave={() => set_active_peer_list(null)}
         >
+            <Pagination currentPage={page} totalPages={get_all_pages(filtered_list)} onPageChange={(page:number) => set_page(page)}/>
             <h2>Contract Transactions History </h2>
             {Object.keys(filter).length > 0 && (
                 <div>
-                    <button onClick={() => clear_all_filters()}>
+                    <button className="button is-info mb-2" onClick={() => clear_all_filters()}>
                         Clear all filters
                     </button>
                 </div>
             )}
+
+            <div className={`${!active_peer_list && 'is-hidden'} has-background-white p-3`} style={{position: "absolute", top: "50%", left: "40%", border: "1px solid gray", zIndex: 2000}}  onMouseLeave={() => set_active_peer_list(null)}>{active_peer_list?.map((p, index) => <p key={`${p}${index}`}>{p}</p>)}</div>
+
             <table
                 id="transaction-peers-history"
                 className="table is-striped block is-bordered"
@@ -151,7 +136,7 @@ const ContractPeersHistory = ({
                         <th>
                             Contract Id
                             {check_if_contains_filter("contract_id") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() =>
                                         clear_one_filter("contract_id")
                                     }
@@ -161,9 +146,13 @@ const ContractPeersHistory = ({
                             )}
                         </th>
                         <th>
+                            Requester <br /> 
+                            Peer Location
+                        </th>
+                        <th>
                             Transaction Id
                             {check_if_contains_filter("transaction_id") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() => clear_one_filter("transaction_id")}
                                 >
                                     Clear filter
@@ -171,9 +160,10 @@ const ContractPeersHistory = ({
                             )}
                         </th>
                         <th>
+                            <i>(Upstream)</i><br/>
                             Requester
                             {check_if_contains_filter("requester") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() => clear_one_filter("requester")}
                                 >
                                     Clear filter
@@ -183,7 +173,7 @@ const ContractPeersHistory = ({
                         <th>
                             Target
                             {check_if_contains_filter("target") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() => clear_one_filter("target")}
                                 >
                                     Clear filter
@@ -193,7 +183,7 @@ const ContractPeersHistory = ({
                         <th>
                             Change Type
                             {check_if_contains_filter("change_type") && (
-                                <button
+                                <button className="button is-small is-outlined ml-1 pr-1 pl-1" 
                                     onClick={() =>
                                         clear_one_filter("change_type")
                                     }
@@ -202,11 +192,24 @@ const ContractPeersHistory = ({
                                 </button>
                             )}
                         </th>
+                        <th>
+                            Timestamp
+                            <button className={`button is-small is-outlined ml-1 ${order_is_loading ? "is-loading" : ""}`}
+                                onClick={() => {
+                                    set_order_is_loading(true);
+                                    set_order_by("timestamp");
+                                    set_order_direction(
+                                        order_direction === "asc" ? "desc" : "asc"
+                                    );
+                                }}
+                            >{order_direction}</button>
+
+                        </th>
                     </tr>
                 </thead>
                 <tbody id="transaction-peers-history-b">
-                    {filtered_list.map((tx) => (
-                        <tr>
+                    {inner_tx_list.map((tx, index) => (
+                        <tr key={`${tx.requester}+${tx.change_type}+${tx.timestamp.toString()}+${tx.target}+${index}`}>
                             <td
                                 onClick={() =>
                                     add_filter("contract_id", tx.contract_id)
@@ -217,6 +220,9 @@ const ContractPeersHistory = ({
                             >
                                 {tx.contract_id.slice(-8)}
                             </td>
+                            <td>
+                                {tx.requester_location}
+                            </td>
                             <td
                                 onClick={() =>
                                     add_filter("transaction_id", tx.transaction_id)
@@ -225,7 +231,7 @@ const ContractPeersHistory = ({
                                     cursor: "pointer",
                                 }}
                             >
-                                {tx.transaction_id}
+                                {tx.transaction_id.slice(-12)}
                             </td>
                             <td
                                 onClick={() =>
@@ -235,6 +241,8 @@ const ContractPeersHistory = ({
                                     cursor: "pointer",
                                 }}
                             >
+
+                            {tx.change_type == ChangeType.BROADCAST_EMITTED && <p key={tx.upstream}><i>({tx.upstream?.slice(-8)})</i></p>}
                                 {tx.requester.slice(-8)}
                             </td>
                             <td
@@ -244,8 +252,9 @@ const ContractPeersHistory = ({
                                 style={{
                                     cursor: "pointer",
                                 }}
+                                onMouseEnter={() => {tx.change_type == ChangeType.BROADCAST_EMITTED && set_active_peer_list(tx.target)} }
                             >
-                                {tx.target.slice(-8)}
+                            {tx.change_type == ChangeType.BROADCAST_EMITTED ? `${tx.target.length} peers` : tx.target.slice(-8)}
                             </td>
                             <td
                                 onClick={() =>
@@ -257,6 +266,9 @@ const ContractPeersHistory = ({
                             >
                                 {tx.change_type}
                             </td>
+                            <td>
+                                {rust_timestamp_to_utc_string(tx.timestamp)}
+                            </td>
                         </tr>
                     ))}
                 </tbody>
@@ -265,8 +277,10 @@ const ContractPeersHistory = ({
     );
 };
 
+
+
 // TODO: use real types
-const ContractHistory = ({ contract_history }: any) => (
+const ContractHistory = ({ contract_history }: ContractHistoryInterface) => (
     <div id="contract-history" className="block">
         <h2>Contract History</h2>
         <table
@@ -307,7 +321,25 @@ export const ContractDetail = ({
     close_detail,
     peers_history,
     tx_history,
-}: TransactionDetailInterface) => (
+}: TransactionDetailInterface) => {
+    const [contract_location, set_contract_location] = useState<RingVisualizationPoint | null>(null);
+    const [caching_peers_locations, set_caching_peers_locations] = useState<Array<RingVisualizationPoint>>([]);
+
+    useEffect(() => {
+        if (!tx_history) {
+            return;
+        }
+
+        console.log("tx_history", tx_history);
+        let caching_locations = get_peers_caching_the_contract(tx_history);
+
+        console.log("caching_locations", caching_locations);
+
+        set_contract_location({localization: tx_history[0].contract_location, peerId: "ideal"});
+        set_caching_peers_locations(caching_locations);
+    }, [tx_history]);
+
+    return (
     <div
         id="contract-detail"
         style={{
@@ -348,6 +380,7 @@ export const ContractDetail = ({
             <h2>Contract Details</h2>
             <div id="transaction-detail-contents">
                 <p>Contract Key {transaction.contract_id}</p>
+                <p><b>Contract Location</b> {transaction.contract_location}</p>
                 <p>Requester {transaction.requester}</p>
                 <p>Target {transaction.target}</p>
                 {/*<p>Status {transaction.status}</p>
@@ -359,9 +392,11 @@ export const ContractDetail = ({
                 <h2>Location Peers</h2>
                 <div id="peers-histogram"></div>
             </div>
+            
+            <RingVisualization main_peer={contract_location || {peerId: "null", localization: 0}}  other_peers={caching_peers_locations}  />
+
 
             <div id="other-peer-conns-graph">
-            {/*another_ring_visualization()*/}
             </div>
 
             {tx_history && (
@@ -372,5 +407,6 @@ export const ContractDetail = ({
         </div>
     </div>
 );
+}
 
 

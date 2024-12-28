@@ -1,4 +1,5 @@
 use super::*;
+use tokio::sync::mpsc::UnboundedSender;
 
 pub(crate) struct MockRuntime {
     pub contract_store: ContractStore,
@@ -34,10 +35,10 @@ impl Executor<MockRuntime> {
         Ok(executor)
     }
 
-    pub async fn handle_request<'a>(
+    pub async fn handle_request(
         &mut self,
         _id: ClientId,
-        _req: ClientRequest<'a>,
+        _req: ClientRequest<'_>,
         _updates: Option<mpsc::UnboundedSender<Result<HostResponse, WsClientError>>>,
     ) -> Response {
         unreachable!()
@@ -48,8 +49,8 @@ impl ContractExecutor for Executor<MockRuntime> {
     async fn fetch_contract(
         &mut self,
         key: ContractKey,
-        fetch_contract: bool,
-    ) -> Result<(WrappedState, Option<ContractContainer>), ExecutorError> {
+        return_contract_code: bool,
+    ) -> Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError> {
         let Some(parameters) = self
             .state_store
             .get_params(&key)
@@ -60,7 +61,7 @@ impl ContractExecutor for Executor<MockRuntime> {
                 "missing state and/or parameters for contract {key}"
             )));
         };
-        let contract = if fetch_contract {
+        let contract = if return_contract_code {
             self.runtime
                 .contract_store
                 .fetch_contract(&key, &parameters)
@@ -72,7 +73,7 @@ impl ContractExecutor for Executor<MockRuntime> {
                 "missing state for contract {key}"
             )));
         };
-        Ok((state, contract))
+        Ok((Some(state), contract))
     }
 
     async fn upsert_contract_state(
@@ -108,6 +109,16 @@ impl ContractExecutor for Executor<MockRuntime> {
             (update, contract) => unreachable!("{update:?}, {contract:?}"),
         }
     }
+
+    fn register_contract_notifier(
+        &mut self,
+        _key: ContractKey,
+        _cli_id: ClientId,
+        _notification_ch: UnboundedSender<HostResult>,
+        _summary: Option<StateSummary<'_>>,
+    ) -> Result<(), Box<RequestError>> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -120,6 +131,7 @@ mod test {
         const MAX_MEM_CACHE: u32 = 10_000_000;
         let tmp_dir = tempfile::tempdir()?;
         let state_store_path = tmp_dir.path().join("state_store");
+        std::fs::create_dir_all(&state_store_path)?;
         let contract_store = ContractStore::new(tmp_dir.path().join("executor-test"), MAX_SIZE)?;
         let state_store =
             StateStore::new(Storage::new(&state_store_path).await?, MAX_MEM_CACHE).unwrap();

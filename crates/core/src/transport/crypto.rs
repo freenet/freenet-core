@@ -20,10 +20,9 @@ impl TransportKeypair {
         // Key size, can be adjusted
         const BITS: usize = 2048;
         let priv_key = RsaPrivateKey::new(&mut rng, BITS).expect("failed to generate a key");
-        let pub_key = RsaPublicKey::from(&priv_key);
-
+        let public = TransportPublicKey(RsaPublicKey::from(&priv_key));
         TransportKeypair {
-            public: TransportPublicKey(pub_key),
+            public,
             secret: TransportSecretKey(priv_key),
         }
     }
@@ -39,12 +38,13 @@ impl TransportKeypair {
         &self.public
     }
 
+    #[cfg(test)]
     pub(crate) fn secret(&self) -> &TransportSecretKey {
         &self.secret
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Hash)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 pub struct TransportPublicKey(RsaPublicKey);
 
 impl TransportPublicKey {
@@ -57,21 +57,26 @@ impl TransportPublicKey {
     }
 }
 
+impl std::fmt::Debug for TransportPublicKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        <Self as std::fmt::Display>::fmt(self, f)
+    }
+}
+
 impl std::fmt::Display for TransportPublicKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use pkcs8::EncodePublicKey;
 
         let encoded = self.0.to_public_key_der().map_err(|_| std::fmt::Error)?;
-        write!(
-            f,
-            "{}",
-            bs58::encode(if encoded.as_bytes().len() > 16 {
-                &encoded.as_bytes()[..16]
-            } else {
-                encoded.as_bytes()
-            })
-            .into_string()
-        )
+        if encoded.as_bytes().len() >= 16 {
+            let bytes = encoded.as_bytes();
+            let first_six = &bytes[..6];
+            let last_six = &bytes[bytes.len() - 6..];
+            let to_encode = [first_six, last_six].concat();
+            write!(f, "{}", bs58::encode(to_encode).into_string())
+        } else {
+            write!(f, "{}", bs58::encode(encoded.as_bytes()).into_string())
+        }
     }
 }
 
@@ -89,6 +94,7 @@ impl TransportSecretKey {
         self.0.decrypt(Pkcs1v15Encrypt, data)
     }
 
+    #[cfg(test)]
     pub fn to_pkcs8_pem(&self) -> Result<Vec<u8>, pkcs8::Error> {
         use pkcs8::EncodePrivateKey;
 

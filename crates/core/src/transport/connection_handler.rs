@@ -1,4 +1,24 @@
 use std::collections::BTreeMap;
+
+type GatewayConnectionFuture = Box<
+    dyn Future<
+            Output = Result<
+                (
+                    RemoteConnection,
+                    InboundRemoteConnection,
+                    PacketData<SymmetricAES>,
+                ),
+                TransportError,
+            >,
+        > + Send
+        + 'static,
+>;
+
+type TraverseNatFuture = Box<
+    dyn Future<Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>>
+        + Send
+        + 'static,
+>;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
@@ -9,23 +29,24 @@ use crate::transport::crypto::TransportSecretKey;
 use crate::transport::packet_data::{AssymetricRSA, UnknownEncryption};
 use crate::transport::symmetric_message::OutboundConnection;
 use aes_gcm::{Aes128Gcm, KeyInit};
+use futures::FutureExt;
 use futures::{
     stream::{FuturesUnordered, StreamExt},
     Future,
 };
-use futures::{FutureExt, TryFutureExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
+use tracing::span;
+use tracing::Instrument;
 
-use super::packet_data::SymmetricAES;
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
-    packet_data::MAX_PACKET_SIZE,
+    packet_data::{PacketData, SymmetricAES, MAX_PACKET_SIZE},
     peer_connection::{PeerConnection, RemoteConnection},
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
-    PacketData, Socket, TransportError,
+    Socket, TransportError,
 };
 
 const PROTOC_VERSION: [u8; 2] = 1u16.to_le_bytes();
@@ -38,24 +59,7 @@ const MAX_INTERVAL: Duration = Duration::from_millis(5000); // Maximum interval 
 const DEFAULT_BW_TRACKER_WINDOW_SIZE: Duration = Duration::from_secs(10);
 const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
 
-type ConnectionHandlerMessage = (SocketAddr, Vec<u8>);
 pub type SerializedMessage = Vec<u8>;
-type PeerChannel = (
-    mpsc::Sender<SerializedMessage>,
-    mpsc::Receiver<SymmetricMessagePayload>,
-);
-
-struct OutboundMessage {
-    remote_addr: SocketAddr,
-    msg: SerializedMessage,
-    recv: mpsc::Receiver<SerializedMessage>,
-}
-
-struct GatewayMessage {
-    remote_addr: SocketAddr,
-    packet: PacketData<UnknownEncryption>,
-    resp_tx: oneshot::Sender<bool>,
-}
 
 pub(crate) async fn create_connection_handler<S: Socket>(
     keypair: TransportKeypair,
@@ -79,8 +83,18 @@ pub(crate) async fn create_connection_handler<S: Socket>(
     ))
 }
 
+/// Receives  new inbound connections from the network.
 pub(crate) struct InboundConnectionHandler {
     new_connection_notifier: mpsc::Receiver<PeerConnection>,
+}
+
+#[cfg(test)]
+impl InboundConnectionHandler {
+    pub fn new(new_connection_notifier: mpsc::Receiver<PeerConnection>) -> Self {
+        InboundConnectionHandler {
+            new_connection_notifier,
+        }
+    }
 }
 
 impl InboundConnectionHandler {
@@ -89,9 +103,17 @@ impl InboundConnectionHandler {
     }
 }
 
+/// Requests a new outbound connection to a remote peer.
 #[derive(Clone)]
 pub(crate) struct OutboundConnectionHandler {
     send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>,
+}
+
+#[cfg(test)]
+impl OutboundConnectionHandler {
+    pub fn new(send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>) -> Self {
+        OutboundConnectionHandler { send_queue }
+    }
 }
 
 impl OutboundConnectionHandler {
@@ -132,7 +154,7 @@ impl OutboundConnectionHandler {
     }
 
     #[cfg(test)]
-    fn test_set_up(
+    fn new_test(
         socket_addr: SocketAddr,
         socket: Arc<impl Socket>,
         keypair: TransportKeypair,
@@ -171,16 +193,6 @@ impl OutboundConnectionHandler {
             })
             .boxed()
     }
-}
-
-pub enum Message {
-    Short(Vec<u8>),
-    Streamed(Vec<u8>, mpsc::Receiver<StreamFragment>),
-}
-
-pub struct StreamFragment {
-    pub fragment_number: u32,
-    pub fragment: Vec<u8>,
 }
 
 /// Handles UDP transport internally.
@@ -229,13 +241,17 @@ impl<T> Drop for UdpPacketsListener<T> {
 }
 
 impl<S: Socket> UdpPacketsListener<S> {
+    #[tracing::instrument(level = "debug", name = "transport_listener", fields(peer = %self.this_peer_keypair.public), skip_all)]
     async fn listen(mut self) -> Result<(), TransportError> {
+        tracing::debug!(%self.this_addr, "listening for packets");
         let mut buf = [0u8; MAX_PACKET_SIZE];
         let mut ongoing_connections: BTreeMap<SocketAddr, OngoingConnection> = BTreeMap::new();
-        let mut gw_ongoing_connections: BTreeMap<SocketAddr, OngoingConnection> = BTreeMap::new();
+        let mut ongoing_gw_connections: BTreeMap<
+            SocketAddr,
+            mpsc::Sender<PacketData<UnknownEncryption>>,
+        > = BTreeMap::new();
         let mut connection_tasks = FuturesUnordered::new();
         let mut gw_connection_tasks = FuturesUnordered::new();
-        let (gw_outbound_tx, mut gw_inbound_rx) = tokio::sync::mpsc::channel(100);
         loop {
             tokio::select! {
                 // Handling of inbound packets
@@ -246,6 +262,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                             if let Some(remote_conn) = self.remote_connections.remove(&remote_addr){
                                 let _ = remote_conn.inbound_packet_sender.send(packet_data).await;
                                 self.remote_connections.insert(remote_addr, remote_conn);
+                                continue;
+                            }
+
+                            if let Some(inbound_packet_sender) = ongoing_gw_connections.remove(&remote_addr){
+                                let _ = inbound_packet_sender.send(packet_data).await;
+                                ongoing_gw_connections.insert(remote_addr, inbound_packet_sender);
                                 continue;
                             }
 
@@ -264,10 +286,17 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 continue;
                             }
                             let packet_data = PacketData::from_buf(&buf[..size]);
-                            let gw_ongoing_connection = self.gateway_connection(packet_data, remote_addr, gw_outbound_tx.clone());
-                            let task = tokio::spawn(gw_ongoing_connection.map_err(move |error| {
-                                (error, remote_addr)
-                            }));
+                            let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr);
+                            let task = tokio::spawn({
+                                let span = tracing::span!(tracing::Level::DEBUG, "gateway_connection");
+                                async move {
+                                    match Pin::from(gw_ongoing_connection).await {
+                                        Ok(result) => Ok(result),
+                                        Err(error) => Err((error, remote_addr))
+                                    }
+                                }.instrument(span)
+                            });
+                            ongoing_gw_connections.insert(remote_addr, packets_sender);
                             gw_connection_tasks.push(task);
                         }
                         Err(e) => {
@@ -277,17 +306,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                         }
                     }
                 },
-                req = gw_inbound_rx.recv() => {
-                    let Some(GatewayMessage { remote_addr, packet, resp_tx }) = req else {
-                        unreachable!();
-                    };
-
-                    if let Some(remote) = self.remote_connections.remove(&remote_addr) {
-                        let _ = remote.inbound_packet_sender.send(packet).await;
-                        self.remote_connections.insert(remote_addr, remote);
-                        let _ = resp_tx.send(true);
-                    }
-                }
                 gw_connection_handshake = gw_connection_tasks.next(), if !gw_connection_tasks.is_empty() => {
                     let Some(res): GwOngoingConnectionResult = gw_connection_handshake else {
                         unreachable!();
@@ -295,6 +313,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     match res.expect("task shouldn't panic") {
                         Ok((outbound_remote_conn, inbound_remote_connection, outbound_ack_packet)) => {
                             let remote_addr = outbound_remote_conn.remote_addr;
+                            ongoing_gw_connections.remove(&remote_addr);
                             let sent_tracker = outbound_remote_conn.sent_tracker.clone();
 
                             self.remote_connections.insert(remote_addr, inbound_remote_connection);
@@ -314,9 +333,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                         }
                         Err((error, remote_addr)) => {
                             tracing::error!(%error, ?remote_addr, "Failed to establish gateway connection");
-                            if let Some((_, result_sender)) = gw_ongoing_connections.remove(&remote_addr) {
-                                let _ = result_sender.send(Err(error));
-                            }
+                            ongoing_gw_connections.remove(&remote_addr);
+                            ongoing_connections.remove(&remote_addr);
                         }
                     }
                 }
@@ -327,13 +345,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                     match res.expect("task shouldn't panic") {
                         Ok((outbound_remote_conn, inbound_remote_connection)) => {
                             if let Some((_, result_sender)) = ongoing_connections.remove(&outbound_remote_conn.remote_addr) {
-                                tracing::debug!(%outbound_remote_conn.remote_addr, "connection established");
+                                tracing::debug!(remote_addr = %outbound_remote_conn.remote_addr, "connection established");
                                 self.remote_connections.insert(outbound_remote_conn.remote_addr, inbound_remote_connection);
                                 let _ = result_sender.send(Ok(outbound_remote_conn)).map_err(|_| {
                                     tracing::error!("failed sending back peer connection");
                                 });
                             } else {
-                                tracing::error!(%outbound_remote_conn.remote_addr, "connection established but no ongoing connection found");
+                                tracing::error!(remote_addr = %outbound_remote_conn.remote_addr, "connection established but no ongoing connection found");
                             }
                         }
                         Err((error, remote_addr)) => {
@@ -346,15 +364,27 @@ impl<S: Socket> UdpPacketsListener<S> {
                 }
                 // Handling of connection events
                 connection_event = self.connection_handler.recv() => {
-                    let Some((remote_addr, event)) = connection_event else { return Ok(()); };
+                    let Some((remote_addr, event)) = connection_event else {
+                        tracing::debug!(%self.this_addr, "connection handler closed");
+                        return Ok(());
+                    };
+                    if let Some(_conn) = self.remote_connections.remove(&remote_addr) {
+                        tracing::warn!(%remote_addr, "connection already established, dropping old connection");
+                    }
                     let ConnectionEvent::ConnectionStart { remote_public_key, open_connection } = event;
                     tracing::debug!(%remote_addr, "attempting to establish connection");
                     let (ongoing_connection, packets_sender) = self.traverse_nat(
                         remote_addr,  remote_public_key,
                     );
-                    let task = tokio::spawn(ongoing_connection.map_err(move |error| {
-                        (error, remote_addr)
-                    }));
+                    let task = tokio::spawn({
+                        let span = span!(tracing::Level::DEBUG, "traverse_nat");
+                        async move {
+                            match Pin::from(ongoing_connection).await {
+                                Ok(result) => Ok(result),
+                                Err(error) => Err((error, remote_addr))
+                            }
+                        }.instrument(span)
+                    });
                     connection_tasks.push(task);
                     ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
                 },
@@ -366,23 +396,16 @@ impl<S: Socket> UdpPacketsListener<S> {
         &mut self,
         remote_intro_packet: PacketData<UnknownEncryption>,
         remote_addr: SocketAddr,
-        outbound_tx: mpsc::Sender<GatewayMessage>,
-    ) -> impl Future<
-        Output = Result<
-            (
-                RemoteConnection,
-                InboundRemoteConnection,
-                PacketData<SymmetricAES>,
-            ),
-            TransportError,
-        >,
-    > + Send
-           + 'static {
+    ) -> (
+        GatewayConnectionFuture,
+        mpsc::Sender<PacketData<UnknownEncryption>>,
+    ) {
         let secret = self.this_peer_keypair.secret.clone();
         let outbound_packets = self.outbound_packets.clone();
-        let socket_listener = self.socket_listener.clone();
 
-        async move {
+        let (inbound_from_remote, mut next_inbound) =
+            mpsc::channel::<PacketData<UnknownEncryption>>(1);
+        let f = async move {
             let decrypted_intro_packet =
                 secret.decrypt(remote_intro_packet.data()).map_err(|err| {
                     tracing::debug!(%remote_addr, %err, "Failed to decrypt intro packet");
@@ -416,7 +439,6 @@ impl<S: Socket> UdpPacketsListener<S> {
             let outbound_ack_packet =
                 SymmetricMessage::ack_ok(&outbound_key, inbound_key_bytes, remote_addr)?;
 
-            let mut buf = [0u8; MAX_PACKET_SIZE];
             let mut waiting_time = INITIAL_INTERVAL;
             let mut attempts = 0;
             const MAX_ATTEMPTS: usize = 30;
@@ -428,34 +450,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                     .map_err(|_| TransportError::ChannelClosed)?;
 
                 // wait until the remote sends the ack packet
-                let timeout =
-                    tokio::time::timeout(waiting_time, socket_listener.recv_from(&mut buf));
+                let timeout = tokio::time::timeout(waiting_time, next_inbound.recv());
                 match timeout.await {
-                    Ok(Ok((size, remote))) => {
-                        let packet: PacketData<UnknownEncryption> =
-                            PacketData::from_buf(&buf[..size]);
-
-                        let mut should_continue = false;
-
-                        if remote != remote_addr {
-                            let (tx, rx) = tokio::sync::oneshot::channel();
-                            outbound_tx
-                                .send(GatewayMessage {
-                                    remote_addr,
-                                    packet: packet.clone(),
-                                    resp_tx: tx,
-                                })
-                                .await
-                                .map_err(|_| TransportError::ChannelClosed)?;
-
-                            should_continue =
-                                rx.await.map_err(|_| TransportError::ChannelClosed)?;
-                        }
-
-                        if should_continue {
-                            continue;
-                        }
-
+                    Ok(Some(packet)) => {
                         let _ = packet.try_decrypt_sym(&inbound_key).map_err(|_| {
                             tracing::debug!(%remote_addr, "Failed to decrypt packet with inbound key");
                             TransportError::ConnectionEstablishmentFailure {
@@ -463,8 +460,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
                         })?;
                     }
-                    Ok(Err(_)) => {
-                        return Err(TransportError::ChannelClosed);
+                    Ok(None) => {
+                        tracing::debug!(%remote_addr, "connection timed out");
+                        return Err(TransportError::ConnectionEstablishmentFailure {
+                            cause: "connection close".into(),
+                        });
                     }
                     Err(_) => {
                         attempts += 1;
@@ -499,13 +499,12 @@ impl<S: Socket> UdpPacketsListener<S> {
 
             let inbound_conn = InboundRemoteConnection {
                 inbound_packet_sender: inbound_packet_tx,
-                inbound_intro_packet: None,
-                inbound_checked_times: 0,
             };
 
             tracing::debug!("returning connection at gw");
             Ok((remote_conn, inbound_conn, outbound_ack_packet))
-        }
+        };
+        (Box::new(f), inbound_from_remote)
     }
 
     // TODO: this value should be set given exponential backoff and max timeout
@@ -520,9 +519,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         remote_addr: SocketAddr,
         remote_public_key: TransportPublicKey,
     ) -> (
-        impl Future<Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>>
-            + Send
-            + 'static,
+        TraverseNatFuture,
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         // Constants for exponential backoff
@@ -643,6 +640,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     {
                                         tracing::debug!(%remote_addr, ?symmetric_message.payload, "received symmetric packet");
                                     }
+                                    #[cfg(not(test))]
+                                    {
+                                        tracing::trace!(%remote_addr, "received symmetric packet");
+                                    }
 
                                     match symmetric_message.payload {
                                         SymmetricMessagePayload::AckConnection {
@@ -672,6 +673,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 .await
                                                 .map_err(|_| TransportError::ChannelClosed)?;
                                             let (inbound_sender, inbound_recv) = mpsc::channel(100);
+                                            tracing::debug!(%remote_addr, "connection established");
                                             return Ok((
                                                 RemoteConnection {
                                                     outbound_packets: outbound_packets.clone(),
@@ -689,8 +691,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 },
                                                 InboundRemoteConnection {
                                                     inbound_packet_sender: inbound_sender,
-                                                    inbound_intro_packet: None,
-                                                    inbound_checked_times: 0,
                                                 },
                                             ));
                                         }
@@ -759,8 +759,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     },
                                     InboundRemoteConnection {
                                         inbound_packet_sender: inbound_sender,
-                                        inbound_intro_packet: Some(intro_packet.clone()),
-                                        inbound_checked_times: 0,
                                     },
                                 ));
                             }
@@ -772,7 +770,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     }
                     Err(_) => {
                         failures += 1;
-                        tracing::debug!(%this_addr, %remote_addr, "failed to receive UDP response, time out");
+                        tracing::debug!(%this_addr, %remote_addr, "failed to receive UDP response in time, retrying");
                     }
                 }
 
@@ -807,11 +805,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                 cause: "max connection attempts reached".into(),
             })
         };
-        (f, inbound_from_remote)
+        (Box::new(f), inbound_from_remote)
     }
 }
 
-enum ConnectionEvent {
+pub(crate) enum ConnectionEvent {
     ConnectionStart {
         remote_public_key: TransportPublicKey,
         open_connection: oneshot::Sender<Result<RemoteConnection, TransportError>>,
@@ -820,55 +818,29 @@ enum ConnectionEvent {
 
 struct InboundRemoteConnection {
     inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
-    inbound_intro_packet: Option<PacketData<AssymetricRSA>>,
-    inbound_checked_times: usize,
-}
-
-impl InboundRemoteConnection {
-    fn check_inbound_packet(&mut self, packet: &PacketData<UnknownEncryption>) -> bool {
-        let mut inbound = false;
-        if let Some(inbound_intro_packet) = self.inbound_intro_packet.as_ref() {
-            if packet.is_intro_packet(inbound_intro_packet) {
-                inbound = true;
-            }
-        }
-        if self.inbound_checked_times >= UdpPacketsListener::<UdpSocket>::NAT_TRAVERSAL_MAX_ATTEMPTS
-        {
-            // no point in checking more than the max attemps since they won't be sending
-            // the intro packet more than this amount of times
-            self.inbound_intro_packet = None;
-        } else {
-            self.inbound_checked_times += 1;
-        }
-        inbound
-    }
 }
 
 #[cfg(test)]
 mod test {
+    #![allow(clippy::single_range_in_vec_init)]
+
     use std::{
-        collections::HashMap,
         net::Ipv4Addr,
         ops::Range,
-        sync::{
-            atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
-            OnceLock,
-        },
+        sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
     };
 
+    use dashmap::DashMap;
     use futures::{stream::FuturesOrdered, TryStreamExt};
     use rand::{Rng, SeedableRng};
     use serde::{de::DeserializeOwned, Serialize};
-    use tokio::sync::{Mutex, RwLock};
+    use tokio::sync::Mutex;
     use tracing::info;
 
     use super::*;
     use crate::transport::packet_data::MAX_DATA_SIZE;
 
-    #[allow(clippy::type_complexity)]
-    static CHANNELS: OnceLock<
-        Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>>>,
-    > = OnceLock::new();
+    type Channels = Arc<DashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>>;
 
     #[derive(Default, Clone)]
     enum PacketDropPolicy {
@@ -877,8 +849,6 @@ mod test {
         ReceiveAll,
         /// Drop the packets randomly based on the factor
         Factor(f64),
-        /// Drop packets fall in the given range
-        Range(Range<usize>),
         /// Drop packets with the given ranges
         Ranges(Vec<Range<usize>>),
     }
@@ -888,25 +858,28 @@ mod test {
         this: SocketAddr,
         packet_drop_policy: PacketDropPolicy,
         num_packets_sent: AtomicUsize,
-        rng: Mutex<rand::rngs::SmallRng>,
+        rng: std::sync::Mutex<rand::rngs::SmallRng>,
+        channels: Channels,
     }
 
     impl MockSocket {
-        async fn test_config(packet_drop_policy: PacketDropPolicy, addr: SocketAddr) -> Self {
-            let channels = CHANNELS
-                .get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
-                .clone();
+        async fn test_config(
+            packet_drop_policy: PacketDropPolicy,
+            addr: SocketAddr,
+            channels: Channels,
+        ) -> Self {
             let (outbound, inbound) = mpsc::unbounded_channel();
-            channels.write().await.insert(addr, outbound);
+            channels.insert(addr, outbound);
             static SEED: AtomicU64 = AtomicU64::new(0xfeedbeef);
             MockSocket {
                 inbound: Mutex::new(inbound),
                 this: addr,
                 packet_drop_policy,
                 num_packets_sent: AtomicUsize::new(0),
-                rng: Mutex::new(rand::rngs::SmallRng::seed_from_u64(
+                rng: std::sync::Mutex::new(rand::rngs::SmallRng::seed_from_u64(
                     SEED.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
                 )),
+                channels,
             }
         }
     }
@@ -937,12 +910,6 @@ mod test {
                         return Ok(buf.len());
                     }
                 }
-                PacketDropPolicy::Range(r) => {
-                    if r.contains(&packet_idx) {
-                        tracing::trace!(id=%packet_idx, %self.this, "drop packet");
-                        return Ok(buf.len());
-                    }
-                }
                 PacketDropPolicy::Ranges(ranges) => {
                     if ranges.iter().any(|r| r.contains(&packet_idx)) {
                         tracing::trace!(id=%packet_idx, %self.this, "drop packet");
@@ -952,11 +919,7 @@ mod test {
             }
 
             assert!(self.this != target, "cannot send to self");
-            let channels = CHANNELS
-                .get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
-                .clone();
-            let channels = channels.read().await;
-            let Some(sender) = channels.get(&target) else {
+            let Some(sender) = self.channels.get(&target).map(|v| v.value().clone()) else {
                 return Ok(0);
             };
             // tracing::trace!(?target, ?self.this, "sending packet to remote");
@@ -970,46 +933,37 @@ mod test {
 
     impl Drop for MockSocket {
         fn drop(&mut self) {
-            let channels = CHANNELS
-                .get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
-                .clone();
-            loop {
-                if let Ok(mut channels) = channels.try_write() {
-                    channels.remove(&self.this);
-                    break;
-                }
-                // unorthodox blocking here but shouldn't be a problem for testing
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            self.channels.remove(&self.this);
         }
     }
 
     async fn set_peer_connection(
         packet_drop_policy: PacketDropPolicy,
+        channels: Channels,
     ) -> anyhow::Result<(TransportPublicKey, OutboundConnectionHandler, SocketAddr)> {
-        set_peer_connection_in(packet_drop_policy, false)
+        set_peer_connection_in(packet_drop_policy, false, channels)
             .await
             .map(|(pk, (o, _), s)| (pk, o, s))
     }
 
     async fn set_gateway_connection(
         packet_drop_policy: PacketDropPolicy,
+        channels: Channels,
     ) -> Result<
         (
             TransportPublicKey,
-            mpsc::Receiver<PeerConnection>,
+            (OutboundConnectionHandler, mpsc::Receiver<PeerConnection>),
             SocketAddr,
         ),
         anyhow::Error,
     > {
-        set_peer_connection_in(packet_drop_policy, true)
-            .await
-            .map(|(pk, (_, i), s)| (pk, i, s))
+        set_peer_connection_in(packet_drop_policy, true, channels).await
     }
 
     async fn set_peer_connection_in(
         packet_drop_policy: PacketDropPolicy,
         gateway: bool,
+        channels: Channels,
     ) -> Result<
         (
             TransportPublicKey,
@@ -1024,9 +978,14 @@ mod test {
         let peer_pub = peer_keypair.public.clone();
         let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let socket = Arc::new(
-            MockSocket::test_config(packet_drop_policy, (Ipv4Addr::LOCALHOST, port).into()).await,
+            MockSocket::test_config(
+                packet_drop_policy,
+                (Ipv4Addr::LOCALHOST, port).into(),
+                channels,
+            )
+            .await,
         );
-        let (peer_conn, inbound_conn) = OutboundConnectionHandler::test_set_up(
+        let (peer_conn, inbound_conn) = OutboundConnectionHandler::new_test(
             (Ipv4Addr::LOCALHOST, port).into(),
             socket,
             peer_keypair,
@@ -1070,9 +1029,10 @@ mod test {
         assert_eq!(generators.len(), config.peers);
         let mut peer_keys_and_addr = vec![];
         let mut peer_conns = vec![];
+        let channels = Arc::new(DashMap::new());
         for _ in 0..config.peers {
             let (peer_pub, peer, peer_addr) =
-                set_peer_connection(config.packet_drop_policy.clone()).await?;
+                set_peer_connection(config.packet_drop_policy.clone(), channels.clone()).await?;
             peer_keys_and_addr.push((peer_pub, peer_addr));
             peer_conns.push(peer);
         }
@@ -1089,7 +1049,7 @@ mod test {
                 barrier_cp.wait().await;
                 for (peer_pub, peer_addr) in &peer_keys_and_addr {
                     let peer_conn = tokio::time::timeout(
-                        Duration::from_secs(10),
+                        Duration::from_secs(2),
                         peer.connect(peer_pub.clone(), *peer_addr).await,
                     );
                     establish_conns.push(peer_conn);
@@ -1102,7 +1062,7 @@ mod test {
                 let extra_wait = if config.wait_time.as_secs() > 10 {
                     Duration::from_secs(3)
                 } else {
-                    Duration::from_secs(1)
+                    Duration::from_millis(200)
                 };
                 for ((_, peer_addr), mut peer_conn) in
                     peer_keys_and_addr.into_iter().zip(connections)
@@ -1114,12 +1074,17 @@ mod test {
                         to.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                         to.tick().await;
                         let start = std::time::Instant::now();
-                        while messages.len() < test_gen_cp.expected_iterations() {
+                        let iters = test_gen_cp.expected_iterations();
+                        while messages.len() < iters {
                             peer_conn.send(test_gen_cp.gen_msg()).await?;
                             let msg = tokio::select! {
                                 _ = to.tick() => {
                                     return Err::<_, anyhow::Error>(
-                                        anyhow::anyhow!("timeout waiting for messages, total time: {:.2}", start.elapsed().as_secs_f64())
+                                        anyhow::anyhow!(
+                                            "timeout waiting for messages, total time: {time:.2}; done iters {iter}", 
+                                            time = start.elapsed().as_secs_f64(),
+                                            iter = messages.len()
+                                        )
                                     );
                                 }
                                 msg = peer_conn.recv() => {
@@ -1138,6 +1103,7 @@ mod test {
                                 }
                             }
                         }
+                        let _ = peer_conn.send(test_gen_cp.gen_msg()).await;
 
                         tracing::info!(%peer_addr, "finished");
                         let _ = tokio::time::timeout(extra_wait, peer_conn.recv()).await;
@@ -1168,9 +1134,11 @@ mod test {
 
     #[tokio::test]
     async fn simulate_nat_traversal() -> anyhow::Result<()> {
-        // crate::config::set_logger();
-        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
-        let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection(Default::default()).await?;
+        let channels = Arc::new(DashMap::new());
+        let (peer_a_pub, mut peer_a, peer_a_addr) =
+            set_peer_connection(Default::default(), channels.clone()).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) =
+            set_peer_connection(Default::default(), channels).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
@@ -1192,11 +1160,11 @@ mod test {
 
     #[tokio::test]
     async fn simulate_nat_traversal_drop_first_packets_for_all() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        let channels = Arc::new(DashMap::new());
         let (peer_a_pub, mut peer_a, peer_a_addr) =
-            set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
+            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
+            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1]), channels).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
@@ -1218,10 +1186,11 @@ mod test {
 
     #[tokio::test]
     async fn simulate_nat_traversal_drop_first_packets_of_peerb() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
-        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
+        let channels = Arc::new(DashMap::new());
+        let (peer_a_pub, mut peer_a, peer_a_addr) =
+            set_peer_connection(Default::default(), channels.clone()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
+            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1]), channels).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
@@ -1245,30 +1214,36 @@ mod test {
 
     #[tokio::test]
     async fn simulate_nat_traversal_drop_packet_ranges_of_peerb_killed() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
-        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
-        let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1, 3..usize::MAX])).await?;
+        let channels = Arc::new(DashMap::new());
+        let (peer_a_pub, mut peer_a, peer_a_addr) =
+            set_peer_connection(Default::default(), channels.clone()).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection(
+            PacketDropPolicy::Ranges(vec![0..1, 3..usize::MAX]),
+            channels,
+        )
+        .await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
-            let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
-            conn.send("some data").await.unwrap();
+            let mut conn = tokio::time::timeout(Duration::from_secs(2), peer_a_conn).await??;
+            conn.send("some data").await.inspect_err(|error| {
+                tracing::error!(%error, "error while sending message to peer a");
+            })?;
+            tracing::info!("Dropping peer b");
             Ok::<_, anyhow::Error>(())
         });
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
-            let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
+            let mut conn = tokio::time::timeout(Duration::from_secs(2), peer_b_conn).await??;
+            let b = tokio::time::timeout(Duration::from_secs(2), conn.recv()).await??;
             // we should receive the message
-            let b = conn.recv().await.unwrap();
-            assert_eq!(b, b"some data");
-            // as peer b will drop all packets after the third packet, the connection should be broken
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            assert_eq!(&b[8..], b"some data");
+            tracing::info!("Peer a received package from peer b");
+            tokio::time::sleep(Duration::from_secs(3)).await;
             // conn should be broken as the remote peer cannot receive message and ping
-            conn.recv().await.unwrap_err();
+            let res = conn.recv().await;
+            assert!(res.is_err());
             Ok::<_, anyhow::Error>(())
         });
 
@@ -1281,53 +1256,69 @@ mod test {
 
     #[tokio::test]
     async fn simulate_nat_traversal_drop_packet_ranges_of_peerb() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
-        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
+        let channels = Arc::new(DashMap::new());
+        let (peer_a_pub, mut peer_a, peer_a_addr) =
+            set_peer_connection(Default::default(), channels.clone()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1, 3..9])).await?;
+            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1, 3..9]), channels).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
-            let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
-            conn.send("some foo").await.unwrap();
-
-            tokio::time::sleep(Duration::from_secs(10)).await;
-
+            let mut conn = tokio::time::timeout(Duration::from_secs(2), peer_a_conn)
+                .await
+                .inspect_err(|_| tracing::error!("peer a timed out"))?
+                .inspect_err(|error| tracing::error!(%error, "error while connecting to peer a"))?;
+            tracing::info!("Connected peer b to peer a");
+            conn.send("some foo").await.inspect_err(|error| {
+                tracing::error!(%error, "error while sending 1st message");
+            })?;
+            tokio::time::sleep(Duration::from_secs(2)).await;
             // although we drop some packets, we still alive
-            conn.send("some data").await.unwrap();
-            Ok::<_, anyhow::Error>(())
+            conn.send("some data").await.inspect_err(|error| {
+                tracing::error!(%error, "error while sending 2nd message");
+            })?;
+            let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
+            Ok::<_, anyhow::Error>(conn)
         });
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
-            let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
+            let mut conn = tokio::time::timeout(Duration::from_secs(2), peer_b_conn)
+                .await
+                .inspect_err(|_| tracing::error!("peer b timed out"))?
+                .inspect_err(|error| tracing::error!(%error, "error while connecting to peer b"))?;
+            tracing::info!("Connected peer a to peer b");
 
-            tokio::time::sleep(Duration::from_secs(5)).await;
             // we should receive the message
-            let b = conn.recv().await.unwrap();
+            let b = conn.recv().await.inspect_err(|error| {
+                tracing::error!(%error, "error while receiving 1st message");
+            })?;
             assert_eq!(&b[8..], b"some foo");
-
-            tokio::time::sleep(Duration::from_secs(10)).await;
             // conn should not be broken
-            let b = conn.recv().await.unwrap();
+            let b = conn.recv().await.inspect_err(|error| {
+                tracing::error!(%error, "error while receiving 2nd message");
+            })?;
             assert_eq!(&b[8..], b"some data");
-            Ok::<_, anyhow::Error>(())
+            let _ = conn.send("complete").await.inspect_err(|error| {
+                tracing::error!(%error, "error while sending 3rd message");
+            });
+            Ok::<_, anyhow::Error>(conn)
         });
 
         let (a, b) = tokio::try_join!(peer_a, peer_b)?;
-        a?;
-        b?;
+        let _ = a?;
+        let _ = b?;
 
         Ok(())
     }
 
     #[tokio::test]
     async fn simulate_gateway_connection() -> anyhow::Result<()> {
+        let channels = Arc::new(DashMap::new());
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
-            set_peer_connection(Default::default()).await?;
-        let (gw_pub, mut gw_conn, gw_addr) = set_gateway_connection(Default::default()).await?;
+            set_peer_connection(Default::default(), channels.clone()).await?;
+        let (gw_pub, (_oc, mut gw_conn), gw_addr) =
+            set_gateway_connection(Default::default(), channels).await?;
 
         let gw = tokio::spawn(async move {
             let gw_conn = gw_conn.recv();
@@ -1339,7 +1330,7 @@ mod test {
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
-            let _ = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            let _ = tokio::time::timeout(Duration::from_secs(60), peer_b_conn).await??;
             Ok::<_, anyhow::Error>(())
         });
 
@@ -1351,11 +1342,11 @@ mod test {
 
     #[tokio::test]
     async fn simulate_gateway_connection_drop_first_packets_of_gateway() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        let channels = Arc::new(DashMap::new());
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
-            set_peer_connection(Default::default()).await?;
-        let (gw_pub, mut gw_conn, gw_addr) =
-            set_gateway_connection(PacketDropPolicy::Range(0..1)).await?;
+            set_peer_connection(Default::default(), channels.clone()).await?;
+        let (gw_pub, (_oc, mut gw_conn), gw_addr) =
+            set_gateway_connection(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
 
         let gw = tokio::spawn(async move {
             let gw_conn = gw_conn.recv();
@@ -1379,11 +1370,11 @@ mod test {
 
     #[tokio::test]
     async fn simulate_gateway_connection_drop_first_packets_for_all() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        let channels = Arc::new(DashMap::new());
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
-            set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
-        let (gw_pub, mut gw_conn, gw_addr) =
-            set_gateway_connection(PacketDropPolicy::Range(0..1)).await?;
+            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
+        let (gw_pub, (_oc, mut gw_conn), gw_addr) =
+            set_gateway_connection(PacketDropPolicy::Ranges(vec![0..1]), channels).await?;
 
         let gw = tokio::spawn(async move {
             let gw_conn = gw_conn.recv();
@@ -1407,10 +1398,11 @@ mod test {
 
     #[tokio::test]
     async fn simulate_gateway_connection_drop_first_packets_of_peer() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
+        let channels = Arc::new(DashMap::new());
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
-            set_peer_connection(PacketDropPolicy::Range(0..1)).await?;
-        let (gw_pub, mut gw_conn, gw_addr) = set_gateway_connection(Default::default()).await?;
+            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
+        let (gw_pub, (_oc, mut gw_conn), gw_addr) =
+            set_gateway_connection(Default::default(), channels).await?;
 
         let gw = tokio::spawn(async move {
             let gw_conn = gw_conn.recv();
@@ -1434,9 +1426,8 @@ mod test {
 
     #[tokio::test]
     async fn simulate_send_short_message() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         #[derive(Clone, Copy)]
-        struct TestData(&'static str, usize);
+        struct TestData(&'static str);
 
         impl TestFixture for TestData {
             type Message = String;
@@ -1458,7 +1449,7 @@ mod test {
                 peers: 10,
                 ..Default::default()
             },
-            Vec::from_iter((0..10).map(|i| TestData("foo", i))),
+            Vec::from_iter((0..10).map(|_| TestData("foo"))),
         )
         .await
     }
@@ -1467,13 +1458,15 @@ mod test {
     /// by using public send API can be directly sent
     #[tokio::test]
     async fn simulate_send_max_short_message() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::ERROR));
-        let (peer_a_pub, mut peer_a, peer_a_addr) = set_peer_connection(Default::default()).await?;
-        let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection(Default::default()).await?;
+        let channels = Arc::new(DashMap::new());
+        let (peer_a_pub, mut peer_a, peer_a_addr) =
+            set_peer_connection(Default::default(), channels.clone()).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) =
+            set_peer_connection(Default::default(), channels).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+            let mut conn = tokio::time::timeout(Duration::from_secs(5), peer_a_conn).await??;
             let data = vec![0u8; 1324];
             let data = tokio::task::spawn_blocking(move || bincode::serialize(&data).unwrap())
                 .await
@@ -1484,7 +1477,7 @@ mod test {
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            let mut conn = tokio::time::timeout(Duration::from_secs(5), peer_b_conn).await??;
             let msg = conn.recv().await?;
             assert!(msg.len() <= MAX_DATA_SIZE);
             Ok::<_, anyhow::Error>(())
@@ -1496,51 +1489,39 @@ mod test {
         Ok(())
     }
 
-    #[test]
-    #[should_panic]
-    fn simulate_send_max_short_message_plus_1() {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::ERROR));
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async move {
-                let (peer_a_pub, mut peer_a, peer_a_addr) =
-                    set_peer_connection(Default::default()).await?;
-                let (peer_b_pub, mut peer_b, peer_b_addr) =
-                    set_peer_connection(Default::default()).await?;
+    #[tokio::test]
+    async fn simulate_send_max_short_message_plus_1() -> anyhow::Result<()> {
+        let channels = Arc::new(DashMap::new());
+        let (peer_a_pub, mut peer_a, peer_a_addr) =
+            set_peer_connection(Default::default(), channels.clone()).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) =
+            set_peer_connection(Default::default(), channels).await?;
 
-                let peer_b = tokio::spawn(async move {
-                    let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-                    let mut conn =
-                        tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
-                    let data = vec![0u8; 1433];
-                    let data =
-                        tokio::task::spawn_blocking(move || bincode::serialize(&data).unwrap())
-                            .await
-                            .unwrap();
-                    conn.outbound_short_message(data).await?;
-                    Ok::<_, anyhow::Error>(())
-                });
+        let peer_a = tokio::spawn(async move {
+            let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
+            let mut conn = tokio::time::timeout(Duration::from_secs(1), peer_b_conn).await??;
+            let _ = tokio::time::timeout(Duration::from_secs(1), conn.recv()).await??;
+            Ok::<_, anyhow::Error>(())
+        });
 
-                let peer_a = tokio::spawn(async move {
-                    let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-                    let mut conn =
-                        tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
-                    let msg = conn.recv().await?;
-                    assert!(msg.len() <= MAX_DATA_SIZE);
-                    Ok::<_, anyhow::Error>(())
-                });
+        let peer_b = tokio::spawn(async move {
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
+            let mut conn = tokio::time::timeout(Duration::from_secs(1), peer_a_conn).await??;
+            let data = vec![0u8; MAX_DATA_SIZE + 1];
+            let data =
+                tokio::task::spawn_blocking(move || bincode::serialize(&data).unwrap()).await?;
+            conn.outbound_short_message(data).await?;
+            Ok::<_, anyhow::Error>(())
+        });
 
-                let (a, b) = tokio::try_join!(peer_a, peer_b)?;
-                a?;
-                b?;
-                Result::<(), anyhow::Error>::Ok(())
-            })
-            .unwrap();
+        let (a, b) = tokio::join!(peer_a, peer_b);
+        assert!(a?.is_err());
+        assert!(b.is_err());
+        Ok(())
     }
 
     #[tokio::test]
     async fn simulate_send_streamed_message() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE));
         #[derive(Clone, Copy)]
         struct TestData(&'static str);
 
@@ -1570,11 +1551,8 @@ mod test {
         .await
     }
 
-    // #[ignore]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
-    // #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn simulate_packet_dropping() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::INFO));
         #[derive(Clone, Copy)]
         struct TestData(&'static str);
 
@@ -1599,33 +1577,58 @@ mod test {
 
         let mut tests = FuturesOrdered::new();
         let mut rng = rand::rngs::StdRng::seed_from_u64(3);
-        for factor in std::iter::repeat(())
-            .map(|_| rng.gen::<f64>())
-            .filter(|x| *x > 0.05 && *x < 0.25)
-            .take(5)
-        {
-            let wait_time = Duration::from_secs((((factor * 5.0 + 1.0) * 15.0) + 10.0) as u64);
-            tracing::info!(
-                "packet loss factor: {factor} (wait time: {wait_time})",
-                wait_time = wait_time.as_secs()
-            );
-            tests.push_back(tokio::spawn(run_test(
-                TestConfig {
-                    packet_drop_policy: PacketDropPolicy::Factor(factor),
-                    wait_time,
-                    ..Default::default()
-                },
-                vec![TestData("foo"), TestData("bar")],
-            )));
-        }
         let mut test_no = 0;
-        while let Some(result) = tests.next().await {
-            result?.map_err(|e| {
-                tracing::error!(%test_no, "error in test");
-                e
-            })?;
-            test_no += 1;
+        for _ in 0..2 {
+            for factor in std::iter::repeat(())
+                .map(|_| rng.gen::<f64>())
+                .filter(|x| *x > 0.05 && *x < 0.25)
+                .take(3)
+            {
+                let wait_time = Duration::from_secs(((factor * 5.0 * 15.0) + 15.0) as u64);
+                tracing::info!(
+                    "test #{test_no}: packet loss factor: {factor} (wait time: {wait_time})",
+                    wait_time = wait_time.as_secs()
+                );
+
+                let now = std::time::Instant::now();
+                tests.push_back(tokio::spawn(
+                    run_test(
+                        TestConfig {
+                            packet_drop_policy: PacketDropPolicy::Factor(factor),
+                            wait_time,
+                            ..Default::default()
+                        },
+                        vec![TestData("foo"), TestData("bar")],
+                    )
+                    .inspect(move |r| {
+                        let msg = if r.is_ok() {
+                            format!(
+                                "successfully, total time: {}s (t/o: {}s, factor: {factor:.3})",
+                                now.elapsed().as_secs(),
+                                wait_time.as_secs()
+                            )
+                        } else {
+                            format!(
+                                "with error, total time: {}s (t/o: {}s, factor: {factor:.3})",
+                                now.elapsed().as_secs(),
+                                wait_time.as_secs()
+                            )
+                        };
+                        if r.is_err() {
+                            tracing::error!("test #{test_no} finished {}", msg);
+                        } else {
+                            tracing::info!("test #{test_no} finished {}", msg);
+                        }
+                    }),
+                ));
+                test_no += 1;
+            }
+
+            while let Some(result) = tests.next().await {
+                result??;
+            }
         }
+
         Ok(())
     }
 }
