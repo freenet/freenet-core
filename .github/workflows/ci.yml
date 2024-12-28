@@ -49,9 +49,10 @@ jobs:
 
       - name: Build
         run: |
+          cargo install --locked --force --path ./crates/core
+          cargo install --locked --force --path ./crates/fdev
+          make -C apps/freenet-ping -f run-ping.mk build
           cargo build --locked 
-          cargo install --path ./crates/core
-          cargo install --path ./crates/fdev
 
       - name: Test - features
         run: cargo test --workspace ${{ matrix.args }}
@@ -79,8 +80,15 @@ jobs:
         with:
           toolchain: stable
           components: clippy
+          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: |
+          cargo install --locked --force --path ../../crates/fdev
+          make -f run-ping.mk build
+        working-directory: apps/freenet-ping
 
       - name: clippy
         run: cargo clippy -- -D warnings

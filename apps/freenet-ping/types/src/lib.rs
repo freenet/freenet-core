@@ -79,7 +79,6 @@ impl Ping {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,8 +90,12 @@ mod tests {
         ping.insert("Bob".to_string());
 
         let mut other = Ping::new();
-        other.from.insert("Alice".to_string(), Utc::now() - Duration::from_secs(6));
-        other.from.insert("Charlie".to_string(), Utc::now() - Duration::from_secs(6));
+        other
+            .from
+            .insert("Alice".to_string(), Utc::now() - Duration::from_secs(6));
+        other
+            .from
+            .insert("Charlie".to_string(), Utc::now() - Duration::from_secs(6));
 
         ping.merge(other, Duration::from_secs(5));
 
@@ -109,8 +112,12 @@ mod tests {
         ping.insert("Bob".to_string());
 
         let mut other = Ping::new();
-        other.from.insert("Alice".to_string(), Utc::now() - Duration::from_secs(4));
-        other.from.insert("Charlie".to_string(), Utc::now() - Duration::from_secs(4));
+        other
+            .from
+            .insert("Alice".to_string(), Utc::now() - Duration::from_secs(4));
+        other
+            .from
+            .insert("Charlie".to_string(), Utc::now() - Duration::from_secs(4));
 
         ping.merge(other, Duration::from_secs(5));
 

@@ -50,7 +50,7 @@ export const HomePageRing = () => {
 
         console.log("all_contracts_locations", all_contracts_locations);
 
-        let key_index = all_contracts.keys().next().value;
+        let key_index = all_contracts.keys().next().value as string;
         let one_contract = all_contracts.get(key_index);
 
         console.log("key_index", key_index);

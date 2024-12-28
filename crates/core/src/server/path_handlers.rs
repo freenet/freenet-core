@@ -56,7 +56,7 @@ pub(super) async fn contract_home(
             req: Box::new(
                 ContractRequest::Get {
                     key,
-                    fetch_contract: true,
+                    return_contract_code: true,
                 }
                 .into(),
             ),

@@ -499,10 +499,11 @@ async fn update_contract(
     state: WrappedState,
     related_contracts: RelatedContracts<'static>,
 ) -> Result<WrappedState, OpError> {
+    let update_data = UpdateData::State(State::from(state));
     match op_manager
         .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
             key,
-            state,
+            data: update_data,
             related_contracts,
         })
         .await

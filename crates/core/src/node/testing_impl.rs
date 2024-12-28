@@ -17,7 +17,10 @@ use tracing::{info, Instrument};
 #[cfg(feature = "trace-ot")]
 use crate::tracing::CombinedRegister;
 use crate::{
-    client_events::test::{MemoryEventsGen, RandomEventGenerator},
+    client_events::{
+        client_event_handling,
+        test::{MemoryEventsGen, RandomEventGenerator},
+    },
     config::{ConfigArgs, GlobalExecutor},
     contract::{
         self, ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
@@ -786,7 +789,7 @@ where
     };
     let (node_controller_tx, node_controller_rx) = tokio::sync::mpsc::channel(1);
     GlobalExecutor::spawn(
-        super::client_event_handling(
+        client_event_handling(
             config.op_manager.clone(),
             config.user_events.take().expect("should be set"),
             client_responses,

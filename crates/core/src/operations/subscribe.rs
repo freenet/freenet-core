@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use freenet_stdlib::{
-    client_api::{ErrorKind, HostResponse},
+    client_api::{ContractResponse, ErrorKind, HostResponse},
     prelude::*,
 };
 use serde::{Deserialize, Serialize};
@@ -36,7 +36,9 @@ enum SubscribeState {
         upstream_subscriber: Option<PeerKeyLocation>,
         current_hop: usize,
     },
-    Completed {},
+    Completed {
+        key: ContractKey,
+    },
 }
 
 pub(crate) struct SubscribeResult {}
@@ -45,7 +47,7 @@ impl TryFrom<SubscribeOp> for SubscribeResult {
     type Error = OpError;
 
     fn try_from(value: SubscribeOp) -> Result<Self, Self::Error> {
-        if let Some(SubscribeState::Completed {}) = value.state {
+        if let Some(SubscribeState::Completed { .. }) = value.state {
             Ok(SubscribeResult {})
         } else {
             Err(OpError::UnexpectedOpState)
@@ -66,6 +68,7 @@ pub(crate) async fn request_subscribe(
 ) -> Result<(), OpError> {
     let (target, _id) = if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
         if !super::has_contract(op_manager, *key).await? {
+            tracing::debug!(%key, "Contract not found, trying other peer");
             return Err(OpError::ContractError(ContractError::ContractNotFound(
                 *key,
             )));
@@ -122,8 +125,13 @@ impl SubscribeOp {
     }
 
     pub(super) fn to_host_result(&self) -> HostResult {
-        if let Some(SubscribeState::Completed {}) = self.state {
-            Ok(HostResponse::Ok)
+        if let Some(SubscribeState::Completed { key }) = self.state {
+            Ok(HostResponse::ContractResponse(
+                ContractResponse::SubscribeResponse {
+                    key,
+                    subscribed: true,
+                },
+            ))
         } else {
             Err(ErrorKind::OperationError {
                 cause: "subscribe didn't finish successfully".into(),
@@ -380,9 +388,12 @@ impl Operation for SubscribeOp {
                             provider = %sender.peer,
                             "Subscribed to contract"
                         );
-                        op_manager.ring.register_subscription(key, sender.clone());
+                        if op_manager.ring.add_subscriber(key, sender.clone()).is_err() {
+                            // concurrently it reached max number of subscribers for this contract
+                            return Err(OpError::UnexpectedOpState);
+                        }
 
-                        new_state = Some(SubscribeState::Completed {});
+                        new_state = Some(SubscribeState::Completed { key: *key });
                         if let Some(upstream_subscriber) = upstream_subscriber {
                             return_msg = Some(SubscribeMsg::ReturnSub {
                                 id: *id,

@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = [
+	"crates/*",
+	"apps/freenet-ping/app",
+	"apps/freenet-ping/types",
+	"apps/freenet-ping/contracts/ping"
+]
 
 [workspace.dependencies]
 arrayvec = { version = "0.7", features = ["serde"] }
@@ -22,7 +27,7 @@ serde_json = "1"
 serde_with = "3"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-wasmer = "4.3"
+wasmer = "5.0.4"
 
 freenet-stdlib = { path = "./stdlib/rust/", features = ["unstable"]   }
 # freenet-stdlib = { version = "0.0.8" }

@@ -371,21 +371,24 @@ impl Ring {
         let seed_score = self.calculate_seed_score(&key);
         let mut old_subscribers = vec![];
         let mut contract_to_drop = None;
-        if self.seeding_contract.len() < Self::MAX_SEEDING_CONTRACTS {
-            let dropped_contract = *self
+
+        if self.seeding_contract.len() <= Self::MAX_SEEDING_CONTRACTS {
+            if let Some(dropped_contract) = self
                 .seeding_contract
                 .iter()
                 .min_by_key(|v| *v.value())
-                .unwrap()
-                .key();
-            self.seeding_contract.remove(&dropped_contract);
-            if let Some((_, mut subscribers_of_contract)) =
-                self.subscribers.remove(&dropped_contract)
+                .map(|entry| *entry.key())
             {
-                std::mem::swap(&mut subscribers_of_contract, &mut old_subscribers);
+                self.seeding_contract.remove(&dropped_contract);
+                if let Some((_, mut subscribers_of_contract)) =
+                    self.subscribers.remove(&dropped_contract)
+                {
+                    std::mem::swap(&mut subscribers_of_contract, &mut old_subscribers);
+                }
+                contract_to_drop = Some(dropped_contract);
             }
-            contract_to_drop = Some(dropped_contract);
         }
+
         self.seeding_contract.insert(key, seed_score);
         (contract_to_drop, old_subscribers)
     }
@@ -469,14 +472,6 @@ impl Ring {
             .write()
             .report_outbound_request(event.peer.clone(), event.contract_location);
         self.router.write().add_event(event);
-    }
-
-    pub fn register_subscription(&self, contract: &ContractKey, subscriber: PeerKeyLocation) {
-        self.subscribers
-            .entry(*contract)
-            .or_insert(Vec::with_capacity(Self::TOTAL_MAX_SUBSCRIPTIONS))
-            .value_mut()
-            .push(subscriber);
     }
 
     /// Will return an error in case the max number of subscribers has been added.
@@ -611,13 +606,14 @@ impl Ring {
             // remove all missing candidates which have been retried
             missing.split_off(&Reverse(retry_missing_candidates_until));
 
+            // avoid connecting to the same peer multiple times
+            let mut skip_list = missing.values().collect::<Vec<_>>();
+            let this_peer = self.connection_manager.get_peer_key().unwrap();
+            skip_list.push(&this_peer);
+
             if let Some(ideal_location) = pending_conn_adds.pop_front() {
                 live_tx = self
-                    .acquire_new(
-                        ideal_location,
-                        &missing.values().collect::<Vec<_>>(),
-                        &notifier,
-                    )
+                    .acquire_new(ideal_location, &skip_list, &notifier)
                     .await
                     .map_err(|error| {
                         tracing::debug!(?error, "Shutting down connection maintenance task");
