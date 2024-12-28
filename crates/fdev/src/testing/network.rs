@@ -21,19 +21,18 @@ use axum::{
     Router,
 };
 use freenet::dev_tool::{
-    EventChain, MemoryEventsGen, NetworkEventGenerator, NetworkPeer, NodeConfig, NodeLabel, PeerId,
-    PeerMessage, PeerStatus, SimNetwork,
+    EventChain, MemoryEventsGen, NetworkEventGenerator, NetworkPeer, NodeConfig, NodeLabel,
+    PeerMessage, PeerStatus, SimNetwork, TransportPublicKey,
 };
 use futures::{
     stream::{SplitSink, SplitStream},
-    SinkExt, StreamExt,
+    FutureExt, SinkExt, StreamExt,
 };
 use http::{Response, StatusCode};
 use thiserror::Error;
 use tokio::{
     process::Command,
     sync::{oneshot, Mutex},
-    task::JoinHandle,
 };
 
 use super::{Error, TestConfig};
@@ -178,17 +177,13 @@ async fn start_supervisor(config: &TestConfig) -> anyhow::Result<(), Error> {
 }
 
 async fn start_child(config: &TestConfig, cmd_config: &NetworkProcessConfig) -> Result<(), Error> {
-    std::env::set_var(
-        "FREENET_PEER_ID",
-        cmd_config.clone().id.expect("id should be set"),
-    );
-    freenet::config::set_logger(None);
-    if let Some(peer_id) = &cmd_config.id {
-        let peer = NetworkPeer::new(peer_id.clone()).await?;
-        peer.run(config, peer_id.clone()).await?;
-    } else {
+    let Some(peer_id) = &cmd_config.id else {
         bail!("Peer id not set");
-    }
+    };
+    std::env::set_var("FREENET_PEER_ID", peer_id);
+    freenet::config::set_logger(None, None);
+    let peer = NetworkPeer::new(peer_id.clone()).await?;
+    peer.run(config, peer_id.clone()).await?;
     Ok(())
 }
 
@@ -224,11 +219,11 @@ pub async fn run_network(
     supervisor.start_peer_gateways(&cmd_args).await?;
     supervisor.start_peer_nodes(&cmd_args).await?;
 
-    let peers: Vec<(NodeLabel, PeerId)> = supervisor
+    let peers: Vec<_> = supervisor
         .get_all_peers()
         .await
         .into_iter()
-        .map(|(label, config)| (label.clone(), config.get_peer_id().unwrap()))
+        .map(|(label, config)| (label.clone(), config.key_pair.public().clone()))
         .collect();
 
     let events_sender = supervisor.user_ev_controller.lock().await.clone();
@@ -312,6 +307,7 @@ async fn config_handler(
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, supervisor: Arc<Supervisor>) -> axum::response::Response {
+    tracing::info!("WebSocket connection received");
     let on_upgrade = move |ws: WebSocket| async move {
         let cloned_supervisor = supervisor.clone();
         if let Err(error) = handle_socket(ws, cloned_supervisor).await {
@@ -327,45 +323,18 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<Supervisor>) -> anyhow
     let (mut sender, mut receiver): (SplitSink<WebSocket, Message>, SplitStream<WebSocket>) =
         socket.split();
 
-    // Spawn a task for handling outgoing messages.
-    let mut sender_task: JoinHandle<Result<(), Error>> =
-        tokio::spawn(
-            async move { handle_outgoing_messages(&cloned_supervisor, &mut sender).await },
-        );
-
-    // Spawn a task for handling incoming messages.
-    let mut receiver_task: JoinHandle<Result<(), Error>> =
-        tokio::spawn(async move { handle_incoming_messages(&supervisor, &mut receiver).await });
-
-    // Wait for either the sender or receiver task to complete and then clean up.
+    let mut sender_task = handle_outgoing_messages(&cloned_supervisor, &mut sender).boxed();
+    let mut receiver_task = handle_incoming_messages(&supervisor, &mut receiver).boxed();
     tokio::select! {
         event_s = &mut sender_task => {
-            match event_s {
-                Ok(_) => {
-                    tracing::info!("Sender task finished");
-                    receiver_task.abort();
-                    Ok(())
-                }
-                Err(e) => {
-                    tracing::error!("Sender task failed: {}", e);
-                    receiver_task.abort();
-                    Err(e.into())
-                }
-            }
+            event_s
+            .inspect_err(|e| tracing::error!("Sender task failed: {e}"))
+            .inspect(|_| tracing::info!("Sender task finished"))
         }
         peer_r = &mut receiver_task => {
-            match peer_r {
-                Ok(_) => {
-                    tracing::info!("Receiver task finished");
-                    sender_task.abort();
-                    Ok(())
-                }
-                Err(e) => {
-                    tracing::error!("Receiver task failed: {}", e);
-                    sender_task.abort();
-                    Err(e.into())
-                }
-            }
+            peer_r
+                .inspect_err(|e| tracing::error!("Receiver task failed: {e}"))
+                .inspect(|_| tracing::info!("Receiver task finished"))
         }
     }
 }
@@ -374,9 +343,8 @@ async fn handle_outgoing_messages(
     supervisor: &Arc<Supervisor>,
     sender: &mut SplitSink<WebSocket, Message>,
 ) -> anyhow::Result<()> {
-    let mut event_rx = supervisor.event_rx.lock().await;
-    while let Some((event, peer_id)) = event_rx.recv().await {
-        tracing::info!("Received event {} for peer {}", event, peer_id);
+    let mut event_rx = supervisor.user_ev_controller.lock().await.subscribe();
+    while let Ok((event, peer_id)) = event_rx.recv().await {
         let serialized_msg: Vec<u8> = bincode::serialize(&(event, peer_id.clone()))
             .map_err(|e| anyhow!("Failed to serialize message: {}", e))?;
 
@@ -463,26 +431,24 @@ async fn handle_peer_message(
 
 pub struct Supervisor {
     peers_config: Arc<Mutex<HashMap<NodeLabel, NodeConfig>>>,
-    processes: Mutex<HashMap<PeerId, SubProcess>>,
+    processes: Mutex<HashMap<TransportPublicKey, SubProcess>>,
     waiting_peers: Arc<Mutex<VecDeque<usize>>>,
     waiting_gateways: Arc<Mutex<VecDeque<usize>>>,
-    user_ev_controller: Arc<Mutex<tokio::sync::mpsc::Sender<(u32, PeerId)>>>,
-    event_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<(u32, PeerId)>>>,
+    user_ev_controller: Mutex<tokio::sync::broadcast::Sender<(u32, TransportPublicKey)>>,
 }
 
 impl Supervisor {
     pub async fn new(network: &mut SimNetwork) -> Self {
         let peers = network.build_peers();
         let peers_config = Arc::new(Mutex::new(peers.into_iter().collect::<HashMap<_, _>>()));
-        let (user_ev_controller, event_rx) = tokio::sync::mpsc::channel(1);
+        let (user_ev_controller, _) = tokio::sync::broadcast::channel(1);
 
         Supervisor {
             peers_config,
             processes: Mutex::new(HashMap::new()),
             waiting_peers: Arc::new(Mutex::new(VecDeque::new())),
             waiting_gateways: Arc::new(Mutex::new(VecDeque::new())),
-            user_ev_controller: Arc::new(Mutex::new(user_ev_controller)),
-            event_rx: Arc::new(Mutex::new(event_rx)),
+            user_ev_controller: Mutex::new(user_ev_controller),
         }
     }
     async fn start_process(
@@ -495,7 +461,7 @@ impl Supervisor {
         self.processes
             .lock()
             .await
-            .insert(config.get_peer_id().unwrap(), process);
+            .insert(config.key_pair.public().clone(), process);
         Ok(())
     }
 
@@ -601,7 +567,7 @@ pub trait Runnable {
 
 impl Runnable for NetworkPeer {
     async fn run(&self, config: &TestConfig, peer_id: String) -> anyhow::Result<()> {
-        let peer = self.config.get_peer_id().unwrap();
+        let peer = self.config.key_pair.public().clone();
         if self.config.is_gateway {
             tracing::info!(%peer, "Starting gateway {}", peer_id);
         } else {
@@ -630,6 +596,8 @@ impl Runnable for NetworkPeer {
                 return Err(anyhow!("Websocket client not initialized"));
             }
         };
+
+        tracing::info!("Starting event generator for peer {}", peer.clone());
 
         let event_generator =
             NetworkEventGenerator::new(peer.clone(), memory_event_generator, ws_client);

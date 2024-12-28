@@ -29,8 +29,7 @@ will be easy to use, scalable, and secured through cryptography.
 
 To learn more about Freenet as a developer read [The User
 Manual](https://docs.freenet.org/). For an introduction to Freenet watch **Ian's
-talk and Q&A** - [YouTube](https://youtu.be/d31jmv5Tx5k) /
-[Vimeo](https://vimeo.com/manage/videos/740461100).
+talk and Q&A** - [YouTube](https://youtu.be/d31jmv5Tx5k).
 
 ## Status
 

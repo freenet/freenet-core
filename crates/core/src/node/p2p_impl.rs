@@ -3,13 +3,12 @@ use std::sync::Arc;
 use tracing::Instrument;
 
 use super::{
-    client_event_handling,
     network_bridge::{
         event_loop_notification_channel, p2p_protoc::P2pConnManager, EventLoopNotificationsReceiver,
     },
     NetEventRegister, PeerId,
 };
-use crate::transport::TransportPublicKey;
+use crate::{client_events::client_event_handling, ring::ConnectionManager};
 use crate::{
     client_events::{combinator::ClientEventsCombinator, BoxedClient},
     config::GlobalExecutor,
@@ -25,7 +24,6 @@ use crate::{
 use super::OpManager;
 
 pub(crate) struct NodeP2P {
-    pub(crate) peer_pub_key: TransportPublicKey,
     pub(crate) op_manager: Arc<OpManager>,
     notification_channel: EventLoopNotificationsReceiver,
     client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
@@ -41,13 +39,8 @@ pub(crate) struct NodeP2P {
 impl NodeP2P {
     pub(super) async fn run_node(self) -> anyhow::Result<()> {
         if self.should_try_connect {
-            connect::initial_join_procedure(
-                self.op_manager.clone(),
-                self.conn_manager.bridge.clone(),
-                self.peer_pub_key,
-                &self.conn_manager.gateways,
-            )
-            .await?;
+            connect::initial_join_procedure(self.op_manager.clone(), &self.conn_manager.gateways)
+                .await?;
         }
 
         // start the p2p event loop
@@ -68,22 +61,22 @@ impl NodeP2P {
         clients: [BoxedClient; CLIENTS],
         event_register: ER,
         ch_builder: CH::Builder,
-    ) -> anyhow::Result<NodeP2P>
+    ) -> anyhow::Result<Self>
     where
         CH: ContractHandler + Send + 'static,
         ER: NetEventRegister + Clone,
     {
-        let peer_pub_key = config.key_pair.public().clone();
-
         let (notification_channel, notification_tx) = event_loop_notification_channel();
         let (ch_outbound, ch_inbound, wait_for_event) = contract::contract_handler_channel();
         let (client_responses, cli_response_sender) = contract::client_responses_channel();
 
+        let connection_manager = ConnectionManager::new(&config);
         let op_manager = Arc::new(OpManager::new(
             notification_tx,
             ch_outbound,
             &config,
             event_register.clone(),
+            connection_manager,
         )?);
         let (executor_listener, executor_sender) = contract::executor_channel(op_manager.clone());
         let contract_handler = CH::build(ch_inbound, executor_sender, ch_builder)
@@ -111,7 +104,6 @@ impl NodeP2P {
         );
 
         Ok(NodeP2P {
-            peer_pub_key,
             conn_manager,
             notification_channel,
             client_wait_for_transaction: wait_for_event,

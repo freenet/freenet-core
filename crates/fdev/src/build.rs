@@ -143,9 +143,8 @@ fn get_out_lib(work_dir: &Path, cli_config: &BuildToolConfig) -> anyhow::Result<
         "debug"
     };
     let output_lib = env::var("CARGO_TARGET_DIR")
-        .map_err(|e| {
+        .inspect_err(|_| {
             println!("Missing environment variable `CARGO_TARGET_DIR");
-            e
         })?
         .parse::<PathBuf>()?
         .join(target)

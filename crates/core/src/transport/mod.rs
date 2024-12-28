@@ -1,4 +1,3 @@
-#![allow(dead_code)] // TODO: Remove before integration
 //! Freenet Transport protocol implementation.
 //!
 //! Please see `docs/architecture/transport.md` for more information.
@@ -22,12 +21,18 @@ type MessagePayload = Vec<u8>;
 
 type PacketId = u32;
 
-use self::{packet_data::PacketData, peer_connection::StreamId};
-
-pub use self::crypto::TransportKeypair;
+pub use self::crypto::{TransportKeypair, TransportPublicKey};
+#[cfg(test)]
 pub(crate) use self::{
-    connection_handler::{create_connection_handler, OutboundConnectionHandler},
-    crypto::TransportPublicKey,
+    connection_handler::ConnectionEvent,
+    packet_data::{PacketData, UnknownEncryption},
+    peer_connection::RemoteConnection,
+    symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
+};
+pub(crate) use self::{
+    connection_handler::{
+        create_connection_handler, InboundConnectionHandler, OutboundConnectionHandler,
+    },
     peer_connection::PeerConnection,
 };
 
@@ -39,20 +44,14 @@ pub(crate) enum TransportError {
     ConnectionClosed(SocketAddr),
     #[error("failed while establishing connection, reason: {cause}")]
     ConnectionEstablishmentFailure { cause: Cow<'static, str> },
-    #[error("incomplete inbound stream: {0}")]
-    IncompleteInboundStream(StreamId),
     #[error(transparent)]
     IO(#[from] std::io::Error),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
-    #[error("{0}")]
-    PrivateKeyDecryptionError(aes_gcm::aead::Error),
     #[error(transparent)]
     PubKeyDecryptionError(#[from] rsa::errors::Error),
     #[error(transparent)]
     Serialization(#[from] bincode::Error),
-    #[error("received unexpected message from remote: {0}")]
-    UnexpectedMessage(Cow<'static, str>),
 }
 
 /// Make connection handler more testable

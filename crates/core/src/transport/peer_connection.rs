@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,10 +7,11 @@ use std::time::Duration;
 use crate::transport::packet_data::UnknownEncryption;
 use aes_gcm::Aes128Gcm;
 use futures::stream::FuturesUnordered;
-use futures::{Future, StreamExt};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tracing::{instrument, span, Instrument};
 
 mod inbound_stream;
 mod outbound_stream;
@@ -35,16 +35,16 @@ type Result<T = (), E = TransportError> = std::result::Result<T, E>;
 const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 100;
 
 #[must_use]
-pub(super) struct RemoteConnection {
-    pub outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
-    pub outbound_symmetric_key: Aes128Gcm,
-    pub remote_addr: SocketAddr,
-    pub sent_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
-    pub last_packet_id: Arc<AtomicU32>,
-    pub inbound_packet_recv: mpsc::Receiver<PacketData<UnknownEncryption>>,
-    pub inbound_symmetric_key: Aes128Gcm,
-    pub inbound_symmetric_key_bytes: [u8; 16],
-    pub my_address: Option<SocketAddr>,
+pub(crate) struct RemoteConnection {
+    pub(super) outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
+    pub(super) outbound_symmetric_key: Aes128Gcm,
+    pub(super) remote_addr: SocketAddr,
+    pub(super) sent_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
+    pub(super) last_packet_id: Arc<AtomicU32>,
+    pub(super) inbound_packet_recv: mpsc::Receiver<PacketData<UnknownEncryption>>,
+    pub(super) inbound_symmetric_key: Aes128Gcm,
+    pub(super) inbound_symmetric_key_bytes: [u8; 16],
+    pub(super) my_address: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -66,7 +66,6 @@ impl std::fmt::Display for StreamId {
 }
 
 type InboundStreamResult = Result<(StreamId, SerializedMessage), StreamId>;
-type InboundStreamFut = Pin<Box<dyn Future<Output = InboundStreamResult> + Send>>;
 
 /// The `PeerConnection` struct is responsible for managing the connection with a remote peer.
 /// It provides methods for sending and receiving messages to and from the remote peer.
@@ -97,6 +96,28 @@ pub(crate) struct PeerConnection {
     outbound_stream_futures: FuturesUnordered<JoinHandle<Result>>,
 }
 
+impl std::fmt::Debug for PeerConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerConnection")
+            .field("remote_conn", &self.remote_conn.remote_addr)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+type PeerConnectionMock = (
+    PeerConnection,
+    mpsc::Sender<PacketData<UnknownEncryption>>,
+    mpsc::Receiver<(SocketAddr, Arc<[u8]>)>,
+);
+
+#[cfg(test)]
+type RemoteConnectionMock = (
+    RemoteConnection,
+    mpsc::Sender<PacketData<UnknownEncryption>>,
+    mpsc::Receiver<(SocketAddr, Arc<[u8]>)>,
+);
+
 impl PeerConnection {
     pub(super) fn new(remote_conn: RemoteConnection) -> Self {
         Self {
@@ -108,6 +129,62 @@ impl PeerConnection {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_test(
+        remote_addr: SocketAddr,
+        my_address: SocketAddr,
+        outbound_symmetric_key: Aes128Gcm,
+        inbound_symmetric_key: Aes128Gcm,
+    ) -> PeerConnectionMock {
+        use parking_lot::Mutex;
+        let (outbound_packets, outbound_packets_recv) = mpsc::channel(1);
+        let (inbound_packet_sender, inbound_packet_recv) = mpsc::channel(1);
+        let remote = RemoteConnection {
+            outbound_packets,
+            outbound_symmetric_key,
+            remote_addr,
+            sent_tracker: Arc::new(Mutex::new(SentPacketTracker::new())),
+            last_packet_id: Arc::new(AtomicU32::new(0)),
+            inbound_packet_recv,
+            inbound_symmetric_key,
+            inbound_symmetric_key_bytes: [1; 16],
+            my_address: Some(my_address),
+        };
+        (
+            Self::new(remote),
+            inbound_packet_sender,
+            outbound_packets_recv,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_remote_test(
+        remote_addr: SocketAddr,
+        my_address: SocketAddr,
+        outbound_symmetric_key: Aes128Gcm,
+        inbound_symmetric_key: Aes128Gcm,
+    ) -> RemoteConnectionMock {
+        use parking_lot::Mutex;
+        let (outbound_packets, outbound_packets_recv) = mpsc::channel(1);
+        let (inbound_packet_sender, inbound_packet_recv) = mpsc::channel(1);
+        (
+            RemoteConnection {
+                outbound_packets,
+                outbound_symmetric_key,
+                remote_addr,
+                sent_tracker: Arc::new(Mutex::new(SentPacketTracker::new())),
+                last_packet_id: Arc::new(AtomicU32::new(0)),
+                inbound_packet_recv,
+                inbound_symmetric_key,
+                inbound_symmetric_key_bytes: [1; 16],
+                my_address: Some(my_address),
+            },
+            inbound_packet_sender,
+            outbound_packets_recv,
+        )
+    }
+
+    #[instrument(name = "peer_connection", skip_all)]
     pub async fn send<T>(&mut self, data: T) -> Result
     where
         T: Serialize + Send + 'static,
@@ -116,26 +193,27 @@ impl PeerConnection {
             .await
             .unwrap();
         if data.len() + SymmetricMessage::short_message_overhead() > MAX_DATA_SIZE {
-            tracing::debug!("sending as stream");
+            tracing::trace!("sending as stream");
             self.outbound_stream(data).await;
         } else {
-            tracing::debug!("sending as short message");
+            tracing::trace!("sending as short message");
             self.outbound_short_message(data).await?;
         }
         Ok(())
     }
 
+    #[instrument(name = "peer_connection", skip(self))]
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
         // listen for incoming messages or receipts or wait until is time to do anything else again
-        let mut resend_check = Some(tokio::time::sleep(tokio::time::Duration::from_secs(1)));
+        let mut resend_check = Some(tokio::time::sleep(tokio::time::Duration::from_millis(10)));
 
-        // #[cfg(debug_assertions)]
-        // const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(2);
-        // #[cfg(not(debug_assertions))]
+        #[cfg(debug_assertions)]
+        const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(2);
+        #[cfg(not(debug_assertions))]
         const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(20);
-        // #[cfg(debug_assertions)]
-        // const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(6);
-        // #[cfg(not(debug_assertions))]
+        #[cfg(debug_assertions)]
+        const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(6);
+        #[cfg(not(debug_assertions))]
         const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(60);
 
         let mut keep_alive = tokio::time::interval(KEEP_ALIVE_INTERVAL);
@@ -193,7 +271,7 @@ impl PeerConnection {
                         tracing::error!(%error, %packet_id, remote = %self.remote_conn.remote_addr, "error processing inbound packet");
                         error
                     })? {
-                        tracing::debug!(%packet_id, "returning full stream message");
+                        tracing::trace!(%packet_id, "returning full stream message");
                         return Ok(msg);
                     }
                 }
@@ -226,9 +304,9 @@ impl PeerConnection {
                     tracing::trace!(remote = ?self.remote_conn.remote_addr, "sending keep-alive");
                     self.noop(vec![]).await?;
                 }
-                _ = resend_check.take().unwrap_or(tokio::time::sleep(Duration::from_secs(5))) => {
+                _ = resend_check.take().unwrap_or(tokio::time::sleep(Duration::from_millis(10))) => {
                     loop {
-                        tracing::trace!(remote = ?self.remote_conn.remote_addr, "checking for resends");
+                        // tracing::trace!(remote = ?self.remote_conn.remote_addr, "checking for resends");
                         let maybe_resend = self.remote_conn
                             .sent_tracker
                             .lock()
@@ -356,15 +434,18 @@ impl PeerConnection {
 
     async fn outbound_stream(&mut self, data: SerializedMessage) {
         let stream_id = StreamId::next();
-        let task = tokio::spawn(outbound_stream::send_stream(
-            stream_id,
-            self.remote_conn.last_packet_id.clone(),
-            self.remote_conn.outbound_packets.clone(),
-            self.remote_conn.remote_addr,
-            data,
-            self.remote_conn.outbound_symmetric_key.clone(),
-            self.remote_conn.sent_tracker.clone(),
-        ));
+        let task = tokio::spawn(
+            outbound_stream::send_stream(
+                stream_id,
+                self.remote_conn.last_packet_id.clone(),
+                self.remote_conn.outbound_packets.clone(),
+                self.remote_conn.remote_addr,
+                data,
+                self.remote_conn.outbound_symmetric_key.clone(),
+                self.remote_conn.sent_tracker.clone(),
+            )
+            .instrument(span!(tracing::Level::DEBUG, "outbound_stream")),
+        );
         self.outbound_stream_futures.push(task);
     }
 }
@@ -510,7 +591,7 @@ mod tests {
             while let Some((_, network_packet)) = receiver.recv().await {
                 let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&network_packet)
                     .try_decrypt_sym(&cipher)
-                    .map_err(TransportError::PrivateKeyDecryptionError)?;
+                    .map_err(|e| e.to_string())?;
                 let SymmetricMessage {
                     payload:
                         SymmetricMessagePayload::StreamFragment {

@@ -339,9 +339,8 @@ impl LogFile {
         let deserialized_records = tokio::task::spawn_blocking(move || {
             let mut filtered = vec![];
             for buf in records {
-                let record: NetLogMessage = bincode::deserialize(&buf).map_err(|e| {
+                let record: NetLogMessage = bincode::deserialize(&buf).inspect_err(|_| {
                     tracing::error!(?buf, "deserialization error");
-                    e
                 })?;
                 // tracing::info!(?record);
                 if let EventKind::Route(outcome) = record.kind {
@@ -396,8 +395,6 @@ impl LogFile {
 mod tests {
     use std::time::SystemTime;
 
-    use tracing::level_filters::LevelFilter;
-
     use crate::{
         dev_tool::{PeerId, Transaction},
         tracing::NetEventLog,
@@ -408,7 +405,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn read_write() -> anyhow::Result<()> {
         NEW_RECORDS_TS.get_or_init(SystemTime::now);
-        crate::config::set_logger(Some(LevelFilter::TRACE));
         let temp_dir = tempfile::tempdir()?;
         let log_path = temp_dir.path().join("event_log");
 
@@ -455,7 +451,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn read_write_small() -> anyhow::Result<()> {
         NEW_RECORDS_TS.get_or_init(SystemTime::now);
-        crate::config::set_logger(Some(LevelFilter::TRACE));
         let temp_dir = tempfile::tempdir()?;
         let log_path = temp_dir.path().join("event_log");
 
@@ -502,7 +497,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn read_write_truncate() -> anyhow::Result<()> {
         NEW_RECORDS_TS.get_or_init(SystemTime::now);
-        crate::config::set_logger(Some(LevelFilter::TRACE));
         let temp_dir = tempfile::tempdir()?;
         let log_path = temp_dir.path().join("event_log");
 

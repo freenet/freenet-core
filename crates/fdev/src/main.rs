@@ -9,6 +9,7 @@ mod config;
 mod inspect;
 pub(crate) mod network_metrics_server;
 mod new_package;
+mod query;
 mod testing;
 mod util;
 mod wasm_runtime;
@@ -39,7 +40,7 @@ fn main() -> anyhow::Result<()> {
         .build()?;
     let config = Config::parse();
     if !config.sub_command.is_child() {
-        freenet::config::set_logger(None);
+        freenet::config::set_logger(None, None);
     }
     tokio_rt.block_on(async move {
         let cwd = std::env::current_dir()?;
@@ -64,6 +65,10 @@ fn main() -> anyhow::Result<()> {
                     _ = tokio::signal::ctrl_c() => {}
                     _ = server => {}
                 }
+                Ok(())
+            }
+            SubCommand::Query {} => {
+                query::query(config.additional).await?;
                 Ok(())
             }
         };

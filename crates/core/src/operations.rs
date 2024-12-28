@@ -118,7 +118,7 @@ where
             let id = *msg.id();
             tracing::debug!(%id, "updated op state");
             if let Some(target) = msg.target() {
-                tracing::debug!(%id, "sending updated op state");
+                tracing::debug!(%id, %target, "sending updated op state");
                 network_bridge.send(&target.peer, msg).await?;
             }
             op_manager.push(id, updated_state).await?;
@@ -305,7 +305,12 @@ impl<T> From<SendError<T>> for OpError {
 }
 
 /// If the contract is not found, it will try to get it first if the `try_get` parameter is set.
-async fn start_subscription_request(op_manager: &OpManager, key: ContractKey, try_get: bool) {
+async fn start_subscription_request(
+    op_manager: &OpManager,
+    key: ContractKey,
+    try_get: bool,
+    skip_list: Vec<PeerId>,
+) {
     let sub_op = subscribe::start_op(key);
     if let Err(error) = subscribe::request_subscribe(op_manager, sub_op).await {
         if !try_get {
@@ -315,7 +320,7 @@ async fn start_subscription_request(op_manager: &OpManager, key: ContractKey, tr
         if let OpError::ContractError(ContractError::ContractNotFound(key)) = &error {
             tracing::debug!(%key, "Contract not found, trying to get it first");
             let get_op = get::start_op(*key, true);
-            if let Err(error) = get::request_get(op_manager, get_op).await {
+            if let Err(error) = get::request_get(op_manager, get_op, skip_list).await {
                 tracing::warn!(%error, "Error getting contract");
             }
         } else {
@@ -328,7 +333,7 @@ async fn has_contract(op_manager: &OpManager, key: ContractKey) -> Result<bool, 
     match op_manager
         .notify_contract_handler(crate::contract::ContractHandlerEvent::GetQuery {
             key,
-            fetch_contract: false,
+            return_contract_code: false,
         })
         .await?
     {
@@ -336,10 +341,6 @@ async fn has_contract(op_manager: &OpManager, key: ContractKey) -> Result<bool, 
             response: Ok(crate::contract::StoreResponse { state: Some(_), .. }),
             ..
         } => Ok(true),
-        crate::contract::ContractHandlerEvent::GetResponse {
-            response: Ok(crate::contract::StoreResponse { state: None, .. }),
-            ..
-        } => Ok(false),
-        _ => Err(OpError::UnexpectedOpState),
+        _ => Ok(false),
     }
 }

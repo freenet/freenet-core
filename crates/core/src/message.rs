@@ -6,7 +6,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use freenet_stdlib::prelude::ContractKey;
+use freenet_stdlib::prelude::{ContractContainer, ContractKey, WrappedState};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -295,6 +295,9 @@ pub(crate) trait InnerMessage: Into<NetMessage> {
     fn requested_location(&self) -> Option<Location>;
 }
 
+type RemainingChecks = Option<usize>;
+type ConnectResult = Result<(PeerId, RemainingChecks), ()>;
+
 /// Internal node events emitted to the event loop.
 #[derive(Debug, Clone)]
 pub(crate) enum NodeEvent {
@@ -303,10 +306,24 @@ pub(crate) enum NodeEvent {
     // Try connecting to the given peer.
     ConnectPeer {
         peer: PeerId,
-        callback: tokio::sync::mpsc::Sender<Result<(), ()>>,
+        tx: Transaction,
+        callback: tokio::sync::mpsc::Sender<ConnectResult>,
+        is_gw: bool,
     },
     Disconnect {
         cause: Option<Cow<'static, str>>,
+    },
+    QueryConnections {
+        callback: tokio::sync::mpsc::Sender<QueryResult>,
+    },
+}
+
+pub(crate) enum QueryResult {
+    Connections(Vec<PeerId>),
+    GetResult {
+        key: ContractKey,
+        state: WrappedState,
+        contract: Option<ContractContainer>,
     },
 }
 
@@ -324,6 +341,9 @@ impl Display for NodeEvent {
             }
             NodeEvent::Disconnect { cause: None } => {
                 write!(f, "Disconnect node, reason: unknown")
+            }
+            NodeEvent::QueryConnections { .. } => {
+                write!(f, "QueryConnections")
             }
         }
     }

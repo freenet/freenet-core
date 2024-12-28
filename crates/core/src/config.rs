@@ -190,9 +190,8 @@ impl ConfigArgs {
             if self.config_paths.data_dir.is_none() {
                 self.config_paths.data_dir = Some(data);
             }
-            Self::read_config(&config)?.map(|cfg| {
+            Self::read_config(&config)?.inspect(|_| {
                 tracing::info!("Found configuration file in default directory");
-                cfg
             })
         };
 
@@ -235,7 +234,8 @@ impl ConfigArgs {
                     .gateways
             }
             Err(err) => {
-                #[cfg(not(any(test, debug_assertions)))]
+                // TODO: remove local-simulation feature and use runtime flags
+                #[cfg(all(not(any(test, debug_assertions)), not(feature = "local-simulation")))]
                 {
                     if peer_id.is_none() && mode == OperationMode::Network {
                         tracing::error!(file = ?gateways_file, "Failed to read gateways file: {err}");
@@ -744,7 +744,7 @@ impl<'a> Iterator for ConfigPathsIter<'a> {
     }
 }
 
-impl<'a> core::iter::FusedIterator for ConfigPathsIter<'a> {}
+impl core::iter::FusedIterator for ConfigPathsIter<'_> {}
 
 impl Config {
     pub fn db_dir(&self) -> PathBuf {
@@ -827,7 +827,7 @@ impl GlobalExecutor {
     }
 }
 
-pub fn set_logger(level: Option<tracing::level_filters::LevelFilter>) {
+pub fn set_logger(level: Option<tracing::level_filters::LevelFilter>, endpoint: Option<String>) {
     #[cfg(feature = "trace")]
     {
         static LOGGER_SET: AtomicBool = AtomicBool::new(false);
@@ -843,7 +843,7 @@ pub fn set_logger(level: Option<tracing::level_filters::LevelFilter>) {
             return;
         }
 
-        crate::tracing::tracer::init_tracer(level).expect("failed tracing initialization")
+        crate::tracing::tracer::init_tracer(level, endpoint).expect("failed tracing initialization")
     }
 }
 

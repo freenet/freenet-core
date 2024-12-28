@@ -20,7 +20,7 @@ const MAX_PENDING_RECEIPTS: usize = 20;
 /// if the returned list is not empty, the list should be sent as receipts immediately in a noop.
 /// This may look something like this:
 ///
-/// ```rust,no_run
+/// ```ignore
 /// use super::MAX_CONFIRMATION_DELAY;
 /// use std::thread::sleep;
 /// let mut received_packet_tracker = todo!();
@@ -88,7 +88,7 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
         while self
             .packet_id_time
             .front()
-            .map_or(false, |&(_, time)| time < remove_before)
+            .is_some_and(|&(_, time)| time < remove_before)
         {
             let expired = self.packet_id_time.pop_front();
             if let Some((packet_id, _)) = expired {
