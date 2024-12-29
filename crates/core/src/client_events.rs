@@ -235,6 +235,18 @@ where
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum Error {
+    #[error("Node not connected to network")]
+    Disconnected,
+    #[error(transparent)]
+    Contract(#[from] crate::contract::ContractError),
+    #[error(transparent)]
+    Op(#[from] OpError),
+    #[error(transparent)]
+    Executor(#[from] crate::contract::ExecutorError),
+}
+
 #[inline]
 async fn process_open_request(
     mut request: OpenRequest<'static>,
@@ -269,8 +281,8 @@ async fn process_open_request(
                     } => {
                         let Some(peer_id) = op_manager.ring.connection_manager.get_peer_key()
                         else {
-                            tracing::error!("Peer id not found at put op, it should be set");
-                            return;
+                            tracing::error!("peer id not found at put op, it should be set");
+                            return Err(Error::Disconnected);
                         };
 
                         tracing::debug!(
@@ -286,14 +298,13 @@ async fn process_open_request(
                         );
                         let op_id = op.id;
 
-                        if let Err(err) = op_manager
+                        op_manager
                             .ch_outbound
                             .waiting_for_transaction_result(op_id, client_id)
                             .await
-                        {
-                            tracing::error!("Error waiting for transaction result: {}", err);
-                            return;
-                        }
+                            .inspect_err(|err| {
+                                tracing::error!("Error waiting for transaction result: {}", err);
+                            })?;
 
                         if let Err(err) = put::request_put(&op_manager, op).await {
                             tracing::error!("Put request error: {}", err);
@@ -303,7 +314,7 @@ async fn process_open_request(
                         let Some(peer_id) = op_manager.ring.connection_manager.get_peer_key()
                         else {
                             tracing::error!("Peer id not found at update op, it should be set");
-                            return;
+                            return Err(Error::Disconnected);
                         };
 
                         tracing::debug!(
@@ -313,7 +324,7 @@ async fn process_open_request(
 
                         let related_contracts = RelatedContracts::default();
 
-                        let Ok(new_state) = match op_manager
+                        let new_state = match op_manager
                             .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
                                 key,
                                 data,
@@ -330,20 +341,17 @@ async fn process_open_request(
                             Err(err) => Err(err.into()),
                             Ok(_) => Err(OpError::UnexpectedOpState),
                         }
-                        .inspect_err(|err| tracing::error!(%key, "update query failed: {}", err)) else {
-                            return;
-                        };
+                        .inspect_err(|err| tracing::error!(%key, "update query failed: {}", err))?;
 
                         let op = update::start_op(key, new_state, related_contracts);
 
-                        if let Err(err) = op_manager
+                        op_manager
                             .ch_outbound
                             .waiting_for_transaction_result(op.id, client_id)
                             .await
-                        {
-                            tracing::error!("Error waiting for transaction result: {}", err);
-                            return;
-                        }
+                            .inspect_err(|err| {
+                                tracing::error!("Error waiting for transaction result: {}", err);
+                            })?;
 
                         if let Err(err) = update::request_update(&op_manager, op).await {
                             tracing::error!("request update error {}", err)
@@ -356,7 +364,7 @@ async fn process_open_request(
                         let Some(peer_id) = op_manager.ring.connection_manager.get_peer_key()
                         else {
                             tracing::error!("Peer id not found at get op, it should be set");
-                            return;
+                            return Err(Error::Disconnected);
                         };
 
                         let (state, contract) = match op_manager
@@ -374,15 +382,15 @@ async fn process_open_request(
                                 response: Err(err), ..
                             }) => {
                                 tracing::error!("get query failed: {}", err);
-                                return;
+                                return Err(Error::Executor(err));
                             }
                             Err(err) => {
                                 tracing::error!("get query failed: {}", err);
-                                return;
+                                return Err(Error::Contract(err));
                             }
                             Ok(_) => {
                                 tracing::error!("get query failed: UnexpectedOpState");
-                                return;
+                                return Err(Error::Op(OpError::UnexpectedOpState));
                             }
                         };
 
@@ -419,17 +427,16 @@ async fn process_open_request(
 
                             let op = get::start_op(key, return_contract_code);
 
-                            if let Err(err) = op_manager
+                            op_manager
                                 .ch_outbound
                                 .waiting_for_transaction_result(op.id, client_id)
                                 .await
-                            {
-                                tracing::error!(
-                                    "Error waiting for transaction result (get): {}",
-                                    err
-                                );
-                                return;
-                            }
+                                .inspect_err(|err| {
+                                    tracing::error!(
+                                        "Error waiting for transaction result (get): {}",
+                                        err
+                                    );
+                                })?;
 
                             if let Err(err) = get::request_get(&op_manager, op, vec![]).await {
                                 tracing::error!("get::request_get error: {}", err);
@@ -438,22 +445,18 @@ async fn process_open_request(
                     }
                     ContractRequest::Subscribe { key, summary } => {
                         let op_id =
-                            match crate::node::subscribe(op_manager.clone(), key, Some(client_id))
+                            crate::node::subscribe(op_manager.clone(), key, Some(client_id))
                                 .await
-                            {
-                                Ok(op_id) => op_id,
-                                Err(err) => {
+                                .inspect_err(|err| {
                                     tracing::error!("Subscribe error: {}", err);
-                                    return;
-                                }
-                            };
+                                })?;
 
                         let Some(subscriber_listener) = subscription_listener else {
                             tracing::error!(%op_id, %client_id, "No subscriber listener");
-                            return;
+                            return Ok(());
                         };
 
-                        if let Err(err) = op_manager
+                        op_manager
                             .notify_contract_handler(
                                 ContractHandlerEvent::RegisterSubscriberListener {
                                     key,
@@ -463,22 +466,20 @@ async fn process_open_request(
                                 },
                             )
                             .await
-                        {
-                            tracing::error!(
-                                %op_id, %client_id,
-                                "Register subscriber listener error: {}", err
-                            );
-                            return;
-                        }
+                            .inspect_err(|err| {
+                                tracing::error!(
+                                    %op_id, %client_id,
+                                    "Register subscriber listener error: {}", err
+                                );
+                            })?;
 
-                        if let Err(err) = op_manager
+                        op_manager
                             .ch_outbound
                             .waiting_for_transaction_result(op_id, client_id)
                             .await
-                        {
-                            tracing::error!("Error waiting for transaction result: {}", err);
-                            return;
-                        }
+                            .inspect_err(|err| {
+                                tracing::error!("Error waiting for transaction result: {}", err);
+                            })?;
                     }
                     _ => {
                         tracing::error!("Op not supported");
@@ -496,7 +497,7 @@ async fn process_open_request(
 
                 let Some(tx) = callback_tx else {
                     tracing::error!("callback_tx not available for NodeQueries");
-                    return;
+                    unreachable!();
                 };
 
                 if let Err(err) = op_manager
@@ -510,6 +511,7 @@ async fn process_open_request(
                 tracing::error!("Op not supported");
             }
         }
+        Ok(())
     };
 
     GlobalExecutor::spawn(fut.instrument(tracing::info_span!(
