@@ -99,7 +99,7 @@ impl NetworkPeer {
                 .lock()
                 .await
                 .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
-                    serialized_msg,
+                    serialized_msg.into(),
                 ))
                 .await
                 .unwrap();
