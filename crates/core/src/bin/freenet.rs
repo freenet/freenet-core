@@ -49,7 +49,6 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     freenet::config::set_logger(None, None);
-    let config = ConfigArgs::parse().build()?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(
             std::thread::available_parallelism()
@@ -59,6 +58,9 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()
         .unwrap();
-    rt.block_on(run(config))?;
+    rt.block_on(async move {
+        let config = ConfigArgs::parse().build().await?;
+        run(config).await
+    })?;
     Ok(())
 }

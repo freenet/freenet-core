@@ -168,7 +168,7 @@ impl ConfigArgs {
     }
 
     /// Parse the command line arguments and return the configuration.
-    pub fn build(mut self) -> anyhow::Result<Config> {
+    pub async fn build(mut self) -> anyhow::Result<Config> {
         let cfg = if let Some(path) = self.config_paths.config_dir.as_ref() {
             if !path.exists() {
                 return Err(anyhow::Error::new(std::io::Error::new(
@@ -226,15 +226,12 @@ impl ConfigArgs {
                 )
             });
         let gateways_file = config_paths.config_dir.join("gateways.toml");
-        let remotely_loaded_gateways = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(load_gateways_from_index(
-                "https://freenet.org/gateways.toml",
-                &config_paths.secrets_dir,
-            ))
-            .unwrap_or_default();
+        let remotely_loaded_gateways = load_gateways_from_index(
+            "https://freenet.org/gateways.toml",
+            &config_paths.secrets_dir,
+        )
+        .await
+        .unwrap_or_default();
         let mut gateways = match File::open(&*gateways_file) {
             Ok(mut file) => {
                 let mut content = String::new();
@@ -928,16 +925,16 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn test_serde_config_args() {
+    #[tokio::test]
+    async fn test_serde_config_args() {
         let args = ConfigArgs::default();
-        let cfg = args.build().unwrap();
+        let cfg = args.build().await.unwrap();
         let serialized = toml::to_string(&cfg).unwrap();
         let _: Config = toml::from_str(&serialized).unwrap();
     }
 
-    #[test]
-    fn test_load_gateways_from_index() {
+    #[tokio::test]
+    async fn test_load_gateways_from_index() {
         let server = Server::run();
         server.expect(
             Expectation::matching(all_of!(request::method("GET"), request::path("/gateways")))
@@ -963,11 +960,8 @@ mod tests {
         );
 
         let pub_keys_dir = tempfile::tempdir().unwrap();
-        let gateways = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(load_gateways_from_index(&url, pub_keys_dir.path()))
+        let gateways = load_gateways_from_index(&url, pub_keys_dir.path())
+            .await
             .unwrap();
 
         assert_eq!(gateways.gateways.len(), 1);
