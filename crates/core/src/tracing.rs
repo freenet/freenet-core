@@ -529,14 +529,14 @@ async fn send_to_metrics_server(
                 (from_peer.clone().to_string(), from_loc.as_f64()),
                 (to_peer.clone().to_string(), to_loc.as_f64()),
             );
-            ws_stream.send(Message::Binary(msg)).await
+            ws_stream.send(Message::Binary(msg.into())).await
         }
         EventKind::Disconnected { from } => {
             let msg = PeerChange::removed_connection_msg(
                 from.clone().to_string(),
                 send_msg.peer_id.clone().to_string(),
             );
-            ws_stream.send(Message::Binary(msg)).await
+            ws_stream.send(Message::Binary(msg.into())).await
         }
         EventKind::Put(PutEvent::Request {
             requester,
@@ -554,7 +554,7 @@ async fn send_to_metrics_server(
                 *timestamp,
                 contract_location.as_f64(),
             );
-            ws_stream.send(Message::Binary(msg)).await
+            ws_stream.send(Message::Binary(msg.into())).await
         }
         EventKind::Put(PutEvent::PutSuccess {
             requester,
@@ -573,7 +573,7 @@ async fn send_to_metrics_server(
                 *timestamp,
                 contract_location.as_f64(),
             );
-            ws_stream.send(Message::Binary(msg)).await
+            ws_stream.send(Message::Binary(msg.into())).await
         }
         EventKind::Put(PutEvent::BroadcastEmitted {
             id,
@@ -596,7 +596,7 @@ async fn send_to_metrics_server(
                 *timestamp,
                 contract_location.as_f64(),
             );
-            ws_stream.send(Message::Binary(msg)).await
+            ws_stream.send(Message::Binary(msg.into())).await
         }
         EventKind::Put(PutEvent::BroadcastReceived {
             id,
@@ -615,7 +615,7 @@ async fn send_to_metrics_server(
                 *timestamp,
                 contract_location.as_f64(),
             );
-            ws_stream.send(Message::Binary(msg)).await
+            ws_stream.send(Message::Binary(msg.into())).await
         }
         _ => Ok(()),
     };
