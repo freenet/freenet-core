@@ -5,39 +5,46 @@
 # Use bash shell
 SHELL := /bin/bash
 
+# ------------------------------------------
 # Project Structure
 # ------------------------------------------
-HOME_DIR := $(HOME)
+HOME_DIR       := $(HOME)
 PROJECT_ROOT   := $(shell pwd)
 PING_CONTRACT  := $(PROJECT_ROOT)/contracts/ping
 PING_APP       := $(PROJECT_ROOT)/app
 BUILD_DIR      := $(PING_CONTRACT)/target
-BASE_DIR 	   := $(HOME_DIR)/.cache/freenet
+BASE_DIR       := $(HOME_DIR)/.cache/freenet
 
-
+# ------------------------------------------
 # Log Command with ANSI color removal
 # ------------------------------------------
 define LOG_CMD
 1> >(stdbuf -o0 sed 's/\x1b\[[0-9;]*m//g' > $(1)) 2>&1
 endef
 
+# ------------------------------------------
 # Build Tools
 # ------------------------------------------
 CARGO          := cargo
 FDEV           := fdev
 
-# Ping Configuration
 # ------------------------------------------
-WS_PORT        ?= 3001     # WebSocket port for node connection
-LOG_LEVEL      ?= debug     # Logging level
-FREQUENCY      ?= 1000ms   # Update frequency with time unit
-TTL            ?= 3600s    # Time to live with time unit
+# Default Configuration
+# ------------------------------------------
+# Provide defaults but allow command-line override, e.g.:
+#   make -f run-ping.mk run WS_PORT=3002 FREQUENCY=2000ms TTL=7200s
+WS_PORT    ?= 3001
+LOG_LEVEL  ?= debug
+FREQUENCY  ?= 1000ms
+TTL        ?= 3600s
 
+# ------------------------------------------
 # PHONY Targets
 # ------------------------------------------
 .PHONY: help all verify build clean run install
 .DEFAULT_GOAL := help
 
+# ------------------------------------------
 # Help Command
 # ------------------------------------------
 help:
@@ -57,6 +64,7 @@ help:
 	@echo "Example:"
 	@echo "  make -f run-ping.mk run WS_PORT=3002 FREQUENCY=2000ms TTL=7200s"
 
+# ------------------------------------------
 # Verification
 # ------------------------------------------
 verify:
@@ -73,6 +81,7 @@ verify:
 	fi
 	@echo "✓ Project structure verified"
 
+# ------------------------------------------
 # Build Commands
 # ------------------------------------------
 build: verify build-contract build-app
@@ -88,6 +97,7 @@ build-app:
 	@cd $(PING_APP) && $(CARGO) build
 	@echo "✓ Application built successfully"
 
+# ------------------------------------------
 # Install Application
 # ------------------------------------------
 install: build
@@ -95,6 +105,7 @@ install: build
 	@cd $(PING_APP) && $(CARGO) install --path .
 	@echo "✓ Tool installed successfully"
 
+# ------------------------------------------
 # Run Application
 # ------------------------------------------
 run:
@@ -110,6 +121,7 @@ run:
 		--ttl $(TTL) \
 		$(call LOG_CMD,$(BASE_DIR)/apps/ping_$(WS_PORT).log)
 
+# ------------------------------------------
 # Cleanup
 # ------------------------------------------
 clean:
