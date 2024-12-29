@@ -468,7 +468,7 @@ async fn process_open_request(
                             return Ok(None);
                         };
 
-                        op_manager
+                        match op_manager
                             .notify_contract_handler(
                                 ContractHandlerEvent::RegisterSubscriberListener {
                                     key,
@@ -483,7 +483,21 @@ async fn process_open_request(
                                     %op_id, %client_id,
                                     "Register subscriber listener error: {}", err
                                 );
-                            })?;
+                            }) {
+                            Ok(ContractHandlerEvent::RegisterSubscriberListenerResponse) => {
+                                tracing::debug!(
+                                    %op_id, %client_id,
+                                    "Subscriber listener registered successfully"
+                                );
+                            }
+                            _ => {
+                                tracing::error!(
+                                    %op_id, %client_id,
+                                    "Subscriber listener registration failed"
+                                );
+                                return Err(Error::Op(OpError::UnexpectedOpState));
+                            }
+                        }
 
                         op_manager
                             .ch_outbound

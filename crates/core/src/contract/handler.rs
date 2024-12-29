@@ -328,6 +328,7 @@ pub(crate) enum ContractHandlerEvent {
         summary: Option<StateSummary<'static>>,
         subscriber_listener: UnboundedSender<HostResult>,
     },
+    RegisterSubscriberListenerResponse,
 }
 
 impl std::fmt::Display for ContractHandlerEvent {
@@ -389,6 +390,9 @@ impl std::fmt::Display for ContractHandlerEvent {
                     f,
                     "register subscriber listener {{ {key}, client_id: {client_id} }}",
                 )
+            }
+            ContractHandlerEvent::RegisterSubscriberListenerResponse => {
+                write!(f, "register subscriber listener response")
             }
         }
     }
