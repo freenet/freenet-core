@@ -1,5 +1,6 @@
 //! Clients events related logic and type definitions. For example, receival of client events from applications throught the HTTP gateway.
 
+use either::Either;
 use freenet_stdlib::{
     client_api::{
         ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse,
@@ -8,7 +9,7 @@ use freenet_stdlib::{
     prelude::*,
 };
 use futures::stream::FuturesUnordered;
-use futures::{future::BoxFuture, StreamExt};
+use futures::{future::BoxFuture, FutureExt, StreamExt};
 use std::fmt::Display;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -170,7 +171,7 @@ pub async fn client_event_handling<ClientEv>(
 where
     ClientEv: ClientEventsProxy + Send + 'static,
 {
-    let mut callbacks = FuturesUnordered::new();
+    let mut results = FuturesUnordered::new();
     loop {
         tokio::select! {
             client_request = client_events.recv() => {
@@ -194,9 +195,20 @@ where
                     anyhow::bail!("shutdown event");
                 }
                 let cli_id = req.client_id;
-                if let Some(mut cb) = process_open_request(req, op_manager.clone()).await {
-                    callbacks.push(async move { cb.recv().await.map(|r| (cli_id, r)) });
-                }
+                let res = process_open_request(req, op_manager.clone()).await;
+                results.push(async move {
+                    match res.await {
+                        Ok(Some(Either::Left(res))) => (cli_id, Ok(Some(res))),
+                        Ok(Some(Either::Right(mut cb))) => {
+                            match cb.recv().await {
+                                Some(res) => (cli_id, Ok(Some(res))),
+                                None => (cli_id, Err(ClientError::from(ErrorKind::ChannelClosed))),
+                            }
+                        }
+                        Ok(None) => (cli_id, Ok(None)),
+                        Err(err) => (cli_id, Err(ErrorKind::OperationError { cause: format!("{err}").into() }.into())),
+                    }
+                });
             }
             res = client_responses.recv() => {
                 if let Some((cli_id, res)) = res {
@@ -209,26 +221,35 @@ where
                     }
                 }
             }
-            res = callbacks.next(), if !callbacks.is_empty() => {
-                if let Some(Some((cli_id, res))) = res {
-                    let res = match res {
-                        QueryResult::Connections(conns) => {
-                            Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers {
-                                peers: conns.into_iter().map(|p| (p.pub_key.to_string(), p.addr)).collect() }
-                            ))
+            res = results.next(), if !results.is_empty() => {
+                let Some(f_res) = res else {
+                    unreachable!();
+                };
+                match f_res {
+                    (cli_id, Ok(Some(res))) => {
+                        let res = match res {
+                            QueryResult::Connections(conns) => {
+                                Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers {
+                                    peers: conns.into_iter().map(|p| (p.pub_key.to_string(), p.addr)).collect() }
+                                ))
+                            }
+                            QueryResult::GetResult { key, state, contract } => {
+                                Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                                    key,
+                                    state,
+                                    contract,
+                                }))
+                            }
+                        };
+                        if let Err(err) = client_events.send(cli_id, res).await {
+                            tracing::debug!("channel closed: {err}");
+                            anyhow::bail!(err);
                         }
-                        QueryResult::GetResult { key, state, contract } => {
-                            Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                                key,
-                                state,
-                                contract,
-                            }))
-                        }
-                    };
-                    if let Err(err) = client_events.send(cli_id, res).await {
-                        tracing::debug!("channel closed: {err}");
-                        anyhow::bail!(err);
                     }
+                    (_, Ok(None)) => continue,
+                    // TODO: we should change the API so client requests have a unique id so we can map specific responses
+                    // to the specific client request
+                    (cli_id, Err(err)) => client_events.send(cli_id, Err(err)).await?,
                 }
             }
         }
@@ -245,13 +266,15 @@ enum Error {
     Op(#[from] OpError),
     #[error(transparent)]
     Executor(#[from] crate::contract::ExecutorError),
+    #[error(transparent)]
+    Panic(#[from] tokio::task::JoinError),
 }
 
 #[inline]
 async fn process_open_request(
     mut request: OpenRequest<'static>,
     op_manager: Arc<OpManager>,
-) -> Option<mpsc::Receiver<QueryResult>> {
+) -> BoxFuture<'static, Result<Option<Either<QueryResult, mpsc::Receiver<QueryResult>>>, Error>> {
     let (callback_tx, callback_rx) = if matches!(
         &*request.request,
         ClientRequest::NodeQueries(_) | ClientRequest::ContractOp(ContractRequest::Get { .. })
@@ -267,7 +290,6 @@ async fn process_open_request(
     let fut = async move {
         let client_id = request.client_id;
 
-        // fixme: communicate back errors in this loop to the client somehow
         let subscription_listener: Option<UnboundedSender<HostResult>> =
             request.notification_channel.take();
 
@@ -402,21 +424,11 @@ async fn process_open_request(
                                     this_peer = %peer_id,
                                     "Contract found, returning get result",
                                 );
-                                if let Some(tx) = &callback_tx {
-                                    if let Err(err) = tx
-                                        .send(QueryResult::GetResult {
-                                            key,
-                                            state,
-                                            contract,
-                                        })
-                                        .await
-                                    {
-                                        tracing::error!(
-                                            "Error sending QueryResult::GetResult: {}",
-                                            err
-                                        );
-                                    }
-                                }
+                                return Ok(Some(Either::Left(QueryResult::GetResult {
+                                    key,
+                                    state,
+                                    contract,
+                                })));
                             }
                         } else {
                             // Initialize a get op.
@@ -453,7 +465,7 @@ async fn process_open_request(
 
                         let Some(subscriber_listener) = subscription_listener else {
                             tracing::error!(%op_id, %client_id, "No subscriber listener");
-                            return Ok(());
+                            return Ok(None);
                         };
 
                         op_manager
@@ -505,21 +517,31 @@ async fn process_open_request(
                     .await
                 {
                     tracing::error!("notify_node_event(QueryConnections) error: {}", err);
+                    return Err(Error::from(err));
                 }
+
+                return Ok(Some(Either::Right(callback_rx.unwrap())));
             }
             _ => {
                 tracing::error!("Op not supported");
             }
         }
-        Ok(())
+        Ok(None)
     };
 
     GlobalExecutor::spawn(fut.instrument(tracing::info_span!(
         parent: tracing::Span::current(),
         "process_client_request"
-    )));
-
-    callback_rx
+    )))
+    .map(|res| match res {
+        Ok(Ok(res)) => Ok(res),
+        Ok(Err(err)) => Err(err),
+        Err(err) => {
+            tracing::error!("Error processing client request: {}", err);
+            Err(Error::from(err))
+        }
+    })
+    .boxed()
 }
 
 pub(crate) mod test {
