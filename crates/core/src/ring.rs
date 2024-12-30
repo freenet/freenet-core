@@ -3,7 +3,7 @@
 //! Mainly maintains a healthy and optimal pool of connections to other peers in the network
 //! and routes requests to the optimal peers.
 
-use std::collections::VecDeque;
+use std::collections::BTreeSet;
 use std::hash::Hash;
 use std::net::SocketAddr;
 use std::{
@@ -556,6 +556,7 @@ impl Ring {
         live_tx_tracker: LiveTransactionTracker,
         mut missing_candidates: sync::mpsc::Receiver<PeerId>,
     ) -> anyhow::Result<()> {
+        tracing::debug!("Initializing connection maintenance task");
         #[cfg(not(test))]
         const CONNECTION_AGE_THRESOLD: Duration = Duration::from_secs(60 * 5);
         #[cfg(test)]
@@ -580,7 +581,7 @@ impl Ring {
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         let mut live_tx = None;
-        let mut pending_conn_adds = VecDeque::new();
+        let mut pending_conn_adds = BTreeSet::new();
         loop {
             if self.connection_manager.get_peer_key().is_none() {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -611,20 +612,24 @@ impl Ring {
             let this_peer = self.connection_manager.get_peer_key().unwrap();
             skip_list.push(&this_peer);
 
-            if let Some(ideal_location) = pending_conn_adds.pop_front() {
-                live_tx = self
-                    .acquire_new(ideal_location, &skip_list, &notifier)
-                    .await
-                    .map_err(|error| {
-                        tracing::debug!(?error, "Shutting down connection maintenance task");
-                        error
-                    })?;
-            }
-
             // if there are no open connections, we need to acquire more
             if let Some(tx) = &live_tx {
                 if !live_tx_tracker.still_alive(tx) {
                     let _ = live_tx.take();
+                }
+            }
+
+            if let Some(ideal_location) = pending_conn_adds.pop_first() {
+                if live_tx.is_none() {
+                    live_tx = self
+                        .acquire_new(ideal_location, &skip_list, &notifier, &live_tx_tracker)
+                        .await
+                        .map_err(|error| {
+                            tracing::debug!(?error, "Shutting down connection maintenance task");
+                            error
+                        })?;
+                } else {
+                    pending_conn_adds.insert(ideal_location);
                 }
             }
 
@@ -688,14 +693,14 @@ impl Ring {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self, notifier), fields(peer = %self.connection_manager.pub_key))]
+    #[tracing::instrument(level = "debug", skip(self, notifier, live_tx_tracker), fields(peer = %self.connection_manager.pub_key))]
     async fn acquire_new(
         &self,
         ideal_location: Location,
         skip_list: &[&PeerId],
         notifier: &EventLoopNotificationsSender,
+        live_tx_tracker: &LiveTransactionTracker,
     ) -> anyhow::Result<Option<Transaction>> {
-        use crate::message::InnerMessage;
         let query_target = {
             let router = self.router.read();
             if let Some(t) =
@@ -716,8 +721,10 @@ impl Ring {
         );
         let missing_connections = self.connection_manager.max_connections - self.open_connections();
         let connected = self.connection_manager.connected_peers();
+        let id = Transaction::new::<connect::ConnectMsg>();
+        live_tx_tracker.add_transaction(query_target.peer.clone(), id);
         let msg = connect::ConnectMsg::Request {
-            id: Transaction::new::<connect::ConnectMsg>(),
+            id,
             target: query_target.clone(),
             msg: connect::ConnectRequest::FindOptimalPeer {
                 query_target,
@@ -731,7 +738,6 @@ impl Ring {
                     .collect(),
             },
         };
-        let id = *msg.id();
         notifier.send(Either::Left(msg.into())).await?;
         Ok(Some(id))
     }

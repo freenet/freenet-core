@@ -46,9 +46,6 @@ jobs:
         working-directory: stdlib/typescript
         run: npm run dev.package
 
-      - name: Update Cargo.lock
-        run: cargo update
-
       - name: Build
         run: |
           cargo install --locked --force --path ./crates/core
