@@ -687,11 +687,8 @@ impl Ring {
             tokio::select! {
               _ = refresh_density_map.tick() => {
                 self.refresh_density_request_cache();
-                tracing::debug!("Refreshing density map");
               }
-              _ = check_interval.tick() => {
-                tracing::debug!("Checking for missing candidates");
-              }
+              _ = check_interval.tick() => {}
             }
         }
     }
