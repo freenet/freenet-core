@@ -98,6 +98,7 @@ start-gateways: generate-gw-config
 	@for i in $$(seq 1 $(N_GATEWAYS)); do \
 		port=$$(( $(BASE_PORT) + $$i )); \
 		ws_port=$$(( $(WS_BASE_PORT) + $$i )); \
+		if [ -f "$(LOGS_DIR)/gw$$i.log" ]; then : > "$(LOGS_DIR)/gw$$i.log"; fi; \
 		($(ENV_VARS) freenet network \
 			--is-gateway \
 			--ws-api-port $$ws_port \
@@ -118,6 +119,7 @@ start-nodes:
 		network_port=$$(( $(BASE_PORT) + $(N_GATEWAYS) + $$i )); \
 		ws_port=$$(( $(WS_BASE_PORT) + $(N_GATEWAYS) + $$i )); \
 		public_port=$$(( $(WS_BASE_PORT) + $(N_NODES) + $$i )); \
+		if [ -f "$(LOGS_DIR)/n$$i.log" ]; then : > $(LOGS_DIR)/n$$i.log; fi; \
 		($(ENV_VARS) freenet network \
 			--config-dir $(BASE_DIR) \
 			--ws-api-port $$ws_port \
@@ -231,9 +233,6 @@ stop:
 		done; \
 	fi
 	@echo "→ All processes stopped"
-	@echo "→ Cleaning all log files..."
-	@rm -rf $(LOGS_DIR)/*.log
-	@echo "→ Logs cleanup complete"
 
 clean: stop
 	@echo "→ Cleaning all files..."

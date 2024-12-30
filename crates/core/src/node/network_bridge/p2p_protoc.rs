@@ -1,5 +1,7 @@
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
+use crate::contract::WaitingTransaction;
 use crate::message::{NetMessageV1, QueryResult};
+use crate::node::subscribe::SubscribeMsg;
 use dashmap::DashSet;
 use either::{Either, Left, Right};
 use freenet_stdlib::client_api::ErrorKind;
@@ -336,7 +338,7 @@ impl P2pConnManager {
                 self.handle_node_controller_msg(msg)
             }
             event_id = client_wait_for_transaction.relay_transaction_result_to_client() => {
-                self.handle_client_transaction_result(event_id, state)
+                self.handle_client_transaction_subscription(event_id, state)
             }
             id = executor_listener.transaction_from_executor() => {
                 self.handle_executor_transaction(id, state)
@@ -388,8 +390,27 @@ impl P2pConnManager {
             .pending_from_executor
             .remove(msg.id())
             .then(|| executor_listener.callback());
-        let pending_client_req = state.tx_to_client.get(msg.id()).copied();
-        let client_req_handler_callback = pending_client_req.map(|_| cli_response_sender.clone());
+        let pending_client_req = state
+            .tx_to_client
+            .get(msg.id())
+            .copied()
+            .map(|c| vec![c])
+            .or(state
+                .client_waiting_transaction
+                .iter_mut()
+                .find_map(|(tx, clients)| match (&msg, &tx) {
+                    (
+                        NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::ReturnSub {
+                            key,
+                            ..
+                        })),
+                        WaitingTransaction::Subscription { contract_key },
+                    ) if contract_key == key.id() => Some(clients.drain().collect::<Vec<_>>()),
+                    _ => None,
+                }));
+        let client_req_handler_callback = pending_client_req
+            .is_some()
+            .then(|| cli_response_sender.clone());
 
         let span = tracing::info_span!(
             "process_network_message",
@@ -671,17 +692,43 @@ impl P2pConnManager {
         }
     }
 
-    fn handle_client_transaction_result(
+    fn handle_client_transaction_subscription(
         &self,
-        event_id: Result<(ClientId, Transaction), anyhow::Error>,
+        event_id: Result<(ClientId, WaitingTransaction), anyhow::Error>,
         state: &mut EventListenerState,
     ) -> EventResult {
-        let Ok((client_id, transaction)) = event_id.map_err(|e| {
-            tracing::debug!("Error while receiving client transaction result: {:?}", e);
+        let Ok((client_id, transaction)) = event_id.inspect_err(|e| {
+            tracing::error!("Error while receiving client transaction result: {:?}", e);
         }) else {
             return EventResult::Continue;
         };
-        state.tx_to_client.insert(transaction, client_id);
+        match transaction {
+            WaitingTransaction::Transaction(tx) => {
+                tracing::debug!(%tx, %client_id, "Subscribing client to transaction results");
+                state.tx_to_client.insert(tx, client_id);
+            }
+            WaitingTransaction::Subscription { contract_key } => {
+                tracing::debug!(%client_id, %contract_key, "Client waiting for subscription");
+                if let Some(clients) =
+                    state
+                        .client_waiting_transaction
+                        .iter_mut()
+                        .find_map(|(tx, clients)| {
+                            if let WaitingTransaction::Subscription { contract_key: key } = tx {
+                                return (key == &contract_key).then_some(clients);
+                            }
+                            None
+                        })
+                {
+                    clients.insert(client_id);
+                } else {
+                    state.client_waiting_transaction.push((
+                        WaitingTransaction::Subscription { contract_key },
+                        HashSet::from_iter([client_id]),
+                    ));
+                }
+            }
+        }
         EventResult::Continue
     }
 
@@ -741,7 +788,9 @@ struct EventListenerState {
     peer_connections:
         FuturesUnordered<BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>>,
     pending_from_executor: HashSet<Transaction>,
+    // FIXME: we are potentially leaving trash here when transacrions are completed
     tx_to_client: HashMap<Transaction, ClientId>,
+    client_waiting_transaction: Vec<(WaitingTransaction, HashSet<ClientId>)>,
     transient_conn: HashMap<Transaction, SocketAddr>,
     awaiting_connection: HashMap<SocketAddr, Box<dyn ConnectResultSender>>,
 }
@@ -752,6 +801,7 @@ impl EventListenerState {
             peer_connections: FuturesUnordered::new(),
             pending_from_executor: HashSet::new(),
             tx_to_client: HashMap::new(),
+            client_waiting_transaction: Vec::new(),
             transient_conn: HashMap::new(),
             awaiting_connection: HashMap::new(),
         }

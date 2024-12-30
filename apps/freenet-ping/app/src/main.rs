@@ -113,7 +113,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     let mut send_tick = tokio::time::interval(args.parameters.frequency);
 
     let mut generator = Generator::default();
+    let mut errors = 0;
     loop {
+        if errors > 100 {
+            tracing::error!("too many errors, shutting down...");
+            return Err("too many errors".into());
+        }
         tokio::select! {
             _ = send_tick.tick() => {
                 if is_subcribed {
@@ -205,6 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                     },
                     Err(e) => {
                         tracing::error!(err=%e);
+                        errors += 1;
                     },
                 }
             }

@@ -36,7 +36,7 @@ use crate::{
     config::{Address, GatewayConfig, WebsocketApiConfig},
     contract::{
         Callback, ClientResponsesSender, ContractError, ExecutorError, ExecutorToEventLoopChannel,
-        NetworkContractHandler,
+        NetworkContractHandler, WaitingTransaction,
     },
     local_node::Executor,
     message::{NetMessage, Transaction, TransactionType},
@@ -361,14 +361,16 @@ async fn report_result(
     op_result: Result<Option<OpEnum>, OpError>,
     op_manager: &OpManager,
     executor_callback: Option<ExecutorToEventLoopChannel<Callback>>,
-    client_req_handler_callback: Option<(ClientId, ClientResponsesSender)>,
+    client_req_handler_callback: Option<(Vec<ClientId>, ClientResponsesSender)>,
     event_listener: &mut dyn NetEventRegister,
 ) {
     match op_result {
         Ok(Some(op_res)) => {
-            if let Some((client_id, cb)) = client_req_handler_callback {
-                tracing::debug!(?tx, %client_id,  "Sending response to client");
-                let _ = cb.send((client_id, op_res.to_host_result()));
+            if let Some((client_ids, cb)) = client_req_handler_callback {
+                for client_id in client_ids {
+                    tracing::debug!(?tx, %client_id,  "Sending response to client");
+                    let _ = cb.send((client_id, op_res.to_host_result()));
+                }
             }
             // check operations.rs:handle_op_result to see what's the meaning of each state
             // in case more cases want to be handled when feeding information to the OpManager
@@ -486,7 +488,7 @@ async fn process_message<CB>(
     event_listener: Box<dyn NetEventRegister>,
     executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
     client_req_handler_callback: Option<ClientResponsesSender>,
-    client_id: Option<ClientId>,
+    client_ids: Option<Vec<ClientId>>,
 ) where
     CB: NetworkBridge,
 {
@@ -501,7 +503,7 @@ async fn process_message<CB>(
                 event_listener,
                 executor_callback,
                 client_req_handler_callback,
-                client_id,
+                client_ids,
             )
             .await
         }
@@ -517,7 +519,7 @@ async fn process_message_v1<CB>(
     mut event_listener: Box<dyn NetEventRegister>,
     executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
     client_req_handler_callback: Option<ClientResponsesSender>,
-    client_id: Option<ClientId>,
+    client_id: Option<Vec<ClientId>>,
 ) where
     CB: NetworkBridge,
 {
@@ -637,7 +639,12 @@ pub async fn subscribe(
     if let Some(client_id) = client_id {
         let _ = op_manager
             .ch_outbound
-            .waiting_for_transaction_result(id, client_id)
+            .waiting_for_transaction_result(
+                WaitingTransaction::Subscription {
+                    contract_key: *key.id(),
+                },
+                client_id,
+            )
             .await;
     }
     // Initialize a subscribe op.
@@ -658,7 +665,8 @@ pub async fn subscribe(
             return Ok(id);
         }
     }
-    let timeout = tokio::time::timeout(TIMEOUT, async {
+
+    let timeout = tokio::time::timeout(TIMEOUT, async move {
         loop {
             // just start a new op to check if contract is present
             let op = subscribe::start_op(key);
