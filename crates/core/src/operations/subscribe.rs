@@ -408,7 +408,6 @@ impl Operation for SubscribeOp {
                                 subscribed: true,
                             });
                         } else {
-                            // op_manager.notify_node_event(No)
                             return_msg = None;
                         }
                     }

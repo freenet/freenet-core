@@ -853,7 +853,12 @@ where
             }
             event_id = wait_for_event.relay_transaction_result_to_client() => {
                 if let Ok((client_id, transaction)) = event_id {
-                   tx_to_client.insert(transaction, client_id);
+                    match transaction {
+                        contract::WaitingTransaction::Transaction(transaction) => {
+                            tx_to_client.insert(transaction, client_id);
+                        }
+                        contract::WaitingTransaction::Subscription { .. } => todo!(),
+                    }
                 }
                 continue;
             }
@@ -942,7 +947,7 @@ where
         let executor_callback = pending_from_executor
             .remove(msg.id())
             .then(|| executor_listener.callback());
-        let pending_client_req = tx_to_client.get(msg.id()).copied();
+        let pending_client_req = tx_to_client.get(msg.id()).copied().map(|c| vec![c]);
         let client_req_handler_callback = if pending_client_req.is_some() {
             Some(cli_response_sender.clone())
         } else {
