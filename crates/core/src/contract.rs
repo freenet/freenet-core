@@ -148,6 +148,15 @@ where
                     .inspect_err(|err| {
                         tracing::warn!("Error while registering subscriber listener: {err}");
                     });
+
+                contract_handler
+                    .channel()
+                    .send_to_sender(id, ContractHandlerEvent::RegisterSubscriberListenerResponse)
+                    .await
+                    .map_err(|error| {
+                        tracing::debug!(%error, "shutting down contract handler");
+                        error
+                    })?;
             }
             _ => unreachable!(),
         }

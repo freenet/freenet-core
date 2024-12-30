@@ -389,7 +389,11 @@ impl Config {
 #[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]
 pub struct NetworkArgs {
     /// Address to bind to for the network event listener, default is 0.0.0.0
-    #[arg(long = "network-address", env = "NETWORK_ADDRESS")]
+    #[arg(
+        name = "network_address",
+        long = "network-address",
+        env = "NETWORK_ADDRESS"
+    )]
     #[serde(rename = "network-address", skip_serializing_if = "Option::is_none")]
     pub address: Option<IpAddr>,
 
@@ -448,7 +452,11 @@ const fn default_network_port() -> u16 {
 #[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]
 pub struct WebsocketApiArgs {
     /// Address to bind to for the websocket API, default is 0.0.0.0
-    #[arg(long = "ws-api-address", env = "WS_API_ADDRESS")]
+    #[arg(
+        name = "ws_api_address",
+        long = "ws-api-address",
+        env = "WS_API_ADDRESS"
+    )]
     #[serde(rename = "ws-api-address", skip_serializing_if = "Option::is_none")]
     pub address: Option<IpAddr>,
 

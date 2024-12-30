@@ -367,6 +367,7 @@ async fn report_result(
     match op_result {
         Ok(Some(op_res)) => {
             if let Some((client_id, cb)) = client_req_handler_callback {
+                tracing::debug!(?tx, %client_id,  "Sending response to client");
                 let _ = cb.send((client_id, op_res.to_host_result()));
             }
             // check operations.rs:handle_op_result to see what's the meaning of each state
@@ -416,7 +417,7 @@ async fn report_result(
             }
         }
         Ok(None) => {
-            tracing::debug!(?tx, "No operation result found, not sending response");
+            tracing::debug!(?tx, "No operation result found");
         }
         Err(err) => {
             // just mark the operation as completed so no redundant messages are processed for this transaction anymore

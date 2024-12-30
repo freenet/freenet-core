@@ -390,6 +390,11 @@ impl Operation for SubscribeOp {
                         );
                         if op_manager.ring.add_subscriber(key, sender.clone()).is_err() {
                             // concurrently it reached max number of subscribers for this contract
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                "Max number of subscribers reached for contract"
+                            );
                             return Err(OpError::UnexpectedOpState);
                         }
 
@@ -403,6 +408,7 @@ impl Operation for SubscribeOp {
                                 subscribed: true,
                             });
                         } else {
+                            // op_manager.notify_node_event(No)
                             return_msg = None;
                         }
                     }

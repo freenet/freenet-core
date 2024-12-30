@@ -898,6 +898,9 @@ where
                 NodeEvent::QueryConnections { .. } => {
                     unimplemented!()
                 }
+                NodeEvent::TransactionTimedOut(_) => {
+                    unimplemented!()
+                }
             },
             Err(err) => {
                 super::report_result(

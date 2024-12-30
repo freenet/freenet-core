@@ -210,13 +210,12 @@ impl Operation for UpdateOp {
                     key,
                     new_value,
                     sender,
+                    target,
                 } => {
                     if let Some(UpdateState::AwaitingResponse { .. }) = self.state {
                         tracing::debug!("Trying to broadcast to a peer that was the initiator of the op because it received the client request, or is in the middle of a seek node process");
                         return Err(OpError::StatePushed);
-                    };
-
-                    let target = op_manager.ring.connection_manager.own_location();
+                    }
 
                     tracing::debug!("Attempting contract value update - BroadcastTo - update");
                     let new_value = update_contract(
@@ -274,6 +273,7 @@ impl Operation for UpdateOp {
                             key: *key,
                             new_value: new_value.clone(),
                             sender: sender.clone(),
+                            target: peer.clone(),
                         };
                         let f = conn_manager.send(&peer.peer, msg.into());
                         broadcasting.push(f);
@@ -472,24 +472,15 @@ fn build_op_result(
     return_msg: Option<UpdateMsg>,
     stats: Option<UpdateStats>,
 ) -> Result<super::OperationResult, OpError> {
-    let mut state_is_none = false;
-    if state.as_ref().is_none() {
-        state_is_none = true;
-    }
-
-    let output_op = Some(UpdateOp { id, state, stats });
-
-    let op_enum_update = output_op.map(OpEnum::Update);
-
+    let output_op = state.map(|op| UpdateOp {
+        id,
+        state: Some(op),
+        stats,
+    });
+    let state = output_op.map(OpEnum::Update);
     Ok(OperationResult {
         return_msg: return_msg.map(NetMessage::from),
-        state: {
-            if state_is_none {
-                None
-            } else {
-                op_enum_update
-            }
-        },
+        state,
     })
 }
 
@@ -679,6 +670,7 @@ mod messages {
             sender: PeerKeyLocation,
             key: ContractKey,
             new_value: WrappedState,
+            target: PeerKeyLocation,
         },
     }
 
@@ -699,6 +691,7 @@ mod messages {
                 UpdateMsg::RequestUpdate { target, .. } => Some(target),
                 UpdateMsg::SuccessfulUpdate { target, .. } => Some(target),
                 UpdateMsg::SeekNode { target, .. } => Some(target),
+                UpdateMsg::BroadcastTo { target, .. } => Some(target),
                 _ => None,
             }
         }

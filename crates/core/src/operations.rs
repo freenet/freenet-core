@@ -140,6 +140,7 @@ where
             // finished the operation at this node, informing back
 
             if let Some(target) = msg.target() {
+                tracing::debug!(%tx_id, target=%target.peer, "sending back message to target");
                 network_bridge.send(&target.peer, msg).await?;
             }
         }

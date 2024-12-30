@@ -296,6 +296,7 @@ impl HandshakeHandler {
                             tracing::debug!(from=%peer_id.addr, "Outbound connection failed: {error}");
                             self.connecting.remove(&peer_id.addr);
                             self.outbound_messages.remove(&peer_id.addr);
+                            self.connection_manager.prune_alive_connection(&peer_id);
                             Ok(Event::OutboundConnectionFailed { peer_id, error })
                         }
                         Some(Ok(other)) => {
@@ -636,7 +637,10 @@ impl HandshakeHandler {
                     tracing::debug!(%remote, "established outbound connection");
                     Ok(InternalEvent::OutboundConnEstablished(remote, conn))
                 }
-                Err(e) => Err((remote, e.into())),
+                Err(e) => {
+                    tracing::debug!(%remote, "failed to establish outbound connection: {e}");
+                    Err((remote, e.into()))
+                }
             })
             .boxed();
         self.ongoing_outbound_connections.push(f);

@@ -560,7 +560,7 @@ impl Ring {
         const CONNECTION_AGE_THRESOLD: Duration = Duration::from_secs(60 * 5);
         #[cfg(test)]
         const CONNECTION_AGE_THRESOLD: Duration = Duration::from_secs(5);
-        const CHECK_TICK_DURATION: Duration = Duration::from_secs(10);
+        const CHECK_TICK_DURATION: Duration = Duration::from_secs(60);
         const REGENERATE_DENSITY_MAP_INTERVAL: Duration = Duration::from_secs(60);
 
         let mut check_interval = tokio::time::interval(CHECK_TICK_DURATION);

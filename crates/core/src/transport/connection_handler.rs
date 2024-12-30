@@ -1,24 +1,4 @@
 use std::collections::BTreeMap;
-
-type GatewayConnectionFuture = Box<
-    dyn Future<
-            Output = Result<
-                (
-                    RemoteConnection,
-                    InboundRemoteConnection,
-                    PacketData<SymmetricAES>,
-                ),
-                TransportError,
-            >,
-        > + Send
-        + 'static,
->;
-
-type TraverseNatFuture = Box<
-    dyn Future<Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>>
-        + Send
-        + 'static,
->;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
@@ -29,16 +9,19 @@ use crate::transport::crypto::TransportSecretKey;
 use crate::transport::packet_data::{AssymetricRSA, UnknownEncryption};
 use crate::transport::symmetric_message::OutboundConnection;
 use aes_gcm::{Aes128Gcm, KeyInit};
-use futures::FutureExt;
 use futures::{
+    future::BoxFuture,
     stream::{FuturesUnordered, StreamExt},
-    Future,
+    Future, FutureExt, TryFutureExt,
 };
-use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task;
-use tracing::span;
-use tracing::Instrument;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use tokio::{
+    net::UdpSocket,
+    sync::{mpsc, oneshot},
+    task, task_local,
+};
+use tracing::{span, Instrument};
 
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
@@ -60,6 +43,21 @@ const DEFAULT_BW_TRACKER_WINDOW_SIZE: Duration = Duration::from_secs(10);
 const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
 
 pub type SerializedMessage = Vec<u8>;
+
+type GatewayConnectionFuture = BoxFuture<
+    'static,
+    Result<
+        (
+            RemoteConnection,
+            InboundRemoteConnection,
+            PacketData<SymmetricAES>,
+        ),
+        TransportError,
+    >,
+>;
+
+type TraverseNatFuture =
+    BoxFuture<'static, Result<(RemoteConnection, InboundRemoteConnection), TransportError>>;
 
 pub(crate) async fn create_connection_handler<S: Socket>(
     keypair: TransportKeypair,
@@ -148,7 +146,7 @@ impl OutboundConnectionHandler {
         };
 
         task::spawn(bw_tracker.rate_limiter(BANDWITH_LIMIT, socket));
-        task::spawn(transport.listen());
+        task::spawn(RANDOM_U64.scope(StdRng::from_entropy().gen(), transport.listen()));
 
         Ok((connection_handler, new_connection_notifier))
     }
@@ -239,6 +237,9 @@ impl<T> Drop for UdpPacketsListener<T> {
         tracing::info!(%self.this_addr, "Dropping UdpPacketsListener");
     }
 }
+task_local! {
+    static RANDOM_U64: [u8; 8];
+}
 
 impl<S: Socket> UdpPacketsListener<S> {
     #[tracing::instrument(level = "debug", name = "transport_listener", fields(peer = %self.this_peer_keypair.public), skip_all)]
@@ -252,7 +253,31 @@ impl<S: Socket> UdpPacketsListener<S> {
         > = BTreeMap::new();
         let mut connection_tasks = FuturesUnordered::new();
         let mut gw_connection_tasks = FuturesUnordered::new();
-        loop {
+        let mut pending_connections = vec![];
+
+        'outer: loop {
+            'inner: loop {
+                if pending_connections.len() > 10 {
+                    tracing::error!(%self.this_addr, "too many pending connections");
+                    break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
+                }
+                if let Some(pending) = pending_connections.pop() {
+                    match self.new_connection_notifier.try_send(pending) {
+                        Ok(_) => {}
+                        Err(mpsc::error::TrySendError::Full(pending)) => {
+                            tracing::error!(%self.this_addr, "channel is full");
+                            pending_connections.push(pending);
+                            break 'inner;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            tracing::error!(%self.this_addr, "failed to notify new connection");
+                            break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
+                        }
+                    }
+                } else {
+                    break 'inner;
+                }
+            }
             tokio::select! {
                 // Handling of inbound packets
                 recv_result = self.socket_listener.recv_from(&mut buf) => {
@@ -286,16 +311,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 continue;
                             }
                             let packet_data = PacketData::from_buf(&buf[..size]);
-                            let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr);
-                            let task = tokio::spawn({
-                                let span = tracing::span!(tracing::Level::DEBUG, "gateway_connection");
-                                async move {
-                                    match Pin::from(gw_ongoing_connection).await {
-                                        Ok(result) => Ok(result),
-                                        Err(error) => Err((error, remote_addr))
-                                    }
-                                }.instrument(span)
-                            });
+                            let inbound_key_bytes = key_from_addr(&remote_addr);
+                            let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
+                            let task = tokio::spawn(gw_ongoing_connection
+                                .instrument(tracing::span!(tracing::Level::DEBUG, "gateway_connection"))
+                                .map_err(move |error| {
+                                (error, remote_addr)
+                            }));
                             ongoing_gw_connections.insert(remote_addr, packets_sender);
                             gw_connection_tasks.push(task);
                         }
@@ -318,12 +340,17 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                             self.remote_connections.insert(remote_addr, inbound_remote_connection);
 
-                            if let Err(e) = self.new_connection_notifier
-                                .send(PeerConnection::new(outbound_remote_conn))
-                                .await
-                                .map_err(|_| TransportError::ChannelClosed) {
-                                tracing::error!(%remote_addr, %e, "gateway connection established but failed to notify new connection");
-                                continue;
+                            match self.new_connection_notifier
+                            .try_send(PeerConnection::new(outbound_remote_conn)) {
+                                Ok(_) => {}
+                                Err(mpsc::error::TrySendError::Full(pending_conn)) => {
+                                    tracing::error!(%remote_addr, "gateway connection established but channel is full");
+                                    pending_connections.push(pending_conn);
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    tracing::error!(%remote_addr, "gateway connection established but failed to notify new connection");
+                                    break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
+                                }
                             }
 
                             sent_tracker.lock().report_sent_packet(
@@ -368,6 +395,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                         tracing::debug!(%self.this_addr, "connection handler closed");
                         return Ok(());
                     };
+                    tracing::debug!(%remote_addr, "received connection event");
                     if let Some(_conn) = self.remote_connections.remove(&remote_addr) {
                         tracing::warn!(%remote_addr, "connection already established, dropping old connection");
                     }
@@ -376,15 +404,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                     let (ongoing_connection, packets_sender) = self.traverse_nat(
                         remote_addr,  remote_public_key,
                     );
-                    let task = tokio::spawn({
-                        let span = span!(tracing::Level::DEBUG, "traverse_nat");
-                        async move {
-                            match Pin::from(ongoing_connection).await {
-                                Ok(result) => Ok(result),
-                                Err(error) => Err((error, remote_addr))
-                            }
-                        }.instrument(span)
-                    });
+                    let task = tokio::spawn(ongoing_connection
+                        .map_err(move |err| (err, remote_addr))
+                        .instrument(span!(tracing::Level::DEBUG, "traverse_nat"))
+                    );
                     connection_tasks.push(task);
                     ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
                 },
@@ -397,6 +420,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         &mut self,
         remote_intro_packet: PacketData<UnknownEncryption>,
         remote_addr: SocketAddr,
+        inbound_key_bytes: [u8; 16],
     ) -> (
         GatewayConnectionFuture,
         mpsc::Sender<PacketData<UnknownEncryption>>,
@@ -435,14 +459,15 @@ impl<S: Socket> UdpPacketsListener<S> {
                 });
             }
 
-            let inbound_key_bytes = rand::random::<[u8; 16]>();
             let inbound_key = Aes128Gcm::new(&inbound_key_bytes.into());
             let outbound_ack_packet =
                 SymmetricMessage::ack_ok(&outbound_key, inbound_key_bytes, remote_addr)?;
 
+            tracing::debug!(%remote_addr, "Sending outbound ack packet: {:?}", outbound_ack_packet.data());
+
             let mut waiting_time = INITIAL_INTERVAL;
             let mut attempts = 0;
-            const MAX_ATTEMPTS: usize = 30;
+            const MAX_ATTEMPTS: usize = 15;
 
             while attempts < MAX_ATTEMPTS {
                 outbound_packets
@@ -455,7 +480,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 match timeout.await {
                     Ok(Some(packet)) => {
                         let _ = packet.try_decrypt_sym(&inbound_key).map_err(|_| {
-                            tracing::debug!(%remote_addr, "Failed to decrypt packet with inbound key");
+                            tracing::debug!(%remote_addr, "Failed to decrypt packet with inbound key: {:?}", packet.data());
                             TransportError::ConnectionEstablishmentFailure {
                                 cause: "invalid symmetric key".into(),
                             }
@@ -505,7 +530,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             tracing::debug!("returning connection at gw");
             Ok((remote_conn, inbound_conn, outbound_ack_packet))
         };
-        (Box::new(f), inbound_from_remote)
+        (f.boxed(), inbound_from_remote)
     }
 
     // TODO: this value should be set given exponential backoff and max timeout
@@ -525,7 +550,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         // Constants for exponential backoff
-        const INITIAL_TIMEOUT: Duration = Duration::from_millis(15);
+        const INITIAL_TIMEOUT: Duration = Duration::from_millis(200);
         const TIMEOUT_MULTIPLIER: f64 = 1.2;
         #[cfg(not(test))]
         const MAX_TIMEOUT: Duration = Duration::from_secs(60); // Maximum timeout limit
@@ -631,6 +656,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             ConnectionState::StartOutbound { .. } => {
                                 // at this point it's either the remote sending us an intro packet or a symmetric packet
                                 // cause is the first packet that passes through the NAT
+                                tracing::debug!(%remote_addr, "received packet from remote: {:?}", packet.data());
                                 if let Ok(decrypted_packet) =
                                     packet.try_decrypt_sym(&inbound_sym_key)
                                 {
@@ -661,6 +687,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                         cause: "invalid symmetric key".into(),
                                                     }
                                                 })?;
+                                            tracing::debug!(%remote_addr, "Sending back ack connection: {:?}", key);
                                             outbound_packets
                                                 .send((
                                                     remote_addr,
@@ -807,8 +834,37 @@ impl<S: Socket> UdpPacketsListener<S> {
                 cause: "max connection attempts reached".into(),
             })
         };
-        (Box::new(f), inbound_from_remote)
+        (f.boxed(), inbound_from_remote)
     }
+}
+
+fn key_from_addr(addr: &SocketAddr) -> [u8; 16] {
+    let current_time = chrono::Utc::now();
+    let mut hasher = blake3::Hasher::new();
+    match addr {
+        SocketAddr::V4(v4) => {
+            hasher.update(&v4.ip().octets());
+            hasher.update(&v4.port().to_le_bytes());
+        }
+        SocketAddr::V6(v6) => {
+            hasher.update(&v6.ip().octets());
+            hasher.update(&v6.port().to_le_bytes());
+        }
+    }
+    hasher.update(
+        current_time
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp()
+            .to_le_bytes()
+            .as_ref(),
+    );
+    RANDOM_U64.with(|&random_value| {
+        hasher.update(random_value.as_ref());
+    });
+    hasher.finalize().as_bytes()[..16].try_into().unwrap()
 }
 
 pub(crate) enum ConnectionEvent {
