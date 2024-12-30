@@ -1,24 +1,4 @@
 use std::collections::BTreeMap;
-
-type GatewayConnectionFuture = Box<
-    dyn Future<
-            Output = Result<
-                (
-                    RemoteConnection,
-                    InboundRemoteConnection,
-                    PacketData<SymmetricAES>,
-                ),
-                TransportError,
-            >,
-        > + Send
-        + 'static,
->;
-
-type TraverseNatFuture = Box<
-    dyn Future<Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>>
-        + Send
-        + 'static,
->;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
@@ -29,17 +9,18 @@ use crate::transport::crypto::TransportSecretKey;
 use crate::transport::packet_data::{AssymetricRSA, UnknownEncryption};
 use crate::transport::symmetric_message::OutboundConnection;
 use aes_gcm::{Aes128Gcm, KeyInit};
-use futures::FutureExt;
 use futures::{
+    future::BoxFuture,
     stream::{FuturesUnordered, StreamExt},
-    Future,
+    Future, FutureExt, TryFutureExt,
 };
-use futures::{FutureExt, TryFutureExt};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
-use tokio::{task, task_local};
+use tokio::{
+    net::UdpSocket,
+    sync::{mpsc, oneshot},
+    task, task_local,
+};
 use tracing::{span, Instrument};
 
 use super::{
@@ -62,6 +43,21 @@ const DEFAULT_BW_TRACKER_WINDOW_SIZE: Duration = Duration::from_secs(10);
 const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
 
 pub type SerializedMessage = Vec<u8>;
+
+type GatewayConnectionFuture = BoxFuture<
+    'static,
+    Result<
+        (
+            RemoteConnection,
+            InboundRemoteConnection,
+            PacketData<SymmetricAES>,
+        ),
+        TransportError,
+    >,
+>;
+
+type TraverseNatFuture =
+    BoxFuture<'static, Result<(RemoteConnection, InboundRemoteConnection), TransportError>>;
 
 pub(crate) async fn create_connection_handler<S: Socket>(
     keypair: TransportKeypair,
@@ -408,15 +404,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                     let (ongoing_connection, packets_sender) = self.traverse_nat(
                         remote_addr,  remote_public_key,
                     );
-                    let task = tokio::spawn({
-                        let span = span!(tracing::Level::DEBUG, "traverse_nat");
-                        async move {
-                            match Pin::from(ongoing_connection).await {
-                                Ok(result) => Ok(result),
-                                Err(error) => Err((error, remote_addr))
-                            }
-                        }.instrument(span)
-                    });
+                    let task = tokio::spawn(ongoing_connection
+                        .map_err(move |err| (err, remote_addr))
+                        .instrument(span!(tracing::Level::DEBUG, "traverse_nat"))
+                    );
                     connection_tasks.push(task);
                     ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
                 },
@@ -424,6 +415,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn gateway_connection(
         &mut self,
         remote_intro_packet: PacketData<UnknownEncryption>,
@@ -538,7 +530,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             tracing::debug!("returning connection at gw");
             Ok((remote_conn, inbound_conn, outbound_ack_packet))
         };
-        (Box::new(f), inbound_from_remote)
+        (f.boxed(), inbound_from_remote)
     }
 
     // TODO: this value should be set given exponential backoff and max timeout
@@ -548,6 +540,7 @@ impl<S: Socket> UdpPacketsListener<S> {
     #[cfg(test)]
     const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
 
+    #[allow(clippy::type_complexity)]
     fn traverse_nat(
         &mut self,
         remote_addr: SocketAddr,
@@ -841,7 +834,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 cause: "max connection attempts reached".into(),
             })
         };
-        (Box::new(f), inbound_from_remote)
+        (f.boxed(), inbound_from_remote)
     }
 }
 

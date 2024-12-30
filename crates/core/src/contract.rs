@@ -151,10 +151,7 @@ where
 
                 contract_handler
                     .channel()
-                    .send_to_sender(
-                        id,
-                        ContractHandlerEvent::RegisterSubscriberListenerResponse,
-                    )
+                    .send_to_sender(id, ContractHandlerEvent::RegisterSubscriberListenerResponse)
                     .await
                     .map_err(|error| {
                         tracing::debug!(%error, "shutting down contract handler");
