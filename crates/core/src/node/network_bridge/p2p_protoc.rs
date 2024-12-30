@@ -173,21 +173,16 @@ impl P2pConnManager {
         );
 
         loop {
-            let event = timeout(
-                Duration::from_secs(120),
-                self.wait_for_event(
+            let event = self
+                .wait_for_event(
                     &mut state,
                     &mut handshake_handler,
                     &mut notification_channel,
                     &mut node_controller,
                     &mut client_wait_for_transaction,
                     &mut executor_listener,
-                ),
-            )
-            .await
-            .inspect_err(|e| {
-                tracing::error!("Error while waiting for event: {:?}", e);
-            })?;
+                )
+                .await;
 
             match event {
                 EventResult::Continue => continue,
