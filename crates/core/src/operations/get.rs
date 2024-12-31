@@ -1,7 +1,6 @@
 use std::fmt::Display;
 use std::pin::Pin;
 use std::{future::Future, time::Instant};
-
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 
@@ -678,9 +677,11 @@ impl Operation for GetOp {
                         })
                     );
                     let should_subscribe = op_manager.ring.should_seed(&key);
+                    // TODO: In case of original requester, we should check if is possible to cache the contract
                     let should_put = is_original_requester || should_subscribe;
 
                     if should_put {
+                        tracing::debug!(tx = %id, %key, %is_original_requester, %should_subscribe, "Putting contract at executor");
                         let res = op_manager
                             .notify_contract_handler(ContractHandlerEvent::PutQuery {
                                 key,
@@ -691,10 +692,12 @@ impl Operation for GetOp {
                             .await?;
                         match res {
                             ContractHandlerEvent::PutResponse { new_value: Ok(_) } => {
+                                tracing::debug!(tx = %id, %key, "Contract put at executor");
                                 let is_subscribed_contract =
                                     op_manager.ring.is_seeding_contract(&key);
                                 if !is_subscribed_contract && should_subscribe {
                                     tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
+                                    op_manager.ring.seed_contract(key);
                                     let mut new_skip_list = skip_list.clone();
                                     new_skip_list.push(sender.peer.clone());
                                     super::start_subscription_request(
