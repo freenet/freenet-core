@@ -1,8 +1,8 @@
+use freenet_stdlib::client_api::{ErrorKind, HostResponse};
+use freenet_stdlib::prelude::*;
 use std::fmt::Display;
 use std::pin::Pin;
 use std::{future::Future, time::Instant};
-use freenet_stdlib::client_api::{ErrorKind, HostResponse};
-use freenet_stdlib::prelude::*;
 
 use crate::client_events::HostResult;
 use crate::{

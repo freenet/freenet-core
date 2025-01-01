@@ -541,8 +541,15 @@ impl Executor<Runtime> {
             .await
             .map_err(ExecutorError::other)?;
 
-        if let Err(err) = self.send_update_notification(key, parameters, &new_state).await {
-            tracing::error!("Failed while sending notifications for contract {}: {}", key, err);
+        if let Err(err) = self
+            .send_update_notification(key, parameters, &new_state)
+            .await
+        {
+            tracing::error!(
+                "Failed while sending notifications for contract {}: {}",
+                key,
+                err
+            );
         }
         Ok(Either::Left(new_state))
     }
