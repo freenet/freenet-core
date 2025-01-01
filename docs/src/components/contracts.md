@@ -105,10 +105,8 @@ language for writing contracts.
 
 #### The `ContractInterface` Trait
 
-Rust contracts implement the `ContractInterface` trait, which defines the
-functions that the core calls to interact with the contract. This trait is
-defined in the
-[freenet-stdlib](https://github.com/freenet/freenet-stdlib/blob/f28e6716364b4e1c9ae8837344286393a2da4c82/rust/src/contract_interface.rs#L446).
+Rust contracts implement the [`ContractInterface`](https://docs.rs/freenet-stdlib/latest/freenet_stdlib/prelude/trait.ContractInterface.html) trait, which defines the
+functions that the core calls to interact with the contract.
 
 ```rust,no_run,noplayground
 {{#include ../../../stdlib/rust/src/contract_interface.rs:contractifce}}

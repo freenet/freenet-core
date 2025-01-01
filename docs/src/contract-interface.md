@@ -9,7 +9,7 @@
 
 ## Interface
 
-Freenet contracts must implement the contract interface from [stdlib/rust/src/contract_interface.rs](https://github.com/freenet/freenet-stdlib/blob/main/rust/src/contract_interface.rs#L446-L483):
+Freenet contracts must implement the [`ContractInterface`](https://docs.rs/freenet-stdlib/latest/freenet_stdlib/prelude/trait.ContractInterface.html) trait:
 
 ```rust,no_run,noplayground
 {{#include ../../stdlib/rust/src/contract_interface.rs:contractifce}}
