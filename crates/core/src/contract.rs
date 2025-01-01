@@ -85,7 +85,6 @@ where
                 related_contracts,
                 contract,
             } => {
-                tracing::debug!(%key, "putting contract state");
                 let put_result = contract_handler
                     .executor()
                     .upsert_contract_state(key, Either::Left(state), related_contracts, contract)
