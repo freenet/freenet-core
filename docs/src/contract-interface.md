@@ -15,7 +15,10 @@ Freenet contracts must implement the [`ContractInterface`](https://docs.rs/freen
 {{#include ../../stdlib/rust/src/contract_interface.rs:contractifce}}
 ```
 
-`Parameters`, `State`, and `StateDelta` are all wrappers around simple `[u8]` byte arrays for maximum efficiency and flexibility.
+[`Parameters`](https://docs.rs/freenet-stdlib/latest/freenet_stdlib/prelude/struct.Parameters.html),
+[`State`](https://docs.rs/freenet-stdlib/latest/freenet_stdlib/prelude/struct.State.html),
+and [`StateDelta`](https://docs.rs/freenet-stdlib/latest/freenet_stdlib/prelude/struct.StateDelta.html)
+are all wrappers around simple `[u8]` byte arrays for maximum efficiency and flexibility.
 
 ## Contract Interaction
 
