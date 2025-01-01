@@ -11,7 +11,7 @@ User Interfaces, and other Delegates. They can also communicate directly with
 the user, such as to request user permissions or notify the user of events.
 
 Implemented in WebAssembly and adhering to the
-[DelegateInterface](https://github.com/freenet/freenet-core/blob/b1e59528eaeba31c7f09881594d19347de60e8cd/crates/freenet-stdlib/src/delegate_interface.rs#L121)
+[DelegateInterface](https://docs.rs/freenet-stdlib/latest/freenet_stdlib/prelude/trait.DelegateInterface.html)
 trait, Delegates seamlessly integrate within the Freenet network, operating
 securely on your devices.
 
