@@ -77,14 +77,9 @@ create-dirs:
 generate-keys:
 	@echo "→ Generating RSA keys..."
 	@for i in $$(seq 1 $(N_GATEWAYS)); do \
-		openssl genpkey -algorithm RSA -out $(KEYS_DIR)/gw$${i}_private_key.pem && \
-		openssl rsa -pubout -in $(KEYS_DIR)/gw$${i}_private_key.pem \
-			-out $(KEYS_DIR)/gw$${i}_public_key.pem; \
-	done
-	@for i in $$(seq 1 $(N_NODES)); do \
-		openssl genpkey -algorithm RSA -out $(BASE_DIR)/n$$i/n$${i}_private_key.pem && \
-		openssl rsa -pubout -in $(BASE_DIR)/n$$i/n$${i}_private_key.pem \
-			-out $(BASE_DIR)/n$$i/n$${i}_public_key.pem; \
+		openssl genpkey -algorithm RSA -out $(KEYS_DIR)/gw$${i}_private_key.pem -pkeyopt rsa_keygen_bits:4096 && \
+		openssl pkey -in $(KEYS_DIR)/gw$${i}_private_key.pem \
+			-pubout -out $(KEYS_DIR)/gw$${i}_public_key.pem; \
 	done
 
 # Network Management
@@ -126,7 +121,7 @@ start-nodes:
 			--public-network-port $$public_port \
 			--db-dir $(BASE_DIR)/n$$i \
 			--network-port $$network_port \
-			--transport-keypair $(BASE_DIR)/n$$i/n$${i}_private_key.pem $(call LOG_CMD,$(LOGS_DIR)/n$$i.log)) & \
+			$(call LOG_CMD,$(LOGS_DIR)/n$$i.log)) & \
 		echo $$! > $(PID_DIR)/n$$i.pid; \
 		echo "  Node $$i: network=$$network_port, ws=$$ws_port, public=$$public_port (PID: $$!)"; \
 		if [ $$i -lt $(N_NODES) ]; then \

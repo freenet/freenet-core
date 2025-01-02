@@ -55,7 +55,7 @@ pub struct ConfigArgs {
     pub ws_api: WebsocketApiArgs,
 
     #[clap(flatten)]
-    pub network_listener: NetworkArgs,
+    pub network_api: NetworkArgs,
 
     #[clap(flatten)]
     pub secrets: SecretArgs,
@@ -75,15 +75,16 @@ impl Default for ConfigArgs {
     fn default() -> Self {
         Self {
             mode: Some(OperationMode::Network),
-            network_listener: NetworkArgs {
-                address: Some(default_address()),
-                network_port: Some(default_network_port()),
+            network_api: NetworkArgs {
+                address: Some(default_listening_address()),
+                network_port: Some(default_network_api_port()),
                 public_address: None,
                 public_port: None,
                 is_gateway: false,
+                load_from_network: false,
             },
             ws_api: WebsocketApiArgs {
-                address: Some(default_address()),
+                address: Some(default_listening_address()),
                 ws_api_port: Some(default_http_gateway_port()),
             },
             secrets: Default::default(),
@@ -216,9 +217,9 @@ impl ConfigArgs {
         let secrets = self.secrets.build()?;
 
         let peer_id = self
-            .network_listener
+            .network_api
             .public_address
-            .zip(self.network_listener.public_port)
+            .zip(self.network_api.public_port)
             .map(|(addr, port)| {
                 PeerId::new(
                     (addr, port).into(),
@@ -226,12 +227,16 @@ impl ConfigArgs {
                 )
             });
         let gateways_file = config_paths.config_dir.join("gateways.toml");
-        let remotely_loaded_gateways = load_gateways_from_index(
-            "https://freenet.org/gateways.toml",
-            &config_paths.secrets_dir,
-        )
-        .await
-        .unwrap_or_default();
+        let remotely_loaded_gateways = if self.network_api.load_from_network {
+            load_gateways_from_index(
+                "https://freenet.org/gateways.toml",
+                &config_paths.secrets_dir,
+            )
+            .await
+            .unwrap_or_default()
+        } else {
+            Gateways::default()
+        };
         let mut gateways = match File::open(&*gateways_file) {
             Ok(mut file) => {
                 let mut content = String::new();
@@ -268,21 +273,21 @@ impl ConfigArgs {
             mode,
             peer_id,
             network_api: NetworkApiConfig {
-                address: self.network_listener.address.unwrap_or_else(|| match mode {
+                address: self.network_api.address.unwrap_or_else(|| match mode {
                     OperationMode::Local => default_local_address(),
-                    OperationMode::Network => default_address(),
+                    OperationMode::Network => default_listening_address(),
                 }),
                 port: self
-                    .network_listener
+                    .network_api
                     .network_port
-                    .unwrap_or(default_network_port()),
-                public_address: self.network_listener.public_address,
-                public_port: self.network_listener.public_port,
+                    .unwrap_or(default_network_api_port()),
+                public_address: self.network_api.public_address,
+                public_port: self.network_api.public_port,
             },
             ws_api: WebsocketApiConfig {
                 address: self.ws_api.address.unwrap_or_else(|| match mode {
                     OperationMode::Local => default_local_address(),
-                    OperationMode::Network => default_address(),
+                    OperationMode::Network => default_listening_address(),
                 }),
                 port: self
                     .ws_api
@@ -293,7 +298,7 @@ impl ConfigArgs {
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
             config_paths: Arc::new(config_paths),
             gateways: gateways.gateways,
-            is_gateway: self.network_listener.is_gateway,
+            is_gateway: self.network_api.is_gateway,
         };
 
         fs::create_dir_all(this.config_dir())?;
@@ -422,30 +427,36 @@ pub struct NetworkArgs {
     /// If the node is a gateway, it will be able to accept connections from other nodes.
     #[arg(long)]
     pub is_gateway: bool,
+
+    /// Load gateway configurations from the network and merge it with existing one.
+    #[arg(long, default_value = "true", env = "LOAD_FROM_NETWORK")]
+    pub load_from_network: bool,
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct NetworkApiConfig {
-    /// Address to bind to
-    #[serde(default = "default_address", rename = "network-address")]
+    /// Address to listen to locally
+    #[serde(default = "default_listening_address", rename = "network-address")]
     pub address: IpAddr,
 
     /// Port to expose api on
-    #[serde(default = "default_network_port", rename = "network-port")]
+    #[serde(default = "default_network_api_port", rename = "network-port")]
     pub port: u16,
 
+    /// Public external address for the network, mandatory for gateways.
     #[serde(
         rename = "public_network_address",
         skip_serializing_if = "Option::is_none"
     )]
     pub public_address: Option<IpAddr>,
 
+    /// Public external port for the network, mandatory for gateways.
     #[serde(rename = "public_port", skip_serializing_if = "Option::is_none")]
     pub public_port: Option<u16>,
 }
 
 #[inline]
-const fn default_network_port() -> u16 {
+pub const fn default_network_api_port() -> u16 {
     31337
 }
 
@@ -469,7 +480,7 @@ pub struct WebsocketApiArgs {
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct WebsocketApiConfig {
     /// Address to bind to
-    #[serde(default = "default_address", rename = "ws-api-address")]
+    #[serde(default = "default_listening_address", rename = "ws-api-address")]
     pub address: IpAddr,
 
     /// Port to expose api on
@@ -490,14 +501,14 @@ impl Default for WebsocketApiConfig {
     #[inline]
     fn default() -> Self {
         Self {
-            address: default_address(),
+            address: default_listening_address(),
             port: default_http_gateway_port(),
         }
     }
 }
 
 #[inline]
-const fn default_address() -> IpAddr {
+const fn default_listening_address() -> IpAddr {
     IpAddr::V4(Ipv4Addr::UNSPECIFIED)
 }
 
@@ -507,7 +518,7 @@ const fn default_local_address() -> IpAddr {
 }
 
 #[inline]
-pub(crate) const fn default_http_gateway_port() -> u16 {
+const fn default_http_gateway_port() -> u16 {
     50509
 }
 
@@ -989,7 +1000,9 @@ mod tests {
         let gateways = Gateways {
             gateways: vec![
                 GatewayConfig {
-                    address: Address::HostAddress(([127, 0, 0, 1], default_network_port()).into()),
+                    address: Address::HostAddress(
+                        ([127, 0, 0, 1], default_network_api_port()).into(),
+                    ),
                     public_key_path: PathBuf::from("path/to/key"),
                 },
                 GatewayConfig {

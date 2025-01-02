@@ -176,11 +176,8 @@ impl NodeConfig {
                 match hostname.rsplit_once(':') {
                     None => {
                         // no port found, use default
-                        let hostname_with_port = format!(
-                            "{}:{}",
-                            hostname,
-                            crate::config::default_http_gateway_port()
-                        );
+                        let hostname_with_port =
+                            format!("{}:{}", hostname, crate::config::default_network_api_port());
 
                         if let Ok(mut addrs) = hostname_with_port.to_socket_addrs() {
                             if let Some(addr) = addrs.next() {
@@ -227,7 +224,7 @@ impl NodeConfig {
         match ips.into_iter().next() {
             Some(ip) => Ok(SocketAddr::new(
                 ip,
-                port.unwrap_or_else(crate::config::default_http_gateway_port),
+                port.unwrap_or_else(crate::config::default_network_api_port),
             )),
             None => Err(anyhow::anyhow!("Fail to resolve IP address of {hostname}")),
         }
@@ -1017,12 +1014,12 @@ mod tests {
             socket_addr
                 == SocketAddr::new(
                     IpAddr::V4(Ipv4Addr::LOCALHOST),
-                    crate::config::default_http_gateway_port()
+                    crate::config::default_network_api_port()
                 )
                 || socket_addr
                     == SocketAddr::new(
                         IpAddr::V6(Ipv6Addr::LOCALHOST),
-                        crate::config::default_http_gateway_port()
+                        crate::config::default_network_api_port()
                     )
         );
 
@@ -1030,7 +1027,7 @@ mod tests {
         let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
         assert_eq!(
             socket_addr.port(),
-            crate::config::default_http_gateway_port()
+            crate::config::default_network_api_port()
         );
 
         let addr = Address::Hostname("google.com:8080".to_string());
