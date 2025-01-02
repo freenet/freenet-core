@@ -2,7 +2,7 @@
 # freenet-setup.sh - Unified Gateway and Node setup script
 
 # Check if required parameters are provided
-# Ahora sólo esperamos 3 parámetros: <name> <type> <gw-host>
+# Only expects 3 parameters: <name> <type> <gw-host>
 if [ -z "$1" ] || [ -z "$2" ]; then
     echo "Usage: $0 <name> <type> <gw-host>"
     echo "Example: $0 my-node node vega.locut.us"
@@ -13,13 +13,13 @@ NAME="$1"
 TYPE="$2"
 GW_HOST="$3"
 
-# Validar el TYPE
+# Validate TYPE
 if [[ "$TYPE" != "gateway" && "$TYPE" != "node" ]]; then
     echo "Error: Type must be either 'gateway' or 'node'."
     exit 1
 fi
 
-# Si es node, necesitamos GW_HOST (aunque ya lo recibimos en $3).
+# If is a regular node, require GW_HOST.
 if [[ "$TYPE" == "node" && -z "$GW_HOST" ]]; then
     echo "Error: <gw-host> parameter is required for node setup."
     exit 1
@@ -58,13 +58,13 @@ fi
 KEY_FILE="$KEYS_DIR/${NAME}_private_key.pem"
 if [ ! -f "$KEY_FILE" ]; then
     echo "Generating keys for $TYPE..."
-    openssl genpkey -algorithm RSA -out "$KEY_FILE"
-    openssl rsa -pubout -in "$KEY_FILE" -out "$KEYS_DIR/${NAME}_public_key.pem"
+    openssl genpkey -algorithm RSA -out "$KEY_FILE" -pkeyopt rsa_keygen_bits:4096
+    openssl pkey -in "$KEY_FILE" -pubout -out "$KEYS_DIR/${NAME}_public_key.pem"
 else
     echo "Keys already exist. Skipping key generation."
 fi
 
-# Si es nodo, creamos el archivo gateways.toml (sin descargar nada por SSH/SCP).
+# If is a regular node, generate the gateways.toml file
 if [[ "$TYPE" == "node" ]]; then
     GATEWAY_CONFIG="$BASE_DIR/gateways.toml"
     echo "Configuring gateways.toml for node..."
