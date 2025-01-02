@@ -170,7 +170,7 @@ impl NodeConfig {
         })
     }
 
-    async fn parse_socket_addr(address: &Address) -> anyhow::Result<SocketAddr> {
+    pub(crate) async fn parse_socket_addr(address: &Address) -> anyhow::Result<SocketAddr> {
         let (hostname, port) = match address {
             crate::config::Address::Hostname(hostname) => {
                 match hostname.rsplit_once(':') {
