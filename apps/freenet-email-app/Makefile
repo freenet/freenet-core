@@ -19,27 +19,34 @@ IDENTITY_DELEGATE := $(FREENET_ROOT)$(PATH_SEP)modules$(PATH_SEP)identity-manage
 WEB_DIR_SRC := $(ROOT)$(PATH_SEP)web$(PATH_SEP)src
 FILE := $(IDENTITY_DELEGATE)$(PATH_SEP)build$(PATH_SEP)identity-manager-key.private.pem
 
-ifeq ($(CARGO_TARGET_DIR),)
-	$(error CARGO_TARGET_DIR is not set)
-endif
+
 
 all: install-deps build
 
 install-deps:
 	cargo install dioxus-cli
 
-build: \
-	generate-id-manager-key \
-	build-inbox \
-	build-webapp \
-	publish-webapp
+build:
+ifeq ($(CARGO_TARGET_DIR),)
+	$(error CARGO_TARGET_DIR is not set)
+endif
+	make generate-id-manager-key
+	make build-inbox
+	make build-webapp
+	make publish-webapp
 
 generate-id-manager-key:
+ifeq ($(CARGO_TARGET_DIR),)
+	$(error CARGO_TARGET_DIR is not set)
+endif
 	@if [ ! -f "$(FILE)" ]; then \
 		cd "$(IDENTITY_DELEGATE)" && cargo run -- --path "$(IDENTITY_DELEGATE)$(PATH_SEP)build"; \
 	fi
 
 build-inbox:
+ifeq ($(CARGO_TARGET_DIR),)
+	$(error CARGO_TARGET_DIR is not set)
+endif
 	cd $(INBOX_DIR) && fdev build --features contract && \
 	hash=$$(bash -c "fdev inspect build$(PATH_SEP)freenet$(PATH_SEP)freenet_email_inbox code | grep 'code hash:' | cut -d' ' -f3") && \
 	mkdir -p $(WEB_DIR_SRC)$(PATH_SEP)..$(PATH_SEP)build && \
@@ -53,6 +60,9 @@ run-web:
 	dx serve --features use-node --port 57616
 
 build-webapp:
+ifeq ($(CARGO_TARGET_DIR),)
+	$(error CARGO_TARGET_DIR is not set)
+endif
 	cd $(INBOX_WEB_DIR) && dx build --target index.html --release --platform web --features use-node && \
 	sed -i 's@/./assets@./assets@g' dist/index.html && \
 	fdev build
@@ -61,4 +71,7 @@ publish-webapp:
 	cd $(INBOX_WEB_DIR) && fdev publish --code build$(PATH_SEP)freenet$(PATH_SEP)freenet_email_app_web contract --state build$(PATH_SEP)freenet$(PATH_SEP)contract-state
 
 clean:
+ifeq ($(CARGO_TARGET_DIR),)
+	$(error CARGO_TARGET_DIR is not set)
+endif
 	rm -rf $(CARGO_TARGET_DIR)
