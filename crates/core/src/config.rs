@@ -923,12 +923,13 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
         let mut buf = String::new();
         key_file.read_to_string(&mut buf)?;
         if rsa::RsaPublicKey::from_public_key_pem(&buf).is_ok() {
+            gateway.public_key_path = local_path;
+            valid_gateways.push(gateway.clone());
+        } else {
             tracing::warn!(
                 "Invalid public key found in remote gateway file: {:?}, ignoring",
                 gateway.public_key_path
             );
-            gateway.public_key_path = local_path;
-            valid_gateways.push(gateway.clone());
         }
     }
 
@@ -941,6 +942,9 @@ mod tests {
     use httptest::{matchers::*, responders::*, Expectation, Server};
 
     use pkcs8::EncodePublicKey;
+    use rsa::RsaPublicKey;
+
+    use crate::node::NodeConfig;
 
     use super::*;
 
@@ -1014,5 +1018,25 @@ mod tests {
 
         let serialized = toml::to_string(&gateways).unwrap();
         let _: Gateways = toml::from_str(&serialized).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_remote_freenet_gateways() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let gateways =
+            load_gateways_from_index("https://freenet.org/keys/gateways.toml", tmp_dir.path())
+                .await
+                .unwrap();
+        assert!(!gateways.gateways.is_empty());
+
+        for gw in gateways.gateways {
+            assert!(gw.public_key_path.exists());
+            assert!(RsaPublicKey::from_public_key_pem(
+                &std::fs::read_to_string(gw.public_key_path).unwrap(),
+            )
+            .is_ok());
+            let socket = NodeConfig::parse_socket_addr(&gw.address).await.unwrap();
+            assert_eq!(socket.port(), default_network_api_port());
+        }
     }
 }
