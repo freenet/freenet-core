@@ -1,0 +1,13 @@
+[Unit]
+Description=Freenet Gateway Service
+After=network.target
+
+[Service]
+Environment="TRANSPORT_KEYPAIR=/path/to/transport-keypair.pem"
+Environment="PUBLIC_NETWORK_ADDRESS=your.public.network.address"
+Environment="PUBLIC_NETWORK_PORT=31337"
+Environment="NETWORK_PORT=31337"
+ExecStart=/home/freenet/gateway-setup.sh $TRANSPORT_KEYPAIR $PUBLIC_NETWORK_ADDRESS $PUBLIC_NETWORK_PORT $NETWORK_PORT
+User=freenet
+WorkingDirectory=/home/freenet
+Restart=always

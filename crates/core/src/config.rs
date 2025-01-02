@@ -45,6 +45,8 @@ const QUALIFIER: &str = "";
 const ORGANIZATION: &str = "The Freenet Project Inc";
 const APPLICATION: &str = "Freenet";
 
+const FREENET_GATEWAYS_INDEX: &str = "https://freenet.org/keys/gateways.toml";
+
 #[derive(clap::Parser, Debug)]
 pub struct ConfigArgs {
     /// Node operation mode. Default is network mode.
@@ -81,7 +83,7 @@ impl Default for ConfigArgs {
                 public_address: None,
                 public_port: None,
                 is_gateway: false,
-                load_from_network: false,
+                skip_load_from_network: true,
             },
             ws_api: WebsocketApiArgs {
                 address: Some(default_listening_address()),
@@ -227,13 +229,16 @@ impl ConfigArgs {
                 )
             });
         let gateways_file = config_paths.config_dir.join("gateways.toml");
-        let remotely_loaded_gateways = if self.network_api.load_from_network {
-            load_gateways_from_index(
-                "https://freenet.org/gateways.toml",
-                &config_paths.secrets_dir,
-            )
-            .await
-            .unwrap_or_default()
+
+        let remotely_loaded_gateways = if !self.network_api.skip_load_from_network {
+            load_gateways_from_index(FREENET_GATEWAYS_INDEX, &config_paths.secrets_dir)
+                .await
+                .inspect_err(|error| {
+                    tracing::error!(
+                        "Failed to load gateways from index (at {FREENET_GATEWAYS_INDEX}): {error}"
+                    );
+                })
+                .unwrap_or_default()
         } else {
             Gateways::default()
         };
@@ -262,12 +267,13 @@ impl ConfigArgs {
                     }
                 }
                 let _ = err;
-                tracing::warn!("No gateways file found, initializing disjoint gateway.");
+                if remotely_loaded_gateways.gateways.is_empty() {
+                    tracing::warn!("No gateways file found, initializing disjoint gateway.");
+                }
                 Gateways { gateways: vec![] }
             }
         };
         gateways.merge_and_deduplicate(remotely_loaded_gateways);
-        gateways.save_to_file(&gateways_file)?;
 
         let this = Config {
             mode,
@@ -297,11 +303,13 @@ impl ConfigArgs {
             secrets,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
             config_paths: Arc::new(config_paths),
-            gateways: gateways.gateways,
+            gateways: gateways.gateways.clone(),
             is_gateway: self.network_api.is_gateway,
         };
 
         fs::create_dir_all(this.config_dir())?;
+        gateways.save_to_file(&gateways_file)?;
+
         if should_persist {
             let path = this.config_dir().join("config.toml");
             tracing::info!("Persisting configuration to {:?}", path);
@@ -428,9 +436,9 @@ pub struct NetworkArgs {
     #[arg(long)]
     pub is_gateway: bool,
 
-    /// Load gateway configurations from the network and merge it with existing one.
-    #[arg(long, default_value = "true", env = "LOAD_FROM_NETWORK")]
-    pub load_from_network: bool,
+    /// Skips loading gateway configurations from the network and merging it with existing one.
+    #[arg(long)]
+    pub skip_load_from_network: bool,
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
@@ -1023,10 +1031,9 @@ mod tests {
     #[tokio::test]
     async fn test_remote_freenet_gateways() {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let gateways =
-            load_gateways_from_index("https://freenet.org/keys/gateways.toml", tmp_dir.path())
-                .await
-                .unwrap();
+        let gateways = load_gateways_from_index(FREENET_GATEWAYS_INDEX, tmp_dir.path())
+            .await
+            .unwrap();
         assert!(!gateways.gateways.is_empty());
 
         for gw in gateways.gateways {
