@@ -2,9 +2,11 @@
 
 import { BroadcastEmitted } from "../topology/broadcast-emitted";
 import { BroadcastReceived } from "../topology/broadcast-received";
+import { GetContract } from "../topology/get-contract";
 import { PutFailure } from "../topology/put-failure";
 import { PutRequest } from "../topology/put-request";
 import { PutSuccess } from "../topology/put-success";
+import { SubscribeToContract } from "../topology/subscribe-to-contract";
 import { UpdateFailure } from "../topology/update-failure";
 import { UpdateRequest } from "../topology/update-request";
 import { UpdateSuccess } from "../topology/update-success";
@@ -19,6 +21,8 @@ export enum ContractChangeType {
     UpdateRequest = 6,
     UpdateSuccess = 7,
     UpdateFailure = 8,
+    GetContract = 9,
+    SubscribeToContract = 10,
 }
 
 export function unionToContractChangeType(
@@ -27,18 +31,22 @@ export function unionToContractChangeType(
         obj:
             | BroadcastEmitted
             | BroadcastReceived
+            | GetContract
             | PutFailure
             | PutRequest
             | PutSuccess
+            | SubscribeToContract
             | UpdateFailure
             | UpdateRequest
             | UpdateSuccess
     ) =>
         | BroadcastEmitted
         | BroadcastReceived
+        | GetContract
         | PutFailure
         | PutRequest
         | PutSuccess
+        | SubscribeToContract
         | UpdateFailure
         | UpdateRequest
         | UpdateSuccess
@@ -46,9 +54,11 @@ export function unionToContractChangeType(
 ):
     | BroadcastEmitted
     | BroadcastReceived
+    | GetContract
     | PutFailure
     | PutRequest
     | PutSuccess
+    | SubscribeToContract
     | UpdateFailure
     | UpdateRequest
     | UpdateSuccess
@@ -72,6 +82,10 @@ export function unionToContractChangeType(
             return accessor(new UpdateSuccess())! as UpdateSuccess;
         case "UpdateFailure":
             return accessor(new UpdateFailure())! as UpdateFailure;
+        case "GetContract":
+            return accessor(new GetContract())! as GetContract;
+        case "SubscribeToContract":
+            return accessor(new SubscribeToContract())! as SubscribeToContract;
         default:
             return null;
     }
@@ -84,18 +98,22 @@ export function unionListToContractChangeType(
         obj:
             | BroadcastEmitted
             | BroadcastReceived
+            | GetContract
             | PutFailure
             | PutRequest
             | PutSuccess
+            | SubscribeToContract
             | UpdateFailure
             | UpdateRequest
             | UpdateSuccess
     ) =>
         | BroadcastEmitted
         | BroadcastReceived
+        | GetContract
         | PutFailure
         | PutRequest
         | PutSuccess
+        | SubscribeToContract
         | UpdateFailure
         | UpdateRequest
         | UpdateSuccess
@@ -104,9 +122,11 @@ export function unionListToContractChangeType(
 ):
     | BroadcastEmitted
     | BroadcastReceived
+    | GetContract
     | PutFailure
     | PutRequest
     | PutSuccess
+    | SubscribeToContract
     | UpdateFailure
     | UpdateRequest
     | UpdateSuccess
@@ -133,6 +153,13 @@ export function unionListToContractChangeType(
             return accessor(index, new UpdateSuccess())! as UpdateSuccess;
         case "UpdateFailure":
             return accessor(index, new UpdateFailure())! as UpdateFailure;
+        case "GetContract":
+            return accessor(index, new GetContract())! as GetContract;
+        case "SubscribeToContract":
+            return accessor(
+                index,
+                new SubscribeToContract()
+            )! as SubscribeToContract;
         default:
             return null;
     }

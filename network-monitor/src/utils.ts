@@ -21,6 +21,10 @@ export const get_change_type = (
             return ChangeType.BROADCAST_EMITTED;
         case fbTopology.ContractChangeType.BroadcastReceived:
             return ChangeType.BROADCAST_RECEIVED;
+        case fbTopology.ContractChangeType.GetContract:
+            return ChangeType.GET_CONTRACT;
+        case fbTopology.ContractChangeType.SubscribeToContract:
+            return ChangeType.SUBSCRIBED_TO_CONTRACT;
         default:
             new Error("Invalid change type");
     }

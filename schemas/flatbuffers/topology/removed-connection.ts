@@ -20,18 +20,34 @@ static getSizePrefixedRootAsRemovedConnection(bb:flatbuffers.ByteBuffer, obj?:Re
   return (obj || new RemovedConnection()).__init(bb.readInt32(bb.position()) + bb.position(), bb);
 }
 
-at():string|null
-at(optionalEncoding:flatbuffers.Encoding):string|Uint8Array|null
-at(optionalEncoding?:any):string|Uint8Array|null {
+at(index: number):number|null {
   const offset = this.bb!.__offset(this.bb_pos, 4);
-  return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
+  return offset ? this.bb!.readUint8(this.bb!.__vector(this.bb_pos + offset) + index) : 0;
 }
 
-from():string|null
-from(optionalEncoding:flatbuffers.Encoding):string|Uint8Array|null
-from(optionalEncoding?:any):string|Uint8Array|null {
+atLength():number {
+  const offset = this.bb!.__offset(this.bb_pos, 4);
+  return offset ? this.bb!.__vector_len(this.bb_pos + offset) : 0;
+}
+
+atArray():Uint8Array|null {
+  const offset = this.bb!.__offset(this.bb_pos, 4);
+  return offset ? new Uint8Array(this.bb!.bytes().buffer, this.bb!.bytes().byteOffset + this.bb!.__vector(this.bb_pos + offset), this.bb!.__vector_len(this.bb_pos + offset)) : null;
+}
+
+from(index: number):number|null {
   const offset = this.bb!.__offset(this.bb_pos, 6);
-  return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
+  return offset ? this.bb!.readUint8(this.bb!.__vector(this.bb_pos + offset) + index) : 0;
+}
+
+fromLength():number {
+  const offset = this.bb!.__offset(this.bb_pos, 6);
+  return offset ? this.bb!.__vector_len(this.bb_pos + offset) : 0;
+}
+
+fromArray():Uint8Array|null {
+  const offset = this.bb!.__offset(this.bb_pos, 6);
+  return offset ? new Uint8Array(this.bb!.bytes().buffer, this.bb!.bytes().byteOffset + this.bb!.__vector(this.bb_pos + offset), this.bb!.__vector_len(this.bb_pos + offset)) : null;
 }
 
 static startRemovedConnection(builder:flatbuffers.Builder) {
@@ -42,8 +58,32 @@ static addAt(builder:flatbuffers.Builder, atOffset:flatbuffers.Offset) {
   builder.addFieldOffset(0, atOffset, 0);
 }
 
+static createAtVector(builder:flatbuffers.Builder, data:number[]|Uint8Array):flatbuffers.Offset {
+  builder.startVector(1, data.length, 1);
+  for (let i = data.length - 1; i >= 0; i--) {
+    builder.addInt8(data[i]!);
+  }
+  return builder.endVector();
+}
+
+static startAtVector(builder:flatbuffers.Builder, numElems:number) {
+  builder.startVector(1, numElems, 1);
+}
+
 static addFrom(builder:flatbuffers.Builder, fromOffset:flatbuffers.Offset) {
   builder.addFieldOffset(1, fromOffset, 0);
+}
+
+static createFromVector(builder:flatbuffers.Builder, data:number[]|Uint8Array):flatbuffers.Offset {
+  builder.startVector(1, data.length, 1);
+  for (let i = data.length - 1; i >= 0; i--) {
+    builder.addInt8(data[i]!);
+  }
+  return builder.endVector();
+}
+
+static startFromVector(builder:flatbuffers.Builder, numElems:number) {
+  builder.startVector(1, numElems, 1);
 }
 
 static endRemovedConnection(builder:flatbuffers.Builder):flatbuffers.Offset {
