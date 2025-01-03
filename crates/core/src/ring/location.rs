@@ -12,6 +12,17 @@ pub struct Location(pub(crate) f64);
 impl Location {
     #[cfg(all(not(feature = "local-simulation"), not(test)))]
     pub fn from_address(addr: &std::net::SocketAddr) -> Self {
+        Self::deterministic_loc(addr)
+    }
+
+    #[cfg(any(feature = "local-simulation", test))]
+    pub fn from_address(_addr: &std::net::SocketAddr) -> Self {
+        let random_component: f64 = rand::random();
+        Location(random_component)
+    }
+
+    #[allow(unused)]
+    fn deterministic_loc(addr: &std::net::SocketAddr) -> Self {
         match addr.ip() {
             std::net::IpAddr::V4(ipv4) => {
                 let octets = ipv4.octets();
@@ -28,12 +39,6 @@ impl Location {
                 Location(combined_segments as f64 / 281474976710655.0) // 2^48 - 1
             }
         }
-    }
-
-    #[cfg(any(feature = "local-simulation", test))]
-    pub fn from_address(_addr: &std::net::SocketAddr) -> Self {
-        let random_component: f64 = rand::random();
-        Location(random_component)
     }
 
     pub fn new(location: f64) -> Self {
@@ -220,24 +225,30 @@ impl Display for Distance {
 
 #[cfg(test)]
 mod test {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
     use super::*;
 
     #[test]
-    fn test_ipv4_address_location() {
+    fn test_ipv4_address_location_distribution() {
         use rand::prelude::*;
         use rand::rngs::StdRng;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
         // Use seeded RNG for reproducible tests
         let mut rng = StdRng::seed_from_u64(12345);
 
-        // Generate 100 random IP addresses with seeded RNG
-        let locations: Vec<f64> = (0..100)
+        // Generate 100 random IP addresses wih seeded RNG
+        let ips = (0..100)
             .map(|_| {
                 let ip = Ipv4Addr::new(rng.gen(), rng.gen(), rng.gen(), rng.gen());
-                let addr = SocketAddr::new(IpAddr::V4(ip), 12345);
-                Location::from_address(&addr).0
+                SocketAddr::new(IpAddr::V4(ip), 12345)
             })
+            .collect::<Vec<_>>();
+
+        // Compute locations for each IP address
+        let locations: Vec<f64> = ips
+            .into_iter()
+            .map(|addr| Location::deterministic_loc(&addr).0)
             .collect();
 
         // Verify all locations are between 0 and 1
@@ -269,6 +280,23 @@ mod test {
             "Found too large wrap-around gap ({})",
             wrap_gap
         );
+    }
+
+    #[test]
+    fn test_ipv4_address_location() {
+        let addresses = [
+            SocketAddr::new(IpAddr::V4([86, 38, 75, 158].into()), 12345),
+            SocketAddr::new(IpAddr::V4([103, 169, 0, 130].into()), 12345),
+            SocketAddr::new(IpAddr::V4([20, 5, 226, 4].into()), 12345),
+        ];
+
+        let locations: Vec<Location> = addresses.iter().map(Location::deterministic_loc).collect();
+        let expected_locations = vec![
+            Location(0.336521824390997),
+            Location(0.40492250948682484),
+            Location(0.07821476925699528),
+        ];
+        assert_eq!(locations, expected_locations);
     }
 
     #[test]
