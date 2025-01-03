@@ -26,7 +26,7 @@ impl Location {
                 let combined_segments = (u64::from(segments[0]) << 32)
                     | (u64::from(segments[1]) << 16)
                     | u64::from(segments[2]);
-                Location(combined_segments as f64 / (u64::MAX as f64))
+                Location(combined_segments as f64 / 281474976710655.0) // 2^48 - 1
             }
         }
     }
@@ -222,6 +222,26 @@ impl Display for Distance {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_ipv4_address_location() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        
+        // Test case from example: 91.116.34.211:14193
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(91, 116, 34, 211)), 14193);
+        let location = Location::from_address(&addr);
+        assert!((location.0 - 0.0013954718600482383).abs() < f64::EPSILON);
+
+        // Test case from example: 51.186.208.163:31337
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(51, 186, 208, 163)), 31337);
+        let location = Location::from_address(&addr);
+        assert!((location.0 - 0.0007893331350733836).abs() < f64::EPSILON);
+
+        // Test case from example: 100.27.151.8:31337
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 27, 151, 8)), 31337);
+        let location = Location::from_address(&addr);
+        assert!((location.0 - 0.0015275233894417816).abs() < f64::EPSILON);
+    }
 
     #[test]
     fn location_dist() {
