@@ -1,6 +1,5 @@
 use anyhow::bail;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
-use rand;
 use std::fmt::Display;
 use std::hash::Hasher;
 use std::ops::Add;
