@@ -225,11 +225,11 @@ mod test {
     #[test]
     fn test_ipv4_address_location() {
         use rand::prelude::*;
-        use rand_chacha::ChaCha8Rng;
+        use rand::rngs::StdRng;
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
         // Use seeded RNG for reproducible tests
-        let mut rng = ChaCha8Rng::seed_from_u64(12345);
+        let mut rng = StdRng::seed_from_u64(12345);
 
         // Generate 100 random IP addresses with seeded RNG
         let locations: Vec<f64> = (0..100)
