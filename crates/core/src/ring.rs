@@ -754,4 +754,3 @@ pub(crate) enum RingError {
     #[error("No location assigned to this peer")]
     NoLocation,
 }
-

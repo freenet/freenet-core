@@ -1,9 +1,9 @@
-use std::fmt::Display;
-use std::hash::Hasher;
-use std::ops::Add;
 use anyhow::bail;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use rand;
+use std::fmt::Display;
+use std::hash::Hasher;
+use std::ops::Add;
 
 /// An abstract location on the 1D ring, represented by a real number on the interal [0, 1]
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy)]
@@ -229,16 +229,11 @@ mod test {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
         let mut rng = rand::thread_rng();
-        
+
         // Generate 100 random IP addresses
         let locations: Vec<f64> = (0..100)
             .map(|_| {
-                let ip = Ipv4Addr::new(
-                    rng.gen(),
-                    rng.gen(),
-                    rng.gen(),
-                    rng.gen(),
-                );
+                let ip = Ipv4Addr::new(rng.gen(), rng.gen(), rng.gen(), rng.gen());
                 let addr = SocketAddr::new(IpAddr::V4(ip), 12345);
                 Location::from_address(&addr).0
             })
@@ -258,15 +253,21 @@ mod test {
         // aren't too large (shouldn't have huge empty spaces)
         let max_acceptable_gap = 0.2; // 20% of the ring
         for i in 1..sorted_locs.len() {
-            let gap = sorted_locs[i] - sorted_locs[i-1];
-            assert!(gap < max_acceptable_gap, 
-                "Found too large gap ({}) between consecutive locations", gap);
+            let gap = sorted_locs[i] - sorted_locs[i - 1];
+            assert!(
+                gap < max_acceptable_gap,
+                "Found too large gap ({}) between consecutive locations",
+                gap
+            );
         }
 
         // Also check wrap-around gap
         let wrap_gap = 1.0 - sorted_locs.last().unwrap() + sorted_locs[0];
-        assert!(wrap_gap < max_acceptable_gap,
-            "Found too large wrap-around gap ({})", wrap_gap);
+        assert!(
+            wrap_gap < max_acceptable_gap,
+            "Found too large wrap-around gap ({})",
+            wrap_gap
+        );
     }
 
     #[test]
