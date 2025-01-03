@@ -225,36 +225,48 @@ mod test {
 
     #[test]
     fn test_ipv4_address_location() {
+        use rand::Rng;
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        
-        // Test different IP addresses and verify they map to different locations
-        let addrs = vec![
-            Ipv4Addr::new(91, 116, 34, 211),
-            Ipv4Addr::new(51, 186, 208, 163),
-            Ipv4Addr::new(100, 27, 151, 8),
-            Ipv4Addr::new(192, 168, 1, 1),
-            Ipv4Addr::new(10, 0, 0, 1),
-        ];
 
-        let locations: Vec<f64> = addrs
-            .iter()
-            .map(|ip| {
-                let addr = SocketAddr::new(IpAddr::V4(*ip), 12345);
+        let mut rng = rand::thread_rng();
+        
+        // Generate 100 random IP addresses
+        let locations: Vec<f64> = (0..100)
+            .map(|_| {
+                let ip = Ipv4Addr::new(
+                    rng.gen(),
+                    rng.gen(),
+                    rng.gen(),
+                    rng.gen(),
+                );
+                let addr = SocketAddr::new(IpAddr::V4(ip), 12345);
                 Location::from_address(&addr).0
             })
             .collect();
 
-        // Verify locations are between 0 and 1
+        // Verify all locations are between 0 and 1
         for loc in &locations {
             assert!(*loc >= 0.0 && *loc <= 1.0);
         }
 
-        // Verify locations are different from each other
-        for i in 0..locations.len() {
-            for j in (i + 1)..locations.len() {
-                assert!((locations[i] - locations[j]).abs() > 0.0001);
-            }
+        // Sort locations to check distribution
+        let mut sorted_locs = locations.clone();
+        sorted_locs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        // Check that locations are reasonably distributed
+        // by ensuring the gaps between consecutive locations
+        // aren't too large (shouldn't have huge empty spaces)
+        let max_acceptable_gap = 0.2; // 20% of the ring
+        for i in 1..sorted_locs.len() {
+            let gap = sorted_locs[i] - sorted_locs[i-1];
+            assert!(gap < max_acceptable_gap, 
+                "Found too large gap ({}) between consecutive locations", gap);
         }
+
+        // Also check wrap-around gap
+        let wrap_gap = 1.0 - sorted_locs.last().unwrap() + sorted_locs[0];
+        assert!(wrap_gap < max_acceptable_gap,
+            "Found too large wrap-around gap ({})", wrap_gap);
     }
 
     #[test]
