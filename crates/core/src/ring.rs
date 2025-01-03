@@ -10,8 +10,6 @@ use std::{
     cmp::Reverse,
     collections::BTreeMap,
     fmt::Display,
-    hash::Hasher,
-    ops::Add,
     sync::{
         atomic::{AtomicU64, AtomicUsize},
         Arc,
@@ -19,10 +17,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::bail;
 use dashmap::{mapref::one::Ref as DmRef, DashMap};
 use either::Either;
-use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
+use freenet_stdlib::prelude::ContractKey;
 use itertools::Itertools;
 use parking_lot::RwLock;
 use rand::Rng;

@@ -8,7 +8,7 @@ use rand;
 /// An abstract location on the 1D ring, represented by a real number on the interal [0, 1]
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-pub struct Location(f64);
+pub struct Location(pub(crate) f64);
 
 impl Location {
     #[cfg(all(not(feature = "local-simulation"), not(test)))]

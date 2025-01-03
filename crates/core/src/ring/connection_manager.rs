@@ -97,7 +97,7 @@ impl ConnectionManager {
         let own_location = if let Some(peer_key) = &peerid {
             // if the peer id is set, then the location must be set, since it is a gateway
             let location = Location::from_address(&peer_key.addr);
-            AtomicU64::new(u64::from_le_bytes(location.0.to_le_bytes()))
+            AtomicU64::new(u64::from_le_bytes(location.as_f64().to_le_bytes()))
         } else {
             // for location here consider -1 == None
             AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()))
@@ -184,7 +184,7 @@ impl ConnectionManager {
     pub fn update_location(&self, loc: Option<Location>) {
         if let Some(loc) = loc {
             self.own_location.store(
-                u64::from_le_bytes(loc.0.to_le_bytes()),
+                u64::from_le_bytes(loc.as_f64().to_le_bytes()),
                 std::sync::atomic::Ordering::Release,
             );
         } else {
@@ -209,7 +209,7 @@ impl ConnectionManager {
         let location = if (location - -1f64).abs() < f64::EPSILON {
             None
         } else {
-            Some(Location(location))
+            Some(Location::new(location))
         };
         let peer = self.get_peer_key().expect("peer key not set");
         PeerKeyLocation { peer, location }
