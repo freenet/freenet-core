@@ -255,6 +255,38 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                         *contract_location,
                     )
                 }
+                Change::GetContract {
+                    requester,
+                    transaction,
+                    key,
+                    contract_location,
+                } => {
+                    tracing::info!("sending get contract");
+                    ContractChange::get_contract_msg(
+                        requester,
+                        transaction,
+                        key,
+                        *contract_location,
+                    )
+                }
+                Change::SubscribedToContract {
+                    requester,
+                    transaction,
+                    key,
+                    contract_location,
+                    at_peer,
+                    at_peer_location,
+                } => {
+                    tracing::info!("sending subscribed to contract");
+                    ContractChange::subscribed_msg(
+                        requester,
+                        transaction,
+                        key,
+                        *contract_location,
+                        at_peer,
+                        *at_peer_location,
+                    )
+                }
 
                 _ => continue,
             };
@@ -359,6 +391,38 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                 );
                 tx.send(Message::Binary(msg)).await?;
             }
+            Change::GetContract {
+                requester,
+                transaction,
+                key,
+                contract_location,
+            } => {
+                let msg = ContractChange::get_contract_msg(
+                    requester,
+                    transaction,
+                    key,
+                    contract_location,
+                );
+                tx.send(Message::Binary(msg)).await?;
+            }
+            Change::SubscribedToContract {
+                requester,
+                transaction,
+                key,
+                contract_location,
+                at_peer,
+                at_peer_location,
+            } => {
+                let msg = ContractChange::subscribed_msg(
+                    requester,
+                    transaction,
+                    key,
+                    contract_location,
+                    at_peer,
+                    at_peer_location,
+                );
+                tx.send(Message::Binary(msg)).await?;
+            }
         }
     }
     Ok(())
@@ -429,6 +493,20 @@ pub(crate) enum Change {
         target: String,
         timestamp: u64,
         contract_location: f64,
+    },
+    GetContract {
+        requester: String,
+        transaction: String,
+        key: String,
+        contract_location: f64,
+    },
+    SubscribedToContract {
+        requester: String,
+        transaction: String,
+        key: String,
+        contract_location: f64,
+        at_peer: String,
+        at_peer_location: f64,
     },
 }
 
@@ -748,9 +826,17 @@ impl ServerState {
                         //connections.dedup();
                     }
                     dashmap::mapref::entry::Entry::Vacant(_vac) => {
-                        // this should not happen
-                        tracing::error!("this tx should be included on transactions_data. It should exists a PutRequest before BroadcastReceived.");
-                        unreachable!();
+                        self.transactions_data.insert(
+                            tx_id.clone(),
+                            vec![Change::BroadcastReceived {
+                                tx_id: tx_id.clone(),
+                                key: key.clone(),
+                                requester: requester.clone(),
+                                target: target.clone(),
+                                timestamp,
+                                contract_location,
+                            }],
+                        );
                     }
                 }
 
@@ -763,6 +849,189 @@ impl ServerState {
                     target,
                     timestamp,
                     contract_location,
+                });
+            }
+            ChangesWrapper::ContractChange(ContractChange::GetContract(get_contract_data)) => {
+                let requester = get_contract_data.requester().to_string();
+                let transaction = get_contract_data.transaction().to_string();
+                let key = get_contract_data.key().to_string();
+                let contract_location = get_contract_data.contract_location();
+
+                if requester.is_empty() {
+                    return Err(anyhow::anyhow!("requester is empty"));
+                }
+
+                if transaction.is_empty() {
+                    return Err(anyhow::anyhow!("transaction is empty"));
+                }
+
+                if key.is_empty() {
+                    return Err(anyhow::anyhow!("key is empty"));
+                }
+
+                if contract_location.is_nan() {
+                    return Err(anyhow::anyhow!("contract_location is not a number"));
+                }
+
+                if let Some(mut transactions) = self.transactions_data.get_mut(&transaction) {
+                    transactions.push(Change::GetContract {
+                        requester: requester.clone(),
+                        transaction: transaction.clone(),
+                        key: key.clone(),
+                        contract_location,
+                    });
+                    tracing::info!("found transaction data, adding GetContract to history");
+                } else {
+                    tracing::info!("running get_contract but with a new transaction");
+                    self.transactions_data.insert(
+                        transaction.clone(),
+                        vec![Change::GetContract {
+                            requester: requester.clone(),
+                            transaction: transaction.clone(),
+                            key: key.clone(),
+                            contract_location,
+                        }],
+                    );
+
+                    tracing::info!("finished inserting new get_contract transaction");
+                }
+
+                //match self.transactions_data.entry(transaction.clone()) {
+                //    dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                //        tracing::info!("found transaction data, adding GetContract to history");
+                //        let changes = occ.get_mut();
+                //        changes.push(Change::GetContract {
+                //            requester: requester.clone(),
+                //            transaction: transaction.clone(),
+                //            key: key.clone(),
+                //            contract_location,
+                //        });
+
+                //        //connections.sort_unstable_by(|a, b| a.cmp(&b.0));
+                //        //connections.dedup();
+                //    }
+                //    dashmap::mapref::entry::Entry::Vacant(_vac) => {
+                //        // this should not happen
+                //        self.transactions_data.insert(
+                //            transaction.clone(),
+                //            vec![Change::GetContract {
+                //                requester: requester.clone(),
+                //                transaction: transaction.clone(),
+                //                key: key.clone(),
+                //                contract_location,
+                //            }],
+                //        );
+                //    }
+                //}
+
+                tracing::debug!(%key, %contract_location, "checking values from save_record -- get_contract");
+
+                let _ = self.changes.send(Change::GetContract {
+                    requester,
+                    transaction,
+                    key,
+                    contract_location,
+                });
+            }
+            ChangesWrapper::ContractChange(ContractChange::SubscribeToContract(subscribe_data)) => {
+                let requester = subscribe_data.requester().to_string();
+                let transaction = subscribe_data.transaction().to_string();
+                let key = subscribe_data.key().to_string();
+                let contract_location = subscribe_data.contract_location();
+                let at_peer = subscribe_data.at_peer().to_string();
+                let at_peer_location = subscribe_data.at_peer_location();
+
+                if requester.is_empty() {
+                    return Err(anyhow::anyhow!("requester is empty"));
+                }
+
+                if transaction.is_empty() {
+                    return Err(anyhow::anyhow!("transaction is empty"));
+                }
+
+                if key.is_empty() {
+                    return Err(anyhow::anyhow!("key is empty"));
+                }
+
+                if at_peer.is_empty() {
+                    return Err(anyhow::anyhow!("at_peer is empty"));
+                }
+
+                if let Some(mut transactions_list) = self.transactions_data.get_mut(&transaction) {
+                    transactions_list.push(Change::SubscribedToContract {
+                        requester: requester.clone(),
+                        transaction: transaction.clone(),
+                        key: key.clone(),
+                        contract_location,
+                        at_peer: at_peer.clone(),
+                        at_peer_location,
+                    });
+                    tracing::info!(
+                        "found transaction data, adding SubscribedToContract to history"
+                    );
+                } else {
+                    tracing::info!("running subscribed_to contract but with a new transaction");
+                    self.transactions_data.insert(
+                        transaction.clone(),
+                        vec![Change::SubscribedToContract {
+                            requester: requester.clone(),
+                            transaction: transaction.clone(),
+                            key: key.clone(),
+                            contract_location,
+                            at_peer: at_peer.clone(),
+                            at_peer_location,
+                        }],
+                    );
+
+                    tracing::info!("finished inserting new subscribed_to transaction");
+                }
+
+                //match self.transactions_data.entry(transaction.clone()) {
+                //    dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                //        tracing::info!(
+                //            "found transaction data, adding SubscribedToContract to history"
+                //        );
+                //        let changes = occ.get_mut();
+                //        changes.push(Change::SubscribedToContract {
+                //            requester: requester.clone(),
+                //            transaction: transaction.clone(),
+                //            key: key.clone(),
+                //            contract_location,
+                //            at_peer: at_peer.clone(),
+                //            at_peer_location,
+                //        });
+
+                //        //connections.sort_unstable_by(|a, b| a.cmp(&b.0));
+                //        //connections.dedup();
+                //    }
+                //    dashmap::mapref::entry::Entry::Vacant(_vac) => {
+                //        // this should not happen
+                //        tracing::warn!(
+                //            "Trying to subscribe to a transaction that does not exist yet."
+                //        );
+                //        self.transactions_data.insert(
+                //            transaction.clone(),
+                //            vec![Change::SubscribedToContract {
+                //                requester: requester.clone(),
+                //                transaction: transaction.clone(),
+                //                key: key.clone(),
+                //                contract_location,
+                //                at_peer: at_peer.clone(),
+                //                at_peer_location,
+                //            }],
+                //        );
+                //    }
+                //}
+
+                tracing::debug!(%key, %contract_location, "checking values from save_record -- subscribed_to msg");
+
+                let _ = self.changes.send(Change::SubscribedToContract {
+                    requester,
+                    transaction,
+                    key,
+                    contract_location,
+                    at_peer,
+                    at_peer_location,
                 });
             }
 
