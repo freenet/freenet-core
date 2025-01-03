@@ -109,6 +109,22 @@ table BroadcastReceived {
   contract_location: float64;
 }
 
+table GetContract {
+  requester: string(required);
+  transaction: string(required);
+  key: string(required);
+  contract_location: float64;
+}
+
+table SubscribeToContract {
+  requester: string(required);
+  transaction: string(required);
+  key: string(required);
+  contract_location: float64;
+  at_peer: string(required);
+  at_peer_location: float64;
+}
+
 union ContractChangeType {
   PutRequest,
   PutSuccess,
@@ -118,6 +134,9 @@ union ContractChangeType {
   UpdateRequest,
   UpdateSuccess,
   UpdateFailure,
+  GetContract,
+  SubscribeToContract
+
 }
 
 table ContractChange {

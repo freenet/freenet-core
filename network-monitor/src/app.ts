@@ -61,6 +61,14 @@ function handleChanges(event: MessageEvent) {
                     contractChange.changeType()
                 );
 
+                if (
+                    now_change_type != ChangeType.PUT_REQUEST &&
+                    now_change_type != ChangeType.PUT_SUCCESS &&
+                    now_change_type != ChangeType.BROADCAST_EMITTED
+                ) {
+                    console.log("Change Type: ", now_change_type);
+                }
+
                 if (now_change_type == ChangeType.BROADCAST_EMITTED) {
                     let {
                         transaction,
