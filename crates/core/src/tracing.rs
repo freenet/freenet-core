@@ -554,6 +554,9 @@ async fn send_to_metrics_server(
                 *timestamp,
                 contract_location.as_f64(),
             );
+
+            tracing::info!("is_going_here");
+
             ws_stream.send(Message::Binary(msg.into())).await
         }
         EventKind::Put(PutEvent::PutSuccess {
@@ -615,6 +618,32 @@ async fn send_to_metrics_server(
                 *timestamp,
                 contract_location.as_f64(),
             );
+            ws_stream.send(Message::Binary(msg.into())).await
+        }
+        EventKind::Get { key } => {
+            let contract_location = Location::from_contract_key(key.as_bytes());
+            let msg = ContractChange::get_contract_msg(
+                send_msg.peer_id.to_string(),
+                send_msg.tx.to_string(),
+                key.to_string(),
+                contract_location.as_f64(),
+            );
+
+            tracing::info!("Sending get_contract msg: {}", send_msg.tx);
+            ws_stream.send(Message::Binary(msg.into())).await
+        }
+        EventKind::Subscribed { key, at } => {
+            let contract_location = Location::from_contract_key(key.as_bytes());
+            let msg = ContractChange::subscribed_msg(
+                send_msg.peer_id.to_string(),
+                send_msg.tx.to_string(),
+                key.to_string(),
+                contract_location.as_f64(),
+                at.peer.to_string(),
+                at.location.unwrap().as_f64(),
+            );
+
+            tracing::info!("Sending subscribed_to msg: {}", send_msg.tx);
             ws_stream.send(Message::Binary(msg.into())).await
         }
         _ => Ok(()),
