@@ -46,6 +46,9 @@ use crate::{
 
 mod connection_manager;
 pub(crate) use connection_manager::ConnectionManager;
+mod location;
+
+pub use location::{Distance, Location};
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
@@ -742,12 +745,6 @@ impl Ring {
         Ok(Some(id))
     }
 }
-
-mod location;
-pub use location::{Distance, Location};
-
-
-
 
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum RingError {
