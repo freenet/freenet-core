@@ -1,5 +1,0 @@
-test-cmd: cd crates/core; cargo test
-auto-test: true
-suggest-shell-commands: false
-cache-prompts: true
-dark-mode: true
