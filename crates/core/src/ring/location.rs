@@ -19,7 +19,7 @@ impl Location {
                 let combined_octets = (u32::from(octets[0]) << 16)
                     | (u32::from(octets[1]) << 8)
                     | u32::from(octets[2]);
-                Location(combined_octets as f64 / (u32::MAX as f64))
+                Location(combined_octets as f64 / 16777215.0) // 2^24 - 1
             }
             std::net::IpAddr::V6(ipv6) => {
                 let segments = ipv6.segments();
