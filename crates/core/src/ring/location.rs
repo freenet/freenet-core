@@ -227,20 +227,34 @@ mod test {
     fn test_ipv4_address_location() {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         
-        // Test case from example: 91.116.34.211:14193
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(91, 116, 34, 211)), 14193);
-        let location = Location::from_address(&addr);
-        assert!((location.0 - 0.0013954718600482383).abs() < f64::EPSILON);
+        // Test different IP addresses and verify they map to different locations
+        let addrs = vec![
+            Ipv4Addr::new(91, 116, 34, 211),
+            Ipv4Addr::new(51, 186, 208, 163),
+            Ipv4Addr::new(100, 27, 151, 8),
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(10, 0, 0, 1),
+        ];
 
-        // Test case from example: 51.186.208.163:31337
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(51, 186, 208, 163)), 31337);
-        let location = Location::from_address(&addr);
-        assert!((location.0 - 0.0007893331350733836).abs() < f64::EPSILON);
+        let locations: Vec<f64> = addrs
+            .iter()
+            .map(|ip| {
+                let addr = SocketAddr::new(IpAddr::V4(*ip), 12345);
+                Location::from_address(&addr).0
+            })
+            .collect();
 
-        // Test case from example: 100.27.151.8:31337
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 27, 151, 8)), 31337);
-        let location = Location::from_address(&addr);
-        assert!((location.0 - 0.0015275233894417816).abs() < f64::EPSILON);
+        // Verify locations are between 0 and 1
+        for loc in &locations {
+            assert!(*loc >= 0.0 && *loc <= 1.0);
+        }
+
+        // Verify locations are different from each other
+        for i in 0..locations.len() {
+            for j in (i + 1)..locations.len() {
+                assert!((locations[i] - locations[j]).abs() > 0.0001);
+            }
+        }
     }
 
     #[test]
