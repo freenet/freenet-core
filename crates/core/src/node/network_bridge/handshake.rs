@@ -120,12 +120,15 @@ pub(super) enum ExternConnection {
         tx: Transaction,
         is_gw: bool,
     },
+    Dropped {
+        peer: PeerId,
+    },
 }
 
-/// Use for starting a new outboound connection to a peer.
-pub(super) struct EstablishConnection(pub(crate) mpsc::Sender<ExternConnection>);
+/// Used for communicating with the HandshakeHandler.
+pub(super) struct HanshakeHandlerMsg(pub(crate) mpsc::Sender<ExternConnection>);
 
-impl EstablishConnection {
+impl HanshakeHandlerMsg {
     pub async fn establish_conn(&self, remote: PeerId, tx: Transaction, is_gw: bool) -> Result<()> {
         self.0
             .send(ExternConnection::Establish {
@@ -133,6 +136,14 @@ impl EstablishConnection {
                 tx,
                 is_gw,
             })
+            .await
+            .map_err(|_| HandshakeError::ChannelClosed)?;
+        Ok(())
+    }
+
+    pub async fn drop_connection(&self, remote: PeerId) -> Result<()> {
+        self.0
+            .send(ExternConnection::Dropped { peer: remote })
             .await
             .map_err(|_| HandshakeError::ChannelClosed)?;
         Ok(())
@@ -194,9 +205,9 @@ impl HandshakeHandler {
         outbound_conn_handler: OutboundConnectionHandler,
         connection_manager: ConnectionManager,
         router: Arc<RwLock<Router>>,
-    ) -> (Self, EstablishConnection, OutboundMessage) {
-        let (pending_msg_tx, pending_msg_rx) = tokio::sync::mpsc::channel(100);
-        let (establish_connection_tx, establish_connection_rx) = tokio::sync::mpsc::channel(100);
+    ) -> (Self, HanshakeHandlerMsg, OutboundMessage) {
+        let (pending_msg_tx, pending_msg_rx) = tokio::sync::mpsc::channel(1);
+        let (establish_connection_tx, establish_connection_rx) = tokio::sync::mpsc::channel(1);
         let connector = HandshakeHandler {
             connecting: HashMap::new(),
             connected: HashSet::new(),
@@ -212,7 +223,7 @@ impl HandshakeHandler {
         };
         (
             connector,
-            EstablishConnection(establish_connection_tx),
+            HanshakeHandlerMsg(establish_connection_tx),
             OutboundMessage(pending_msg_tx),
         )
     }
@@ -465,6 +476,10 @@ impl HandshakeHandler {
                     match establish_connection {
                         Some(ExternConnection::Establish { peer, tx, is_gw }) => {
                             self.start_outbound_connection(peer, tx, is_gw).await;
+                        }
+                        Some(ExternConnection::Dropped { peer }) => {
+                            self.connected.remove(&peer.addr);
+                            self.outbound_messages.remove(&peer.addr);
                         }
                         None => return Err(HandshakeError::ChannelClosed),
                     }
@@ -1203,7 +1218,7 @@ mod tests {
     }
 
     struct NodeMock {
-        establish_conn: EstablishConnection,
+        establish_conn: HanshakeHandlerMsg,
         _outbound_msg: OutboundMessage,
     }
 
