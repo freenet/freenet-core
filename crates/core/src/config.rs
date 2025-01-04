@@ -84,6 +84,7 @@ impl Default for ConfigArgs {
                 public_port: None,
                 is_gateway: false,
                 skip_load_from_network: true,
+                ignore_protocol_checking: false,
             },
             ws_api: WebsocketApiArgs {
                 address: Some(default_listening_address()),
@@ -289,6 +290,7 @@ impl ConfigArgs {
                     .unwrap_or(default_network_api_port()),
                 public_address: self.network_api.public_address,
                 public_port: self.network_api.public_port,
+                ignore_protocol: self.network_api.ignore_protocol_checking,
             },
             ws_api: WebsocketApiConfig {
                 address: self.ws_api.address.unwrap_or_else(|| match mode {
@@ -439,6 +441,10 @@ pub struct NetworkArgs {
     /// Skips loading gateway configurations from the network and merging it with existing one.
     #[arg(long)]
     pub skip_load_from_network: bool,
+
+    /// Ignores protocol version failures, continuing to run the node if there is a mismatch with the gateway.
+    #[arg(long)]
+    pub ignore_protocol_checking: bool,
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
@@ -461,6 +467,9 @@ pub struct NetworkApiConfig {
     /// Public external port for the network, mandatory for gateways.
     #[serde(rename = "public_port", skip_serializing_if = "Option::is_none")]
     pub public_port: Option<u16>,
+
+    #[serde(skip)]
+    pub ignore_protocol: bool,
 }
 
 #[inline]

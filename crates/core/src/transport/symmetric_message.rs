@@ -28,14 +28,17 @@ impl SymmetricMessage {
         bincode::deserialize(bytes)
     }
 
+    const ACK_ERROR_MSG: &str = concat!(
+        "remote is using a different protocol version, expected version ",
+        env!("CARGO_PKG_VERSION")
+    );
+
     const ACK_ERROR: SymmetricMessage = SymmetricMessage {
         packet_id: Self::FIRST_PACKET_ID,
         confirm_receipt: Vec::new(),
         payload: SymmetricMessagePayload::AckConnection {
             // TODO: change to return UnsupportedProtocolVersion
-            result: Err(Cow::Borrowed(
-                "remote is using a different protocol version",
-            )),
+            result: Err(Cow::Borrowed(Self::ACK_ERROR_MSG)),
         },
     };
 

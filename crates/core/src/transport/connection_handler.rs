@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -579,7 +580,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                 tracing::debug!(%remote_addr, "received intro packet");
                 let protoc = &decrypted_intro_packet.data()[..PROTOC_VERSION.len()];
                 if protoc != PROTOC_VERSION {
-                    todo!("return error");
+                    tracing::debug!(%remote_addr, ?protoc, this_protoc = ?PROTOC_VERSION, "remote is using a different protocol version");
+                    return Err(());
                 }
                 let outbound_key_bytes =
                     &decrypted_intro_packet.data()[PROTOC_VERSION.len()..PROTOC_VERSION.len() + 16];
@@ -725,11 +727,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         SymmetricMessagePayload::AckConnection {
                                             result: Err(err),
                                         } => {
-                                            return Err(
-                                                TransportError::ConnectionEstablishmentFailure {
-                                                    cause: err,
-                                                },
-                                            );
+                                            return Err(handle_ack_connection_error(err));
                                         }
                                         _ => {
                                             tracing::debug!(%remote_addr, "unexpected packet from remote");
@@ -837,6 +835,17 @@ impl<S: Socket> UdpPacketsListener<S> {
     }
 }
 
+fn handle_ack_connection_error(err: Cow<'static, str>) -> TransportError {
+    if let Some(expected) = err.split("expected version").nth(1) {
+        TransportError::ProtocolVersionMismatch {
+            expected: expected.trim().to_string(),
+            actual: version_cmp::VERSION,
+        }
+    } else {
+        TransportError::ConnectionEstablishmentFailure { cause: err }
+    }
+}
+
 fn key_from_addr(addr: &SocketAddr) -> [u8; 16] {
     let current_time = chrono::Utc::now();
     let mut hasher = blake3::Hasher::new();
@@ -878,7 +887,7 @@ struct InboundRemoteConnection {
 }
 
 mod version_cmp {
-    const VERSION: &str = env!("CARGO_PKG_VERSION");
+    pub(super) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
     pub(super) const PROTOC_VERSION: [u8; 8] = parse_version_with_flags(VERSION);
 
@@ -1013,6 +1022,27 @@ mod test {
 
     use super::*;
     use crate::transport::packet_data::MAX_DATA_SIZE;
+
+    #[test]
+    fn test_handle_ack_connection_error() {
+        let err_msg =
+            "remote is using a different protocol version, expected version 1.2.3".to_string();
+        match handle_ack_connection_error(err_msg.into()) {
+            TransportError::ProtocolVersionMismatch { expected, actual } => {
+                assert_eq!(expected, "1.2.3");
+                assert_eq!(actual, version_cmp::VERSION);
+            }
+            _ => panic!("Expected ProtocolVersionMismatch error"),
+        }
+
+        let err_msg_no_version = "remote is using a different protocol version".to_string();
+        match handle_ack_connection_error(err_msg_no_version.clone().into()) {
+            TransportError::ConnectionEstablishmentFailure { cause } => {
+                assert_eq!(cause, err_msg_no_version);
+            }
+            _ => panic!("Expected ConnectionEstablishmentFailure error"),
+        }
+    }
 
     type Channels = Arc<DashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>>;
 
