@@ -30,7 +30,7 @@ impl Location {
                     | (u32::from(octets[1]) << 8)
                     | u32::from(octets[2]);
                 let hashed = simple_hash(combined_octets);
-                Location(hashed as f64 / u32::MAX as f64)
+                Location(hashed as f64 / u64::MAX as f64)
             }
             std::net::IpAddr::V6(ipv6) => {
                 let segments = ipv6.segments();
