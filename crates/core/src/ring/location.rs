@@ -32,10 +32,12 @@ impl Location {
                 Location(hashed as f64 / u64::MAX as f64)
             }
             std::net::IpAddr::V6(ipv6) => {
+                // Take first 8 bytes (4 segments) of IPv6 address
                 let segments = ipv6.segments();
-                let combined_segments = (u64::from(segments[0]) << 32)
-                    | (u64::from(segments[1]) << 16)
-                    | u64::from(segments[2]);
+                let combined_segments = (u64::from(segments[0]) << 48)
+                    | (u64::from(segments[1]) << 32)
+                    | (u64::from(segments[2]) << 16)
+                    | u64::from(segments[3]);
                 let hashed = distribute_hash(combined_segments);
                 Location(hashed as f64 / u64::MAX as f64)
             }
