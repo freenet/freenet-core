@@ -26,7 +26,9 @@ impl Location {
         match addr.ip() {
             std::net::IpAddr::V4(ipv4) => {
                 let value: u32 = ipv4.into();
-                let hashed = distribute_hash(value as u64);
+                // Mask out the last byte
+                let masked_value = value & 0xFFFFFF00;
+                let hashed = distribute_hash(masked_value as u64);
                 Location(hashed as f64 / u64::MAX as f64)
             }
             std::net::IpAddr::V6(ipv6) => {
