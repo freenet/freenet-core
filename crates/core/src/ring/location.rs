@@ -26,9 +26,9 @@ impl Location {
         match addr.ip() {
             std::net::IpAddr::V4(ipv4) => {
                 let octets = ipv4.octets();
-                let combined_octets = (u32::from(octets[0]) << 16)
-                    | (u32::from(octets[1]) << 8)
-                    | u32::from(octets[2]);
+                let combined_octets = (u64::from(octets[0]) << 16)
+                    | (u64::from(octets[1]) << 8)
+                    | u64::from(octets[2]);
                 let hashed = distribute_hash(combined_octets);
                 Location(hashed as f64 / u64::MAX as f64)
             }
@@ -320,9 +320,9 @@ mod test {
 
         let locations: Vec<Location> = addresses.iter().map(Location::deterministic_loc).collect();
         let expected_locations = vec![
-            Location(0.9695508112571837),
-            Location(0.6870191464639596),
-            Location(0.31787443724464287),
+            Location(0.336521824390997),
+            Location(0.40492250948682484),
+            Location(0.07821476925699528),
         ];
         assert_eq!(locations, expected_locations);
     }
