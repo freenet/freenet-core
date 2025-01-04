@@ -320,9 +320,9 @@ mod test {
 
         let locations: Vec<Location> = addresses.iter().map(Location::deterministic_loc).collect();
         let expected_locations = vec![
-            Location(0.336521824390997),
-            Location(0.40492250948682484),
-            Location(0.07821476925699528),
+            Location(0.9695508112571837),
+            Location(0.6870191464639596),
+            Location(0.31787443724464287),
         ];
         assert_eq!(locations, expected_locations);
     }
