@@ -26,13 +26,14 @@ impl Location {
         match addr.ip() {
             std::net::IpAddr::V4(ipv4) => {
                 let value: u32 = ipv4.into();
-                // Mask out the last byte
+                // Mask out the last byte for sybil mitigation
                 let masked_value = value & 0xFFFFFF00;
                 let hashed = distribute_hash(masked_value as u64);
                 Location(hashed as f64 / u64::MAX as f64)
             }
             std::net::IpAddr::V6(ipv6) => {
                 let segments = ipv6.segments();
+                // We only use the first 3 segments for sybil migation
                 let combined_segments = (u64::from(segments[0]) << 32)
                     | (u64::from(segments[1]) << 16)
                     | u64::from(segments[2]);
