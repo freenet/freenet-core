@@ -237,14 +237,14 @@ impl Display for Distance {
 /// - Uses a series of bit-mixing operations (multiplication by large primes and XOR shifts).
 /// - Inspired by techniques from MurmurHash and SplitMix64, optimized for speed and distribution.
 fn distribute_hash(x: u64) -> u64 {
-    let mut h = x; // Already u64
-    h = h.wrapping_mul(0x9e3779b97f4a7c15); // Prime multiplier
-    h ^= h >> 33; // XOR and shift
-    h = h.wrapping_mul(0xc2b2ae3d27d4eb4f); // Second prime
-    h ^= h >> 29; // XOR again
-    h = h.wrapping_mul(0x85ebca6b2b2d3d1d); // Final prime
-    h ^= h >> 32; // Final XOR
-    h // Return the u64 directly
+    let mut h = x;
+    h = h.wrapping_mul(0x517cc1b727220a95);
+    h ^= h >> 32;
+    h = h.wrapping_mul(0x4cf5ad432745937f);
+    h ^= h >> 28;
+    h = h.wrapping_mul(0x2f38a814cad5c4ed);
+    h ^= h >> 31;
+    h
 }
 
 #[cfg(test)]
