@@ -1,9 +1,10 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{collections::HashMap, time::Instant};
 
+use crate::transport::connection_handler::NAT_TRAVERSAL_MAX_ATTEMPTS;
 use crate::transport::packet_data::UnknownEncryption;
 use aes_gcm::Aes128Gcm;
 use futures::stream::FuturesUnordered;
@@ -94,6 +95,8 @@ pub(crate) struct PeerConnection {
     inbound_streams: HashMap<StreamId, mpsc::Sender<(u32, Vec<u8>)>>,
     inbound_stream_futures: FuturesUnordered<JoinHandle<InboundStreamResult>>,
     outbound_stream_futures: FuturesUnordered<JoinHandle<Result>>,
+    failure_count: usize,
+    first_failure_time: Option<std::time::Instant>,
 }
 
 impl std::fmt::Debug for PeerConnection {
@@ -126,6 +129,8 @@ impl PeerConnection {
             inbound_streams: HashMap::new(),
             inbound_stream_futures: FuturesUnordered::new(),
             outbound_stream_futures: FuturesUnordered::new(),
+            failure_count: 0,
+            first_failure_time: None,
         }
     }
 
@@ -221,20 +226,38 @@ impl PeerConnection {
         keep_alive.tick().await;
         let mut last_received = std::time::Instant::now();
 
+        const FAILURE_TIME_WINDOW: Duration = Duration::from_secs(30);
+
         loop {
             // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
             tokio::select! {
                 inbound = self.remote_conn.inbound_packet_recv.recv() => {
                     let packet_data = inbound.ok_or(TransportError::ConnectionClosed(self.remote_addr()))?;
                     last_received = std::time::Instant::now();
-                    let Ok(decrypted) = packet_data.try_decrypt_sym(&self.remote_conn.inbound_symmetric_key).map_err(|error| {
+                    let Ok(decrypted) = packet_data.try_decrypt_sym(&self.remote_conn.inbound_symmetric_key).inspect_err(|error| {
                         tracing::debug!(%error, remote = ?self.remote_conn.remote_addr, "Failed to decrypt packet, might be an intro packet or a partial packet");
                     }) else {
-                        // just ignore this message
-                        // TODO: maybe check how frequently this happens and decide to drop a connection based on that
-                        // if it is partial packets being received too often
-                        // TODO: this branch should at much happen UdpPacketsListener::NAT_TRAVERSAL_MAX_ATTEMPTS
-                        // for intro packets will be sent than this amount, so we could be checking for that initially
+                        let now = Instant::now();
+                        if let Some(first_failure_time) = self.first_failure_time {
+                            if now.duration_since(first_failure_time) <= FAILURE_TIME_WINDOW {
+                                self.failure_count += 1;
+                            } else {
+                                // Reset the failure count and time window
+                                self.failure_count = 1;
+                                self.first_failure_time = Some(now);
+                            }
+                        } else {
+                            // Initialize the failure count and time window
+                            self.failure_count = 1;
+                            self.first_failure_time = Some(now);
+                        }
+
+                        if self.failure_count > NAT_TRAVERSAL_MAX_ATTEMPTS {
+                            tracing::warn!(remote = ?self.remote_conn.remote_addr, "Dropping connection due to repeated decryption failures");
+                            // Drop the connection (implement the logic to drop the connection here)
+                            return Err(TransportError::ConnectionClosed(self.remote_addr()));
+                        }
+
                         tracing::trace!(remote = ?self.remote_conn.remote_addr, "ignoring packet");
                         continue;
                     };

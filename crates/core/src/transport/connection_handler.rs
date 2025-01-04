@@ -241,6 +241,12 @@ task_local! {
     static RANDOM_U64: [u8; 8];
 }
 
+#[cfg(not(test))]
+pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 20;
+
+#[cfg(test)]
+pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
+
 impl<S: Socket> UdpPacketsListener<S> {
     #[tracing::instrument(level = "debug", name = "transport_listener", fields(peer = %self.this_peer_keypair.public), skip_all)]
     async fn listen(mut self) -> Result<(), TransportError> {
@@ -533,13 +539,6 @@ impl<S: Socket> UdpPacketsListener<S> {
         (f.boxed(), inbound_from_remote)
     }
 
-    // TODO: this value should be set given exponential backoff and max timeout
-    #[cfg(not(test))]
-    const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 20;
-
-    #[cfg(test)]
-    const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
-
     #[allow(clippy::type_complexity)]
     fn traverse_nat(
         &mut self,
@@ -624,7 +623,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
             let mut sent_tracker = SentPacketTracker::new();
 
-            while failures < Self::NAT_TRAVERSAL_MAX_ATTEMPTS {
+            while failures < NAT_TRAVERSAL_MAX_ATTEMPTS {
                 match state {
                     ConnectionState::StartOutbound { .. } => {
                         tracing::debug!(%remote_addr, "sending protocol version and inbound key");
