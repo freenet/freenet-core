@@ -328,6 +328,23 @@ mod test {
     }
 
     #[test]
+    fn test_ipv6_address_location() {
+        let addresses = [
+            SocketAddr::new(IpAddr::V6([0x2001, 0xdb8, 0x1234, 0x5678, 0xabcd, 0xef01, 0x2345, 0x6789].into()), 12345),
+            SocketAddr::new(IpAddr::V6([0xfe80, 0x0000, 0x0000, 0x0000, 0x0202, 0xb3ff, 0xfe1e, 0x8329].into()), 12345),
+            SocketAddr::new(IpAddr::V6([0x2001, 0x4860, 0x4860, 0x0000, 0x0000, 0x0000, 0x0000, 0x8888].into()), 12345),
+        ];
+
+        let locations: Vec<Location> = addresses.iter().map(Location::deterministic_loc).collect();
+        let expected_locations = vec![
+            Location(0.0),
+            Location(0.0),
+            Location(0.0),
+        ];
+        assert_eq!(locations, expected_locations);
+    }
+
+    #[test]
     fn location_dist() {
         let l0 = Location(0.);
         let l1 = Location(0.25);
