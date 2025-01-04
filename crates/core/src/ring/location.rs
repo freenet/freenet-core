@@ -29,14 +29,16 @@ impl Location {
                 let combined_octets = (u32::from(octets[0]) << 16)
                     | (u32::from(octets[1]) << 8)
                     | u32::from(octets[2]);
-                Location(combined_octets as f64 / 16777215.0) // 2^24 - 1
+                let hashed = simple_hash(combined_octets);
+                Location(hashed as f64 / u32::MAX as f64)
             }
             std::net::IpAddr::V6(ipv6) => {
                 let segments = ipv6.segments();
                 let combined_segments = (u64::from(segments[0]) << 32)
                     | (u64::from(segments[1]) << 16)
                     | u64::from(segments[2]);
-                Location(combined_segments as f64 / 281474976710655.0) // 2^48 - 1
+                let hashed = simple_hash(combined_segments);
+                Location(hashed as f64 / u64::MAX as f64)
             }
         }
     }
@@ -221,6 +223,17 @@ impl Display for Distance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
+}
+
+fn simple_hash<T: Into<u64>>(x: T) -> u64 {
+    let mut h = x.into(); // Convert input to u64 for consistency
+    h = h.wrapping_mul(0x9e3779b97f4a7c15);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc2b2ae3d27d4eb4f);
+    h ^= h >> 29;
+    h = h.wrapping_mul(0x85ebca6b2b2d3d1d);
+    h ^= h >> 32;
+    h
 }
 
 #[cfg(test)]
