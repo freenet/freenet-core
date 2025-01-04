@@ -26,11 +26,11 @@ impl Location {
         match addr.ip() {
             std::net::IpAddr::V4(ipv4) => {
                 let octets = ipv4.octets();
-                // is necessary to convert this to u64 and shifft the bits anymore? can't we directly hash the different octets? AI!
-                let combined_octets = (u64::from(octets[0]) << 16)
-                    | (u64::from(octets[1]) << 8)
-                    | u64::from(octets[2]);
-                let hashed = distribute_hash(combined_octets);
+                let mut hash_value = distribute_hash(u64::from(octets[0]));
+                for &octet in &octets[1..3] {
+                    hash_value ^= distribute_hash(u64::from(octet));
+                }
+                let hashed = hash_value;
                 Location(hashed as f64 / u64::MAX as f64)
             }
             std::net::IpAddr::V6(ipv6) => {
