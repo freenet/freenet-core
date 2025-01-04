@@ -116,6 +116,7 @@ pub(in crate::node) struct P2pConnManager {
     listening_ip: IpAddr,
     listening_port: u16,
     is_gateway: bool,
+    check_version: bool,
 }
 
 impl P2pConnManager {
@@ -142,9 +143,11 @@ impl P2pConnManager {
             listening_ip: listener_ip,
             listening_port: listen_port,
             is_gateway: config.is_gateway,
+            check_version: !config.config.network_api.ignore_protocol,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(name = "network_event_listener", fields(peer = %self.bridge.op_manager.ring.connection_manager.pub_key), skip_all)]
     pub async fn run_event_listener(
         mut self,
@@ -549,6 +552,24 @@ impl P2pConnManager {
             }
             HandshakeEvent::OutboundConnectionFailed { peer_id, error } => {
                 tracing::info!(%peer_id, "Connection failed: {:?}", error);
+                if self.check_version {
+                    if let HandshakeError::TransportError(
+                        TransportError::ProtocolVersionMismatch { expected, actual },
+                    ) = &error
+                    {
+                        tracing::error!(
+                            %peer_id,
+                            "Protocol version mismatch: expected {}, got {}",
+                            expected,
+                            actual
+                        );
+                        return Err(anyhow::anyhow!(
+                            "Protocol version mismatch: expected {}, got {}",
+                            expected,
+                            actual
+                        ));
+                    }
+                }
                 if let Some(mut r) = state.awaiting_connection.remove(&peer_id.addr) {
                     r.send_result(Err(error)).await?;
                 }

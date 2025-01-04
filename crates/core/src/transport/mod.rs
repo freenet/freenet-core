@@ -44,6 +44,11 @@ pub(crate) enum TransportError {
     ConnectionClosed(SocketAddr),
     #[error("failed while establishing connection, reason: {cause}")]
     ConnectionEstablishmentFailure { cause: Cow<'static, str> },
+    #[error("wrong version of the protocol for gateway, expected {expected}, got {actual}")]
+    ProtocolVersionMismatch {
+        expected: String,
+        actual: &'static str,
+    },
     #[error(transparent)]
     IO(#[from] std::io::Error),
     #[error(transparent)]
