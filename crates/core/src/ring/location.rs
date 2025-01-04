@@ -25,18 +25,20 @@ impl Location {
     fn deterministic_loc(addr: &std::net::SocketAddr) -> Self {
         match addr.ip() {
             std::net::IpAddr::V4(ipv4) => {
-                let octets = ipv4.octets();
-                let combined_octets = (u32::from(octets[0]) << 16)
-                    | (u32::from(octets[1]) << 8)
-                    | u32::from(octets[2]);
-                Location(combined_octets as f64 / 16777215.0) // 2^24 - 1
+                let value: u32 = ipv4.into();
+                // Mask out the last byte for sybil mitigation
+                let masked_value = value & 0xFFFFFF00;
+                let hashed = distribute_hash(masked_value as u64);
+                Location(hashed as f64 / u64::MAX as f64)
             }
             std::net::IpAddr::V6(ipv6) => {
                 let segments = ipv6.segments();
+                // We only use the first 3 segments for sybil migation
                 let combined_segments = (u64::from(segments[0]) << 32)
                     | (u64::from(segments[1]) << 16)
                     | u64::from(segments[2]);
-                Location(combined_segments as f64 / 281474976710655.0) // 2^48 - 1
+                let hashed = distribute_hash(combined_segments);
+                Location(hashed as f64 / u64::MAX as f64)
             }
         }
     }
@@ -223,6 +225,31 @@ impl Display for Distance {
     }
 }
 
+/// A simple, non-cryptographic hash function for evenly distributing integer inputs.
+///
+/// # Purpose
+/// This function generates a hash that evenly distributes input values, even if they
+/// are sequential or exhibit patterns. It is **not cryptographically secure** but is
+/// suitable for use cases such as hash tables, randomized ordering, or lookup keys.
+///
+/// # Supported Types
+/// Works with any unsigned integer type (`u8`, `u16`, `u32`, `u64`, `u128`) and returns
+/// a value of the **same type** as the input.
+///
+/// # Implementation
+/// - Uses a series of bit-mixing operations (multiplication by large primes and XOR shifts).
+/// - Inspired by techniques from MurmurHash and SplitMix64, optimized for speed and distribution.
+fn distribute_hash(x: u64) -> u64 {
+    let mut h = x;
+    h = h.wrapping_mul(0x517cc1b727220a95);
+    h ^= h >> 32;
+    h = h.wrapping_mul(0x4cf5ad432745937f);
+    h ^= h >> 28;
+    h = h.wrapping_mul(0x2f38a814cad5c4ed);
+    h ^= h >> 31;
+    h
+}
+
 #[cfg(test)]
 mod test {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -292,9 +319,50 @@ mod test {
 
         let locations: Vec<Location> = addresses.iter().map(Location::deterministic_loc).collect();
         let expected_locations = vec![
-            Location(0.336521824390997),
-            Location(0.40492250948682484),
-            Location(0.07821476925699528),
+            Location(0.7110288569038304),
+            Location(0.6202899973091933),
+            Location(0.2587135150434003),
+        ];
+        assert_eq!(locations, expected_locations);
+    }
+
+    #[test]
+    fn test_ipv6_address_location() {
+        let addresses = [
+            SocketAddr::new(
+                IpAddr::V6(
+                    [
+                        0x2001, 0xdb8, 0x1234, 0x5678, 0xabcd, 0xef01, 0x2345, 0x6789,
+                    ]
+                    .into(),
+                ),
+                12345,
+            ),
+            SocketAddr::new(
+                IpAddr::V6(
+                    [
+                        0xfe80, 0x0000, 0x0000, 0x0000, 0x0202, 0xb3ff, 0xfe1e, 0x8329,
+                    ]
+                    .into(),
+                ),
+                12345,
+            ),
+            SocketAddr::new(
+                IpAddr::V6(
+                    [
+                        0x2001, 0x4860, 0x4860, 0x0000, 0x0000, 0x0000, 0x0000, 0x8888,
+                    ]
+                    .into(),
+                ),
+                12345,
+            ),
+        ];
+
+        let locations: Vec<Location> = addresses.iter().map(Location::deterministic_loc).collect();
+        let expected_locations = vec![
+            Location(0.4539831101283351),
+            Location(0.7201264112803492),
+            Location(0.2243401485619054),
         ];
         assert_eq!(locations, expected_locations);
     }
