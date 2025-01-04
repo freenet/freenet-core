@@ -26,7 +26,7 @@ impl Location {
         match addr.ip() {
             std::net::IpAddr::V4(ipv4) => {
                 let value: u32 = ipv4.into();
-                let hashed = distribute_hash(value);
+                let hashed = distribute_hash(value as u64);
                 Location(hashed as f64 / u64::MAX as f64)
             }
             std::net::IpAddr::V6(ipv6) => {
@@ -236,8 +236,8 @@ impl Display for Distance {
 /// # Implementation
 /// - Uses a series of bit-mixing operations (multiplication by large primes and XOR shifts).
 /// - Inspired by techniques from MurmurHash and SplitMix64, optimized for speed and distribution.
-fn distribute_hash<T: Copy + Into<u64> + From<u64>>(x: T) -> T {
-    let mut h = x.into(); // Normalize input to u64
+fn distribute_hash(x: u64) -> u64 {
+    let mut h = x; // Already u64
     h = h.wrapping_mul(0x9e3779b97f4a7c15); // Prime multiplier
     h ^= h >> 33; // XOR and shift
     h = h.wrapping_mul(0xc2b2ae3d27d4eb4f); // Second prime
