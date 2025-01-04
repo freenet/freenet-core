@@ -26,11 +26,11 @@ impl Location {
         match addr.ip() {
             std::net::IpAddr::V4(ipv4) => {
                 let octets = ipv4.octets();
-                let mut hash_value = distribute_hash(u64::from(octets[0]));
-                for &octet in &octets[1..3] {
-                    hash_value ^= distribute_hash(u64::from(octet));
-                }
-                let hashed = hash_value;
+                let value = u64::from(octets[0]) << 24 
+                    | u64::from(octets[1]) << 16 
+                    | u64::from(octets[2]) << 8
+                    | u64::from(octets[3]);
+                let hashed = distribute_hash(value);
                 Location(hashed as f64 / u64::MAX as f64)
             }
             std::net::IpAddr::V6(ipv6) => {
