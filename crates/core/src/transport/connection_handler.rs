@@ -243,7 +243,6 @@ task_local! {
 
 #[cfg(not(test))]
 pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 20;
-
 #[cfg(test)]
 pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
 

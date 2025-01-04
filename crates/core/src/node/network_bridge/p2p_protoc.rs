@@ -26,7 +26,7 @@ use tracing::Instrument;
 
 use crate::dev_tool::Location;
 use crate::node::network_bridge::handshake::{
-    EstablishConnection, Event as HandshakeEvent, ForwardInfo, HandshakeError, HandshakeHandler,
+    Event as HandshakeEvent, ForwardInfo, HandshakeError, HandshakeHandler, HanshakeHandlerMsg,
     OutboundMessage,
 };
 use crate::node::PeerId;
@@ -170,24 +170,26 @@ impl P2pConnManager {
         )
         .await?;
 
-        let (mut handshake_handler, establish_connection, outbound_message) = HandshakeHandler::new(
-            inbound_conn_handler,
-            outbound_conn_handler.clone(),
-            self.bridge.op_manager.ring.connection_manager.clone(),
-            self.bridge.op_manager.ring.router.clone(),
-        );
+        let (mut handshake_handler, handshake_handler_msg, outbound_message) =
+            HandshakeHandler::new(
+                inbound_conn_handler,
+                outbound_conn_handler.clone(),
+                self.bridge.op_manager.ring.connection_manager.clone(),
+                self.bridge.op_manager.ring.router.clone(),
+            );
 
         loop {
             let event = self
                 .wait_for_event(
                     &mut state,
                     &mut handshake_handler,
+                    &handshake_handler_msg,
                     &mut notification_channel,
                     &mut node_controller,
                     &mut client_wait_for_transaction,
                     &mut executor_listener,
                 )
-                .await;
+                .await?;
 
             match event {
                 EventResult::Continue => continue,
@@ -271,7 +273,7 @@ impl P2pConnManager {
                                     peer,
                                     Box::new(callback),
                                     tx,
-                                    &establish_connection,
+                                    &handshake_handler_msg,
                                     &mut state,
                                     is_gw,
                                 )
@@ -315,36 +317,38 @@ impl P2pConnManager {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn wait_for_event(
         &mut self,
         state: &mut EventListenerState,
         handshake_handler: &mut HandshakeHandler,
+        handshake_handler_msg: &HanshakeHandlerMsg,
         notification_channel: &mut EventLoopNotificationsReceiver,
         node_controller: &mut Receiver<NodeEvent>,
         client_wait_for_transaction: &mut ContractHandlerChannel<WaitingResolution>,
         executor_listener: &mut ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
-    ) -> EventResult {
+    ) -> anyhow::Result<EventResult> {
         select! {
             msg = state.peer_connections.next(), if !state.peer_connections.is_empty() => {
-                self.handle_peer_connection_msg(msg, state).await
+                self.handle_peer_connection_msg(msg, state, handshake_handler_msg).await
             }
             msg = notification_channel.0.recv() => {
-                self.handle_notification_msg(msg)
+                Ok(self.handle_notification_msg(msg))
             }
             msg = self.conn_bridge_rx.recv() => {
-                self.handle_bridge_msg(msg)
+                Ok(self.handle_bridge_msg(msg))
             }
             msg = handshake_handler.wait_for_events() => {
-                self.handle_handshake_msg(msg)
+                Ok(self.handle_handshake_msg(msg))
             }
             msg = node_controller.recv() => {
-                self.handle_node_controller_msg(msg)
+                Ok(self.handle_node_controller_msg(msg))
             }
             event_id = client_wait_for_transaction.relay_transaction_result_to_client() => {
-                self.handle_client_transaction_subscription(event_id, state)
+                Ok(self.handle_client_transaction_subscription(event_id, state))
             }
             id = executor_listener.transaction_from_executor() => {
-                self.handle_executor_transaction(id, state)
+                Ok(self.handle_executor_transaction(id, state))
             }
         }
     }
@@ -440,7 +444,7 @@ impl P2pConnManager {
         peer: PeerId,
         callback: Box<dyn ConnectResultSender>,
         tx: Transaction,
-        establish_connection: &EstablishConnection,
+        handshake_handler_msg: &HanshakeHandlerMsg,
         state: &mut EventListenerState,
         is_gw: bool,
     ) -> anyhow::Result<()> {
@@ -448,7 +452,7 @@ impl P2pConnManager {
         state.awaiting_connection.insert(peer.addr, callback);
         let res = timeout(
             Duration::from_secs(10),
-            establish_connection.establish_conn(peer.clone(), tx, is_gw),
+            handshake_handler_msg.establish_conn(peer.clone(), tx, is_gw),
         )
         .await
         .inspect_err(|error| {
@@ -649,13 +653,14 @@ impl P2pConnManager {
     async fn handle_peer_connection_msg(
         &mut self,
         msg: Option<Result<PeerConnectionInbound, TransportError>>,
-        state: &mut EventListenerState,
-    ) -> EventResult {
+        state: &EventListenerState,
+        handshake_handler_msg: &HanshakeHandlerMsg,
+    ) -> anyhow::Result<EventResult> {
         match msg {
             Some(Ok(peer_conn)) => {
                 let task = peer_connection_listener(peer_conn.rx, peer_conn.conn).boxed();
                 state.peer_connections.push(task);
-                EventResult::Event(ConnEvent::InboundMessage(peer_conn.msg))
+                Ok(EventResult::Event(ConnEvent::InboundMessage(peer_conn.msg)))
             }
             Some(Err(err)) => {
                 if let TransportError::ConnectionClosed(socket_addr) = err {
@@ -671,13 +676,14 @@ impl P2pConnManager {
                             .prune_connection(peer.clone())
                             .await;
                         self.connections.remove(&peer);
+                        handshake_handler_msg.drop_connection(peer).await?;
                     }
                 }
-                EventResult::Continue
+                Ok(EventResult::Continue)
             }
             None => {
                 tracing::error!("All peer connections closed");
-                EventResult::Continue
+                Ok(EventResult::Continue)
             }
         }
     }
