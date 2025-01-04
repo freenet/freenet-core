@@ -22,6 +22,7 @@ use tokio::{
     task, task_local,
 };
 use tracing::{span, Instrument};
+use version_cmp::PROTOC_VERSION;
 
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
@@ -31,8 +32,6 @@ use super::{
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
     Socket, TransportError,
 };
-
-const PROTOC_VERSION: [u8; 2] = 1u16.to_le_bytes();
 
 // Constants for interval increase
 const INITIAL_INTERVAL: Duration = Duration::from_millis(200);
@@ -876,6 +875,123 @@ pub(crate) enum ConnectionEvent {
 
 struct InboundRemoteConnection {
     inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
+}
+
+mod version_cmp {
+    const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+    pub(super) const PROTOC_VERSION: [u8; 8] = parse_version_with_flags(VERSION);
+
+    const fn parse_version_with_flags(version: &str) -> [u8; 8] {
+        let mut major = 0u8;
+        let mut minor = 0u8;
+        let mut patch = 0u8;
+        let mut flags = 0u32;
+        let mut state = 0; // 0: major, 1: minor, 2: patch
+
+        let bytes = version.as_bytes();
+        let mut i = 0;
+
+        // Parse major.minor.patch
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c == b'.' {
+                state += 1;
+            } else if c >= b'0' && c <= b'9' {
+                let digit = c - b'0';
+                match state {
+                    0 => major = major * 10 + digit,
+                    1 => minor = minor * 10 + digit,
+                    2 => patch = patch * 10 + digit,
+                    _ => {}
+                }
+            } else {
+                break; // Move to flags processing.
+            }
+            i += 1;
+        }
+
+        // Parse flags (pre-release only)
+        if i < bytes.len() && bytes[i] == b'-' {
+            i += 1; // Skip the '-'
+
+            flags = get_flag_hash(bytes, i);
+        }
+
+        // Encode into [u8; 8]
+        [
+            major,
+            minor,
+            patch,
+            (flags >> 24) as u8,
+            (flags >> 16) as u8,
+            (flags >> 8) as u8,
+            flags as u8,
+            0, // Reserved for future use
+        ]
+    }
+
+    const fn get_flag_hash(bytes: &[u8], start_index: usize) -> u32 {
+        let mut hash = 0u32;
+        let mut i = start_index;
+
+        while i < bytes.len() {
+            let byte = bytes[i];
+            hash = hash.wrapping_mul(31).wrapping_add(byte as u32);
+            i += 1;
+        }
+        hash
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn test_parse_version_with_flags() {
+        fn decode_version_from_bytes(bytes: [u8; 8]) -> String {
+            let major = bytes[0];
+            let minor = bytes[1];
+            let patch = bytes[2];
+
+            let flags = u32::from_be_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]);
+
+            let flags_str = match flags {
+                _ if flags == get_flag_hash(b"alpha", 0) => "alpha",
+                _ if flags == get_flag_hash(b"beta2", 0) => "beta2",
+                _ if flags == get_flag_hash(b"rc1", 0) => "rc1",
+                _ if flags == get_flag_hash(b"rc2", 0) => "rc2",
+                _ => "",
+            };
+
+            if !flags_str.is_empty() {
+                format!("{}.{}.{}-{}", major, minor, patch, flags_str)
+            } else {
+                format!("{}.{}.{}", major, minor, patch)
+            }
+        }
+
+        let test_cases = vec![
+            "1.2.3",
+            "1.2.3-alpha",
+            "255.255.255",
+            "10.20.30-beta2",
+            "1.2.3-rc1",
+            "1.2.3-rc2",
+        ];
+
+        for version_str in test_cases {
+            // Step 1: Encode the version string into bytes
+            let encoded = parse_version_with_flags(version_str);
+
+            // Step 2: Decode the bytes back into a version string
+            let decoded = decode_version_from_bytes(encoded);
+
+            // Step 3: Compare the decoded string with the original version string
+            assert_eq!(
+                decoded, version_str,
+                "Failed for version string '{}', decoded as '{}'",
+                version_str, decoded
+            );
+        }
+    }
 }
 
 #[cfg(test)]
