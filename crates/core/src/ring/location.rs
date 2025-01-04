@@ -244,7 +244,7 @@ fn distribute_hash(x: u64) -> u64 {
     h ^= h >> 29; // XOR again
     h = h.wrapping_mul(0x85ebca6b2b2d3d1d); // Final prime
     h ^= h >> 32; // Final XOR
-    T::from(h) // Convert back to the original type
+    h // Return the u64 directly
 }
 
 #[cfg(test)]
