@@ -25,11 +25,7 @@ impl Location {
     fn deterministic_loc(addr: &std::net::SocketAddr) -> Self {
         match addr.ip() {
             std::net::IpAddr::V4(ipv4) => {
-                let octets = ipv4.octets();
-                let value = u64::from(octets[0]) << 24 
-                    | u64::from(octets[1]) << 16 
-                    | u64::from(octets[2]) << 8
-                    | u64::from(octets[3]);
+                let value: u32 = ipv4.into();
                 let hashed = distribute_hash(value);
                 Location(hashed as f64 / u64::MAX as f64)
             }
