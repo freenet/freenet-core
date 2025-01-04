@@ -242,14 +242,13 @@ impl Display for Distance {
 fn distribute_hash<T: Copy + Into<u64> + From<u64>>(x: T) -> T {
     let mut h = x.into(); // Normalize input to u64
     h = h.wrapping_mul(0x9e3779b97f4a7c15); // Prime multiplier
-    h ^= h >> 33;                          // XOR and shift
+    h ^= h >> 33; // XOR and shift
     h = h.wrapping_mul(0xc2b2ae3d27d4eb4f); // Second prime
-    h ^= h >> 29;                          // XOR again
+    h ^= h >> 29; // XOR again
     h = h.wrapping_mul(0x85ebca6b2b2d3d1d); // Final prime
-    h ^= h >> 32;                          // Final XOR
+    h ^= h >> 32; // Final XOR
     T::from(h) // Convert back to the original type
 }
-
 
 #[cfg(test)]
 mod test {
@@ -330,9 +329,33 @@ mod test {
     #[test]
     fn test_ipv6_address_location() {
         let addresses = [
-            SocketAddr::new(IpAddr::V6([0x2001, 0xdb8, 0x1234, 0x5678, 0xabcd, 0xef01, 0x2345, 0x6789].into()), 12345),
-            SocketAddr::new(IpAddr::V6([0xfe80, 0x0000, 0x0000, 0x0000, 0x0202, 0xb3ff, 0xfe1e, 0x8329].into()), 12345),
-            SocketAddr::new(IpAddr::V6([0x2001, 0x4860, 0x4860, 0x0000, 0x0000, 0x0000, 0x0000, 0x8888].into()), 12345),
+            SocketAddr::new(
+                IpAddr::V6(
+                    [
+                        0x2001, 0xdb8, 0x1234, 0x5678, 0xabcd, 0xef01, 0x2345, 0x6789,
+                    ]
+                    .into(),
+                ),
+                12345,
+            ),
+            SocketAddr::new(
+                IpAddr::V6(
+                    [
+                        0xfe80, 0x0000, 0x0000, 0x0000, 0x0202, 0xb3ff, 0xfe1e, 0x8329,
+                    ]
+                    .into(),
+                ),
+                12345,
+            ),
+            SocketAddr::new(
+                IpAddr::V6(
+                    [
+                        0x2001, 0x4860, 0x4860, 0x0000, 0x0000, 0x0000, 0x0000, 0x8888,
+                    ]
+                    .into(),
+                ),
+                12345,
+            ),
         ];
 
         let locations: Vec<Location> = addresses.iter().map(Location::deterministic_loc).collect();
