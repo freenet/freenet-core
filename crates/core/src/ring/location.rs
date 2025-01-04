@@ -34,10 +34,9 @@ impl Location {
             std::net::IpAddr::V6(ipv6) => {
                 // Take first 8 bytes (4 segments) of IPv6 address
                 let segments = ipv6.segments();
-                let combined_segments = (u64::from(segments[0]) << 48)
-                    | (u64::from(segments[1]) << 32)
-                    | (u64::from(segments[2]) << 16)
-                    | u64::from(segments[3]);
+                let combined_segments = (u64::from(segments[0]) << 32)
+                    | (u64::from(segments[1]) << 16)
+                    | u64::from(segments[2]);
                 let hashed = distribute_hash(combined_segments);
                 Location(hashed as f64 / u64::MAX as f64)
             }
@@ -361,9 +360,9 @@ mod test {
 
         let locations: Vec<Location> = addresses.iter().map(Location::deterministic_loc).collect();
         let expected_locations = vec![
-            Location(0.17218831909986057),
-            Location(0.6061667671923302),
-            Location(0.14432566176337014),
+            Location(0.7965489827349848),
+            Location(0.47795282110090903),
+            Location(0.07918706852076753),
         ];
         assert_eq!(locations, expected_locations);
     }
