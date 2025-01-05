@@ -4,16 +4,11 @@
 //! and routes requests to the optimal peers.
 
 use std::collections::BTreeSet;
-use std::hash::Hash;
 use std::net::SocketAddr;
 use std::{
     cmp::Reverse,
     collections::BTreeMap,
-    fmt::Display,
-    sync::{
-        atomic::{AtomicU64, AtomicUsize},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -23,9 +18,6 @@ use freenet_stdlib::prelude::ContractKey;
 use itertools::Itertools;
 use parking_lot::RwLock;
 use rand::Rng;
-use serde::{Deserialize, Serialize};
-use tokio::sync;
-use tracing::Instrument;
 
 use crate::message::TransactionType;
 use crate::topology::rate::Rate;
@@ -35,7 +27,7 @@ use crate::transport::TransportPublicKey;
 use crate::util::Contains;
 use crate::{
     config::GlobalExecutor,
-    message::Transaction,
+    message::{Transaction, NodeEvent},
     node::{self, EventLoopNotificationsSender, NodeConfig, PeerId},
     operations::connect,
     router::Router,
@@ -44,8 +36,13 @@ use crate::{
 mod connection_manager;
 pub(crate) use connection_manager::ConnectionManager;
 mod location;
+mod types;
+mod live_tx;
+mod maintenance;
 
 pub use location::{Distance, Location};
+use self::types::{PeerKeyLocation, Connection, Score}; 
+use self::live_tx::LiveTransactionTracker;
 
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
