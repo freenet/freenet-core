@@ -17,9 +17,8 @@ This guide provides step-by-step instructions for setting up a **Freenet Gateway
 ### Network Requirements
 
 - Open ports:
-    - **31337** for network communication
-    - **3001** (Gateway WS API)
-    - **3002** (Node WS API)
+    - **31337** default network api port
+    - **50509** default ws api port 
 
 ### Pre-Installed Tools
 
@@ -44,36 +43,27 @@ The `freenet-setup.sh` script supports two modes:
 ```bash
 git clone https://github.com/freenet/freenet-core.git
 cd freenet-core
-chmod +x freenet-setup.sh
+chmod +x freenet-node-setup.sh
 ```
 
 ### Script Syntax
 
 ```bash
-./freenet-setup.sh <name> <type> <gw-host>
+./freenet-node-setup.sh <name> [ws-api-port]
 ```
 
 - **<name>**: Unique name for your node or gateway.
-- **<type>**: `gateway` or `node`
-- **<gw-host>**: Hostname or IP:Port of the Gateway (required only for `node`).
+- **[ws-api-port]**: Optional WebSocket API port (default: 50509).
 
 ### Examples
-
-#### Gateway Setup Example
-
-```bash
-./freenet-setup.sh freenet-gw gateway
-```
-
-- Sets up a Gateway node named `freenet-gw`.
 
 #### Node Setup Example
 
 ```bash
-./freenet-setup.sh freenet-n1 node 192.168.1.10:31337
+./freenet-node-setup.sh freenet-n1
 ```
 
-- Sets up a Node named `freenet-n1` connected to a Gateway at `192.168.1.10:31337`.
+- Sets up a Node named `freenet-n1` connected to a freenet gateways. The gateways config is downloaded from freenet.org by default.
 
 ## Configuration Details
 
@@ -91,41 +81,22 @@ After running the setup, the following directories and files will be created:
 - **PIDs Directory**: `~/.cache/freenet/pids`
 - **Node Directory**: `~/.cache/freenet/<name>`
 - **Gateways Configuration**: `~/.cache/freenet/gateways.toml`
+- **Node Configuration**: `~/.cache/freenet/node.toml`
 - **Startup Scripts**: `~/freenet/start-<name>.sh`
 
-### Gateways Configuration (gateways.toml)
-
-For **Node Mode**, the script generates a `gateways.toml` file based on whether `gw-host` is an IP or a hostname:
-
-- **IP:PORT**:
-
-```toml
-[[gateways]]
-address = { host_address = "192.168.1.10:31337" }
-public_key = "~/freenet/freenet-gw_public_key.pem"
-```
-
-- **Hostname**:
-
-```toml
-[[gateways]]
-address = { hostname = "gateway.local" }
-public_key = "~/freenet/freenet-gw_public_key.pem"
-```
-
-## Start the Node or Gateway
+## Start the Node
 
 After running the setup, a startup script will be generated:
 
 ```bash
-~/freenet/start-<name>.sh
+~/freenet/init-<name>.sh
 ```
 
 Make it executable and start the service:
 
 ```bash
-chmod +x ~/freenet/start-<name>.sh
-~/freenet/start-<name>.sh
+chmod +x ~/freenet/init-<name>.sh
+~/freenet/init-<name>.sh
 ```
 
 ## Verify the Service
@@ -154,7 +125,7 @@ kill $(cat ~/.cache/freenet/pids/<name>.pid)
 1. **Permission Errors:** Ensure the script has executable permissions.
 
 ```bash
-chmod +x freenet-setup.sh
+chmod +x freenet-node-setup.sh
 ```
 
 2. **SSH Issues (for Node Mode):** Verify access to the Gateway.

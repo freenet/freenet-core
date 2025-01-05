@@ -81,20 +81,19 @@ Ensure you have the following prerequisites installed:
 
 This project includes two Makefiles to help you set up and run a local Freenet network:
 
-- `local-network.mk`: Manages the local Freenet network (nodes and gateways)
-- `run-ping.mk`: Builds and runs the ping application
+- `local-network.mk`: Located in `freenet-core/scripts`, this Makefile manages the local Freenet network (nodes and gateways).
+- `run-ping.mk`: Builds and runs the ping application.
 
 ### Start Local Network
+1. Navigate to the `freenet-core/scripts` directory:
+   ```bash
+   cd freenet-core/scripts
+   ```
 
-1. First, clean any previous setup and create necessary directories:
+2. First, clean any previous setup and create necessary directories:
    ```bash
    make -f local-network.mk clean
    make -f local-network.mk setup N_GATEWAYS=1 N_NODES=2
-   ```
-
-2. Generate RSA keys for nodes and gateway:
-   ```bash
-   make -f local-network.mk generate-keys N_GATEWAYS=1 N_NODES=2
    ```
 
 3. Start the gateway:
@@ -109,7 +108,7 @@ This project includes two Makefiles to help you set up and run a local Freenet n
 
 5. Verify network status:
    ```bash
-   make -f local-network.mk status
+   make -f local-network.mk status N_GATEWAYS=1 N_NODES=2
    ```
 
 The network will be configured with:
@@ -128,9 +127,17 @@ make -f local-network.mk logs node=gw1   # For gateway 1
 
 # Stop specific node
 make -f local-network.mk stop-node node=n1
+
+# Stop all nodes and gateways, clean up all files
+make -f local-network.mk clean
 ```
 
 ## Build and Run Ping
+
+1. Navigate to the `freenet-core/apps/freenet-ping` directory:
+   ```bash
+   cd freenet-core/apps/freenet-ping
+   ```
 
 1. View available options:
    ```bash
