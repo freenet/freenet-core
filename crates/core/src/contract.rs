@@ -17,6 +17,7 @@ pub(crate) use handler::{
     client_responses_channel, contract_handler_channel, in_memory::MemoryContractHandler,
     ClientResponsesReceiver, ClientResponsesSender, ContractHandler, ContractHandlerChannel,
     ContractHandlerEvent, NetworkContractHandler, SenderHalve, StoreResponse, WaitingResolution,
+    WaitingTransaction,
 };
 
 pub use executor::{Executor, ExecutorError, OperationMode};
@@ -148,6 +149,15 @@ where
                     .inspect_err(|err| {
                         tracing::warn!("Error while registering subscriber listener: {err}");
                     });
+
+                // FIXME: if there is an error senc actually an error back
+                contract_handler
+                    .channel()
+                    .send_to_sender(id, ContractHandlerEvent::RegisterSubscriberListenerResponse)
+                    .await
+                    .inspect_err(|error| {
+                        tracing::debug!(%error, "shutting down contract handler");
+                    })?;
             }
             _ => unreachable!(),
         }

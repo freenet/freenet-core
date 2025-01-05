@@ -349,7 +349,7 @@ mod tests {
     fn test_request_time() {
         // Define constants for the number of peers, number of events, and number of test iterations.
         const NUM_PEERS: usize = 25;
-        const NUM_EVENTS: usize = 40000;
+        const NUM_EVENTS: usize = 400000;
 
         // Create `NUM_PEERS` random peers and put them in a vector.
         let peers: Vec<PeerKeyLocation> =

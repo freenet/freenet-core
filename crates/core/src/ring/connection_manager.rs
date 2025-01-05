@@ -97,7 +97,7 @@ impl ConnectionManager {
         let own_location = if let Some(peer_key) = &peerid {
             // if the peer id is set, then the location must be set, since it is a gateway
             let location = Location::from_address(&peer_key.addr);
-            AtomicU64::new(u64::from_le_bytes(location.0.to_le_bytes()))
+            AtomicU64::new(u64::from_le_bytes(location.as_f64().to_le_bytes()))
         } else {
             // for location here consider -1 == None
             AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()))
@@ -142,9 +142,6 @@ impl ConnectionManager {
 
         if open == 0 {
             // if this is the first connection, then accept it
-            self.location_for_peer
-                .write()
-                .insert(peer_id.clone(), location);
             return true;
         }
 
@@ -179,9 +176,6 @@ impl ConnectionManager {
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         } else {
             tracing::debug!(%peer_id, "Accepted connection, reserving spot");
-            self.location_for_peer
-                .write()
-                .insert(peer_id.clone(), location);
         }
         accepted
     }
@@ -190,7 +184,7 @@ impl ConnectionManager {
     pub fn update_location(&self, loc: Option<Location>) {
         if let Some(loc) = loc {
             self.own_location.store(
-                u64::from_le_bytes(loc.0.to_le_bytes()),
+                u64::from_le_bytes(loc.as_f64().to_le_bytes()),
                 std::sync::atomic::Ordering::Release,
             );
         } else {
@@ -215,7 +209,7 @@ impl ConnectionManager {
         let location = if (location - -1f64).abs() < f64::EPSILON {
             None
         } else {
-            Some(Location(location))
+            Some(Location::new(location))
         };
         let peer = self.get_peer_key().expect("peer key not set");
         PeerKeyLocation { peer, location }
@@ -245,6 +239,7 @@ impl ConnectionManager {
     }
 
     pub fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) {
+        tracing::debug!(%peer, "Adding connection");
         debug_assert!(self.get_peer_key().expect("should be set") != peer);
         if was_reserved {
             let old = self
@@ -259,28 +254,33 @@ impl ConnectionManager {
             }
             let _ = old;
         }
+        let mut lop = self.location_for_peer.write();
+        lop.insert(peer.clone(), loc);
+        {
+            let mut cbl = self.connections_by_location.write();
+            cbl.entry(loc).or_default().push(Connection {
+                location: PeerKeyLocation {
+                    peer: peer.clone(),
+                    location: Some(loc),
+                },
+                open_at: Instant::now(),
+            });
+        }
         self.open_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let mut cbl = self.connections_by_location.write();
-        cbl.entry(loc).or_default().push(Connection {
-            location: PeerKeyLocation {
-                peer: peer.clone(),
-                location: Some(loc),
-            },
-            open_at: Instant::now(),
-        });
-        self.location_for_peer.write().insert(peer.clone(), loc);
-        std::mem::drop(cbl);
+        std::mem::drop(lop);
     }
 
     fn prune_connection(&self, peer: &PeerId, is_alive: bool) -> Option<Location> {
         let connection_type = if is_alive { "active" } else { "in transit" };
         tracing::debug!(%peer, "Pruning {} connection", connection_type);
 
-        let Some(loc) = self.location_for_peer.write().remove(peer) else {
+        let mut locations_for_peer = self.location_for_peer.write();
+
+        let Some(loc) = locations_for_peer.remove(peer) else {
             if is_alive {
-                self.open_connections
-                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                tracing::debug!("no location found for peer, skip pruning");
+                return None;
             } else {
                 self.reserved_connections
                     .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);

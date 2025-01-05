@@ -583,7 +583,11 @@ fn build_op_result(
     msg: Option<PutMsg>,
     stats: Option<PutStats>,
 ) -> Result<OperationResult, OpError> {
-    let output_op = Some(PutOp { id, state, stats });
+    let output_op = state.map(|op| PutOp {
+        id,
+        state: Some(op),
+        stats,
+    });
     Ok(OperationResult {
         return_msg: msg.map(NetMessage::from),
         state: output_op.map(OpEnum::Put),

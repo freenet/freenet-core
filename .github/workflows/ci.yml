@@ -12,7 +12,6 @@ jobs:
   test_all:
     name: Test
 
-    # Use more powerful runner
     runs-on: freenet-core-ci
 
     strategy:
@@ -52,7 +51,7 @@ jobs:
           cargo install --locked --force --path ./crates/core
           cargo install --locked --force --path ./crates/fdev
           make -C apps/freenet-ping -f run-ping.mk build
-          cargo build --locked 
+          cargo build --locked
 
       - name: Test - features
         run: cargo test --workspace ${{ matrix.args }}

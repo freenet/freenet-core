@@ -1,5 +1,6 @@
 use crate::ring::{Distance, Location, PeerKeyLocation};
-use pav_regression::pav::{IsotonicRegression, Point};
+use pav_regression::IsotonicRegression;
+use pav_regression::Point;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -14,7 +15,7 @@ const MIN_POINTS_FOR_REGRESSION: usize = 5;
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct IsotonicEstimator {
-    pub global_regression: IsotonicRegression,
+    pub global_regression: IsotonicRegression<f64>,
     pub peer_adjustments: HashMap<PeerKeyLocation, Adjustment>,
 }
 
@@ -44,7 +45,8 @@ impl IsotonicEstimator {
         let global_regression = match estimator_type {
             EstimatorType::Positive => IsotonicRegression::new_ascending(&all_points),
             EstimatorType::Negative => IsotonicRegression::new_descending(&all_points),
-        };
+        }
+        .expect("Failed to create isotonic regression");
 
         let adjustment_prior_size = 20;
         let global_regression_big_enough_to_estimate_peer_adjustments =

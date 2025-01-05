@@ -106,11 +106,11 @@ impl ContractExecutor for Executor<Runtime> {
 
         for (id, state) in related_contracts
             .states()
-            .filter_map(|(id, c)| c.map(|c| (id, c)))
+            .filter_map(|(id, c)| c.as_ref().map(|c| (id, c)))
         {
             updates.push(UpdateData::RelatedState {
-                related_to: id,
-                state,
+                related_to: *id,
+                state: state.clone(),
             });
         }
 
@@ -129,7 +129,20 @@ impl ContractExecutor for Executor<Runtime> {
                 }));
             }
         };
-        Ok(updated_state)
+        match self
+            .runtime
+            .validate_state(&key, &params, &updated_state, &related_contracts)
+            .map_err(|e| ExecutorError::execution(e, None))?
+        {
+            ValidateResult::Valid => Ok(updated_state),
+            ValidateResult::Invalid => Err(ExecutorError::request(
+                freenet_stdlib::client_api::ContractError::Update {
+                    key,
+                    cause: "invalid outcome state".into(),
+                },
+            )),
+            ValidateResult::RequestRelated(_) => todo!(),
+        }
     }
 
     fn register_contract_notifier(
@@ -527,6 +540,17 @@ impl Executor<Runtime> {
             .update(key, new_state.clone())
             .await
             .map_err(ExecutorError::other)?;
+
+        if let Err(err) = self
+            .send_update_notification(key, parameters, &new_state)
+            .await
+        {
+            tracing::error!(
+                "Failed while sending notifications for contract {}: {}",
+                key,
+                err
+            );
+        }
         Ok(Either::Left(new_state))
     }
 
