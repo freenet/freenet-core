@@ -27,7 +27,7 @@ use crate::transport::TransportPublicKey;
 use crate::util::Contains;
 use crate::{
     config::GlobalExecutor,
-    message::{Transaction, NodeEvent},
+    message::Transaction,
     node::{self, EventLoopNotificationsSender, NodeConfig, PeerId},
     operations::connect,
     router::Router,
@@ -444,8 +444,8 @@ impl Ring {
                     Ok(missing_candidate) => {
                         missing.insert(Reverse(Instant::now()), missing_candidate);
                     }
-                    Err(sync::mpsc::error::TryRecvError::Empty) => break,
-                    Err(sync::mpsc::error::TryRecvError::Disconnected) => {
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
                         tracing::debug!("Shutting down connection maintenance");
                         anyhow::bail!("finished");
                     }
