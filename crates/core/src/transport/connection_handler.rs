@@ -441,9 +441,19 @@ impl<S: Socket> UdpPacketsListener<S> {
                     tracing::debug!(%remote_addr, %err, "Failed to decrypt intro packet");
                     err
                 })?;
-            let protoc = &decrypted_intro_packet[..PROTOC_VERSION.len()];
-            let outbound_key_bytes =
-                &decrypted_intro_packet[PROTOC_VERSION.len()..PROTOC_VERSION.len() + 16];
+
+            let protoc = decrypted_intro_packet
+                .get(..PROTOC_VERSION.len())
+                .ok_or_else(|| TransportError::ConnectionEstablishmentFailure {
+                    cause: "Packet too small to contain protocol version".into(),
+                })?;
+
+            let outbound_key_bytes = decrypted_intro_packet
+                .get(PROTOC_VERSION.len()..PROTOC_VERSION.len() + 16)
+                .ok_or_else(|| TransportError::ConnectionEstablishmentFailure {
+                    cause: "Packet too small to contain outbound key bytes".into(),
+                })?;
+
             let outbound_key = Aes128Gcm::new_from_slice(outbound_key_bytes).map_err(|_| {
                 TransportError::ConnectionEstablishmentFailure {
                     cause: "invalid symmetric key".into(),
