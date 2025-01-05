@@ -4,7 +4,7 @@ use tokio::sync;
 use crate::{message::Transaction, node::PeerId};
 
 #[derive(Clone)]
-pub(crate) struct LiveTransactionTracker {
+pub struct LiveTransactionTracker {
     tx_per_peer: Arc<DashMap<PeerId, Vec<Transaction>>>,
     missing_candidate_sender: sync::mpsc::Sender<PeerId>,
 }
