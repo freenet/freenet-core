@@ -1,4 +1,3 @@
 use super::Ring;
 
-impl Ring {
-}
+impl Ring {}

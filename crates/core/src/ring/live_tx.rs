@@ -1,7 +1,7 @@
-use std::sync::Arc;
-use dashmap::DashMap;
-use tokio::sync;
 use crate::{message::Transaction, node::PeerId};
+use dashmap::DashMap;
+use std::sync::Arc;
+use tokio::sync;
 
 #[derive(Clone)]
 pub struct LiveTransactionTracker {

@@ -8,7 +8,10 @@ use std::net::SocketAddr;
 use std::{
     cmp::Reverse,
     collections::BTreeMap,
-    sync::{Arc, atomic::{AtomicU64, AtomicUsize}},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc::{self, error::TryRecvError};
@@ -37,15 +40,14 @@ use crate::{
 
 mod connection_manager;
 pub(crate) use connection_manager::ConnectionManager;
-mod location;
-mod types;
 pub mod live_tx;
+mod location;
 mod maintenance;
+mod types;
 
-pub use location::{Distance, Location};
-pub use types::{PeerKeyLocation, Connection, Score};
 pub use self::live_tx::LiveTransactionTracker;
-
+pub use location::{Distance, Location};
+pub use types::{Connection, PeerKeyLocation, Score};
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
