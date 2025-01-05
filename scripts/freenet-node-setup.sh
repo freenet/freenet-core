@@ -40,6 +40,8 @@ export RUST_BACKTRACE=1
 export RUST_LOG="info,freenet=debug,freenet-stdlib=debug,fdev=debug"
 
 freenet network \
+  --config-dir "$BASE_DIR" \
+  --db-dir "$NODE_DIR" \
   --ws-api-port "$WS_API_PORT" \
   1> >(stdbuf -o0 sed 's/\x1b\[[0-9;]*m//g' >> "$LOGS_DIR/${NAME}.log") 2>&1 &
 

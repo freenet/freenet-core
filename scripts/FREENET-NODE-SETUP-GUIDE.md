@@ -25,8 +25,8 @@ This guide provides step-by-step instructions for setting up a **Freenet Gateway
 Make sure the following tools are installed:
 
 ```bash
-sudo apt update
-sudo apt install -y git openssl curl
+  sudo apt update
+  sudo apt install -y git openssl curl
 ```
 
 ## Script Overview
@@ -38,18 +38,25 @@ The `freenet-setup.sh` script supports two modes:
 
 ## Usage
 
+### Create a freenet directory
+
+```bash
+  mkdir freenet
+```
+
 ### Clone the Repository
 
 ```bash
-git clone https://github.com/freenet/freenet-core.git
-cd freenet-core
-chmod +x freenet-node-setup.sh
+  cd freenet
+  git clone https://github.com/freenet/freenet-core.git
+  cd freenet-core
+  chmod +x freenet-node-setup.sh
 ```
 
 ### Script Syntax
 
 ```bash
-./freenet-node-setup.sh <name> [ws-api-port]
+  ./freenet-node-setup.sh <name> [ws-api-port]
 ```
 
 - **<name>**: Unique name for your node or gateway.
@@ -60,7 +67,7 @@ chmod +x freenet-node-setup.sh
 #### Node Setup Example
 
 ```bash
-./freenet-node-setup.sh freenet-n1
+  ./freenet-node-setup.sh freenet-n1
 ```
 
 - Sets up a Node named `freenet-n1` connected to a freenet gateways. The gateways config is downloaded from freenet.org by default.
@@ -89,14 +96,14 @@ After running the setup, the following directories and files will be created:
 After running the setup, a startup script will be generated:
 
 ```bash
-~/freenet/init-<name>.sh
+  ~/freenet/init-<name>.sh
 ```
 
 Make it executable and start the service:
 
 ```bash
-chmod +x ~/freenet/init-<name>.sh
-~/freenet/init-<name>.sh
+  chmod +x ~/freenet/init-<name>.sh
+  ~/freenet/init-<name>.sh
 ```
 
 ## Verify the Service
@@ -105,19 +112,19 @@ chmod +x ~/freenet/init-<name>.sh
 - **Processes**: Verify the service is running:
 
 ```bash
-ps -aux | grep freenet
+  ps -aux | grep freenet
 ```
 
 - **Check Ports**:
 
 ```bash
-sudo netstat -tulnp | grep 31337
+  sudo netstat -tulnp | grep 31337
 ```
 
 ## Stop the Service
 
 ```bash
-kill $(cat ~/.cache/freenet/pids/<name>.pid)
+  kill $(cat ~/.cache/freenet/pids/<name>.pid)
 ```
 
 ## Troubleshooting
@@ -125,7 +132,7 @@ kill $(cat ~/.cache/freenet/pids/<name>.pid)
 1. **Permission Errors:** Ensure the script has executable permissions.
 
 ```bash
-chmod +x freenet-node-setup.sh
+  chmod +x freenet-node-setup.sh
 ```
 
 2. **SSH Issues (for Node Mode):** Verify access to the Gateway.
