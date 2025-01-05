@@ -11,7 +11,7 @@ use std::{
     sync::{Arc, atomic::{AtomicU64, AtomicUsize}},
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc::{self, error::TryRecvError};
+use tokio::sync::mpsc::{error::TryRecvError};
 use tracing::Instrument;
 
 use dashmap::{mapref::one::Ref as DmRef, DashMap};
@@ -408,7 +408,7 @@ impl Ring {
         self: Arc<Self>,
         notifier: EventLoopNotificationsSender,
         live_tx_tracker: LiveTransactionTracker,
-        mut missing_candidates: sync::mpsc::Receiver<PeerId>,
+        mut missing_candidates: mpsc::Receiver<PeerId>,
     ) -> anyhow::Result<()> {
         tracing::debug!("Initializing connection maintenance task");
         #[cfg(not(test))]
