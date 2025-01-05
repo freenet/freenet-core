@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::{
     cmp::Reverse,
     collections::BTreeMap,
-    sync::Arc,
+    sync::{Arc, atomic::{AtomicU64, AtomicUsize}},
     time::{Duration, Instant},
 };
 
@@ -41,7 +41,7 @@ mod live_tx;
 mod maintenance;
 
 pub use location::{Distance, Location};
-use self::types::{PeerKeyLocation, Connection, Score}; 
+pub use types::{PeerKeyLocation, Connection, Score};
 use self::live_tx::LiveTransactionTracker;
 
 

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use dashmap::DashMap;
-use tokio::sync;
+use tokio::sync::{self, mpsc};
 use crate::{message::Transaction, node::PeerId};
 
 #[derive(Clone)]

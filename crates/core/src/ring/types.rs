@@ -51,7 +51,7 @@ impl Display for PeerKeyLocation {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct Connection {
+pub struct Connection {
     pub(crate) location: PeerKeyLocation,
     pub(crate) open_at: Instant,
 }
