@@ -39,12 +39,12 @@ mod connection_manager;
 pub(crate) use connection_manager::ConnectionManager;
 mod location;
 mod types;
-mod live_tx;
+pub mod live_tx;
 mod maintenance;
 
 pub use location::{Distance, Location};
 pub use types::{PeerKeyLocation, Connection, Score};
-use self::live_tx::LiveTransactionTracker;
+pub use self::live_tx::LiveTransactionTracker;
 
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
