@@ -155,13 +155,25 @@ pub(crate) struct ContractHandlerHalve {
 
 pub(crate) struct SenderHalve {
     event_sender: mpsc::UnboundedSender<InternalCHEvent>,
-    wait_for_res_tx: mpsc::Sender<(ClientId, Transaction)>,
+    wait_for_res_tx: mpsc::Sender<(ClientId, WaitingTransaction)>,
+}
+
+#[derive(Debug)]
+pub(crate) enum WaitingTransaction {
+    Transaction(Transaction),
+    Subscription { contract_key: ContractInstanceId },
+}
+
+impl From<Transaction> for WaitingTransaction {
+    fn from(tx: Transaction) -> Self {
+        WaitingTransaction::Transaction(tx)
+    }
 }
 
 /// Communicates that a client is waiting for a transaction resolution
 /// to continue processing this event.
 pub(crate) struct WaitingResolution {
-    wait_for_res_rx: mpsc::Receiver<(ClientId, Transaction)>,
+    wait_for_res_rx: mpsc::Receiver<(ClientId, WaitingTransaction)>,
 }
 
 mod sealed {
@@ -203,7 +215,7 @@ static EV_ID: AtomicU64 = AtomicU64::new(0);
 impl ContractHandlerChannel<WaitingResolution> {
     pub async fn relay_transaction_result_to_client(
         &mut self,
-    ) -> anyhow::Result<(ClientId, Transaction)> {
+    ) -> anyhow::Result<(ClientId, WaitingTransaction)> {
         self.end
             .wait_for_res_rx
             .recv()
@@ -239,12 +251,12 @@ impl ContractHandlerChannel<SenderHalve> {
 
     pub async fn waiting_for_transaction_result(
         &self,
-        transaction: Transaction,
+        transaction: impl Into<WaitingTransaction>,
         client_id: ClientId,
     ) -> Result<(), ContractError> {
         self.end
             .wait_for_res_tx
-            .send((client_id, transaction))
+            .send((client_id, transaction.into()))
             .await
             .map_err(|_| ContractError::NoEvHandlerResponse)
     }
@@ -328,6 +340,7 @@ pub(crate) enum ContractHandlerEvent {
         summary: Option<StateSummary<'static>>,
         subscriber_listener: UnboundedSender<HostResult>,
     },
+    RegisterSubscriberListenerResponse,
 }
 
 impl std::fmt::Display for ContractHandlerEvent {
@@ -389,6 +402,9 @@ impl std::fmt::Display for ContractHandlerEvent {
                     f,
                     "register subscriber listener {{ {key}, client_id: {client_id} }}",
                 )
+            }
+            ContractHandlerEvent::RegisterSubscriberListenerResponse => {
+                write!(f, "register subscriber listener response")
             }
         }
     }

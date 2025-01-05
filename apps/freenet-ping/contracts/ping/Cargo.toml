@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 [dependencies]
 freenet-stdlib.workspace = true
 freenet-stdlib.features = ["contract"]
-freenet-ping-types.path = "../../types"
+freenet-ping-types = { path = "../../types", default-features = false }
 serde_json = "1"
 
 [features]

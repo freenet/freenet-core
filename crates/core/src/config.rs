@@ -1,16 +1,19 @@
 use std::{
+    collections::HashSet,
     fs::{self, File},
     future::Future,
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
 
+use anyhow::Context;
 use directories::ProjectDirs;
 use either::Either;
 use once_cell::sync::Lazy;
+use pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
@@ -42,6 +45,8 @@ const QUALIFIER: &str = "";
 const ORGANIZATION: &str = "The Freenet Project Inc";
 const APPLICATION: &str = "Freenet";
 
+const FREENET_GATEWAYS_INDEX: &str = "https://freenet.org/keys/gateways.toml";
+
 #[derive(clap::Parser, Debug)]
 pub struct ConfigArgs {
     /// Node operation mode. Default is network mode.
@@ -52,7 +57,7 @@ pub struct ConfigArgs {
     pub ws_api: WebsocketApiArgs,
 
     #[clap(flatten)]
-    pub network_listener: NetworkArgs,
+    pub network_api: NetworkArgs,
 
     #[clap(flatten)]
     pub secrets: SecretArgs,
@@ -72,15 +77,17 @@ impl Default for ConfigArgs {
     fn default() -> Self {
         Self {
             mode: Some(OperationMode::Network),
-            network_listener: NetworkArgs {
-                address: Some(default_address()),
-                network_port: Some(default_network_port()),
+            network_api: NetworkArgs {
+                address: Some(default_listening_address()),
+                network_port: Some(default_network_api_port()),
                 public_address: None,
                 public_port: None,
                 is_gateway: false,
+                skip_load_from_network: true,
+                ignore_protocol_checking: false,
             },
             ws_api: WebsocketApiArgs {
-                address: Some(default_address()),
+                address: Some(default_listening_address()),
                 ws_api_port: Some(default_http_gateway_port()),
             },
             secrets: Default::default(),
@@ -165,7 +172,7 @@ impl ConfigArgs {
     }
 
     /// Parse the command line arguments and return the configuration.
-    pub fn build(mut self) -> anyhow::Result<Config> {
+    pub async fn build(mut self) -> anyhow::Result<Config> {
         let cfg = if let Some(path) = self.config_paths.config_dir.as_ref() {
             if !path.exists() {
                 return Err(anyhow::Error::new(std::io::Error::new(
@@ -213,9 +220,9 @@ impl ConfigArgs {
         let secrets = self.secrets.build()?;
 
         let peer_id = self
-            .network_listener
+            .network_api
             .public_address
-            .zip(self.network_listener.public_port)
+            .zip(self.network_api.public_port)
             .map(|(addr, port)| {
                 PeerId::new(
                     (addr, port).into(),
@@ -223,21 +230,35 @@ impl ConfigArgs {
                 )
             });
         let gateways_file = config_paths.config_dir.join("gateways.toml");
-        let gateways = match File::open(&*gateways_file) {
+
+        let remotely_loaded_gateways = if !self.network_api.skip_load_from_network {
+            load_gateways_from_index(FREENET_GATEWAYS_INDEX, &config_paths.secrets_dir)
+                .await
+                .inspect_err(|error| {
+                    tracing::error!(
+                        "Failed to load gateways from index (at {FREENET_GATEWAYS_INDEX}): {error}"
+                    );
+                })
+                .unwrap_or_default()
+        } else {
+            Gateways::default()
+        };
+        let mut gateways = match File::open(&*gateways_file) {
             Ok(mut file) => {
                 let mut content = String::new();
                 file.read_to_string(&mut content)?;
-                toml::from_str::<Gateways>(&content)
-                    .map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                    })?
-                    .gateways
+                toml::from_str::<Gateways>(&content).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })?
             }
             Err(err) => {
                 // TODO: remove local-simulation feature and use runtime flags
                 #[cfg(all(not(any(test, debug_assertions)), not(feature = "local-simulation")))]
                 {
-                    if peer_id.is_none() && mode == OperationMode::Network {
+                    if peer_id.is_none()
+                        && mode == OperationMode::Network
+                        && remotely_loaded_gateways.gateways.is_empty()
+                    {
                         tracing::error!(file = ?gateways_file, "Failed to read gateways file: {err}");
 
                         return Err(anyhow::Error::new(std::io::Error::new(
@@ -247,30 +268,34 @@ impl ConfigArgs {
                     }
                 }
                 let _ = err;
-                tracing::warn!("No gateways file found, initializing disjoint gateway.");
-                vec![]
+                if remotely_loaded_gateways.gateways.is_empty() {
+                    tracing::warn!("No gateways file found, initializing disjoint gateway.");
+                }
+                Gateways { gateways: vec![] }
             }
         };
+        gateways.merge_and_deduplicate(remotely_loaded_gateways);
 
         let this = Config {
             mode,
             peer_id,
             network_api: NetworkApiConfig {
-                address: self.network_listener.address.unwrap_or_else(|| match mode {
+                address: self.network_api.address.unwrap_or_else(|| match mode {
                     OperationMode::Local => default_local_address(),
-                    OperationMode::Network => default_address(),
+                    OperationMode::Network => default_listening_address(),
                 }),
                 port: self
-                    .network_listener
+                    .network_api
                     .network_port
-                    .unwrap_or(default_network_port()),
-                public_address: self.network_listener.public_address,
-                public_port: self.network_listener.public_port,
+                    .unwrap_or(default_network_api_port()),
+                public_address: self.network_api.public_address,
+                public_port: self.network_api.public_port,
+                ignore_protocol: self.network_api.ignore_protocol_checking,
             },
             ws_api: WebsocketApiConfig {
                 address: self.ws_api.address.unwrap_or_else(|| match mode {
                     OperationMode::Local => default_local_address(),
-                    OperationMode::Network => default_address(),
+                    OperationMode::Network => default_listening_address(),
                 }),
                 port: self
                     .ws_api
@@ -280,11 +305,13 @@ impl ConfigArgs {
             secrets,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
             config_paths: Arc::new(config_paths),
-            gateways,
-            is_gateway: self.network_listener.is_gateway,
+            gateways: gateways.gateways.clone(),
+            is_gateway: self.network_api.is_gateway,
         };
 
         fs::create_dir_all(this.config_dir())?;
+        gateways.save_to_file(&gateways_file)?;
+
         if should_persist {
             let path = this.config_dir().join("config.toml");
             tracing::info!("Persisting configuration to {:?}", path);
@@ -377,7 +404,11 @@ impl Config {
 #[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]
 pub struct NetworkArgs {
     /// Address to bind to for the network event listener, default is 0.0.0.0
-    #[arg(long = "network-address", env = "NETWORK_ADDRESS")]
+    #[arg(
+        name = "network_address",
+        long = "network-address",
+        env = "NETWORK_ADDRESS"
+    )]
     #[serde(rename = "network-address", skip_serializing_if = "Option::is_none")]
     pub address: Option<IpAddr>,
 
@@ -406,37 +437,54 @@ pub struct NetworkArgs {
     /// If the node is a gateway, it will be able to accept connections from other nodes.
     #[arg(long)]
     pub is_gateway: bool,
+
+    /// Skips loading gateway configurations from the network and merging it with existing one.
+    #[arg(long)]
+    pub skip_load_from_network: bool,
+
+    /// Ignores protocol version failures, continuing to run the node if there is a mismatch with the gateway.
+    #[arg(long)]
+    pub ignore_protocol_checking: bool,
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct NetworkApiConfig {
-    /// Address to bind to
-    #[serde(default = "default_address", rename = "network-address")]
+    /// Address to listen to locally
+    #[serde(default = "default_listening_address", rename = "network-address")]
     pub address: IpAddr,
 
     /// Port to expose api on
-    #[serde(default = "default_network_port", rename = "network-port")]
+    #[serde(default = "default_network_api_port", rename = "network-port")]
     pub port: u16,
 
+    /// Public external address for the network, mandatory for gateways.
     #[serde(
         rename = "public_network_address",
         skip_serializing_if = "Option::is_none"
     )]
     pub public_address: Option<IpAddr>,
 
+    /// Public external port for the network, mandatory for gateways.
     #[serde(rename = "public_port", skip_serializing_if = "Option::is_none")]
     pub public_port: Option<u16>,
+
+    #[serde(skip)]
+    pub ignore_protocol: bool,
 }
 
 #[inline]
-const fn default_network_port() -> u16 {
+pub const fn default_network_api_port() -> u16 {
     31337
 }
 
 #[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]
 pub struct WebsocketApiArgs {
     /// Address to bind to for the websocket API, default is 0.0.0.0
-    #[arg(long = "ws-api-address", env = "WS_API_ADDRESS")]
+    #[arg(
+        name = "ws_api_address",
+        long = "ws-api-address",
+        env = "WS_API_ADDRESS"
+    )]
     #[serde(rename = "ws-api-address", skip_serializing_if = "Option::is_none")]
     pub address: Option<IpAddr>,
 
@@ -449,7 +497,7 @@ pub struct WebsocketApiArgs {
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct WebsocketApiConfig {
     /// Address to bind to
-    #[serde(default = "default_address", rename = "ws-api-address")]
+    #[serde(default = "default_listening_address", rename = "ws-api-address")]
     pub address: IpAddr,
 
     /// Port to expose api on
@@ -470,14 +518,14 @@ impl Default for WebsocketApiConfig {
     #[inline]
     fn default() -> Self {
         Self {
-            address: default_address(),
+            address: default_listening_address(),
             port: default_http_gateway_port(),
         }
     }
 }
 
 #[inline]
-const fn default_address() -> IpAddr {
+const fn default_listening_address() -> IpAddr {
     IpAddr::V4(Ipv4Addr::UNSPECIFIED)
 }
 
@@ -487,7 +535,7 @@ const fn default_local_address() -> IpAddr {
 }
 
 #[inline]
-pub(crate) const fn default_http_gateway_port() -> u16 {
+const fn default_http_gateway_port() -> u16 {
     50509
 }
 
@@ -772,12 +820,28 @@ impl Config {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 struct Gateways {
     pub gateways: Vec<GatewayConfig>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+impl Gateways {
+    pub fn merge_and_deduplicate(&mut self, other: Gateways) {
+        let mut existing_gateways: HashSet<_> = self.gateways.drain(..).collect();
+        for gateway in other.gateways {
+            existing_gateways.insert(gateway);
+        }
+        self.gateways = existing_gateways.into_iter().collect();
+    }
+
+    pub fn save_to_file(&self, path: &Path) -> anyhow::Result<()> {
+        let content = toml::to_string(self)?;
+        fs::write(path, content)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone)]
 pub struct GatewayConfig {
     /// Address of the gateway. It can be either a hostname or an IP address and port.
     pub address: Address,
@@ -787,7 +851,7 @@ pub struct GatewayConfig {
     pub public_key_path: PathBuf,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone)]
 pub enum Address {
     #[serde(rename = "hostname")]
     Hostname(String),
@@ -847,16 +911,109 @@ pub fn set_logger(level: Option<tracing::level_filters::LevelFilter>, endpoint: 
     }
 }
 
+async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Result<Gateways> {
+    let response = reqwest::get(url).await?.error_for_status()?.text().await?;
+    let mut gateways: Gateways = toml::from_str(&response)?;
+    let mut base_url = reqwest::Url::parse(url)?;
+    base_url.set_path("");
+    let mut valid_gateways = Vec::new();
+
+    for gateway in &mut gateways.gateways {
+        let public_key_url = base_url.join(&gateway.public_key_path.to_string_lossy())?;
+        let public_key_response = reqwest::get(public_key_url).await?.error_for_status()?;
+        let file_name = gateway
+            .public_key_path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("Invalid public key path"))?;
+        let local_path = pub_keys_dir.join(file_name);
+        let mut public_key_file = File::create(&local_path)?;
+        let content = public_key_response.bytes().await?;
+        std::io::copy(&mut content.as_ref(), &mut public_key_file)?;
+
+        // Validate the public key
+        let mut key_file = File::open(&local_path).with_context(|| {
+            format!(
+                "failed loading gateway pubkey from {:?}",
+                gateway.public_key_path
+            )
+        })?;
+        let mut buf = String::new();
+        key_file.read_to_string(&mut buf)?;
+        if rsa::RsaPublicKey::from_public_key_pem(&buf).is_ok() {
+            gateway.public_key_path = local_path;
+            valid_gateways.push(gateway.clone());
+        } else {
+            tracing::warn!(
+                "Invalid public key found in remote gateway file: {:?}, ignoring",
+                gateway.public_key_path
+            );
+        }
+    }
+
+    gateways.gateways = valid_gateways;
+    Ok(gateways)
+}
+
 #[cfg(test)]
 mod tests {
+    use httptest::{matchers::*, responders::*, Expectation, Server};
+
+    use pkcs8::EncodePublicKey;
+    use rsa::RsaPublicKey;
+
+    use crate::node::NodeConfig;
+
     use super::*;
 
-    #[test]
-    fn test_serde_config_args() {
+    #[tokio::test]
+    async fn test_serde_config_args() {
         let args = ConfigArgs::default();
-        let cfg = args.build().unwrap();
+        let cfg = args.build().await.unwrap();
         let serialized = toml::to_string(&cfg).unwrap();
         let _: Config = toml::from_str(&serialized).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_load_gateways_from_index() {
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of!(request::method("GET"), request::path("/gateways")))
+                .respond_with(status_code(200).body(
+                    r#"
+                    [[gateways]]
+                    address = { hostname = "example.com" }
+                    public_key = "/path/to/public_key.pem"
+                    "#,
+                )),
+        );
+
+        let url = server.url_str("/gateways");
+
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 256).unwrap();
+        let key = key
+            .to_public_key()
+            .to_public_key_pem(pkcs8::LineEnding::LF)
+            .unwrap();
+        server.expect(
+            Expectation::matching(request::path("/path/to/public_key.pem"))
+                .respond_with(status_code(200).body(key.as_str().to_string())),
+        );
+
+        let pub_keys_dir = tempfile::tempdir().unwrap();
+        let gateways = load_gateways_from_index(&url, pub_keys_dir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(gateways.gateways.len(), 1);
+        assert_eq!(
+            gateways.gateways[0].address,
+            Address::Hostname("example.com".to_string())
+        );
+        assert_eq!(
+            gateways.gateways[0].public_key_path,
+            pub_keys_dir.path().join("public_key.pem")
+        );
+        assert!(pub_keys_dir.path().join("public_key.pem").exists());
     }
 
     #[test]
@@ -864,7 +1021,9 @@ mod tests {
         let gateways = Gateways {
             gateways: vec![
                 GatewayConfig {
-                    address: Address::HostAddress(([127, 0, 0, 1], default_network_port()).into()),
+                    address: Address::HostAddress(
+                        ([127, 0, 0, 1], default_network_api_port()).into(),
+                    ),
                     public_key_path: PathBuf::from("path/to/key"),
                 },
                 GatewayConfig {
@@ -876,5 +1035,24 @@ mod tests {
 
         let serialized = toml::to_string(&gateways).unwrap();
         let _: Gateways = toml::from_str(&serialized).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_remote_freenet_gateways() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let gateways = load_gateways_from_index(FREENET_GATEWAYS_INDEX, tmp_dir.path())
+            .await
+            .unwrap();
+        assert!(!gateways.gateways.is_empty());
+
+        for gw in gateways.gateways {
+            assert!(gw.public_key_path.exists());
+            assert!(RsaPublicKey::from_public_key_pem(
+                &std::fs::read_to_string(gw.public_key_path).unwrap(),
+            )
+            .is_ok());
+            let socket = NodeConfig::parse_socket_addr(&gw.address).await.unwrap();
+            assert_eq!(socket.port(), default_network_api_port());
+        }
     }
 }

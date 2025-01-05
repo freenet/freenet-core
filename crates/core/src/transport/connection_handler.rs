@@ -1,24 +1,5 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
-
-type GatewayConnectionFuture = Box<
-    dyn Future<
-            Output = Result<
-                (
-                    RemoteConnection,
-                    InboundRemoteConnection,
-                    PacketData<SymmetricAES>,
-                ),
-                TransportError,
-            >,
-        > + Send
-        + 'static,
->;
-
-type TraverseNatFuture = Box<
-    dyn Future<Output = Result<(RemoteConnection, InboundRemoteConnection), TransportError>>
-        + Send
-        + 'static,
->;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
@@ -29,16 +10,20 @@ use crate::transport::crypto::TransportSecretKey;
 use crate::transport::packet_data::{AssymetricRSA, UnknownEncryption};
 use crate::transport::symmetric_message::OutboundConnection;
 use aes_gcm::{Aes128Gcm, KeyInit};
-use futures::FutureExt;
 use futures::{
+    future::BoxFuture,
     stream::{FuturesUnordered, StreamExt},
-    Future,
+    Future, FutureExt, TryFutureExt,
 };
-use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task;
-use tracing::span;
-use tracing::Instrument;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use tokio::{
+    net::UdpSocket,
+    sync::{mpsc, oneshot},
+    task, task_local,
+};
+use tracing::{span, Instrument};
+use version_cmp::PROTOC_VERSION;
 
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
@@ -49,8 +34,6 @@ use super::{
     Socket, TransportError,
 };
 
-const PROTOC_VERSION: [u8; 2] = 1u16.to_le_bytes();
-
 // Constants for interval increase
 const INITIAL_INTERVAL: Duration = Duration::from_millis(200);
 const INTERVAL_INCREASE_FACTOR: u64 = 2;
@@ -60,6 +43,21 @@ const DEFAULT_BW_TRACKER_WINDOW_SIZE: Duration = Duration::from_secs(10);
 const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
 
 pub type SerializedMessage = Vec<u8>;
+
+type GatewayConnectionFuture = BoxFuture<
+    'static,
+    Result<
+        (
+            RemoteConnection,
+            InboundRemoteConnection,
+            PacketData<SymmetricAES>,
+        ),
+        TransportError,
+    >,
+>;
+
+type TraverseNatFuture =
+    BoxFuture<'static, Result<(RemoteConnection, InboundRemoteConnection), TransportError>>;
 
 pub(crate) async fn create_connection_handler<S: Socket>(
     keypair: TransportKeypair,
@@ -148,7 +146,7 @@ impl OutboundConnectionHandler {
         };
 
         task::spawn(bw_tracker.rate_limiter(BANDWITH_LIMIT, socket));
-        task::spawn(transport.listen());
+        task::spawn(RANDOM_U64.scope(StdRng::from_entropy().gen(), transport.listen()));
 
         Ok((connection_handler, new_connection_notifier))
     }
@@ -239,6 +237,14 @@ impl<T> Drop for UdpPacketsListener<T> {
         tracing::info!(%self.this_addr, "Dropping UdpPacketsListener");
     }
 }
+task_local! {
+    static RANDOM_U64: [u8; 8];
+}
+
+#[cfg(not(test))]
+pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 20;
+#[cfg(test)]
+pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
 
 impl<S: Socket> UdpPacketsListener<S> {
     #[tracing::instrument(level = "debug", name = "transport_listener", fields(peer = %self.this_peer_keypair.public), skip_all)]
@@ -252,7 +258,31 @@ impl<S: Socket> UdpPacketsListener<S> {
         > = BTreeMap::new();
         let mut connection_tasks = FuturesUnordered::new();
         let mut gw_connection_tasks = FuturesUnordered::new();
-        loop {
+        let mut pending_connections = vec![];
+
+        'outer: loop {
+            'inner: loop {
+                if pending_connections.len() > 10 {
+                    tracing::error!(%self.this_addr, "too many pending connections");
+                    break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
+                }
+                if let Some(pending) = pending_connections.pop() {
+                    match self.new_connection_notifier.try_send(pending) {
+                        Ok(_) => {}
+                        Err(mpsc::error::TrySendError::Full(pending)) => {
+                            tracing::error!(%self.this_addr, "channel is full");
+                            pending_connections.push(pending);
+                            break 'inner;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            tracing::error!(%self.this_addr, "failed to notify new connection");
+                            break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
+                        }
+                    }
+                } else {
+                    break 'inner;
+                }
+            }
             tokio::select! {
                 // Handling of inbound packets
                 recv_result = self.socket_listener.recv_from(&mut buf) => {
@@ -286,16 +316,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 continue;
                             }
                             let packet_data = PacketData::from_buf(&buf[..size]);
-                            let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr);
-                            let task = tokio::spawn({
-                                let span = tracing::span!(tracing::Level::DEBUG, "gateway_connection");
-                                async move {
-                                    match Pin::from(gw_ongoing_connection).await {
-                                        Ok(result) => Ok(result),
-                                        Err(error) => Err((error, remote_addr))
-                                    }
-                                }.instrument(span)
-                            });
+                            let inbound_key_bytes = key_from_addr(&remote_addr);
+                            let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
+                            let task = tokio::spawn(gw_ongoing_connection
+                                .instrument(tracing::span!(tracing::Level::DEBUG, "gateway_connection"))
+                                .map_err(move |error| {
+                                (error, remote_addr)
+                            }));
                             ongoing_gw_connections.insert(remote_addr, packets_sender);
                             gw_connection_tasks.push(task);
                         }
@@ -318,12 +345,17 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                             self.remote_connections.insert(remote_addr, inbound_remote_connection);
 
-                            if let Err(e) = self.new_connection_notifier
-                                .send(PeerConnection::new(outbound_remote_conn))
-                                .await
-                                .map_err(|_| TransportError::ChannelClosed) {
-                                tracing::error!(%remote_addr, %e, "gateway connection established but failed to notify new connection");
-                                continue;
+                            match self.new_connection_notifier
+                            .try_send(PeerConnection::new(outbound_remote_conn)) {
+                                Ok(_) => {}
+                                Err(mpsc::error::TrySendError::Full(pending_conn)) => {
+                                    tracing::error!(%remote_addr, "gateway connection established but channel is full");
+                                    pending_connections.push(pending_conn);
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    tracing::error!(%remote_addr, "gateway connection established but failed to notify new connection");
+                                    break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
+                                }
                             }
 
                             sent_tracker.lock().report_sent_packet(
@@ -368,6 +400,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                         tracing::debug!(%self.this_addr, "connection handler closed");
                         return Ok(());
                     };
+                    tracing::debug!(%remote_addr, "received connection event");
                     if let Some(_conn) = self.remote_connections.remove(&remote_addr) {
                         tracing::warn!(%remote_addr, "connection already established, dropping old connection");
                     }
@@ -376,15 +409,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                     let (ongoing_connection, packets_sender) = self.traverse_nat(
                         remote_addr,  remote_public_key,
                     );
-                    let task = tokio::spawn({
-                        let span = span!(tracing::Level::DEBUG, "traverse_nat");
-                        async move {
-                            match Pin::from(ongoing_connection).await {
-                                Ok(result) => Ok(result),
-                                Err(error) => Err((error, remote_addr))
-                            }
-                        }.instrument(span)
-                    });
+                    let task = tokio::spawn(ongoing_connection
+                        .map_err(move |err| (err, remote_addr))
+                        .instrument(span!(tracing::Level::DEBUG, "traverse_nat"))
+                    );
                     connection_tasks.push(task);
                     ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
                 },
@@ -392,10 +420,12 @@ impl<S: Socket> UdpPacketsListener<S> {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn gateway_connection(
         &mut self,
         remote_intro_packet: PacketData<UnknownEncryption>,
         remote_addr: SocketAddr,
+        inbound_key_bytes: [u8; 16],
     ) -> (
         GatewayConnectionFuture,
         mpsc::Sender<PacketData<UnknownEncryption>>,
@@ -434,14 +464,15 @@ impl<S: Socket> UdpPacketsListener<S> {
                 });
             }
 
-            let inbound_key_bytes = rand::random::<[u8; 16]>();
             let inbound_key = Aes128Gcm::new(&inbound_key_bytes.into());
             let outbound_ack_packet =
                 SymmetricMessage::ack_ok(&outbound_key, inbound_key_bytes, remote_addr)?;
 
+            tracing::debug!(%remote_addr, "Sending outbound ack packet: {:?}", outbound_ack_packet.data());
+
             let mut waiting_time = INITIAL_INTERVAL;
             let mut attempts = 0;
-            const MAX_ATTEMPTS: usize = 30;
+            const MAX_ATTEMPTS: usize = 15;
 
             while attempts < MAX_ATTEMPTS {
                 outbound_packets
@@ -454,7 +485,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 match timeout.await {
                     Ok(Some(packet)) => {
                         let _ = packet.try_decrypt_sym(&inbound_key).map_err(|_| {
-                            tracing::debug!(%remote_addr, "Failed to decrypt packet with inbound key");
+                            tracing::debug!(%remote_addr, "Failed to decrypt packet with inbound key: {:?}", packet.data());
                             TransportError::ConnectionEstablishmentFailure {
                                 cause: "invalid symmetric key".into(),
                             }
@@ -504,16 +535,10 @@ impl<S: Socket> UdpPacketsListener<S> {
             tracing::debug!("returning connection at gw");
             Ok((remote_conn, inbound_conn, outbound_ack_packet))
         };
-        (Box::new(f), inbound_from_remote)
+        (f.boxed(), inbound_from_remote)
     }
 
-    // TODO: this value should be set given exponential backoff and max timeout
-    #[cfg(not(test))]
-    const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 20;
-
-    #[cfg(test)]
-    const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
-
+    #[allow(clippy::type_complexity)]
     fn traverse_nat(
         &mut self,
         remote_addr: SocketAddr,
@@ -523,7 +548,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         // Constants for exponential backoff
-        const INITIAL_TIMEOUT: Duration = Duration::from_millis(15);
+        const INITIAL_TIMEOUT: Duration = Duration::from_millis(200);
         const TIMEOUT_MULTIPLIER: f64 = 1.2;
         #[cfg(not(test))]
         const MAX_TIMEOUT: Duration = Duration::from_secs(60); // Maximum timeout limit
@@ -553,7 +578,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                 tracing::debug!(%remote_addr, "received intro packet");
                 let protoc = &decrypted_intro_packet.data()[..PROTOC_VERSION.len()];
                 if protoc != PROTOC_VERSION {
-                    todo!("return error");
+                    tracing::debug!(%remote_addr, ?protoc, this_protoc = ?PROTOC_VERSION, "remote is using a different protocol version");
+                    return Err(());
                 }
                 let outbound_key_bytes =
                     &decrypted_intro_packet.data()[PROTOC_VERSION.len()..PROTOC_VERSION.len() + 16];
@@ -596,7 +622,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
             let mut sent_tracker = SentPacketTracker::new();
 
-            while failures < Self::NAT_TRAVERSAL_MAX_ATTEMPTS {
+            while failures < NAT_TRAVERSAL_MAX_ATTEMPTS {
                 match state {
                     ConnectionState::StartOutbound { .. } => {
                         tracing::debug!(%remote_addr, "sending protocol version and inbound key");
@@ -629,6 +655,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             ConnectionState::StartOutbound { .. } => {
                                 // at this point it's either the remote sending us an intro packet or a symmetric packet
                                 // cause is the first packet that passes through the NAT
+                                tracing::debug!(%remote_addr, "received packet from remote: {:?}", packet.data());
                                 if let Ok(decrypted_packet) =
                                     packet.try_decrypt_sym(&inbound_sym_key)
                                 {
@@ -659,6 +686,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                         cause: "invalid symmetric key".into(),
                                                     }
                                                 })?;
+                                            tracing::debug!(%remote_addr, "Sending back ack connection: {:?}", key);
                                             outbound_packets
                                                 .send((
                                                     remote_addr,
@@ -697,11 +725,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         SymmetricMessagePayload::AckConnection {
                                             result: Err(err),
                                         } => {
-                                            return Err(
-                                                TransportError::ConnectionEstablishmentFailure {
-                                                    cause: err,
-                                                },
-                                            );
+                                            return Err(handle_ack_connection_error(err));
                                         }
                                         _ => {
                                             tracing::debug!(%remote_addr, "unexpected packet from remote");
@@ -805,8 +829,48 @@ impl<S: Socket> UdpPacketsListener<S> {
                 cause: "max connection attempts reached".into(),
             })
         };
-        (Box::new(f), inbound_from_remote)
+        (f.boxed(), inbound_from_remote)
     }
+}
+
+fn handle_ack_connection_error(err: Cow<'static, str>) -> TransportError {
+    if let Some(expected) = err.split("expected version").nth(1) {
+        TransportError::ProtocolVersionMismatch {
+            expected: expected.trim().to_string(),
+            actual: version_cmp::VERSION,
+        }
+    } else {
+        TransportError::ConnectionEstablishmentFailure { cause: err }
+    }
+}
+
+fn key_from_addr(addr: &SocketAddr) -> [u8; 16] {
+    let current_time = chrono::Utc::now();
+    let mut hasher = blake3::Hasher::new();
+    match addr {
+        SocketAddr::V4(v4) => {
+            hasher.update(&v4.ip().octets());
+            hasher.update(&v4.port().to_le_bytes());
+        }
+        SocketAddr::V6(v6) => {
+            hasher.update(&v6.ip().octets());
+            hasher.update(&v6.port().to_le_bytes());
+        }
+    }
+    hasher.update(
+        current_time
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp()
+            .to_le_bytes()
+            .as_ref(),
+    );
+    RANDOM_U64.with(|&random_value| {
+        hasher.update(random_value.as_ref());
+    });
+    hasher.finalize().as_bytes()[..16].try_into().unwrap()
 }
 
 pub(crate) enum ConnectionEvent {
@@ -818,6 +882,123 @@ pub(crate) enum ConnectionEvent {
 
 struct InboundRemoteConnection {
     inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
+}
+
+mod version_cmp {
+    pub(super) const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+    pub(super) const PROTOC_VERSION: [u8; 8] = parse_version_with_flags(VERSION);
+
+    const fn parse_version_with_flags(version: &str) -> [u8; 8] {
+        let mut major = 0u8;
+        let mut minor = 0u8;
+        let mut patch = 0u8;
+        let mut flags = 0u32;
+        let mut state = 0; // 0: major, 1: minor, 2: patch
+
+        let bytes = version.as_bytes();
+        let mut i = 0;
+
+        // Parse major.minor.patch
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c == b'.' {
+                state += 1;
+            } else if c >= b'0' && c <= b'9' {
+                let digit = c - b'0';
+                match state {
+                    0 => major = major * 10 + digit,
+                    1 => minor = minor * 10 + digit,
+                    2 => patch = patch * 10 + digit,
+                    _ => {}
+                }
+            } else {
+                break; // Move to flags processing.
+            }
+            i += 1;
+        }
+
+        // Parse flags (pre-release only)
+        if i < bytes.len() && bytes[i] == b'-' {
+            i += 1; // Skip the '-'
+
+            flags = get_flag_hash(bytes, i);
+        }
+
+        // Encode into [u8; 8]
+        [
+            major,
+            minor,
+            patch,
+            (flags >> 24) as u8,
+            (flags >> 16) as u8,
+            (flags >> 8) as u8,
+            flags as u8,
+            0, // Reserved for future use
+        ]
+    }
+
+    const fn get_flag_hash(bytes: &[u8], start_index: usize) -> u32 {
+        let mut hash = 0u32;
+        let mut i = start_index;
+
+        while i < bytes.len() {
+            let byte = bytes[i];
+            hash = hash.wrapping_mul(31).wrapping_add(byte as u32);
+            i += 1;
+        }
+        hash
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn test_parse_version_with_flags() {
+        fn decode_version_from_bytes(bytes: [u8; 8]) -> String {
+            let major = bytes[0];
+            let minor = bytes[1];
+            let patch = bytes[2];
+
+            let flags = u32::from_be_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]);
+
+            let flags_str = match flags {
+                _ if flags == get_flag_hash(b"alpha", 0) => "alpha",
+                _ if flags == get_flag_hash(b"beta2", 0) => "beta2",
+                _ if flags == get_flag_hash(b"rc1", 0) => "rc1",
+                _ if flags == get_flag_hash(b"rc2", 0) => "rc2",
+                _ => "",
+            };
+
+            if !flags_str.is_empty() {
+                format!("{}.{}.{}-{}", major, minor, patch, flags_str)
+            } else {
+                format!("{}.{}.{}", major, minor, patch)
+            }
+        }
+
+        let test_cases = vec![
+            "1.2.3",
+            "1.2.3-alpha",
+            "255.255.255",
+            "10.20.30-beta2",
+            "1.2.3-rc1",
+            "1.2.3-rc2",
+        ];
+
+        for version_str in test_cases {
+            // Step 1: Encode the version string into bytes
+            let encoded = parse_version_with_flags(version_str);
+
+            // Step 2: Decode the bytes back into a version string
+            let decoded = decode_version_from_bytes(encoded);
+
+            // Step 3: Compare the decoded string with the original version string
+            assert_eq!(
+                decoded, version_str,
+                "Failed for version string '{}', decoded as '{}'",
+                version_str, decoded
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -839,6 +1020,27 @@ mod test {
 
     use super::*;
     use crate::transport::packet_data::MAX_DATA_SIZE;
+
+    #[test]
+    fn test_handle_ack_connection_error() {
+        let err_msg =
+            "remote is using a different protocol version, expected version 1.2.3".to_string();
+        match handle_ack_connection_error(err_msg.into()) {
+            TransportError::ProtocolVersionMismatch { expected, actual } => {
+                assert_eq!(expected, "1.2.3");
+                assert_eq!(actual, version_cmp::VERSION);
+            }
+            _ => panic!("Expected ProtocolVersionMismatch error"),
+        }
+
+        let err_msg_no_version = "remote is using a different protocol version".to_string();
+        match handle_ack_connection_error(err_msg_no_version.clone().into()) {
+            TransportError::ConnectionEstablishmentFailure { cause } => {
+                assert_eq!(cause, err_msg_no_version);
+            }
+            _ => panic!("Expected ConnectionEstablishmentFailure error"),
+        }
+    }
 
     type Channels = Arc<DashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>>;
 

@@ -14,7 +14,7 @@ LOGS_DIR := $(BASE_DIR)/logs
 
 # Network Configuration
 # ------------------------------------------
-N_NODES     := 2
+N_NODES     := 1
 N_GATEWAYS  := 1
 BASE_PORT   := 3100
 WS_BASE_PORT:= 3000
@@ -26,7 +26,7 @@ GW_CONFIG   := $(BASE_DIR)/gateways.toml
 # Environment
 # ------------------------------------------
 ENV_VARS := RUST_BACKTRACE=1 RUST_LOG="info,freenet=debug,freenet-stdlib=debug,fdev=debug"
-FREENET_CORE_PATH := ../../crates/core/
+FREENET_CORE_PATH := ../crates/core/
 
 # Log Command with ANSI color removal
 # ------------------------------------------
@@ -77,19 +77,14 @@ create-dirs:
 generate-keys:
 	@echo "→ Generating RSA keys..."
 	@for i in $$(seq 1 $(N_GATEWAYS)); do \
-		openssl genpkey -algorithm RSA -out $(KEYS_DIR)/gw$${i}_private_key.pem && \
-		openssl rsa -pubout -in $(KEYS_DIR)/gw$${i}_private_key.pem \
-			-out $(KEYS_DIR)/gw$${i}_public_key.pem; \
-	done
-	@for i in $$(seq 1 $(N_NODES)); do \
-		openssl genpkey -algorithm RSA -out $(BASE_DIR)/n$$i/n$${i}_private_key.pem && \
-		openssl rsa -pubout -in $(BASE_DIR)/n$$i/n$${i}_private_key.pem \
-			-out $(BASE_DIR)/n$$i/n$${i}_public_key.pem; \
+		openssl genpkey -algorithm RSA -out $(KEYS_DIR)/gw$${i}_private_key.pem -pkeyopt rsa_keygen_bits:4096 && \
+		openssl pkey -in $(KEYS_DIR)/gw$${i}_private_key.pem \
+			-pubout -out $(KEYS_DIR)/gw$${i}_public_key.pem; \
 	done
 
 # Network Management
 # ------------------------------------------
-start: start-gateways start-nodes
+start: stop start-gateways start-nodes
 	@echo "→ Network started successfully"
 	@$(MAKE) -f local-network.mk status
 
@@ -97,15 +92,18 @@ start-gateways: generate-gw-config
 	@echo "→ Starting gateways..."
 	@for i in $$(seq 1 $(N_GATEWAYS)); do \
 		port=$$(( $(BASE_PORT) + $$i )); \
+		ws_port=$$(( $(WS_BASE_PORT) + $$i )); \
+		if [ -f "$(LOGS_DIR)/gw$$i.log" ]; then : > "$(LOGS_DIR)/gw$$i.log"; fi; \
 		($(ENV_VARS) freenet network \
 			--is-gateway \
+			--ws-api-port $$ws_port \
 			--public-network-address 127.0.0.1 \
 			--public-network-port $$port \
 			--db-dir $(BASE_DIR)/gw$$i \
 			--transport-keypair $(KEYS_DIR)/gw$${i}_private_key.pem \
 			--network-port $$port $(call LOG_CMD,$(LOGS_DIR)/gw$$i.log)) & \
 		echo $$! > $(PID_DIR)/gw$$i.pid; \
-		echo "  Gateway $$i: port=$$port (PID: $$!)"; \
+		echo "  Gateway $$i: port=$$port, ws=$$ws_port (PID: $$!)"; \
 	done
 	@echo "  Waiting 2 seconds for gateways to initialize..."
 	@sleep 2
@@ -114,15 +112,16 @@ start-nodes:
 	@echo "→ Starting nodes..."
 	@for i in $$(seq 1 $(N_NODES)); do \
 		network_port=$$(( $(BASE_PORT) + $(N_GATEWAYS) + $$i )); \
-		ws_port=$$(( $(WS_BASE_PORT) + $$i )); \
+		ws_port=$$(( $(WS_BASE_PORT) + $(N_GATEWAYS) + $$i )); \
 		public_port=$$(( $(WS_BASE_PORT) + $(N_NODES) + $$i )); \
+		if [ -f "$(LOGS_DIR)/n$$i.log" ]; then : > $(LOGS_DIR)/n$$i.log; fi; \
 		($(ENV_VARS) freenet network \
 			--config-dir $(BASE_DIR) \
 			--ws-api-port $$ws_port \
 			--public-network-port $$public_port \
 			--db-dir $(BASE_DIR)/n$$i \
 			--network-port $$network_port \
-			--transport-keypair $(BASE_DIR)/n$$i/n$${i}_private_key.pem $(call LOG_CMD,$(LOGS_DIR)/n$$i.log)) & \
+			$(call LOG_CMD,$(LOGS_DIR)/n$$i.log)) & \
 		echo $$! > $(PID_DIR)/n$$i.pid; \
 		echo "  Node $$i: network=$$network_port, ws=$$ws_port, public=$$public_port (PID: $$!)"; \
 		if [ $$i -lt $(N_NODES) ]; then \

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use clap::Parser;
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
@@ -7,6 +9,7 @@ use freenet_stdlib::{
     },
 };
 use names::Generator;
+use tokio::time::timeout;
 
 #[derive(clap::Parser)]
 struct Args {
@@ -55,15 +58,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         }))
         .await?;
 
-    let resp = client.recv().await;
+    let resp = timeout(Duration::from_secs(5), client.recv()).await;
 
     let mut is_subcribed = false;
     let mut local_state = match resp {
-        Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
             key,
             contract: _,
             state,
-        })) => {
+        }))) => {
             tracing::info!(key=%key, "fetched state successfully!");
             if contract_key != key || (*state).is_empty() {
                 client
@@ -110,7 +113,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     let mut send_tick = tokio::time::interval(args.parameters.frequency);
 
     let mut generator = Generator::default();
+    let mut errors = 0;
     loop {
+        if errors > 100 {
+            tracing::error!("too many errors, shutting down...");
+            return Err("too many errors".into());
+        }
         tokio::select! {
             _ = send_tick.tick() => {
                 if is_subcribed {
@@ -202,6 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                     },
                     Err(e) => {
                         tracing::error!(err=%e);
+                        errors += 1;
                     },
                 }
             }
