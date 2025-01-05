@@ -11,7 +11,8 @@ use std::{
     sync::{Arc, atomic::{AtomicU64, AtomicUsize}},
     time::{Duration, Instant},
 };
-use tokio::sync::{self, mpsc::{self, TryRecvError}};
+use tokio::sync::{self, mpsc::{self, error::TryRecvError}};
+use tracing::Instrument;
 
 use dashmap::{mapref::one::Ref as DmRef, DashMap};
 use either::Either;

@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use dashmap::DashMap;
-use tokio::sync::{self, mpsc};
+use tokio::sync;
 use crate::{message::Transaction, node::PeerId};
 
 #[derive(Clone)]
-pub struct LiveTransactionTracker {
+pub(crate) struct LiveTransactionTracker {
     tx_per_peer: Arc<DashMap<PeerId, Vec<Transaction>>>,
     missing_candidate_sender: sync::mpsc::Sender<PeerId>,
 }
