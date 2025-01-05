@@ -16,6 +16,7 @@ Ensure you have the following installed:
 - `openssl`
 - `curl`
 - `git`
+- The latest version of `freenet` utility available in `/usr/local/bin/` via a symbolic link to the target directory where it is installed.
 
 ---
 
