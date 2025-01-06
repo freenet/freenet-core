@@ -12,6 +12,22 @@ pub struct RateProportion {
     value: f64,
 }
 
+impl RateProportion {
+    pub(crate) fn new(value: f64) -> Self {
+        debug_assert!(
+            (0.0..=1.0).contains(&value),
+            "Proportion must be between 0 and 1"
+        );
+        RateProportion { value }
+    }
+}
+
+impl PartialOrd for RateProportion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.value.partial_cmp(&other.value)
+    }
+}
+
 impl Rate {
     pub fn new(value: f64, divisor: Duration) -> Self {
         debug_assert!(value >= 0.0, "Value must be non-negative");
@@ -55,12 +71,6 @@ impl PartialOrd for Rate {
     }
 }
 
-impl PartialOrd for RateProportion {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.value.partial_cmp(&other.value)
-    }
-}
-
 impl std::ops::Add for Rate {
     type Output = Self;
 
@@ -84,16 +94,6 @@ impl std::ops::Sub for Rate {
 impl std::ops::AddAssign for Rate {
     fn add_assign(&mut self, other: Self) {
         self.value += other.value;
-    }
-}
-
-impl RateProportion {
-    pub(crate) fn new(value: f64) -> Self {
-        debug_assert!(
-            (0.0..=1.0).contains(&value),
-            "Proportion must be between 0 and 1"
-        );
-        RateProportion { value }
     }
 }
 
