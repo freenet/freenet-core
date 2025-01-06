@@ -128,7 +128,7 @@ impl SeedingManager {
 
     pub fn prune_subscriber(&self, loc: Location) {
         self.subscribers.alter_all(|_, mut subs| {
-            if let Some(pos) = subs.iter().position(|l| l.peer_key_location.location == Some(loc)) {
+            if let Some(pos) = subs.iter().position(|l| l.location == Some(loc)) {
                 subs.swap_remove(pos);
             }
             subs

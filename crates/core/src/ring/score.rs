@@ -1,3 +1,5 @@
+//! Score type used for ranking peers and contracts
+
 #[derive(PartialEq, Clone, Copy)]
 pub struct Score(pub f64);
 

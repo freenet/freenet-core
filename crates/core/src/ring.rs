@@ -42,8 +42,11 @@ mod connection_manager;
 pub(crate) use connection_manager::ConnectionManager;
 pub mod live_tx;
 mod location;
+pub(crate) mod score;
 mod seeding;
 mod types;
+
+use self::score::Score;
 
 pub use self::live_tx::LiveTransactionTracker;
 pub use location::{Distance, Location};
