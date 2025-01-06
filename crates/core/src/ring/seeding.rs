@@ -1,4 +1,4 @@
-use dashmap::mapref::one::Ref as DmRef;
+use dashmap::{DashMap, mapref::one::Ref as DmRef};
 use super::{Location, PeerKeyLocation, Score};
 use freenet_stdlib::prelude::ContractKey;
 
