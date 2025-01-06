@@ -17,7 +17,7 @@ use std::{
 use tokio::sync::mpsc::{self, error::TryRecvError};
 use tracing::Instrument;
 
-use dashmap::{mapref::one::Ref as DmRef, DashMap};
+use dashmap::mapref::one::Ref as DmRef;
 use either::Either;
 use freenet_stdlib::prelude::ContractKey;
 use itertools::Itertools;
@@ -186,8 +186,7 @@ impl Ring {
 
     /// Return if a contract is within appropiate seeding distance.
     pub fn should_seed(&self, key: &ContractKey) -> bool {
-        const CACHING_DISTANCE: f64 = 0.05;
-        let caching_distance = Distance::new(CACHING_DISTANCE);
+        const _CACHING_DISTANCE: f64 = 0.05;
         let own_loc = self
             .connection_manager
             .own_location()
@@ -299,12 +298,7 @@ impl Ring {
             return;
         };
         {
-            self.subscribers.alter_all(|_, mut subs| {
-                if let Some(pos) = subs.iter().position(|l| l.location == Some(loc)) {
-                    subs.swap_remove(pos);
-                }
-                subs
-            });
+            self.seeding_manager.prune_subscriber(loc);
         }
         self.event_register
             .register_events(Either::Left(NetEventLog::disconnected(self, &peer)))

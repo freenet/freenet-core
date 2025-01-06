@@ -1,6 +1,4 @@
-use std::collections::BTreeSet;
-use dashmap::{DashMap, mapref::one::Ref as DmRef};
-use crate::node::PeerId;
+use dashmap::mapref::one::Ref as DmRef;
 use super::{Location, PeerKeyLocation, Score};
 use freenet_stdlib::prelude::ContractKey;
 
@@ -129,6 +127,11 @@ impl SeedingManager {
     }
 
     pub fn prune_subscriber(&self, loc: Location) {
-        self.seeding_manager.prune_subscriber(loc);
+        self.subscribers.alter_all(|_, mut subs| {
+            if let Some(pos) = subs.iter().position(|l| l.peer_key_location.location == Some(loc)) {
+                subs.swap_remove(pos);
+            }
+            subs
+        });
     }
 }
