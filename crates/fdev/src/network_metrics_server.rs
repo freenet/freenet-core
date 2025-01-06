@@ -260,13 +260,17 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     transaction,
                     key,
                     contract_location,
+                    timestamp,
+                    target,
                 } => {
                     tracing::info!("sending get contract");
                     ContractChange::get_contract_msg(
                         requester,
+                        target,
                         transaction,
                         key,
                         *contract_location,
+                        *timestamp,
                     )
                 }
                 Change::SubscribedToContract {
@@ -276,6 +280,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     contract_location,
                     at_peer,
                     at_peer_location,
+                    timestamp,
                 } => {
                     tracing::info!("sending subscribed to contract");
                     ContractChange::subscribed_msg(
@@ -285,6 +290,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                         *contract_location,
                         at_peer,
                         *at_peer_location,
+                        *timestamp,
                     )
                 }
 
@@ -396,12 +402,16 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                 transaction,
                 key,
                 contract_location,
+                timestamp,
+                target,
             } => {
                 let msg = ContractChange::get_contract_msg(
                     requester,
+                    target,
                     transaction,
                     key,
                     contract_location,
+                    timestamp,
                 );
                 tx.send(Message::Binary(msg)).await?;
             }
@@ -412,6 +422,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                 contract_location,
                 at_peer,
                 at_peer_location,
+                timestamp,
             } => {
                 let msg = ContractChange::subscribed_msg(
                     requester,
@@ -420,6 +431,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     contract_location,
                     at_peer,
                     at_peer_location,
+                    timestamp,
                 );
                 tx.send(Message::Binary(msg)).await?;
             }
@@ -499,6 +511,8 @@ pub(crate) enum Change {
         transaction: String,
         key: String,
         contract_location: f64,
+        timestamp: u64,
+        target: String,
     },
     SubscribedToContract {
         requester: String,
@@ -507,6 +521,7 @@ pub(crate) enum Change {
         contract_location: f64,
         at_peer: String,
         at_peer_location: f64,
+        timestamp: u64,
     },
 }
 
@@ -856,6 +871,8 @@ impl ServerState {
                 let transaction = get_contract_data.transaction().to_string();
                 let key = get_contract_data.key().to_string();
                 let contract_location = get_contract_data.contract_location();
+                let timestamp = get_contract_data.timestamp();
+                let target = get_contract_data.target().to_string();
 
                 if requester.is_empty() {
                     return Err(anyhow::anyhow!("requester is empty"));
@@ -873,12 +890,22 @@ impl ServerState {
                     return Err(anyhow::anyhow!("contract_location is not a number"));
                 }
 
+                if timestamp == 0 {
+                    return Err(anyhow::anyhow!("timestamp is invalid"));
+                }
+
+                if target.is_empty() {
+                    return Err(anyhow::anyhow!("target is empty"));
+                }
+
                 if let Some(mut transactions) = self.transactions_data.get_mut(&transaction) {
                     transactions.push(Change::GetContract {
                         requester: requester.clone(),
                         transaction: transaction.clone(),
                         key: key.clone(),
                         contract_location,
+                        timestamp,
+                        target: target.clone(),
                     });
                     tracing::info!("found transaction data, adding GetContract to history");
                 } else {
@@ -890,6 +917,8 @@ impl ServerState {
                             transaction: transaction.clone(),
                             key: key.clone(),
                             contract_location,
+                            timestamp,
+                            target: target.clone(),
                         }],
                     );
 
@@ -931,15 +960,20 @@ impl ServerState {
                     transaction,
                     key,
                     contract_location,
+                    timestamp,
+                    target,
                 });
             }
-            ChangesWrapper::ContractChange(ContractChange::SubscribeToContract(subscribe_data)) => {
+            ChangesWrapper::ContractChange(ContractChange::SubscribedToContract(
+                subscribe_data,
+            )) => {
                 let requester = subscribe_data.requester().to_string();
                 let transaction = subscribe_data.transaction().to_string();
                 let key = subscribe_data.key().to_string();
                 let contract_location = subscribe_data.contract_location();
                 let at_peer = subscribe_data.at_peer().to_string();
                 let at_peer_location = subscribe_data.at_peer_location();
+                let timestamp = subscribe_data.timestamp();
 
                 if requester.is_empty() {
                     return Err(anyhow::anyhow!("requester is empty"));
@@ -957,6 +991,14 @@ impl ServerState {
                     return Err(anyhow::anyhow!("at_peer is empty"));
                 }
 
+                if contract_location.is_nan() {
+                    return Err(anyhow::anyhow!("contract_location is not a number"));
+                }
+
+                if timestamp == 0 {
+                    return Err(anyhow::anyhow!("timestamp is invalid"));
+                }
+
                 if let Some(mut transactions_list) = self.transactions_data.get_mut(&transaction) {
                     transactions_list.push(Change::SubscribedToContract {
                         requester: requester.clone(),
@@ -965,6 +1007,7 @@ impl ServerState {
                         contract_location,
                         at_peer: at_peer.clone(),
                         at_peer_location,
+                        timestamp,
                     });
                     tracing::info!(
                         "found transaction data, adding SubscribedToContract to history"
@@ -980,6 +1023,7 @@ impl ServerState {
                             contract_location,
                             at_peer: at_peer.clone(),
                             at_peer_location,
+                            timestamp,
                         }],
                     );
 
@@ -1032,6 +1076,7 @@ impl ServerState {
                     contract_location,
                     at_peer,
                     at_peer_location,
+                    timestamp,
                 });
             }
 
