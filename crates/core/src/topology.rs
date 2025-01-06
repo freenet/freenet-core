@@ -448,7 +448,7 @@ impl TopologyManager {
             }
             Err(e) => {
                 error!("Failed to get max density location: {:?}", e);
-                return Err(anyhow::Error::from(e));
+                return Err(anyhow!(e));
             }
         };
 
