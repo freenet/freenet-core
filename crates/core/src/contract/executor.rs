@@ -32,7 +32,6 @@ use crate::{
     client_events::{ClientId, HostResult},
     operations::{self, Operation},
 };
-
 use super::storages::Storage;
 
 pub(super) mod mock_runtime;
@@ -399,6 +398,12 @@ struct UpdateContract {
     new_state: WrappedState,
 }
 
+#[derive(Debug)]
+pub(crate) enum UpsertResult {
+    NoChange,
+    Updated(WrappedState),
+}
+
 impl ComposeNetworkMessage<operations::update::UpdateOp> for UpdateContract {
     fn initiate_op(self, _op_manager: &OpManager) -> operations::update::UpdateOp {
         let UpdateContract { key, new_state } = self;
@@ -428,7 +433,7 @@ pub(crate) trait ContractExecutor: Send + 'static {
         update: Either<WrappedState, StateDelta<'static>>,
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
-    ) -> impl Future<Output = Result<WrappedState, ExecutorError>> + Send;
+    ) -> impl Future<Output = Result<UpsertResult, ExecutorError>> + Send;
 
     fn register_contract_notifier(
         &mut self,

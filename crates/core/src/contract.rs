@@ -10,7 +10,7 @@ mod handler;
 pub mod storages;
 
 pub(crate) use executor::{
-    executor_channel, mock_runtime::MockRuntime, Callback, ExecutorToEventLoopChannel,
+    executor_channel, mock_runtime::MockRuntime, Callback, ExecutorToEventLoopChannel, UpsertResult,
     NetworkEventListenerHalve,
 };
 pub(crate) use handler::{
@@ -87,17 +87,21 @@ where
             } => {
                 let put_result = contract_handler
                     .executor()
-                    .upsert_contract_state(key, Either::Left(state), related_contracts, contract)
+                    .upsert_contract_state(key, Either::Left(state.clone()), related_contracts, contract)
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await;
+
+                let event_result = match put_result {
+                    Ok(UpsertResult::NoChange) => ContractHandlerEvent::PutResponse {new_value: Ok(state)},
+                    Ok(UpsertResult::Updated(state)) => ContractHandlerEvent::PutResponse {new_value: Ok(state)},
+                    Err(err) => ContractHandlerEvent::PutResponse {new_value: Err(err)},
+                };
 
                 contract_handler
                     .channel()
                     .send_to_sender(
                         id,
-                        ContractHandlerEvent::PutResponse {
-                            new_value: put_result.map_err(Into::into),
-                        },
+                        event_result,
                     )
                     .await
                     .map_err(|error| {
@@ -123,13 +127,17 @@ where
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await;
 
+                let event_result = match update_result {
+                    Ok(UpsertResult::NoChange) => ContractHandlerEvent::UpdateNoChange { key },
+                    Ok(UpsertResult::Updated(state)) => ContractHandlerEvent::UpdateResponse {new_value: Ok(state)},
+                    Err(err) => ContractHandlerEvent::UpdateResponse {new_value: Err(err)},
+                };
+
                 contract_handler
                     .channel()
                     .send_to_sender(
                         id,
-                        ContractHandlerEvent::UpdateResponse {
-                            new_value: update_result.map_err(Into::into),
-                        },
+                        event_result,
                     )
                     .await
                     .map_err(|error| {
