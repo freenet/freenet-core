@@ -16,7 +16,7 @@ export { PutRequest } from './topology/put-request.js';
 export { PutSuccess } from './topology/put-success.js';
 export { RemovedConnection } from './topology/removed-connection.js';
 export { Response } from './topology/response.js';
-export { SubscribeToContract } from './topology/subscribe-to-contract.js';
+export { SubscribedToContract } from './topology/subscribed-to-contract.js';
 export { UpdateFailure } from './topology/update-failure.js';
 export { UpdateRequest } from './topology/update-request.js';
 export { UpdateSuccess } from './topology/update-success.js';

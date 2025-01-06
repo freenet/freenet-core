@@ -72,6 +72,7 @@ table PutFailure {
   requester: string(required);
   target: string(required);
   key: string(required);
+  timestamp: uint64;
 }
 
 table UpdateSuccess {
@@ -79,6 +80,7 @@ table UpdateSuccess {
   requester: string(required);
   target: string(required);
   key: string(required);
+  timestamp: uint64;
 }
 
 table UpdateFailure {
@@ -86,6 +88,7 @@ table UpdateFailure {
   requester: string(required);
   target: string(required);
   key: string(required);
+  timestamp: uint64;
 }
 
 table BroadcastEmitted {
@@ -111,18 +114,21 @@ table BroadcastReceived {
 
 table GetContract {
   requester: string(required);
+  target: string(required);
   transaction: string(required);
   key: string(required);
   contract_location: float64;
+  timestamp: uint64;
 }
 
-table SubscribeToContract {
+table SubscribedToContract {
   requester: string(required);
   transaction: string(required);
   key: string(required);
   contract_location: float64;
   at_peer: string(required);
   at_peer_location: float64;
+  timestamp: uint64;
 }
 
 union ContractChangeType {
@@ -135,7 +141,7 @@ union ContractChangeType {
   UpdateSuccess,
   UpdateFailure,
   GetContract,
-  SubscribeToContract
+  SubscribedToContract
 
 }
 

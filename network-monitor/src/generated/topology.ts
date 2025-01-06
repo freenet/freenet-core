@@ -19,7 +19,7 @@ export {
     RemovedConnectionT,
 } from "./topology/removed-connection";
 export { Response } from "./topology/response";
-export { SubscribeToContract } from "./topology/subscribe-to-contract";
+export { SubscribedToContract } from "./topology/subscribed-to-contract";
 export { UpdateFailure } from "./topology/update-failure";
 export { UpdateRequest } from "./topology/update-request";
 export { UpdateSuccess } from "./topology/update-success";

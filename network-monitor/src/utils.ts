@@ -23,7 +23,7 @@ export const get_change_type = (
             return ChangeType.BROADCAST_RECEIVED;
         case fbTopology.ContractChangeType.GetContract:
             return ChangeType.GET_CONTRACT;
-        case fbTopology.ContractChangeType.SubscribeToContract:
+        case fbTopology.ContractChangeType.SubscribedToContract:
             return ChangeType.SUBSCRIBED_TO_CONTRACT;
         default:
             new Error("Invalid change type");
@@ -349,4 +349,103 @@ export const get_peers_caching_the_contract = (
     }
 
     return peers_caching_contract;
+};
+
+export const parse_get_contract_msg_data = (
+    contractChange: ContractChange,
+    changeType: fbTopology.ContractChangeType
+) => {
+    let get_contract_obj = contractChange.change(new fbTopology.GetContract());
+
+    let transaction = get_contract_obj.transaction();
+
+    if (!transaction) {
+        throw new Error("Transaction ID not found");
+    }
+
+    let requester = get_contract_obj.requester();
+
+    if (!requester) {
+        throw new Error("Requester Peer not found");
+    }
+
+    let key = get_contract_obj.key();
+
+    if (!key) {
+        throw new Error("Contract Key not found");
+    }
+
+    let target = get_contract_obj.target();
+
+    if (!target) {
+        throw new Error("Target Peer not found");
+    }
+
+    let contract_location = get_contract_obj.contractLocation();
+
+    let timestamp = get_contract_obj.timestamp()!;
+
+    let change_type = get_change_type(changeType)!;
+
+    return {
+        transaction,
+        requester,
+        key,
+        contract_location,
+        change_type,
+        timestamp,
+        target,
+    };
+};
+
+export const parse_subscribed_to_contract_msg_data = (
+    contractChange: ContractChange,
+    changeType: fbTopology.ContractChangeType
+) => {
+    let subscribed_to_contract_obj = contractChange.change(
+        new fbTopology.SubscribedToContract()
+    );
+
+    let transaction = subscribed_to_contract_obj.transaction();
+
+    if (!transaction) {
+        throw new Error("Transaction ID not found");
+    }
+
+    let requester = subscribed_to_contract_obj.requester();
+
+    if (!requester) {
+        throw new Error("Requester Peer not found");
+    }
+
+    let key = subscribed_to_contract_obj.key();
+
+    if (!key) {
+        throw new Error("Contract Key not found");
+    }
+
+    let at_peer = subscribed_to_contract_obj.atPeer();
+
+    if (!at_peer) {
+        throw new Error("At Peer not found");
+    }
+
+    let at_peer_location = subscribed_to_contract_obj.atPeerLocation();
+
+    let contract_location = subscribed_to_contract_obj.contractLocation();
+
+    let timestamp = subscribed_to_contract_obj.timestamp()!;
+
+    let change_type = get_change_type(changeType)!;
+
+    return {
+        transaction,
+        requester,
+        key,
+        contract_location,
+        change_type,
+        at_peer,
+        at_peer_location,
+        timestamp,
+    };
 };

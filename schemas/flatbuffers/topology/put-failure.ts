@@ -48,8 +48,13 @@ key(optionalEncoding?:any):string|Uint8Array|null {
   return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
 }
 
+timestamp():bigint {
+  const offset = this.bb!.__offset(this.bb_pos, 12);
+  return offset ? this.bb!.readUint64(this.bb_pos + offset) : BigInt('0');
+}
+
 static startPutFailure(builder:flatbuffers.Builder) {
-  builder.startObject(4);
+  builder.startObject(5);
 }
 
 static addTransaction(builder:flatbuffers.Builder, transactionOffset:flatbuffers.Offset) {
@@ -68,6 +73,10 @@ static addKey(builder:flatbuffers.Builder, keyOffset:flatbuffers.Offset) {
   builder.addFieldOffset(3, keyOffset, 0);
 }
 
+static addTimestamp(builder:flatbuffers.Builder, timestamp:bigint) {
+  builder.addFieldInt64(4, timestamp, BigInt('0'));
+}
+
 static endPutFailure(builder:flatbuffers.Builder):flatbuffers.Offset {
   const offset = builder.endObject();
   builder.requiredField(offset, 4) // transaction
@@ -77,12 +86,13 @@ static endPutFailure(builder:flatbuffers.Builder):flatbuffers.Offset {
   return offset;
 }
 
-static createPutFailure(builder:flatbuffers.Builder, transactionOffset:flatbuffers.Offset, requesterOffset:flatbuffers.Offset, targetOffset:flatbuffers.Offset, keyOffset:flatbuffers.Offset):flatbuffers.Offset {
+static createPutFailure(builder:flatbuffers.Builder, transactionOffset:flatbuffers.Offset, requesterOffset:flatbuffers.Offset, targetOffset:flatbuffers.Offset, keyOffset:flatbuffers.Offset, timestamp:bigint):flatbuffers.Offset {
   PutFailure.startPutFailure(builder);
   PutFailure.addTransaction(builder, transactionOffset);
   PutFailure.addRequester(builder, requesterOffset);
   PutFailure.addTarget(builder, targetOffset);
   PutFailure.addKey(builder, keyOffset);
+  PutFailure.addTimestamp(builder, timestamp);
   return PutFailure.endPutFailure(builder);
 }
 }

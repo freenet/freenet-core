@@ -27,59 +27,82 @@ requester(optionalEncoding?:any):string|Uint8Array|null {
   return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
 }
 
+target():string|null
+target(optionalEncoding:flatbuffers.Encoding):string|Uint8Array|null
+target(optionalEncoding?:any):string|Uint8Array|null {
+  const offset = this.bb!.__offset(this.bb_pos, 6);
+  return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
+}
+
 transaction():string|null
 transaction(optionalEncoding:flatbuffers.Encoding):string|Uint8Array|null
 transaction(optionalEncoding?:any):string|Uint8Array|null {
-  const offset = this.bb!.__offset(this.bb_pos, 6);
+  const offset = this.bb!.__offset(this.bb_pos, 8);
   return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
 }
 
 key():string|null
 key(optionalEncoding:flatbuffers.Encoding):string|Uint8Array|null
 key(optionalEncoding?:any):string|Uint8Array|null {
-  const offset = this.bb!.__offset(this.bb_pos, 8);
+  const offset = this.bb!.__offset(this.bb_pos, 10);
   return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
 }
 
 contractLocation():number {
-  const offset = this.bb!.__offset(this.bb_pos, 10);
+  const offset = this.bb!.__offset(this.bb_pos, 12);
   return offset ? this.bb!.readFloat64(this.bb_pos + offset) : 0.0;
 }
 
+timestamp():bigint {
+  const offset = this.bb!.__offset(this.bb_pos, 14);
+  return offset ? this.bb!.readUint64(this.bb_pos + offset) : BigInt('0');
+}
+
 static startGetContract(builder:flatbuffers.Builder) {
-  builder.startObject(4);
+  builder.startObject(6);
 }
 
 static addRequester(builder:flatbuffers.Builder, requesterOffset:flatbuffers.Offset) {
   builder.addFieldOffset(0, requesterOffset, 0);
 }
 
+static addTarget(builder:flatbuffers.Builder, targetOffset:flatbuffers.Offset) {
+  builder.addFieldOffset(1, targetOffset, 0);
+}
+
 static addTransaction(builder:flatbuffers.Builder, transactionOffset:flatbuffers.Offset) {
-  builder.addFieldOffset(1, transactionOffset, 0);
+  builder.addFieldOffset(2, transactionOffset, 0);
 }
 
 static addKey(builder:flatbuffers.Builder, keyOffset:flatbuffers.Offset) {
-  builder.addFieldOffset(2, keyOffset, 0);
+  builder.addFieldOffset(3, keyOffset, 0);
 }
 
 static addContractLocation(builder:flatbuffers.Builder, contractLocation:number) {
-  builder.addFieldFloat64(3, contractLocation, 0.0);
+  builder.addFieldFloat64(4, contractLocation, 0.0);
+}
+
+static addTimestamp(builder:flatbuffers.Builder, timestamp:bigint) {
+  builder.addFieldInt64(5, timestamp, BigInt('0'));
 }
 
 static endGetContract(builder:flatbuffers.Builder):flatbuffers.Offset {
   const offset = builder.endObject();
   builder.requiredField(offset, 4) // requester
-  builder.requiredField(offset, 6) // transaction
-  builder.requiredField(offset, 8) // key
+  builder.requiredField(offset, 6) // target
+  builder.requiredField(offset, 8) // transaction
+  builder.requiredField(offset, 10) // key
   return offset;
 }
 
-static createGetContract(builder:flatbuffers.Builder, requesterOffset:flatbuffers.Offset, transactionOffset:flatbuffers.Offset, keyOffset:flatbuffers.Offset, contractLocation:number):flatbuffers.Offset {
+static createGetContract(builder:flatbuffers.Builder, requesterOffset:flatbuffers.Offset, targetOffset:flatbuffers.Offset, transactionOffset:flatbuffers.Offset, keyOffset:flatbuffers.Offset, contractLocation:number, timestamp:bigint):flatbuffers.Offset {
   GetContract.startGetContract(builder);
   GetContract.addRequester(builder, requesterOffset);
+  GetContract.addTarget(builder, targetOffset);
   GetContract.addTransaction(builder, transactionOffset);
   GetContract.addKey(builder, keyOffset);
   GetContract.addContractLocation(builder, contractLocation);
+  GetContract.addTimestamp(builder, timestamp);
   return GetContract.endGetContract(builder);
 }
 }
