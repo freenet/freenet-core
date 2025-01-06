@@ -77,9 +77,14 @@ create-dirs:
 generate-keys:
 	@echo "→ Generating RSA keys..."
 	@for i in $$(seq 1 $(N_GATEWAYS)); do \
-		openssl genpkey -algorithm RSA -out $(KEYS_DIR)/gw$${i}_private_key.pem -pkeyopt rsa_keygen_bits:4096 && \
-		openssl pkey -in $(KEYS_DIR)/gw$${i}_private_key.pem \
-			-pubout -out $(KEYS_DIR)/gw$${i}_public_key.pem; \
+		if [ ! -f "$(KEYS_DIR)/gw$${i}_private_key.pem" ]; then \
+			openssl genpkey -algorithm RSA -out $(KEYS_DIR)/gw$${i}_private_key.pem -pkeyopt rsa_keygen_bits:4096 && \
+			openssl pkey -in $(KEYS_DIR)/gw$${i}_private_key.pem \
+				-pubout -out $(KEYS_DIR)/gw$${i}_public_key.pem; \
+			echo "  Generated keys for gateway $$i"; \
+		else \
+			echo "  Keys for gateway $$i already exist"; \
+		fi; \
 	done
 
 # Network Management
