@@ -8,7 +8,7 @@ pub(crate) struct MockRuntime {
 impl MockRuntime {
     pub async fn attempt_state_update(
         &self,
-        key: ContractKey,
+        _key: ContractKey,
         state: Either<WrappedState, StateDelta<'static>>,
         _related_contracts: RelatedContracts<'static>,
         _code: Option<ContractContainer>,
@@ -44,7 +44,7 @@ impl Executor<MockRuntime> {
             || Ok(()),
             OperationMode::Local,
             MockRuntime { contract_store },
-            Some(event_loop_channel),
+            event_loop_channel,
         )
         .await?;
         Ok(executor)
