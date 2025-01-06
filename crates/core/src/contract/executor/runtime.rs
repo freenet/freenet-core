@@ -18,7 +18,7 @@ impl ContractExecutor for Executor<Runtime> {
         update: Either<WrappedState, StateDelta<'static>>,
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
-    ) -> Result<WrappedState, ExecutorError> {
+    ) -> Result<UpsertResult, ExecutorError> {
         let params = if let Some(code) = &code {
             code.params()
         } else {
@@ -134,7 +134,13 @@ impl ContractExecutor for Executor<Runtime> {
             .validate_state(&key, &params, &updated_state, &related_contracts)
             .map_err(|e| ExecutorError::execution(e, None))?
         {
-            ValidateResult::Valid => Ok(updated_state),
+            ValidateResult::Valid => {
+                if updated_state.as_ref() == current_state.as_ref() {
+                    Ok(UpsertResult::NoChange)
+                } else {
+                    Ok(UpsertResult::Updated(updated_state))
+                }
+            }
             ValidateResult::Invalid => Err(ExecutorError::request(
                 freenet_stdlib::client_api::ContractError::Update {
                     key,
@@ -886,5 +892,37 @@ impl Executor<Runtime> {
         };
         let get_result: operations::get::GetResult = self.op_request(request).await?;
         Ok(Either::Right(get_result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::runtime::Runtime;
+
+    #[tokio::test]
+    async fn test_attempt_state_update() {
+        // Setup the necessary environment
+        let mut executor = Executor::new_mock("test_attempt_state_update", None)
+            .await
+            .unwrap();
+        let key = ContractKey::from(vec![1, 2, 3]);
+        let state = WrappedState::from(vec![4, 5, 6]);
+        let related_contracts = RelatedContracts::default();
+        let code = Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            WrappedContract::new(
+                Arc::new(ContractCode::from(vec![7, 8, 9])),
+                Parameters::from(vec![10, 11, 12]),
+            ),
+        )));
+
+        // Call the function
+        let result = executor
+            .runtime
+            .attempt_state_update(key, Either::Left(state), related_contracts, code)
+            .await;
+
+        // Assert the result
+        assert!(result.is_ok());
     }
 }
