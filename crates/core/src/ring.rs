@@ -50,7 +50,7 @@ use self::score::Score;
 
 pub use self::live_tx::LiveTransactionTracker;
 pub use location::{Distance, Location};
-pub use types::{Connection, PeerKeyLocation, Score};
+pub use types::{Connection, PeerKeyLocation};
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
