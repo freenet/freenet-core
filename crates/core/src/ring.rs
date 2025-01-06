@@ -42,7 +42,6 @@ mod connection_manager;
 pub(crate) use connection_manager::ConnectionManager;
 pub mod live_tx;
 mod location;
-mod maintenance;
 mod types;
 
 pub use self::live_tx::LiveTransactionTracker;
