@@ -1,6 +1,6 @@
+use super::Location;
 use super::PeerKeyLocation;
 use crate::node::PeerId;
-use super::Location;
 use std::time::Instant;
 
 #[derive(Clone, Debug)]

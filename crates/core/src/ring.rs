@@ -40,17 +40,19 @@ use crate::{
 
 mod connection_manager;
 pub(crate) use connection_manager::ConnectionManager;
+mod connection;
 pub mod live_tx;
 mod location;
+mod peer_key_location;
 pub(crate) mod score;
 mod seeding;
-mod types;
 
 use self::score::Score;
 
 pub use self::live_tx::LiveTransactionTracker;
+pub use connection::Connection;
 pub use location::{Distance, Location};
-pub use types::{Connection, PeerKeyLocation};
+pub use peer_key_location::PeerKeyLocation;
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
