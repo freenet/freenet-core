@@ -5,25 +5,10 @@ pub(crate) struct MockRuntime {
     pub contract_store: ContractStore,
 }
 
-impl MockRuntime {
-    pub async fn attempt_state_update(
-        &self,
-        _key: ContractKey,
-        state: Either<WrappedState, StateDelta<'static>>,
-        _related_contracts: RelatedContracts<'static>,
-        _code: Option<ContractContainer>,
-    ) -> Result<Either<WrappedState, Vec<RelatedContract>>, ExecutorError> {
-        match state {
-            Either::Left(state) => Ok(Either::Left(state)),
-            Either::Right(_) => Err(ExecutorError::other(anyhow::anyhow!("Delta updates not supported in mock")))
-        }
-    }
-}
-
 impl Executor<MockRuntime> {
     pub async fn new_mock(
         identifier: &str,
-        event_loop_channel: Option<ExecutorToEventLoopChannel<ExecutorHalve>>,
+        event_loop_channel: ExecutorToEventLoopChannel<ExecutorHalve>,
     ) -> anyhow::Result<Self> {
         let data_dir = Self::test_data_dir(identifier);
 
@@ -44,7 +29,7 @@ impl Executor<MockRuntime> {
             || Ok(()),
             OperationMode::Local,
             MockRuntime { contract_store },
-            event_loop_channel,
+            Some(event_loop_channel),
         )
         .await?;
         Ok(executor)

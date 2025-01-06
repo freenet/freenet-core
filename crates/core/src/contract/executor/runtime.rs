@@ -898,6 +898,7 @@ impl Executor<Runtime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::runtime::Runtime;
 
     #[tokio::test]
     async fn test_attempt_state_update() {
@@ -905,7 +906,7 @@ mod tests {
         let mut executor = Executor::new_mock("test_attempt_state_update", None)
             .await
             .unwrap();
-        let key = ContractKey::from(ContractInstanceId::from_bytes(&[1, 2, 3]));
+        let key = ContractKey::from(vec![1, 2, 3]);
         let state = WrappedState::from(vec![4, 5, 6]);
         let related_contracts = RelatedContracts::default();
         let code = Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
