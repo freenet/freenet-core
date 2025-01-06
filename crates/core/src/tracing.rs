@@ -526,8 +526,8 @@ async fn send_to_metrics_server(
         }) => {
             let msg = PeerChange::added_connection_msg(
                 (&send_msg.tx != Transaction::NULL).then(|| send_msg.tx.to_string()),
-                (from_peer.clone().to_string(), from_loc.as_f64()),
-                (to_peer.clone().to_string(), to_loc.as_f64()),
+                (from_peer.clone().to_string(), from_loc.as_f64() as f64),
+                (to_peer.clone().to_string(), to_loc.as_f64() as f64),
             );
             ws_stream.send(Message::Binary(msg.into())).await
         }

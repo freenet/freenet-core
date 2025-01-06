@@ -44,7 +44,6 @@ pub mod live_tx;
 mod location;
 pub(crate) mod score;
 mod seeding;
-mod types;
 
 use self::score::Score;
 
