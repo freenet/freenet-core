@@ -6,7 +6,7 @@ import { GetContract } from '../topology/get-contract.js';
 import { PutFailure } from '../topology/put-failure.js';
 import { PutRequest } from '../topology/put-request.js';
 import { PutSuccess } from '../topology/put-success.js';
-import { SubscribeToContract } from '../topology/subscribe-to-contract.js';
+import { SubscribedToContract } from '../topology/subscribed-to-contract.js';
 import { UpdateFailure } from '../topology/update-failure.js';
 import { UpdateRequest } from '../topology/update-request.js';
 import { UpdateSuccess } from '../topology/update-success.js';
@@ -23,13 +23,13 @@ export enum ContractChangeType {
   UpdateSuccess = 7,
   UpdateFailure = 8,
   GetContract = 9,
-  SubscribeToContract = 10
+  SubscribedToContract = 10
 }
 
 export function unionToContractChangeType(
   type: ContractChangeType,
-  accessor: (obj:BroadcastEmitted|BroadcastReceived|GetContract|PutFailure|PutRequest|PutSuccess|SubscribeToContract|UpdateFailure|UpdateRequest|UpdateSuccess) => BroadcastEmitted|BroadcastReceived|GetContract|PutFailure|PutRequest|PutSuccess|SubscribeToContract|UpdateFailure|UpdateRequest|UpdateSuccess|null
-): BroadcastEmitted|BroadcastReceived|GetContract|PutFailure|PutRequest|PutSuccess|SubscribeToContract|UpdateFailure|UpdateRequest|UpdateSuccess|null {
+  accessor: (obj:BroadcastEmitted|BroadcastReceived|GetContract|PutFailure|PutRequest|PutSuccess|SubscribedToContract|UpdateFailure|UpdateRequest|UpdateSuccess) => BroadcastEmitted|BroadcastReceived|GetContract|PutFailure|PutRequest|PutSuccess|SubscribedToContract|UpdateFailure|UpdateRequest|UpdateSuccess|null
+): BroadcastEmitted|BroadcastReceived|GetContract|PutFailure|PutRequest|PutSuccess|SubscribedToContract|UpdateFailure|UpdateRequest|UpdateSuccess|null {
   switch(ContractChangeType[type]) {
     case 'NONE': return null; 
     case 'PutRequest': return accessor(new PutRequest())! as PutRequest;
@@ -41,16 +41,16 @@ export function unionToContractChangeType(
     case 'UpdateSuccess': return accessor(new UpdateSuccess())! as UpdateSuccess;
     case 'UpdateFailure': return accessor(new UpdateFailure())! as UpdateFailure;
     case 'GetContract': return accessor(new GetContract())! as GetContract;
-    case 'SubscribeToContract': return accessor(new SubscribeToContract())! as SubscribeToContract;
+    case 'SubscribedToContract': return accessor(new SubscribedToContract())! as SubscribedToContract;
     default: return null;
   }
 }
 
 export function unionListToContractChangeType(
   type: ContractChangeType, 
-  accessor: (index: number, obj:BroadcastEmitted|BroadcastReceived|GetContract|PutFailure|PutRequest|PutSuccess|SubscribeToContract|UpdateFailure|UpdateRequest|UpdateSuccess) => BroadcastEmitted|BroadcastReceived|GetContract|PutFailure|PutRequest|PutSuccess|SubscribeToContract|UpdateFailure|UpdateRequest|UpdateSuccess|null, 
+  accessor: (index: number, obj:BroadcastEmitted|BroadcastReceived|GetContract|PutFailure|PutRequest|PutSuccess|SubscribedToContract|UpdateFailure|UpdateRequest|UpdateSuccess) => BroadcastEmitted|BroadcastReceived|GetContract|PutFailure|PutRequest|PutSuccess|SubscribedToContract|UpdateFailure|UpdateRequest|UpdateSuccess|null, 
   index: number
-): BroadcastEmitted|BroadcastReceived|GetContract|PutFailure|PutRequest|PutSuccess|SubscribeToContract|UpdateFailure|UpdateRequest|UpdateSuccess|null {
+): BroadcastEmitted|BroadcastReceived|GetContract|PutFailure|PutRequest|PutSuccess|SubscribedToContract|UpdateFailure|UpdateRequest|UpdateSuccess|null {
   switch(ContractChangeType[type]) {
     case 'NONE': return null; 
     case 'PutRequest': return accessor(index, new PutRequest())! as PutRequest;
@@ -62,7 +62,7 @@ export function unionListToContractChangeType(
     case 'UpdateSuccess': return accessor(index, new UpdateSuccess())! as UpdateSuccess;
     case 'UpdateFailure': return accessor(index, new UpdateFailure())! as UpdateFailure;
     case 'GetContract': return accessor(index, new GetContract())! as GetContract;
-    case 'SubscribeToContract': return accessor(index, new SubscribeToContract())! as SubscribeToContract;
+    case 'SubscribedToContract': return accessor(index, new SubscribedToContract())! as SubscribedToContract;
     default: return null;
   }
 }

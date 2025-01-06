@@ -2,22 +2,22 @@
 
 import * as flatbuffers from 'flatbuffers';
 
-export class SubscribeToContract {
+export class SubscribedToContract {
   bb: flatbuffers.ByteBuffer|null = null;
   bb_pos = 0;
-  __init(i:number, bb:flatbuffers.ByteBuffer):SubscribeToContract {
+  __init(i:number, bb:flatbuffers.ByteBuffer):SubscribedToContract {
   this.bb_pos = i;
   this.bb = bb;
   return this;
 }
 
-static getRootAsSubscribeToContract(bb:flatbuffers.ByteBuffer, obj?:SubscribeToContract):SubscribeToContract {
-  return (obj || new SubscribeToContract()).__init(bb.readInt32(bb.position()) + bb.position(), bb);
+static getRootAsSubscribedToContract(bb:flatbuffers.ByteBuffer, obj?:SubscribedToContract):SubscribedToContract {
+  return (obj || new SubscribedToContract()).__init(bb.readInt32(bb.position()) + bb.position(), bb);
 }
 
-static getSizePrefixedRootAsSubscribeToContract(bb:flatbuffers.ByteBuffer, obj?:SubscribeToContract):SubscribeToContract {
+static getSizePrefixedRootAsSubscribedToContract(bb:flatbuffers.ByteBuffer, obj?:SubscribedToContract):SubscribedToContract {
   bb.setPosition(bb.position() + flatbuffers.SIZE_PREFIX_LENGTH);
-  return (obj || new SubscribeToContract()).__init(bb.readInt32(bb.position()) + bb.position(), bb);
+  return (obj || new SubscribedToContract()).__init(bb.readInt32(bb.position()) + bb.position(), bb);
 }
 
 requester():string|null
@@ -58,8 +58,13 @@ atPeerLocation():number {
   return offset ? this.bb!.readFloat64(this.bb_pos + offset) : 0.0;
 }
 
-static startSubscribeToContract(builder:flatbuffers.Builder) {
-  builder.startObject(6);
+timestamp():bigint {
+  const offset = this.bb!.__offset(this.bb_pos, 16);
+  return offset ? this.bb!.readUint64(this.bb_pos + offset) : BigInt('0');
+}
+
+static startSubscribedToContract(builder:flatbuffers.Builder) {
+  builder.startObject(7);
 }
 
 static addRequester(builder:flatbuffers.Builder, requesterOffset:flatbuffers.Offset) {
@@ -86,7 +91,11 @@ static addAtPeerLocation(builder:flatbuffers.Builder, atPeerLocation:number) {
   builder.addFieldFloat64(5, atPeerLocation, 0.0);
 }
 
-static endSubscribeToContract(builder:flatbuffers.Builder):flatbuffers.Offset {
+static addTimestamp(builder:flatbuffers.Builder, timestamp:bigint) {
+  builder.addFieldInt64(6, timestamp, BigInt('0'));
+}
+
+static endSubscribedToContract(builder:flatbuffers.Builder):flatbuffers.Offset {
   const offset = builder.endObject();
   builder.requiredField(offset, 4) // requester
   builder.requiredField(offset, 6) // transaction
@@ -95,14 +104,15 @@ static endSubscribeToContract(builder:flatbuffers.Builder):flatbuffers.Offset {
   return offset;
 }
 
-static createSubscribeToContract(builder:flatbuffers.Builder, requesterOffset:flatbuffers.Offset, transactionOffset:flatbuffers.Offset, keyOffset:flatbuffers.Offset, contractLocation:number, atPeerOffset:flatbuffers.Offset, atPeerLocation:number):flatbuffers.Offset {
-  SubscribeToContract.startSubscribeToContract(builder);
-  SubscribeToContract.addRequester(builder, requesterOffset);
-  SubscribeToContract.addTransaction(builder, transactionOffset);
-  SubscribeToContract.addKey(builder, keyOffset);
-  SubscribeToContract.addContractLocation(builder, contractLocation);
-  SubscribeToContract.addAtPeer(builder, atPeerOffset);
-  SubscribeToContract.addAtPeerLocation(builder, atPeerLocation);
-  return SubscribeToContract.endSubscribeToContract(builder);
+static createSubscribedToContract(builder:flatbuffers.Builder, requesterOffset:flatbuffers.Offset, transactionOffset:flatbuffers.Offset, keyOffset:flatbuffers.Offset, contractLocation:number, atPeerOffset:flatbuffers.Offset, atPeerLocation:number, timestamp:bigint):flatbuffers.Offset {
+  SubscribedToContract.startSubscribedToContract(builder);
+  SubscribedToContract.addRequester(builder, requesterOffset);
+  SubscribedToContract.addTransaction(builder, transactionOffset);
+  SubscribedToContract.addKey(builder, keyOffset);
+  SubscribedToContract.addContractLocation(builder, contractLocation);
+  SubscribedToContract.addAtPeer(builder, atPeerOffset);
+  SubscribedToContract.addAtPeerLocation(builder, atPeerLocation);
+  SubscribedToContract.addTimestamp(builder, timestamp);
+  return SubscribedToContract.endSubscribedToContract(builder);
 }
 }

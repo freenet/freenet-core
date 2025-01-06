@@ -191,3 +191,120 @@ export function handleBroadcastReceived(
 
     all_contracts.get(key)!.push(obj_data);
 }
+
+export function handleGetContract(
+    transaction_id: string,
+    requester: string,
+    contract_id: string,
+    contract_location: number,
+    change_type: ChangeType,
+    timestamp: number,
+    target: string
+) {
+    // console.log("handle get contract");
+    // console.log("transaction_id: ", transaction_id);
+    // console.log("requester: ", requester);
+    // console.log("contract_id: ", contract_id);
+    // console.log("contract_location: ", contract_location);
+    // console.log("change_type: ", change_type);
+    // console.log("timestamp: ", timestamp);
+    // console.log("target: ", target);
+
+    let requester_location = parseFloat(
+        requester.split(" (@ ")[1].split(")")[0]
+    );
+    requester = requester.split(" (@")[0];
+
+    let target_location = parseFloat(target.split(" (@ ")[1].split(")")[0]);
+    target = target.split(" (@")[0];
+
+    let obj_data = {
+        change_type,
+        transaction_id,
+        contract_id: contract_id,
+        target,
+        requester,
+        unique_id:
+            transaction_id +
+            contract_id +
+            contract_location +
+            requester +
+            change_type,
+        timestamp,
+        contract_location,
+        requester_location,
+    } as TransactionData;
+
+    let tx_list = all_tx.get(transaction_id);
+
+    if (tx_list) {
+        all_tx.set(transaction_id, [...tx_list, obj_data]);
+    } else {
+        all_tx.set(transaction_id, [obj_data]);
+    }
+
+    const this_contract_data = all_contracts.get(contract_id);
+    if (this_contract_data) {
+        all_contracts.get(contract_id)!.push(obj_data);
+    } else {
+        all_contracts.set(contract_id, [obj_data]);
+    }
+}
+
+export function handleSubscribedToContract(
+    transaction_id: string,
+    requester: string,
+    contract_id: string,
+    contract_location: number,
+    change_type: ChangeType,
+    at_peer: string,
+    at_peer_location: number,
+    timestamp: number
+) {
+    console.log("handle subscribed to contract");
+    console.log("transaction_id: ", transaction_id);
+    console.log("requester: ", requester);
+    console.log("contract_id: ", contract_id);
+    console.log("contract_location: ", contract_location);
+    console.log("change_type: ", change_type);
+    console.log("at_peer: ", at_peer);
+    console.log("at_peer_location: ", at_peer_location);
+    console.log("timestamp: ", timestamp);
+
+    let requester_location = parseFloat(
+        requester.split(" (@ ")[1].split(")")[0]
+    );
+    requester = requester.split(" (@")[0];
+
+    let obj_data = {
+        change_type,
+        transaction_id,
+        contract_id: contract_id,
+        target: at_peer,
+        requester,
+        unique_id:
+            transaction_id +
+            contract_id +
+            contract_location +
+            requester +
+            change_type,
+        timestamp,
+        contract_location,
+        requester_location,
+    } as TransactionData;
+
+    let tx_list = all_tx.get(transaction_id);
+
+    if (tx_list) {
+        all_tx.set(transaction_id, [...tx_list, obj_data]);
+    } else {
+        all_tx.set(transaction_id, [obj_data]);
+    }
+
+    const this_contract_data = all_contracts.get(contract_id);
+    if (this_contract_data) {
+        all_contracts.get(contract_id)!.push(obj_data);
+    } else {
+        all_contracts.set(contract_id, [obj_data]);
+    }
+}
