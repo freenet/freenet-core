@@ -1,5 +1,5 @@
-use dashmap::{DashMap, mapref::one::Ref as DmRef};
 use super::{Location, PeerKeyLocation, Score};
+use dashmap::{mapref::one::Ref as DmRef, DashMap};
 use freenet_stdlib::prelude::ContractKey;
 
 pub(crate) struct SeedingManager {
@@ -23,7 +23,7 @@ impl SeedingManager {
     /// Max number of seeding contracts.
     const MAX_SEEDING_CONTRACTS: usize = 100;
 
-    /// Min number of seeding contracts. 
+    /// Min number of seeding contracts.
     const MIN_SEEDING_CONTRACTS: usize = Self::MAX_SEEDING_CONTRACTS / 4;
 
     pub fn new() -> Self {
@@ -56,7 +56,11 @@ impl SeedingManager {
     }
 
     /// Add a new subscription for this peer.
-    pub fn seed_contract(&self, key: ContractKey, own_location: Location) -> (Option<ContractKey>, Vec<PeerKeyLocation>) {
+    pub fn seed_contract(
+        &self,
+        key: ContractKey,
+        own_location: Location,
+    ) -> (Option<ContractKey>, Vec<PeerKeyLocation>) {
         let seed_score = self.calculate_seed_score(&key, own_location);
         let mut old_subscribers = vec![];
         let mut contract_to_drop = None;
