@@ -1,7 +1,7 @@
 use super::Location;
 use crate::node::PeerId;
 use serde::{Deserialize, Serialize};
-use std::{fmt::Display, hash::Hash, time::Instant};
+use std::{fmt::Display, hash::Hash};
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]

@@ -1,6 +1,6 @@
 use super::Location;
 use super::PeerKeyLocation;
-use crate::node::PeerId;
+
 use std::time::Instant;
 
 #[derive(Clone, Debug)]
@@ -8,6 +8,9 @@ pub struct Connection {
     pub(crate) location: PeerKeyLocation,
     pub(crate) open_at: Instant,
 }
+
+#[cfg(test)]
+use crate::node::PeerId;
 
 #[cfg(test)]
 impl Connection {
