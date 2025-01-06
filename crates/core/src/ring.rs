@@ -88,23 +88,11 @@ impl Ring {
 
     const DEFAULT_MAX_DOWNSTREAM_BANDWIDTH: Rate = Rate::new_per_second(1_000_000.0);
 
-    /// Max number of subscribers for a contract.
-    const MAX_SUBSCRIBERS: usize = 10;
-
-    /// All subscribers, including the upstream subscriber.
-    const TOTAL_MAX_SUBSCRIPTIONS: usize = Self::MAX_SUBSCRIBERS + 1;
-
     /// Above this number of remaining hops, randomize which node a message which be forwarded to.
     const DEFAULT_RAND_WALK_ABOVE_HTL: usize = 7;
 
     /// Max hops to be performed for certain operations (e.g. propagating connection of a peer in the network).
     pub const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
-
-    /// Max number of seeding contracts.
-    const MAX_SEEDING_CONTRACTS: usize = 100;
-
-    /// Min number of seeding contracts.
-    const MIN_SEEDING_CONTRACTS: usize = Self::MAX_SEEDING_CONTRACTS / 4;
 
     pub fn new<ER: NetEventRegister + Clone>(
         config: &NodeConfig,
