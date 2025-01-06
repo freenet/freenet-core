@@ -59,17 +59,7 @@ pub(crate) struct Ring {
     pub connection_manager: ConnectionManager,
     pub router: Arc<RwLock<Router>>,
     pub live_tx_tracker: LiveTransactionTracker,
-    /// The container for subscriber is a vec instead of something like a hashset
-    /// that would allow for blind inserts of duplicate peers subscribing because
-    /// of data locality, since we are likely to end up iterating over the whole sequence
-    /// of subscribers more often than inserting, and anyways is a relatively short sequence
-    /// then is more optimal to just use a vector for it's compact memory layout.
-    subscribers: DashMap<ContractKey, Vec<PeerKeyLocation>>,
-    /// Contracts this peer is seeding.
-    seeding_contract: DashMap<ContractKey, Score>,
-    // A peer which has been blacklisted to perform actions regarding a given contract.
-    // todo: add blacklist
-    // contract_blacklist: Arc<DashMap<ContractKey, Vec<Blacklisted>>>,
+    seeding_manager: seeding::SeedingManager,
     event_register: Box<dyn NetEventRegister>,
     /// Whether this peer is a gateway or not. This will affect behavior of the node when acquiring
     /// and dropping connections.
