@@ -42,6 +42,7 @@ mod connection_manager;
 pub(crate) use connection_manager::ConnectionManager;
 pub mod live_tx;
 mod location;
+mod seeding;
 mod types;
 
 pub use self::live_tx::LiveTransactionTracker;
@@ -125,8 +126,7 @@ impl Ring {
             max_hops_to_live,
             router,
             connection_manager,
-            subscribers: DashMap::new(),
-            seeding_contract: DashMap::new(),
+            seeding_manager: seeding::SeedingManager::new(),
             live_tx_tracker: live_tx_tracker.clone(),
             event_register: Box::new(event_register),
             is_gateway,
@@ -188,72 +188,28 @@ impl Ring {
     pub fn should_seed(&self, key: &ContractKey) -> bool {
         const CACHING_DISTANCE: f64 = 0.05;
         let caching_distance = Distance::new(CACHING_DISTANCE);
-        if self.seeding_contract.len() < Self::MIN_SEEDING_CONTRACTS {
-            return true;
-        }
-        let key_loc = Location::from(key);
         let own_loc = self
             .connection_manager
             .own_location()
             .location
             .expect("should be set");
-        if self.seeding_contract.len() < Self::MAX_SEEDING_CONTRACTS {
-            return own_loc.distance(key_loc) <= caching_distance;
-        }
-
-        let contract_score = self.calculate_seed_score(key);
-        let r = self
-            .seeding_contract
-            .iter()
-            .min_by_key(|v| *v.value())
-            .unwrap();
-        let min_score = *r.value();
-        contract_score > min_score
+        self.seeding_manager.should_seed(key, own_loc)
     }
 
     /// Add a new subscription for this peer.
     pub fn seed_contract(&self, key: ContractKey) -> (Option<ContractKey>, Vec<PeerKeyLocation>) {
-        let seed_score = self.calculate_seed_score(&key);
-        let mut old_subscribers = vec![];
-        let mut contract_to_drop = None;
-
-        if self.seeding_contract.len() <= Self::MAX_SEEDING_CONTRACTS {
-            if let Some(dropped_contract) = self
-                .seeding_contract
-                .iter()
-                .min_by_key(|v| *v.value())
-                .map(|entry| *entry.key())
-            {
-                self.seeding_contract.remove(&dropped_contract);
-                if let Some((_, mut subscribers_of_contract)) =
-                    self.subscribers.remove(&dropped_contract)
-                {
-                    std::mem::swap(&mut subscribers_of_contract, &mut old_subscribers);
-                }
-                contract_to_drop = Some(dropped_contract);
-            }
-        }
-
-        self.seeding_contract.insert(key, seed_score);
-        (contract_to_drop, old_subscribers)
-    }
-
-    fn calculate_seed_score(&self, key: &ContractKey) -> Score {
-        let location = self
+        let own_loc = self
             .connection_manager
             .own_location()
             .location
             .expect("should be set");
-        let key_loc = Location::from(key);
-        let distance = key_loc.distance(location);
-        let score = 0.5 - distance.as_f64();
-        Score(score)
+        self.seeding_manager.seed_contract(key, own_loc)
     }
 
     /// Whether this node already is seeding to this contract or not.
     #[inline]
     pub fn is_seeding_contract(&self, key: &ContractKey) -> bool {
-        self.seeding_contract.contains_key(key)
+        self.seeding_manager.is_seeding_contract(key)
     }
 
     pub fn record_request(
@@ -325,29 +281,14 @@ impl Ring {
         contract: &ContractKey,
         subscriber: PeerKeyLocation,
     ) -> Result<(), ()> {
-        let mut subs = self
-            .subscribers
-            .entry(*contract)
-            .or_insert(Vec::with_capacity(Self::TOTAL_MAX_SUBSCRIPTIONS));
-        if subs.len() >= Self::MAX_SUBSCRIBERS {
-            return Err(());
-        }
-        if let Err(next_idx) = subs.value_mut().binary_search(&subscriber) {
-            let subs = subs.value_mut();
-            if subs.len() == Self::MAX_SUBSCRIBERS {
-                return Err(());
-            } else {
-                subs.insert(next_idx, subscriber);
-            }
-        }
-        Ok(())
+        self.seeding_manager.add_subscriber(contract, subscriber)
     }
 
     pub fn subscribers_of(
         &self,
         contract: &ContractKey,
     ) -> Option<DmRef<ContractKey, Vec<PeerKeyLocation>>> {
-        self.subscribers.get(contract)
+        self.seeding_manager.subscribers_of(contract)
     }
 
     pub async fn prune_connection(&self, peer: PeerId) {
