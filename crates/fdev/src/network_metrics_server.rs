@@ -925,34 +925,6 @@ impl ServerState {
                     tracing::info!("finished inserting new get_contract transaction");
                 }
 
-                //match self.transactions_data.entry(transaction.clone()) {
-                //    dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-                //        tracing::info!("found transaction data, adding GetContract to history");
-                //        let changes = occ.get_mut();
-                //        changes.push(Change::GetContract {
-                //            requester: requester.clone(),
-                //            transaction: transaction.clone(),
-                //            key: key.clone(),
-                //            contract_location,
-                //        });
-
-                //        //connections.sort_unstable_by(|a, b| a.cmp(&b.0));
-                //        //connections.dedup();
-                //    }
-                //    dashmap::mapref::entry::Entry::Vacant(_vac) => {
-                //        // this should not happen
-                //        self.transactions_data.insert(
-                //            transaction.clone(),
-                //            vec![Change::GetContract {
-                //                requester: requester.clone(),
-                //                transaction: transaction.clone(),
-                //                key: key.clone(),
-                //                contract_location,
-                //            }],
-                //        );
-                //    }
-                //}
-
                 tracing::debug!(%key, %contract_location, "checking values from save_record -- get_contract");
 
                 let _ = self.changes.send(Change::GetContract {
@@ -1029,43 +1001,6 @@ impl ServerState {
 
                     tracing::info!("finished inserting new subscribed_to transaction");
                 }
-
-                //match self.transactions_data.entry(transaction.clone()) {
-                //    dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-                //        tracing::info!(
-                //            "found transaction data, adding SubscribedToContract to history"
-                //        );
-                //        let changes = occ.get_mut();
-                //        changes.push(Change::SubscribedToContract {
-                //            requester: requester.clone(),
-                //            transaction: transaction.clone(),
-                //            key: key.clone(),
-                //            contract_location,
-                //            at_peer: at_peer.clone(),
-                //            at_peer_location,
-                //        });
-
-                //        //connections.sort_unstable_by(|a, b| a.cmp(&b.0));
-                //        //connections.dedup();
-                //    }
-                //    dashmap::mapref::entry::Entry::Vacant(_vac) => {
-                //        // this should not happen
-                //        tracing::warn!(
-                //            "Trying to subscribe to a transaction that does not exist yet."
-                //        );
-                //        self.transactions_data.insert(
-                //            transaction.clone(),
-                //            vec![Change::SubscribedToContract {
-                //                requester: requester.clone(),
-                //                transaction: transaction.clone(),
-                //                key: key.clone(),
-                //                contract_location,
-                //                at_peer: at_peer.clone(),
-                //                at_peer_location,
-                //            }],
-                //        );
-                //    }
-                //}
 
                 tracing::debug!(%key, %contract_location, "checking values from save_record -- subscribed_to msg");
 

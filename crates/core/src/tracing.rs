@@ -568,8 +568,6 @@ async fn send_to_metrics_server(
                 contract_location.as_f64(),
             );
 
-            tracing::info!("is_going_here");
-
             ws_stream.send(Message::Binary(msg.into())).await
         }
         EventKind::Put(PutEvent::PutSuccess {
@@ -650,7 +648,6 @@ async fn send_to_metrics_server(
                 *timestamp,
             );
 
-            tracing::info!("Sending get_contract msg: {}", send_msg.tx);
             ws_stream.send(Message::Binary(msg.into())).await
         }
         EventKind::Subscribed {
@@ -671,7 +668,6 @@ async fn send_to_metrics_server(
                 *timestamp,
             );
 
-            tracing::info!("Sending subscribed_to msg: {}", send_msg.tx);
             ws_stream.send(Message::Binary(msg.into())).await
         }
         _ => Ok(()),
