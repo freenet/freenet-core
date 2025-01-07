@@ -201,15 +201,6 @@ export function handleGetContract(
     timestamp: number,
     target: string
 ) {
-    // console.log("handle get contract");
-    // console.log("transaction_id: ", transaction_id);
-    // console.log("requester: ", requester);
-    // console.log("contract_id: ", contract_id);
-    // console.log("contract_location: ", contract_location);
-    // console.log("change_type: ", change_type);
-    // console.log("timestamp: ", timestamp);
-    // console.log("target: ", target);
-
     let requester_location = parseFloat(
         requester.split(" (@ ")[1].split(")")[0]
     );
@@ -261,16 +252,6 @@ export function handleSubscribedToContract(
     at_peer_location: number,
     timestamp: number
 ) {
-    console.log("handle subscribed to contract");
-    console.log("transaction_id: ", transaction_id);
-    console.log("requester: ", requester);
-    console.log("contract_id: ", contract_id);
-    console.log("contract_location: ", contract_location);
-    console.log("change_type: ", change_type);
-    console.log("at_peer: ", at_peer);
-    console.log("at_peer_location: ", at_peer_location);
-    console.log("timestamp: ", timestamp);
-
     let requester_location = parseFloat(
         requester.split(" (@ ")[1].split(")")[0]
     );
