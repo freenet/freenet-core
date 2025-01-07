@@ -763,9 +763,6 @@ impl ServerState {
 
                 match self.transactions_data.entry(tx_id.clone()) {
                     dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-                        tracing::info!(
-                            "found transaction data, adding BroadcastEmitted to history"
-                        );
                         let changes = occ.get_mut();
                         changes.push(Change::BroadcastEmitted {
                             tx_id: tx_id.clone(),
@@ -783,8 +780,7 @@ impl ServerState {
                     }
                     dashmap::mapref::entry::Entry::Vacant(_vac) => {
                         // this should not happen
-                        tracing::error!("this tx should be included on transactions_data. It should exists a PutRequest before BroadcastEmitted.");
-                        unreachable!();
+                        unreachable!("this tx should be included on transactions_data. It should exists a PutRequest before BroadcastEmitted.");
                     }
                 }
 
@@ -824,9 +820,6 @@ impl ServerState {
 
                 match self.transactions_data.entry(tx_id.clone()) {
                     dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-                        tracing::info!(
-                            "found transaction data, adding BroadcastReceived to history"
-                        );
                         let changes = occ.get_mut();
                         changes.push(Change::BroadcastReceived {
                             tx_id: tx_id.clone(),
@@ -907,9 +900,7 @@ impl ServerState {
                         timestamp,
                         target: target.clone(),
                     });
-                    tracing::info!("found transaction data, adding GetContract to history");
                 } else {
-                    tracing::info!("running get_contract but with a new transaction");
                     self.transactions_data.insert(
                         transaction.clone(),
                         vec![Change::GetContract {
@@ -921,8 +912,6 @@ impl ServerState {
                             target: target.clone(),
                         }],
                     );
-
-                    tracing::info!("finished inserting new get_contract transaction");
                 }
 
                 tracing::debug!(%key, %contract_location, "checking values from save_record -- get_contract");
@@ -981,11 +970,7 @@ impl ServerState {
                         at_peer_location,
                         timestamp,
                     });
-                    tracing::info!(
-                        "found transaction data, adding SubscribedToContract to history"
-                    );
                 } else {
-                    tracing::info!("running subscribed_to contract but with a new transaction");
                     self.transactions_data.insert(
                         transaction.clone(),
                         vec![Change::SubscribedToContract {
@@ -998,8 +983,6 @@ impl ServerState {
                             timestamp,
                         }],
                     );
-
-                    tracing::info!("finished inserting new subscribed_to transaction");
                 }
 
                 tracing::debug!(%key, %contract_location, "checking values from save_record -- subscribed_to msg");
