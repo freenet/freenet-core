@@ -274,6 +274,10 @@ export const get_peers_description_to_render = (
         let change_type = peer.change_type;
         let peer_target = peer.target;
 
+        if (peer_target == peer_id) {
+            continue;
+        }
+
         if (typeof peer_target == "string") {
             //peer_target = peer_target.split(" (@")[0].slice(-8);
             peer_target = [peer_target];
