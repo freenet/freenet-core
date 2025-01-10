@@ -11,7 +11,7 @@ pub mod storages;
 
 pub(crate) use executor::{
     executor_channel, mock_runtime::MockRuntime, Callback, ExecutorToEventLoopChannel,
-    NetworkEventListenerHalve,
+    NetworkEventListenerHalve, UpsertResult,
 };
 pub(crate) use handler::{
     client_responses_channel, contract_handler_channel, in_memory::MemoryContractHandler,
@@ -87,18 +87,30 @@ where
             } => {
                 let put_result = contract_handler
                     .executor()
-                    .upsert_contract_state(key, Either::Left(state), related_contracts, contract)
+                    .upsert_contract_state(
+                        key,
+                        Either::Left(state.clone()),
+                        related_contracts,
+                        contract,
+                    )
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await;
 
+                let event_result = match put_result {
+                    Ok(UpsertResult::NoChange) => ContractHandlerEvent::PutResponse {
+                        new_value: Ok(state),
+                    },
+                    Ok(UpsertResult::Updated(state)) => ContractHandlerEvent::PutResponse {
+                        new_value: Ok(state),
+                    },
+                    Err(err) => ContractHandlerEvent::PutResponse {
+                        new_value: Err(err),
+                    },
+                };
+
                 contract_handler
                     .channel()
-                    .send_to_sender(
-                        id,
-                        ContractHandlerEvent::PutResponse {
-                            new_value: put_result.map_err(Into::into),
-                        },
-                    )
+                    .send_to_sender(id, event_result)
                     .await
                     .map_err(|error| {
                         tracing::debug!(%error, "shutting down contract handler");
@@ -123,14 +135,19 @@ where
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await;
 
+                let event_result = match update_result {
+                    Ok(UpsertResult::NoChange) => ContractHandlerEvent::UpdateNoChange { key },
+                    Ok(UpsertResult::Updated(state)) => ContractHandlerEvent::UpdateResponse {
+                        new_value: Ok(state),
+                    },
+                    Err(err) => ContractHandlerEvent::UpdateResponse {
+                        new_value: Err(err),
+                    },
+                };
+
                 contract_handler
                     .channel()
-                    .send_to_sender(
-                        id,
-                        ContractHandlerEvent::UpdateResponse {
-                            new_value: update_result.map_err(Into::into),
-                        },
-                    )
+                    .send_to_sender(id, event_result)
                     .await
                     .map_err(|error| {
                         tracing::debug!(%error, "shutting down contract handler");

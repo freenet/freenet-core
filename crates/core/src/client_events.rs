@@ -360,6 +360,10 @@ async fn process_open_request(
                             Ok(ContractHandlerEvent::UpdateResponse {
                                 new_value: Err(err),
                             }) => Err(OpError::from(err)),
+                            Ok(ContractHandlerEvent::UpdateNoChange { key }) => {
+                                tracing::debug!(%key, "update with no change, do not start op");
+                                return Ok(None);
+                            }
                             Err(err) => Err(err.into()),
                             Ok(_) => Err(OpError::UnexpectedOpState),
                         }
