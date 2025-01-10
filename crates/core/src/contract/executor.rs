@@ -19,6 +19,7 @@ use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self};
 
+use super::storages::Storage;
 use crate::config::Config;
 use crate::message::Transaction;
 use crate::node::OpManager;
@@ -32,7 +33,6 @@ use crate::{
     client_events::{ClientId, HostResult},
     operations::{self, Operation},
 };
-use super::storages::Storage;
 
 pub(super) mod mock_runtime;
 pub(super) mod runtime;
