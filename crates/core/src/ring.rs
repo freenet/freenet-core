@@ -4,28 +4,25 @@
 //! and routes requests to the optimal peers.
 
 use std::collections::BTreeSet;
-use std::hash::Hash;
 use std::net::SocketAddr;
 use std::{
     cmp::Reverse,
     collections::BTreeMap,
-    fmt::Display,
     sync::{
         atomic::{AtomicU64, AtomicUsize},
         Arc,
     },
     time::{Duration, Instant},
 };
+use tokio::sync::mpsc::{self, error::TryRecvError};
+use tracing::Instrument;
 
-use dashmap::{mapref::one::Ref as DmRef, DashMap};
+use dashmap::mapref::one::Ref as DmRef;
 use either::Either;
 use freenet_stdlib::prelude::ContractKey;
 use itertools::Itertools;
 use parking_lot::RwLock;
 use rand::Rng;
-use serde::{Deserialize, Serialize};
-use tokio::sync;
-use tracing::Instrument;
 
 use crate::message::TransactionType;
 use crate::topology::rate::Rate;
@@ -43,155 +40,19 @@ use crate::{
 
 mod connection_manager;
 pub(crate) use connection_manager::ConnectionManager;
+mod connection;
+mod live_tx;
 mod location;
+mod peer_key_location;
+mod score;
+mod seeding;
 
+use self::score::Score;
+
+pub use self::live_tx::LiveTransactionTracker;
+pub use connection::Connection;
 pub use location::{Distance, Location};
-
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(test, derive(arbitrary::Arbitrary))]
-/// The location of a peer in the ring. This location allows routing towards the peer.
-pub struct PeerKeyLocation {
-    pub peer: PeerId,
-    /// An unspecified location means that the peer hasn't been asigned a location, yet.
-    pub location: Option<Location>,
-}
-
-impl PeerKeyLocation {
-    #[cfg(test)]
-    pub fn random() -> Self {
-        PeerKeyLocation {
-            peer: PeerId::random(),
-            location: Some(Location::random()),
-        }
-    }
-}
-
-impl From<PeerId> for PeerKeyLocation {
-    fn from(peer: PeerId) -> Self {
-        PeerKeyLocation {
-            peer,
-            location: None,
-        }
-    }
-}
-
-impl std::fmt::Debug for PeerKeyLocation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        <Self as Display>::fmt(self, f)
-    }
-}
-
-impl Display for PeerKeyLocation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.location {
-            Some(loc) => write!(f, "{} (@ {loc})", self.peer),
-            None => write!(f, "{}", self.peer),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct Connection {
-    location: PeerKeyLocation,
-    open_at: Instant,
-}
-
-#[cfg(test)]
-impl Connection {
-    pub fn new(peer: PeerId, location: Location) -> Self {
-        Connection {
-            location: PeerKeyLocation {
-                peer,
-                location: Some(location),
-            },
-            open_at: Instant::now(),
-        }
-    }
-
-    pub fn get_location(&self) -> &PeerKeyLocation {
-        &self.location
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct LiveTransactionTracker {
-    tx_per_peer: Arc<DashMap<PeerId, Vec<Transaction>>>,
-    missing_candidate_sender: sync::mpsc::Sender<PeerId>,
-}
-
-impl LiveTransactionTracker {
-    /// The given peer does not have (good) candidates for acquiring new connections.
-    pub async fn missing_candidate_peers(&self, peer: PeerId) {
-        let _ = self
-            .missing_candidate_sender
-            .send(peer)
-            .await
-            .map_err(|error| {
-                tracing::debug!(%error, "live transaction tracker channel closed");
-                error
-            });
-    }
-
-    pub fn add_transaction(&self, peer: PeerId, tx: Transaction) {
-        self.tx_per_peer.entry(peer).or_default().push(tx);
-    }
-
-    pub fn remove_finished_transaction(&self, tx: Transaction) {
-        let keys_to_remove: Vec<PeerId> = self
-            .tx_per_peer
-            .iter()
-            .filter(|entry| entry.value().iter().any(|otx| otx == &tx))
-            .map(|entry| entry.key().clone())
-            .collect();
-
-        for k in keys_to_remove {
-            self.tx_per_peer.remove_if_mut(&k, |_, v| {
-                v.retain(|otx| otx != &tx);
-                v.is_empty()
-            });
-        }
-    }
-
-    fn new() -> (Self, sync::mpsc::Receiver<PeerId>) {
-        let (missing_peer, rx) = sync::mpsc::channel(10);
-        (
-            Self {
-                tx_per_peer: Arc::new(DashMap::default()),
-                missing_candidate_sender: missing_peer,
-            },
-            rx,
-        )
-    }
-
-    fn prune_transactions_from_peer(&self, peer: &PeerId) {
-        self.tx_per_peer.remove(peer);
-    }
-
-    fn has_live_connection(&self, peer: &PeerId) -> bool {
-        self.tx_per_peer.contains_key(peer)
-    }
-
-    fn still_alive(&self, tx: &Transaction) -> bool {
-        self.tx_per_peer.iter().any(|e| e.value().contains(tx))
-    }
-}
-
-#[derive(PartialEq, Clone, Copy)]
-struct Score(f64);
-
-impl PartialOrd for Score {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Score {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
-    }
-}
-
-impl Eq for Score {}
+pub use peer_key_location::PeerKeyLocation;
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
@@ -204,17 +65,7 @@ pub(crate) struct Ring {
     pub connection_manager: ConnectionManager,
     pub router: Arc<RwLock<Router>>,
     pub live_tx_tracker: LiveTransactionTracker,
-    /// The container for subscriber is a vec instead of something like a hashset
-    /// that would allow for blind inserts of duplicate peers subscribing because
-    /// of data locality, since we are likely to end up iterating over the whole sequence
-    /// of subscribers more often than inserting, and anyways is a relatively short sequence
-    /// then is more optimal to just use a vector for it's compact memory layout.
-    subscribers: DashMap<ContractKey, Vec<PeerKeyLocation>>,
-    /// Contracts this peer is seeding.
-    seeding_contract: DashMap<ContractKey, Score>,
-    // A peer which has been blacklisted to perform actions regarding a given contract.
-    // todo: add blacklist
-    // contract_blacklist: Arc<DashMap<ContractKey, Vec<Blacklisted>>>,
+    seeding_manager: seeding::SeedingManager,
     event_register: Box<dyn NetEventRegister>,
     /// Whether this peer is a gateway or not. This will affect behavior of the node when acquiring
     /// and dropping connections.
@@ -239,23 +90,11 @@ impl Ring {
 
     const DEFAULT_MAX_DOWNSTREAM_BANDWIDTH: Rate = Rate::new_per_second(1_000_000.0);
 
-    /// Max number of subscribers for a contract.
-    const MAX_SUBSCRIBERS: usize = 10;
-
-    /// All subscribers, including the upstream subscriber.
-    const TOTAL_MAX_SUBSCRIPTIONS: usize = Self::MAX_SUBSCRIBERS + 1;
-
     /// Above this number of remaining hops, randomize which node a message which be forwarded to.
     const DEFAULT_RAND_WALK_ABOVE_HTL: usize = 7;
 
     /// Max hops to be performed for certain operations (e.g. propagating connection of a peer in the network).
     pub const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
-
-    /// Max number of seeding contracts.
-    const MAX_SEEDING_CONTRACTS: usize = 100;
-
-    /// Min number of seeding contracts.
-    const MIN_SEEDING_CONTRACTS: usize = Self::MAX_SEEDING_CONTRACTS / 4;
 
     pub fn new<ER: NetEventRegister + Clone>(
         config: &NodeConfig,
@@ -280,8 +119,7 @@ impl Ring {
             max_hops_to_live,
             router,
             connection_manager,
-            subscribers: DashMap::new(),
-            seeding_contract: DashMap::new(),
+            seeding_manager: seeding::SeedingManager::new(),
             live_tx_tracker: live_tx_tracker.clone(),
             event_register: Box::new(event_register),
             is_gateway,
@@ -341,74 +179,28 @@ impl Ring {
 
     /// Return if a contract is within appropiate seeding distance.
     pub fn should_seed(&self, key: &ContractKey) -> bool {
-        const CACHING_DISTANCE: f64 = 0.05;
-        let caching_distance = Distance::new(CACHING_DISTANCE);
-        if self.seeding_contract.len() < Self::MIN_SEEDING_CONTRACTS {
-            return true;
-        }
-        let key_loc = Location::from(key);
         let own_loc = self
             .connection_manager
             .own_location()
             .location
             .expect("should be set");
-        if self.seeding_contract.len() < Self::MAX_SEEDING_CONTRACTS {
-            return own_loc.distance(key_loc) <= caching_distance;
-        }
-
-        let contract_score = self.calculate_seed_score(key);
-        let r = self
-            .seeding_contract
-            .iter()
-            .min_by_key(|v| *v.value())
-            .unwrap();
-        let min_score = *r.value();
-        contract_score > min_score
+        self.seeding_manager.should_seed(key, own_loc)
     }
 
     /// Add a new subscription for this peer.
     pub fn seed_contract(&self, key: ContractKey) -> (Option<ContractKey>, Vec<PeerKeyLocation>) {
-        let seed_score = self.calculate_seed_score(&key);
-        let mut old_subscribers = vec![];
-        let mut contract_to_drop = None;
-
-        if self.seeding_contract.len() <= Self::MAX_SEEDING_CONTRACTS {
-            if let Some(dropped_contract) = self
-                .seeding_contract
-                .iter()
-                .min_by_key(|v| *v.value())
-                .map(|entry| *entry.key())
-            {
-                self.seeding_contract.remove(&dropped_contract);
-                if let Some((_, mut subscribers_of_contract)) =
-                    self.subscribers.remove(&dropped_contract)
-                {
-                    std::mem::swap(&mut subscribers_of_contract, &mut old_subscribers);
-                }
-                contract_to_drop = Some(dropped_contract);
-            }
-        }
-
-        self.seeding_contract.insert(key, seed_score);
-        (contract_to_drop, old_subscribers)
-    }
-
-    fn calculate_seed_score(&self, key: &ContractKey) -> Score {
-        let location = self
+        let own_loc = self
             .connection_manager
             .own_location()
             .location
             .expect("should be set");
-        let key_loc = Location::from(key);
-        let distance = key_loc.distance(location);
-        let score = 0.5 - distance.as_f64();
-        Score(score)
+        self.seeding_manager.seed_contract(key, own_loc)
     }
 
     /// Whether this node already is seeding to this contract or not.
     #[inline]
     pub fn is_seeding_contract(&self, key: &ContractKey) -> bool {
-        self.seeding_contract.contains_key(key)
+        self.seeding_manager.is_seeding_contract(key)
     }
 
     pub fn record_request(
@@ -480,29 +272,14 @@ impl Ring {
         contract: &ContractKey,
         subscriber: PeerKeyLocation,
     ) -> Result<(), ()> {
-        let mut subs = self
-            .subscribers
-            .entry(*contract)
-            .or_insert(Vec::with_capacity(Self::TOTAL_MAX_SUBSCRIPTIONS));
-        if subs.len() >= Self::MAX_SUBSCRIBERS {
-            return Err(());
-        }
-        if let Err(next_idx) = subs.value_mut().binary_search(&subscriber) {
-            let subs = subs.value_mut();
-            if subs.len() == Self::MAX_SUBSCRIBERS {
-                return Err(());
-            } else {
-                subs.insert(next_idx, subscriber);
-            }
-        }
-        Ok(())
+        self.seeding_manager.add_subscriber(contract, subscriber)
     }
 
     pub fn subscribers_of(
         &self,
         contract: &ContractKey,
     ) -> Option<DmRef<ContractKey, Vec<PeerKeyLocation>>> {
-        self.subscribers.get(contract)
+        self.seeding_manager.subscribers_of(contract)
     }
 
     pub async fn prune_connection(&self, peer: PeerId) {
@@ -513,12 +290,7 @@ impl Ring {
             return;
         };
         {
-            self.subscribers.alter_all(|_, mut subs| {
-                if let Some(pos) = subs.iter().position(|l| l.location == Some(loc)) {
-                    subs.swap_remove(pos);
-                }
-                subs
-            });
+            self.seeding_manager.prune_subscriber(loc);
         }
         self.event_register
             .register_events(Either::Left(NetEventLog::disconnected(self, &peer)))
@@ -554,7 +326,7 @@ impl Ring {
         self: Arc<Self>,
         notifier: EventLoopNotificationsSender,
         live_tx_tracker: LiveTransactionTracker,
-        mut missing_candidates: sync::mpsc::Receiver<PeerId>,
+        mut missing_candidates: mpsc::Receiver<PeerId>,
     ) -> anyhow::Result<()> {
         tracing::debug!("Initializing connection maintenance task");
         #[cfg(not(test))]
@@ -592,8 +364,8 @@ impl Ring {
                     Ok(missing_candidate) => {
                         missing.insert(Reverse(Instant::now()), missing_candidate);
                     }
-                    Err(sync::mpsc::error::TryRecvError::Empty) => break,
-                    Err(sync::mpsc::error::TryRecvError::Disconnected) => {
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
                         tracing::debug!("Shutting down connection maintenance");
                         anyhow::bail!("finished");
                     }
