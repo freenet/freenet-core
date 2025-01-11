@@ -290,8 +290,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                         Ok((size, remote_addr)) => {
                             let packet_data = PacketData::from_buf(&buf[..size]);
                             if let Some(remote_conn) = self.remote_connections.remove(&remote_addr){
-                                let _ = remote_conn.inbound_packet_sender.send(packet_data).await;
-                                self.remote_connections.insert(remote_addr, remote_conn);
+                                if remote_conn.inbound_packet_sender.send(packet_data).await.is_ok() {
+                                    self.remote_connections.insert(remote_addr, remote_conn);
+                                }
                                 continue;
                             }
 
