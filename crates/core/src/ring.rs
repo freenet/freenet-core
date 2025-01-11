@@ -41,10 +41,10 @@ use crate::{
 mod connection_manager;
 pub(crate) use connection_manager::ConnectionManager;
 mod connection;
-pub mod live_tx;
+mod live_tx;
 mod location;
 mod peer_key_location;
-pub(crate) mod score;
+mod score;
 mod seeding;
 
 use self::score::Score;
@@ -179,7 +179,6 @@ impl Ring {
 
     /// Return if a contract is within appropiate seeding distance.
     pub fn should_seed(&self, key: &ContractKey) -> bool {
-        const _CACHING_DISTANCE: f64 = 0.05;
         let own_loc = self
             .connection_manager
             .own_location()
