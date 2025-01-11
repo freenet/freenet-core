@@ -290,14 +290,22 @@ impl<S: Socket> UdpPacketsListener<S> {
                         Ok((size, remote_addr)) => {
                             let packet_data = PacketData::from_buf(&buf[..size]);
                             if let Some(remote_conn) = self.remote_connections.remove(&remote_addr){
-                                if remote_conn.inbound_packet_sender.send(packet_data).await.is_ok() {
+                                if remote_conn.inbound_packet_sender.send(packet_data)
+                                    .await
+                                    .inspect_err(|err| {
+                                        tracing::debug!(%remote_addr, %err, "failed to send packet to remote");
+                                    })
+                                    .is_ok()
+                                {
                                     self.remote_connections.insert(remote_addr, remote_conn);
                                 }
                                 continue;
                             }
 
                             if let Some(inbound_packet_sender) = ongoing_gw_connections.remove(&remote_addr){
-                                if inbound_packet_sender.send(packet_data).await.is_ok() {
+                                if inbound_packet_sender.send(packet_data).await.inspect_err(|err| {
+                                    tracing::debug!(%remote_addr, %err, "failed to send packet to remote");
+                                }).is_ok() {
                                     ongoing_gw_connections.insert(remote_addr, inbound_packet_sender);
                                 }
                                 continue;
