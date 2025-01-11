@@ -296,8 +296,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
 
                             if let Some(inbound_packet_sender) = ongoing_gw_connections.remove(&remote_addr){
-                                let _ = inbound_packet_sender.send(packet_data).await;
-                                ongoing_gw_connections.insert(remote_addr, inbound_packet_sender);
+                                if inbound_packet_sender.send(packet_data).await.is_ok() {
+                                    ongoing_gw_connections.insert(remote_addr, inbound_packet_sender);
+                                }
                                 continue;
                             }
 
@@ -480,47 +481,32 @@ impl<S: Socket> UdpPacketsListener<S> {
 
             tracing::debug!(%remote_addr, "Sending outbound ack packet: {:?}", outbound_ack_packet.data());
 
-            let mut waiting_time = INITIAL_INTERVAL;
-            let mut attempts = 0;
-            const MAX_ATTEMPTS: usize = 15;
+            outbound_packets
+                .send((remote_addr, outbound_ack_packet.clone().prepared_send()))
+                .await
+                .map_err(|_| TransportError::ChannelClosed)?;
 
-            while attempts < MAX_ATTEMPTS {
-                outbound_packets
-                    .send((remote_addr, outbound_ack_packet.clone().prepared_send()))
-                    .await
-                    .map_err(|_| TransportError::ChannelClosed)?;
-
-                // wait until the remote sends the ack packet
-                let timeout = tokio::time::timeout(waiting_time, next_inbound.recv());
-                match timeout.await {
-                    Ok(Some(packet)) => {
-                        let _ = packet.try_decrypt_sym(&inbound_key).map_err(|_| {
+            // wait until the remote sends the ack packet
+            let timeout = tokio::time::timeout(Duration::from_secs(5), next_inbound.recv());
+            match timeout.await {
+                Ok(Some(packet)) => {
+                    let _ = packet.try_decrypt_sym(&inbound_key).map_err(|_| {
                             tracing::debug!(%remote_addr, "Failed to decrypt packet with inbound key: {:?}", packet.data());
                             TransportError::ConnectionEstablishmentFailure {
                                 cause: "invalid symmetric key".into(),
                             }
                         })?;
-                    }
-                    Ok(None) => {
-                        tracing::debug!(%remote_addr, "connection timed out");
-                        return Err(TransportError::ConnectionEstablishmentFailure {
-                            cause: "connection close".into(),
-                        });
-                    }
-                    Err(_) => {
-                        attempts += 1;
-                        waiting_time = std::cmp::min(
-                            Duration::from_millis(
-                                waiting_time.as_millis() as u64 * INTERVAL_INCREASE_FACTOR,
-                            ),
-                            MAX_INTERVAL,
-                        );
-                        continue;
-                    }
                 }
-                // we know the inbound is successfully connected now and can proceed
-                // ignoring this will force them to resend the packet but that is fine and simpler
-                break;
+                Ok(None) => {
+                    return Err(TransportError::ConnectionEstablishmentFailure {
+                        cause: "connection closed".into(),
+                    });
+                }
+                Err(_) => {
+                    return Err(TransportError::ConnectionEstablishmentFailure {
+                        cause: "connection timed out waiting for response".into(),
+                    });
+                }
             }
 
             let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
