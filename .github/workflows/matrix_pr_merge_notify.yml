@@ -15,5 +15,5 @@ jobs:
           room_id: ${{ secrets.MATRIX_ROOM_ID }}
           access_token: ${{ secrets.MATRIX_ACCESS_TOKEN }}
           subject: "Pull Request Merged"
-          message: "🤖 [Pull Request #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}](${{ github.event.pull_request.html_url }}) has been merged by [${{ github.event.pull_request.user.login }}](${{ github.event.pull_request.user.html_url }}) into the [${{ github.repository }}](${{ github.event.repository.html_url }}) repository."
+          message: "🤖 [Pull Request #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}](${{ github.event.pull_request.html_url }}) (created by [${{ github.event.pull_request.user.login }}](${{ github.event.pull_request.user.html_url }})) has been merged by [${{ github.event.pull_request.merged_by.login }}](${{ github.event.pull_request.merged_by.html_url }}) into the [${{ github.repository }}](${{ github.event.repository.html_url }}) repository."
           server: "matrix.org"
