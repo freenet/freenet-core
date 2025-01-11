@@ -27,11 +27,19 @@ transaction(optionalEncoding?:any):string|Uint8Array|null {
   return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
 }
 
-from():string|null
-from(optionalEncoding:flatbuffers.Encoding):string|Uint8Array|null
-from(optionalEncoding?:any):string|Uint8Array|null {
+from(index: number):number|null {
   const offset = this.bb!.__offset(this.bb_pos, 6);
-  return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
+  return offset ? this.bb!.readUint8(this.bb!.__vector(this.bb_pos + offset) + index) : 0;
+}
+
+fromLength():number {
+  const offset = this.bb!.__offset(this.bb_pos, 6);
+  return offset ? this.bb!.__vector_len(this.bb_pos + offset) : 0;
+}
+
+fromArray():Uint8Array|null {
+  const offset = this.bb!.__offset(this.bb_pos, 6);
+  return offset ? new Uint8Array(this.bb!.bytes().buffer, this.bb!.bytes().byteOffset + this.bb!.__vector(this.bb_pos + offset), this.bb!.__vector_len(this.bb_pos + offset)) : null;
 }
 
 fromLocation():number {
@@ -39,11 +47,19 @@ fromLocation():number {
   return offset ? this.bb!.readFloat64(this.bb_pos + offset) : 0.0;
 }
 
-to():string|null
-to(optionalEncoding:flatbuffers.Encoding):string|Uint8Array|null
-to(optionalEncoding?:any):string|Uint8Array|null {
+to(index: number):number|null {
   const offset = this.bb!.__offset(this.bb_pos, 10);
-  return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
+  return offset ? this.bb!.readUint8(this.bb!.__vector(this.bb_pos + offset) + index) : 0;
+}
+
+toLength():number {
+  const offset = this.bb!.__offset(this.bb_pos, 10);
+  return offset ? this.bb!.__vector_len(this.bb_pos + offset) : 0;
+}
+
+toArray():Uint8Array|null {
+  const offset = this.bb!.__offset(this.bb_pos, 10);
+  return offset ? new Uint8Array(this.bb!.bytes().buffer, this.bb!.bytes().byteOffset + this.bb!.__vector(this.bb_pos + offset), this.bb!.__vector_len(this.bb_pos + offset)) : null;
 }
 
 toLocation():number {
@@ -63,12 +79,36 @@ static addFrom(builder:flatbuffers.Builder, fromOffset:flatbuffers.Offset) {
   builder.addFieldOffset(1, fromOffset, 0);
 }
 
+static createFromVector(builder:flatbuffers.Builder, data:number[]|Uint8Array):flatbuffers.Offset {
+  builder.startVector(1, data.length, 1);
+  for (let i = data.length - 1; i >= 0; i--) {
+    builder.addInt8(data[i]!);
+  }
+  return builder.endVector();
+}
+
+static startFromVector(builder:flatbuffers.Builder, numElems:number) {
+  builder.startVector(1, numElems, 1);
+}
+
 static addFromLocation(builder:flatbuffers.Builder, fromLocation:number) {
   builder.addFieldFloat64(2, fromLocation, 0.0);
 }
 
 static addTo(builder:flatbuffers.Builder, toOffset:flatbuffers.Offset) {
   builder.addFieldOffset(3, toOffset, 0);
+}
+
+static createToVector(builder:flatbuffers.Builder, data:number[]|Uint8Array):flatbuffers.Offset {
+  builder.startVector(1, data.length, 1);
+  for (let i = data.length - 1; i >= 0; i--) {
+    builder.addInt8(data[i]!);
+  }
+  return builder.endVector();
+}
+
+static startToVector(builder:flatbuffers.Builder, numElems:number) {
+  builder.startVector(1, numElems, 1);
 }
 
 static addToLocation(builder:flatbuffers.Builder, toLocation:number) {
