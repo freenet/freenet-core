@@ -334,6 +334,10 @@ pub(crate) enum ContractHandlerEvent {
     UpdateResponse {
         new_value: Result<WrappedState, ExecutorError>,
     },
+    // The response to an update query where the state has not changed
+    UpdateNoChange {
+        key: ContractKey,
+    },
     RegisterSubscriberListener {
         key: ContractKey,
         client_id: ClientId,
@@ -397,6 +401,9 @@ impl std::fmt::Display for ContractHandlerEvent {
                     write!(f, "update query failed {{ {e} }}",)
                 }
             },
+            ContractHandlerEvent::UpdateNoChange { key } => {
+                write!(f, "update query no change {{ {key} }}",)
+            }
             ContractHandlerEvent::RegisterSubscriberListener { key, client_id, .. } => {
                 write!(
                     f,

@@ -82,7 +82,7 @@ impl ContractExecutor for Executor<MockRuntime> {
         state: Either<WrappedState, StateDelta<'static>>,
         _related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
-    ) -> Result<WrappedState, ExecutorError> {
+    ) -> Result<UpsertResult, ExecutorError> {
         // todo: instead allow to perform mutations per contract based on incoming value so we can track
         // state values over the network
         match (state, code) {
@@ -95,16 +95,15 @@ impl ContractExecutor for Executor<MockRuntime> {
                     .store(key, incoming_state.clone(), contract.params().into_owned())
                     .await
                     .map_err(ExecutorError::other)?;
-                Ok(incoming_state)
+                Ok(UpsertResult::Updated(incoming_state))
             }
             (Either::Left(incoming_state), None) => {
                 // update case
-
                 self.state_store
                     .update(&key, incoming_state.clone())
                     .await
                     .map_err(ExecutorError::other)?;
-                Ok(incoming_state)
+                Ok(UpsertResult::Updated(incoming_state))
             }
             (update, contract) => unreachable!("{update:?}, {contract:?}"),
         }
