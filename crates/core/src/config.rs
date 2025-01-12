@@ -284,7 +284,10 @@ impl ConfigArgs {
                     OperationMode::Local => default_local_address(),
                     OperationMode::Network => default_listening_address(),
                 }),
-                port: self.network_api.network_port.unwrap_or_else(default_network_api_port),
+                port: self
+                    .network_api
+                    .network_port
+                    .unwrap_or_else(default_network_api_port),
                 public_address: self.network_api.public_address,
                 public_port: self.network_api.public_port,
                 ignore_protocol: self.network_api.ignore_protocol_checking,
@@ -469,24 +472,24 @@ pub struct NetworkApiConfig {
     pub ignore_protocol: bool,
 }
 
-use std::net::UdpSocket;
 use rand::Rng;
+use std::net::UdpSocket;
 
 fn find_available_port() -> std::io::Result<u16> {
     // Try up to 100 times to find an available port
     for _ in 0..100 {
         // Generate random port in the ephemeral port range (49152-65535)
         let port = rand::thread_rng().gen_range(49152..=65535);
-        
+
         // Try to bind to this port to see if it's available
         if UdpSocket::bind(("127.0.0.1", port)).is_ok() {
             return Ok(port);
         }
     }
-    
+
     Err(std::io::Error::new(
         std::io::ErrorKind::AddrInUse,
-        "Could not find an available port after 100 attempts"
+        "Could not find an available port after 100 attempts",
     ))
 }
 

@@ -1011,8 +1011,8 @@ mod tests {
         let addr = Address::Hostname("localhost".to_string());
         let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
         assert!(
-            socket_addr.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST) ||
-            socket_addr.ip() == IpAddr::V6(Ipv6Addr::LOCALHOST)
+            socket_addr.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST)
+                || socket_addr.ip() == IpAddr::V6(Ipv6Addr::LOCALHOST)
         );
         // Port should be in valid range
         assert!(socket_addr.port() > 0 && socket_addr.port() <= 65535);
