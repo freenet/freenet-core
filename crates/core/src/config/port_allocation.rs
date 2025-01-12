@@ -78,7 +78,7 @@ mod tests {
         let port = find_available_port()?;
 
         // Verify we can immediately bind to it
-        let socket = UdpSocket::bind(("127.0.0.1", port))?;
+        let _socket = UdpSocket::bind(("127.0.0.1", port))?;
         
         // Verify we can also connect to it
         let client = UdpSocket::bind("127.0.0.1:0")?;
@@ -100,9 +100,9 @@ mod tests {
         assert_ne!(port1, port3);
 
         // Verify they're all in the expected range
-        assert!(port1 >= 49152 && port1 <= 65535);
-        assert!(port2 >= 49152 && port2 <= 65535);
-        assert!(port3 >= 49152 && port3 <= 65535);
+        assert!(port1 >= 49152);
+        assert!(port2 >= 49152);
+        assert!(port3 >= 49152);
 
         Ok(())
     }
