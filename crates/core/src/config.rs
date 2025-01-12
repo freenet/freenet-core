@@ -470,6 +470,7 @@ pub struct NetworkApiConfig {
 }
 
 use std::net::UdpSocket;
+use rand::Rng;
 
 fn find_available_port() -> std::io::Result<u16> {
     // Try up to 100 times to find an available port
