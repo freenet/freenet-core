@@ -467,6 +467,25 @@ pub struct NetworkArgs {
     pub ignore_protocol_checking: bool,
 }
 
+impl NetworkArgs {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if self.is_gateway {
+            // For gateways, require both public address and port
+            if self.public_address.is_none() {
+                return Err(anyhow::anyhow!(
+                    "Gateway nodes must specify a public network address"
+                ));
+            }
+            if self.public_port.is_none() && self.network_port.is_none() {
+                return Err(anyhow::anyhow!(
+                    "Gateway nodes must specify a network port"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct NetworkApiConfig {
     /// Address to listen to locally
