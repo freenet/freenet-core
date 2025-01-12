@@ -1020,7 +1020,7 @@ mod tests {
         let addr = Address::Hostname("google.com".to_string());
         let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
         // Port should be in valid range
-        assert!(socket_addr.port() >= 49152); // Ensure we're using dynamic/private port range
+        assert!(socket_addr.port() >= 49152); // Ensure we're using dynamic/private port range // This is too strict AI!
 
         let addr = Address::Hostname("google.com:8080".to_string());
         let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
