@@ -476,7 +476,7 @@ fn find_available_port() -> std::io::Result<u16> {
     // Try up to 100 times to find an available port
     for _ in 0..100 {
         // Generate random port in the ephemeral port range (49152-65535)
-        let port = rand::thread_rng().gen_range(49152..65536);
+        let port = rand::thread_rng().gen_range(49152..=65535);
         
         // Try to bind to this port to see if it's available
         if UdpSocket::bind(("127.0.0.1", port)).is_ok() {
