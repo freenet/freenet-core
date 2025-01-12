@@ -62,6 +62,7 @@ tower-http = { features = ["fs", "trace"], version = "0.6" }
 ulid = { features = ["serde"], version = "1.1" }
 unsigned-varint = { version = "0.8", features = ["codec", "asynchronous_codec"] }
 wasmer = { features = ["sys"], workspace = true }
+wasmer-middlewares = "5.0.4"
 xz2 = { version = "0.1" }
 reqwest = { version = "0.12", features = ["json"] }
 rsa = { version = "0.9", features = ["serde", "pem"] }

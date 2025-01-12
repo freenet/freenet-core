@@ -1585,6 +1585,7 @@ dependencies = [
  "ulid",
  "unsigned-varint",
  "wasmer",
+ "wasmer-middlewares",
  "xz2",
 ]
 
@@ -5763,6 +5764,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "wasmer-middlewares"
+version = "5.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "371b38abbba1a0fb747bee025d3a40c776842be4a2052b7a3ca18bd2db80669d"
+dependencies = [
+ "wasmer",
+ "wasmer-types",
+ "wasmer-vm",
 ]
 
 [[package]]

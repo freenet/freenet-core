@@ -1,5 +1,5 @@
 use std::{collections::HashMap, sync::atomic::AtomicI64};
-
+use std::sync::Arc;
 use freenet_stdlib::{
     memory::{
         buf::{BufferBuilder, BufferMut},
@@ -7,7 +7,7 @@ use freenet_stdlib::{
     },
     prelude::*,
 };
-use wasmer::{imports, Bytes, Imports, Instance, Memory, MemoryType, Module, Store, TypedFunction};
+use wasmer::{imports, Bytes, CompilerConfig, EngineBuilder, Imports, Instance, Memory, MemoryType, Module, Store, TypedFunction};
 
 use super::{
     contract_store::ContractStore, delegate_store::DelegateStore, error::RuntimeInnerError,
@@ -87,6 +87,10 @@ pub enum ContractExecError {
 
     #[error("unexpected result from contract interface")]
     UnexpectedResult,
+
+    #[error("The operation ran out of gas. This might be caused by an infinite loop or an inefficient computation.")]
+    OutOfGas,
+
 }
 
 pub struct Runtime {
@@ -259,8 +263,20 @@ impl Runtime {
     }
 
     fn instance_store() -> Store {
-        use wasmer::Cranelift;
-        Store::new(Cranelift::new())
+        use wasmer::{Cranelift};
+        use wasmer_middlewares::Metering;
+
+        // Simple metering middleware that counts the number of instructions executed
+        let initial_limit = 10_000;
+        let cost_per_instruction = 1;
+
+        let metering = Arc::new(Metering::new(initial_limit, move |_, _| cost_per_instruction));
+        let mut compiler_config = Cranelift::default();
+        compiler_config.push_middleware(metering);
+
+        let engine = EngineBuilder::new(compiler_config).engine();
+
+        Store::new(&engine)
     }
 
     // #[cfg(not(test))]
