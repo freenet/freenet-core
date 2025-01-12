@@ -502,8 +502,8 @@ fn find_available_port() -> std::io::Result<u16> {
         attempts += 1;
         
         let port = LAST_PORT.fetch_add(1, Ordering::Relaxed);
-        if port > 65535 {
-            LAST_PORT.store(49152, Ordering::Relaxed);
+        if port >= 49152 {
+            LAST_PORT.store(49152, Ordering::Relaxed); 
             break; // Switch to random allocation
         }
 
@@ -512,7 +512,7 @@ fn find_available_port() -> std::io::Result<u16> {
         }
 
         // Try to create socket with SO_REUSEADDR
-        if let Ok(socket) = UdpSocket::bind(("127.0.0.1", port)) {
+        if let Ok(_socket) = UdpSocket::bind(("127.0.0.1", port)) {
             recent_ports.insert(port, now);
             return Ok(port);
         }
@@ -528,7 +528,7 @@ fn find_available_port() -> std::io::Result<u16> {
             continue;
         }
 
-        if let Ok(socket) = UdpSocket::bind(("127.0.0.1", port)) {
+        if let Ok(_socket) = UdpSocket::bind(("127.0.0.1", port)) {
             recent_ports.insert(port, now);
             LAST_PORT.store(port, Ordering::Relaxed);
             return Ok(port);
@@ -1121,7 +1121,7 @@ mod tests {
             .is_ok());
             let socket = NodeConfig::parse_socket_addr(&gw.address).await.unwrap();
             // Don't test for specific port since it's randomly assigned
-            assert!(socket.port() > 0 && socket.port() <= 65535);
+            assert!(socket.port() >= 49152); // Ensure we're using dynamic/private port range
         }
     }
 }

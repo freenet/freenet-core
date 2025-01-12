@@ -1015,12 +1015,12 @@ mod tests {
                 || socket_addr.ip() == IpAddr::V6(Ipv6Addr::LOCALHOST)
         );
         // Port should be in valid range
-        assert!(socket_addr.port() > 0 && socket_addr.port() <= 65535);
+        assert!(socket_addr.port() >= 49152); // Ensure we're using dynamic/private port range
 
         let addr = Address::Hostname("google.com".to_string());
         let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
         // Port should be in valid range
-        assert!(socket_addr.port() > 0 && socket_addr.port() <= 65535);
+        assert!(socket_addr.port() >= 49152); // Ensure we're using dynamic/private port range
 
         let addr = Address::Hostname("google.com:8080".to_string());
         let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
