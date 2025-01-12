@@ -404,7 +404,7 @@ impl Config {
     }
 }
 
-#[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)] 
+#[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]
 pub struct NetworkArgs {
     /// Address to bind to for the network event listener, default is 0.0.0.0
     #[arg(
@@ -460,9 +460,7 @@ impl NetworkArgs {
                 ));
             }
             if self.public_port.is_none() && self.network_port.is_none() {
-                return Err(anyhow::anyhow!(
-                    "Gateway nodes must specify a network port"
-                ));
+                return Err(anyhow::anyhow!("Gateway nodes must specify a network port"));
             }
         }
         Ok(())
