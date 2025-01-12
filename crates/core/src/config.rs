@@ -513,10 +513,8 @@ fn find_available_port() -> std::io::Result<u16> {
 
         // Try to create socket with SO_REUSEADDR
         if let Ok(socket) = UdpSocket::bind(("127.0.0.1", port)) {
-            if let Ok(()) = socket.set_reuse_addr(true) {
-                recent_ports.insert(port, now);
-                return Ok(port);
-            }
+            recent_ports.insert(port, now);
+            return Ok(port);
         }
     }
 
@@ -531,11 +529,9 @@ fn find_available_port() -> std::io::Result<u16> {
         }
 
         if let Ok(socket) = UdpSocket::bind(("127.0.0.1", port)) {
-            if let Ok(()) = socket.set_reuse_addr(true) {
-                recent_ports.insert(port, now);
-                LAST_PORT.store(port, Ordering::Relaxed);
-                return Ok(port);
-            }
+            recent_ports.insert(port, now);
+            LAST_PORT.store(port, Ordering::Relaxed);
+            return Ok(port);
         }
     }
 
