@@ -173,6 +173,9 @@ impl ConfigArgs {
 
     /// Parse the command line arguments and return the configuration.
     pub async fn build(mut self) -> anyhow::Result<Config> {
+        // Validate gateway configuration
+        self.network_api.validate()?;
+
         let cfg = if let Some(path) = self.config_paths.config_dir.as_ref() {
             if !path.exists() {
                 return Err(anyhow::Error::new(std::io::Error::new(
@@ -287,7 +290,7 @@ impl ConfigArgs {
                 port: self
                     .network_api
                     .network_port
-                    .unwrap_or(default_network_api_port()),
+                    .unwrap_or_else(default_network_api_port),
                 public_address: self.network_api.public_address,
                 public_port: self.network_api.public_port,
                 ignore_protocol: self.network_api.ignore_protocol_checking,
@@ -447,6 +450,23 @@ pub struct NetworkArgs {
     pub ignore_protocol_checking: bool,
 }
 
+impl NetworkArgs {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if self.is_gateway {
+            // For gateways, require both public address and port
+            if self.public_address.is_none() {
+                return Err(anyhow::anyhow!(
+                    "Gateway nodes must specify a public network address"
+                ));
+            }
+            if self.public_port.is_none() && self.network_port.is_none() {
+                return Err(anyhow::anyhow!("Gateway nodes must specify a network port"));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct NetworkApiConfig {
     /// Address to listen to locally
@@ -472,9 +492,11 @@ pub struct NetworkApiConfig {
     pub ignore_protocol: bool,
 }
 
-#[inline]
-pub const fn default_network_api_port() -> u16 {
-    31337
+mod port_allocation;
+use port_allocation::find_available_port;
+
+pub fn default_network_api_port() -> u16 {
+    find_available_port().unwrap_or(31337) // Fallback to 31337 if we can't find a random port
 }
 
 #[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]
@@ -1052,7 +1074,8 @@ mod tests {
             )
             .is_ok());
             let socket = NodeConfig::parse_socket_addr(&gw.address).await.unwrap();
-            assert_eq!(socket.port(), default_network_api_port());
+            // Don't test for specific port since it's randomly assigned
+            assert!(socket.port() > 1024); // Ensure we're using unprivileged ports
         }
     }
 }
