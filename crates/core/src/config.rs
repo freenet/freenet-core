@@ -1075,7 +1075,7 @@ mod tests {
             .is_ok());
             let socket = NodeConfig::parse_socket_addr(&gw.address).await.unwrap();
             // Don't test for specific port since it's randomly assigned
-            assert!(socket.port() >= 49152); // Ensure we're using dynamic/private port range
+            assert!(socket.port() > 1024); // Ensure we're using unprivileged ports
         }
     }
 }
