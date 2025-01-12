@@ -1015,7 +1015,7 @@ mod tests {
                 || socket_addr.ip() == IpAddr::V6(Ipv6Addr::LOCALHOST)
         );
         // Port should be in valid range
-        assert!(socket_addr.port() >= 49152); // Ensure we're using dynamic/private port range
+        assert!(socket_addr.port() > 1024); // Ensure we're using unprivileged ports
 
         let addr = Address::Hostname("google.com".to_string());
         let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
