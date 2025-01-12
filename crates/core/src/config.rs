@@ -475,10 +475,9 @@ pub struct NetworkApiConfig {
 use rand::Rng;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use once_cell::sync::Lazy;
 
 // Track recently used ports to avoid reuse conflicts
 static RECENT_PORTS: Lazy<Mutex<HashMap<u16, SystemTime>>> = Lazy::new(|| Mutex::new(HashMap::new()));
@@ -514,7 +513,7 @@ fn find_available_port() -> std::io::Result<u16> {
 
         // Try to create socket with SO_REUSEADDR
         if let Ok(socket) = UdpSocket::bind(("127.0.0.1", port)) {
-            if let Ok(true) = socket.set_reuse_address(true) {
+            if let Ok(()) = socket.set_reuse_addr(true) {
                 recent_ports.insert(port, now);
                 return Ok(port);
             }
@@ -532,7 +531,7 @@ fn find_available_port() -> std::io::Result<u16> {
         }
 
         if let Ok(socket) = UdpSocket::bind(("127.0.0.1", port)) {
-            if let Ok(true) = socket.set_reuse_address(true) {
+            if let Ok(()) = socket.set_reuse_addr(true) {
                 recent_ports.insert(port, now);
                 LAST_PORT.store(port, Ordering::Relaxed);
                 return Ok(port);
