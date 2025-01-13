@@ -32,7 +32,7 @@ crossbeam = { workspace = true }
 ctrlc = { features = ["termination"], workspace = true }
 dashmap = { workspace = true }
 delegate = "0.13"
-directories = "5"
+directories = "6"
 either = { features = ["serde"], workspace = true }
 flatbuffers = "24.3"
 futures = "0.3"
