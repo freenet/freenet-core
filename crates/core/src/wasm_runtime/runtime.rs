@@ -1,5 +1,3 @@
-use std::{collections::HashMap, sync::atomic::AtomicI64};
-use std::sync::Arc;
 use freenet_stdlib::{
     memory::{
         buf::{BufferBuilder, BufferMut},
@@ -7,7 +5,12 @@ use freenet_stdlib::{
     },
     prelude::*,
 };
-use wasmer::{imports, Bytes, CompilerConfig, EngineBuilder, Imports, Instance, Memory, MemoryType, Module, Store, TypedFunction};
+use std::sync::Arc;
+use std::{collections::HashMap, sync::atomic::AtomicI64};
+use wasmer::{
+    imports, Bytes, CompilerConfig, EngineBuilder, Imports, Instance, Memory, MemoryType, Module,
+    Store, TypedFunction,
+};
 
 use super::{
     contract_store::ContractStore, delegate_store::DelegateStore, error::RuntimeInnerError,
@@ -90,7 +93,6 @@ pub enum ContractExecError {
 
     #[error("The operation ran out of gas. This might be caused by an infinite loop or an inefficient computation.")]
     OutOfGas,
-
 }
 
 pub struct Runtime {
@@ -263,7 +265,7 @@ impl Runtime {
     }
 
     fn instance_store() -> Store {
-        use wasmer::{Cranelift};
+        use wasmer::Cranelift;
         use wasmer_middlewares::Metering;
 
         // Simple metering middleware that counts the number of instructions executed

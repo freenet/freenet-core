@@ -1,10 +1,10 @@
+use super::{ContractExecError, RuntimeResult};
 use freenet_stdlib::prelude::{
     ContractInterfaceResult, ContractKey, Parameters, RelatedContracts, StateDelta, StateSummary,
     UpdateData, UpdateModification, ValidateResult, WrappedState,
 };
 use wasmer::TypedFunction;
 use wasmer_middlewares::metering::{get_remaining_points, MeteringPoints};
-use super::{ContractExecError, RuntimeResult};
 
 type FfiReturnTy = i64;
 
@@ -108,17 +108,20 @@ impl ContractRuntimeInterface for super::Runtime {
                 res
             }
             Err(e) => {
-                let remaining_points = get_remaining_points(&mut self.wasm_store, &running.instance);
+                let remaining_points =
+                    get_remaining_points(&mut self.wasm_store, &running.instance);
                 return match remaining_points {
                     MeteringPoints::Remaining(..) => {
                         tracing::error!("Error while calling validate_state: {:?}", e);
                         Err(e.into())
                     }
                     MeteringPoints::Exhausted => {
-                        tracing::error!("Validate state ran out of gas, not enough points remaining");
+                        tracing::error!(
+                            "Validate state ran out of gas, not enough points remaining"
+                        );
                         Err(ContractExecError::OutOfGas.into())
-                    },
-                }
+                    }
+                };
             }
         };
         Ok(is_valid)
@@ -156,11 +159,10 @@ impl ContractRuntimeInterface for super::Runtime {
             update_data_buf.ptr()
         };
 
-        let update_state_func: TypedFunction<(i64, i64, i64), FfiReturnTy> =
-            running
-                .instance
-                .exports
-                .get_typed_function(&self.wasm_store, "update_state")?;
+        let update_state_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = running
+            .instance
+            .exports
+            .get_typed_function(&self.wasm_store, "update_state")?;
 
         let call_result = update_state_func.call(
             &mut self.wasm_store,
@@ -179,7 +181,8 @@ impl ContractRuntimeInterface for super::Runtime {
                 res
             }
             Err(e) => {
-                let remaining_points = get_remaining_points(&mut self.wasm_store, &running.instance);
+                let remaining_points =
+                    get_remaining_points(&mut self.wasm_store, &running.instance);
                 return match remaining_points {
                     MeteringPoints::Remaining(..) => {
                         tracing::error!("Error while calling update_state: {:?}", e);
@@ -188,8 +191,8 @@ impl ContractRuntimeInterface for super::Runtime {
                     MeteringPoints::Exhausted => {
                         tracing::error!("Update state ran out of gas, not enough points remaining");
                         Err(ContractExecError::OutOfGas.into())
-                    },
-                }
+                    }
+                };
             }
         };
 
@@ -238,17 +241,20 @@ impl ContractRuntimeInterface for super::Runtime {
                 res
             }
             Err(e) => {
-                let remaining_points = get_remaining_points(&mut self.wasm_store, &running.instance);
+                let remaining_points =
+                    get_remaining_points(&mut self.wasm_store, &running.instance);
                 return match remaining_points {
                     MeteringPoints::Remaining(..) => {
                         tracing::error!("Error while calling summarize_state: {:?}", e);
                         Err(e.into())
                     }
                     MeteringPoints::Exhausted => {
-                        tracing::error!("Summarize state ran out of gas, not enough points remaining");
+                        tracing::error!(
+                            "Summarize state ran out of gas, not enough points remaining"
+                        );
                         Err(ContractExecError::OutOfGas.into())
-                    },
-                }
+                    }
+                };
             }
         };
 
@@ -304,17 +310,20 @@ impl ContractRuntimeInterface for super::Runtime {
                 res
             }
             Err(e) => {
-                let remaining_points = get_remaining_points(&mut self.wasm_store, &running.instance);
+                let remaining_points =
+                    get_remaining_points(&mut self.wasm_store, &running.instance);
                 return match remaining_points {
                     MeteringPoints::Remaining(..) => {
                         tracing::error!("Error while calling get_state_delta: {:?}", e);
                         Err(e.into())
                     }
                     MeteringPoints::Exhausted => {
-                        tracing::error!("Get state delta ran out of gas, not enough points remaining");
+                        tracing::error!(
+                            "Get state delta ran out of gas, not enough points remaining"
+                        );
                         Err(ContractExecError::OutOfGas.into())
-                    },
-                }
+                    }
+                };
             }
         };
 
