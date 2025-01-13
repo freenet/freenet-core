@@ -270,7 +270,7 @@ impl Runtime {
         let initial_limit = 10_000;
         let cost_per_instruction = 1;
 
-        let metering = Arc::new(Metering::new(initial_limit, move |_, _| cost_per_instruction));
+        let metering = Arc::new(Metering::new(initial_limit, move |_| cost_per_instruction));
         let mut compiler_config = Cranelift::default();
         compiler_config.push_middleware(metering);
 
