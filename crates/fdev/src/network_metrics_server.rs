@@ -255,6 +255,44 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                         *contract_location,
                     )
                 }
+                Change::GetContract {
+                    requester,
+                    transaction,
+                    key,
+                    contract_location,
+                    timestamp,
+                    target,
+                } => {
+                    tracing::info!("sending get contract");
+                    ContractChange::get_contract_msg(
+                        requester,
+                        target,
+                        transaction,
+                        key,
+                        *contract_location,
+                        *timestamp,
+                    )
+                }
+                Change::SubscribedToContract {
+                    requester,
+                    transaction,
+                    key,
+                    contract_location,
+                    at_peer,
+                    at_peer_location,
+                    timestamp,
+                } => {
+                    tracing::info!("sending subscribed to contract");
+                    ContractChange::subscribed_msg(
+                        requester,
+                        transaction,
+                        key,
+                        *contract_location,
+                        at_peer,
+                        *at_peer_location,
+                        *timestamp,
+                    )
+                }
 
                 _ => continue,
             };
@@ -359,6 +397,44 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                 );
                 tx.send(Message::Binary(msg)).await?;
             }
+            Change::GetContract {
+                requester,
+                transaction,
+                key,
+                contract_location,
+                timestamp,
+                target,
+            } => {
+                let msg = ContractChange::get_contract_msg(
+                    requester,
+                    target,
+                    transaction,
+                    key,
+                    contract_location,
+                    timestamp,
+                );
+                tx.send(Message::Binary(msg)).await?;
+            }
+            Change::SubscribedToContract {
+                requester,
+                transaction,
+                key,
+                contract_location,
+                at_peer,
+                at_peer_location,
+                timestamp,
+            } => {
+                let msg = ContractChange::subscribed_msg(
+                    requester,
+                    transaction,
+                    key,
+                    contract_location,
+                    at_peer,
+                    at_peer_location,
+                    timestamp,
+                );
+                tx.send(Message::Binary(msg)).await?;
+            }
         }
     }
     Ok(())
@@ -429,6 +505,23 @@ pub(crate) enum Change {
         target: String,
         timestamp: u64,
         contract_location: f64,
+    },
+    GetContract {
+        requester: String,
+        transaction: String,
+        key: String,
+        contract_location: f64,
+        timestamp: u64,
+        target: String,
+    },
+    SubscribedToContract {
+        requester: String,
+        transaction: String,
+        key: String,
+        contract_location: f64,
+        at_peer: String,
+        at_peer_location: f64,
+        timestamp: u64,
     },
 }
 
@@ -670,9 +763,6 @@ impl ServerState {
 
                 match self.transactions_data.entry(tx_id.clone()) {
                     dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-                        tracing::info!(
-                            "found transaction data, adding BroadcastEmitted to history"
-                        );
                         let changes = occ.get_mut();
                         changes.push(Change::BroadcastEmitted {
                             tx_id: tx_id.clone(),
@@ -690,8 +780,7 @@ impl ServerState {
                     }
                     dashmap::mapref::entry::Entry::Vacant(_vac) => {
                         // this should not happen
-                        tracing::error!("this tx should be included on transactions_data. It should exists a PutRequest before BroadcastEmitted.");
-                        unreachable!();
+                        unreachable!("this tx should be included on transactions_data. It should exists a PutRequest before BroadcastEmitted.");
                     }
                 }
 
@@ -731,9 +820,6 @@ impl ServerState {
 
                 match self.transactions_data.entry(tx_id.clone()) {
                     dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-                        tracing::info!(
-                            "found transaction data, adding BroadcastReceived to history"
-                        );
                         let changes = occ.get_mut();
                         changes.push(Change::BroadcastReceived {
                             tx_id: tx_id.clone(),
@@ -748,9 +834,17 @@ impl ServerState {
                         //connections.dedup();
                     }
                     dashmap::mapref::entry::Entry::Vacant(_vac) => {
-                        // this should not happen
-                        tracing::error!("this tx should be included on transactions_data. It should exists a PutRequest before BroadcastReceived.");
-                        unreachable!();
+                        self.transactions_data.insert(
+                            tx_id.clone(),
+                            vec![Change::BroadcastReceived {
+                                tx_id: tx_id.clone(),
+                                key: key.clone(),
+                                requester: requester.clone(),
+                                target: target.clone(),
+                                timestamp,
+                                contract_location,
+                            }],
+                        );
                     }
                 }
 
@@ -763,6 +857,144 @@ impl ServerState {
                     target,
                     timestamp,
                     contract_location,
+                });
+            }
+            ChangesWrapper::ContractChange(ContractChange::GetContract(get_contract_data)) => {
+                let requester = get_contract_data.requester().to_string();
+                let transaction = get_contract_data.transaction().to_string();
+                let key = get_contract_data.key().to_string();
+                let contract_location = get_contract_data.contract_location();
+                let timestamp = get_contract_data.timestamp();
+                let target = get_contract_data.target().to_string();
+
+                if requester.is_empty() {
+                    return Err(anyhow::anyhow!("requester is empty"));
+                }
+
+                if transaction.is_empty() {
+                    return Err(anyhow::anyhow!("transaction is empty"));
+                }
+
+                if key.is_empty() {
+                    return Err(anyhow::anyhow!("key is empty"));
+                }
+
+                if contract_location.is_nan() {
+                    return Err(anyhow::anyhow!("contract_location is not a number"));
+                }
+
+                if timestamp == 0 {
+                    return Err(anyhow::anyhow!("timestamp is invalid"));
+                }
+
+                if target.is_empty() {
+                    return Err(anyhow::anyhow!("target is empty"));
+                }
+
+                if let Some(mut transactions) = self.transactions_data.get_mut(&transaction) {
+                    transactions.push(Change::GetContract {
+                        requester: requester.clone(),
+                        transaction: transaction.clone(),
+                        key: key.clone(),
+                        contract_location,
+                        timestamp,
+                        target: target.clone(),
+                    });
+                } else {
+                    self.transactions_data.insert(
+                        transaction.clone(),
+                        vec![Change::GetContract {
+                            requester: requester.clone(),
+                            transaction: transaction.clone(),
+                            key: key.clone(),
+                            contract_location,
+                            timestamp,
+                            target: target.clone(),
+                        }],
+                    );
+                }
+
+                tracing::debug!(%key, %contract_location, "checking values from save_record -- get_contract");
+
+                let _ = self.changes.send(Change::GetContract {
+                    requester,
+                    transaction,
+                    key,
+                    contract_location,
+                    timestamp,
+                    target,
+                });
+            }
+            ChangesWrapper::ContractChange(ContractChange::SubscribedToContract(
+                subscribe_data,
+            )) => {
+                let requester = subscribe_data.requester().to_string();
+                let transaction = subscribe_data.transaction().to_string();
+                let key = subscribe_data.key().to_string();
+                let contract_location = subscribe_data.contract_location();
+                let at_peer = subscribe_data.at_peer().to_string();
+                let at_peer_location = subscribe_data.at_peer_location();
+                let timestamp = subscribe_data.timestamp();
+
+                if requester.is_empty() {
+                    return Err(anyhow::anyhow!("requester is empty"));
+                }
+
+                if transaction.is_empty() {
+                    return Err(anyhow::anyhow!("transaction is empty"));
+                }
+
+                if key.is_empty() {
+                    return Err(anyhow::anyhow!("key is empty"));
+                }
+
+                if at_peer.is_empty() {
+                    return Err(anyhow::anyhow!("at_peer is empty"));
+                }
+
+                if contract_location.is_nan() {
+                    return Err(anyhow::anyhow!("contract_location is not a number"));
+                }
+
+                if timestamp == 0 {
+                    return Err(anyhow::anyhow!("timestamp is invalid"));
+                }
+
+                if let Some(mut transactions_list) = self.transactions_data.get_mut(&transaction) {
+                    transactions_list.push(Change::SubscribedToContract {
+                        requester: requester.clone(),
+                        transaction: transaction.clone(),
+                        key: key.clone(),
+                        contract_location,
+                        at_peer: at_peer.clone(),
+                        at_peer_location,
+                        timestamp,
+                    });
+                } else {
+                    self.transactions_data.insert(
+                        transaction.clone(),
+                        vec![Change::SubscribedToContract {
+                            requester: requester.clone(),
+                            transaction: transaction.clone(),
+                            key: key.clone(),
+                            contract_location,
+                            at_peer: at_peer.clone(),
+                            at_peer_location,
+                            timestamp,
+                        }],
+                    );
+                }
+
+                tracing::debug!(%key, %contract_location, "checking values from save_record -- subscribed_to msg");
+
+                let _ = self.changes.send(Change::SubscribedToContract {
+                    requester,
+                    transaction,
+                    key,
+                    contract_location,
+                    at_peer,
+                    at_peer_location,
+                    timestamp,
                 });
             }
 

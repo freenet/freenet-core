@@ -7,6 +7,7 @@ export { ContractChange } from "./topology/contract-change";
 export { ContractChangeType } from "./topology/contract-change-type";
 export { ControllerResponse } from "./topology/controller-response";
 export { Error, ErrorT } from "./topology/error";
+export { GetContract } from "./topology/get-contract";
 export { Ok, OkT } from "./topology/ok";
 export { PeerChange, PeerChangeT } from "./topology/peer-change";
 export { PeerChangeType } from "./topology/peer-change-type";
@@ -18,6 +19,7 @@ export {
     RemovedConnectionT,
 } from "./topology/removed-connection";
 export { Response } from "./topology/response";
+export { SubscribedToContract } from "./topology/subscribed-to-contract";
 export { UpdateFailure } from "./topology/update-failure";
 export { UpdateRequest } from "./topology/update-request";
 export { UpdateSuccess } from "./topology/update-success";

@@ -274,18 +274,31 @@ impl<'a> NetEventLog<'a> {
                 timestamp: chrono::Utc::now().timestamp() as u64,
             }),
             NetMessageV1::Get(GetMsg::ReturnGet {
+                id,
                 key,
                 value: StoreResponse { state: Some(_), .. },
+                sender,
+                target,
                 ..
-            }) => EventKind::Get { key: *key },
+            }) => EventKind::Get {
+                id: *id,
+                key: *key,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+                requester: target.clone(),
+                target: sender.clone(),
+            },
             NetMessageV1::Subscribe(SubscribeMsg::ReturnSub {
+                id,
                 subscribed: true,
                 key,
                 sender,
-                ..
+                target,
             }) => EventKind::Subscribed {
+                id: *id,
                 key: *key,
                 at: sender.clone(),
+                timestamp: chrono::Utc::now().timestamp() as u64,
+                requester: target.clone(),
             },
             _ => EventKind::Ignored,
         };
@@ -554,6 +567,7 @@ async fn send_to_metrics_server(
                 *timestamp,
                 contract_location.as_f64(),
             );
+
             ws_stream.send(Message::Binary(msg.into())).await
         }
         EventKind::Put(PutEvent::PutSuccess {
@@ -609,12 +623,51 @@ async fn send_to_metrics_server(
             let contract_location = Location::from_contract_key(key.as_bytes());
             let msg = ContractChange::broadcast_received_msg(
                 id.to_string(),
-                target.to_string(),
                 requester.to_string(),
+                target.to_string(),
                 key.to_string(),
                 *timestamp,
                 contract_location.as_f64(),
             );
+            ws_stream.send(Message::Binary(msg.into())).await
+        }
+        EventKind::Get {
+            id,
+            key,
+            timestamp,
+            requester,
+            target,
+        } => {
+            let contract_location = Location::from_contract_key(key.as_bytes());
+            let msg = ContractChange::get_contract_msg(
+                requester.to_string(),
+                target.to_string(),
+                id.to_string(),
+                key.to_string(),
+                contract_location.as_f64(),
+                *timestamp,
+            );
+
+            ws_stream.send(Message::Binary(msg.into())).await
+        }
+        EventKind::Subscribed {
+            id,
+            key,
+            at,
+            timestamp,
+            requester,
+        } => {
+            let contract_location = Location::from_contract_key(key.as_bytes());
+            let msg = ContractChange::subscribed_msg(
+                requester.to_string(),
+                id.to_string(),
+                key.to_string(),
+                contract_location.as_f64(),
+                at.peer.to_string(),
+                at.location.unwrap().as_f64(),
+                *timestamp,
+            );
+
             ws_stream.send(Message::Binary(msg.into())).await
         }
         _ => Ok(()),
@@ -921,13 +974,20 @@ enum EventKind {
     Put(PutEvent),
     // todo: make this a sequence like Put
     Get {
+        id: Transaction,
         key: ContractKey,
+        timestamp: u64,
+        requester: PeerKeyLocation,
+        target: PeerKeyLocation,
     },
     Route(RouteEvent),
     // todo: add update sequences too
     Subscribed {
+        id: Transaction,
         key: ContractKey,
         at: PeerKeyLocation,
+        timestamp: u64,
+        requester: PeerKeyLocation,
     },
     Ignored,
     Disconnected {

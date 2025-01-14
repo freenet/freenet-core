@@ -7,6 +7,8 @@ export enum ChangeType {
     PUT_FAILURE = "Put Failure",
     BROADCAST_EMITTED = "Broadcast Emitted",
     BROADCAST_RECEIVED = "Broadcast Received",
+    GET_CONTRACT = "Get Contract",
+    SUBSCRIBED_TO_CONTRACT = "Subscribed to Contract",
 }
 
 export type TransactionData = {

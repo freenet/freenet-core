@@ -4,15 +4,19 @@ import { handleChange } from "./topology";
 import {
     handleBroadcastEmitted,
     handleBroadcastReceived,
+    handleGetContract,
     handlePutRequest,
     handlePutSuccess,
+    handleSubscribedToContract,
 } from "./transactions-data";
 import {
     get_change_type,
     parse_broadcast_emitted_msg,
     parse_broadcast_received_msg,
+    parse_get_contract_msg_data,
     parse_put_request_msg_data,
     parse_put_success_msg_data,
+    parse_subscribed_to_contract_msg_data,
 } from "./utils";
 import { ChangeType } from "./type_definitions";
 import { unionToContractChangeType } from "./generated/topology/contract-change-type";
@@ -60,6 +64,62 @@ function handleChanges(event: MessageEvent) {
                 let now_change_type = get_change_type(
                     contractChange.changeType()
                 );
+
+                if (now_change_type == ChangeType.GET_CONTRACT) {
+                    let {
+                        transaction,
+                        requester,
+                        key,
+                        contract_location,
+                        change_type,
+                        timestamp,
+                        target,
+                    } = parse_get_contract_msg_data(
+                        contractChange,
+                        contractChange.changeType()
+                    );
+
+                    handleGetContract(
+                        transaction,
+                        requester,
+                        key,
+                        contract_location,
+                        change_type,
+                        timestamp,
+                        target
+                    );
+
+                    return;
+                }
+
+                if (now_change_type == ChangeType.SUBSCRIBED_TO_CONTRACT) {
+                    let {
+                        transaction,
+                        requester,
+                        key,
+                        contract_location,
+                        change_type,
+                        at_peer,
+                        at_peer_location,
+                        timestamp,
+                    } = parse_subscribed_to_contract_msg_data(
+                        contractChange,
+                        contractChange.changeType()
+                    );
+
+                    handleSubscribedToContract(
+                        transaction,
+                        requester,
+                        key,
+                        contract_location,
+                        change_type,
+                        at_peer,
+                        at_peer_location,
+                        timestamp
+                    );
+
+                    return;
+                }
 
                 if (now_change_type == ChangeType.BROADCAST_EMITTED) {
                     let {
