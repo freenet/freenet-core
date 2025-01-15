@@ -12,7 +12,7 @@ jobs:
   test_all:
     name: Test
 
-    runs-on: freenet-core-ci
+    runs-on: freenet-core-ci-smaller
 
     strategy:
       max-parallel: 1
@@ -59,7 +59,7 @@ jobs:
   clippy_check:
     name: Clippy
 
-    runs-on: freenet-core-ci
+    runs-on: freenet-core-ci-smaller
 
     env:
       FREENET_LOG: error
