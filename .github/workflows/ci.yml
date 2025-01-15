@@ -59,7 +59,7 @@ jobs:
   clippy_check:
     name: Clippy
 
-    runs-on: ubuntu-latest
+    runs-on: freenet-core-ci
 
     env:
       FREENET_LOG: error
