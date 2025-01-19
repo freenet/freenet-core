@@ -17,15 +17,13 @@ pub struct PingContractOptions {
     #[cfg_attr(feature = "clap", clap(long, value_parser = duration_parser, default_value = "1s"))]
     pub frequency: Duration,
 
-    /// The tag of the ping contract
-    #[serde(default = "freenet_ping")]
-    #[cfg_attr(feature = "clap", clap(long, default_value = "freenet-ping"))]
+    /// The tag of the ping contract subscriber.
+    #[cfg_attr(feature = "clap", clap(long))]
     pub tag: String,
-}
 
-#[inline]
-fn freenet_ping() -> String {
-    "freenet-ping".to_string()
+    /// Code hash of the ping contract.
+    #[cfg_attr(feature = "clap", clap(long))]
+    pub code_key: String,
 }
 
 #[cfg(feature = "clap")]
@@ -63,19 +61,32 @@ impl Ping {
         self.from.insert(name, Utc::now());
     }
 
-    pub fn merge(&mut self, other: Self, ttl: Duration) {
+    pub fn merge(&mut self, other: Self, ttl: Duration) -> HashMap<String, DateTime<Utc>> {
         #[cfg(feature = "std")]
         let now = Utc::now();
         #[cfg(not(feature = "std"))]
         let now = freenet_stdlib::time::now();
 
+        let mut updates = HashMap::new();
         for (name, created_time) in other.from.into_iter() {
             if now <= created_time + ttl {
-                self.from.insert(name, created_time);
+                match self.from.entry(name.clone()) {
+                    std::collections::hash_map::Entry::Occupied(mut occupied_entry) => {
+                        if occupied_entry.get() > &created_time {
+                            occupied_entry.insert(created_time);
+                            updates.insert(name, created_time);
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(vacant_entry) => {
+                        vacant_entry.insert(created_time);
+                        updates.insert(name, created_time);
+                    }
+                }
             }
         }
 
         self.from.retain(|_, v| now <= *v + ttl);
+        updates
     }
 }
 

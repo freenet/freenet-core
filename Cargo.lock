@@ -1606,7 +1606,6 @@ dependencies = [
  "freenet-ping-types",
  "freenet-stdlib",
  "futures",
- "names",
  "serde_json",
  "tokio",
  "tokio-tungstenite 0.24.0",
@@ -2910,15 +2909,6 @@ dependencies = [
  "rand_distr",
  "simba",
  "typenum",
-]
-
-[[package]]
-name = "names"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bddcd3bf5144b6392de80e04c347cd7fab2508f6df16a85fc496ecd5cec39bc"
-dependencies = [
- "rand",
 ]
 
 [[package]]
