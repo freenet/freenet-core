@@ -11,7 +11,6 @@ tokio-tungstenite = "0.24"
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 freenet-stdlib = { workspace = true, features = ["net"] }
-names = { version = "0.14.0", default-features = false }
 serde_json = "1"
 freenet-ping-types = { path = "../types", features = ["std", "clap"] }
 chrono = { workspace = true, features = ["default"] }

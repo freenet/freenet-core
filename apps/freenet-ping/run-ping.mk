@@ -113,12 +113,17 @@ run:
 	@echo "  WebSocket Port: $(WS_PORT)"
 	@echo "  Update Frequency: $(FREQUENCY)"
 	@echo "  TTL: $(TTL)"
+	@echo "  Tag: $(TAG)"
+    @echo "  Put Contract: $(PUT_CONTRACT)"
 	@mkdir -p $(BASE_DIR)/apps
 	@freenet-ping \
 		--host "localhost:$(WS_PORT)" \
 		--log-level $(LOG_LEVEL) \
 		--frequency $(FREQUENCY) \
 		--ttl $(TTL) \
+		--tag $(TAG) \
+		--code-key $(CODE_KEY) \
+		$(if $(PUT_CONTRACT),--put-contract) \
 		$(call LOG_CMD,$(BASE_DIR)/apps/ping_$(WS_PORT).log)
 
 # ------------------------------------------

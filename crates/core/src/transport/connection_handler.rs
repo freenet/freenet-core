@@ -322,7 +322,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
 
                             if !self.is_gateway {
-                                tracing::debug!(%remote_addr, "unexpected packet from remote");
+                                tracing::trace!(%remote_addr, "unexpected packet from remote");
                                 continue;
                             }
                             let packet_data = PacketData::from_buf(&buf[..size]);

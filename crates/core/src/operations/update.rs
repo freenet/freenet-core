@@ -503,10 +503,10 @@ async fn update_contract(
             new_value: Ok(new_val),
         }) => Ok(new_val),
         Ok(ContractHandlerEvent::UpdateResponse {
-            new_value: Err(_err),
+            new_value: Err(_rr),
         }) => {
-            // return Err(OpError::from(ContractError::StorageError(err)));
-            todo!("not a valid value update, notify back to requester")
+            tracing::error!("Failed to update contract value");
+            Err(OpError::UnexpectedOpState)
         }
         Err(err) => Err(err.into()),
         Ok(_) => Err(OpError::UnexpectedOpState),
