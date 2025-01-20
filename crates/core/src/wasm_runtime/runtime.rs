@@ -5,11 +5,10 @@ use freenet_stdlib::{
     },
     prelude::*,
 };
-use std::sync::Arc;
 use std::{collections::HashMap, sync::atomic::AtomicI64};
 use wasmer::{
-    imports, Bytes, CompilerConfig, EngineBuilder, Imports, Instance, Memory, MemoryType, Module,
-    Store, TypedFunction,
+    imports, Bytes, CompilerConfig, Imports, Instance, Memory, MemoryType, Module, Store,
+    TypedFunction,
 };
 
 use super::{
@@ -265,18 +264,52 @@ impl Runtime {
     }
 
     fn instance_store() -> Store {
+        use std::sync::Arc;
+        use wasmer::wasmparser::Operator;
         use wasmer::Cranelift;
         use wasmer_middlewares::Metering;
 
-        // Simple metering middleware that counts the number of instructions executed
-        let initial_limit = 10_000;
-        let cost_per_instruction = 1;
+        // Maximum allowed execution time for WASM code
+        const MAX_EXECUTION_SECONDS: f64 = 5.0;
+        // Assumed CPU speed for cost calculations (3.0 GHz)
+        const CPU_CYCLES_PER_SECOND: u64 = 3_000_000_000;
+        // Additional buffer to account for varying CPU speeds
+        const SAFETY_MARGIN: f64 = 0.2;
 
-        let metering = Arc::new(Metering::new(initial_limit, move |_| cost_per_instruction));
+        // Calculate total allowed cycles including safety margin
+        let max_cycles =
+            (MAX_EXECUTION_SECONDS * CPU_CYCLES_PER_SECOND as f64 * (1.0 + SAFETY_MARGIN)) as u64;
+
+        // Cost function that assigns cycle costs to different WASM operations
+        let operation_cost = |operator: &Operator| -> u64 {
+            use wasmer::wasmparser::Operator;
+
+            match operator {
+                // Control flow operations
+                Operator::Loop { .. } | Operator::If { .. } => 25,
+
+                // Function calls are relatively expensive
+                Operator::Call { .. } | Operator::CallIndirect { .. } => 50,
+
+                // Memory operations are most expensive
+                Operator::MemoryGrow { .. } | Operator::MemorySize { .. } => 200,
+                Operator::MemoryInit { .. } | Operator::MemoryCopy { .. } => 250,
+
+                // Basic arithmetic operations
+                Operator::I32Add | Operator::I32Sub => 2,
+                Operator::I32Mul => 4,
+                Operator::I32DivS | Operator::I32DivU => 25,
+
+                // Default cost for all other operations
+                _ => 2,
+            }
+        };
+
+        let metering = Arc::new(Metering::new(max_cycles, operation_cost));
         let mut compiler_config = Cranelift::default();
         compiler_config.push_middleware(metering);
 
-        let engine = EngineBuilder::new(compiler_config).engine();
+        let engine = wasmer::EngineBuilder::new(compiler_config).engine();
 
         Store::new(&engine)
     }

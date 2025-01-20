@@ -1,3 +1,4 @@
+use std::cmp::PartialEq;
 use std::fmt::Display;
 
 use freenet_stdlib::prelude::{ContractKey, DelegateKey};
@@ -12,6 +13,12 @@ pub struct ContractError(Box<RuntimeInnerError>);
 impl ContractError {
     pub(crate) fn deref(&self) -> &RuntimeInnerError {
         &self.0
+    }
+}
+
+impl PartialEq for ContractError {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
     }
 }
 
@@ -99,4 +106,10 @@ pub(crate) enum RuntimeInnerError {
 
     #[error(transparent)]
     WasmRtError(#[from] wasmer::RuntimeError),
+}
+
+impl PartialEq for RuntimeInnerError {
+    fn eq(&self, other: &Self) -> bool {
+        self == other
+    }
 }

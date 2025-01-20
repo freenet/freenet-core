@@ -160,16 +160,27 @@ impl ConnectionManager {
         let accepted = if location == my_location
             || self.connections_by_location.read().contains_key(&location)
         {
+            tracing::debug!(%peer_id, "Rejected connection, same location");
             false
         } else if total_conn < self.min_connections {
+            tracing::debug!(%peer_id, "Accepted connection, below min connections");
             true
         } else if total_conn >= self.max_connections {
+            tracing::debug!(%peer_id, "Rejected connection, max connections reached");
             false
         } else {
-            self.topology_manager
+            let accepted = self
+                .topology_manager
                 .write()
                 .evaluate_new_connection(location, Instant::now())
-                .unwrap_or(true)
+                .unwrap_or(true);
+
+            if accepted {
+                tracing::debug!(%peer_id, "Accepted connection, topology manager");
+            } else {
+                tracing::debug!(%peer_id, "Rejected connection, topology manager");
+            }
+            accepted
         };
         if !accepted {
             self.reserved_connections

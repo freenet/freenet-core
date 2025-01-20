@@ -13,6 +13,7 @@ use crate::util::tests::get_temp_dir;
 use super::{ContractStore, DelegateStore, SecretsStore};
 
 mod contract;
+mod contract_metering;
 mod time;
 
 pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
