@@ -270,7 +270,7 @@ impl Runtime {
         use wasmer_middlewares::Metering;
 
         // Maximum allowed execution time for WASM code
-        const MAX_EXECUTION_SECONDS: f64 = 5.0;
+        const MAX_EXECUTION_SECONDS: f64 = 20.0;
         // Assumed CPU speed for cost calculations (3.0 GHz)
         const CPU_CYCLES_PER_SECOND: u64 = 3_000_000_000;
         // Additional buffer to account for varying CPU speeds
