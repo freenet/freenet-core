@@ -138,11 +138,7 @@ fn test_summarize_state_metering_limits() -> Result<(), Box<dyn std::error::Erro
     };
     let state = WrappedState::new(serde_json::to_vec(&test_conditions)?);
 
-    let result = runtime.summarize_state(
-        &contract_key,
-        &Parameters::from([].as_ref()),
-        &state,
-    );
+    let result = runtime.summarize_state(&contract_key, &Parameters::from([].as_ref()), &state);
 
     assert!(result.is_err());
     let result_err = result.unwrap_err();
@@ -160,11 +156,7 @@ fn test_summarize_state_metering_limits() -> Result<(), Box<dyn std::error::Erro
     };
     let state = WrappedState::new(serde_json::to_vec(&test_conditions)?);
 
-    let result = runtime.summarize_state(
-        &contract_key,
-        &Parameters::from([].as_ref()),
-        &state,
-    );
+    let result = runtime.summarize_state(&contract_key, &Parameters::from([].as_ref()), &state);
 
     assert!(result.is_ok());
 
@@ -196,7 +188,7 @@ fn test_get_state_delta_metering_limits() -> Result<(), Box<dyn std::error::Erro
         &contract_key,
         &Parameters::from([].as_ref()),
         &state,
-        &summary
+        &summary,
     );
 
     assert!(result.is_err());
@@ -219,7 +211,7 @@ fn test_get_state_delta_metering_limits() -> Result<(), Box<dyn std::error::Erro
         &contract_key,
         &Parameters::from([].as_ref()),
         &state,
-        &summary
+        &summary,
     );
 
     assert!(result.is_ok());
