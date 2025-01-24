@@ -1,7 +1,3 @@
-Below is a comprehensive README for `fdev` that combines the existing reference documentation and the original README content. You can drop it in place of your current `README.md`.
-
----
-
 # fdev
 
 The Freenet Development Tool (`fdev`) is a command-line utility to create, build, publish, inspect, and test Freenet contracts or delegates. It also supports local node simulations, a TUI-based WASM runtime, and optional network metrics gathering.
