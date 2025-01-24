@@ -11,8 +11,8 @@ then you could test it by building and deploying any web application:
 ```
 .\build-examples.sh
 ```
-.
 
+.
 
 # Build freenet from source on Linux from command line:
 
@@ -68,6 +68,7 @@ Update `npm`. Warning: required! You must do that to have the latest npm package
 ```
 
 Install typescript and `webpack` to `build` `freenet-email-app` example.
+
 ```
 ~/n/bin/npm install -g typescript webpack
 ```
@@ -83,6 +84,7 @@ export CARGO_TARGET_DIR="$(pwd)/target"
 ```
 
 build typescript stdlib.
+
 ```
 cd stdlib/typescript/ && npm run dev.package && cd ../..
 ```
@@ -104,12 +106,11 @@ make build
 cd ../antiflood-tokens/
 ```
 
-
 Fix a compile issue with:
+
 ```
 rm Cargo.lock
 ```
-
 
 ```
 make build
