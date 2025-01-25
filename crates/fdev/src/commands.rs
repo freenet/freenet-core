@@ -113,7 +113,7 @@ async fn put_contract(
         buf.into()
     } else {
         tracing::warn!("no state provided for contract, if your contract cannot handle empty state correctly, this will always cause an error.");
-        vec![].into().into()
+        freenet_stdlib::prelude::State::from(vec![])
     };
     let related_contracts = if let Some(_related) = &contract_config.related_contracts {
         todo!("use `related` contracts")
