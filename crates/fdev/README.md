@@ -149,7 +149,7 @@ fdev publish \
 ```
 - **`--webapp-archive`**: path to your xz-compressed tar archive containing the webapp files.
   The archive should contain an index.html file at the root level.
-- **`--webapp-metadata`**: optional path to metadata file for the webapp.
+- **`--webapp-metadata`**: optional path to metadata file for the webapp (can be any binary format).
 
 This alternative to the TypeScript/webpack build process allows you to provide your own pre-compressed webapp archive.
 
