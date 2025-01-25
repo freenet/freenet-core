@@ -134,6 +134,25 @@ fdev publish \
 - **`--parameters`**: optional contract parameters.
 - **`--state`**: optional initial state JSON or binary.
 
+**Example: Publishing a webapp contract with pre-compressed archive**:
+```bash
+# First compress your webapp directory
+tar cf - webapp/ | xz > webapp.tar.xz
+
+# Then publish the webapp contract
+fdev publish \
+    --code path/to/webapp_contract.wasm \
+    --parameters path/to/params.json \
+    contract \
+    --webapp-archive webapp.tar.xz \
+    --webapp-metadata path/to/metadata.json
+```
+- **`--webapp-archive`**: path to your xz-compressed tar archive containing the webapp files.
+  The archive should contain an index.html file at the root level.
+- **`--webapp-metadata`**: optional path to metadata file for the webapp.
+
+This alternative to the TypeScript/webpack build process allows you to provide your own pre-compressed webapp archive.
+
 **Example: Publishing a delegate**:
 ```bash
 fdev publish \
