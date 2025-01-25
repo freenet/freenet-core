@@ -1,3 +1,7 @@
+use super::{
+    contract_store::ContractStore, delegate_store::DelegateStore, error::RuntimeInnerError,
+    native_api, secrets_store::SecretsStore, RuntimeResult,
+};
 use freenet_stdlib::{
     memory::{
         buf::{BufferBuilder, BufferMut},
@@ -11,10 +15,6 @@ use wasmer::{
     TypedFunction,
 };
 use wasmer_middlewares::metering::{get_remaining_points, MeteringPoints};
-use super::{
-    contract_store::ContractStore, delegate_store::DelegateStore, error::RuntimeInnerError,
-    native_api, secrets_store::SecretsStore, RuntimeResult,
-};
 
 static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
 
@@ -269,16 +269,28 @@ impl Runtime {
         use wasmer::Cranelift;
         use wasmer_middlewares::Metering;
 
+        fn get_cpu_cycles_per_second() -> (u64, f64) {
+            // Assumed CPU speed for cost calculations (3.0 GHz)
+            const DEFAULT_CPU_CYCLES_PER_SECOND: u64 = 3_000_000_000;
+            // Additional buffer to account for varying CPU speeds
+            const SAFETY_MARGIN: f64 = 0.2;
+            if let Some(cpu) = option_env!("CPU_CYCLES_PER_SECOND") {
+                (parse_cpu_cycles_per_second(cpu), 0.0)
+            } else {
+                get_cpu_cycles_per_second_runtime()
+                    .map(|x| (x, 0.0))
+                    .unwrap_or((DEFAULT_CPU_CYCLES_PER_SECOND, SAFETY_MARGIN))
+            }
+        }
+
         // Maximum allowed execution time for WASM code
-        const MAX_EXECUTION_SECONDS: f64 = 20.0;
-        // Assumed CPU speed for cost calculations (3.0 GHz)
-        const CPU_CYCLES_PER_SECOND: u64 = 3_000_000_000;
-        // Additional buffer to account for varying CPU speeds
-        const SAFETY_MARGIN: f64 = 0.2;
+        const MAX_EXECUTION_SECONDS: f64 = 5.0;
+
+        let (cpu_cycles_per_sec, safety_margin) = get_cpu_cycles_per_second();
 
         // Calculate total allowed cycles including safety margin
-        let max_cycles =
-            (MAX_EXECUTION_SECONDS * CPU_CYCLES_PER_SECOND as f64 * (1.0 + SAFETY_MARGIN)) as u64;
+        let max_cycles: u64 =
+            (MAX_EXECUTION_SECONDS * cpu_cycles_per_sec as f64 * (1.0 + safety_margin)) as u64;
 
         // Cost function that assigns cycle costs to different WASM operations.
         // Costs are rough estimates based on typical CPU cycles:
@@ -302,7 +314,6 @@ impl Runtime {
         Store::new(&engine)
     }
 
-
     pub(crate) fn handle_contract_error<T>(
         &mut self,
         error: wasmer::RuntimeError,
@@ -323,5 +334,121 @@ impl Runtime {
                 Err(ContractExecError::OutOfGas.into())
             }
         }
+    }
+}
+
+const fn parse_cpu_cycles_per_second(cpu: &str) -> u64 {
+    let bytes = cpu.as_bytes();
+    let mut result = 0u64;
+    let mut i = 0;
+    while i < bytes.len() {
+        result = result * 10 + (bytes[i] - b'0') as u64;
+        i += 1;
+    }
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn get_cpu_cycles_per_second_runtime() -> Option<u64> {
+    use std::process::Command;
+
+    fn parse_sysctl_output(output: &str) -> Option<u64> {
+        let parts: Vec<&str> = output.split(':').collect();
+        if parts.len() == 2 {
+            if let Ok(freq) = parts[1].trim().parse() {
+                return Some(freq);
+            }
+        }
+        None
+    }
+
+    let output = Command::new("sysctl")
+        .arg("hw.cpufrequency")
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        println!("sysctl output (hw.cpufrequency): {}", output_str); // Debugging information
+
+        if let Some(freq) = parse_sysctl_output(&output_str) {
+            return Some(freq);
+        }
+    } else {
+        eprintln!("sysctl command failed with status: {}", output.status);
+    }
+
+    // Fallback to hw.tbfrequency if hw.cpufrequency is not available
+    let output = Command::new("sysctl").arg("hw.tbfrequency").output().ok()?;
+
+    if output.status.success() {
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        println!("sysctl output (hw.tbfrequency): {}", output_str); // Debugging information
+
+        if let Some(freq) = parse_sysctl_output(&output_str) {
+            return Some(freq);
+        }
+    } else {
+        eprintln!("sysctl command failed with status: {}", output.status);
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn get_cpu_cycles_per_second_runtime() -> Option<u64> {
+    use std::fs::File;
+    use std::io::{self, BufRead};
+
+    if let Ok(file) = File::open("/proc/cpuinfo") {
+        for line in io::BufReader::new(file).lines() {
+            if let Ok(line) = line {
+                if line.starts_with("cpu MHz") {
+                    let parts: Vec<&str> = line.split(':').collect();
+                    if parts.len() == 2 {
+                        let mhz: f64 = parts[1].trim().parse().ok()?;
+                        return (mhz * 1_000_000.0) as u64;
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn get_cpu_cycles_per_second_runtime() -> Option<u64> {
+    use serde::Deserialize;
+    use wmi::{COMLibrary, Variant, WMIConnection};
+
+    #[derive(Deserialize, Debug)]
+    struct Win32_Processor {
+        #[serde(rename = "MaxClockSpeed")]
+        max_clock_speed: u64,
+    }
+
+    let com_con = COMLibrary::new().ok()?;
+    let wmi_con = WMIConnection::new(com_con.into()).ok()?;
+
+    let results: Vec<Win32_Processor> = wmi_con
+        .raw_query("SELECT MaxClockSpeed FROM Win32_Processor")
+        .ok()?;
+
+    if let Some(cpu) = results.first() {
+        return Some(cpu.max_clock_speed * 1_000_000); // Convert MHz to Hz
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_cpu_cycles_per_second() {
+        assert_eq!(parse_cpu_cycles_per_second("3000000000"), 3_000_000_000);
+        assert_eq!(parse_cpu_cycles_per_second("2500000000"), 2_500_000_000);
+        assert_eq!(parse_cpu_cycles_per_second("2000000000"), 2_000_000_000);
+        assert_eq!(parse_cpu_cycles_per_second("1000000000"), 1_000_000_000);
     }
 }

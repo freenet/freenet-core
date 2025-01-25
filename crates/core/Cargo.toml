@@ -80,6 +80,12 @@ opentelemetry_sdk = { optional = true, version = "0.27", features = ["rt-tokio"]
 # internal deps
 freenet-stdlib = { features = ["net"], workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["sysinfoapi"] }
+wmi = "0.14.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_derive = "1.0"
+
 [dev-dependencies]
 arbitrary = { features = ["derive"], version = "1" }
 chrono = { features = ["arbitrary"], workspace = true }
