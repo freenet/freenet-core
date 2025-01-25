@@ -38,7 +38,7 @@ fn create_view_package(cwd: &Path) -> anyhow::Result<()> {
                 source_dirs: Some(vec![PathBuf::from("dist")]),
                 files: None,
             },
-            metadata: None,
+            metadata_source: None,
             dependencies: None,
         }),
         state: None,

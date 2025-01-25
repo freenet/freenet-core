@@ -304,9 +304,30 @@ mod contract {
                                 .stdout(Stdio::piped())
                                 .spawn()?;
                                 
-                            // Write archive to child's stdin
+                            // Create archive and write to child's stdin 
+                            let mut archive = Builder::new(Cursor::new(Vec::new()));
+                            // Add files to archive
+                            if let Some(sources) = &sources.files {
+                                for src in sources {
+                                    for entry in glob::glob(src)? {
+                                        let p = entry?;
+                                        let mut f = File::open(&p)?;
+                                        archive.append_file(p, &mut f)?;
+                                    }
+                                }
+                            }
+                            if let Some(src_dirs) = &sources.source_dirs {
+                                for dir in src_dirs {
+                                    let dir = cwd.join(dir);
+                                    if dir.is_dir() {
+                                        archive.append_dir_all(".", &dir)?;
+                                    }
+                                }
+                            }
+                            
+                            // Get archive bytes and write to stdin
                             if let Some(mut stdin) = child.stdin.take() {
-                                let archive_bytes = archive.into_inner().into_inner();
+                                let archive_bytes = archive.into_inner()?.into_inner();
                                 stdin.write_all(&archive_bytes)?;
                             }
                             
