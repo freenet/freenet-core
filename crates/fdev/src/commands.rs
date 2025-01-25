@@ -102,7 +102,7 @@ async fn put_contract(
         }
 
         // Create WebApp state
-        let webapp = WebApp::from_data(metadata, archive.into_inner().into_inner())?;
+        let webapp = WebApp::from_data(metadata, archive)?;
         webapp.pack()?.into()
     } else if let Some(ref state_path) = contract_config.state {
         let mut buf = vec![];
