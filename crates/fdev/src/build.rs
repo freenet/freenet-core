@@ -228,8 +228,32 @@ mod contract {
         pub typescript: Option<TypescriptConfig>,
         #[serde(rename = "state-sources")]
         pub state_sources: Sources,
-        pub metadata: Option<PathBuf>,
+        #[serde(rename = "metadata")]
+        pub metadata_source: Option<MetadataSource>,
         pub dependencies: Option<toml::value::Table>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    pub(crate) enum MetadataSource {
+        // Old style - direct path string
+        LegacyFile(PathBuf),
+        // New style - structured config
+        #[serde(rename_all = "lowercase")]
+        Structured {
+            #[serde(flatten)]
+            source: MetadataSourceType
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub(crate) enum MetadataSourceType {
+        File(PathBuf),
+        Generator {
+            binary: PathBuf,
+            args: Vec<String>,
+        }
     }
 
     #[derive(Serialize, Deserialize, PartialEq)]
@@ -254,13 +278,54 @@ mod contract {
             return Ok(());
         };
 
-        let metadata = if let Some(md) = config.webapp.as_ref().and_then(|a| a.metadata.as_ref()) {
-            let mut buf = vec![];
-            File::open(md)?.read_to_end(&mut buf)?;
-            buf
+        let metadata = if let Some(metadata_source) = config.webapp.as_ref().and_then(|a| a.metadata_source.as_ref()) {
+            match metadata_source {
+                MetadataSource::LegacyFile(path) => {
+                    // Handle old-style direct file path
+                    let mut buf = vec![];
+                    File::open(path)?.read_to_end(&mut buf)?;
+                    buf
+                }
+                MetadataSource::Structured { source } => {
+                    match source {
+                        MetadataSourceType::File(path) => {
+                            // Handle new-style file path
+                            let mut buf = vec![];
+                            File::open(path)?.read_to_end(&mut buf)?;
+                            buf
+                        }
+                        MetadataSourceType::Generator { binary, args } => {
+                            use std::process::{Command, Stdio};
+                            
+                            // Create child process
+                            let mut child = Command::new(binary)
+                                .args(args)
+                                .stdin(Stdio::piped())
+                                .stdout(Stdio::piped())
+                                .spawn()?;
+                                
+                            // Write archive to child's stdin
+                            if let Some(mut stdin) = child.stdin.take() {
+                                let archive_bytes = archive.into_inner().into_inner();
+                                stdin.write_all(&archive_bytes)?;
+                            }
+                            
+                            // Read metadata from stdout
+                            let output = child.wait_with_output()?;
+                            if !output.status.success() {
+                                anyhow::bail!("Metadata generator failed with status: {}", output.status);
+                            }
+                            output.stdout
+                        }
+                    }
+                }
+            }
         } else {
             vec![]
         };
+
+        // Recreate the archive since we consumed it for the generator
+        let archive = Builder::new(Cursor::new(Vec::new()));
 
         let mut archive: Builder<Cursor<Vec<u8>>> = Builder::new(Cursor::new(Vec::new()));
         println!("Bundling webapp contract state");
