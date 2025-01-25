@@ -126,13 +126,13 @@ fdev build \
 ```bash
 fdev publish \
     --code path/to/my_contract.wasm \
-    --parameters path/to/params.json \
+    --parameters path/to/params \
     contract \
-    --state path/to/initial_state.json
+    --state path/to/initial_state
 ```
 - **`--code`**: path to your built WASM.
-- **`--parameters`**: optional contract parameters.
-- **`--state`**: optional initial state JSON or binary.
+- **`--parameters`**: optional contract parameters file (typically binary format).
+- **`--state`**: optional initial state file (typically binary format).
 
 **Example: Publishing a webapp contract with pre-compressed archive**:
 ```bash
@@ -142,7 +142,7 @@ tar cf - webapp/ | xz > webapp.tar.xz
 # Then publish the webapp contract
 fdev publish \
     --code path/to/webapp_contract.wasm \
-    --parameters path/to/params.json \
+    --parameters path/to/params \
     contract \
     --webapp-archive webapp.tar.xz \
     --webapp-metadata path/to/metadata.json
@@ -157,7 +157,7 @@ This alternative to the TypeScript/webpack build process allows you to provide y
 ```bash
 fdev publish \
     --code path/to/my_delegate.wasm \
-    --parameters delegate_params.json \
+    --parameters delegate_params \
     delegate \
     [--nonce ... --cipher ...]
 ```
@@ -173,7 +173,7 @@ To push a state delta to an existing contract (identified by its Base58 key):
 
 ```bash
 fdev execute update <BASE58_CONTRACT_KEY> \
-    --delta path/to/delta.json \
+    --delta path/to/delta \
     [--address 127.0.0.1 \
      --port 50509 \
      --release]
@@ -234,8 +234,8 @@ fdev inspect delegate path/to/delegate.wasm
 
 ```bash
 fdev wasm-runtime \
-    --input-file /tmp/input.json \
-    --deserialization-format json \
+    --input-file /tmp/input \
+    --deserialization-format binary \
     --terminal-output
 ```
 - The tool will connect to a local Freenet node by default (see `--mode`, `--address`, `--port` if needed).
@@ -346,7 +346,7 @@ Below are a few typical steps you might perform:
    fdev publish \
        --code build/freenet/my_contract.wasm \
        contract \
-       --state initial_state.json
+       --state initial_state
    ```
 4. **Update** the contract:
    ```bash
