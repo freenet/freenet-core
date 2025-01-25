@@ -307,8 +307,9 @@ mod contract {
                             // Create archive and write to child's stdin 
                             let mut archive = Builder::new(Cursor::new(Vec::new()));
                             // Add files to archive
-                            if let Some(sources) = &sources.files {
-                                for src in sources {
+                            let sources = &web_config.state_sources;
+                            if let Some(files) = &sources.files {
+                                for src in files {
                                     for entry in glob::glob(src)? {
                                         let p = entry?;
                                         let mut f = File::open(&p)?;
