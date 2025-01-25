@@ -124,7 +124,7 @@ async fn put_contract(
     println!("Putting contract {}", contract.key());
     let request = ContractRequest::Put {
         contract,
-        state,
+        state: state.into(),
         related_contracts,
     }
     .into();
