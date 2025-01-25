@@ -7,6 +7,7 @@ use freenet_stdlib::{
 };
 use freenet::server::WebApp;
 use xz2::read::XzDecoder;
+use tar::Builder;
 
 use crate::config::{BaseConfig, PutConfig, UpdateConfig};
 
@@ -104,7 +105,7 @@ async fn put_contract(
         // Create WebApp state
         let mut archive_builder = Builder::new(Cursor::new(Vec::new()));
         archive_builder.append_data(&mut tar::Header::new_gnu(), "archive.tar.xz", &archive)?;
-        let webapp = WebApp::from_data(metadata, archive_builder)?;
+        let webapp = WebApp::nfrom_data(metadata, archive_builder)?;
         webapp.pack()?.into()
     } else if let Some(ref state_path) = contract_config.state {
         let mut buf = vec![];
