@@ -89,7 +89,7 @@ async fn put_contract(
         use tar::Archive;
         use std::io::Cursor;
         let mut found_index = false;
-        let tar = Archive::new(XzDecoder::new(Cursor::new(&archive)));
+        let mut tar = Archive::new(XzDecoder::new(Cursor::new(&archive)));
         for entry in tar.entries()? {
             if let Ok(entry) = entry {
                 if entry.path()?.to_string_lossy() == "index.html" {
