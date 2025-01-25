@@ -114,24 +114,6 @@ fdev build \
 
 `fdev` looks for a `freenet.toml` in your current directory that defines if your contract is standard or a webapp, and (for webapps) how to compile front-end code.
 
-For webapp contracts, you can specify metadata either as a static file or generate it dynamically:
-
-```toml
-[webapp]
-# Static file approach:
-metadata = "path/to/metadata.json"
-
-# Or dynamic generator approach:
-metadata = { binary = "path/to/generator", args = ["--param1", "value1"] }
-```
-
-When using a generator, the program:
-1. Receives the xzipped state archive via stdin
-2. Processes it according to its logic
-3. Outputs the metadata via stdout
-
-This allows dynamic metadata generation based on the actual contract state.
-
 **After building**, the output artifact is typically placed in `build/freenet/` unless overridden by your config file.
 
 ---
