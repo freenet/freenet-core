@@ -33,7 +33,7 @@ tokio-tungstenite = "0.24"
 toml = { version = "0.8", features = ["default", "preserve_order"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
-xz2 = "0.1"
+xz2 = { version = "0.1", features = ["tokio"] }
 reqwest = { version = "0.12", features = ["json"] }
 http = "1.2"
 

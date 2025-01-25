@@ -5,6 +5,8 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, DelegateRequest, WebApi},
     prelude::*,
 };
+use freenet::server::WebApp;
+use xz2::read::XzDecoder;
 
 use crate::config::{BaseConfig, PutConfig, UpdateConfig};
 
@@ -86,7 +88,7 @@ async fn put_contract(
         use tar::Archive;
         use std::io::Cursor;
         let mut found_index = false;
-        let tar = Archive::new(xz::read::XzDecoder::new(Cursor::new(&archive)));
+        let tar = Archive::new(XzDecoder::new(Cursor::new(&archive)));
         for entry in tar.entries()? {
             if let Ok(entry) = entry {
                 if entry.path()?.to_string_lossy() == "index.html" {
@@ -100,7 +102,7 @@ async fn put_contract(
         }
 
         // Create WebApp state
-        let webapp = freenet_stdlib::prelude::WebApp::from_data(metadata, archive)?;
+        let webapp = WebApp::from_data(metadata, archive)?;
         webapp.pack()?
     } else if let Some(ref state_path) = contract_config.state {
         let mut buf = vec![];
