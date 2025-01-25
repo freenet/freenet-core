@@ -275,7 +275,7 @@ impl Runtime {
             // Additional buffer to account for varying CPU speeds
             const SAFETY_MARGIN: f64 = 0.2;
             if let Some(cpu) = option_env!("CPU_CYCLES_PER_SECOND") {
-                (parse_cpu_cycles_per_second(cpu), 0.0)
+                (cpu.parse().expect("incorrect number"), 0.0)
             } else {
                 get_cpu_cycles_per_second_runtime()
                     .map(|x| (x, 0.0))
@@ -314,38 +314,27 @@ impl Runtime {
         Store::new(&engine)
     }
 
-    pub(crate) fn handle_contract_error<T>(
+    pub(crate) fn handle_contract_error(
         &mut self,
         error: wasmer::RuntimeError,
         instance: &wasmer::Instance,
         function_name: &str,
-    ) -> RuntimeResult<T> {
+    ) -> super::error::ContractError {
         let remaining_points = get_remaining_points(&mut self.wasm_store, instance);
         match remaining_points {
             MeteringPoints::Remaining(..) => {
                 tracing::error!("Error while calling {}: {:?}", function_name, error);
-                Err(error.into())
+                error.into()
             }
             MeteringPoints::Exhausted => {
                 tracing::error!(
                     "{} ran out of gas, not enough points remaining",
                     function_name
                 );
-                Err(ContractExecError::OutOfGas.into())
+                ContractExecError::OutOfGas.into()
             }
         }
     }
-}
-
-const fn parse_cpu_cycles_per_second(cpu: &str) -> u64 {
-    let bytes = cpu.as_bytes();
-    let mut result = 0u64;
-    let mut i = 0;
-    while i < bytes.len() {
-        result = result * 10 + (bytes[i] - b'0') as u64;
-        i += 1;
-    }
-    result
 }
 
 #[cfg(target_os = "macos")]
@@ -438,17 +427,4 @@ fn get_cpu_cycles_per_second_runtime() -> Option<u64> {
     }
 
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_cpu_cycles_per_second() {
-        assert_eq!(parse_cpu_cycles_per_second("3000000000"), 3_000_000_000);
-        assert_eq!(parse_cpu_cycles_per_second("2500000000"), 2_500_000_000);
-        assert_eq!(parse_cpu_cycles_per_second("2000000000"), 2_000_000_000);
-        assert_eq!(parse_cpu_cycles_per_second("1000000000"), 1_000_000_000);
-    }
 }
