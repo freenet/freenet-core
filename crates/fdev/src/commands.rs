@@ -102,15 +102,15 @@ async fn put_contract(
         }
 
         // Create WebApp state
-        let webapp = WebApp::from_data(metadata, archive)?;
-        webapp.pack()?
+        let webapp = WebApp::from_data(metadata, archive.into_inner().into_inner())?;
+        webapp.pack()?.into()
     } else if let Some(ref state_path) = contract_config.state {
         let mut buf = vec![];
         File::open(state_path)?.read_to_end(&mut buf)?;
         buf.into()
     } else {
         tracing::warn!("no state provided for contract, if your contract cannot handle empty state correctly, this will always cause an error.");
-        vec![].into()
+        vec![].into().into()
     };
     let related_contracts = if let Some(_related) = &contract_config.related_contracts {
         todo!("use `related` contracts")
