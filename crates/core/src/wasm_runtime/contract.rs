@@ -4,7 +4,6 @@ use freenet_stdlib::prelude::{
     UpdateData, UpdateModification, ValidateResult, WrappedState,
 };
 use wasmer::TypedFunction;
-use wasmer_middlewares::metering::{get_remaining_points, MeteringPoints};
 
 type FfiReturnTy = i64;
 
@@ -99,30 +98,14 @@ impl ContractRuntimeInterface for super::Runtime {
         );
 
         let is_valid = match call_result {
-            Ok(result) => {
-                let res = unsafe {
-                    ContractInterfaceResult::from_raw(result, &linear_mem)
-                        .unwrap_validate_state_res(linear_mem)
-                        .map_err(Into::<ContractExecError>::into)?
-                };
-                res
-            }
+            Ok(result) => unsafe {
+                ContractInterfaceResult::from_raw(result, &linear_mem)
+                    .unwrap_validate_state_res(linear_mem)
+                    .map_err(Into::<ContractExecError>::into)?
+            },
             Err(e) => {
-                let remaining_points =
-                    get_remaining_points(&mut self.wasm_store, &running.instance);
-                return match remaining_points {
-                    MeteringPoints::Remaining(..) => {
-                        tracing::error!("Error while calling validate_state: {:?}", e);
-                        Err(e.into())
-                    }
-                    MeteringPoints::Exhausted => {
-                        tracing::error!(
-                            "Validate state ran out of gas, not enough points remaining"
-                        );
-                        Err(ContractExecError::OutOfGas.into())
-                    }
-                };
-            }
+                return self.handle_contract_error(e, &running.instance, "validate_state")
+            },
         };
         Ok(is_valid)
     }
@@ -172,28 +155,12 @@ impl ContractRuntimeInterface for super::Runtime {
         );
 
         let update_res = match call_result {
-            Ok(result) => {
-                let res = unsafe {
-                    ContractInterfaceResult::from_raw(result, &linear_mem)
-                        .unwrap_update_state(linear_mem)
-                        .map_err(Into::<ContractExecError>::into)?
-                };
-                res
-            }
-            Err(e) => {
-                let remaining_points =
-                    get_remaining_points(&mut self.wasm_store, &running.instance);
-                return match remaining_points {
-                    MeteringPoints::Remaining(..) => {
-                        tracing::error!("Error while calling update_state: {:?}", e);
-                        Err(e.into())
-                    }
-                    MeteringPoints::Exhausted => {
-                        tracing::error!("Update state ran out of gas, not enough points remaining");
-                        Err(ContractExecError::OutOfGas.into())
-                    }
-                };
-            }
+            Ok(result) => unsafe {
+                ContractInterfaceResult::from_raw(result, &linear_mem)
+                    .unwrap_update_state(linear_mem)
+                    .map_err(Into::<ContractExecError>::into)?
+            },
+            Err(e) => return self.handle_contract_error(e, &running.instance, "update_state"),
         };
 
         Ok(update_res)
@@ -232,30 +199,12 @@ impl ContractRuntimeInterface for super::Runtime {
         );
 
         let result = match call_result {
-            Ok(result) => {
-                let res = unsafe {
-                    ContractInterfaceResult::from_raw(result, &linear_mem)
-                        .unwrap_summarize_state(linear_mem)
-                        .map_err(Into::<ContractExecError>::into)?
-                };
-                res
-            }
-            Err(e) => {
-                let remaining_points =
-                    get_remaining_points(&mut self.wasm_store, &running.instance);
-                return match remaining_points {
-                    MeteringPoints::Remaining(..) => {
-                        tracing::error!("Error while calling summarize_state: {:?}", e);
-                        Err(e.into())
-                    }
-                    MeteringPoints::Exhausted => {
-                        tracing::error!(
-                            "Summarize state ran out of gas, not enough points remaining"
-                        );
-                        Err(ContractExecError::OutOfGas.into())
-                    }
-                };
-            }
+            Ok(result) => unsafe {
+                ContractInterfaceResult::from_raw(result, &linear_mem)
+                    .unwrap_summarize_state(linear_mem)
+                    .map_err(Into::<ContractExecError>::into)?
+            },
+            Err(e) => return self.handle_contract_error(e, &running.instance, "summarize_state"),
         };
 
         Ok(result)
@@ -301,30 +250,12 @@ impl ContractRuntimeInterface for super::Runtime {
         );
 
         let result = match call_result {
-            Ok(result) => {
-                let res = unsafe {
-                    ContractInterfaceResult::from_raw(result, &linear_mem)
-                        .unwrap_get_state_delta(linear_mem)
-                        .map_err(Into::<ContractExecError>::into)?
-                };
-                res
-            }
-            Err(e) => {
-                let remaining_points =
-                    get_remaining_points(&mut self.wasm_store, &running.instance);
-                return match remaining_points {
-                    MeteringPoints::Remaining(..) => {
-                        tracing::error!("Error while calling get_state_delta: {:?}", e);
-                        Err(e.into())
-                    }
-                    MeteringPoints::Exhausted => {
-                        tracing::error!(
-                            "Get state delta ran out of gas, not enough points remaining"
-                        );
-                        Err(ContractExecError::OutOfGas.into())
-                    }
-                };
-            }
+            Ok(result) => unsafe {
+                ContractInterfaceResult::from_raw(result, &linear_mem)
+                    .unwrap_get_state_delta(linear_mem)
+                    .map_err(Into::<ContractExecError>::into)?
+            },
+            Err(e) => return self.handle_contract_error(e, &running.instance, "get_state_delta"),
         };
 
         Ok(result)

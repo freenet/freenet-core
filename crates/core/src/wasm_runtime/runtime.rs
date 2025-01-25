@@ -10,7 +10,7 @@ use wasmer::{
     imports, Bytes, CompilerConfig, Imports, Instance, Memory, MemoryType, Module, Store,
     TypedFunction,
 };
-
+use wasmer_middlewares::metering::{get_remaining_points, MeteringPoints};
 use super::{
     contract_store::ContractStore, delegate_store::DelegateStore, error::RuntimeInnerError,
     native_api, secrets_store::SecretsStore, RuntimeResult,
@@ -280,28 +280,16 @@ impl Runtime {
         let max_cycles =
             (MAX_EXECUTION_SECONDS * CPU_CYCLES_PER_SECOND as f64 * (1.0 + SAFETY_MARGIN)) as u64;
 
-        // Cost function that assigns cycle costs to different WASM operations
+        // Cost function that assigns cycle costs to different WASM operations.
+        // Costs are rough estimates based on typical CPU cycles:
+        // - Control flow: ~10-25 cycles (with pipeline stalls) -> cost 25
         let operation_cost = |operator: &Operator| -> u64 {
-            use wasmer::wasmparser::Operator;
-
             match operator {
                 // Control flow operations
-                Operator::Loop { .. } | Operator::If { .. } => 25,
-
-                // Function calls are relatively expensive
-                Operator::Call { .. } | Operator::CallIndirect { .. } => 50,
-
-                // Memory operations are most expensive
-                Operator::MemoryGrow { .. } | Operator::MemorySize { .. } => 200,
-                Operator::MemoryInit { .. } | Operator::MemoryCopy { .. } => 250,
-
-                // Basic arithmetic operations
-                Operator::I32Add | Operator::I32Sub => 2,
-                Operator::I32Mul => 4,
-                Operator::I32DivS | Operator::I32DivU => 25,
+                Operator::Loop { .. } => 25,
 
                 // Default cost for all other operations
-                _ => 2,
+                _ => 1,
             }
         };
 
@@ -314,17 +302,26 @@ impl Runtime {
         Store::new(&engine)
     }
 
-    // #[cfg(not(test))]
-    // fn instance_store() -> Store {
-    //     use wasmer::Universal;
-    //     if cfg!(target_arch = "aarch64") {
-    //         use wasmer::Cranelift;
-    //         Store::new(&Universal::new(Cranelift::new()).engine())
-    //     } else {
-    //         use wasmer_compiler_llvm::LLVM;
-    //         Store::new(&Universal::new(LLVM::new()).engine())
-    //     }
-    //     // use wasmer::Dylib;
-    //     // Store::new(&Dylib::headless().engine())
-    // }
+
+    pub(crate) fn handle_contract_error<T>(
+        &mut self,
+        error: wasmer::RuntimeError,
+        instance: &wasmer::Instance,
+        function_name: &str,
+    ) -> RuntimeResult<T> {
+        let remaining_points = get_remaining_points(&mut self.wasm_store, instance);
+        match remaining_points {
+            MeteringPoints::Remaining(..) => {
+                tracing::error!("Error while calling {}: {:?}", function_name, error);
+                Err(error.into())
+            }
+            MeteringPoints::Exhausted => {
+                tracing::error!(
+                    "{} ran out of gas, not enough points remaining",
+                    function_name
+                );
+                Err(ContractExecError::OutOfGas.into())
+            }
+        }
+    }
 }

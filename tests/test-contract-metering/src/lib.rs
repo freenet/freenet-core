@@ -2,7 +2,7 @@ use freenet_stdlib::prelude::*;
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct TestConditions {
-    pub max_iterations: u64,
+    pub iterations: u64,
 }
 
 struct Contract;
@@ -14,101 +14,96 @@ impl ContractInterface for Contract {
         state: State<'static>,
         _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
-        let bytes = state.as_ref();
-        let test_conditions: TestConditions = serde_json::from_slice::<TestConditions>(bytes)
+        let test_conditions: TestConditions = serde_json::from_slice(state.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         
-        // Perform CPU-intensive loop based on max_iterations
-        let mut sum: i32 = 0;
-        for i in 0..test_conditions.max_iterations {
-            sum = sum.wrapping_add(i as i32);
-            if i % 2 == 0 {
-                sum = sum.wrapping_mul(2);
-            }
+        // Simple loop with:
+        // - Loop operation: 25 cycles
+        // - Addition: 1 cycle
+        // Total: 26 cycles per iteration
+        let mut _counter = 0;
+        for _ in 0..test_conditions.iterations {
+            _counter += 1;
         }
 
-        if sum % 2 == 0 {
-            Ok(ValidateResult::Valid)
-        } else {
-            Ok(ValidateResult::RequestRelated(vec![]))
-        }
+        Ok(ValidateResult::Valid)
     }
 
     fn update_state(
         _parameters: Parameters<'static>,
         state: State<'static>,
-        mut data: Vec<UpdateData<'static>>,
+        _data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
-        let bytes = state.as_ref();
-        let test_conditions: TestConditions = serde_json::from_slice::<TestConditions>(bytes)
+        let test_conditions: TestConditions = serde_json::from_slice(state.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-        // CPU-intensive loop
-        let mut sum: i32 = 0;
-        for i in 0..test_conditions.max_iterations {
-            sum = sum.wrapping_add(i as i32);
-            if i % 3 == 0 {
-                sum = sum.wrapping_mul(3);
+        // Loop with:
+        // - Loop operation: 25 cycles
+        // - Modulo: 1 cycle
+        // - Comparison: 1 cycle
+        // - Addition: 1 cycle
+        // Total: 28 cycles per iteration
+        let mut _counter = 0;
+        for i in 0..test_conditions.iterations {
+            if i % 2 == 0 {
+                _counter += 1;
             }
         }
 
-        let mut new_state = bytes.to_vec();
-        if let Some(update) = data.pop() {
-            match update {
-                UpdateData::State(s) => new_state.extend_from_slice(s.as_ref()),
-                UpdateData::Delta(d) => new_state.extend_from_slice(d.as_ref()),
-                UpdateData::StateAndDelta { state: s, delta: d } => {
-                    new_state.extend_from_slice(s.as_ref());
-                    new_state.extend_from_slice(d.as_ref());
-                }
-                _ => {}
-            }
-        }
-        
-        Ok(UpdateModification::valid(State::from(new_state)))
+        Ok(UpdateModification::valid(state))
     }
 
     fn summarize_state(
         _parameters: Parameters<'static>,
         state: State<'static>,
     ) -> Result<StateSummary<'static>, ContractError> {
-        let bytes = state.as_ref();
-        let test_conditions: TestConditions = serde_json::from_slice::<TestConditions>(bytes)
+        let state = state.as_ref();
+        let test_conditions: TestConditions = serde_json::from_slice(state)
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-        // CPU-intensive loop
-        let mut sum: i32 = 0;
-        for i in 0..test_conditions.max_iterations {
-            sum = sum.wrapping_add(i as i32);
-            if i % 4 == 0 {
-                sum = sum.wrapping_mul(4);
+        // Loop with:
+        // - Loop operation: 25 cycles
+        // - Two modulo ops: 2 cycles
+        // - Three comparisons: 3 cycles
+        // - Two additions: 2 cycles
+        // Total: 32 cycles per iteration
+        let mut _counter = 0;
+        for i in 0..test_conditions.iterations {
+            if i % 2 == 0 {
+                _counter += 1;
+            } else if i % 3 == 0 {
+                _counter += 2;
             }
         }
 
-        let summary_bytes = bytes[..bytes.len().saturating_sub(1)].to_vec();
-        Ok(StateSummary::from(summary_bytes))
+        Ok(StateSummary::from(state.to_vec()))
     }
 
     fn get_state_delta(
         _parameters: Parameters<'static>,
         state: State<'static>,
-        summary: StateSummary<'static>,
+        _summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
-        let bytes = state.as_ref();
-        let test_conditions: TestConditions = serde_json::from_slice::<TestConditions>(bytes)
+        let test_conditions: TestConditions = serde_json::from_slice(state.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-        // CPU-intensive loop
-        let mut sum: i32 = 0;
-        for i in 0..test_conditions.max_iterations {
-            sum = sum.wrapping_add(i as i32);
-            if i % 5 == 0 {
-                sum = sum.wrapping_mul(5);
+        // Loop with:
+        // - Loop operation: 25 cycles
+        // - Three modulo ops: 3 cycles
+        // - Four comparisons: 4 cycles
+        // - Three additions: 3 cycles
+        // Total: 35 cycles per iteration
+        let mut counter = 0;
+        for i in 0..test_conditions.iterations {
+            if i % 2 == 0 {
+                counter += 1;
+            } else if i % 3 == 0 {
+                counter += 2;
+            } else if i % 5 == 0 {
+                counter += 3;
             }
         }
 
-        let summary_len = summary.as_ref().len();
-        let delta_bytes = bytes[summary_len..].to_vec();
-        Ok(StateDelta::from(delta_bytes))
+        Ok(StateDelta::from(vec![counter as u8]))
     }
 }
