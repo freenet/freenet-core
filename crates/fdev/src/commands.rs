@@ -26,6 +26,12 @@ pub(crate) struct PutContract {
     /// A path to the initial state for the contract being published.
     #[arg(long)]
     pub(crate) state: Option<PathBuf>,
+    /// A path to a pre-compressed tar.xz webapp archive
+    #[arg(long)]
+    pub(crate) webapp_archive: Option<PathBuf>,
+    /// A path to the metadata file to include with the webapp
+    #[arg(long)]
+    pub(crate) webapp_metadata: Option<PathBuf>,
 }
 
 #[derive(clap::Parser, Clone, Debug)]
@@ -62,7 +68,41 @@ async fn put_contract(
     params: Parameters<'static>,
 ) -> anyhow::Result<()> {
     let contract = ContractContainer::try_from((config.code.as_path(), params))?;
-    let state = if let Some(ref state_path) = contract_config.state {
+    let state = if let Some(ref webapp_archive) = contract_config.webapp_archive {
+        // Read webapp archive
+        let mut archive = vec![];
+        File::open(webapp_archive)?.read_to_end(&mut archive)?;
+        
+        // Read optional metadata
+        let metadata = if let Some(ref metadata_path) = contract_config.webapp_metadata {
+            let mut buf = vec![];
+            File::open(metadata_path)?.read_to_end(&mut buf)?;
+            buf
+        } else {
+            vec![]
+        };
+
+        // Validate archive has index.html (warning only)
+        use tar::Archive;
+        use std::io::Cursor;
+        let mut found_index = false;
+        let tar = Archive::new(xz::read::XzDecoder::new(Cursor::new(&archive)));
+        for entry in tar.entries()? {
+            if let Ok(entry) = entry {
+                if entry.path()?.to_string_lossy() == "index.html" {
+                    found_index = true;
+                    break;
+                }
+            }
+        }
+        if !found_index {
+            tracing::warn!("Warning: No index.html found at root of webapp archive");
+        }
+
+        // Create WebApp state
+        let webapp = freenet_stdlib::prelude::WebApp::from_data(metadata, archive)?;
+        webapp.pack()?
+    } else if let Some(ref state_path) = contract_config.state {
         let mut buf = vec![];
         File::open(state_path)?.read_to_end(&mut buf)?;
         buf.into()
