@@ -15,34 +15,34 @@ mod v1;
 
 #[derive(Debug, Clone, clap::Subcommand)]
 pub(crate) enum PutType {
-    /// Puts a new contract
+    /// Publish a new contract to the network
     Contract(PutContract),
-    /// Puts a new delegate
+    /// Publish a new delegate to the network
     Delegate(PutDelegate),
 }
 
 #[derive(clap::Parser, Clone, Debug)]
 pub(crate) struct PutContract {
-    /// A path to a JSON file listing the related contracts.
+    /// Path to a file listing the related contracts
     #[arg(long)]
     pub(crate) related_contracts: Option<PathBuf>,
-    /// A path to the initial state for the contract being published.
+    /// Path to the initial state for the contract (typically binary format)
     #[arg(long)]
     pub(crate) state: Option<PathBuf>,
-    /// A path to a pre-compressed tar.xz webapp archive
+    /// Path to a pre-compressed tar.xz webapp archive containing the webapp files (must include index.html at root)
     #[arg(long)]
     pub(crate) webapp_archive: Option<PathBuf>,
-    /// A path to the metadata file to include with the webapp
+    /// Path to the metadata file to include with the webapp (can be any binary format)
     #[arg(long)]
     pub(crate) webapp_metadata: Option<PathBuf>,
 }
 
 #[derive(clap::Parser, Clone, Debug)]
 pub(crate) struct PutDelegate {
-    /// Base58 encoded nonce. If empty the default value will be used, this is only allowed in local mode.
+    /// Base58 encoded nonce for delegate encryption. If empty the default value will be used (only allowed in local mode)
     #[arg(long, env = "DELEGATE_NONCE", default_value_t = String::new())]
     pub(crate) nonce: String,
-    /// Base58 encoded cipher. If empty the default value will be used, this is only allowed in local mode.
+    /// Base58 encoded cipher for delegate encryption. If empty the default value will be used (only allowed in local mode)
     #[arg(long, env = "DELEGATE_CIPHER", default_value_t = String::new())]
     pub(crate) cipher: String,
 }
