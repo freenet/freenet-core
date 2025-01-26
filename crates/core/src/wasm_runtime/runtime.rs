@@ -424,7 +424,7 @@ fn get_cpu_cycles_per_second_runtime() -> Option<u64> {
                     let parts: Vec<&str> = line.split(':').collect();
                     if parts.len() == 2 {
                         let mhz: f64 = parts[1].trim().parse().ok()?;
-                        return (mhz * 1_000_000.0) as u64;
+                        return Some((mhz * 1_000_000.0) as u64);
                     }
                 }
             }
