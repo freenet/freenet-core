@@ -289,6 +289,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     match recv_result {
                         Ok((size, remote_addr)) => {
                             let packet_data = PacketData::from_buf(&buf[..size]);
+                            tracing::debug!(%remote_addr, %size, "received packet from remote");
                             if let Some(remote_conn) = self.remote_connections.remove(&remote_addr){
                                 if remote_conn.inbound_packet_sender.send(packet_data)
                                     .await
@@ -656,6 +657,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 let next_inbound = tokio::time::timeout(timeout, next_inbound.recv());
                 match next_inbound.await {
                     Ok(Some(packet)) => {
+                        tracing::debug!(%remote_addr, "received packet after sending it");
                         match state {
                             ConnectionState::StartOutbound { .. } => {
                                 // at this point it's either the remote sending us an intro packet or a symmetric packet
@@ -765,6 +767,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 // next packet should be an acknowledgement packet, but might also be a repeated
                                 // intro packet so we need to handle that
                                 if packet.is_intro_packet(intro_packet) {
+                                    tracing::debug!(%remote_addr, "received intro packet");
                                     // we add to the number of failures so we are not stuck in a loop retrying
                                     failures += 1;
                                     continue;
