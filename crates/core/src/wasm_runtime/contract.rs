@@ -286,7 +286,7 @@ fn handle_execution_call(
         thread::sleep(Duration::from_secs(1));
     }
     if !r.is_finished() {
-        return Err(Errors::OutOfGas);
+        return Err(Errors::MaxComputeTimeExceeded);
     }
     let r = r
         .join()
@@ -302,13 +302,15 @@ fn match_err(
     match r {
         Ok(result) => Ok(result),
         Err(Errors::Wasmer(e)) => Err(rt.handle_contract_error(e, instance, "get_state_delta")),
-        Err(Errors::OutOfGas) => Err(ContractExecError::OutOfGas.into()),
+        Err(Errors::MaxComputeTimeExceeded) => {
+            Err(ContractExecError::MaxComputeTimeExceeded.into())
+        }
         Err(Errors::Other(e)) => Err(e.into()),
     }
 }
 
 enum Errors {
     Wasmer(wasmer::RuntimeError),
-    OutOfGas,
+    MaxComputeTimeExceeded,
     Other(anyhow::Error),
 }

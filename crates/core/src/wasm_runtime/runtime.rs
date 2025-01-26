@@ -92,6 +92,28 @@ pub enum ContractExecError {
 
     #[error("The operation ran out of gas. This might be caused by an infinite loop or an inefficient computation.")]
     OutOfGas,
+
+    #[error("The operation exceeded the maximum allowed compute time")]
+    MaxComputeTimeExceeded,
+}
+
+pub struct RuntimeConfig {
+    /// Maximum allowed execution time for WASM code in seconds
+    pub max_execution_seconds: f64,
+    /// Optional override for CPU cycles per second
+    pub cpu_cycles_per_second: Option<u64>,
+    /// Safety margin for CPU speed variations (0.0 to 1.0)
+    pub safety_margin: f64,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_execution_seconds: 5.0,
+            cpu_cycles_per_second: None,
+            safety_margin: 0.2,
+        }
+    }
 }
 
 pub struct Runtime {
@@ -114,13 +136,14 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub fn build(
+    pub fn build_with_config(
         contract_store: ContractStore,
         delegate_store: DelegateStore,
         secret_store: SecretsStore,
         host_mem: bool,
+        config: RuntimeConfig,
     ) -> RuntimeResult<Self> {
-        let mut store = Self::instance_store();
+        let mut store = Self::instance_store_with_config(&config);
         let (host_memory, mut top_level_imports) = if host_mem {
             let mem = Self::instance_host_mem(&mut store)?;
             let imports = imports! {
@@ -148,6 +171,21 @@ impl Runtime {
             contract_store,
             delegate_modules: HashMap::new(),
         })
+    }
+
+    pub fn build(
+        contract_store: ContractStore,
+        delegate_store: DelegateStore,
+        secret_store: SecretsStore,
+        host_mem: bool,
+    ) -> RuntimeResult<Self> {
+        Self::build_with_config(
+            contract_store,
+            delegate_store,
+            secret_store,
+            host_mem,
+            RuntimeConfig::default(),
+        )
     }
 
     pub(super) fn init_buf<T>(&mut self, instance: &Instance, data: T) -> RuntimeResult<BufferMut>
@@ -263,7 +301,7 @@ impl Runtime {
         )?)
     }
 
-    fn instance_store() -> Store {
+    fn instance_store_with_config(config: &RuntimeConfig) -> Store {
         use std::sync::Arc;
         use wasmer::wasmparser::Operator;
         use wasmer::Cranelift;
@@ -272,38 +310,29 @@ impl Runtime {
         fn get_cpu_cycles_per_second() -> (u64, f64) {
             // Assumed CPU speed for cost calculations (3.0 GHz)
             const DEFAULT_CPU_CYCLES_PER_SECOND: u64 = 3_000_000_000;
-            // Additional buffer to account for varying CPU speeds
-            const SAFETY_MARGIN: f64 = 0.2;
             if let Some(cpu) = option_env!("CPU_CYCLES_PER_SECOND") {
                 (cpu.parse().expect("incorrect number"), 0.0)
             } else {
                 get_cpu_cycles_per_second_runtime()
                     .map(|x| (x, 0.0))
-                    .unwrap_or((DEFAULT_CPU_CYCLES_PER_SECOND, SAFETY_MARGIN))
+                    .unwrap_or((DEFAULT_CPU_CYCLES_PER_SECOND, 0.2))
             }
         }
 
-        // Maximum allowed execution time for WASM code
-        const MAX_EXECUTION_SECONDS: f64 = 5.0;
-
-        let (cpu_cycles_per_sec, safety_margin) = get_cpu_cycles_per_second();
+        let (default_cycles, default_margin) = get_cpu_cycles_per_second();
+        let cpu_cycles_per_sec = config.cpu_cycles_per_second.unwrap_or(default_cycles);
+        let safety_margin = if config.safety_margin >= 0.0 && config.safety_margin <= 1.0 {
+            config.safety_margin
+        } else {
+            default_margin
+        };
 
         // Calculate total allowed cycles including safety margin
-        let max_cycles: u64 =
-            (MAX_EXECUTION_SECONDS * cpu_cycles_per_sec as f64 * (1.0 + safety_margin)) as u64;
+        let max_cycles: u64 = (config.max_execution_seconds
+            * cpu_cycles_per_sec as f64
+            * (1.0 + safety_margin)) as u64;
 
-        // Cost function that assigns cycle costs to different WASM operations.
-        // Costs are rough estimates based on typical CPU cycles:
-        // - Control flow: ~10-25 cycles (with pipeline stalls) -> cost 25
-        let operation_cost = |operator: &Operator| -> u64 {
-            match operator {
-                // Control flow operations
-                Operator::Loop { .. } => 25,
-
-                // Default cost for all other operations
-                _ => 1,
-            }
-        };
+        let operation_cost = |_operator: &Operator| -> u64 { 1 };
 
         let metering = Arc::new(Metering::new(max_cycles, operation_cost));
         let mut compiler_config = Cranelift::default();
