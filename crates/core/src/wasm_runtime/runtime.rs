@@ -418,7 +418,7 @@ fn get_cpu_cycles_per_second_runtime() -> Option<u64> {
     use std::io::{self, BufRead};
 
     if let Ok(file) = File::open("/proc/cpuinfo") {
-        for line in io::BufReader::new(file).lines().flatten() {
+        for line in io::BufReader::new(file).lines().map_while(Result::ok) {
             if line.starts_with("cpu MHz") {
                 let parts: Vec<&str> = line.split(':').collect();
                 if parts.len() == 2 {
