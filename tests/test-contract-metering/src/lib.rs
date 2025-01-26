@@ -17,10 +17,6 @@ impl ContractInterface for Contract {
         let test_conditions: TestConditions = serde_json::from_slice(state.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         
-        // Simple loop with:
-        // - Loop operation: 25 cycles
-        // - Addition: 1 cycle
-        // Total: 26 cycles per iteration
         let mut _counter = 0;
         for _ in 0..test_conditions.iterations {
             _counter += 1;
@@ -37,10 +33,6 @@ impl ContractInterface for Contract {
         let test_conditions: TestConditions = serde_json::from_slice(state.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-        // Simple loop with:
-        // - Loop operation: 25 cycles
-        // - Addition: 1 cycle
-        // Total: 26 cycles per iteration
         let mut _counter = 0;
         for _ in 0..test_conditions.iterations {
             _counter += 1;
@@ -57,10 +49,6 @@ impl ContractInterface for Contract {
         let test_conditions: TestConditions = serde_json::from_slice(state)
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-        // Simple loop with:
-        // - Loop operation: 25 cycles
-        // - Addition: 1 cycle
-        // Total: 26 cycles per iteration
         let mut _counter = 0;
         for _ in 0..test_conditions.iterations {
             _counter += 1;
@@ -77,10 +65,6 @@ impl ContractInterface for Contract {
         let test_conditions: TestConditions = serde_json::from_slice(state.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-        // Simple loop with:
-        // - Loop operation: 25 cycles
-        // - Addition: 1 cycle
-        // Total: 26 cycles per iteration
         let mut counter = 0;
         for _ in 0..test_conditions.iterations {
             counter += 1;
