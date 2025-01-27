@@ -72,10 +72,11 @@ async fn put_contract(
     params: Parameters<'static>,
 ) -> anyhow::Result<()> {
     // Try to load as raw WASM first
-    let contract = if let Ok(code) = ContractCode::load_raw(&config.code) {
+    let contract = if let Ok(raw_code) = ContractCode::load_raw(&config.code) {
         // Add version wrapper
         let version = Version::new(0, 0, 1);
-        ContractContainer::try_from((code.data(), params))?
+        let code = ContractCode::from(raw_code.data().to_vec());
+        ContractContainer::try_from((code, params))?
     } else {
         // Fall back to trying as already versioned
         ContractContainer::try_from((config.code.as_path(), params))?
