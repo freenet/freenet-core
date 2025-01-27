@@ -5,7 +5,6 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, DelegateRequest, WebApi},
     prelude::*,
 };
-use semver::Version;
 use freenet::server::WebApp;
 use xz2::read::XzDecoder;
 use tar::Builder;
