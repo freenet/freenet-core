@@ -390,7 +390,7 @@ mod contract {
             if !found_entry {
                 anyhow::bail!("didn't find entry point `index.html` in package");
             } else {
-                let state = WebApp::nfrom_data(metadata, archive)?;
+                let state = WebApp::from_data(metadata, archive)?;
                 let packed = state.pack()?;
                 output_artifact(&config.contract.output_dir, &packed, cwd)?;
                 println!("Finished bundling webapp contract state");

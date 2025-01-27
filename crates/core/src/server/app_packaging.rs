@@ -25,7 +25,7 @@ pub struct WebApp {
 }
 
 impl WebApp {
-    pub fn nfrom_data(
+    pub fn from_data(
         metadata: Vec<u8>,
         web: Builder<Cursor<Vec<u8>>>,
     ) -> Result<Self, WebContractError> {
