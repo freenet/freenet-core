@@ -76,7 +76,7 @@ async fn put_contract(
         // Add version wrapper
         let version = Version::new(0, 0, 1); 
         let code = ContractCode::from(raw_code.data().to_vec());
-        let api_version = ContractWasmAPIVersion::from((code, params));
+        let api_version = ContractWasmAPIVersion::V1 { code, params };
         ContractContainer::from(api_version)
     } else {
         // Fall back to trying as already versioned
