@@ -74,7 +74,6 @@ async fn put_contract(
     // Try to load as raw WASM first
     let contract = if let Ok(raw_code) = ContractCode::load_raw(&config.code) {
         // Add version wrapper
-        let version = Version::new(0, 0, 1); 
         let code = ContractCode::from(raw_code.data().to_vec());
         let wrapped = WrappedContract::new(Arc::new(code), params);
         let api_version = ContractWasmAPIVersion::V1(wrapped);
