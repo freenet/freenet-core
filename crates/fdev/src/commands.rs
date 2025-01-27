@@ -105,7 +105,9 @@ async fn put_contract(
         for entry in entries {
             let entry = entry?;
             let path = entry.path()?;
-            if path.to_string_lossy() == "index.html" {
+            tracing::debug!("Found file in archive: {}", path.display());
+            if path.file_name().map(|f| f.to_string_lossy()) == Some("index.html".into()) {
+                tracing::debug!("Found index.html at path: {}", path.display());
                 found_index = true;
                 break;
             }
