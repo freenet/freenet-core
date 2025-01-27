@@ -101,12 +101,13 @@ async fn put_contract(
         let mut found_index = false;
         let decoder = XzDecoder::new(Cursor::new(&archive));
         let mut tar = Archive::new(decoder);
-        for entry in tar.entries()? {
-            if let Ok(entry) = entry {
-                if entry.path()?.to_string_lossy() == "index.html" {
-                    found_index = true;
-                    break;
-                }
+        let entries = tar.entries()?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path()?;
+            if path.to_string_lossy() == "index.html" {
+                found_index = true;
+                break;
             }
         }
         if !found_index {
