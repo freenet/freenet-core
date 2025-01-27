@@ -1,4 +1,4 @@
-use std::{fs::File, io::Read, net::SocketAddr, path::PathBuf};
+use std::{fs::File, io::Read, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use freenet::dev_tool::OperationMode;
 use freenet_stdlib::{
@@ -76,7 +76,7 @@ async fn put_contract(
         // Add version wrapper
         let version = Version::new(0, 0, 1); 
         let code = ContractCode::from(raw_code.data().to_vec());
-        let wrapped = WrappedContract::new(code, params);
+        let wrapped = WrappedContract::new(Arc::new(code), params);
         let api_version = ContractWasmAPIVersion::V1(wrapped);
         ContractContainer::from(api_version)
     } else {
