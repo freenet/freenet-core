@@ -4,6 +4,7 @@ use freenet::dev_tool::OperationMode;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, DelegateRequest, WebApi},
     prelude::*,
+    versioning::Version,
 };
 use freenet::server::WebApp;
 use xz2::read::XzDecoder;
@@ -70,7 +71,15 @@ async fn put_contract(
     other: BaseConfig,
     params: Parameters<'static>,
 ) -> anyhow::Result<()> {
-    let contract = ContractContainer::try_from((config.code.as_path(), params))?;
+    // Try to load as raw WASM first
+    let contract = if let Ok(code) = ContractCode::load_raw(&config.code) {
+        // Add version wrapper
+        let version = Version::new(0, 0, 1);
+        ContractContainer::from_code_versioned(code, version.into())?
+    } else {
+        // Fall back to trying as already versioned
+        ContractContainer::try_from((config.code.as_path(), params))?
+    };
     let state = if let Some(ref webapp_archive) = contract_config.webapp_archive {
         // Read webapp archive
         let mut archive = vec![];
