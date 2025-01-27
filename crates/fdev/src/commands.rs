@@ -99,7 +99,8 @@ async fn put_contract(
         use tar::Archive;
         use std::io::Cursor;
         let mut found_index = false;
-        let mut tar = Archive::new(XzDecoder::new(Cursor::new(&archive)));
+        let decoder = XzDecoder::new(Cursor::new(&archive));
+        let mut tar = Archive::new(decoder);
         for entry in tar.entries()? {
             if let Ok(entry) = entry {
                 if entry.path()?.to_string_lossy() == "index.html" {
@@ -112,10 +113,8 @@ async fn put_contract(
             tracing::warn!("Warning: No index.html found at root of webapp archive");
         }
 
-        // Create WebApp state
-        let mut archive_builder = Builder::new(Cursor::new(Vec::new()));
-        archive_builder.append_data(&mut tar::Header::new_gnu(), "archive.tar.xz", &*archive)?;
-        let webapp = WebApp::nfrom_data(metadata, archive_builder)?;
+        // Create WebApp state from the archive directly
+        let webapp = WebApp::nfrom_data(metadata, archive)?;
         webapp.pack()?.into()
     } else if let Some(ref state_path) = contract_config.state {
         let mut buf = vec![];
