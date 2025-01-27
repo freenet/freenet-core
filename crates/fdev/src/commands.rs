@@ -4,8 +4,8 @@ use freenet::dev_tool::OperationMode;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, DelegateRequest, WebApi},
     prelude::*,
-    versioning::Version,
 };
+use semver::Version;
 use freenet::server::WebApp;
 use xz2::read::XzDecoder;
 use tar::Builder;
@@ -75,7 +75,7 @@ async fn put_contract(
     let contract = if let Ok(code) = ContractCode::load_raw(&config.code) {
         // Add version wrapper
         let version = Version::new(0, 0, 1);
-        ContractContainer::from_code_versioned(code, version.into())?
+        ContractContainer::try_from((code.data(), params))?
     } else {
         // Fall back to trying as already versioned
         ContractContainer::try_from((config.code.as_path(), params))?
