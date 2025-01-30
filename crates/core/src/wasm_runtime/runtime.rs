@@ -304,7 +304,7 @@ impl Runtime {
     fn instance_store_with_config(config: &RuntimeConfig) -> Store {
         use std::sync::Arc;
         use wasmer::wasmparser::Operator;
-        use wasmer::Cranelift;
+        use wasmer_compiler_singlepass::Singlepass;
         use wasmer_middlewares::Metering;
 
         fn get_cpu_cycles_per_second() -> (u64, f64) {
@@ -335,7 +335,7 @@ impl Runtime {
         let operation_cost = |_operator: &Operator| -> u64 { 1 };
 
         let metering = Arc::new(Metering::new(max_cycles, operation_cost));
-        let mut compiler_config = Cranelift::default();
+        let mut compiler_config = Singlepass::default();
         compiler_config.push_middleware(metering);
 
         let engine = wasmer::EngineBuilder::new(compiler_config).engine();
