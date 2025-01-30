@@ -306,12 +306,17 @@ impl Executor<Runtime> {
             }
             ContractRequest::Update { key, data } => self.perform_contract_update(key, data).await,
             // FIXME
+            // Handle Get requests by returning the contract state and optionally the contract code
             ContractRequest::Get {
                 key,
                 return_contract_code,
             } => match self.perform_contract_get(return_contract_code, key).await {
-                Ok(_) => todo!(),
-                Err(_) => todo!(),
+                Ok((state, contract)) => Ok(ContractResponse::GetResponse { 
+                    key,
+                    state,
+                    contract 
+                }.into()),
+                Err(err) => Err(err),
             },
             ContractRequest::Subscribe { key, summary } => {
                 tracing::debug!("subscribing to contract {key}");
