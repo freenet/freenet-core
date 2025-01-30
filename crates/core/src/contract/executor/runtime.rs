@@ -328,8 +328,7 @@ impl Executor<Runtime> {
                 // by default a subscribe op has an implicit get
                 let _res = self.perform_contract_get(true, key).await?;
                 self.subscribe(key).await?;
-                // FIXME
-                todo!() // Do you know what remains to be done here? AI?ple
+                Ok(ContractResponse::SubscribeResponse { key }.into())
             }
             _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
         }
