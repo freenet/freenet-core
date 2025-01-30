@@ -313,7 +313,7 @@ impl Executor<Runtime> {
             } => match self.perform_contract_get(return_contract_code, key).await {
                 Ok((state, contract)) => Ok(ContractResponse::GetResponse { 
                     key,
-                    state,
+                    state: state.unwrap_or_else(|| WrappedState::new(Vec::new())),
                     contract 
                 }.into()),
                 Err(err) => Err(err),
