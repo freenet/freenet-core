@@ -313,7 +313,10 @@ impl Executor<Runtime> {
             } => match self.perform_contract_get(return_contract_code, key).await {
                 Ok((state, contract)) => Ok(ContractResponse::GetResponse {
                     key,
-                    state: state.unwrap_or_else(|| WrappedState::new(Vec::new())),  // mmmm I think we should return an error when the state is not there? AI!
+                    state: state.ok_or_else(|| ExecutorError::request(StdContractError::Get {
+                        key,
+                        cause: "contract state not found".into(),
+                    }))?,
                     contract,
                 }
                 .into()),
