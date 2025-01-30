@@ -311,11 +311,12 @@ impl Executor<Runtime> {
                 key,
                 return_contract_code,
             } => match self.perform_contract_get(return_contract_code, key).await {
-                Ok((state, contract)) => Ok(ContractResponse::GetResponse { 
+                Ok((state, contract)) => Ok(ContractResponse::GetResponse {
                     key,
                     state: state.unwrap_or_else(|| WrappedState::new(Vec::new())),
-                    contract 
-                }.into()),
+                    contract,
+                }
+                .into()),
                 Err(err) => Err(err),
             },
             ContractRequest::Subscribe { key, summary } => {
@@ -328,7 +329,11 @@ impl Executor<Runtime> {
                 // by default a subscribe op has an implicit get
                 let _res = self.perform_contract_get(true, key).await?;
                 self.subscribe(key).await?;
-                Ok(ContractResponse::SubscribeResponse { key, subscribed: true }.into())
+                Ok(ContractResponse::SubscribeResponse {
+                    key,
+                    subscribed: true,
+                }
+                .into())
             }
             _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
         }
