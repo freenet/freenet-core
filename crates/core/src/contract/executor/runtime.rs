@@ -313,10 +313,12 @@ impl Executor<Runtime> {
             } => match self.perform_contract_get(return_contract_code, key).await {
                 Ok((state, contract)) => Ok(ContractResponse::GetResponse {
                     key,
-                    state: state.ok_or_else(|| ExecutorError::request(StdContractError::Get {
-                        key,
-                        cause: "contract state not found".into(),
-                    }))?,
+                    state: state.ok_or_else(|| {
+                        ExecutorError::request(StdContractError::Get {
+                            key,
+                            cause: "contract state not found".into(),
+                        })
+                    })?,
                     contract,
                 }
                 .into()),
