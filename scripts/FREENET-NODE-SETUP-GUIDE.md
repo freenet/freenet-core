@@ -16,9 +16,8 @@ This guide provides step-by-step instructions for setting up a **Freenet Gateway
 
 ### Network Requirements
 
-- Open ports:
-    - **31337** default network api port
-    - **50509** default ws api port 
+- Open ports (gateway only):
+    - **31337** default network api port (or alternate port if specified)
 
 ### Pre-Installed Tools
 
