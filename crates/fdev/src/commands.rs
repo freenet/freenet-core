@@ -1,13 +1,13 @@
 use std::{fs::File, io::Read, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use freenet::dev_tool::OperationMode;
+use freenet::server::WebApp;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, DelegateRequest, WebApi},
     prelude::*,
 };
-use freenet::server::WebApp;
-use xz2::read::XzDecoder;
 use tar::Builder;
+use xz2::read::XzDecoder;
 
 use crate::config::{BaseConfig, PutConfig, UpdateConfig};
 
@@ -85,7 +85,7 @@ async fn put_contract(
         // Read webapp archive
         let mut archive = vec![];
         File::open(webapp_archive)?.read_to_end(&mut archive)?;
-        
+
         // Read optional metadata
         let metadata = if let Some(ref metadata_path) = contract_config.webapp_metadata {
             let mut buf = vec![];
@@ -96,8 +96,8 @@ async fn put_contract(
         };
 
         // Validate archive has index.html (warning only)
-        use tar::Archive;
         use std::io::Cursor;
+        use tar::Archive;
         let mut found_index = false;
         let decoder = XzDecoder::new(Cursor::new(&archive));
         let mut tar = Archive::new(decoder);
@@ -118,7 +118,11 @@ async fn put_contract(
 
         // Create WebApp state
         let mut archive_builder = Builder::new(Cursor::new(Vec::new()));
-        archive_builder.append_data(&mut tar::Header::new_gnu(), "archive.tar.xz", &mut std::io::Cursor::new(&archive))?;
+        archive_builder.append_data(
+            &mut tar::Header::new_gnu(),
+            "archive.tar.xz",
+            &mut std::io::Cursor::new(&archive),
+        )?;
         let webapp = WebApp::from_data(metadata, archive_builder)?;
         webapp.pack()?.into()
     } else if let Some(ref state_path) = contract_config.state {
