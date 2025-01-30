@@ -304,8 +304,8 @@ impl Runtime {
     fn instance_store_with_config(config: &RuntimeConfig) -> Store {
         use std::sync::Arc;
         use wasmer::wasmparser::Operator;
-        use wasmer_middlewares::Metering;
         use wasmer_compiler_singlepass::Singlepass;
+        use wasmer_middlewares::Metering;
 
         fn get_cpu_cycles_per_second() -> (u64, f64) {
             // Assumed CPU speed for cost calculations (3.0 GHz)
