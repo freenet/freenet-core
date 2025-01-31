@@ -6,7 +6,23 @@ impl ContractExecutor for Executor<Runtime> {
         key: ContractKey,
         return_contract_code: bool,
     ) -> Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError> {
-        match self.perform_contract_get(return_contract_code, key).await {
+        tracing::debug!(
+            contract = %key,
+            return_code = return_contract_code,
+            "fetching contract"
+        );
+        let result = self.perform_contract_get(return_contract_code, key).await;
+        if let Ok((Some(ref state), ref code)) = result {
+            let hash = blake3::hash(state.as_ref());
+            tracing::debug!(
+                contract = %key,
+                state_size = state.as_ref().len(),
+                state_hash = %hash,
+                has_code = code.is_some(),
+                "fetched contract state"
+            );
+        }
+        match result {
             Ok((state, code)) => Ok((state, code)),
             Err(err) => Err(err),
         }
@@ -19,6 +35,15 @@ impl ContractExecutor for Executor<Runtime> {
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
     ) -> Result<UpsertResult, ExecutorError> {
+        if let Either::Left(ref state) = update {
+            let hash = blake3::hash(state.as_ref());
+            tracing::debug!(
+                contract = %key,
+                state_size = state.as_ref().len(),
+                state_hash = %hash,
+                "upserting contract state"
+            );
+        }
         let params = if let Some(code) = &code {
             code.params()
         } else {
