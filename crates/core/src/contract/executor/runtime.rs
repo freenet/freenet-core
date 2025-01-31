@@ -306,12 +306,23 @@ impl Executor<Runtime> {
             }
             ContractRequest::Update { key, data } => self.perform_contract_update(key, data).await,
             // FIXME
+            // Handle Get requests by returning the contract state and optionally the contract code
             ContractRequest::Get {
                 key,
                 return_contract_code,
             } => match self.perform_contract_get(return_contract_code, key).await {
-                Ok(_) => todo!(),
-                Err(_) => todo!(),
+                Ok((state, contract)) => Ok(ContractResponse::GetResponse {
+                    key,
+                    state: state.ok_or_else(|| {
+                        ExecutorError::request(StdContractError::Get {
+                            key,
+                            cause: "contract state not found".into(),
+                        })
+                    })?,
+                    contract,
+                }
+                .into()),
+                Err(err) => Err(err),
             },
             ContractRequest::Subscribe { key, summary } => {
                 tracing::debug!("subscribing to contract {key}");
@@ -323,8 +334,11 @@ impl Executor<Runtime> {
                 // by default a subscribe op has an implicit get
                 let _res = self.perform_contract_get(true, key).await?;
                 self.subscribe(key).await?;
-                // FIXME
-                todo!()
+                Ok(ContractResponse::SubscribeResponse {
+                    key,
+                    subscribed: true,
+                }
+                .into())
             }
             _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
         }
