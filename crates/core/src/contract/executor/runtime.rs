@@ -341,7 +341,7 @@ impl Executor<Runtime> {
                     state: state.ok_or_else(|| {
                         ExecutorError::request(StdContractError::Get {
                             key,
-                            cause: "contract state not found".into(),
+                            cause: "contract state not found".into(), // Getting this error in the browser but trying to figure out why, can you add trace logging to help debug? AI!
                         })
                     })?,
                     contract,
