@@ -16,12 +16,13 @@ fn now() -> Result<(), Box<dyn std::error::Error>> {
     let mut runtime = Runtime::build(contract_store, delegate_store, secrets_store, false).unwrap();
 
     let module = runtime.prepare_contract_call(&contract_key, &vec![].into(), 1_000)?;
+    let wasm_store = runtime.wasm_store.as_mut().unwrap();
     let f: TypedFunction<(), ()> = module
         .instance
         .exports
         .get_function("time_func")?
-        .typed(&runtime.wasm_store)?;
-    f.call(&mut runtime.wasm_store)?;
+        .typed(&*wasm_store)?;
+    f.call(wasm_store)?;
     std::mem::drop(temp_dir);
     Ok(())
 }

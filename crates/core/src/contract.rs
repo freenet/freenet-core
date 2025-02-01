@@ -62,6 +62,9 @@ where
                     }
                     Err(err) => {
                         tracing::warn!("Error while executing get contract query: {err}");
+                        if err.is_fatal() {
+                            todo!("Handle fatal error; reset executor");
+                        }
                         contract_handler
                             .channel()
                             .send_to_sender(
@@ -103,9 +106,14 @@ where
                     Ok(UpsertResult::Updated(state)) => ContractHandlerEvent::PutResponse {
                         new_value: Ok(state),
                     },
-                    Err(err) => ContractHandlerEvent::PutResponse {
-                        new_value: Err(err),
-                    },
+                    Err(err) => {
+                        if err.is_fatal() {
+                            todo!("Handle fatal error; reset executor");
+                        }
+                        ContractHandlerEvent::PutResponse {
+                            new_value: Err(err),
+                        }
+                    }
                 };
 
                 contract_handler
@@ -140,9 +148,14 @@ where
                     Ok(UpsertResult::Updated(state)) => ContractHandlerEvent::UpdateResponse {
                         new_value: Ok(state),
                     },
-                    Err(err) => ContractHandlerEvent::UpdateResponse {
-                        new_value: Err(err),
-                    },
+                    Err(err) => {
+                        if err.is_fatal() {
+                            todo!("Handle fatal error; reset executor");
+                        }
+                        ContractHandlerEvent::UpdateResponse {
+                            new_value: Err(err),
+                        }
+                    }
                 };
 
                 contract_handler
