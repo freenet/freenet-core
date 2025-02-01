@@ -86,7 +86,7 @@ impl Runtime {
             msg_buf.ptr()
         };
         let res = process_func.call(
-            &mut self.wasm_store,
+            self.wasm_store.as_mut().unwrap(),
             param_buf_ptr as i64,
             attested_buf_ptr as i64,
             msg_ptr as i64,
@@ -240,7 +240,7 @@ impl DelegateRuntimeInterface for Runtime {
         let process_func: TypedFunction<(i64, i64, i64), i64> = running
             .instance
             .exports
-            .get_typed_function(&self.wasm_store, "process")?;
+            .get_typed_function(self.wasm_store.as_ref().unwrap(), "process")?;
 
         // Initialize the shared context with the first message context
         let mut last_context = match inbound.first() {

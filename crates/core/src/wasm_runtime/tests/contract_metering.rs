@@ -249,7 +249,11 @@ fn test_timeout_metering() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let duration = time.elapsed().as_secs_f64();
-    println!("Duration: {:.2}s", duration);
+    assert!(
+        duration < 5.5,
+        "Took {:.2}s, should timeout before",
+        duration
+    );
 
     assert!(
         matches!(
