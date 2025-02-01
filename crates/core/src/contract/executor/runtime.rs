@@ -339,9 +339,13 @@ impl Executor<Runtime> {
                 Ok((state, contract)) => Ok(ContractResponse::GetResponse {
                     key,
                     state: state.ok_or_else(|| {
+                        tracing::trace!(
+                            contract = %key,
+                            "Contract state not found during get request"
+                        );
                         ExecutorError::request(StdContractError::Get {
                             key,
-                            cause: "contract state not found".into(), // Getting this error in the browser but trying to figure out why, can you add trace logging to help debug? AI!
+                            cause: "contract state not found".into(),
                         })
                     })?,
                     contract,
