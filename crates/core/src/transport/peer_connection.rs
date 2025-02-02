@@ -271,8 +271,8 @@ impl PeerConnection {
                     } = msg;
                     {
                         tracing::debug!(
-                            remote = %self.remote_conn.remote_addr, %packet_id, %payload, ?confirm_receipt,
-                            "received inbound packet"
+                            remote = %self.remote_conn.remote_addr, %packet_id, ?confirm_receipt,
+                            "received inbound packet",
                         );
                     }
 
