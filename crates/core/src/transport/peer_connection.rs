@@ -6,6 +6,7 @@ use std::{collections::HashMap, time::Instant};
 
 use crate::transport::connection_handler::NAT_TRAVERSAL_MAX_ATTEMPTS;
 use crate::transport::packet_data::UnknownEncryption;
+use crate::transport::sent_packet_tracker::MESSAGE_CONFIRMATION_TIMEOUT;
 use aes_gcm::Aes128Gcm;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -13,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{instrument, span, Instrument};
-use crate::transport::sent_packet_tracker::MESSAGE_CONFIRMATION_TIMEOUT;
 
 mod inbound_stream;
 mod outbound_stream;
@@ -365,7 +365,6 @@ impl PeerConnection {
                 }
             }
         }
-
     }
 
     /// Returns the external address of the peer holding this connection.
