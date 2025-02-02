@@ -126,7 +126,7 @@ impl OutboundConnectionHandler {
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(100);
 
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
-        let (outbound_sender, outbound_recv) = mpsc::channel(1);
+        let (outbound_sender, outbound_recv) = mpsc::channel(10000);
         let transport = UdpPacketsListener {
             is_gateway,
             socket_listener: socket.clone(),
