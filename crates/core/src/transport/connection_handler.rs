@@ -553,6 +553,10 @@ impl<S: Socket> UdpPacketsListener<S> {
         TraverseNatFuture,
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
+        tracing::debug!(
+            addr = ?remote_addr,
+            "Starting NAT traversal"
+        );
         // Constants for exponential backoff
         const INITIAL_TIMEOUT: Duration = Duration::from_millis(600);
         const TIMEOUT_MULTIPLIER: f64 = 1.2;
@@ -808,6 +812,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                 // We have retried for a while, so return an error
                 if timeout >= MAX_TIMEOUT {
+                    tracing::error!(%this_addr, %remote_addr, "failed to establish connection after multiple attempts, max timeout reached");
                     break;
                 }
 

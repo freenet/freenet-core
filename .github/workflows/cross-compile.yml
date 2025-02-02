@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build and Cross-Compile
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        run: cargo install cross
+
+      - name: Cross-compile for x86_64-unknown-linux-gnu
+        run: cross build --release --target x86_64-unknown-linux-gnu
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v3
+        with:
+          name: binaries
+          path: target/x86_64-unknown-linux-gnu/release/
