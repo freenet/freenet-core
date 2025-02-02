@@ -554,7 +554,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         tracing::debug!(
-            addr = ?remote_addr,
+            %remote_addr,
             "Starting NAT traversal"
         );
         // Constants for exponential backoff
