@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{instrument, span, Instrument};
+use crate::transport::sent_packet_tracker::MESSAGE_CONFIRMATION_TIMEOUT;
 
 mod inbound_stream;
 mod outbound_stream;
@@ -97,6 +98,7 @@ pub(crate) struct PeerConnection {
     outbound_stream_futures: FuturesUnordered<JoinHandle<Result>>,
     failure_count: usize,
     first_failure_time: Option<std::time::Instant>,
+    last_packet_report_time: Instant,
 }
 
 impl std::fmt::Debug for PeerConnection {
@@ -131,6 +133,7 @@ impl PeerConnection {
             outbound_stream_futures: FuturesUnordered::new(),
             failure_count: 0,
             first_failure_time: None,
+            last_packet_report_time: Instant::now(),
         }
     }
 
@@ -227,7 +230,6 @@ impl PeerConnection {
         let mut last_received = std::time::Instant::now();
 
         const FAILURE_TIME_WINDOW: Duration = Duration::from_secs(30);
-
         loop {
             // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
             tokio::select! {
@@ -274,21 +276,32 @@ impl PeerConnection {
                             "received inbound packet"
                         );
                     }
+
+                    let current_time = Instant::now();
+                    let should_send_receipts = if current_time > self.last_packet_report_time + MESSAGE_CONFIRMATION_TIMEOUT {
+                        self.last_packet_report_time = current_time;
+                        true
+                    } else {
+                        false
+                    };
+
                     self.remote_conn
                         .sent_tracker
                         .lock()
                         .report_received_receipts(&confirm_receipt);
-                    match self.received_tracker.report_received_packet(packet_id) {
-                        ReportResult::Ok => {}
-                        ReportResult::AlreadyReceived => {
+                    match (self.received_tracker.report_received_packet(packet_id), should_send_receipts) {
+                        (ReportResult::QueueFull, _) | (_, true) => {
+                            let receipts = self.received_tracker.get_receipts();
+                            tracing::debug!(?receipts, remote = %self.remote_conn.remote_addr, "queue full, reporting receipts");
+                            if !receipts.is_empty() {
+                                self.noop(receipts).await?;
+                            }
+                        },
+                        (ReportResult::Ok, _) => {}
+                        (ReportResult::AlreadyReceived, _) => {
                             tracing::trace!(%packet_id, "already received packet");
                             continue;
                         }
-                        ReportResult::QueueFull => {
-                            let receipts = self.received_tracker.get_receipts();
-                            tracing::debug!(?receipts, "queue full, reporting receipts");
-                            self.noop(receipts).await?;
-                        },
                     }
                     if let Some(msg) = self.process_inbound(payload).await.map_err(|error| {
                         tracing::error!(%error, %packet_id, remote = %self.remote_conn.remote_addr, "error processing inbound packet");
@@ -352,6 +365,7 @@ impl PeerConnection {
                 }
             }
         }
+
     }
 
     /// Returns the external address of the peer holding this connection.
