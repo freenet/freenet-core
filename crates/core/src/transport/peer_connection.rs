@@ -269,9 +269,8 @@ impl PeerConnection {
                         confirm_receipt,
                         payload,
                     } = msg;
-                    #[cfg(test)]
                     {
-                        tracing::trace!(
+                        tracing::debug!(
                             remote = %self.remote_conn.remote_addr, %packet_id, %payload, ?confirm_receipt,
                             "received inbound packet"
                         );
@@ -342,13 +341,14 @@ impl PeerConnection {
                 }
                 _ = resend_check.take().unwrap_or(tokio::time::sleep(Duration::from_millis(10))) => {
                     loop {
-                        // tracing::trace!(remote = ?self.remote_conn.remote_addr, "checking for resends");
+                        tracing::trace!(remote = ?self.remote_conn.remote_addr, "checking for resends");
                         let maybe_resend = self.remote_conn
                             .sent_tracker
                             .lock()
                             .get_resend();
                         match maybe_resend {
                             ResendAction::WaitUntil(wait_until) => {
+                                tracing::debug!(remote = ?self.remote_conn.remote_addr, "waiting until {:?}", wait_until);
                                 resend_check = Some(tokio::time::sleep_until(wait_until.into()));
                                 break;
                             }
