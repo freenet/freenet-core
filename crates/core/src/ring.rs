@@ -82,7 +82,7 @@ pub(crate) struct Ring {
 // }
 
 impl Ring {
-    const DEFAULT_MIN_CONNECTIONS: usize = 5;
+    const DEFAULT_MIN_CONNECTIONS: usize = 25;
 
     const DEFAULT_MAX_CONNECTIONS: usize = 200;
 

@@ -242,7 +242,7 @@ task_local! {
 }
 
 #[cfg(not(test))]
-pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 20;
+pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 40;
 #[cfg(test)]
 pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
 
@@ -554,7 +554,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         // Constants for exponential backoff
-        const INITIAL_TIMEOUT: Duration = Duration::from_millis(200);
+        const INITIAL_TIMEOUT: Duration = Duration::from_millis(600);
         const TIMEOUT_MULTIPLIER: f64 = 1.2;
         #[cfg(not(test))]
         const MAX_TIMEOUT: Duration = Duration::from_secs(60); // Maximum timeout limit
