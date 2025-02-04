@@ -157,16 +157,6 @@ export function handleBroadcastReceived(
     contract_location: number
 ) {
 
-    console.log("\nHandling Broadcast Received");
-    console.log("Transaction ID: " + transaction_id);
-    console.log("Target: " + target);
-    console.log("Requester: " + requester);
-    console.log("Key: " + key);
-    console.log("Change Type: " + change_type);
-    console.log("Timestamp: " + timestamp);
-    console.log("Contract Location: " + contract_location);
-
-
     let requester_location = parseFloat(
         requester.split(" (@")[1].split(")")[0]
     );
