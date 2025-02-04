@@ -4,7 +4,7 @@ import {
     RingVisualizationPoint,
     TransactionData,
 } from "./type_definitions";
-import { ContractChange } from "./generated/topology";
+import {ContractChange} from "./generated/topology";
 import * as fbTopology from "./generated/topology";
 
 export const get_change_type = (
@@ -17,14 +17,24 @@ export const get_change_type = (
             return ChangeType.PUT_SUCCESS;
         case fbTopology.ContractChangeType.PutFailure:
             return ChangeType.PUT_FAILURE;
+
         case fbTopology.ContractChangeType.BroadcastEmitted:
             return ChangeType.BROADCAST_EMITTED;
         case fbTopology.ContractChangeType.BroadcastReceived:
             return ChangeType.BROADCAST_RECEIVED;
+
         case fbTopology.ContractChangeType.GetContract:
             return ChangeType.GET_CONTRACT;
         case fbTopology.ContractChangeType.SubscribedToContract:
             return ChangeType.SUBSCRIBED_TO_CONTRACT;
+
+        case fbTopology.ContractChangeType.UpdateRequest:
+            return ChangeType.UPDATE_REQUEST;
+        case fbTopology.ContractChangeType.UpdateSuccess:
+            return ChangeType.UPDATE_SUCCESS;
+        case fbTopology.ContractChangeType.UpdateFailure:
+            return ChangeType.UPDATE_FAILURE;
+
         default:
             new Error("Invalid change type");
     }
@@ -240,6 +250,153 @@ export const parse_broadcast_received_msg = (
     };
 };
 
+export const parse_update_request_msg_data = (
+    contractChange: ContractChange,
+    changeType: fbTopology.ContractChangeType
+) => {
+    let update_request_obj = contractChange.change(
+        new fbTopology.UpdateRequest()
+    );
+
+    let transaction = update_request_obj.transaction();
+
+    if (!transaction) {
+        throw new Error("Transaction ID not found");
+    }
+
+    let contract_id = contractChange.contractId();
+
+    if (!contract_id) {
+        throw new Error("Contract ID not found");
+    }
+
+    let target = update_request_obj.target();
+
+    if (!target) {
+        throw new Error("Target Peer not found");
+    }
+
+    let requester = update_request_obj.requester();
+
+    if (!requester) {
+        throw new Error("Requester Peer not found");
+    }
+
+    let timestamp = update_request_obj.timestamp()!;
+
+    let change_type = get_change_type(changeType)!;
+
+    let contract_location = update_request_obj.contractLocation()!;
+
+    return {
+        transaction,
+        contract_id,
+        target,
+        requester,
+        change_type,
+        timestamp,
+        contract_location,
+    };
+};
+
+export const parse_update_success_msg_data = (
+    contractChange: ContractChange,
+    changeType: fbTopology.ContractChangeType
+) => {
+    let update_success_obj = contractChange.change(
+        new fbTopology.UpdateSuccess()
+    );
+
+    let transaction = update_success_obj.transaction();
+
+    if (!transaction) {
+        throw new Error("Transaction ID not found");
+    }
+
+    let contract_id = contractChange.contractId();
+
+    if (!contract_id) {
+        throw new Error("Contract ID not found");
+    }
+
+    let target = update_success_obj.target();
+
+    if (!target) {
+        throw new Error("Target Peer not found");
+    }
+
+    let requester = update_success_obj.requester();
+
+    if (!requester) {
+        throw new Error("Requester Peer not found");
+    }
+
+    let timestamp = update_success_obj.timestamp()!;
+
+    let change_type = get_change_type(changeType)!;
+
+    let contract_location = update_success_obj.contractLocation()!;
+
+    return {
+        transaction,
+        contract_id,
+        target,
+        requester,
+        change_type,
+        timestamp,
+        contract_location,
+    };
+};
+
+export const parse_update_failure_msg_data = (
+    contractChange: ContractChange,
+    changeType: fbTopology.ContractChangeType
+) => {
+    let update_failure_obj = contractChange.change(
+        new fbTopology.UpdateFailure()
+    );
+
+    let transaction = update_failure_obj.transaction();
+
+    if (!transaction) {
+        throw new Error("Transaction ID not found");
+    }
+
+    let contract_id = contractChange.contractId();
+
+    if (!contract_id) {
+        throw new Error("Contract ID not found");
+    }
+
+    let target = update_failure_obj.target();
+
+    if (!target) {
+        throw new Error("Target Peer not found");
+    }
+
+    let requester = update_failure_obj.requester();
+
+    if (!requester) {
+        throw new Error("Requester Peer not found");
+    }
+
+    let timestamp = update_failure_obj.timestamp()!;
+
+    let change_type = get_change_type(changeType)!;
+
+    let contract_location = update_failure_obj.contractLocation()!;
+
+    return {
+        transaction,
+        contract_id,
+        target,
+        requester,
+        change_type,
+        timestamp,
+        contract_location,
+    };
+};
+
 export const rust_timestamp_to_utc_string = (timestamp: number): string => {
     return new Date(parseInt(timestamp.toString()) * 1000).toUTCString();
 };
@@ -322,7 +479,7 @@ export const get_peers_description_to_render = (
 
 export const refresh_peers_tree = async (graph_definition: string) => {
     let element = document.querySelector("#transactions-tree-graph")!;
-    const { svg, bindFunctions } = await window.mermaid.render(
+    const {svg, bindFunctions} = await window.mermaid.render(
         "mermaid-tree",
         graph_definition
     );

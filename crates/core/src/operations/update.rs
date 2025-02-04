@@ -261,6 +261,7 @@ impl Operation for UpdateOp {
                     key,
                     new_value,
                     upstream,
+                    ..
                 } => {
                     let sender = op_manager.ring.connection_manager.own_location();
                     let mut broadcasted_to = *broadcasted_to;
@@ -318,6 +319,8 @@ impl Operation for UpdateOp {
                         id: *id,
                         target: upstream.clone(),
                         summary,
+                        sender: sender.clone(),
+                        key: *key,
                     });
 
                     new_state = None;
@@ -333,7 +336,7 @@ impl Operation for UpdateOp {
                             );
 
                             new_state = Some(UpdateState::Finished {
-                                key,
+                                key: key.clone(),
                                 summary: summary.clone(),
                             });
                             if let Some(upstream) = upstream {
@@ -341,6 +344,8 @@ impl Operation for UpdateOp {
                                     id: *id,
                                     target: upstream,
                                     summary: summary.clone(),
+                                    key,
+                                    sender: op_manager.ring.connection_manager.own_location(),
                                 });
                             } else {
                                 // this means op finalized
@@ -414,6 +419,7 @@ async fn try_to_broadcast(
                     broadcast_to,
                     key,
                     upstream,
+                    sender: op_manager.ring.connection_manager.own_location(),
                 });
 
                 let op = UpdateOp {
@@ -435,6 +441,8 @@ async fn try_to_broadcast(
                     id,
                     target: upstream,
                     summary,
+                    key,
+                    sender: op_manager.ring.connection_manager.own_location(),
                 });
             }
         }
@@ -647,6 +655,8 @@ mod messages {
             target: PeerKeyLocation,
             #[serde(deserialize_with = "StateSummary::deser_state_summary")]
             summary: StateSummary<'static>,
+            sender: PeerKeyLocation,
+            key: ContractKey,
         },
         AwaitUpdate {
             id: Transaction,
@@ -669,6 +679,7 @@ mod messages {
             new_value: WrappedState,
             //contract: ContractContainer,
             upstream: PeerKeyLocation,
+            sender: PeerKeyLocation,
         },
         /// Broadcasting a change to a peer, which then will relay the changes to other peers.
         BroadcastTo {

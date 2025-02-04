@@ -56,6 +56,8 @@ table UpdateRequest {
   key: string(required);
   requester: string(required);
   target: string(required);
+  timestamp: uint64;
+  contract_location: float64;
 }
 
 table PutSuccess {
@@ -81,6 +83,7 @@ table UpdateSuccess {
   target: string(required);
   key: string(required);
   timestamp: uint64;
+  contract_location: float64;
 }
 
 table UpdateFailure {
@@ -89,6 +92,7 @@ table UpdateFailure {
   target: string(required);
   key: string(required);
   timestamp: uint64;
+  contract_location: float64;
 }
 
 table BroadcastEmitted {
