@@ -210,12 +210,14 @@ impl Operation for UpdateOp {
                     key,
                     new_value,
                     sender,
-                    target,
+                    ..
                 } => {
                     if let Some(UpdateState::AwaitingResponse { .. }) = self.state {
                         tracing::debug!("Trying to broadcast to a peer that was the initiator of the op because it received the client request, or is in the middle of a seek node process");
                         return Err(OpError::StatePushed);
                     }
+
+                    let target = op_manager.ring.connection_manager.own_location();
 
                     tracing::debug!("Attempting contract value update - BroadcastTo - update");
                     let new_value = update_contract(
