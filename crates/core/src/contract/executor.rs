@@ -26,8 +26,8 @@ use crate::node::OpManager;
 use crate::operations::get::GetResult;
 use crate::operations::{OpEnum, OpError};
 use crate::wasm_runtime::{
-    ContractRuntimeInterface, ContractStore, DelegateRuntimeInterface, DelegateStore, Runtime,
-    SecretsStore, StateStore, StateStoreError,
+    ContractExecError, ContractRuntimeInterface, ContractStore, DelegateRuntimeInterface,
+    DelegateStore, Runtime, SecretsStore, StateStore, StateStoreError,
 };
 use crate::{
     client_events::{ClientId, HostResult},
@@ -38,7 +38,10 @@ pub(super) mod mock_runtime;
 pub(super) mod runtime;
 
 #[derive(Debug)]
-pub struct ExecutorError(Either<Box<RequestError>, anyhow::Error>);
+pub struct ExecutorError {
+    inner: Either<Box<RequestError>, anyhow::Error>,
+    fatal: bool,
+}
 
 enum InnerOpError {
     Upsert(ContractKey),
@@ -49,16 +52,25 @@ impl std::error::Error for ExecutorError {}
 
 impl ExecutorError {
     pub fn other(error: impl Into<anyhow::Error>) -> Self {
-        Self(Either::Right(error.into()))
+        Self {
+            inner: Either::Right(error.into()),
+            fatal: false,
+        }
     }
 
     /// Call this when an unreachable path is reached but need to avoid panics.
     fn internal_error() -> Self {
-        ExecutorError(Either::Right(anyhow::anyhow!("internal error")))
+        Self {
+            inner: Either::Right(anyhow::anyhow!("internal error")),
+            fatal: false,
+        }
     }
 
     fn request(error: impl Into<RequestError>) -> Self {
-        Self(Either::Left(Box::new(error.into())))
+        Self {
+            inner: Either::Left(Box::new(error.into())),
+            fatal: false,
+        }
     }
 
     fn execution(
@@ -68,7 +80,11 @@ impl ExecutorError {
         use crate::wasm_runtime::RuntimeInnerError;
         let error = outer_error.deref();
 
+        let mut fatal = false;
         if let RuntimeInnerError::ContractExecError(e) = error {
+            if matches!(e, ContractExecError::MaxComputeTimeExceeded) {
+                fatal = true;
+            }
             if let Some(InnerOpError::Upsert(key)) = &op {
                 return ExecutorError::request(StdContractError::update_exec_error(*key, e));
             }
@@ -117,15 +133,21 @@ impl ExecutorError {
             _ => {}
         }
 
-        ExecutorError::other(outer_error)
+        let mut err = ExecutorError::other(outer_error);
+        err.fatal = fatal;
+        err
     }
 
     pub fn is_request(&self) -> bool {
-        matches!(self.0, Either::Left(_))
+        matches!(self.inner, Either::Left(_))
+    }
+
+    pub fn is_fatal(&self) -> bool {
+        self.fatal
     }
 
     pub fn unwrap_request(self) -> RequestError {
-        match self.0 {
+        match self.inner {
             Either::Left(err) => *err,
             Either::Right(_) => panic!(),
         }
@@ -134,13 +156,16 @@ impl ExecutorError {
 
 impl From<RequestError> for ExecutorError {
     fn from(value: RequestError) -> Self {
-        Self(Either::Left(Box::new(value)))
+        Self {
+            inner: Either::Left(Box::new(value)),
+            fatal: false,
+        }
     }
 }
 
 impl Display for ExecutorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.0 {
+        match &self.inner {
             Either::Left(l) => write!(f, "{}", &**l),
             Either::Right(r) => write!(f, "{}", &**r),
         }
@@ -149,7 +174,10 @@ impl Display for ExecutorError {
 
 impl From<Box<RequestError>> for ExecutorError {
     fn from(value: Box<RequestError>) -> Self {
-        Self(Either::Left(value))
+        Self {
+            inner: Either::Left(value),
+            fatal: false,
+        }
     }
 }
 

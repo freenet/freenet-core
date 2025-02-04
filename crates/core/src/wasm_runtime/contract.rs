@@ -1,5 +1,5 @@
 use std::{
-    thread::{self, ScopedJoinHandle},
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
@@ -8,7 +8,7 @@ use freenet_stdlib::prelude::{
     ContractInterfaceResult, ContractKey, Parameters, RelatedContracts, StateDelta, StateSummary,
     UpdateData, UpdateModification, ValidateResult, WrappedState,
 };
-use wasmer::{Instance, TypedFunction};
+use wasmer::{Instance, Store, TypedFunction};
 
 type FfiReturnTy = i64;
 
@@ -89,22 +89,32 @@ impl ContractRuntimeInterface for super::Runtime {
             related_buf.ptr()
         };
 
-        let validate_func: TypedFunction<(i64, i64, i64), FfiReturnTy> =
-            running
-                .instance
-                .exports
-                .get_typed_function(&self.wasm_store, "validate_state")?;
+        let mut wasm_store = self.wasm_store.take().unwrap();
+        let validate_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = match running
+            .instance
+            .exports
+            .get_typed_function(&wasm_store, "validate_state")
+        {
+            Ok(f) => f,
+            Err(e) => {
+                self.wasm_store = Some(wasm_store);
+                return Err(e.into());
+            }
+        };
 
         let param_buf_ptr = param_buf_ptr as i64;
         let state_buf_ptr = state_buf_ptr as i64;
         let related_buf_ptr = related_buf_ptr as i64;
-        let wasm_store = &mut self.wasm_store;
-        let r: Result<i64, Errors> = std::thread::scope(|s| {
-            let r = s.spawn(move || {
-                validate_func.call(wasm_store, param_buf_ptr, state_buf_ptr, related_buf_ptr)
-            });
-            handle_execution_call(r)
+        let t = std::thread::spawn(move || {
+            let r = validate_func.call(
+                &mut wasm_store,
+                param_buf_ptr,
+                state_buf_ptr,
+                related_buf_ptr,
+            );
+            (r, wasm_store)
         });
+        let r = handle_execution_call(t, self);
 
         let result = match_err(self, &running.instance, r)?;
         let is_valid = unsafe {
@@ -147,26 +157,32 @@ impl ContractRuntimeInterface for super::Runtime {
             update_data_buf.ptr()
         };
 
-        let update_state_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = running
+        let mut wasm_store = self.wasm_store.take().unwrap();
+        let update_state_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = match running
             .instance
             .exports
-            .get_typed_function(&self.wasm_store, "update_state")?;
+            .get_typed_function(&wasm_store, "update_state")
+        {
+            Ok(f) => f,
+            Err(e) => {
+                self.wasm_store = Some(wasm_store);
+                return Err(e.into());
+            }
+        };
 
         let param_buf_ptr = param_buf_ptr as i64;
         let state_buf_ptr = state_buf_ptr as i64;
         let update_data_buf_ptr = update_data_buf_ptr as i64;
-        let wasm_store = &mut self.wasm_store;
-        let r: Result<i64, Errors> = std::thread::scope(|s| {
-            let r = s.spawn(move || {
-                update_state_func.call(
-                    wasm_store,
-                    param_buf_ptr,
-                    state_buf_ptr,
-                    update_data_buf_ptr,
-                )
-            });
-            handle_execution_call(r)
+        let t = std::thread::spawn(move || {
+            let r = update_state_func.call(
+                &mut wasm_store,
+                param_buf_ptr,
+                state_buf_ptr,
+                update_data_buf_ptr,
+            );
+            (r, wasm_store)
         });
+        let r = handle_execution_call(t, self);
 
         let result = match_err(self, &running.instance, r)?;
         let update_res = unsafe {
@@ -199,18 +215,26 @@ impl ContractRuntimeInterface for super::Runtime {
             state_buf.ptr()
         };
 
-        let summary_func: TypedFunction<(i64, i64), FfiReturnTy> = running
+        let mut wasm_store = self.wasm_store.take().unwrap();
+        let summary_func: TypedFunction<(i64, i64), FfiReturnTy> = match running
             .instance
             .exports
-            .get_typed_function(&self.wasm_store, "summarize_state")?;
+            .get_typed_function(&wasm_store, "summarize_state")
+        {
+            Ok(f) => f,
+            Err(e) => {
+                self.wasm_store = Some(wasm_store);
+                return Err(e.into());
+            }
+        };
 
         let param_buf_ptr = param_buf_ptr as i64;
         let state_buf_ptr = state_buf_ptr as i64;
-        let wasm_store = &mut self.wasm_store;
-        let r: Result<i64, Errors> = std::thread::scope(|s| {
-            let r = s.spawn(move || summary_func.call(wasm_store, param_buf_ptr, state_buf_ptr));
-            handle_execution_call(r)
+        let t = std::thread::spawn(move || {
+            let r = summary_func.call(&mut wasm_store, param_buf_ptr, state_buf_ptr);
+            (r, wasm_store)
         });
+        let r = handle_execution_call(t, self);
 
         let result = match_err(self, &running.instance, r)?;
         let result = unsafe {
@@ -249,21 +273,25 @@ impl ContractRuntimeInterface for super::Runtime {
             summary_buf.ptr()
         };
 
+        let mut wasm_store = self.wasm_store.take().unwrap();
         let get_state_delta_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = running
             .instance
             .exports
-            .get_typed_function(&self.wasm_store, "get_state_delta")?;
+            .get_typed_function(&wasm_store, "get_state_delta")?;
 
         let param_buf_ptr = param_buf_ptr as i64;
         let state_buf_ptr = state_buf_ptr as i64;
         let summary_buf_ptr = summary_buf_ptr as i64;
-        let wasm_store = &mut self.wasm_store;
-        let r: Result<i64, Errors> = std::thread::scope(|s| {
-            let r = s.spawn(move || {
-                get_state_delta_func.call(wasm_store, param_buf_ptr, state_buf_ptr, summary_buf_ptr)
-            });
-            handle_execution_call(r)
+        let t = std::thread::spawn(move || {
+            let r = get_state_delta_func.call(
+                &mut wasm_store,
+                param_buf_ptr,
+                state_buf_ptr,
+                summary_buf_ptr,
+            );
+            (r, wasm_store)
         });
+        let r = handle_execution_call(t, self);
 
         let result = match_err(self, &running.instance, r)?;
         let result = unsafe {
@@ -277,7 +305,8 @@ impl ContractRuntimeInterface for super::Runtime {
 }
 
 fn handle_execution_call(
-    r: ScopedJoinHandle<'_, Result<i64, wasmer::RuntimeError>>,
+    r: JoinHandle<(Result<i64, wasmer::RuntimeError>, Store)>,
+    rt: &mut super::Runtime,
 ) -> Result<i64, Errors> {
     for _ in 0..5 {
         if r.is_finished() {
@@ -288,9 +317,10 @@ fn handle_execution_call(
     if !r.is_finished() {
         return Err(Errors::MaxComputeTimeExceeded);
     }
-    let r = r
+    let (r, s) = r
         .join()
         .map_err(|_| Errors::Other(anyhow::anyhow!("Failed to join thread")))?;
+    rt.wasm_store = Some(s);
     r.map_err(Errors::Wasmer)
 }
 

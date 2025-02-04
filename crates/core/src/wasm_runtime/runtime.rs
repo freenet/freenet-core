@@ -55,13 +55,14 @@ impl RunningInstance {
             .as_ref()
             .map(Ok)
             .unwrap_or_else(|| instance.exports.get_memory("memory"))?;
+        let wasm_store = rt.wasm_store.as_mut().unwrap();
         let set_id: TypedFunction<i64, ()> = instance
             .exports
-            .get_typed_function(&rt.wasm_store, "__frnt_set_id")
+            .get_typed_function(&*wasm_store, "__frnt_set_id")
             .unwrap();
         let id = INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        set_id.call(&mut rt.wasm_store, id).unwrap();
-        let ptr = memory.view(&rt.wasm_store).data_ptr() as i64;
+        set_id.call(wasm_store, id).unwrap();
+        let ptr = memory.view(&*wasm_store).data_ptr() as i64;
         native_api::MEM_ADDR.insert(
             id,
             InstanceInfo {
@@ -118,7 +119,7 @@ impl Default for RuntimeConfig {
 
 pub struct Runtime {
     /// Working memory store used by the inner engine
-    pub(super) wasm_store: Store,
+    pub(super) wasm_store: Option<Store>,
     /// includes all the necessary imports to interact with the native runtime environment
     pub(super) top_level_imports: Imports,
     /// assigned growable host memory
@@ -160,7 +161,7 @@ impl Runtime {
         native_api::time::prepare_export(&mut store, &mut top_level_imports);
 
         Ok(Self {
-            wasm_store: store,
+            wasm_store: Some(store),
             top_level_imports,
             host_memory,
 
@@ -193,10 +194,11 @@ impl Runtime {
         T: AsRef<[u8]>,
     {
         let data = data.as_ref();
+        let wasm_store = self.wasm_store.as_mut().unwrap();
         let initiate_buffer: TypedFunction<u32, i64> = instance
             .exports
-            .get_typed_function(&self.wasm_store, "__frnt__initiate_buffer")?;
-        let builder_ptr = initiate_buffer.call(&mut self.wasm_store, data.len() as u32)?;
+            .get_typed_function(&*wasm_store, "__frnt__initiate_buffer")?;
+        let builder_ptr = initiate_buffer.call(wasm_store, data.len() as u32)?;
         let linear_mem = self.linear_mem(instance)?;
         unsafe {
             Ok(BufferMut::from_ptr(
@@ -212,7 +214,7 @@ impl Runtime {
             .as_ref()
             .map(Ok)
             .unwrap_or_else(|| instance.exports.get_memory("memory"))?
-            .view(&self.wasm_store);
+            .view(self.wasm_store.as_ref().unwrap());
         Ok(unsafe { WasmLinearMem::new(memory.data_ptr() as *const _, memory.data_size()) })
     }
 
@@ -231,7 +233,7 @@ impl Runtime {
                 .ok_or_else(|| RuntimeInnerError::ContractNotFound(*key))?;
             let module = match contract {
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
-                    Module::new(&self.wasm_store, contract_v1.code().data())?
+                    Module::new(self.wasm_store.as_ref().unwrap(), contract_v1.code().data())?
                 }
                 _ => unimplemented!(),
             };
@@ -257,7 +259,7 @@ impl Runtime {
                 .delegate_store
                 .fetch_delegate(key, params)
                 .ok_or_else(|| RuntimeInnerError::DelegateNotFound(key.clone()))?;
-            let module = Module::new(&self.wasm_store, delegate.code().as_ref())?;
+            let module = Module::new(self.wasm_store.as_ref().unwrap(), delegate.code().as_ref())?;
             self.delegate_modules.insert(key.clone(), module);
             self.delegate_modules.get(key).unwrap()
         }
@@ -268,19 +270,19 @@ impl Runtime {
     }
 
     fn set_instance_mem(&mut self, req_bytes: usize, instance: &Instance) -> RuntimeResult<()> {
+        let wasm_store = self.wasm_store.as_mut().unwrap();
         let memory = self
             .host_memory
             .as_ref()
             .map(Ok)
             .unwrap_or_else(|| instance.exports.get_memory("memory"))?;
         let req_pages: wasmer::Pages = Bytes::from(req_bytes).try_into().unwrap();
-        if memory.view(&self.wasm_store).size() < req_pages {
-            if let Err(err) = memory.grow(&mut self.wasm_store, req_pages) {
+        if memory.view(&*wasm_store).size() < req_pages {
+            if let Err(err) = memory.grow(wasm_store, req_pages) {
                 tracing::error!("wasm runtime failed with memory error: {err}");
                 return Err(ContractExecError::InsufficientMemory {
                     req: (req_pages.0 as usize * wasmer::WASM_PAGE_SIZE),
-                    free: (memory.view(&self.wasm_store).size().0 as usize
-                        * wasmer::WASM_PAGE_SIZE),
+                    free: (memory.view(&*wasm_store).size().0 as usize * wasmer::WASM_PAGE_SIZE),
                 }
                 .into());
             }
@@ -295,7 +297,7 @@ impl Runtime {
 
     fn prepare_instance(&mut self, module: &Module) -> RuntimeResult<Instance> {
         Ok(Instance::new(
-            &mut self.wasm_store,
+            self.wasm_store.as_mut().unwrap(),
             module,
             &self.top_level_imports,
         )?)
@@ -349,7 +351,7 @@ impl Runtime {
         instance: &wasmer::Instance,
         function_name: &str,
     ) -> super::error::ContractError {
-        let remaining_points = get_remaining_points(&mut self.wasm_store, instance);
+        let remaining_points = get_remaining_points(self.wasm_store.as_mut().unwrap(), instance);
         match remaining_points {
             MeteringPoints::Remaining(..) => {
                 tracing::error!("Error while calling {}: {:?}", function_name, error);
@@ -381,19 +383,19 @@ fn get_cpu_cycles_per_second_runtime() -> Option<u64> {
     }
 
     let output = Command::new("sysctl")
-        .arg("hw.cpufrequency")
+        .arg("hw.cpufrequency_max")
         .output()
         .ok()?;
 
     if output.status.success() {
         let output_str = String::from_utf8_lossy(&output.stdout);
-        println!("sysctl output (hw.cpufrequency): {}", output_str); // Debugging information
+        tracing::debug!("sysctl output (hw.cpufrequency_max): {}", output_str); // Debugging information
 
         if let Some(freq) = parse_sysctl_output(&output_str) {
             return Some(freq);
         }
     } else {
-        eprintln!("sysctl command failed with status: {}", output.status);
+        tracing::debug!("sysctl command failed with status: {}", output.status);
     }
 
     // Fallback to hw.tbfrequency if hw.cpufrequency is not available
@@ -401,13 +403,13 @@ fn get_cpu_cycles_per_second_runtime() -> Option<u64> {
 
     if output.status.success() {
         let output_str = String::from_utf8_lossy(&output.stdout);
-        println!("sysctl output (hw.tbfrequency): {}", output_str); // Debugging information
+        tracing::debug!("sysctl output (hw.tbfrequency): {}", output_str); // Debugging information
 
         if let Some(freq) = parse_sysctl_output(&output_str) {
             return Some(freq);
         }
     } else {
-        eprintln!("sysctl command failed with status: {}", output.status);
+        tracing::debug!("sysctl command failed with status: {}", output.status);
     }
     None
 }
