@@ -338,7 +338,7 @@ impl Operation for UpdateOp {
                             );
 
                             new_state = Some(UpdateState::Finished {
-                                key: key.clone(),
+                                key,
                                 summary: summary.clone(),
                             });
                             if let Some(upstream) = upstream {
