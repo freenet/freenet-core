@@ -306,9 +306,9 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     tracing::info!("sending update request");
                     ContractChange::update_request_msg(
                         tx_id.clone(),
-                        key.to_string(),
-                        requester.to_string(),
-                        target.to_string(),
+                        key,
+                        requester,
+                        target,
                         *timestamp,
                         *contract_location,
                     )
@@ -324,9 +324,9 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     tracing::info!("sending update success");
                     ContractChange::update_success_msg(
                         tx_id.clone(),
-                        key.to_string(),
-                        requester.to_string(),
-                        target.to_string(),
+                        key,
+                        requester,
+                        target,
                         *timestamp,
                         *contract_location,
                     )
@@ -342,9 +342,9 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     tracing::info!("sending update failure");
                     ContractChange::update_failure_msg(
                         tx_id.clone(),
-                        key.to_string(),
-                        requester.to_string(),
-                        target.to_string(),
+                        key,
+                        requester,
+                        target,
                         *timestamp,
                         *contract_location,
                     )
