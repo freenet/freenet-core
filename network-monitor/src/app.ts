@@ -112,9 +112,9 @@ function handleChanges(event: MessageEvent) {
 
                     handleUpdate(
                         transaction,
-                        contract_id,
                         target,
                         requester,
+                        contract_id,
                         change_type,
                         timestamp,
                         contract_location
@@ -168,9 +168,9 @@ function handleChanges(event: MessageEvent) {
 
                     handleUpdate(
                         transaction,
-                        contract_id,
                         target,
                         requester,
+                        contract_id,
                         change_type,
                         timestamp,
                         contract_location
@@ -195,9 +195,9 @@ function handleChanges(event: MessageEvent) {
 
                     handleUpdate(
                         transaction,
-                        contract_id,
                         target,
                         requester,
+                        contract_id,
                         change_type,
                         timestamp,
                         contract_location

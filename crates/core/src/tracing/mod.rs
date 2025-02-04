@@ -267,10 +267,10 @@ impl<'a> NetEventLog<'a> {
                 ..
             }) => EventKind::Put(PutEvent::BroadcastReceived {
                 id: *id,
-                requester: sender.clone(),
+                requester: target.clone(),
                 key: *key,
                 value: new_value.clone(),
-                target: target.clone(),
+                target: sender.clone(),
                 timestamp: chrono::Utc::now().timestamp() as u64,
             }),
             NetMessageV1::Get(GetMsg::ReturnGet {
@@ -353,10 +353,10 @@ impl<'a> NetEventLog<'a> {
                 ..
             }) => EventKind::Update(UpdateEvent::BroadcastReceived {
                 id: *id,
-                requester: sender.clone(),
+                requester: target.clone(),
                 key: *key,
                 value: new_value.clone(),
-                target: target.clone(),
+                target: sender.clone(),
                 timestamp: chrono::Utc::now().timestamp() as u64,
             }),
             _ => EventKind::Ignored,
