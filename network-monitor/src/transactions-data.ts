@@ -156,6 +156,17 @@ export function handleBroadcastReceived(
     timestamp: number,
     contract_location: number
 ) {
+
+    console.log("\nHandling Broadcast Received");
+    console.log("Transaction ID: " + transaction_id);
+    console.log("Target: " + target);
+    console.log("Requester: " + requester);
+    console.log("Key: " + key);
+    console.log("Change Type: " + change_type);
+    console.log("Timestamp: " + timestamp);
+    console.log("Contract Location: " + contract_location);
+
+
     let requester_location = parseFloat(
         requester.split(" (@")[1].split(")")[0]
     );
@@ -306,8 +317,10 @@ export function handleUpdate(
     );
     requester = requester.split(" (@")[0];
 
-    let target_location = parseFloat(target.split(" (@ ")[1].split(")")[0]);
-    target = target.split(" (@")[0];
+    //let target_location = parseFloat(target.split(" (@ ")[1].split(")")[0]);
+    //target = target.split(" (@")[0];
+
+    contract_id = contract_id.split(" (@")[0];
 
     let obj_data = {
         change_type,
