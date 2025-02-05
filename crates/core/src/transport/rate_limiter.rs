@@ -37,9 +37,9 @@ impl<T: TimeSource> PacketRateLimiter<T> {
     pub(super) async fn rate_limiter<S: Socket>(mut self, bandwidth_limit: usize, socket: Arc<S>) {
         tracing::info!(bandwidth_limit, "Rate limiter task started");
         while let Some((socket_addr, packet)) = self.outbound_packets.recv().await {
+            tracing::debug!(%socket_addr, "Received outbound packet to send");
             if let Some(wait_time) = self.can_send_packet(bandwidth_limit, packet.len()) {
                 tokio::time::sleep(wait_time).await;
-                tracing::debug!(%socket_addr, "Sending outbound packet after waiting {:?}", wait_time);
                 if let Err(error) = socket.send_to(&packet, socket_addr).await {
                     tracing::debug!("Error sending packet: {:?}", error);
                     continue;
