@@ -391,8 +391,25 @@ impl Executor<Runtime> {
                 }
                 .into())
             }
-            _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
+            other => {
+                tracing::warn!(
+                    client = %cli_id,
+                    request = ?other,
+                    "unsupported contract request"
+                );
+                Err(ExecutorError::other(anyhow::anyhow!("not supported")))
+            }
+        };
+
+        if let Err(ref e) = result {
+            tracing::error!(
+                client = %cli_id,
+                error = %e,
+                "contract request failed"
+            );
         }
+
+        result
     }
 
     pub fn delegate_request(
