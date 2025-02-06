@@ -339,9 +339,9 @@ impl Executor<Runtime> {
                 Ok((state, contract)) => Ok(ContractResponse::GetResponse {
                     key,
                     state: state.ok_or_else(|| {
-                        tracing::trace!(
+                        tracing::debug!(
                             contract = %key,
-                            "Contract state not found during get request"
+                            "Contract state not found during get request. This could indicate using an incorrect key."
                         );
                         ExecutorError::request(StdContractError::Get {
                             key,
