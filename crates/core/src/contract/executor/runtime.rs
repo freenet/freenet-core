@@ -313,6 +313,7 @@ impl Executor<Runtime> {
         }
     }
 
+    // Can you add better trace and debug logging to this function? AI!
     /// Responde to requests made through any API's from client applications in local mode.
     pub async fn contract_requests(
         &mut self,
