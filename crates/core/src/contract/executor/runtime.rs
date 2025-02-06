@@ -326,6 +326,7 @@ impl Executor<Runtime> {
                 state,
                 related_contracts,
             } => {
+                tracing::debug!("putting contract {}", contract.key());
                 self.perform_contract_put(contract, state, related_contracts)
                     .await
             }
@@ -341,7 +342,7 @@ impl Executor<Runtime> {
                     state: state.ok_or_else(|| {
                         tracing::debug!(
                             contract = %key,
-                            "Contract state not found during get request. This could indicate using an incorrect key."
+                            "Contract state not found during get request." 
                         );
                         ExecutorError::request(StdContractError::Get {
                             key,
