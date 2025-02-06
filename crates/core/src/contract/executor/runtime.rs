@@ -311,23 +311,13 @@ impl Executor<Runtime> {
             }
             other => {
                 tracing::warn!(
-                    client = %cli_id,
+                    client = %id,
                     request = ?other,
-                    "unsupported contract request"
+                    "unsupported client request"
                 );
                 Err(ExecutorError::other(anyhow::anyhow!("not supported")))
             }
-        };
-        
-        if let Err(ref e) = result {
-            tracing::error!(
-                client = %cli_id,
-                error = %e,
-                "contract request failed"
-            );
         }
-        
-        result
     }
 
     /// Respond to requests made through any API's from client applications in local mode.
