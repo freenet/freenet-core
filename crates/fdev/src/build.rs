@@ -143,9 +143,14 @@ fn get_out_lib(work_dir: &Path, cli_config: &BuildToolConfig) -> anyhow::Result<
         "debug"
     };
     let output_lib = env::var("CARGO_TARGET_DIR")
-        .inspect_err(|_| {
-            println!("Missing environment variable `CARGO_TARGET_DIR");
-        })?
+        .unwrap_or_else(|_| {
+            // For tests, use a temporary directory if CARGO_TARGET_DIR is not set
+            if cfg!(test) {
+                env::temp_dir().join("cargo_target")
+            } else {
+                panic!("Missing environment variable CARGO_TARGET_DIR")
+            }
+        })
         .parse::<PathBuf>()?
         .join(target)
         .join(opt_dir)
