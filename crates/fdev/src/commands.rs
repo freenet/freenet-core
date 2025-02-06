@@ -133,7 +133,7 @@ async fn put_contract(
         tracing::warn!("no state provided for contract, if your contract cannot handle empty state correctly, this will always cause an error.");
         freenet_stdlib::prelude::State::from(vec![])
     };
-    let related_contracts = if let Some(_related) = &contract_config.related_contracts {
+    let related_contracts: freenet_stdlib::prelude::RelatedContracts = if let Some(_related) = &contract_config.related_contracts {
         todo!("use `related` contracts")
     } else {
         Default::default()
