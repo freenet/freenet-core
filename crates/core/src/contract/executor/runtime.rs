@@ -309,25 +309,50 @@ impl Executor<Runtime> {
                 }
                 Err(RequestError::Disconnect.into())
             }
-            _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
+            other => {
+                tracing::warn!(
+                    client = %cli_id,
+                    request = ?other,
+                    "unsupported contract request"
+                );
+                Err(ExecutorError::other(anyhow::anyhow!("not supported")))
+            }
+        };
+        
+        if let Err(ref e) = result {
+            tracing::error!(
+                client = %cli_id,
+                error = %e,
+                "contract request failed"
+            );
         }
+        
+        result
     }
 
-    // Can you add better trace and debug logging to this function? AI!
-    /// Responde to requests made through any API's from client applications in local mode.
+    /// Respond to requests made through any API's from client applications in local mode.
     pub async fn contract_requests(
         &mut self,
         req: ContractRequest<'_>,
         cli_id: ClientId,
         updates: Option<mpsc::UnboundedSender<Result<HostResponse, WsClientError>>>,
     ) -> Response {
-        match req {
+        tracing::debug!(
+            client = %cli_id,
+            "received contract request"
+        );
+        let result = match req {
             ContractRequest::Put {
                 contract,
                 state,
                 related_contracts,
             } => {
-                tracing::debug!("putting contract {}", contract.key());
+                tracing::debug!(
+                    client = %cli_id,
+                    contract = %contract.key(),
+                    state_size = state.as_ref().len(),
+                    "putting contract"
+                );
                 self.perform_contract_put(contract, state, related_contracts)
                     .await
             }
@@ -356,7 +381,12 @@ impl Executor<Runtime> {
                 Err(err) => Err(err),
             },
             ContractRequest::Subscribe { key, summary } => {
-                tracing::debug!("subscribing to contract {key}");
+                tracing::debug!(
+                    client = %cli_id,
+                    contract = %key,
+                    has_summary = summary.is_some(),
+                    "subscribing to contract"
+                );
                 let updates = updates.ok_or_else(|| {
                     ExecutorError::other(anyhow::anyhow!("missing update channel"))
                 })?;
