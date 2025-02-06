@@ -213,6 +213,10 @@ impl ContractExecutor for Executor<Runtime> {
 }
 
 impl Executor<Runtime> {
+    // Private implementation methods
+}
+
+impl Executor<Runtime> {
     pub async fn from_config(
         config: Arc<Config>,
         event_loop_channel: Option<ExecutorToEventLoopChannel<ExecutorHalve>>,
@@ -777,11 +781,11 @@ impl Executor<Runtime> {
             Err(err) => {
                 tracing::error!(contract = %key, error = %err, "Failed to get contract state");
                 Err(ExecutorError::request(RequestError::from(
-                StdContractError::Get {
-                    key,
-                    cause: format!("{err}").into(),
-                },
-            ))),
+                    StdContractError::Get {
+                        key,
+                        cause: format!("{err}").into(),
+                    },
+                ))),
         }
     }
 
