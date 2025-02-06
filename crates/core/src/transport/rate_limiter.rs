@@ -36,22 +36,50 @@ impl PacketRateLimiter<InstantTimeSrc> {
 impl<T: TimeSource> PacketRateLimiter<T> {
     pub(super) async fn rate_limiter<S: Socket>(mut self, bandwidth_limit: usize, socket: Arc<S>) {
         tracing::info!(bandwidth_limit, "Rate limiter task started");
+        let mut total_packets = 0;
+        let mut last_packet_time = self.time_source.now();
+
         while let Some((socket_addr, packet)) = self.outbound_packets.recv().await {
-            tracing::debug!(%socket_addr, "Received outbound packet to send");
+            total_packets += 1;
+            let now = self.time_source.now();
+            let time_since_last = now - last_packet_time;
+            
+            tracing::debug!(
+                %socket_addr,
+                packet_size = packet.len(),
+                total_packets,
+                ?time_since_last,
+                current_bandwidth = self.current_bandwidth,
+                "Processing outbound packet"
+            );
+            
             if let Some(wait_time) = self.can_send_packet(bandwidth_limit, packet.len()) {
+                tracing::debug!(%socket_addr, ?wait_time, "Rate limiting activated, waiting before sending");
                 tokio::time::sleep(wait_time).await;
-                tracing::debug!(%socket_addr, "Sending packet after waiting {:?}", wait_time);
-                if let Err(error) = socket.send_to(&packet, socket_addr).await {
-                    tracing::debug!("Error sending packet: {:?}", error);
+                tracing::debug!(%socket_addr, "Sending packet after rate limit wait");
+                if let Err(error) = socket.send_to(&packet, socket_addr).await.inspect(|bytes_sent| {
+                    tracing::debug!(%socket_addr, bytes_sent, "Socket send_to executed");
+                }) {
+                    tracing::error!(%socket_addr, %error, "Failed to send packet after rate limit wait");
                     continue;
                 }
-            } else if let Err(error) = socket.send_to(&packet, socket_addr).await {
-                tracing::debug!(%socket_addr, "Error sending packet: {:?}", error);
+            } else if let Err(error) = socket.send_to(&packet, socket_addr).await.inspect(|bytes_sent| {
+                tracing::debug!(%socket_addr, bytes_sent, "Socket send_to executed immediately");
+            }) {
+                tracing::error!(%socket_addr, %error, "Failed to send packet immediately");
                 continue;
             }
+            
             self.add_packet(packet.len());
+            last_packet_time = now;
+            
+            tracing::debug!(
+                total_packets,
+                current_bandwidth = self.current_bandwidth,
+                "Rate limiter status update"
+            );
         }
-        tracing::debug!("Rate limiter task ended unexpectedly");
+        tracing::warn!("Rate limiter task ended - channel closed");
     }
 
     /// Report that a packet was sent

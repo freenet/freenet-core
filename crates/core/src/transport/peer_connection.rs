@@ -495,6 +495,9 @@ async fn packet_sending(
     payload: impl Into<SymmetricMessagePayload>,
     sent_tracker: &parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>,
 ) -> Result<()> {
+    let start_time = std::time::Instant::now();
+    tracing::debug!(%remote_addr, %packet_id, "Attempting to send packet");
+    
     match SymmetricMessage::try_serialize_msg_to_packet_data(
         packet_id,
         payload,
@@ -502,16 +505,28 @@ async fn packet_sending(
         confirm_receipt,
     )? {
         either::Either::Left(packet) => {
-            outbound_packets
+            let packet_size = packet.data().len();
+            tracing::debug!(%remote_addr, %packet_id, packet_size, "Sending single packet");
+            match outbound_packets
                 .send((remote_addr, packet.clone().prepared_send()))
                 .await
-                .map_err(|_| TransportError::ConnectionClosed(remote_addr))?;
-            sent_tracker
-                .lock()
-                .report_sent_packet(packet_id, packet.prepared_send());
-            Ok(())
+            {
+                Ok(_) => {
+                    let elapsed = start_time.elapsed();
+                    tracing::debug!(%remote_addr, %packet_id, ?elapsed, "Successfully sent packet");
+                    sent_tracker
+                        .lock()
+                        .report_sent_packet(packet_id, packet.prepared_send());
+                    Ok(())
+                }
+                Err(e) => {
+                    tracing::error!(%remote_addr, %packet_id, error = %e, "Failed to send packet - channel closed");
+                    Err(TransportError::ConnectionClosed(remote_addr))
+                }
+            }
         }
         either::Either::Right((payload, mut confirm_receipt)) => {
+            tracing::debug!(%remote_addr, %packet_id, "Sending multi-packet message");
             macro_rules! send {
                 ($packets:ident) => {{
                     for packet in $packets {
