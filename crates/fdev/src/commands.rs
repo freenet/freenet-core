@@ -139,7 +139,13 @@ async fn put_contract(
         Default::default()
     };
 
-    println!("Putting contract {}", contract.key());
+    let key = contract.key();
+    tracing::info!("Publishing contract {key}");
+    tracing::debug!(
+        state_size = state.as_ref().len(),
+        has_related = !related_contracts.is_empty(),
+        "Contract details"
+    );
     let request = ContractRequest::Put {
         contract,
         state: state.to_vec().into(),

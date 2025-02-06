@@ -748,6 +748,11 @@ impl Executor<Runtime> {
         return_contract_code: bool,
         key: ContractKey,
     ) -> Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError> {
+        tracing::debug!(
+            contract = %key,
+            return_code = return_contract_code,
+            "Getting contract"
+        );
         let mut got_contract: Option<ContractContainer> = None;
 
         if return_contract_code {
@@ -756,10 +761,22 @@ impl Executor<Runtime> {
             }
         }
 
-        match self.state_store.get(&key).await {
+        let state_result = self.state_store.get(&key).await;
+        tracing::debug!(
+            contract = %key,
+            state_found = state_result.is_ok(),
+            has_contract = got_contract.is_some(),
+            "Contract get result"
+        );
+        match state_result {
             Ok(state) => Ok((Some(state), got_contract)),
-            Err(StateStoreError::MissingContract(_)) => Ok((None, got_contract)),
-            Err(err) => Err(ExecutorError::request(RequestError::from(
+            Err(StateStoreError::MissingContract(_)) => {
+                tracing::warn!(contract = %key, "Contract state not found in store");
+                Ok((None, got_contract))
+            },
+            Err(err) => {
+                tracing::error!(contract = %key, error = %err, "Failed to get contract state");
+                Err(ExecutorError::request(RequestError::from(
                 StdContractError::Get {
                     key,
                     cause: format!("{err}").into(),
