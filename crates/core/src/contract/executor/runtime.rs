@@ -345,7 +345,7 @@ impl Executor<Runtime> {
                         );
                         ExecutorError::request(StdContractError::Get {
                             key,
-                            cause: "contract state not found".into(),
+                            cause: "contract state not found".into(), // Getting this error, need to add debug/trace logging to figure out why - most likely I'm using the wrong key - 
                         })
                     })?,
                     contract,
