@@ -786,6 +786,7 @@ impl Executor<Runtime> {
                         cause: format!("{err}").into(),
                     }
                 )))
+            }
         }
     }
 
