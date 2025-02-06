@@ -270,35 +270,81 @@ impl PeerConnection {
                         payload,
                     } = msg;
                     {
-                        tracing::debug!(
-                            remote = %self.remote_conn.remote_addr, %packet_id, ?confirm_receipt,
-                            "received inbound packet",
+                        tracing::info!(
+                            remote = %self.remote_conn.remote_addr, 
+                            %packet_id, 
+                            confirm_receipts_count = ?confirm_receipt.len(),
+                            confirm_receipts = ?confirm_receipt,
+                            "received inbound packet with confirmations"
                         );
                     }
 
                     let current_time = Instant::now();
                     let should_send_receipts = if current_time > self.last_packet_report_time + MESSAGE_CONFIRMATION_TIMEOUT {
+                        tracing::info!(
+                            remote = %self.remote_conn.remote_addr,
+                            elapsed = ?current_time.duration_since(self.last_packet_report_time),
+                            timeout = ?MESSAGE_CONFIRMATION_TIMEOUT,
+                            "timeout reached, should send receipts"
+                        );
                         self.last_packet_report_time = current_time;
                         true
                     } else {
                         false
                     };
 
+                    // Log received confirmations
+                    if !confirm_receipt.is_empty() {
+                        tracing::info!(
+                            remote = %self.remote_conn.remote_addr,
+                            "Received confirmation for {} packets with IDs: {:?}",
+                            confirm_receipt.len(),
+                            confirm_receipt
+                        );
+                    }
+
                     self.remote_conn
                         .sent_tracker
                         .lock()
                         .report_received_receipts(&confirm_receipt);
-                    match (self.received_tracker.report_received_packet(packet_id), should_send_receipts) {
+
+                    let report_result = self.received_tracker.report_received_packet(packet_id);
+                    tracing::info!(
+                        remote = %self.remote_conn.remote_addr,
+                        %packet_id,
+                        ?report_result,
+                        "packet reported to received tracker"
+                    );
+
+                    match (report_result, should_send_receipts) {
                         (ReportResult::QueueFull, _) | (_, true) => {
                             let receipts = self.received_tracker.get_receipts();
-                            tracing::debug!(?receipts, remote = %self.remote_conn.remote_addr, "queue full, reporting receipts");
+                            tracing::info!(
+                                ?receipts, 
+                                receipts_count = receipts.len(),
+                                remote = %self.remote_conn.remote_addr, 
+                                timeout_triggered = should_send_receipts,
+                                "sending accumulated receipts"
+                            );
                             if !receipts.is_empty() {
+                                tracing::info!(
+                                    remote = %self.remote_conn.remote_addr,
+                                    receipts_count = receipts.len(),
+                                    confirmed_packets = ?receipts,
+                                    "sending confirmation receipts"
+                                );
                                 self.noop(receipts).await?;
                             }
                         },
-                        (ReportResult::Ok, _) => {}
+                        (ReportResult::Ok, _) => {
+                            tracing::debug!(
+                                remote = %self.remote_conn.remote_addr,
+                                %packet_id,
+                                "packet accepted, waiting for more before sending receipt"
+                            );
+                        }
                         (ReportResult::AlreadyReceived, _) => {
-                            tracing::trace!(%packet_id, "already received packet");
+                            tracing::debug!(%packet_id, "already received packet");
                             continue;
                         }
                     }

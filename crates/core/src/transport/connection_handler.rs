@@ -283,18 +283,31 @@ impl<S: Socket> UdpPacketsListener<S> {
                     break 'inner;
                 }
             }
+
             tokio::select! {
-                // Handling of inbound packets
                 recv_result = self.socket_listener.recv_from(&mut buf) => {
                     match recv_result {
                         Ok((size, remote_addr)) => {
                             let packet_data = PacketData::from_buf(&buf[..size]);
-                            tracing::debug!(%remote_addr, %size, "received packet from remote");
-                            if let Some(remote_conn) = self.remote_connections.remove(&remote_addr){
+                            
+                            tracing::debug!(
+                                %remote_addr,
+                                %size,
+                                has_remote_conn = %self.remote_connections.contains_key(&remote_addr),
+                                has_ongoing_gw = %ongoing_gw_connections.contains_key(&remote_addr),
+                                has_ongoing_conn = %ongoing_connections.contains_key(&remote_addr),
+                                "received packet from remote"
+                            );
+
+                            if let Some(remote_conn) = self.remote_connections.remove(&remote_addr) {
                                 if remote_conn.inbound_packet_sender.send(packet_data)
                                     .await
                                     .inspect_err(|err| {
-                                        tracing::debug!(%remote_addr, %err, "failed to receive packet from remote");
+                                        tracing::warn!(
+                                            %remote_addr,
+                                            %err,
+                                            "failed to receive packet from remote"
+                                        );
                                     })
                                     .is_ok()
                                 {
@@ -303,9 +316,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 continue;
                             }
 
-                            if let Some(inbound_packet_sender) = ongoing_gw_connections.remove(&remote_addr){
+                            if let Some(inbound_packet_sender) = ongoing_gw_connections.remove(&remote_addr) {
                                 if inbound_packet_sender.send(packet_data).await.inspect_err(|err| {
-                                    tracing::debug!(%remote_addr, %err, "failed to receive packet from remote");
+                                    tracing::warn!(
+                                        %remote_addr,
+                                        %err,
+                                        "failed to receive packet from remote"
+                                    );
                                 }).is_ok() {
                                     ongoing_gw_connections.insert(remote_addr, inbound_packet_sender);
                                 }
@@ -313,32 +330,39 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
 
                             if let Some((packets_sender, open_connection)) = ongoing_connections.remove(&remote_addr) {
-                                if packets_sender.send(packet_data).await.is_err() {
-                                    // it can happen that the connection is established but the channel is closed because the task completed
-                                    // but we still haven't polled the result future
-                                    tracing::debug!(%remote_addr, "failed to send packet to remote");
+                                if packets_sender.send(packet_data).await.inspect_err(|err| {
+                                    tracing::warn!(
+                                        %remote_addr,
+                                        %err,
+                                        "failed to send packet to remote"
+                                    );
+                                }).is_ok() {
+                                    ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
                                 }
-                                ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
                                 continue;
                             }
 
                             if !self.is_gateway {
-                                tracing::trace!(%remote_addr, "unexpected packet from remote");
+                                tracing::debug!(
+                                    %remote_addr,
+                                    %size,
+                                    "unexpected packet from non-gateway node"
+                                );
                                 continue;
                             }
-                            let packet_data = PacketData::from_buf(&buf[..size]);
+
                             let inbound_key_bytes = key_from_addr(&remote_addr);
                             let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
                             let task = tokio::spawn(gw_ongoing_connection
                                 .instrument(tracing::span!(tracing::Level::DEBUG, "gateway_connection"))
                                 .map_err(move |error| {
-                                (error, remote_addr)
-                            }));
+                                    tracing::warn!(%remote_addr, %error, "gateway connection error");
+                                    (error, remote_addr)
+                                }));
                             ongoing_gw_connections.insert(remote_addr, packets_sender);
                             gw_connection_tasks.push(task);
                         }
                         Err(e) => {
-                            // TODO: this should panic and be propagate to the main task or retry and eventually fail
                             tracing::error!("Failed to receive UDP packet: {:?}", e);
                             return Err(e.into());
                         }
