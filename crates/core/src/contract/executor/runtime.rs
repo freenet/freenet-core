@@ -784,8 +784,8 @@ impl Executor<Runtime> {
                     StdContractError::Get {
                         key,
                         cause: format!("{err}").into(),
-                    },
-                ))),
+                    }
+                )))
         }
     }
 
