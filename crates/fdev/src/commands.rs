@@ -225,7 +225,15 @@ pub(crate) async fn execute_command(
     api_client: &mut WebApi,
 ) -> anyhow::Result<()> {
     tracing::debug!("Starting execute_command with request: {request}");
-    let result = v1::execute_command(request, api_client).await;
-    tracing::debug!(success = ?result.is_ok(), "Finished execute_command");
-    result
+    tracing::debug!("Sending request to server and waiting for response...");
+    match v1::execute_command(request, api_client).await {
+        Ok(_) => {
+            tracing::debug!("Server confirmed successful execution");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("Server returned error: {}", e);
+            Err(e)
+        }
+    }
 }

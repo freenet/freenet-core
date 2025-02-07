@@ -212,8 +212,16 @@ async fn websocket_commands(
 ) -> axum::response::Response {
     let on_upgrade = move |ws: WebSocket| async move {
         tracing::debug!(protoc = ?ws.protocol(), "websocket connection established");
-        if let Err(error) = websocket_interface(rs.clone(), auth_token, encoding_protoc, ws).await {
-            tracing::error!("{error}");
+        match websocket_interface(rs.clone(), auth_token, encoding_protoc, ws).await {
+            Ok(_) => {
+                tracing::debug!("WebSocket interface completed normally");
+            }
+            Err(error) => {
+                tracing::error!("WebSocket interface error: {}", error);
+                if let Some(source) = error.source() {
+                    tracing::error!("Caused by: {}", source);
+                }
+            }
         }
     };
     ws.on_upgrade(on_upgrade)
