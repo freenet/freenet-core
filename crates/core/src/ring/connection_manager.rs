@@ -153,16 +153,7 @@ impl ConnectionManager {
             return false;
         }
 
-        let my_location = self
-            .own_location()
-            .location
-            .unwrap_or_else(Location::random);
-        let accepted = if location == my_location
-            || self.connections_by_location.read().contains_key(&location)
-        {
-            tracing::debug!(%peer_id, "Rejected connection, same location");
-            false
-        } else if total_conn < self.min_connections {
+        let accepted = if total_conn < self.min_connections {
             tracing::debug!(%peer_id, "Accepted connection, below min connections");
             true
         } else if total_conn >= self.max_connections {

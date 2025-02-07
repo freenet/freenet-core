@@ -557,10 +557,10 @@ impl Executor<Runtime> {
         };
         let new_state = WrappedState::new(new_state.into_bytes());
 
-        if new_state.as_ref() == current_state.as_ref() {
-            tracing::debug!("No changes in state for contract {key}, avoiding update");
-            return Ok(Either::Left(current_state.clone()));
-        }
+        // if new_state.as_ref() == current_state.as_ref() {
+        //     tracing::debug!("No changes in state for contract {key}, avoiding update");
+        //     return Ok(Either::Left(current_state.clone()));
+        // }
 
         self.state_store
             .update(key, new_state.clone())
