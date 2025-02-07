@@ -152,8 +152,12 @@ async fn put_contract(
         related_contracts,
     }
     .into();
+    tracing::debug!("Starting WebSocket client connection");
     let mut client = start_api_client(other).await?;
-    execute_command(request, &mut client).await
+    tracing::debug!("WebSocket client connected successfully");
+    let result = execute_command(request, &mut client).await;
+    tracing::debug!(success = ?result.is_ok(), "WebSocket client operation complete");
+    result
 }
 
 async fn put_delegate(
@@ -220,5 +224,8 @@ pub(crate) async fn execute_command(
     request: ClientRequest<'static>,
     api_client: &mut WebApi,
 ) -> anyhow::Result<()> {
-    v1::execute_command(request, api_client).await
+    tracing::debug!("Starting execute_command with request: {request}");
+    let result = v1::execute_command(request, api_client).await;
+    tracing::debug!(success = ?result.is_ok(), "Finished execute_command");
+    result
 }
