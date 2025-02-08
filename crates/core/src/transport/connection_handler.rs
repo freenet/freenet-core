@@ -241,6 +241,8 @@ task_local! {
     static RANDOM_U64: [u8; 8];
 }
 
+/// The amount of times to retry NAT traversal before giving up. It should be sufficient
+/// so we give peers enough time for the other party to start the connection on its end.
 #[cfg(not(test))]
 pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 40;
 #[cfg(test)]
