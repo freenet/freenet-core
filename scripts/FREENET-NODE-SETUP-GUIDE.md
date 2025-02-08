@@ -48,7 +48,7 @@ The `freenet-setup.sh` script supports two modes:
 ```bash
   cd freenet
   git clone https://github.com/freenet/freenet-core.git
-  cd freenet-core
+  cd freenet-core/scripts
   chmod +x freenet-node-setup.sh
 ```
 
