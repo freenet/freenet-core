@@ -1,6 +1,6 @@
 #[cfg(debug_assertions)]
 use std::backtrace::Backtrace as StdTrace;
-use std::{pin::Pin, time::Duration};
+use std::{collections::HashSet, pin::Pin, time::Duration};
 
 use freenet_stdlib::prelude::ContractKey;
 use futures::Future;
@@ -310,7 +310,7 @@ async fn start_subscription_request(
     op_manager: &OpManager,
     key: ContractKey,
     try_get: bool,
-    skip_list: Vec<PeerId>,
+    skip_list: HashSet<PeerId>,
 ) {
     let sub_op = subscribe::start_op(key);
     if let Err(error) = subscribe::request_subscribe(op_manager, sub_op).await {

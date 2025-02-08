@@ -1,11 +1,6 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-
-use freenet_stdlib::{
-    client_api::{ContractResponse, ErrorKind, HostResponse},
-    prelude::*,
-};
-use serde::{Deserialize, Serialize};
 
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::{
@@ -15,6 +10,11 @@ use crate::{
     node::{NetworkBridge, OpManager, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
 };
+use freenet_stdlib::{
+    client_api::{ContractResponse, ErrorKind, HostResponse},
+    prelude::*,
+};
+use serde::{Deserialize, Serialize};
 
 pub(crate) use self::messages::SubscribeMsg;
 
@@ -31,7 +31,7 @@ enum SubscribeState {
     ReceivedRequest,
     /// Awaitinh response from petition.
     AwaitingResponse {
-        skip_list: Vec<PeerId>,
+        skip_list: HashSet<PeerId>,
         retries: usize,
         upstream_subscriber: Option<PeerKeyLocation>,
         current_hop: usize,
@@ -90,7 +90,7 @@ pub(crate) async fn request_subscribe(
     match sub_op.state {
         Some(SubscribeState::PrepareRequest { id, key, .. }) => {
             let new_state = Some(SubscribeState::AwaitingResponse {
-                skip_list: vec![],
+                skip_list: vec![].into_iter().collect(),
                 retries: 0,
                 current_hop: op_manager.ring.max_hops_to_live,
                 upstream_subscriber: None,
@@ -209,7 +209,7 @@ impl Operation for SubscribeOp {
                         key: *key,
                         target: target.clone(),
                         subscriber: sender.clone(),
-                        skip_list: vec![sender.peer],
+                        skip_list: HashSet::from([sender.peer]),
                         htl: op_manager.ring.max_hops_to_live,
                         retries: 0,
                     });
@@ -240,9 +240,8 @@ impl Operation for SubscribeOp {
                     if !super::has_contract(op_manager, *key).await? {
                         tracing::debug!(tx = %id, %key, "Contract not found, trying other peer");
 
-                        let Some(new_target) = op_manager
-                            .ring
-                            .closest_potentially_caching(key, skip_list.as_slice())
+                        let Some(new_target) =
+                            op_manager.ring.closest_potentially_caching(key, skip_list)
                         else {
                             tracing::warn!(tx = %id, %key, "No target peer found while trying getting contract");
                             return Ok(return_not_subbed());
@@ -255,7 +254,7 @@ impl Operation for SubscribeOp {
                         }
 
                         let mut new_skip_list = skip_list.clone();
-                        new_skip_list.push(target.peer.clone());
+                        new_skip_list.insert(target.peer.clone());
 
                         tracing::debug!(tx = %id, new_target = %new_target.peer, "Forward request to peer");
                         // Retry seek node when the contract to subscribe has not been found in this node
@@ -332,10 +331,10 @@ impl Operation for SubscribeOp {
                             current_hop,
                         }) => {
                             if retries < MAX_RETRIES {
-                                skip_list.push(sender.peer.clone());
+                                skip_list.insert(sender.peer.clone());
                                 if let Some(target) = op_manager
                                     .ring
-                                    .closest_potentially_caching(key, skip_list.as_slice())
+                                    .closest_potentially_caching(key, &skip_list)
                                     .into_iter()
                                     .next()
                                 {
@@ -459,7 +458,7 @@ mod messages {
             key: ContractKey,
             target: PeerKeyLocation,
             subscriber: PeerKeyLocation,
-            skip_list: Vec<PeerId>,
+            skip_list: HashSet<PeerId>,
             htl: usize,
             retries: usize,
         },

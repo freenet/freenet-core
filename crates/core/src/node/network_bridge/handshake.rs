@@ -368,6 +368,9 @@ impl HandshakeHandler {
                                         location: Some(joiner_loc),
                                     };
 
+                                    let mut skip_list = skip_list.clone();
+                                    skip_list.insert(my_peer_id.peer.clone());
+
                                     let f = forward_conn(
                                         id,
                                         &self.connection_manager,
@@ -504,8 +507,8 @@ impl HandshakeHandler {
             location: Some(joiner_loc),
         };
         let my_peer_id = self.connection_manager.own_location();
-        transaction.skip_list.push(transaction.joiner.clone());
-        transaction.skip_list.push(my_peer_id.peer.clone());
+        transaction.skip_list.insert(transaction.joiner.clone());
+        transaction.skip_list.insert(my_peer_id.peer.clone());
 
         match forward_conn(
             transaction.tx,
@@ -732,7 +735,7 @@ struct InboundGwJoinRequest {
     pub joiner: PeerId,
     pub hops_to_live: usize,
     pub max_hops_to_live: usize,
-    pub skip_list: Vec<PeerId>,
+    pub skip_list: HashSet<PeerId>,
 }
 
 #[derive(Debug)]
@@ -783,7 +786,7 @@ async fn wait_for_gw_confirmation(
             joiner_key: this_peer.pub_key.clone(),
             hops_to_live: tracker.total_checks,
             max_hops_to_live: tracker.total_checks,
-            skip_list: vec![this_peer],
+            skip_list: HashSet::from([this_peer.clone()]),
         },
     }));
     tracing::debug!(
@@ -1051,7 +1054,7 @@ struct TransientConnection {
     joiner: PeerId,
     max_hops_to_live: usize,
     hops_to_live: usize,
-    skip_list: Vec<PeerId>,
+    skip_list: HashSet<PeerId>,
 }
 
 impl TransientConnection {

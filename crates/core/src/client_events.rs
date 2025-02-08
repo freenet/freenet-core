@@ -10,6 +10,7 @@ use freenet_stdlib::{
 };
 use futures::stream::FuturesUnordered;
 use futures::{future::BoxFuture, FutureExt, StreamExt};
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -454,7 +455,9 @@ async fn process_open_request(
                                     );
                                 })?;
 
-                            if let Err(err) = get::request_get(&op_manager, op, vec![]).await {
+                            if let Err(err) =
+                                get::request_get(&op_manager, op, HashSet::new()).await
+                            {
                                 tracing::error!("get::request_get error: {}", err);
                             }
                         }

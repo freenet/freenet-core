@@ -280,6 +280,12 @@ impl Contains<PeerId> for &Vec<&PeerId> {
     }
 }
 
+impl Contains<PeerId> for &HashSet<PeerId> {
+    fn has_element(&self, target: &PeerId) -> bool {
+        self.contains(target)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use tempfile::TempDir;

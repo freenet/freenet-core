@@ -1,6 +1,6 @@
 //! Contract executor.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::future::Future;
 use std::path::PathBuf;
@@ -371,7 +371,7 @@ impl ComposeNetworkMessage<operations::get::GetOp> for GetContract {
     }
 
     async fn resume_op(op: operations::get::GetOp, op_manager: &OpManager) -> Result<(), OpError> {
-        operations::get::request_get(op_manager, op, vec![]).await
+        operations::get::request_get(op_manager, op, HashSet::new()).await
     }
 }
 

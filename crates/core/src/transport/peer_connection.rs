@@ -271,8 +271,8 @@ impl PeerConnection {
                     } = msg;
                     {
                         tracing::info!(
-                            remote = %self.remote_conn.remote_addr, 
-                            %packet_id, 
+                            remote = %self.remote_conn.remote_addr,
+                            %packet_id,
                             confirm_receipts_count = ?confirm_receipt.len(),
                             confirm_receipts = ?confirm_receipt,
                             "received inbound packet with confirmations"
@@ -320,9 +320,9 @@ impl PeerConnection {
                         (ReportResult::QueueFull, _) | (_, true) => {
                             let receipts = self.received_tracker.get_receipts();
                             tracing::info!(
-                                ?receipts, 
+                                ?receipts,
                                 receipts_count = receipts.len(),
-                                remote = %self.remote_conn.remote_addr, 
+                                remote = %self.remote_conn.remote_addr,
                                 timeout_triggered = should_send_receipts,
                                 "sending accumulated receipts"
                             );
@@ -543,7 +543,7 @@ async fn packet_sending(
 ) -> Result<()> {
     let start_time = std::time::Instant::now();
     tracing::debug!(%remote_addr, %packet_id, "Attempting to send packet");
-    
+
     match SymmetricMessage::try_serialize_msg_to_packet_data(
         packet_id,
         payload,

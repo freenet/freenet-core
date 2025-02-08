@@ -289,7 +289,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     match recv_result {
                         Ok((size, remote_addr)) => {
                             let packet_data = PacketData::from_buf(&buf[..size]);
-                            
+
                             tracing::debug!(
                                 %remote_addr,
                                 %size,

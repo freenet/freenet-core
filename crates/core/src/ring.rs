@@ -3,7 +3,7 @@
 //! Mainly maintains a healthy and optimal pool of connections to other peers in the network
 //! and routes requests to the optimal peers.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::net::SocketAddr;
 use std::{
     cmp::Reverse,
@@ -300,7 +300,7 @@ impl Ring {
     pub fn closest_to_location(
         &self,
         location: Location,
-        skip_list: &[PeerId],
+        skip_list: HashSet<PeerId>,
     ) -> Option<PeerKeyLocation> {
         use rand::seq::SliceRandom;
         self.connection_manager
@@ -380,9 +380,9 @@ impl Ring {
             missing.split_off(&Reverse(retry_missing_candidates_until));
 
             // avoid connecting to the same peer multiple times
-            let mut skip_list = missing.values().collect::<Vec<_>>();
+            let mut skip_list: HashSet<_> = missing.values().collect();
             let this_peer = self.connection_manager.get_peer_key().unwrap();
-            skip_list.push(&this_peer);
+            skip_list.insert(&this_peer);
 
             // if there are no open connections, we need to acquire more
             if let Some(tx) = &live_tx {
@@ -469,15 +469,20 @@ impl Ring {
     async fn acquire_new(
         &self,
         ideal_location: Location,
-        skip_list: &[&PeerId],
+        skip_list: &HashSet<&PeerId>,
         notifier: &EventLoopNotificationsSender,
         live_tx_tracker: &LiveTransactionTracker,
     ) -> anyhow::Result<Option<Transaction>> {
+        // Generate a new skip list that includes the already connected peers
+        let mut complete_skip_list: HashSet<PeerId> =
+            skip_list.iter().map(|&p| p.clone()).collect();
+        complete_skip_list.extend(self.connection_manager.connected_peers());
+
         let query_target = {
             let router = self.router.read();
             if let Some(t) =
                 self.connection_manager
-                    .routing(ideal_location, None, skip_list, &router)
+                    .routing(ideal_location, None, &complete_skip_list, &router)
             {
                 t
             } else {
@@ -489,10 +494,10 @@ impl Ring {
             this_peer = %joiner,
             %query_target,
             %ideal_location,
+            skip_list = ?complete_skip_list,
             "Adding new connections"
         );
         let missing_connections = self.connection_manager.max_connections - self.open_connections();
-        let connected = self.connection_manager.connected_peers();
         let id = Transaction::new::<connect::ConnectMsg>();
         live_tx_tracker.add_transaction(query_target.peer.clone(), id);
         let msg = connect::ConnectMsg::Request {
@@ -503,11 +508,7 @@ impl Ring {
                 ideal_location,
                 joiner,
                 max_hops_to_live: missing_connections,
-                skip_list: skip_list
-                    .iter()
-                    .map(|p| (*p).clone())
-                    .chain(connected)
-                    .collect(),
+                skip_list: complete_skip_list,
             },
         };
         notifier.send(Either::Left(msg.into())).await?;

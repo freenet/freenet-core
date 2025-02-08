@@ -182,10 +182,10 @@ impl Operation for ConnectOp {
                             skip_list = ?skip_list,
                             "Got queried for new connections from joiner",
                         );
-                        if let Some(desirable_peer) = op_manager
-                            .ring
-                            .closest_to_location(*ideal_location, &[joiner.peer.clone()])
-                        {
+                        if let Some(desirable_peer) = op_manager.ring.closest_to_location(
+                            *ideal_location,
+                            HashSet::from([joiner.peer.clone()]),
+                        ) {
                             tracing::debug!(
                                 tx = %id,
                                 query_target = %query_target.peer,
@@ -857,7 +857,7 @@ pub(crate) struct ForwardParams {
     pub left_htl: usize,
     pub max_htl: usize,
     pub accepted: bool,
-    pub skip_list: Vec<PeerId>,
+    pub skip_list: HashSet<PeerId>,
     pub req_peer: PeerKeyLocation,
     pub joiner: PeerKeyLocation,
 }
@@ -910,7 +910,7 @@ where
             &skip_list,
         )
     };
-    skip_list.push(req_peer.peer.clone());
+    skip_list.insert(req_peer.peer.clone());
     match target_peer {
         Some(target_peer) => {
             let forward_msg = create_forward_message(
@@ -937,7 +937,7 @@ fn select_forward_target(
     request_peer: &PeerKeyLocation,
     joiner: &PeerKeyLocation,
     left_htl: usize,
-    skip_list: &[PeerId],
+    skip_list: &HashSet<PeerId>,
 ) -> Option<PeerKeyLocation> {
     if left_htl >= connection_manager.rnd_if_htl_above {
         tracing::debug!(
@@ -970,7 +970,7 @@ fn create_forward_message(
     target: &PeerKeyLocation,
     hops_to_live: usize,
     max_hops_to_live: usize,
-    skip_list: Vec<PeerId>,
+    skip_list: HashSet<PeerId>,
 ) -> NetMessage {
     NetMessage::from(ConnectMsg::Request {
         id,
@@ -1118,7 +1118,7 @@ mod messages {
             hops_to_live: usize,
             max_hops_to_live: usize,
             // The list of peers to skip when forwarding the connection request, avoiding loops
-            skip_list: Vec<PeerId>,
+            skip_list: HashSet<PeerId>,
         },
         /// Query target should find a good candidate for joiner to join.
         FindOptimalPeer {
@@ -1128,7 +1128,7 @@ mod messages {
             ideal_location: Location,
             joiner: PeerKeyLocation,
             max_hops_to_live: usize,
-            skip_list: Vec<PeerId>,
+            skip_list: HashSet<PeerId>,
         },
         CheckConnectivity {
             sender: PeerKeyLocation,
@@ -1136,7 +1136,7 @@ mod messages {
             hops_to_live: usize,
             max_hops_to_live: usize,
             // The list of peers to skip when forwarding the connection request, avoiding loops
-            skip_list: Vec<PeerId>,
+            skip_list: HashSet<PeerId>,
         },
         CleanConnection {
             joiner: PeerKeyLocation,

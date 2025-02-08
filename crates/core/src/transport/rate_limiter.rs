@@ -43,7 +43,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
             total_packets += 1;
             let now = self.time_source.now();
             let time_since_last = now - last_packet_time;
-            
+
             tracing::debug!(
                 %socket_addr,
                 packet_size = packet.len(),
@@ -52,7 +52,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
                 current_bandwidth = self.current_bandwidth,
                 "Processing outbound packet"
             );
-            
+
             if let Some(wait_time) = self.can_send_packet(bandwidth_limit, packet.len()) {
                 tracing::debug!(%socket_addr, ?wait_time, "Rate limiting activated, waiting before sending");
                 tokio::time::sleep(wait_time).await;
@@ -69,10 +69,10 @@ impl<T: TimeSource> PacketRateLimiter<T> {
                 tracing::error!(%socket_addr, %error, "Failed to send packet immediately");
                 continue;
             }
-            
+
             self.add_packet(packet.len());
             last_packet_time = now;
-            
+
             tracing::debug!(
                 total_packets,
                 current_bandwidth = self.current_bandwidth,

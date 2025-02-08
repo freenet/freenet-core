@@ -2,6 +2,7 @@
 //! a given radius will cache a copy of the contract and it's current value,
 //! as well as will broadcast updates to the contract value to all subscribers.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -190,7 +191,9 @@ impl Operation for PutOp {
                     let mut already_put = false;
                     if is_subscribed_contract || should_seed {
                         if !is_subscribed_contract {
-                            let skip_list = vec![sender.peer.clone(), target.peer.clone()];
+                            let mut skip_list = HashSet::new();
+                            skip_list.insert(sender.peer.clone());
+                            skip_list.insert(target.peer.clone());
                             super::start_subscription_request(op_manager, key, true, skip_list)
                                 .await;
                             // FIXME: we start subscription request, but that does not mean we are already seeding
@@ -226,7 +229,7 @@ impl Operation for PutOp {
                             value.clone(),
                             *id,
                             new_htl,
-                            vec![sender.peer.clone()],
+                            HashSet::from([sender.peer.clone()]),
                         )
                         .await
                     } else {
@@ -243,7 +246,8 @@ impl Operation for PutOp {
                         );
 
                         if should_seed && !is_subscribed_contract {
-                            let skip_list = vec![sender.peer.clone()];
+                            let mut skip_list = HashSet::new();
+                            skip_list.insert(sender.peer.clone());
                             super::start_subscription_request(op_manager, key, true, skip_list)
                                 .await;
                             // FIXME: we start subscription request, but that does not mean we are already seeding
@@ -400,8 +404,13 @@ impl Operation for PutOp {
                             let is_subscribed_contract = op_manager.ring.is_seeding_contract(&key);
                             if !is_subscribed_contract && op_manager.ring.should_seed(&key) {
                                 tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
-                                super::start_subscription_request(op_manager, key, true, vec![])
-                                    .await;
+                                super::start_subscription_request(
+                                    op_manager,
+                                    key,
+                                    true,
+                                    HashSet::new(),
+                                )
+                                .await;
                             }
                             tracing::info!(
                                 tx = %id,
@@ -462,7 +471,7 @@ impl Operation for PutOp {
                     // if successful, forward to the next closest peers (if any)
                     let last_hop = if let Some(new_htl) = htl.checked_sub(1) {
                         let mut new_skip_list = skip_list.clone();
-                        new_skip_list.push(sender.peer.clone());
+                        new_skip_list.insert(sender.peer.clone());
                         // only hop forward if there are closer peers
                         let put_here = forward_put(
                             op_manager,
@@ -687,17 +696,21 @@ pub(crate) fn start_op(
 
 pub enum PutState {
     ReceivedRequest,
+    /// Preparing request for put op.
     PrepareRequest {
         contract: ContractContainer,
         related_contracts: RelatedContracts<'static>,
         value: WrappedState,
         htl: usize,
     },
+    /// Awaiting response from petition.
     AwaitingResponse {
         key: ContractKey,
         upstream: Option<PeerKeyLocation>,
     },
+    /// Broadcasting changes to subscribers.
     BroadcastOngoing,
+    /// Operation completed.
     Finished {
         key: ContractKey,
     },
@@ -809,7 +822,7 @@ async fn forward_put<CB>(
     new_value: WrappedState,
     id: Transaction,
     htl: usize,
-    skip_list: Vec<PeerId>,
+    skip_list: HashSet<PeerId>,
 ) -> bool
 where
     CB: NetworkBridge,
@@ -818,7 +831,7 @@ where
     let contract_loc = Location::from(&key);
     let forward_to = op_manager
         .ring
-        .closest_potentially_caching(&key, &*skip_list);
+        .closest_potentially_caching(&key, &skip_list);
     let own_pkloc = op_manager.ring.connection_manager.own_location();
     let own_loc = own_pkloc.location.expect("infallible");
     if let Some(peer) = forward_to {
@@ -880,7 +893,7 @@ mod messages {
             new_value: WrappedState,
             /// current htl, reduced by one at each hop
             htl: usize,
-            skip_list: Vec<PeerId>,
+            skip_list: HashSet<PeerId>,
         },
         /// Value successfully inserted/updated.
         SuccessfulPut {

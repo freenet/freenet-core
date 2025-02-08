@@ -107,7 +107,7 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
     fn cleanup(&mut self) {
         let remove_before = self.time_source.now() - RETAIN_TIME;
         let initial_count = self.packet_id_time.len();
-        
+
         while self
             .packet_id_time
             .front()
