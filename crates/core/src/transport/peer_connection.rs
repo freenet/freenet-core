@@ -270,7 +270,7 @@ impl PeerConnection {
                         payload,
                     } = msg;
                     {
-                        tracing::info!(
+                        tracing::trace!(
                             remote = %self.remote_conn.remote_addr,
                             %packet_id,
                             confirm_receipts_count = ?confirm_receipt.len(),
@@ -281,7 +281,7 @@ impl PeerConnection {
 
                     let current_time = Instant::now();
                     let should_send_receipts = if current_time > self.last_packet_report_time + MESSAGE_CONFIRMATION_TIMEOUT {
-                        tracing::info!(
+                        tracing::debug!(
                             remote = %self.remote_conn.remote_addr,
                             elapsed = ?current_time.duration_since(self.last_packet_report_time),
                             timeout = ?MESSAGE_CONFIRMATION_TIMEOUT,
@@ -295,7 +295,7 @@ impl PeerConnection {
 
                     // Log received confirmations
                     if !confirm_receipt.is_empty() {
-                        tracing::info!(
+                        tracing::debug!(
                             remote = %self.remote_conn.remote_addr,
                             "Received confirmation for {} packets with IDs: {:?}",
                             confirm_receipt.len(),
@@ -309,25 +309,12 @@ impl PeerConnection {
                         .report_received_receipts(&confirm_receipt);
 
                     let report_result = self.received_tracker.report_received_packet(packet_id);
-                    tracing::info!(
-                        remote = %self.remote_conn.remote_addr,
-                        %packet_id,
-                        ?report_result,
-                        "packet reported to received tracker"
-                    );
 
                     match (report_result, should_send_receipts) {
                         (ReportResult::QueueFull, _) | (_, true) => {
                             let receipts = self.received_tracker.get_receipts();
-                            tracing::info!(
-                                ?receipts,
-                                receipts_count = receipts.len(),
-                                remote = %self.remote_conn.remote_addr,
-                                timeout_triggered = should_send_receipts,
-                                "sending accumulated receipts"
-                            );
                             if !receipts.is_empty() {
-                                tracing::info!(
+                                tracing::trace!(
                                     remote = %self.remote_conn.remote_addr,
                                     receipts_count = receipts.len(),
                                     confirmed_packets = ?receipts,
@@ -337,14 +324,14 @@ impl PeerConnection {
                             }
                         },
                         (ReportResult::Ok, _) => {
-                            tracing::debug!(
+                            tracing::trace!(
                                 remote = %self.remote_conn.remote_addr,
                                 %packet_id,
                                 "packet accepted, waiting for more before sending receipt"
                             );
                         }
                         (ReportResult::AlreadyReceived, _) => {
-                            tracing::debug!(%packet_id, "already received packet");
+                            tracing::trace!(%packet_id, "already received packet");
                             continue;
                         }
                     }
@@ -394,7 +381,6 @@ impl PeerConnection {
                             .get_resend();
                         match maybe_resend {
                             ResendAction::WaitUntil(wait_until) => {
-                                tracing::debug!(remote = ?self.remote_conn.remote_addr, "waiting until {:?}", wait_until);
                                 resend_check = Some(tokio::time::sleep_until(wait_until.into()));
                                 break;
                             }
@@ -542,7 +528,7 @@ async fn packet_sending(
     sent_tracker: &parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>,
 ) -> Result<()> {
     let start_time = std::time::Instant::now();
-    tracing::debug!(%remote_addr, %packet_id, "Attempting to send packet");
+    tracing::trace!(%remote_addr, %packet_id, "Attempting to send packet");
 
     match SymmetricMessage::try_serialize_msg_to_packet_data(
         packet_id,
@@ -552,14 +538,14 @@ async fn packet_sending(
     )? {
         either::Either::Left(packet) => {
             let packet_size = packet.data().len();
-            tracing::debug!(%remote_addr, %packet_id, packet_size, "Sending single packet");
+            tracing::trace!(%remote_addr, %packet_id, packet_size, "Sending single packet");
             match outbound_packets
                 .send((remote_addr, packet.clone().prepared_send()))
                 .await
             {
                 Ok(_) => {
                     let elapsed = start_time.elapsed();
-                    tracing::debug!(%remote_addr, %packet_id, ?elapsed, "Successfully sent packet");
+                    tracing::trace!(%remote_addr, %packet_id, ?elapsed, "Successfully sent packet");
                     sent_tracker
                         .lock()
                         .report_sent_packet(packet_id, packet.prepared_send());
@@ -572,7 +558,7 @@ async fn packet_sending(
             }
         }
         either::Either::Right((payload, mut confirm_receipt)) => {
-            tracing::debug!(%remote_addr, %packet_id, "Sending multi-packet message");
+            tracing::trace!(%remote_addr, %packet_id, "Sending multi-packet message");
             macro_rules! send {
                 ($packets:ident) => {{
                     for packet in $packets {

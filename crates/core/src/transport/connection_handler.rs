@@ -292,7 +292,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                         Ok((size, remote_addr)) => {
                             let packet_data = PacketData::from_buf(&buf[..size]);
 
-                            tracing::debug!(
+                            tracing::trace!(
                                 %remote_addr,
                                 %size,
                                 has_remote_conn = %self.remote_connections.contains_key(&remote_addr),

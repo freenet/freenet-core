@@ -57,7 +57,7 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
 
         match self.time_by_packet_id.entry(packet_id) {
             std::collections::hash_map::Entry::Occupied(_) => {
-                tracing::debug!(%packet_id, "packet already received");
+                tracing::trace!(%packet_id, "packet already received");
                 ReportResult::AlreadyReceived
             }
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -65,22 +65,9 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
                 self.packet_id_time.push_back((packet_id, current_time));
                 self.pending_receipts.push(packet_id);
 
-                let pending_count = self.pending_receipts.len();
-                tracing::info!(
-                    %packet_id,
-                    pending_count,
-                    max_pending = MAX_PENDING_RECEIPTS,
-                    "added packet to pending receipts"
-                );
-
-                if pending_count < MAX_PENDING_RECEIPTS {
+                if self.pending_receipts.len() < MAX_PENDING_RECEIPTS {
                     ReportResult::Ok
                 } else {
-                    tracing::info!(
-                        %packet_id,
-                        pending_count,
-                        "pending receipts queue is full"
-                    );
                     ReportResult::QueueFull
                 }
             }
@@ -93,13 +80,8 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
     /// list is not empty, the list should be sent as receipts immediately in a noop packet.
     pub(super) fn get_receipts(&mut self) -> Vec<PacketId> {
         self.cleanup();
-        let receipts = mem::take(self.pending_receipts.as_mut());
-        tracing::info!(
-            receipts_count = self.pending_receipts.len(),
-            ?receipts,
-            "getting accumulated receipts"
-        );
-        receipts
+
+        mem::take(self.pending_receipts.as_mut())
     }
 
     /// This function cleans up the `packet_id_time` and `time_by_packet_id` data structures.
@@ -121,7 +103,7 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
 
         let removed_count = initial_count - self.packet_id_time.len();
         if removed_count > 0 {
-            tracing::info!(
+            tracing::debug!(
                 removed_count,
                 remaining_count = self.packet_id_time.len(),
                 "cleaned up old packets"

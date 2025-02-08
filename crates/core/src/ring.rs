@@ -473,28 +473,32 @@ impl Ring {
         notifier: &EventLoopNotificationsSender,
         live_tx_tracker: &LiveTransactionTracker,
     ) -> anyhow::Result<Option<Transaction>> {
-        // Generate a new skip list that includes the already connected peers
-        let mut complete_skip_list: HashSet<PeerId> =
-            skip_list.iter().map(|&p| p.clone()).collect();
-        complete_skip_list.extend(self.connection_manager.connected_peers());
-
+        // First find a query target using just the input skip list
+        let initial_skip_list: HashSet<PeerId> = skip_list.iter().copied().cloned().collect();
         let query_target = {
             let router = self.router.read();
-            if let Some(t) =
-                self.connection_manager
-                    .routing(ideal_location, None, &complete_skip_list, &router)
-            {
+            if let Some(t) = self.connection_manager.routing(
+                ideal_location,
+                None,
+                &initial_skip_list,  //aΩ Use just the input skip list for finding who to query
+                &router,
+            ) {
                 t
             } else {
                 return Ok(None);
             }
         };
+
+        // Now create the complete skip list for the connect request
+        let mut new_skip_list = initial_skip_list.clone();
+        new_skip_list.extend(self.connection_manager.connected_peers());
+
         let joiner = self.connection_manager.own_location();
         tracing::debug!(
             this_peer = %joiner,
             %query_target,
             %ideal_location,
-            skip_list = ?complete_skip_list,
+            skip_list = ?new_skip_list,
             "Adding new connections"
         );
         let missing_connections = self.connection_manager.max_connections - self.open_connections();
@@ -508,7 +512,7 @@ impl Ring {
                 ideal_location,
                 joiner,
                 max_hops_to_live: missing_connections,
-                skip_list: complete_skip_list,
+                skip_list: new_skip_list,
             },
         };
         notifier.send(Either::Left(msg.into())).await?;

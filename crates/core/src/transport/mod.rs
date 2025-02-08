@@ -83,9 +83,7 @@ impl Socket for UdpSocket {
     }
 
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
-        self.send_to(buf, target).await.inspect_err(|e| {
-            tracing::debug!(%target, "Error sending packet: {:?}", e);
-        })
+        self.send_to(buf, target).await
     }
 }
 
