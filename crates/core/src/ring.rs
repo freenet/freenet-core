@@ -508,7 +508,10 @@ impl Ring {
             skip_list = ?new_skip_list,
             "Adding new connections"
         );
-        let missing_connections = self.connection_manager.max_connections - self.open_connections();
+        const MAX_NUM_HOPS_AVAILABLE: usize = 30;
+        let missing_connections = (self.connection_manager.max_connections
+            - self.open_connections())
+        .min(MAX_NUM_HOPS_AVAILABLE);
         let id = Transaction::new::<connect::ConnectMsg>();
         live_tx_tracker.add_transaction(query_target.peer.clone(), id);
         let msg = connect::ConnectMsg::Request {

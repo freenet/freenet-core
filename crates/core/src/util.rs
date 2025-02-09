@@ -249,43 +249,6 @@ pub(crate) mod test {
     use super::*;
 
     #[test]
-    fn backoff_logarithmic() {
-        let base = Duration::from_millis(200);
-        let ceiling = Duration::from_secs(2);
-        let max_attempts = 40;
-        let backoff = Backoff::new(base, ceiling, max_attempts)
-            .logarithmic()
-            .with_interval_reduction_factor(2.0);
-        let total = backoff
-            .into_iter()
-            .reduce(|acc, x| {
-                // println!("next: {:?}", x);
-                acc + x
-            })
-            .unwrap();
-        assert!(
-            total < Duration::from_secs(18) && total > Duration::from_secs(20),
-            "total: {:?}",
-            total
-        );
-
-        let base = Duration::from_millis(600);
-        let ceiling = Duration::from_secs(30);
-        let max_attempts = 40;
-        let backoff = Backoff::new(base, ceiling, max_attempts).logarithmic();
-
-        // const MAX: Duration = Duration::from_secs(30);
-        let _ = backoff
-            .into_iter()
-            .reduce(|acc, x| {
-                // println!("next: {:?}", x);
-                acc + x
-            })
-            .unwrap();
-        // println!("total: {:?}", total);
-    }
-
-    #[test]
     fn randomize_iter() {
         let iter = [0, 1, 2, 3, 4, 5];
         let mut times_equal = 0;

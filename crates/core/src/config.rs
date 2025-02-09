@@ -196,6 +196,11 @@ impl ConfigArgs {
                     Either::Right(dir) => (dir.clone(), dir),
                 }
             };
+            tracing::info!(
+                ?config,
+                ?data,
+                "Looking for configuration file in default directory"
+            );
             self.config_paths.config_dir = Some(config.clone());
             if self.config_paths.data_dir.is_none() {
                 self.config_paths.data_dir = Some(data);

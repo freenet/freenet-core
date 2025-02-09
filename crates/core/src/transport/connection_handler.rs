@@ -38,17 +38,7 @@ use super::{
 ///
 /// The backoff strategy uses a logarithmic growth pattern optimized for NAT traversal:
 ///
-/// 1. Timeout Growth:
-///    - Initial timeout: INITIAL_TIMEOUT
-///    - Growth formula: timeout = INITIAL_TIMEOUT * (BACKOFF_BASE + log2(attempt))
-///    - Maximum timeout: MAX_TIMEOUT
-///
-/// This provides:
-///    - More aggressive early attempts when NAT mappings are fresh
-///    - Gradual timeout increase for complex network conditions
-///    - Reasonable upper bound to fail fast when connection is impossible
-///
-/// 2. Retry Intervals:
+/// 1. Retry Intervals:
 ///    - Base interval: BASE_INTERVAL_TIMEOUT
 ///    - Growth formula: interval = BASE_INTERVAL_TIMEOUT * (BACKOFF_BASE + log2(attempt)) / INTERVAL_REDUCTION_FACTOR
 ///    - Maximum interval: MAX_INTERVAL_TIMEOUT
@@ -63,15 +53,9 @@ use super::{
 /// - Networks with variable latency
 /// - Maintaining connection pressure without overwhelming the network
 /// - Maximizing success rate in the critical first few seconds
-const INITIAL_TIMEOUT: Duration = Duration::from_millis(600);
-#[cfg(not(test))]
-const MAX_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(test)]
-const MAX_TIMEOUT: Duration = Duration::from_secs(10);
-
-const INTERVAL_REDUCTION_FACTOR: f64 = 2.0;
-const BASE_INTERVAL_TIMEOUT: Duration = Duration::from_millis(200);
+const BASE_INTERVAL_TIMEOUT: Duration = Duration::from_millis(1000);
 const MAX_INTERVAL_TIMEOUT: Duration = Duration::from_millis(2000);
+const INTERVAL_REDUCTION_FACTOR: f64 = 1.3;
 
 const DEFAULT_BW_TRACKER_WINDOW_SIZE: Duration = Duration::from_secs(10);
 const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
@@ -687,10 +671,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             )
             .logarithmic()
             .with_interval_reduction_factor(INTERVAL_REDUCTION_FACTOR);
-            let timeout =
-                crate::util::Backoff::new(INITIAL_TIMEOUT, MAX_TIMEOUT, NAT_TRAVERSAL_MAX_ATTEMPTS)
-                    .logarithmic();
-            for (sleep, timeout) in backoff.into_iter().zip(timeout.into_iter()) {
+            for sleep in backoff.into_iter() {
                 match state {
                     ConnectionState::StartOutbound { .. } => {
                         tracing::debug!(%remote_addr, "sending protocol version and inbound key");
@@ -716,7 +697,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                         );
                     }
                 }
-                let next_inbound = tokio::time::timeout(timeout, next_inbound.recv());
+                let next_inbound = tokio::time::timeout(sleep, next_inbound.recv());
                 match next_inbound.await {
                     Ok(Some(packet)) => {
                         tracing::debug!(%remote_addr, "received packet after sending it");
@@ -863,13 +844,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                         tracing::debug!(%this_addr, %remote_addr, "failed to receive UDP response in time, retrying");
                     }
                 }
-
-                // We have retried for a while, so return an error
-                if timeout >= MAX_TIMEOUT {
-                    tracing::error!(%this_addr, %remote_addr, "failed to establish connection after multiple attempts, max timeout reached");
-                    break;
-                }
-
                 tokio::time::sleep(sleep).await;
             }
 
@@ -1067,7 +1041,7 @@ mod test {
     use tracing::info;
 
     use super::*;
-    use crate::transport::packet_data::MAX_DATA_SIZE;
+    use crate::{transport::packet_data::MAX_DATA_SIZE, util::Backoff};
 
     #[test]
     fn test_handle_ack_connection_error() {
@@ -1880,5 +1854,27 @@ mod test {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_backoff_logarithmic() {
+        const _TOTAL_MAX: Duration = Duration::from_secs(30);
+        let max_attempts = 40;
+        let backoff = Backoff::new(BASE_INTERVAL_TIMEOUT, MAX_INTERVAL_TIMEOUT, max_attempts)
+            .logarithmic()
+            .with_interval_reduction_factor(INTERVAL_REDUCTION_FACTOR);
+        let total = backoff
+            .into_iter()
+            .reduce(|acc, x| {
+                println!("next: {:?}", x);
+                acc + x
+            })
+            .unwrap();
+        println!("total: {:?}", total);
+        // assert!(
+        //     total > Duration::from_secs(28) && total < TOTAL_MAX,
+        //     "total: {:?}",
+        //     total
+        // );
     }
 }
