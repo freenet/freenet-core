@@ -24,6 +24,7 @@ pub struct WebApp {
     pub web: Vec<u8>,
 }
 
+// Please add detailed tracing debug! logs to this file AI!
 impl WebApp {
     pub fn from_data(
         metadata: Vec<u8>,
