@@ -364,7 +364,7 @@ impl ConnectionManager {
                     return None;
                 }
             }
-            (!skip_list.has_element(&conn.location.peer)).then_some(&conn.location)
+            (!skip_list.has_element(conn.location.peer.clone())).then_some(&conn.location)
         });
         router.select_peer(peers, target).cloned()
     }

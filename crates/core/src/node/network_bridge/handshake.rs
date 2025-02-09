@@ -1173,7 +1173,7 @@ mod tests {
                     joiner_key: pub_key,
                     hops_to_live,
                     max_hops_to_live: hops_to_live,
-                    skip_list: vec![],
+                    skip_list: HashSet::new(),
                 },
             };
             self.inbound_msg(

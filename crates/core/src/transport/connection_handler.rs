@@ -42,7 +42,8 @@ use super::{
 ///    - Initial timeout: INITIAL_TIMEOUT
 ///    - Growth formula: timeout = INITIAL_TIMEOUT * (BACKOFF_BASE + log2(attempt))
 ///    - Maximum timeout: MAX_TIMEOUT
-///    This provides:
+///
+/// This provides:
 ///    - More aggressive early attempts when NAT mappings are fresh
 ///    - Gradual timeout increase for complex network conditions
 ///    - Reasonable upper bound to fail fast when connection is impossible
@@ -51,7 +52,8 @@ use super::{
 ///    - Base interval: BASE_INTERVAL_TIMEOUT
 ///    - Growth formula: interval = BASE_INTERVAL_TIMEOUT * (BACKOFF_BASE + log2(attempt)) / INTERVAL_REDUCTION_FACTOR
 ///    - Maximum interval: MAX_INTERVAL_TIMEOUT
-///    This ensures:
+///
+/// This ensures:
 ///    - High frequency initial attempts
 ///    - Gradual backing off while maintaining connection pressure
 ///    - Minimum retry rate of once every MAX_INTERVAL_TIMEOUT seconds

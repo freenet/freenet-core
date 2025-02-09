@@ -474,13 +474,12 @@ impl Ring {
         live_tx_tracker: &LiveTransactionTracker,
     ) -> anyhow::Result<Option<Transaction>> {
         // First find a query target using just the input skip list
-        let initial_skip_list: HashSet<PeerId> = skip_list.iter().copied().cloned().collect();
         let query_target = {
             let router = self.router.read();
             if let Some(t) = self.connection_manager.routing(
                 ideal_location,
                 None,
-                &initial_skip_list, // Use just the input skip list for finding who to query
+                skip_list, // Use just the input skip list for finding who to query
                 &router,
             ) {
                 t
@@ -490,8 +489,12 @@ impl Ring {
         };
 
         // Now create the complete skip list for the connect request
-        let mut new_skip_list = initial_skip_list.clone();
-        new_skip_list.extend(self.connection_manager.connected_peers());
+        let new_skip_list = skip_list
+            .iter()
+            .copied()
+            .cloned()
+            .chain(self.connection_manager.connected_peers())
+            .collect();
 
         let joiner = self.connection_manager.own_location();
         tracing::debug!(

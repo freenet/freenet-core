@@ -1,7 +1,9 @@
 pub(crate) mod time_source;
 
 use std::{
+    borrow::Borrow,
     collections::{BTreeMap, HashSet},
+    hash::Hash,
     net::{Ipv4Addr, SocketAddr, TcpListener},
     sync::Arc,
     time::Duration,
@@ -259,30 +261,40 @@ impl std::fmt::Display for EncodingProtocol {
 }
 
 pub(crate) trait Contains<T> {
-    fn has_element(&self, target: &T) -> bool;
+    fn has_element(&self, target: T) -> bool;
 }
 
 impl Contains<PeerId> for &[PeerId] {
+    fn has_element(&self, target: PeerId) -> bool {
+        self.contains(&target)
+    }
+}
+
+impl Contains<&PeerId> for &[PeerId] {
     fn has_element(&self, target: &PeerId) -> bool {
         self.contains(target)
     }
 }
 
 impl Contains<PeerId> for &[&PeerId] {
+    fn has_element(&self, target: PeerId) -> bool {
+        self.contains(&&target)
+    }
+}
+
+impl Contains<&PeerId> for &[&PeerId] {
     fn has_element(&self, target: &PeerId) -> bool {
         self.contains(&target)
     }
 }
 
-impl Contains<PeerId> for &Vec<&PeerId> {
-    fn has_element(&self, target: &PeerId) -> bool {
+impl<Q, T> Contains<Q> for &HashSet<T>
+where
+    T: Borrow<Q> + Eq + Hash,
+    Q: Eq + Hash,
+{
+    fn has_element(&self, target: Q) -> bool {
         self.contains(&target)
-    }
-}
-
-impl Contains<PeerId> for &HashSet<PeerId> {
-    fn has_element(&self, target: &PeerId) -> bool {
-        self.contains(target)
     }
 }
 
