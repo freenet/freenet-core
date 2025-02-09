@@ -1,6 +1,8 @@
 use super::*;
 use tracing::{debug, instrument};
 
+// Please add debug level instrument! tracing to relevant functions in this file to help with debugging AI!
+
 impl HttpGateway {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
     pub fn as_router_v1(socket: &SocketAddr) -> (Self, Router) {
