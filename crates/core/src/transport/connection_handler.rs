@@ -1020,6 +1020,10 @@ mod version_cmp {
                 version_str, decoded
             );
         }
+
+        let rc1 = parse_version_with_flags("0.1.0-rc1");
+        let rc2 = parse_version_with_flags("0.1.0-rc2");
+        assert_ne!(rc1, rc2, "rc1 and rc2 should have different flags");
     }
 }
 
