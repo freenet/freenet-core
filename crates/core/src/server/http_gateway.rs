@@ -18,6 +18,8 @@ use super::{errors::WebSocketApiError, path_handlers, AuthToken, ClientConnectio
 
 mod v1;
 
+// Please add debug level instrument! tracing to relevant functions in this file to help with debugging AI!
+
 #[derive(Clone)]
 pub(super) struct HttpGatewayRequest(mpsc::Sender<ClientConnection>);
 
