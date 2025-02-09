@@ -515,7 +515,8 @@ impl Ring {
                 ideal_location,
                 joiner,
                 max_hops_to_live: missing_connections,
-                skip_list: new_skip_list,
+                skip_connections: new_skip_list,
+                skip_forwards: HashSet::new(),
             },
         };
         notifier.send(Either::Left(msg.into())).await?;

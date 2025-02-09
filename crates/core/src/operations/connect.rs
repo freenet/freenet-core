@@ -158,7 +158,8 @@ impl Operation for ConnectOp {
                             ideal_location,
                             joiner,
                             max_hops_to_live,
-                            skip_list,
+                            skip_connections,
+                            skip_forwards,
                         },
                     id,
                     ..
@@ -171,15 +172,18 @@ impl Operation for ConnectOp {
                     else {
                         return Err(OpError::RingError(crate::ring::RingError::NoLocation));
                     };
-                    let mut skip_list = skip_list.clone();
-                    skip_list.extend([this_peer.clone(), query_target.peer.clone()]);
+                    let mut skip_connections = skip_connections.clone();
+                    let mut skip_forwards = skip_forwards.clone();
+                    skip_connections.extend([this_peer.clone(), query_target.peer.clone()]);
+                    skip_forwards.extend([this_peer.clone(), query_target.peer.clone()]);
                     if this_peer == &query_target.peer {
                         // this peer should be the original target queries
                         tracing::debug!(
                             tx = %id,
                             query_target = %query_target.peer,
                             joiner = %joiner.peer,
-                            skip_list = ?skip_list,
+                            skip_connections = ?skip_connections,
+                            skip_forwards = ?skip_forwards,
                             "Got queried for new connections from joiner",
                         );
                         if let Some(desirable_peer) = op_manager.ring.closest_to_location(
@@ -200,7 +204,8 @@ impl Operation for ConnectOp {
                                 &desirable_peer,
                                 *max_hops_to_live,
                                 *max_hops_to_live,
-                                skip_list,
+                                skip_connections,
+                                skip_forwards,
                             );
                             network_bridge.send(&desirable_peer.peer, msg).await?;
                             return_msg = None;
@@ -235,7 +240,8 @@ impl Operation for ConnectOp {
                                 ideal_location: *ideal_location,
                                 joiner: joiner.clone(),
                                 max_hops_to_live: *max_hops_to_live,
-                                skip_list,
+                                skip_connections,
+                                skip_forwards,
                             },
                         };
                         network_bridge.send(&query_target.peer, msg.into()).await?;
@@ -250,7 +256,8 @@ impl Operation for ConnectOp {
                             joiner,
                             hops_to_live,
                             max_hops_to_live,
-                            skip_list,
+                            skip_connections,
+                            skip_forwards,
                             ..
                         },
                     ..
@@ -333,7 +340,8 @@ impl Operation for ConnectOp {
                                 left_htl: *hops_to_live,
                                 max_htl: *max_hops_to_live,
                                 accepted: should_accept,
-                                skip_list: skip_list.clone(),
+                                skip_connections: skip_connections.clone(),
+                                skip_forwards: skip_forwards.clone(),
                                 req_peer: sender.clone(),
                                 joiner: joiner.clone(),
                             },
@@ -857,7 +865,8 @@ pub(crate) struct ForwardParams {
     pub left_htl: usize,
     pub max_htl: usize,
     pub accepted: bool,
-    pub skip_list: HashSet<PeerId>,
+    pub skip_connections: HashSet<PeerId>,
+    pub skip_forwards: HashSet<PeerId>,
     pub req_peer: PeerKeyLocation,
     pub joiner: PeerKeyLocation,
 }
@@ -876,7 +885,8 @@ where
         left_htl,
         max_htl,
         accepted,
-        mut skip_list,
+        mut skip_connections,
+        mut skip_forwards,
         req_peer,
         joiner,
     } = params;
@@ -907,10 +917,11 @@ where
             &req_peer,
             &joiner,
             left_htl,
-            &skip_list,
+            &skip_forwards,
         )
     };
-    skip_list.insert(req_peer.peer.clone());
+    skip_connections.insert(req_peer.peer.clone());
+    skip_forwards.insert(req_peer.peer.clone());
     match target_peer {
         Some(target_peer) => {
             let forward_msg = create_forward_message(
@@ -920,7 +931,8 @@ where
                 &target_peer,
                 left_htl,
                 max_htl,
-                skip_list,
+                skip_connections,
+                skip_forwards,
             );
             tracing::debug!(target: "network", "Forwarding connection request to {:?}", target_peer);
             network_bridge.send(&target_peer.peer, forward_msg).await?;
@@ -937,7 +949,7 @@ fn select_forward_target(
     request_peer: &PeerKeyLocation,
     joiner: &PeerKeyLocation,
     left_htl: usize,
-    skip_list: &HashSet<PeerId>,
+    skip_forwards: &HashSet<PeerId>,
 ) -> Option<PeerKeyLocation> {
     if left_htl >= connection_manager.rnd_if_htl_above {
         tracing::debug!(
@@ -945,7 +957,7 @@ fn select_forward_target(
             joiner = %joiner.peer,
             "Randomly selecting peer to forward connect request",
         );
-        connection_manager.random_peer(|p| !skip_list.contains(p))
+        connection_manager.random_peer(|p| !skip_forwards.contains(p))
     } else {
         tracing::debug!(
             tx = %id,
@@ -956,7 +968,7 @@ fn select_forward_target(
             .routing(
                 joiner.location.unwrap(),
                 Some(&request_peer.peer),
-                skip_list,
+                skip_forwards,
                 router,
             )
             .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))
@@ -970,7 +982,8 @@ fn create_forward_message(
     target: &PeerKeyLocation,
     hops_to_live: usize,
     max_hops_to_live: usize,
-    skip_list: HashSet<PeerId>,
+    skip_connections: HashSet<PeerId>,
+    skip_forwards: HashSet<PeerId>,
 ) -> NetMessage {
     NetMessage::from(ConnectMsg::Request {
         id,
@@ -980,7 +993,8 @@ fn create_forward_message(
             joiner: joiner.clone(),
             hops_to_live: hops_to_live.saturating_sub(1), // decrement the hops to live for the next hop
             max_hops_to_live,
-            skip_list,
+            skip_connections,
+            skip_forwards,
         },
     })
 }
@@ -1117,8 +1131,10 @@ mod messages {
             joiner_key: TransportPublicKey,
             hops_to_live: usize,
             max_hops_to_live: usize,
-            // The list of peers to skip when forwarding the connection request, avoiding loops
-            skip_list: HashSet<PeerId>,
+            // Peers we don't want to connect to directly
+            skip_connections: HashSet<PeerId>,
+            // Peers we don't want to forward connectivity messages to (to avoid loops)
+            skip_forwards: HashSet<PeerId>,
         },
         /// Query target should find a good candidate for joiner to join.
         FindOptimalPeer {
@@ -1128,15 +1144,16 @@ mod messages {
             ideal_location: Location,
             joiner: PeerKeyLocation,
             max_hops_to_live: usize,
-            skip_list: HashSet<PeerId>,
+            skip_connections: HashSet<PeerId>,
+            skip_forwards: HashSet<PeerId>,
         },
         CheckConnectivity {
             sender: PeerKeyLocation,
             joiner: PeerKeyLocation,
             hops_to_live: usize,
             max_hops_to_live: usize,
-            // The list of peers to skip when forwarding the connection request, avoiding loops
-            skip_list: HashSet<PeerId>,
+            skip_connections: HashSet<PeerId>,
+            skip_forwards: HashSet<PeerId>,
         },
         CleanConnection {
             joiner: PeerKeyLocation,
