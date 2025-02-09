@@ -3,7 +3,7 @@ use std::{
     io::{Cursor, Read},
     path::Path,
 };
-use tracing::debug;
+use tracing::{debug, instrument};
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use tar::{Archive, Builder};
@@ -26,6 +26,7 @@ pub struct WebApp {
 }
 
 impl WebApp {
+    #[instrument(skip(web))]
     pub fn from_data(
         metadata: Vec<u8>,
         web: Builder<Cursor<Vec<u8>>>,
@@ -52,6 +53,7 @@ impl WebApp {
         Ok(output)
     }
 
+    #[instrument(skip(self))]
     pub fn unpack(&mut self, dst: impl AsRef<Path>) -> Result<(), WebContractError> {
         debug!("Unpacking web content to {:?}", dst.as_ref());
         let mut decoded_web = self.decode_web();
@@ -61,6 +63,7 @@ impl WebApp {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub fn get_file(&mut self, path: &str) -> Result<Vec<u8>, WebContractError> {
         debug!("Retrieving file from web content: {}", path);
         let mut decoded_web = self.decode_web();

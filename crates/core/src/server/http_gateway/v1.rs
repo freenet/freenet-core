@@ -1,5 +1,5 @@
 use super::*;
-use tracing::debug;
+use tracing::{debug, instrument};
 
 impl HttpGateway {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
@@ -34,6 +34,7 @@ impl HttpGateway {
     }
 }
 
+#[instrument(skip(rs))]
 async fn web_home(
     Path(key): Path<String>,
     Extension(rs): Extension<HttpGatewayRequest>,
@@ -75,6 +76,7 @@ async fn web_home(
     Ok(response)
 }
 
+#[instrument]
 async fn web_subpages(
     Path((key, last_path)): Path<(String, String)>,
 ) -> Result<axum::response::Response, WebSocketApiError> {

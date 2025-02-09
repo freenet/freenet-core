@@ -11,7 +11,7 @@ use tokio::{fs::File, io::AsyncReadExt, sync::mpsc};
 
 use crate::client_events::AuthToken;
 
-use tracing::debug;
+use tracing::{debug, instrument};
 use super::{
     app_packaging::{WebApp, WebContractError},
     errors::WebSocketApiError,
@@ -23,6 +23,7 @@ mod v1;
 
 const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
+#[instrument(skip(request_sender))]
 pub(super) async fn contract_home(
     key: String,
     request_sender: HttpGatewayRequest,
@@ -164,6 +165,7 @@ pub(super) async fn contract_home(
     Ok(response)
 }
 
+#[instrument]
 pub(super) async fn variable_content(
     key: String,
     req_path: String,
