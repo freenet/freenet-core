@@ -1,6 +1,5 @@
 use super::*;
-
-// Please add detailed tracing logging to this code, particularly to the `web_home` function. AI!
+use tracing::{debug, info, warn};
 
 impl HttpGateway {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
@@ -40,14 +39,18 @@ async fn web_home(
     Extension(rs): Extension<HttpGatewayRequest>,
     axum::extract::State(config): axum::extract::State<Config>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
+    info!("Handling web_home request for contract key: {}", key);
     use headers::{Header, HeaderMapExt};
 
+    debug!("Checking localhost configuration");
     let domain = config
         .localhost
         .then_some("localhost")
         .expect("non-local connections not supported yet");
     let token = AuthToken::generate();
+    debug!("Generated new auth token");
 
+    info!("Setting up authentication headers and cookie");
     let auth_header = headers::Authorization::<headers::authorization::Bearer>::name().to_string();
     let cookie = cookie::Cookie::build((auth_header, format!("Bearer {}", token.as_str())))
         .domain(domain)
@@ -59,7 +62,9 @@ async fn web_home(
         .build();
 
     let token_header = headers::Authorization::bearer(token.as_str()).unwrap();
-    let contract_idx = path_handlers::contract_home(key, rs, token).await?;
+    debug!("Requesting contract home page");
+    let contract_idx = path_handlers::contract_home(key.clone(), rs, token).await?;
+    info!("Successfully retrieved contract home for key: {}", key);
     let mut response = contract_idx.into_response();
     response.headers_mut().typed_insert(token_header);
     response.headers_mut().insert(
@@ -73,7 +78,9 @@ async fn web_home(
 async fn web_subpages(
     Path((key, last_path)): Path<(String, String)>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
+    info!("Handling web subpage request for contract: {}, path: {}", key, last_path);
     let full_path: String = format!("/v1/contract/web/{}/{}", key, last_path);
+    debug!("Constructed full path: {}", full_path);
     path_handlers::variable_content(key, full_path)
         .await
         .map_err(|e| *e)
