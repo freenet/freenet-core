@@ -814,6 +814,12 @@ impl Executor<Runtime> {
     ) -> Result<(), ExecutorError> {
         let key = trying_container.key();
         let params = trying_container.params();
+        
+        tracing::debug!(
+            contract = %key,
+            state_size = state.as_ref().len(),
+            "starting contract verification and storage"
+        );
 
         const DEPENDENCY_CYCLE_LIMIT_GUARD: usize = 100;
         let mut iterations = 0;
@@ -828,10 +834,21 @@ impl Executor<Runtime> {
 
         while iterations < DEPENDENCY_CYCLE_LIMIT_GUARD {
             if let Some(contract) = trying_contract.take() {
+                tracing::debug!(
+                    contract = %trying_key,
+                    "storing contract in runtime store"
+                );
                 self.runtime
                     .contract_store
                     .store_contract(contract)
-                    .map_err(ExecutorError::other)?;
+                    .map_err(|e| {
+                        tracing::error!(
+                            contract = %trying_key,
+                            error = %e,
+                            "failed to store contract in runtime"
+                        );
+                        ExecutorError::other(e)
+                    })?;
             }
 
             let result = self
@@ -888,10 +905,22 @@ impl Executor<Runtime> {
                 }));
             }
 
+            tracing::debug!(
+                contract = %trying_key,
+                state_size = trying_state.as_ref().len(),
+                "storing contract state"
+            );
             self.state_store
                 .store(trying_key, trying_state.clone(), trying_params.clone())
                 .await
-                .map_err(ExecutorError::other)?;
+                .map_err(|e| {
+                    tracing::error!(
+                        contract = %trying_key,
+                        error = %e,
+                        "failed to store contract state"
+                    );
+                    ExecutorError::other(e)
+                })?;
             if trying_key != original_key {
                 trying_key = original_key;
                 trying_params = original_params.clone();
