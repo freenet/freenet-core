@@ -1,5 +1,7 @@
 use super::*;
 
+// Please add detailed tracing logging to this code, particularly to the `web_home` function. AI!
+
 impl HttpGateway {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
     pub fn as_router_v1(socket: &SocketAddr) -> (Self, Router) {
