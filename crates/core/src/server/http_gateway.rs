@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
 use axum::extract::Path;
+use tracing::instrument;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Extension, Router};
@@ -17,8 +18,6 @@ use crate::server::HostCallbackResult;
 use super::{errors::WebSocketApiError, path_handlers, AuthToken, ClientConnection};
 
 mod v1;
-
-// Please add debug level instrument! tracing to relevant functions in this file to help with debugging AI!
 
 #[derive(Clone)]
 pub(super) struct HttpGatewayRequest(mpsc::Sender<ClientConnection>);
@@ -55,11 +54,13 @@ struct Config {
     localhost: bool,
 }
 
+#[instrument(level = "debug")]
 async fn home() -> axum::response::Response {
     axum::response::Response::default()
 }
 
 impl ClientEventsProxy for HttpGateway {
+    #[instrument(level = "debug", skip(self))]
     fn recv(&mut self) -> BoxFuture<Result<OpenRequest<'static>, ClientError>> {
         async move {
             while let Some(msg) = self.proxy_server_request.recv().await {
@@ -92,6 +93,7 @@ impl ClientEventsProxy for HttpGateway {
         .boxed()
     }
 
+    #[instrument(level = "debug", skip(self))]
     fn send(
         &mut self,
         id: ClientId,
