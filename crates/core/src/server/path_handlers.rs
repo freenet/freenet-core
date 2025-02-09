@@ -198,7 +198,7 @@ pub(super) async fn variable_content(
         .map(|r| r.into_response())
 }
 
-#[instrument]
+#[instrument(level = "debug")]
 async fn get_web_body(path: &Path) -> Result<impl IntoResponse, WebSocketApiError> {
     debug!("get_web_body: Attempting to read index.html from path: {:?}", path);
     let web_path = path.join("web").join("index.html");
