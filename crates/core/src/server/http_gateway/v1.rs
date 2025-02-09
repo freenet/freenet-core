@@ -34,7 +34,7 @@ impl HttpGateway {
     }
 }
 
-#[instrument(skip(rs, config))]
+#[instrument(level = "debug", skip(rs, config))]
 async fn web_home(
     Path(key): Path<String>,
     Extension(rs): Extension<HttpGatewayRequest>,
@@ -76,7 +76,7 @@ async fn web_home(
     Ok(response)
 }
 
-#[instrument]
+#[instrument(level = "debug")]
 async fn web_subpages(
     Path((key, last_path)): Path<(String, String)>,
 ) -> Result<axum::response::Response, WebSocketApiError> {

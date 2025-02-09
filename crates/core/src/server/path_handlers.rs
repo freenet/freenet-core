@@ -23,7 +23,7 @@ mod v1;
 
 const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-#[instrument(skip(request_sender))]
+#[instrument(level = "debug", skip(request_sender))]
 pub(super) async fn contract_home(
     key: String,
     request_sender: HttpGatewayRequest,
@@ -165,7 +165,7 @@ pub(super) async fn contract_home(
     Ok(response)
 }
 
-#[instrument]
+#[instrument(level = "debug")]
 pub(super) async fn variable_content(
     key: String,
     req_path: String,

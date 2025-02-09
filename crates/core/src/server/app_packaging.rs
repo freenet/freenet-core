@@ -26,7 +26,7 @@ pub struct WebApp {
 }
 
 impl WebApp {
-    #[instrument(skip(web))]
+    #[instrument(level = "debug", skip(web))]
     pub fn from_data(
         metadata: Vec<u8>,
         web: Builder<Cursor<Vec<u8>>>,
@@ -53,7 +53,7 @@ impl WebApp {
         Ok(output)
     }
 
-    #[instrument(skip(self, dst))]
+    #[instrument(level = "debug", skip(self, dst))]
     pub fn unpack(&mut self, dst: impl AsRef<Path>) -> Result<(), WebContractError> {
         debug!("Unpacking web content to {:?}", dst.as_ref());
         let mut decoded_web = self.decode_web();
@@ -63,7 +63,7 @@ impl WebApp {
         Ok(())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "debug", skip(self))]
     pub fn get_file(&mut self, path: &str) -> Result<Vec<u8>, WebContractError> {
         debug!("Retrieving file from web content: {}", path);
         let mut decoded_web = self.decode_web();
