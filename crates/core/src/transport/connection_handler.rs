@@ -34,10 +34,44 @@ use super::{
     Socket, TransportError,
 };
 
-// Constants for interval increase
-const INITIAL_INTERVAL: Duration = Duration::from_millis(200);
-const INTERVAL_INCREASE_FACTOR: u64 = 2;
-const MAX_INTERVAL: Duration = Duration::from_millis(5000); // Maximum interval limit
+/// NAT traversal backoff configuration.
+///
+/// The backoff strategy uses a logarithmic growth pattern optimized for NAT traversal:
+///
+/// 1. Timeout Growth:
+///    - Initial timeout: INITIAL_TIMEOUT
+///    - Growth formula: timeout = INITIAL_TIMEOUT * (BACKOFF_BASE + log2(attempt))
+///    - Maximum timeout: MAX_TIMEOUT
+///    This provides:
+///    - More aggressive early attempts when NAT mappings are fresh
+///    - Gradual timeout increase for complex network conditions
+///    - Reasonable upper bound to fail fast when connection is impossible
+///
+/// 2. Retry Intervals:
+///    - Base interval: BASE_INTERVAL_TIMEOUT
+///    - Growth formula: interval = BASE_INTERVAL_TIMEOUT * (BACKOFF_BASE + log2(attempt)) / INTERVAL_REDUCTION_FACTOR
+///    - Maximum interval: MAX_INTERVAL_TIMEOUT
+///    This ensures:
+///    - High frequency initial attempts
+///    - Gradual backing off while maintaining connection pressure
+///    - Minimum retry rate of once every MAX_INTERVAL_TIMEOUT seconds
+///
+/// This strategy is particularly effective for:
+/// - Multiple NAT hops where early attempts are crucial
+/// - Networks with variable latency
+/// - Maintaining connection pressure without overwhelming the network
+/// - Maximizing success rate in the critical first few seconds
+const INITIAL_TIMEOUT: Duration = Duration::from_millis(600);
+#[cfg(not(test))]
+const MAX_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const MAX_TIMEOUT: Duration = Duration::from_secs(10);
+const LOG_BASE: f64 = 2.0;
+const INTERVAL_REDUCTION_FACTOR: f64 = 2.0;
+const BASE_INTERVAL_TIMEOUT: Duration = Duration::from_millis(200);
+const MAX_INTERVAL_TIMEOUT: Duration = Duration::from_millis(2000);
+/// Base value for the backoff calculation to ensure a minimum multiplier of 1.0
+const BACKOFF_BASE: f64 = 1.0;
 
 const DEFAULT_BW_TRACKER_WINDOW_SIZE: Duration = Duration::from_secs(10);
 const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
@@ -452,7 +486,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     );
                     connection_tasks.push(task);
                     ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
-                },
+                }
             }
         }
     }
@@ -583,13 +617,6 @@ impl<S: Socket> UdpPacketsListener<S> {
             %remote_addr,
             "Starting NAT traversal"
         );
-        // Constants for exponential backoff
-        const INITIAL_TIMEOUT: Duration = Duration::from_millis(600);
-        const TIMEOUT_MULTIPLIER: f64 = 1.2;
-        #[cfg(not(test))]
-        const MAX_TIMEOUT: Duration = Duration::from_secs(60); // Maximum timeout limit
-        #[cfg(test)]
-        const MAX_TIMEOUT: Duration = Duration::from_secs(10); // Maximum timeout limit
 
         #[allow(clippy::large_enum_variant)]
         enum ConnectionState {
@@ -640,8 +667,9 @@ impl<S: Socket> UdpPacketsListener<S> {
             let mut state = ConnectionState::StartOutbound {};
             // Initialize timeout and interval
             let mut timeout = INITIAL_TIMEOUT;
-            let mut interval_duration = INITIAL_INTERVAL;
+            let mut interval_duration = BASE_INTERVAL_TIMEOUT;
             let mut tick = tokio::time::interval(interval_duration);
+            let mut attempt = 1u32;
 
             let mut failures = 0;
 
@@ -842,21 +870,26 @@ impl<S: Socket> UdpPacketsListener<S> {
                     break;
                 }
 
-                // Update timeout using exponential backoff, capped at MAX_TIMEOUT
+                // Update timeout using logarithmic backoff, capped at MAX_TIMEOUT
                 timeout = std::cmp::min(
                     Duration::from_millis(
-                        ((timeout.as_millis()) as f64 * TIMEOUT_MULTIPLIER) as u64,
+                        (INITIAL_TIMEOUT.as_millis() as f64
+                            * (BACKOFF_BASE + (attempt as f64).log(LOG_BASE)))
+                            as u64,
                     ),
                     MAX_TIMEOUT,
                 );
+                attempt += 1;
 
-                // Update interval, capped at MAX_INTERVAL
-                if interval_duration < MAX_INTERVAL {
+                // Update interval proportionally but capped
+                if interval_duration < MAX_INTERVAL_TIMEOUT {
                     interval_duration = std::cmp::min(
                         Duration::from_millis(
-                            interval_duration.as_millis() as u64 * INTERVAL_INCREASE_FACTOR,
+                            (BASE_INTERVAL_TIMEOUT.as_millis() as f64
+                                * (BACKOFF_BASE + (attempt as f64).log(LOG_BASE))
+                                / INTERVAL_REDUCTION_FACTOR) as u64,
                         ),
-                        MAX_INTERVAL,
+                        MAX_INTERVAL_TIMEOUT,
                     );
                     tick = tokio::time::interval(interval_duration);
                 }

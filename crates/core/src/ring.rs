@@ -480,7 +480,7 @@ impl Ring {
             if let Some(t) = self.connection_manager.routing(
                 ideal_location,
                 None,
-                &initial_skip_list,  //aΩ Use just the input skip list for finding who to query
+                &initial_skip_list, // Use just the input skip list for finding who to query
                 &router,
             ) {
                 t
