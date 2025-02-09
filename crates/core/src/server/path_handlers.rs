@@ -22,6 +22,7 @@ mod v1;
 
 const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
+// Please add debug! tracing logs to this file, trying to diagnose an issue with failing to GET a contract after supposedly PUTting it AI!
 pub(super) async fn contract_home(
     key: String,
     request_sender: HttpGatewayRequest,
