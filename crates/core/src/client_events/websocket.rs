@@ -482,7 +482,7 @@ async fn process_host_response(
                                         "sending PUT response"
                                     );
                                 }
-                                _ => tracing::debug!(response = %resp, "sending contract response"),
+                                _ => tracing::debug!(response = ?resp, "sending contract response"),
                             }
                         }
                         _ => tracing::debug!(response = %res, "sending response"),
