@@ -68,12 +68,10 @@ const INITIAL_TIMEOUT: Duration = Duration::from_millis(600);
 const MAX_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const MAX_TIMEOUT: Duration = Duration::from_secs(10);
-const LOG_BASE: f64 = 2.0;
+
 const INTERVAL_REDUCTION_FACTOR: f64 = 2.0;
 const BASE_INTERVAL_TIMEOUT: Duration = Duration::from_millis(200);
 const MAX_INTERVAL_TIMEOUT: Duration = Duration::from_millis(2000);
-/// Base value for the backoff calculation to ensure a minimum multiplier of 1.0
-const BACKOFF_BASE: f64 = 1.0;
 
 const DEFAULT_BW_TRACKER_WINDOW_SIZE: Duration = Duration::from_secs(10);
 const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
@@ -668,12 +666,6 @@ impl<S: Socket> UdpPacketsListener<S> {
         let f = async move {
             let mut state = ConnectionState::StartOutbound {};
             // Initialize timeout and interval
-            let mut timeout = INITIAL_TIMEOUT;
-            let mut interval_duration = BASE_INTERVAL_TIMEOUT;
-            let mut tick = tokio::time::interval(interval_duration);
-            let mut attempt = 1u32;
-
-            let mut failures = 0;
 
             let inbound_sym_key_bytes = rand::random::<[u8; 16]>();
             let inbound_sym_key = Aes128Gcm::new(&inbound_sym_key_bytes.into());
@@ -688,7 +680,17 @@ impl<S: Socket> UdpPacketsListener<S> {
 
             let mut sent_tracker = SentPacketTracker::new();
 
-            while failures < NAT_TRAVERSAL_MAX_ATTEMPTS {
+            let backoff = crate::util::Backoff::new(
+                BASE_INTERVAL_TIMEOUT,
+                MAX_INTERVAL_TIMEOUT,
+                NAT_TRAVERSAL_MAX_ATTEMPTS,
+            )
+            .logarithmic()
+            .with_interval_reduction_factor(INTERVAL_REDUCTION_FACTOR);
+            let timeout =
+                crate::util::Backoff::new(INITIAL_TIMEOUT, MAX_TIMEOUT, NAT_TRAVERSAL_MAX_ATTEMPTS)
+                    .logarithmic();
+            for (sleep, timeout) in backoff.into_iter().zip(timeout.into_iter()) {
                 match state {
                     ConnectionState::StartOutbound { .. } => {
                         tracing::debug!(%remote_addr, "sending protocol version and inbound key");
@@ -796,7 +798,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         }
                                         _ => {
                                             tracing::debug!(%remote_addr, "unexpected packet from remote");
-                                            failures += 1;
                                             continue;
                                         }
                                     }
@@ -815,7 +816,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     continue;
                                 }
 
-                                failures += 1;
                                 tracing::debug!("Failed to decrypt packet");
                                 continue;
                             }
@@ -829,7 +829,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 if packet.is_intro_packet(intro_packet) {
                                     tracing::debug!(%remote_addr, "received intro packet");
                                     // we add to the number of failures so we are not stuck in a loop retrying
-                                    failures += 1;
                                     continue;
                                 }
                                 // if is not an intro packet, the connection is successful and we can proceed
@@ -861,7 +860,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                         return Err(TransportError::ConnectionClosed(remote_addr));
                     }
                     Err(_) => {
-                        failures += 1;
                         tracing::debug!(%this_addr, %remote_addr, "failed to receive UDP response in time, retrying");
                     }
                 }
@@ -872,31 +870,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     break;
                 }
 
-                // Update timeout using logarithmic backoff, capped at MAX_TIMEOUT
-                timeout = std::cmp::min(
-                    Duration::from_millis(
-                        (INITIAL_TIMEOUT.as_millis() as f64
-                            * (BACKOFF_BASE + (attempt as f64).log(LOG_BASE)))
-                            as u64,
-                    ),
-                    MAX_TIMEOUT,
-                );
-                attempt += 1;
-
-                // Update interval proportionally but capped
-                if interval_duration < MAX_INTERVAL_TIMEOUT {
-                    interval_duration = std::cmp::min(
-                        Duration::from_millis(
-                            (BASE_INTERVAL_TIMEOUT.as_millis() as f64
-                                * (BACKOFF_BASE + (attempt as f64).log(LOG_BASE))
-                                / INTERVAL_REDUCTION_FACTOR) as u64,
-                        ),
-                        MAX_INTERVAL_TIMEOUT,
-                    );
-                    tick = tokio::time::interval(interval_duration);
-                }
-
-                tick.tick().await;
+                tokio::time::sleep(sleep).await;
             }
 
             Err(TransportError::ConnectionEstablishmentFailure {

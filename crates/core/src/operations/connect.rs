@@ -20,7 +20,7 @@ use crate::{
     node::{NetworkBridge, OpManager, PeerId},
     operations::OpEnum,
     ring::PeerKeyLocation,
-    util::ExponentialBackoff,
+    util::Backoff,
 };
 
 pub(crate) use self::messages::{ConnectMsg, ConnectRequest, ConnectResponse};
@@ -31,7 +31,7 @@ pub(crate) struct ConnectOp {
     state: Option<ConnectState>,
     pub gateway: Option<Box<PeerKeyLocation>>,
     /// keeps track of the number of retries and applies an exponential backoff cooldown period
-    pub backoff: Option<ExponentialBackoff>,
+    pub backoff: Option<Backoff>,
 }
 
 impl ConnectOp {
@@ -39,7 +39,7 @@ impl ConnectOp {
         id: Transaction,
         state: Option<ConnectState>,
         gateway: Option<Box<PeerKeyLocation>>,
-        backoff: Option<ExponentialBackoff>,
+        backoff: Option<Backoff>,
     ) -> Self {
         Self {
             id,
@@ -555,7 +555,7 @@ fn build_op_result(
     state: Option<ConnectState>,
     msg: Option<ConnectMsg>,
     gateway: Option<Box<PeerKeyLocation>>,
-    backoff: Option<ExponentialBackoff>,
+    backoff: Option<Backoff>,
 ) -> Result<OperationResult, OpError> {
     tracing::debug!(tx = %id, ?msg, "Connect operation result");
     Ok(OperationResult {
@@ -711,7 +711,7 @@ pub(crate) async fn initial_join_procedure(
 
 #[tracing::instrument(fields(peer = %op_manager.ring.connection_manager.pub_key), skip_all)]
 pub(crate) async fn join_ring_request(
-    backoff: Option<ExponentialBackoff>,
+    backoff: Option<Backoff>,
     gateway: &PeerKeyLocation,
     op_manager: &OpManager,
 ) -> Result<(), OpError> {
@@ -774,7 +774,7 @@ fn initial_request(
         id,
         state: Some(state),
         gateway: Some(Box::new(gateway)),
-        backoff: Some(ExponentialBackoff::new(
+        backoff: Some(Backoff::new(
             Duration::from_secs(1),
             ceiling,
             MAX_JOIN_RETRIES,
