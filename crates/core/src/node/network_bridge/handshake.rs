@@ -513,7 +513,9 @@ impl HandshakeHandler {
             location: Some(joiner_loc),
         };
         let my_peer_id = self.connection_manager.own_location();
-        transaction.skip_connections.insert(transaction.joiner.clone());
+        transaction
+            .skip_connections
+            .insert(transaction.joiner.clone());
         transaction.skip_forwards.insert(transaction.joiner.clone());
         transaction.skip_connections.insert(my_peer_id.peer.clone());
         transaction.skip_forwards.insert(my_peer_id.peer.clone());
@@ -533,7 +535,7 @@ impl HandshakeHandler {
             &self.connection_manager,
             self.router.clone(),
             &mut nw_bridge,
-            forward_info
+            forward_info,
         )
         .await
         {

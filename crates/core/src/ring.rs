@@ -354,11 +354,16 @@ impl Ring {
 
         let mut live_tx = None;
         let mut pending_conn_adds = BTreeSet::new();
+        let mut this_peer = None;
         loop {
-            if self.connection_manager.get_peer_key().is_none() {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            let Some(this_peer) = &this_peer else {
+                let Some(peer) = self.connection_manager.get_peer_key() else {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                };
+                this_peer = Some(peer);
                 continue;
-            }
+            };
             loop {
                 match missing_candidates.try_recv() {
                     Ok(missing_candidate) => {
@@ -381,8 +386,7 @@ impl Ring {
 
             // avoid connecting to the same peer multiple times
             let mut skip_list: HashSet<_> = missing.values().collect();
-            let this_peer = self.connection_manager.get_peer_key().unwrap();
-            skip_list.insert(&this_peer);
+            skip_list.insert(this_peer);
 
             // if there are no open connections, we need to acquire more
             if let Some(tx) = &live_tx {

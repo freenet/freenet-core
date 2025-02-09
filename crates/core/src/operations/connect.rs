@@ -230,7 +230,7 @@ impl Operation for ConnectOp {
                         );
                         debug_assert_eq!(this_peer, &joiner.peer);
                         new_state = Some(ConnectState::AwaitingNewConnection(NewConnectionInfo {
-                            remaining_connetions: *max_hops_to_live,
+                            remaining_connections: *max_hops_to_live,
                         }));
                         let msg = ConnectMsg::Request {
                             id: *id,
@@ -263,7 +263,7 @@ impl Operation for ConnectOp {
                     ..
                 } => {
                     if sender.peer == joiner.peer {
-                        tracing::warn!(
+                        tracing::error!(
                             tx = %id,
                             sender = %sender.peer,
                             joiner = %joiner.peer,
@@ -331,6 +331,8 @@ impl Operation for ConnectOp {
                     };
 
                     {
+                        let mut new_skip_list = skip_connections.clone();
+                        new_skip_list.insert(this_peer.peer.clone());
                         if let Some(updated_state) = forward_conn(
                             *id,
                             &op_manager.ring.connection_manager,
@@ -503,10 +505,11 @@ impl Operation for ConnectOp {
                                 from = %sender.peer,
                                 "Connection request forwarded",
                             );
-                            assert!(info.remaining_connetions > 0);
-                            let remaining_connetions = info.remaining_connetions.saturating_sub(1);
+                            assert!(info.remaining_connections > 0);
+                            let remaining_connections =
+                                info.remaining_connections.saturating_sub(1);
 
-                            if remaining_connetions == 0 {
+                            if remaining_connections == 0 {
                                 tracing::debug!(
                                     tx = %id,
                                     at = %this_peer_id,
@@ -516,13 +519,13 @@ impl Operation for ConnectOp {
                                 op_manager
                                     .ring
                                     .live_tx_tracker
-                                    .missing_candidate_peers(this_peer_id)
+                                    .missing_candidate_peers(sender.peer.clone())
                                     .await;
                                 new_state = None;
                             } else {
                                 new_state =
                                     Some(ConnectState::AwaitingNewConnection(NewConnectionInfo {
-                                        remaining_connetions,
+                                        remaining_connections,
                                     }));
                             }
 
@@ -646,7 +649,7 @@ pub(crate) struct ConnectionInfo {
 
 #[derive(Debug, Clone)]
 pub(crate) struct NewConnectionInfo {
-    remaining_connetions: usize,
+    remaining_connections: usize,
 }
 
 impl ConnectState {
@@ -826,7 +829,7 @@ async fn connect_request(
                     true,
                 )
                 .await;
-            let Some(remaining_connetions) = remaining_checks else {
+            let Some(remaining_connections) = remaining_checks else {
                 tracing::error!(tx = %id, "Failed to connect to gateway, missing remaining checks");
                 return Err(OpError::ConnError(
                     crate::node::ConnectionError::FailedConnectOp,
@@ -846,7 +849,7 @@ async fn connect_request(
                     OpEnum::Connect(Box::new(ConnectOp {
                         id,
                         state: Some(ConnectState::AwaitingNewConnection(NewConnectionInfo {
-                            remaining_connetions,
+                            remaining_connections,
                         })),
                         gateway: Some(Box::new(gateway)),
                         backoff,
@@ -865,7 +868,9 @@ pub(crate) struct ForwardParams {
     pub left_htl: usize,
     pub max_htl: usize,
     pub accepted: bool,
+    /// Avoid connecting to these peers.
     pub skip_connections: HashSet<PeerId>,
+    /// Avoif forwarding to these peers.
     pub skip_forwards: HashSet<PeerId>,
     pub req_peer: PeerKeyLocation,
     pub joiner: PeerKeyLocation,
