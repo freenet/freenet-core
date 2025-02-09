@@ -814,10 +814,13 @@ impl Executor<Runtime> {
     ) -> Result<(), ExecutorError> {
         let key = trying_container.key();
         let params = trying_container.params();
+        let state_hash = blake3::hash(state.as_ref());
         
         tracing::debug!(
             contract = %key,
             state_size = state.as_ref().len(),
+            state_hash = %state_hash,
+            params_size = params.as_ref().len(),
             "starting contract verification and storage"
         );
 

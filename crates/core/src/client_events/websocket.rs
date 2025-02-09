@@ -233,8 +233,12 @@ async fn websocket_interface(
     encoding_protoc: EncodingProtocol,
     ws: WebSocket,
 ) -> anyhow::Result<()> {
+    tracing::debug!("starting websocket interface handler");
     let (mut response_rx, client_id) = new_client_connection(&request_sender).await?;
+    tracing::debug!(client_id = %client_id, "client connection established");
+    
     let (mut server_sink, mut client_stream) = ws.split();
+    tracing::debug!("websocket stream split for bidirectional communication");
     let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::UnboundedReceiver<HostResult>)>>> =
         Arc::new(Mutex::new(VecDeque::new()));
     loop {
@@ -374,13 +378,22 @@ async fn process_client_request(
             tracing::debug!(size = data.len(), "received text message");
             data.into_bytes()
         }
-        Ok(Message::Close(_)) => return Err(None),
-        Ok(Message::Ping(ping)) => return Ok(Some(Message::Pong(ping))),
+        Ok(Message::Close(frame)) => {
+            tracing::debug!(?frame, "received close frame");
+            return Err(None);
+        }
+        Ok(Message::Ping(ping)) => {
+            tracing::debug!("received ping");
+            return Ok(Some(Message::Pong(ping)));
+        }
         Ok(m) => {
-            tracing::debug!(msg = ?m, "received random message");
+            tracing::debug!(msg = ?m, "received unexpected message type");
             return Ok(None);
         }
-        Err(err) => return Err(Some(err.into())),
+        Err(err) => {
+            tracing::error!(error = %err, "error receiving websocket message");
+            return Err(Some(err.into()));
+        }
     };
 
     // Try to deserialize the ClientRequest message
