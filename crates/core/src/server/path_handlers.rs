@@ -11,6 +11,7 @@ use tokio::{fs::File, io::AsyncReadExt, sync::mpsc};
 
 use crate::client_events::AuthToken;
 
+use tracing::debug;
 use super::{
     app_packaging::{WebApp, WebContractError},
     errors::WebSocketApiError,

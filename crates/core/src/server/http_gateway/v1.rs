@@ -1,5 +1,5 @@
 use super::*;
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 impl HttpGateway {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
