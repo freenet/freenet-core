@@ -34,7 +34,7 @@ impl HttpGateway {
     }
 }
 
-#[instrument(skip(rs))]
+#[instrument(skip(rs, config))]
 async fn web_home(
     Path(key): Path<String>,
     Extension(rs): Extension<HttpGatewayRequest>,

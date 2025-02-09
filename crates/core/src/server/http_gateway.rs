@@ -48,7 +48,7 @@ impl HttpGateway {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Config {
     localhost: bool,
 }

@@ -53,7 +53,7 @@ impl WebApp {
         Ok(output)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, dst))]
     pub fn unpack(&mut self, dst: impl AsRef<Path>) -> Result<(), WebContractError> {
         debug!("Unpacking web content to {:?}", dst.as_ref());
         let mut decoded_web = self.decode_web();
