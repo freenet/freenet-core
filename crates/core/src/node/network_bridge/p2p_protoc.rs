@@ -643,6 +643,7 @@ impl P2pConnManager {
         } else {
             tracing::warn!(%peer_id, "No callback for connection established");
         }
+        tracing::info!(at=%peer_id, remote_addr=%connection.remote_addr(), "Connection established");
         let (tx, rx) = mpsc::channel(10);
         self.connections.insert(peer_id.clone(), tx);
         let task = peer_connection_listener(rx, connection).boxed();
