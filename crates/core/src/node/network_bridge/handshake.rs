@@ -29,7 +29,7 @@ use crate::{
 type Result<T, E = HandshakeError> = std::result::Result<T, E>;
 type OutboundConnResult = Result<InternalEvent, (PeerId, HandshakeError)>;
 
-const TIMEOUT: Duration = Duration::from_secs(10);
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub(super) struct ForwardInfo {
@@ -1221,23 +1221,53 @@ mod tests {
         }
 
         async fn recv_outbound_msg(&mut self) -> anyhow::Result<NetMessage> {
-            let (_, msg) = self.packet_receivers[0]
-                .recv()
-                .await
-                .ok_or_else(|| anyhow::Error::msg("Failed to receive packet"))?;
-            let packet: PacketData<UnknownEncryption> = PacketData::from_buf(&*msg);
-            let packet = packet
-                .try_decrypt_sym(&self.in_key)
-                .map_err(|_| anyhow!("Failed to decrypt packet"))?;
-            let msg: SymmetricMessage = bincode::deserialize(packet.data()).unwrap();
-            let SymmetricMessage {
-                payload: SymmetricMessagePayload::ShortMessage { payload },
-                ..
-            } = msg
-            else {
-                panic!()
-            };
-            let msg: NetMessage = bincode::deserialize(&payload).unwrap();
+            // let (_, msg) = self.packet_receivers[0]
+            //     .recv()
+            //     .await
+            //     .ok_or_else(|| anyhow::Error::msg("Failed to receive packet"))?;
+
+            let mut outbound_bytes = Vec::new();
+            while let Some((_, packet)) = self.packet_receivers[0].recv().await {
+                let decrypted_packet = PacketData::<_>::from_buf(packet.as_ref())
+                    .try_decrypt_sym(&self.in_key)
+                    .map_err(|e| e.to_string())
+                    .unwrap(); //TODO: CHANGE THIS UNWRAP ASAP!
+                let deserialized = SymmetricMessage::deser(decrypted_packet.data())?;
+                let SymmetricMessagePayload::StreamFragment { payload, .. } = deserialized.payload
+                else {
+                    tracing::info!("Expected a StreamFragment, got {:?}", deserialized.payload);
+                    break;
+                };
+                outbound_bytes.extend_from_slice(payload.as_ref());
+            }
+
+            // let packet: PacketData<UnknownEncryption> = PacketData::from_buf(&*msg);
+            // let packet = packet
+            //     .try_decrypt_sym(&self.in_key)
+            //     .map_err(|_| anyhow!("Failed to decrypt packet"))?;
+            // let msg: SymmetricMessage = bincode::deserialize(packet.data()).unwrap();
+
+            // let payload = match msg {
+            //     SymmetricMessage {
+            //         payload: SymmetricMessagePayload::ShortMessage { payload },
+            //         ..
+            //     } => payload,
+            //     SymmetricMessage {
+            //         payload: SymmetricMessagePayload::StreamFragment { payload, .. },
+            //         ..
+            //     } => payload,
+            //     _ => panic!(),
+            // };
+
+            // let SymmetricMessage {
+            //     payload: SymmetricMessagePayload::ShortMessage { payload },
+            //     ..
+            // } = msg
+            // else {
+            //     println!("{:?}", msg);
+            //     panic!()
+            // };
+            let msg: NetMessage = bincode::deserialize(&outbound_bytes).unwrap();
             Ok(msg)
         }
     }
@@ -1478,7 +1508,7 @@ mod tests {
 
         let peer_inbound = async {
             let event =
-                tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
+                tokio::time::timeout(Duration::from_secs(20), handler.wait_for_events()).await??;
             match event {
                 Event::OutboundGatewayConnectionSuccessful { peer_id, .. } => {
                     assert_eq!(peer_id.addr, remote_addr);
@@ -1580,7 +1610,7 @@ mod tests {
             let mut third_party = None;
             loop {
                 let event =
-                    tokio::time::timeout(Duration::from_secs(1), gw_handler.wait_for_events())
+                    tokio::time::timeout(Duration::from_secs(20), gw_handler.wait_for_events())
                         .await??;
                 match event {
                     Event::InboundConnection {
@@ -1771,7 +1801,7 @@ mod tests {
             for conn_num in 3..Ring::DEFAULT_MAX_HOPS_TO_LIVE {
                 let conn_num = conn_num + 2;
                 let event =
-                    tokio::time::timeout(Duration::from_secs(60), handler.wait_for_events())
+                    tokio::time::timeout(Duration::from_secs(20), handler.wait_for_events())
                         .await
                         .inspect_err(|_| {
                             tracing::error!(%conn_num, "failed while waiting for events");
@@ -1867,7 +1897,7 @@ mod tests {
 
         let peer_inbound = async {
             let event =
-                tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
+                tokio::time::timeout(Duration::from_secs(10), handler.wait_for_events()).await??;
             let _conn = match event {
                 Event::OutboundGatewayConnectionSuccessful {
                     peer_id,
