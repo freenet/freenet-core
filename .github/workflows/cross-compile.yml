@@ -28,11 +28,17 @@ jobs:
       - name: Compile for x86_64-unknown-linux-gnu
         run: cargo build --release
 
-      - name: Upload binaries
+      - name: Upload freenet binary
         uses: actions/upload-artifact@v4
         with:
-          name: binaries-x86_64
+          name: binaries-x86_64-freenet
           path: target/release/freenet
+
+      - name: Upload fdev binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-x86_64-fdev
+          path: target/release/fdev
 
   build-arm64:
     name: Build for aarch64-unknown-linux-gnu
@@ -54,8 +60,14 @@ jobs:
       - name: Compile for aarch64-unknown-linux-gnu
         run: cargo build --release
 
-      - name: Upload binaries
+      - name: Upload freenet binary
         uses: actions/upload-artifact@v4
         with:
-          name: binaries-arm64
+          name: binaries-arm64-freenet
           path: target/release/freenet
+
+      - name: Upload fdev binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-arm64-fdev
+          path: target/release/fdev
