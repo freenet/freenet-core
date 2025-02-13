@@ -1,4 +1,5 @@
-use std::{fs::File, io::Read, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{fs::File, io::Read, net::SocketAddr, path::PathBuf, sync::Arc, io::Cursor};
+use tar::Builder;
 
 use freenet::dev_tool::OperationMode;
 use freenet::server::WebApp;
@@ -115,8 +116,14 @@ async fn put_contract(
             tracing::warn!("Warning: No index.html found at root of webapp archive");
         }
 
-        // Create WebApp state directly from pre-compressed archive
-        let webapp = WebApp::from_data(metadata, archive)?;
+        // Create WebApp state from pre-compressed archive
+        let mut builder = Builder::new(Cursor::new(Vec::new()));
+        builder.append_data(
+            &mut tar::Header::new_gnu(),
+            "archive.tar.xz",
+            &mut std::io::Cursor::new(&archive),
+        )?;
+        let webapp = WebApp::from_data(metadata, builder)?;
         webapp.pack()?.into()
     } else if let Some(ref state_path) = contract_config.state {
         let mut buf = vec![];
