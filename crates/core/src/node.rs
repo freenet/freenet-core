@@ -8,6 +8,13 @@
 //! - in-memory: a simplifying node used for emulation purposes mainly.
 //! - inter-process: similar to in-memory, but can be rana cross multiple processes, closer to the real p2p impl
 
+use anyhow::Context;
+use either::Either;
+use freenet_stdlib::{
+    client_api::{ClientRequest, ErrorKind},
+    prelude::ContractKey,
+};
+use std::collections::HashSet;
 use std::{
     borrow::Cow,
     fmt::Display,
@@ -17,13 +24,6 @@ use std::{
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     sync::Arc,
     time::Duration,
-};
-
-use anyhow::Context;
-use either::Either;
-use freenet_stdlib::{
-    client_api::{ClientRequest, ErrorKind},
-    prelude::ContractKey,
 };
 
 use rsa::pkcs8::DecodePublicKey;
@@ -649,7 +649,7 @@ pub async fn subscribe(
         Err(OpError::ContractError(ContractError::ContractNotFound(key))) => {
             tracing::info!(%key, "Trying to subscribe to a contract not present, requesting it first");
             let get_op = get::start_op(key, true);
-            if let Err(error) = get::request_get(&op_manager, get_op, vec![]).await {
+            if let Err(error) = get::request_get(&op_manager, get_op, HashSet::new()).await {
                 tracing::error!(%key, %error, "Failed getting the contract while previously trying to subscribe; bailing");
                 return Err(error);
             }

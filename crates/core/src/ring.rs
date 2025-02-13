@@ -3,7 +3,7 @@
 //! Mainly maintains a healthy and optimal pool of connections to other peers in the network
 //! and routes requests to the optimal peers.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::net::SocketAddr;
 use std::{
     cmp::Reverse,
@@ -300,7 +300,7 @@ impl Ring {
     pub fn closest_to_location(
         &self,
         location: Location,
-        skip_list: &[PeerId],
+        skip_list: HashSet<PeerId>,
     ) -> Option<PeerKeyLocation> {
         use rand::seq::SliceRandom;
         self.connection_manager
@@ -354,11 +354,16 @@ impl Ring {
 
         let mut live_tx = None;
         let mut pending_conn_adds = BTreeSet::new();
+        let mut this_peer = None;
         loop {
-            if self.connection_manager.get_peer_key().is_none() {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            let Some(this_peer) = &this_peer else {
+                let Some(peer) = self.connection_manager.get_peer_key() else {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                };
+                this_peer = Some(peer);
                 continue;
-            }
+            };
             loop {
                 match missing_candidates.try_recv() {
                     Ok(missing_candidate) => {
@@ -380,9 +385,8 @@ impl Ring {
             missing.split_off(&Reverse(retry_missing_candidates_until));
 
             // avoid connecting to the same peer multiple times
-            let mut skip_list = missing.values().collect::<Vec<_>>();
-            let this_peer = self.connection_manager.get_peer_key().unwrap();
-            skip_list.push(&this_peer);
+            let mut skip_list: HashSet<_> = missing.values().collect();
+            skip_list.insert(this_peer);
 
             // if there are no open connections, we need to acquire more
             if let Some(tx) = &live_tx {
@@ -469,30 +473,42 @@ impl Ring {
     async fn acquire_new(
         &self,
         ideal_location: Location,
-        skip_list: &[&PeerId],
+        skip_list: &HashSet<&PeerId>,
         notifier: &EventLoopNotificationsSender,
         live_tx_tracker: &LiveTransactionTracker,
     ) -> anyhow::Result<Option<Transaction>> {
+        // First find a query target using just the input skip list
         let query_target = {
             let router = self.router.read();
-            if let Some(t) =
-                self.connection_manager
-                    .routing(ideal_location, None, skip_list, &router)
-            {
+            if let Some(t) = self.connection_manager.routing(
+                ideal_location,
+                None,
+                skip_list, // Use just the input skip list for finding who to query
+                &router,
+            ) {
                 t
             } else {
                 return Ok(None);
             }
         };
+
+        // Now create the complete skip list for the connect request
+        let new_skip_list = skip_list
+            .iter()
+            .copied()
+            .cloned()
+            .chain(self.connection_manager.connected_peers())
+            .collect();
+
         let joiner = self.connection_manager.own_location();
         tracing::debug!(
             this_peer = %joiner,
             %query_target,
             %ideal_location,
+            skip_list = ?new_skip_list,
             "Adding new connections"
         );
         let missing_connections = self.connection_manager.max_connections - self.open_connections();
-        let connected = self.connection_manager.connected_peers();
         let id = Transaction::new::<connect::ConnectMsg>();
         live_tx_tracker.add_transaction(query_target.peer.clone(), id);
         let msg = connect::ConnectMsg::Request {
@@ -503,11 +519,8 @@ impl Ring {
                 ideal_location,
                 joiner,
                 max_hops_to_live: missing_connections,
-                skip_list: skip_list
-                    .iter()
-                    .map(|p| (*p).clone())
-                    .chain(connected)
-                    .collect(),
+                skip_connections: new_skip_list,
+                skip_forwards: HashSet::new(),
             },
         };
         notifier.send(Either::Left(msg.into())).await?;

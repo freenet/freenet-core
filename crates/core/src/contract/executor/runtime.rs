@@ -135,13 +135,11 @@ impl ContractExecutor for Executor<Runtime> {
             .map_err(|e| ExecutorError::execution(e, None))?
         {
             ValidateResult::Valid => {
-                //FIXME: do a better comparison of states
-                // if updated_state.as_ref() == current_state.as_ref() {
-                //     Ok(UpsertResult::NoChange)
-                // } else {
-                //     Ok(UpsertResult::Updated(updated_state))
-                // }
-                Ok(UpsertResult::Updated(updated_state))
+                if updated_state.as_ref() == current_state.as_ref() {
+                    Ok(UpsertResult::NoChange)
+                } else {
+                    Ok(UpsertResult::Updated(updated_state))
+                }
             }
             ValidateResult::Invalid => Err(ExecutorError::request(
                 freenet_stdlib::client_api::ContractError::Update {

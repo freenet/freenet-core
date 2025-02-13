@@ -353,7 +353,7 @@ impl HandshakeHandler {
                                     return Err(e.into());
                                 }
 
-                                let InboundGwJoinRequest { conn, id, joiner, hops_to_live, max_hops_to_live, skip_list } = req;
+                                let InboundGwJoinRequest { conn, id, joiner, hops_to_live, max_hops_to_live, skip_connections, skip_forwards } = req;
 
                                 let (ok, forward_info) = {
                                     // TODO: refactor this so it happens in the background out of the main handler loop
@@ -368,19 +368,27 @@ impl HandshakeHandler {
                                         location: Some(joiner_loc),
                                     };
 
+                                    let mut skip_connections = skip_connections.clone();
+                                    let mut skip_forwards = skip_forwards.clone();
+                                    skip_connections.insert(my_peer_id.peer.clone());
+                                    skip_forwards.insert(my_peer_id.peer.clone());
+
+                                    let forward_info = ForwardParams {
+                                        left_htl: hops_to_live,
+                                        max_htl: max_hops_to_live,
+                                        accepted: true,
+                                        skip_connections,
+                                        skip_forwards,
+                                        req_peer: my_peer_id.clone(),
+                                        joiner: joiner_pk_loc.clone(),
+                                    };
+
                                     let f = forward_conn(
                                         id,
                                         &self.connection_manager,
                                         self.router.clone(),
                                         &mut nw_bridge,
-                                        ForwardParams {
-                                            left_htl: hops_to_live,
-                                            max_htl: max_hops_to_live,
-                                            skip_list,
-                                            accepted: true,
-                                            req_peer: my_peer_id.clone(),
-                                            joiner: joiner_pk_loc.clone(),
-                                        }
+                                        forward_info
                                     );
 
                                     match f.await {
@@ -413,7 +421,7 @@ impl HandshakeHandler {
                                 })
 
                             } else {
-                                let InboundGwJoinRequest { mut conn, id, hops_to_live, max_hops_to_live, skip_list, .. } = req;
+                                let InboundGwJoinRequest { mut conn, id, hops_to_live, max_hops_to_live, skip_connections, skip_forwards, .. } = req;
                                 let remote = conn.remote_addr();
                                 tracing::debug!(at=?conn.my_address(), from=%remote, "Transient connection");
                                 let mut tx = TransientConnection {
@@ -421,7 +429,8 @@ impl HandshakeHandler {
                                     joiner: req.joiner.clone(),
                                     max_hops_to_live,
                                     hops_to_live,
-                                    skip_list,
+                                    skip_connections,
+                                    skip_forwards,
                                 };
                                 match self.forward_transient_connection(&mut conn, &mut tx).await {
                                     Ok(ForwardResult::Forward(forward_target, msg, info)) => {
@@ -504,22 +513,29 @@ impl HandshakeHandler {
             location: Some(joiner_loc),
         };
         let my_peer_id = self.connection_manager.own_location();
-        transaction.skip_list.push(transaction.joiner.clone());
-        transaction.skip_list.push(my_peer_id.peer.clone());
+        transaction
+            .skip_connections
+            .insert(transaction.joiner.clone());
+        transaction.skip_forwards.insert(transaction.joiner.clone());
+        transaction.skip_connections.insert(my_peer_id.peer.clone());
+        transaction.skip_forwards.insert(my_peer_id.peer.clone());
+
+        let forward_info = ForwardParams {
+            left_htl: transaction.hops_to_live,
+            max_htl: transaction.max_hops_to_live,
+            accepted: true,
+            skip_connections: transaction.skip_connections.clone(),
+            skip_forwards: transaction.skip_forwards.clone(),
+            req_peer: my_peer_id.clone(),
+            joiner: joiner_pk_loc.clone(),
+        };
 
         match forward_conn(
             transaction.tx,
             &self.connection_manager,
             self.router.clone(),
             &mut nw_bridge,
-            ForwardParams {
-                left_htl: transaction.hops_to_live,
-                max_htl: transaction.max_hops_to_live,
-                skip_list: transaction.skip_list.clone(),
-                accepted: false,
-                req_peer: my_peer_id.clone(),
-                joiner: joiner_pk_loc.clone(),
-            },
+            forward_info,
         )
         .await
         {
@@ -732,7 +748,8 @@ struct InboundGwJoinRequest {
     pub joiner: PeerId,
     pub hops_to_live: usize,
     pub max_hops_to_live: usize,
-    pub skip_list: Vec<PeerId>,
+    pub skip_connections: HashSet<PeerId>,
+    pub skip_forwards: HashSet<PeerId>,
 }
 
 #[derive(Debug)]
@@ -783,7 +800,8 @@ async fn wait_for_gw_confirmation(
             joiner_key: this_peer.pub_key.clone(),
             hops_to_live: tracker.total_checks,
             max_hops_to_live: tracker.total_checks,
-            skip_list: vec![this_peer],
+            skip_connections: HashSet::from([this_peer.clone()]),
+            skip_forwards: HashSet::from([this_peer.clone()]),
         },
     }));
     tracing::debug!(
@@ -927,7 +945,7 @@ async fn gw_peer_connection_listener(
                 match net_message {
                     NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
                         id,
-                        msg: ConnectRequest::StartJoinReq { joiner, joiner_key, hops_to_live, max_hops_to_live, skip_list },
+                        msg: ConnectRequest::StartJoinReq { joiner, joiner_key, hops_to_live, max_hops_to_live, skip_connections, skip_forwards },
                         ..
                     })) => {
                         let joiner = joiner.unwrap_or_else(|| {
@@ -935,12 +953,16 @@ async fn gw_peer_connection_listener(
                             PeerId::new(conn.remote_addr(), joiner_key)
                         });
                         break Ok((
-                            InternalEvent::InboundGwJoinRequest(
-                                InboundGwJoinRequest {
-                                    conn, id, joiner, hops_to_live, max_hops_to_live, skip_list
-                                }
-                            ),
-                            outbound
+                            InternalEvent::InboundGwJoinRequest(InboundGwJoinRequest {
+                                conn,
+                                id,
+                                joiner,
+                                hops_to_live,
+                                max_hops_to_live,
+                                skip_connections,
+                                skip_forwards,
+                            }),
+                            outbound,
                         ));
                     }
                     other =>  {
@@ -1051,7 +1073,8 @@ struct TransientConnection {
     joiner: PeerId,
     max_hops_to_live: usize,
     hops_to_live: usize,
-    skip_list: Vec<PeerId>,
+    skip_connections: HashSet<PeerId>,
+    skip_forwards: HashSet<PeerId>,
 }
 
 impl TransientConnection {
@@ -1170,7 +1193,8 @@ mod tests {
                     joiner_key: pub_key,
                     hops_to_live,
                     max_hops_to_live: hops_to_live,
-                    skip_list: vec![],
+                    skip_connections: HashSet::new(),
+                    skip_forwards: HashSet::new(),
                 },
             };
             self.inbound_msg(

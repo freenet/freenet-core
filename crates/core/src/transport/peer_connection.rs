@@ -270,14 +270,23 @@ impl PeerConnection {
                         payload,
                     } = msg;
                     {
-                        tracing::debug!(
-                            remote = %self.remote_conn.remote_addr, %packet_id, ?confirm_receipt,
-                            "received inbound packet",
+                        tracing::trace!(
+                            remote = %self.remote_conn.remote_addr,
+                            %packet_id,
+                            confirm_receipts_count = ?confirm_receipt.len(),
+                            confirm_receipts = ?confirm_receipt,
+                            "received inbound packet with confirmations"
                         );
                     }
 
                     let current_time = Instant::now();
                     let should_send_receipts = if current_time > self.last_packet_report_time + MESSAGE_CONFIRMATION_TIMEOUT {
+                        tracing::trace!(
+                            remote = %self.remote_conn.remote_addr,
+                            elapsed = ?current_time.duration_since(self.last_packet_report_time),
+                            timeout = ?MESSAGE_CONFIRMATION_TIMEOUT,
+                            "timeout reached, should send receipts"
+                        );
                         self.last_packet_report_time = current_time;
                         true
                     } else {
@@ -288,10 +297,11 @@ impl PeerConnection {
                         .sent_tracker
                         .lock()
                         .report_received_receipts(&confirm_receipt);
-                    match (self.received_tracker.report_received_packet(packet_id), should_send_receipts) {
+
+                    let report_result = self.received_tracker.report_received_packet(packet_id);
+                    match (report_result, should_send_receipts) {
                         (ReportResult::QueueFull, _) | (_, true) => {
                             let receipts = self.received_tracker.get_receipts();
-                            tracing::debug!(?receipts, remote = %self.remote_conn.remote_addr, "queue full, reporting receipts");
                             if !receipts.is_empty() {
                                 self.noop(receipts).await?;
                             }
@@ -348,7 +358,6 @@ impl PeerConnection {
                             .get_resend();
                         match maybe_resend {
                             ResendAction::WaitUntil(wait_until) => {
-                                tracing::debug!(remote = ?self.remote_conn.remote_addr, "waiting until {:?}", wait_until);
                                 resend_check = Some(tokio::time::sleep_until(wait_until.into()));
                                 break;
                             }
@@ -495,6 +504,9 @@ async fn packet_sending(
     payload: impl Into<SymmetricMessagePayload>,
     sent_tracker: &parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>,
 ) -> Result<()> {
+    let start_time = std::time::Instant::now();
+    tracing::trace!(%remote_addr, %packet_id, "Attempting to send packet");
+
     match SymmetricMessage::try_serialize_msg_to_packet_data(
         packet_id,
         payload,
@@ -502,16 +514,28 @@ async fn packet_sending(
         confirm_receipt,
     )? {
         either::Either::Left(packet) => {
-            outbound_packets
+            let packet_size = packet.data().len();
+            tracing::trace!(%remote_addr, %packet_id, packet_size, "Sending single packet");
+            match outbound_packets
                 .send((remote_addr, packet.clone().prepared_send()))
                 .await
-                .map_err(|_| TransportError::ConnectionClosed(remote_addr))?;
-            sent_tracker
-                .lock()
-                .report_sent_packet(packet_id, packet.prepared_send());
-            Ok(())
+            {
+                Ok(_) => {
+                    let elapsed = start_time.elapsed();
+                    tracing::trace!(%remote_addr, %packet_id, ?elapsed, "Successfully sent packet");
+                    sent_tracker
+                        .lock()
+                        .report_sent_packet(packet_id, packet.prepared_send());
+                    Ok(())
+                }
+                Err(e) => {
+                    tracing::error!(%remote_addr, %packet_id, error = %e, "Failed to send packet - channel closed");
+                    Err(TransportError::ConnectionClosed(remote_addr))
+                }
+            }
         }
         either::Either::Right((payload, mut confirm_receipt)) => {
+            tracing::trace!(%remote_addr, %packet_id, "Sending multi-packet message");
             macro_rules! send {
                 ($packets:ident) => {{
                     for packet in $packets {

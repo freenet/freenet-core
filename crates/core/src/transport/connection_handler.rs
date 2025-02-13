@@ -1,10 +1,10 @@
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::transport::crypto::TransportSecretKey;
 use crate::transport::packet_data::{AssymetricRSA, UnknownEncryption};
@@ -241,6 +241,8 @@ task_local! {
     static RANDOM_U64: [u8; 8];
 }
 
+/// The amount of times to retry NAT traversal before giving up. It should be sufficient
+/// so we give peers enough time for the other party to start the connection on its end.
 #[cfg(not(test))]
 pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 40;
 #[cfg(test)]
@@ -259,6 +261,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         let mut connection_tasks = FuturesUnordered::new();
         let mut gw_connection_tasks = FuturesUnordered::new();
         let mut pending_connections = vec![];
+        let mut outdated_peer: HashMap<SocketAddr, Instant> = HashMap::new();
 
         'outer: loop {
             'inner: loop {
@@ -283,18 +286,38 @@ impl<S: Socket> UdpPacketsListener<S> {
                     break 'inner;
                 }
             }
+
             tokio::select! {
-                // Handling of inbound packets
                 recv_result = self.socket_listener.recv_from(&mut buf) => {
                     match recv_result {
                         Ok((size, remote_addr)) => {
+                            if let Some(time) = outdated_peer.get(&remote_addr) {
+                                if time.elapsed() < Duration::from_secs(60 * 10) {
+                                    continue;
+                                } else {
+                                    outdated_peer.remove(&remote_addr);
+                                }
+                            }
                             let packet_data = PacketData::from_buf(&buf[..size]);
-                            tracing::debug!(%remote_addr, %size, "received packet from remote");
-                            if let Some(remote_conn) = self.remote_connections.remove(&remote_addr){
+
+                            tracing::trace!(
+                                %remote_addr,
+                                %size,
+                                has_remote_conn = %self.remote_connections.contains_key(&remote_addr),
+                                has_ongoing_gw = %ongoing_gw_connections.contains_key(&remote_addr),
+                                has_ongoing_conn = %ongoing_connections.contains_key(&remote_addr),
+                                "received packet from remote"
+                            );
+
+                            if let Some(remote_conn) = self.remote_connections.remove(&remote_addr) {
                                 if remote_conn.inbound_packet_sender.send(packet_data)
                                     .await
                                     .inspect_err(|err| {
-                                        tracing::debug!(%remote_addr, %err, "failed to receive packet from remote");
+                                        tracing::warn!(
+                                            %remote_addr,
+                                            %err,
+                                            "failed to receive packet from remote, connection closed"
+                                        );
                                     })
                                     .is_ok()
                                 {
@@ -303,9 +326,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 continue;
                             }
 
-                            if let Some(inbound_packet_sender) = ongoing_gw_connections.remove(&remote_addr){
+                            if let Some(inbound_packet_sender) = ongoing_gw_connections.remove(&remote_addr) {
                                 if inbound_packet_sender.send(packet_data).await.inspect_err(|err| {
-                                    tracing::debug!(%remote_addr, %err, "failed to receive packet from remote");
+                                    tracing::warn!(
+                                        %remote_addr,
+                                        %err,
+                                        "failed to receive packet from remote, connection closed"
+                                    );
                                 }).is_ok() {
                                     ongoing_gw_connections.insert(remote_addr, inbound_packet_sender);
                                 }
@@ -313,32 +340,39 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
 
                             if let Some((packets_sender, open_connection)) = ongoing_connections.remove(&remote_addr) {
-                                if packets_sender.send(packet_data).await.is_err() {
-                                    // it can happen that the connection is established but the channel is closed because the task completed
-                                    // but we still haven't polled the result future
-                                    tracing::debug!(%remote_addr, "failed to send packet to remote");
+                                if packets_sender.send(packet_data).await.inspect_err(|err| {
+                                    tracing::warn!(
+                                        %remote_addr,
+                                        %err,
+                                        "failed to send packet to remote"
+                                    );
+                                }).is_ok() {
+                                    ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
                                 }
-                                ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
                                 continue;
                             }
 
                             if !self.is_gateway {
-                                tracing::trace!(%remote_addr, "unexpected packet from remote");
+                                tracing::debug!(
+                                    %remote_addr,
+                                    %size,
+                                    "unexpected packet from non-gateway node"
+                                );
                                 continue;
                             }
-                            let packet_data = PacketData::from_buf(&buf[..size]);
+
                             let inbound_key_bytes = key_from_addr(&remote_addr);
                             let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
                             let task = tokio::spawn(gw_ongoing_connection
                                 .instrument(tracing::span!(tracing::Level::DEBUG, "gateway_connection"))
                                 .map_err(move |error| {
-                                (error, remote_addr)
-                            }));
+                                    tracing::warn!(%remote_addr, %error, "gateway connection error");
+                                    (error, remote_addr)
+                                }));
                             ongoing_gw_connections.insert(remote_addr, packets_sender);
                             gw_connection_tasks.push(task);
                         }
                         Err(e) => {
-                            // TODO: this should panic and be propagate to the main task or retry and eventually fail
                             tracing::error!("Failed to receive UDP packet: {:?}", e);
                             return Err(e.into());
                         }
@@ -376,6 +410,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                         }
                         Err((error, remote_addr)) => {
                             tracing::error!(%error, ?remote_addr, "Failed to establish gateway connection");
+                            if let TransportError::ConnectionEstablishmentFailure { cause } = error {
+                                cause.starts_with("remote is using a different protocol version");
+                                outdated_peer.insert(remote_addr, Instant::now());
+                            }
                             ongoing_gw_connections.remove(&remote_addr);
                             ongoing_connections.remove(&remote_addr);
                         }
@@ -1011,6 +1049,10 @@ mod version_cmp {
                 version_str, decoded
             );
         }
+
+        let rc1 = parse_version_with_flags("0.1.0-rc1");
+        let rc2 = parse_version_with_flags("0.1.0-rc2");
+        assert_ne!(rc1, rc2, "rc1 and rc2 should have different flags");
     }
 }
 
