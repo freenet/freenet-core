@@ -6,7 +6,6 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, DelegateRequest, WebApi},
     prelude::*,
 };
-use tar::Builder;
 use xz2::read::XzDecoder;
 
 use crate::config::{BaseConfig, PutConfig, UpdateConfig};
@@ -117,8 +116,8 @@ async fn put_contract(
         }
 
         // Create WebApp state directly from pre-compressed archive
-        let webapp = WebApp::from_data(metadata, archive)?;
-        webapp.into()
+        let webapp = WebApp::from_data(metadata, archive.into_inner().into_inner())?;
+        webapp.pack()?.into()
     } else if let Some(ref state_path) = contract_config.state {
         let mut buf = vec![];
         File::open(state_path)?.read_to_end(&mut buf)?;
