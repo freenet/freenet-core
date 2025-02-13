@@ -117,13 +117,7 @@ async fn put_contract(
         }
 
         // Create WebApp state from pre-compressed archive
-        let mut builder = Builder::new(Cursor::new(Vec::new()));
-        builder.append_data(
-            &mut tar::Header::new_gnu(),
-            "archive.tar.xz",
-            &mut std::io::Cursor::new(&archive),
-        )?;
-        let webapp = WebApp::from_data(metadata, builder)?;
+        let webapp = WebApp::from_compressed(metadata, archive)?;
         webapp.pack()?.into()
     } else if let Some(ref state_path) = contract_config.state {
         let mut buf = vec![];

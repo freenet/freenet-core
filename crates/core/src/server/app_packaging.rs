@@ -42,6 +42,19 @@ impl WebApp {
         })
     }
 
+    #[instrument(level = "debug")]
+    pub fn from_compressed(
+        metadata: Vec<u8>,
+        compressed_web: Vec<u8>,
+    ) -> Result<Self, WebContractError> {
+        debug!("Creating WebApp from metadata ({} bytes) and pre-compressed web content ({} bytes)", 
+            metadata.len(), compressed_web.len());
+        Ok(Self {
+            metadata,
+            web: compressed_web,
+        })
+    }
+
     pub fn pack(mut self) -> std::io::Result<Vec<u8>> {
         let mut output = Vec::with_capacity(
             self.metadata.len() + self.web.len() + (std::mem::size_of::<u64>() * 2),
