@@ -47,7 +47,7 @@ impl WebApp {
         metadata: Vec<u8>,
         compressed_web: Vec<u8>,
     ) -> Result<Self, WebContractError> {
-        debug!("Creating WebApp from metadata ({} bytes) and pre-compressed web content ({} bytes)", 
+        debug!("Creating WebApp with metadata size {} bytes and pre-compressed web content {} bytes", 
             metadata.len(), compressed_web.len());
         Ok(Self {
             metadata,
