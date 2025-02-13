@@ -1461,7 +1461,7 @@ dependencies = [
  "clap",
  "dashmap",
  "either",
- "freenet 0.1.0-rc2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "freenet",
  "freenet-stdlib",
  "futures",
  "glob",
@@ -1642,82 +1642,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "freenet"
-version = "0.1.0-rc2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d83e97e304bea7898064089d6ec0d63bdc39b1e1c9914edff0f157b35df0893d"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "arc-swap",
- "asynchronous-codec",
- "axum",
- "bincode",
- "blake3",
- "bs58",
- "byteorder",
- "bytes",
- "cache-padded",
- "chacha20poly1305",
- "chrono",
- "clap",
- "cookie",
- "crossbeam",
- "ctrlc",
- "dashmap",
- "delegate",
- "directories",
- "either",
- "flatbuffers",
- "freenet-stdlib",
- "futures",
- "headers",
- "hickory-resolver",
- "itertools 0.14.0",
- "notify",
- "once_cell",
- "opentelemetry 0.27.1",
- "opentelemetry-jaeger",
- "opentelemetry-otlp",
- "ordered-float 4.6.0",
- "parking_lot",
- "pav_regression",
- "pkcs8",
- "rand",
- "redb",
- "reqwest",
- "rsa",
- "semver",
- "serde",
- "serde_derive",
- "serde_json",
- "serde_with",
- "stretto",
- "tar",
- "thiserror 2.0.11",
- "time",
- "tokio",
- "tokio-tungstenite 0.26.1",
- "toml",
- "tower-http",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "ulid",
- "unsigned-varint",
- "wasmer",
- "wasmer-compiler-singlepass",
- "wasmer-middlewares",
- "winapi",
- "wmi",
- "xz2",
-]
-
-[[package]]
 name = "freenet-macros"
 version = "0.1.0-rc1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0275f94d4abc4e49d8b8bcb46f9f876293fd238ef3ca6dfc959553df1262861a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1764,8 +1690,6 @@ dependencies = [
 [[package]]
 name = "freenet-stdlib"
 version = "0.1.0-rc1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f8cc010193004318454a1bb02032f66003a0ab9f4a8eb6ae3bd0ca8e610a696"
 dependencies = [
  "arbitrary",
  "bincode",
@@ -1778,6 +1702,7 @@ dependencies = [
  "futures",
  "js-sys",
  "once_cell",
+ "rand",
  "semver",
  "serde",
  "serde-wasm-bindgen 0.6.5",
@@ -1790,6 +1715,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wasm-bindgen",
+ "wasmer",
  "web-sys",
 ]
 
