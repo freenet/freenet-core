@@ -42,7 +42,6 @@ impl WebApp {
         })
     }
 
-    #[instrument(level = "debug")]
     pub fn from_compressed(
         metadata: Vec<u8>,
         compressed_web: Vec<u8>,
