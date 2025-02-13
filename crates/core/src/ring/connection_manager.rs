@@ -153,16 +153,7 @@ impl ConnectionManager {
             return false;
         }
 
-        let my_location = self
-            .own_location()
-            .location
-            .unwrap_or_else(Location::random);
-        let accepted = if location == my_location
-            || self.connections_by_location.read().contains_key(&location)
-        {
-            tracing::debug!(%peer_id, "Rejected connection, same location");
-            false
-        } else if total_conn < self.min_connections {
+        let accepted = if total_conn < self.min_connections {
             tracing::debug!(%peer_id, "Accepted connection, below min connections");
             true
         } else if total_conn >= self.max_connections {
@@ -373,7 +364,7 @@ impl ConnectionManager {
                     return None;
                 }
             }
-            (!skip_list.has_element(&conn.location.peer)).then_some(&conn.location)
+            (!skip_list.has_element(conn.location.peer.clone())).then_some(&conn.location)
         });
         router.select_peer(peers, target).cloned()
     }

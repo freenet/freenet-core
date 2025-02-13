@@ -20,7 +20,7 @@ use crate::{
     node::{NetworkBridge, OpManager, PeerId},
     operations::OpEnum,
     ring::PeerKeyLocation,
-    util::ExponentialBackoff,
+    util::Backoff,
 };
 
 pub(crate) use self::messages::{ConnectMsg, ConnectRequest, ConnectResponse};
@@ -31,7 +31,7 @@ pub(crate) struct ConnectOp {
     state: Option<ConnectState>,
     pub gateway: Option<Box<PeerKeyLocation>>,
     /// keeps track of the number of retries and applies an exponential backoff cooldown period
-    pub backoff: Option<ExponentialBackoff>,
+    pub backoff: Option<Backoff>,
 }
 
 impl ConnectOp {
@@ -39,7 +39,7 @@ impl ConnectOp {
         id: Transaction,
         state: Option<ConnectState>,
         gateway: Option<Box<PeerKeyLocation>>,
-        backoff: Option<ExponentialBackoff>,
+        backoff: Option<Backoff>,
     ) -> Self {
         Self {
             id,
@@ -158,7 +158,8 @@ impl Operation for ConnectOp {
                             ideal_location,
                             joiner,
                             max_hops_to_live,
-                            skip_list,
+                            skip_connections,
+                            skip_forwards,
                         },
                     id,
                     ..
@@ -171,21 +172,24 @@ impl Operation for ConnectOp {
                     else {
                         return Err(OpError::RingError(crate::ring::RingError::NoLocation));
                     };
-                    let mut skip_list = skip_list.clone();
-                    skip_list.extend([this_peer.clone(), query_target.peer.clone()]);
+                    let mut skip_connections = skip_connections.clone();
+                    let mut skip_forwards = skip_forwards.clone();
+                    skip_connections.extend([this_peer.clone(), query_target.peer.clone()]);
+                    skip_forwards.extend([this_peer.clone(), query_target.peer.clone()]);
                     if this_peer == &query_target.peer {
                         // this peer should be the original target queries
                         tracing::debug!(
                             tx = %id,
                             query_target = %query_target.peer,
                             joiner = %joiner.peer,
-                            skip_list = ?skip_list,
+                            skip_connections = ?skip_connections,
+                            skip_forwards = ?skip_forwards,
                             "Got queried for new connections from joiner",
                         );
-                        if let Some(desirable_peer) = op_manager
-                            .ring
-                            .closest_to_location(*ideal_location, &[joiner.peer.clone()])
-                        {
+                        if let Some(desirable_peer) = op_manager.ring.closest_to_location(
+                            *ideal_location,
+                            HashSet::from([joiner.peer.clone()]),
+                        ) {
                             tracing::debug!(
                                 tx = %id,
                                 query_target = %query_target.peer,
@@ -200,7 +204,8 @@ impl Operation for ConnectOp {
                                 &desirable_peer,
                                 *max_hops_to_live,
                                 *max_hops_to_live,
-                                skip_list,
+                                skip_connections,
+                                skip_forwards,
                             );
                             network_bridge.send(&desirable_peer.peer, msg).await?;
                             return_msg = None;
@@ -225,7 +230,7 @@ impl Operation for ConnectOp {
                         );
                         debug_assert_eq!(this_peer, &joiner.peer);
                         new_state = Some(ConnectState::AwaitingNewConnection(NewConnectionInfo {
-                            remaining_connetions: *max_hops_to_live,
+                            remaining_connections: *max_hops_to_live,
                         }));
                         let msg = ConnectMsg::Request {
                             id: *id,
@@ -235,7 +240,8 @@ impl Operation for ConnectOp {
                                 ideal_location: *ideal_location,
                                 joiner: joiner.clone(),
                                 max_hops_to_live: *max_hops_to_live,
-                                skip_list,
+                                skip_connections,
+                                skip_forwards,
                             },
                         };
                         network_bridge.send(&query_target.peer, msg.into()).await?;
@@ -250,13 +256,14 @@ impl Operation for ConnectOp {
                             joiner,
                             hops_to_live,
                             max_hops_to_live,
-                            skip_list,
+                            skip_connections,
+                            skip_forwards,
                             ..
                         },
                     ..
                 } => {
                     if sender.peer == joiner.peer {
-                        tracing::warn!(
+                        tracing::error!(
                             tx = %id,
                             sender = %sender.peer,
                             joiner = %joiner.peer,
@@ -324,6 +331,8 @@ impl Operation for ConnectOp {
                     };
 
                     {
+                        let mut new_skip_list = skip_connections.clone();
+                        new_skip_list.insert(this_peer.peer.clone());
                         if let Some(updated_state) = forward_conn(
                             *id,
                             &op_manager.ring.connection_manager,
@@ -333,7 +342,8 @@ impl Operation for ConnectOp {
                                 left_htl: *hops_to_live,
                                 max_htl: *max_hops_to_live,
                                 accepted: should_accept,
-                                skip_list: skip_list.clone(),
+                                skip_connections: skip_connections.clone(),
+                                skip_forwards: skip_forwards.clone(),
                                 req_peer: sender.clone(),
                                 joiner: joiner.clone(),
                             },
@@ -495,10 +505,11 @@ impl Operation for ConnectOp {
                                 from = %sender.peer,
                                 "Connection request forwarded",
                             );
-                            assert!(info.remaining_connetions > 0);
-                            let remaining_connetions = info.remaining_connetions.saturating_sub(1);
+                            assert!(info.remaining_connections > 0);
+                            let remaining_connections =
+                                info.remaining_connections.saturating_sub(1);
 
-                            if remaining_connetions == 0 {
+                            if remaining_connections == 0 {
                                 tracing::debug!(
                                     tx = %id,
                                     at = %this_peer_id,
@@ -508,13 +519,13 @@ impl Operation for ConnectOp {
                                 op_manager
                                     .ring
                                     .live_tx_tracker
-                                    .missing_candidate_peers(this_peer_id)
+                                    .missing_candidate_peers(sender.peer.clone())
                                     .await;
                                 new_state = None;
                             } else {
                                 new_state =
                                     Some(ConnectState::AwaitingNewConnection(NewConnectionInfo {
-                                        remaining_connetions,
+                                        remaining_connections,
                                     }));
                             }
 
@@ -555,7 +566,7 @@ fn build_op_result(
     state: Option<ConnectState>,
     msg: Option<ConnectMsg>,
     gateway: Option<Box<PeerKeyLocation>>,
-    backoff: Option<ExponentialBackoff>,
+    backoff: Option<Backoff>,
 ) -> Result<OperationResult, OpError> {
     tracing::debug!(tx = %id, ?msg, "Connect operation result");
     Ok(OperationResult {
@@ -638,7 +649,7 @@ pub(crate) struct ConnectionInfo {
 
 #[derive(Debug, Clone)]
 pub(crate) struct NewConnectionInfo {
-    remaining_connetions: usize,
+    remaining_connections: usize,
 }
 
 impl ConnectState {
@@ -711,7 +722,7 @@ pub(crate) async fn initial_join_procedure(
 
 #[tracing::instrument(fields(peer = %op_manager.ring.connection_manager.pub_key), skip_all)]
 pub(crate) async fn join_ring_request(
-    backoff: Option<ExponentialBackoff>,
+    backoff: Option<Backoff>,
     gateway: &PeerKeyLocation,
     op_manager: &OpManager,
 ) -> Result<(), OpError> {
@@ -774,7 +785,7 @@ fn initial_request(
         id,
         state: Some(state),
         gateway: Some(Box::new(gateway)),
-        backoff: Some(ExponentialBackoff::new(
+        backoff: Some(Backoff::new(
             Duration::from_secs(1),
             ceiling,
             MAX_JOIN_RETRIES,
@@ -818,7 +829,7 @@ async fn connect_request(
                     true,
                 )
                 .await;
-            let Some(remaining_connetions) = remaining_checks else {
+            let Some(remaining_connections) = remaining_checks else {
                 tracing::error!(tx = %id, "Failed to connect to gateway, missing remaining checks");
                 return Err(OpError::ConnError(
                     crate::node::ConnectionError::FailedConnectOp,
@@ -838,7 +849,7 @@ async fn connect_request(
                     OpEnum::Connect(Box::new(ConnectOp {
                         id,
                         state: Some(ConnectState::AwaitingNewConnection(NewConnectionInfo {
-                            remaining_connetions,
+                            remaining_connections,
                         })),
                         gateway: Some(Box::new(gateway)),
                         backoff,
@@ -857,7 +868,10 @@ pub(crate) struct ForwardParams {
     pub left_htl: usize,
     pub max_htl: usize,
     pub accepted: bool,
-    pub skip_list: Vec<PeerId>,
+    /// Avoid connecting to these peers.
+    pub skip_connections: HashSet<PeerId>,
+    /// Avoif forwarding to these peers.
+    pub skip_forwards: HashSet<PeerId>,
     pub req_peer: PeerKeyLocation,
     pub joiner: PeerKeyLocation,
 }
@@ -876,7 +890,8 @@ where
         left_htl,
         max_htl,
         accepted,
-        mut skip_list,
+        mut skip_connections,
+        mut skip_forwards,
         req_peer,
         joiner,
     } = params;
@@ -907,10 +922,11 @@ where
             &req_peer,
             &joiner,
             left_htl,
-            &skip_list,
+            &skip_forwards,
         )
     };
-    skip_list.push(req_peer.peer.clone());
+    skip_connections.insert(req_peer.peer.clone());
+    skip_forwards.insert(req_peer.peer.clone());
     match target_peer {
         Some(target_peer) => {
             let forward_msg = create_forward_message(
@@ -920,7 +936,8 @@ where
                 &target_peer,
                 left_htl,
                 max_htl,
-                skip_list,
+                skip_connections,
+                skip_forwards,
             );
             tracing::debug!(target: "network", "Forwarding connection request to {:?}", target_peer);
             network_bridge.send(&target_peer.peer, forward_msg).await?;
@@ -937,7 +954,7 @@ fn select_forward_target(
     request_peer: &PeerKeyLocation,
     joiner: &PeerKeyLocation,
     left_htl: usize,
-    skip_list: &[PeerId],
+    skip_forwards: &HashSet<PeerId>,
 ) -> Option<PeerKeyLocation> {
     if left_htl >= connection_manager.rnd_if_htl_above {
         tracing::debug!(
@@ -945,7 +962,7 @@ fn select_forward_target(
             joiner = %joiner.peer,
             "Randomly selecting peer to forward connect request",
         );
-        connection_manager.random_peer(|p| !skip_list.contains(p))
+        connection_manager.random_peer(|p| !skip_forwards.contains(p))
     } else {
         tracing::debug!(
             tx = %id,
@@ -956,13 +973,14 @@ fn select_forward_target(
             .routing(
                 joiner.location.unwrap(),
                 Some(&request_peer.peer),
-                skip_list,
+                skip_forwards,
                 router,
             )
             .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_forward_message(
     id: Transaction,
     request_peer: &PeerKeyLocation,
@@ -970,7 +988,8 @@ fn create_forward_message(
     target: &PeerKeyLocation,
     hops_to_live: usize,
     max_hops_to_live: usize,
-    skip_list: Vec<PeerId>,
+    skip_connections: HashSet<PeerId>,
+    skip_forwards: HashSet<PeerId>,
 ) -> NetMessage {
     NetMessage::from(ConnectMsg::Request {
         id,
@@ -980,7 +999,8 @@ fn create_forward_message(
             joiner: joiner.clone(),
             hops_to_live: hops_to_live.saturating_sub(1), // decrement the hops to live for the next hop
             max_hops_to_live,
-            skip_list,
+            skip_connections,
+            skip_forwards,
         },
     })
 }
@@ -1117,8 +1137,10 @@ mod messages {
             joiner_key: TransportPublicKey,
             hops_to_live: usize,
             max_hops_to_live: usize,
-            // The list of peers to skip when forwarding the connection request, avoiding loops
-            skip_list: Vec<PeerId>,
+            // Peers we don't want to connect to directly
+            skip_connections: HashSet<PeerId>,
+            // Peers we don't want to forward connectivity messages to (to avoid loops)
+            skip_forwards: HashSet<PeerId>,
         },
         /// Query target should find a good candidate for joiner to join.
         FindOptimalPeer {
@@ -1128,15 +1150,16 @@ mod messages {
             ideal_location: Location,
             joiner: PeerKeyLocation,
             max_hops_to_live: usize,
-            skip_list: Vec<PeerId>,
+            skip_connections: HashSet<PeerId>,
+            skip_forwards: HashSet<PeerId>,
         },
         CheckConnectivity {
             sender: PeerKeyLocation,
             joiner: PeerKeyLocation,
             hops_to_live: usize,
             max_hops_to_live: usize,
-            // The list of peers to skip when forwarding the connection request, avoiding loops
-            skip_list: Vec<PeerId>,
+            skip_connections: HashSet<PeerId>,
+            skip_forwards: HashSet<PeerId>,
         },
         CleanConnection {
             joiner: PeerKeyLocation,

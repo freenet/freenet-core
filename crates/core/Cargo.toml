@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.1.0-rc1"
+version = "0.1.0-rc2"
 edition = "2021"
 rust-version = "1.80"
 publish = true
@@ -95,6 +95,7 @@ httptest = "0.16"
 pico-args = "0.5"
 statrs = "0.18"
 tempfile = "3"
+test-log = "*"
 tracing = "0.1"
 # console-subscriber = { version = "0.4" }
 
