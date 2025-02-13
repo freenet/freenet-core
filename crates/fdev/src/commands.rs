@@ -82,7 +82,7 @@ async fn put_contract(
         ContractContainer::try_from((config.code.as_path(), params))?
     };
     let state = if let Some(ref webapp_archive) = contract_config.webapp_archive {
-        // Read webapp archive
+        // Read pre-compressed webapp archive
         let mut archive = vec![];
         File::open(webapp_archive)?.read_to_end(&mut archive)?;
 
@@ -95,7 +95,7 @@ async fn put_contract(
             vec![]
         };
 
-        // Validate archive has index.html (warning only)
+        // Validate archive has index.html (warning only) 
         use std::io::Cursor;
         use tar::Archive;
         let mut found_index = false;
@@ -116,15 +116,9 @@ async fn put_contract(
             tracing::warn!("Warning: No index.html found at root of webapp archive");
         }
 
-        // Create WebApp state
-        let mut archive_builder = Builder::new(Cursor::new(Vec::new()));
-        archive_builder.append_data(
-            &mut tar::Header::new_gnu(),
-            "archive.tar.xz",
-            &mut std::io::Cursor::new(&archive),
-        )?;
-        let webapp = WebApp::from_data(metadata, archive_builder)?;
-        webapp.pack()?.into()
+        // Create WebApp state directly from pre-compressed archive
+        let webapp = WebApp::from_data(metadata, archive)?;
+        webapp.into()
     } else if let Some(ref state_path) = contract_config.state {
         let mut buf = vec![];
         File::open(state_path)?.read_to_end(&mut buf)?;
