@@ -101,7 +101,7 @@ impl WebApp {
     fn decode_web(&self) -> Archive<XzDecoder<&[u8]>> {
         debug!("Decoding compressed web content ({} bytes)", self.web.len());
         let decoder = XzDecoder::new(self.web.as_slice());
-        let archive = Archive::new(decoder);
+        let mut archive = Archive::new(decoder);
         
         // Debug log the archive contents
         match archive.entries() {
