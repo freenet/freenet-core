@@ -101,7 +101,25 @@ impl WebApp {
     fn decode_web(&self) -> Archive<XzDecoder<&[u8]>> {
         debug!("Decoding compressed web content ({} bytes)", self.web.len());
         let decoder = XzDecoder::new(self.web.as_slice());
-        Archive::new(decoder)
+        let archive = Archive::new(decoder);
+        
+        // Debug log the archive contents
+        match archive.entries() {
+            Ok(entries) => {
+                debug!("Archive contents:");
+                for entry in entries {
+                    if let Ok(entry) = entry {
+                        if let Ok(path) = entry.path() {
+                            debug!("  {}", path.display());
+                        }
+                    }
+                }
+            }
+            Err(e) => debug!("Failed to read archive entries: {}", e),
+        }
+        
+        // Create a fresh archive since we consumed the entries
+        Archive::new(XzDecoder::new(self.web.as_slice()))
     }
 }
 
