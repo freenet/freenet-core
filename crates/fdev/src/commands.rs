@@ -117,8 +117,29 @@ async fn put_contract(
         }
 
         // Create WebApp state from pre-compressed archive
-        let webapp = WebApp::from_compressed(metadata, archive)?;
-        webapp.pack()?.into()
+        let webapp = WebApp::from_compressed(metadata.clone(), archive)?;
+        tracing::info!(
+            metadata_len = metadata.len(),
+            "Metadata being packed into WebApp state"
+        );
+        if !metadata.is_empty() {
+            tracing::info!(
+                first_32_bytes = format!("{:02x?}", &metadata[..metadata.len().min(32)]),
+                "First 32 bytes of metadata"
+            );
+        }
+        let packed = webapp.pack()?;
+        tracing::info!(
+            packed_len = packed.len(),
+            "WebApp state after packing"
+        );
+        if !packed.is_empty() {
+            tracing::info!(
+                first_32_bytes = format!("{:02x?}", &packed[..packed.len().min(32)]),
+                "First 32 bytes of packed state"
+            );
+        }
+        packed.into()
     } else if let Some(ref state_path) = contract_config.state {
         let mut buf = vec![];
         File::open(state_path)?.read_to_end(&mut buf)?;
