@@ -1226,7 +1226,7 @@ mod tests {
             self.packet_id += 1;
         }
 
-        async fn recv_outbound_msg(&mut self) -> anyhow::Result<Either<NetMessage, ()>> {
+        async fn recv_outbound_msg(&mut self) -> anyhow::Result<NetMessage> {
             let receiver = &mut self.packet_receivers[0];
             let (_, msg) = receiver
                 .recv()
@@ -1279,7 +1279,7 @@ mod tests {
                 _ => panic!("Unexpected message type"),
             };
             let msg: NetMessage = bincode::deserialize(&payload).unwrap();
-            Ok(Either::Left(msg))
+            Ok(msg)
         }
     }
 
@@ -1439,9 +1439,7 @@ mod tests {
             test.transport
                 .establish_inbound_conn(remote_addr, pub_key, Some(0))
                 .await;
-            let Either::Left(msg) = test.transport.recv_outbound_msg().await? else {
-                bail!("Expected message");
-            };
+            let msg = test.transport.recv_outbound_msg().await?;
             tracing::debug!("Received outbound message: {:?}", msg);
             assert!(
                 matches!(msg, NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
@@ -1485,9 +1483,7 @@ mod tests {
                 .new_outbound_conn(remote_addr, open_connection)
                 .await;
             tracing::debug!("Outbound connection established");
-            let Either::Left(msg) = test.transport.recv_outbound_msg().await? else {
-                bail!("Expected message");
-            };
+            let msg = test.transport.recv_outbound_msg().await?;
             let msg = match msg {
                 NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
                     id: inbound_id,
@@ -1708,10 +1704,8 @@ mod tests {
                 .new_outbound_conn(gw_addr, open_connection)
                 .await;
 
-            let Either::Left(msg) = test.transport.recv_outbound_msg().await? else {
-                bail!("Expected message");
-            };
-            tracing::info!("Received connec request: {:?}", msg);
+            let msg = test.transport.recv_outbound_msg().await?;
+            tracing::info!("Received connect request: {:?}", msg);
             let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
                 id,
                 msg: ConnectRequest::StartJoinReq { .. },
@@ -1880,9 +1874,7 @@ mod tests {
                 .new_outbound_conn(gw_addr, open_connection_peer)
                 .await;
 
-            let Either::Left(msg) = test.transport.recv_outbound_msg().await? else {
-                bail!("Expected message");
-            };
+            let msg = test.transport.recv_outbound_msg().await?;
             tracing::info!("Received connec request: {:?}", msg);
             let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
                 id,
