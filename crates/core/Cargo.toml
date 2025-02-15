@@ -101,7 +101,6 @@ tracing = "0.1"
 
 [features]
 default = ["redb", "trace", "websocket"]
-local-simulation = []
 sqlite = ["sqlx"]
 trace = ["tracing-subscriber"]
 trace-ot = ["opentelemetry-jaeger", "trace", "tracing-opentelemetry", "opentelemetry-otlp"]

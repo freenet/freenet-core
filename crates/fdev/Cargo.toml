@@ -38,8 +38,8 @@ reqwest = { version = "0.12", features = ["json"] }
 http = "1.2"
 
 # internal
-freenet = { path = "../core", features = ["local-simulation"]}
-# freenet = { version = "0.1.0-rc1", features = ["local-simulation"]}
+freenet = { path = "../core"}
+# freenet = { version = "0.1.0-rc1"}
 freenet-stdlib = { workspace = true }
 
 [features]

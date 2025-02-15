@@ -1110,7 +1110,6 @@ mod tests {
 
     use aes_gcm::{Aes128Gcm, KeyInit};
     use anyhow::{anyhow, bail};
-    use either::Either;
     use serde::Serialize;
     use tokio::sync::{mpsc, oneshot};
 

@@ -129,6 +129,7 @@ impl NodeConfig {
             let GatewayConfig {
                 address,
                 public_key_path,
+                location,
             } = gw;
 
             let mut key_file = File::open(public_key_path).with_context(|| {
@@ -141,7 +142,10 @@ impl NodeConfig {
 
             let address = Self::parse_socket_addr(address).await?;
             let peer_id = PeerId::new(address, TransportPublicKey::from(pub_key));
-            gateways.push(InitPeerNode::new(peer_id, Location::from_address(&address)));
+            let location = location
+                .map(Location::new)
+                .unwrap_or_else(|| Location::from_address(&address));
+            gateways.push(InitPeerNode::new(peer_id, location));
         }
         tracing::info!(
             "Node will be listening at {}:{} internal address",
@@ -159,8 +163,8 @@ impl NodeConfig {
             peer_id: config.peer_id.clone(),
             network_listener_ip: config.network_api.address,
             network_listener_port: config.network_api.port,
+            location: config.location.map(Location::new),
             config: Arc::new(config),
-            location: None,
             max_hops_to_live: None,
             rnd_if_htl_above: None,
             max_number_conn: None,
