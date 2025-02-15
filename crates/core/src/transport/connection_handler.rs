@@ -1061,6 +1061,7 @@ mod test {
     #![allow(clippy::single_range_in_vec_init)]
 
     use std::{
+        fmt::Debug,
         net::Ipv4Addr,
         ops::Range,
         sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
@@ -1257,7 +1258,7 @@ mod test {
     }
 
     trait TestFixture: Clone + Send + Sync + 'static {
-        type Message: DeserializeOwned + Serialize + Send + 'static;
+        type Message: DeserializeOwned + Serialize + Send + Debug + 'static;
         fn expected_iterations(&self) -> usize;
         fn gen_msg(&mut self) -> Self::Message;
         fn assert_message_ok(&self, peer_idx: usize, msg: Self::Message) -> bool;

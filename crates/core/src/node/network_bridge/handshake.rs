@@ -1106,7 +1106,7 @@ fn decode_msg(data: &[u8]) -> Result<NetMessage> {
 #[cfg(test)]
 mod tests {
     use core::panic;
-    use std::{sync::Arc, time::Duration};
+    use std::{fmt::Display, sync::Arc, time::Duration};
 
     use aes_gcm::{Aes128Gcm, KeyInit};
     use anyhow::{anyhow, bail};
@@ -1128,9 +1128,12 @@ mod tests {
     struct TransportMock {
         inbound_sender: mpsc::Sender<PeerConnection>,
         outbound_recv: mpsc::Receiver<(SocketAddr, ConnectionEvent)>,
+        /// Outbount messages to peers
         packet_senders:
             HashMap<SocketAddr, (Aes128Gcm, mpsc::Sender<PacketData<UnknownEncryption>>)>,
+        /// Next packet id to use
         packet_id: u32,
+        /// Inbound messages from peers
         packet_receivers: Vec<mpsc::Receiver<(SocketAddr, Arc<[u8]>)>>,
         in_key: Aes128Gcm,
         my_addr: SocketAddr,
@@ -1206,7 +1209,8 @@ mod tests {
             .await
         }
 
-        async fn inbound_msg(&mut self, addr: SocketAddr, msg: impl Serialize) {
+        async fn inbound_msg(&mut self, addr: SocketAddr, msg: impl Serialize + Display) {
+            tracing::debug!(at=?self.my_addr, to=%addr, "Sending message from peer");
             let msg = bincode::serialize(&msg).unwrap();
             let (out_symm_key, packet_sender) = self.packet_senders.get_mut(&addr).unwrap();
             let sym_msg = SymmetricMessage::serialize_msg_to_packet_data(
@@ -1218,12 +1222,13 @@ mod tests {
             .unwrap();
             tracing::trace!(at=?self.my_addr, to=%addr, "Sending message to peer");
             packet_sender.send(sym_msg.into_unknown()).await.unwrap();
-            tracing::trace!(at=?self.my_addr, from=%addr, "Message sent");
+            tracing::trace!(at=?self.my_addr, to=%addr, "Message sent");
             self.packet_id += 1;
         }
 
         async fn recv_outbound_msg(&mut self) -> anyhow::Result<Either<NetMessage, ()>> {
-            let (_, msg) = self.packet_receivers[0]
+            let receiver = &mut self.packet_receivers[0];
+            let (_, msg) = receiver
                 .recv()
                 .await
                 .ok_or_else(|| anyhow::Error::msg("Failed to receive packet"))?;
@@ -1238,9 +1243,39 @@ mod tests {
                     ..
                 } => payload,
                 SymmetricMessage {
-                    payload: SymmetricMessagePayload::StreamFragment { .. },
+                    payload:
+                        SymmetricMessagePayload::StreamFragment {
+                            total_length_bytes,
+                            mut payload,
+                            ..
+                        },
                     ..
-                } => return Ok(Either::Right(())),
+                } => {
+                    let mut remaining = total_length_bytes as usize - payload.len();
+                    while remaining > 0 {
+                        let (_, msg) = receiver
+                            .recv()
+                            .await
+                            .ok_or_else(|| anyhow::Error::msg("Failed to receive packet"))?;
+                        let packet: PacketData<UnknownEncryption> = PacketData::from_buf(&*msg);
+                        let packet = packet
+                            .try_decrypt_sym(&self.in_key)
+                            .map_err(|_| anyhow!("Failed to decrypt packet"))?;
+                        let msg: SymmetricMessage = bincode::deserialize(packet.data()).unwrap();
+                        match msg {
+                            SymmetricMessage {
+                                payload:
+                                    SymmetricMessagePayload::StreamFragment { payload: new, .. },
+                                ..
+                            } => {
+                                payload.extend_from_slice(&new);
+                                remaining -= new.len();
+                            }
+                            _ => panic!("Unexpected message type"),
+                        }
+                    }
+                    payload
+                }
                 _ => panic!("Unexpected message type"),
             };
             let msg: NetMessage = bincode::deserialize(&payload).unwrap();
@@ -1433,7 +1468,6 @@ mod tests {
         Ok(())
     }
 
-    #[ignore = "should be fixed"]
     #[test_log::test(tokio::test)]
     async fn test_peer_to_gw_outbound_conn() -> anyhow::Result<()> {
         let addr = ([127, 0, 0, 1], 10000).into();
@@ -1641,7 +1675,7 @@ mod tests {
         Ok(())
     }
 
-    #[ignore = "flaky in ci"]
+    #[ignore = "fix this test"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_peer_to_gw_outbound_conn_rejected() -> anyhow::Result<()> {
         // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE), None);
@@ -1814,10 +1848,9 @@ mod tests {
         Ok(())
     }
 
-    #[ignore = "should be fixed"]
     #[tokio::test]
     async fn test_peer_to_gw_outbound_conn_forwarded() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG), None);
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::TRACE), None);
         let joiner_addr = ([127, 0, 0, 1], 10001).into();
         let (mut handler, mut test) = config_handler(joiner_addr, None);
 

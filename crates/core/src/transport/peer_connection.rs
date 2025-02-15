@@ -195,13 +195,13 @@ impl PeerConnection {
     #[instrument(name = "peer_connection", skip_all)]
     pub async fn send<T>(&mut self, data: T) -> Result
     where
-        T: Serialize + Send + 'static,
+        T: Serialize + Send + std::fmt::Debug + 'static,
     {
         let data = tokio::task::spawn_blocking(move || bincode::serialize(&data).unwrap())
             .await
             .unwrap();
         if data.len() + SymmetricMessage::short_message_overhead() > MAX_DATA_SIZE {
-            tracing::trace!("sending as stream");
+            tracing::trace!(total_size = data.len(), "sending as stream");
             self.outbound_stream(data).await;
         } else {
             tracing::trace!("sending as short message");
