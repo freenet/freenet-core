@@ -385,7 +385,7 @@ mod serde_log_level_filter {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     /// Node operation mode.
     pub mode: OperationMode,
@@ -472,16 +472,16 @@ pub struct NetworkArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct InlineGwConfig {
+pub struct InlineGwConfig {
     /// Address of the gateway.
-    address: SocketAddr,
+    pub address: SocketAddr,
 
     /// Path to the public key of the gateway in PEM format.
     #[serde(rename = "public_key")]
-    public_key_path: PathBuf,
+    pub public_key_path: PathBuf,
 
     /// Optional location of the gateway. Necessary for deterministic testing.
-    location: Option<f64>,
+    pub location: Option<f64>,
 }
 
 impl NetworkArgs {
