@@ -973,14 +973,18 @@ pub async fn run_network_node(mut node: Node) -> anyhow::Result<()> {
     tracing::info!("Starting node");
 
     let is_gateway = node.0.is_gateway;
-    let location = is_gateway
-        .then(|| {
-            node.0
-                .peer_id
-                .clone()
-                .map(|id| Location::from_address(&id.addr))
-        })
-        .flatten();
+    let location = if let Some(loc) = node.0.location {
+        Some(loc)
+    } else {
+        is_gateway
+            .then(|| {
+                node.0
+                    .peer_id
+                    .clone()
+                    .map(|id| Location::from_address(&id.addr))
+            })
+            .flatten()
+    };
 
     if let Some(location) = location {
         tracing::info!("Setting initial location: {location}");

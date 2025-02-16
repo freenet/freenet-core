@@ -14,7 +14,6 @@ impl Location {
         Self::deterministic_loc(addr)
     }
 
-    #[allow(unused)]
     fn deterministic_loc(addr: &std::net::SocketAddr) -> Self {
         match addr.ip() {
             std::net::IpAddr::V4(ipv4) => {
