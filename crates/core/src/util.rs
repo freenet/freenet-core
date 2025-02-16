@@ -61,13 +61,12 @@ pub struct Backoff {
     base: Duration,
     ceiling: Duration,
     strategy: BackoffStrategy,
-    interval_reduction_factor: Option<f64>,
 }
 
 #[derive(Debug)]
 enum BackoffStrategy {
     Exponential,
-    Logarithmic,
+    Logarithmic { interval_reduction_factor: f64 },
 }
 
 impl Backoff {
@@ -78,17 +77,13 @@ impl Backoff {
             base,
             ceiling,
             strategy: BackoffStrategy::Exponential,
-            interval_reduction_factor: None,
         }
     }
 
-    pub fn logarithmic(mut self) -> Self {
-        self.strategy = BackoffStrategy::Logarithmic;
-        self
-    }
-
-    pub fn with_interval_reduction_factor(mut self, factor: f64) -> Self {
-        self.interval_reduction_factor = Some(factor);
+    pub fn logarithmic(mut self, interval_reduction_factor: f64) -> Self {
+        self.strategy = BackoffStrategy::Logarithmic {
+            interval_reduction_factor,
+        };
         self
     }
 
@@ -110,7 +105,9 @@ impl Backoff {
     fn delay(&self) -> Duration {
         let mut delay = match self.strategy {
             BackoffStrategy::Exponential => self.exponential_delay(),
-            BackoffStrategy::Logarithmic => self.logarithmic_delay(),
+            BackoffStrategy::Logarithmic {
+                interval_reduction_factor,
+            } => self.logarithmic_delay(interval_reduction_factor),
         };
         if delay > self.ceiling {
             delay = self.ceiling;
@@ -122,14 +119,11 @@ impl Backoff {
         self.base.saturating_mul(1 << self.attempt)
     }
 
-    fn logarithmic_delay(&self) -> Duration {
+    fn logarithmic_delay(&self, interval_reduction_factor: f64) -> Duration {
         const LOG_BASE: f64 = 2.0;
-        const INTERVAL_REDUCTION_FACTOR: f64 = 1.0;
         Duration::from_millis(
-            (self.base.as_millis() as f64 * (1.0 + (self.attempt as f64).log(LOG_BASE))
-                / self
-                    .interval_reduction_factor
-                    .unwrap_or(INTERVAL_REDUCTION_FACTOR)) as u64,
+            ((self.base.as_millis() as f64 * (1.0 + (self.attempt as f64).log(LOG_BASE)))
+                / interval_reduction_factor) as u64,
         )
     }
 
@@ -253,9 +247,7 @@ pub(crate) mod test {
         let base = Duration::from_millis(200);
         let ceiling = Duration::from_secs(2);
         let max_attempts = 40;
-        let backoff = Backoff::new(base, ceiling, max_attempts)
-            .logarithmic()
-            .with_interval_reduction_factor(2.0);
+        let backoff = Backoff::new(base, ceiling, max_attempts).logarithmic(2.0);
         let total = backoff
             .into_iter()
             .reduce(|acc, x| {
@@ -272,7 +264,7 @@ pub(crate) mod test {
         let base = Duration::from_millis(600);
         let ceiling = Duration::from_secs(30);
         let max_attempts = 40;
-        let backoff = Backoff::new(base, ceiling, max_attempts).logarithmic();
+        let backoff = Backoff::new(base, ceiling, max_attempts).logarithmic(1.0);
 
         // const MAX: Duration = Duration::from_secs(30);
         let _ = backoff

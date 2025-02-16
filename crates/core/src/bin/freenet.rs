@@ -2,8 +2,7 @@ use anyhow::Context;
 use clap::Parser;
 use freenet::{
     config::{Config, ConfigArgs},
-    dev_tool::NodeConfig,
-    local_node::{Executor, OperationMode},
+    local_node::{Executor, NodeConfig, OperationMode},
     run_local_node, run_network_node,
     server::serve_gateway,
 };

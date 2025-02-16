@@ -8,6 +8,7 @@ use std::{fmt::Display, hash::Hash};
 /// The location of a peer in the ring. This location allows routing towards the peer.
 pub struct PeerKeyLocation {
     pub peer: PeerId,
+    // TODO: this shouldn't e an option, when we are using this struct the location is always known
     /// An unspecified location means that the peer hasn't been asigned a location, yet.
     pub location: Option<Location>,
 }

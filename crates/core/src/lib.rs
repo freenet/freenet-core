@@ -35,6 +35,7 @@ pub mod local_node {
     use super::*;
     pub use contract::Executor;
     pub use contract::OperationMode;
+    pub use node::NodeConfig;
 }
 
 /// Exports for the dev tool.

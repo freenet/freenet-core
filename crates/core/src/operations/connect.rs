@@ -1135,6 +1135,9 @@ mod messages {
             // The peer who is trying to join, should be set when PeerConnection is established
             joiner: Option<PeerId>,
             joiner_key: TransportPublicKey,
+            /// Used for deterministic testing purposes. In production, this should be none and will be ignored
+            /// by the gateway.
+            joiner_location: Option<Location>,
             hops_to_live: usize,
             max_hops_to_live: usize,
             // Peers we don't want to connect to directly
