@@ -61,7 +61,7 @@ fn gw_config(port: u16, path: &Path) -> anyhow::Result<(InlineGwConfig, Transpor
     ))
 }
 
-#[tokio::test]
+#[test_log::test(tokio::test)]
 async fn test_get_contract() -> anyhow::Result<()> {
     let node_b_tmp_dir = tempfile::tempdir()?;
     let node_b_pub_key = node_b_tmp_dir.path().join("pub_key.pem");
