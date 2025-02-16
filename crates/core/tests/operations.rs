@@ -5,6 +5,7 @@ use freenet::{
     local_node::NodeConfig,
     server::serve_gateway,
 };
+use futures::FutureExt;
 use rand::random;
 use std::{
     net::{Ipv4Addr, TcpListener},
@@ -90,7 +91,8 @@ async fn test_get_contract() -> anyhow::Result<()> {
             .build(serve_gateway(config.ws_api).await)
             .await?;
         node.run().await
-    };
+    }
+    .boxed_local();
 
     let mut config_b = base_test_config(
         true,
@@ -115,9 +117,10 @@ async fn test_get_contract() -> anyhow::Result<()> {
             .build(serve_gateway(config.ws_api).await)
             .await?;
         node.run().await
-    };
+    }
+    .boxed_local();
 
-    let test = tokio::time::timeout(Duration::from_secs(1), async {
+    let test = tokio::time::timeout(Duration::from_secs(600), async {
         // TODO: setup test with a client from freenet_stdlib::client_api::regular
         tokio::time::sleep(Duration::from_secs(10)).await;
         Ok::<_, anyhow::Error>(())
