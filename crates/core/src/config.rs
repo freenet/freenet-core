@@ -67,7 +67,7 @@ pub struct ConfigArgs {
     pub log_level: Option<tracing::log::LevelFilter>,
 
     #[clap(flatten)]
-    config_paths: ConfigPathsArgs,
+    pub config_paths: ConfigPathsArgs,
 
     /// An arbitrary identifier for the node, mostly for debugging or testing purposes.
     #[clap(long)]
@@ -599,7 +599,7 @@ const fn default_http_gateway_port() -> u16 {
 pub struct ConfigPathsArgs {
     /// The configuration directory.
     #[arg(long, default_value = None, env = "CONFIG_DIR")]
-    config_dir: Option<PathBuf>,
+    pub config_dir: Option<PathBuf>,
     /// The contracts directory.
     #[arg(long, default_value = None, env = "CONTRACTS_DIR")]
     contracts_dir: Option<PathBuf>,
@@ -617,7 +617,7 @@ pub struct ConfigPathsArgs {
     event_log: Option<PathBuf>,
     /// The data directory.
     #[arg(long, default_value = None, env = "DATA_DIR")]
-    data_dir: Option<PathBuf>,
+    pub data_dir: Option<PathBuf>,
 }
 
 impl ConfigPathsArgs {
@@ -1067,7 +1067,7 @@ mod tests {
         let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 256).unwrap();
         let key = key
             .to_public_key()
-            .to_public_key_pem(pkcs8::LineEnding::LF)
+            .to_public_key_pem(pkcs8::LineEnding::default())
             .unwrap();
         server.expect(
             Expectation::matching(request::path("/path/to/public_key.pem"))

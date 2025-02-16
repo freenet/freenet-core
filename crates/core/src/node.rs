@@ -14,7 +14,6 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ErrorKind},
     prelude::ContractKey,
 };
-use std::collections::HashSet;
 use std::{
     borrow::Cow,
     fmt::Display,
@@ -25,6 +24,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use std::{collections::HashSet, convert::Infallible};
 
 use rsa::pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
@@ -76,9 +76,8 @@ impl Node {
             .update_location(Some(location));
     }
 
-    pub async fn run(self) -> anyhow::Result<()> {
-        self.0.run_node().await?;
-        Ok(())
+    pub async fn run(self) -> anyhow::Result<Infallible> {
+        self.0.run_node().await
     }
 }
 
