@@ -45,18 +45,19 @@ async fn base_test_config(
 fn gw_config(port: u16) -> InlineGwConfig {
     // generate key and store it in a temp file
     let key = TransportKeypair::new();
-    // TODO: store
+    // TODO: store at path
     InlineGwConfig {
         address: (Ipv4Addr::LOCALHOST, port).into(),
-        public_key_path: todo!(),
         location: Some(random()),
+        public_key_path: todo!(),
     }
 }
+
 #[tokio::test]
 async fn integration_test_get_contract() -> anyhow::Result<()> {
     let reserved_listener = TcpListener::bind("127.0.0.1:0")?;
     let gw_config = gw_config(reserved_listener.local_addr()?.port());
-    let gw_loc = gw_config.location.clone();
+    let gw_loc = gw_config.location;
     let config_a = base_test_config(false, vec![serde_json::to_string(&gw_config)?], None).await?;
     let node_a = async move {
         let config = config_a.build().await?;
@@ -68,7 +69,8 @@ async fn integration_test_get_contract() -> anyhow::Result<()> {
         Ok::<(), anyhow::Error>(())
     };
 
-    let config_b = base_test_config(true, vec![], Some(gw_config.address.port())).await?;
+    let mut config_b = base_test_config(true, vec![], Some(gw_config.address.port())).await?;
+    config_b.network_api.location = gw_loc;
     std::mem::drop(reserved_listener); // Free the port so it does not fail on initialization
     let node_b = async {
         let config = config_b.build().await?;
