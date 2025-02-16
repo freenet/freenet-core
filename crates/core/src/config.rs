@@ -254,7 +254,7 @@ impl ConfigArgs {
                     Ok::<_, anyhow::Error>(GatewayConfig {
                         address: Address::HostAddress(cfg.address),
                         public_key_path: cfg.public_key_path,
-                        location: None,
+                        location: cfg.location,
                     })
                 })
                 .try_collect()?;
@@ -479,6 +479,9 @@ struct InlineGwConfig {
     /// Path to the public key of the gateway in PEM format.
     #[serde(rename = "public_key")]
     public_key_path: PathBuf,
+
+    /// Optional location of the gateway. Necessary for deterministic testing.
+    location: Option<f64>,
 }
 
 impl NetworkArgs {
