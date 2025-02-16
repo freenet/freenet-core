@@ -16,6 +16,7 @@ async fn base_test_config(
     is_gateway: bool,
     gateways: Vec<String>,
     public_port: Option<u16>,
+    ws_api_port: u16,
 ) -> anyhow::Result<ConfigArgs> {
     let network_port = if public_port.is_none() {
         (!is_gateway)
@@ -24,23 +25,23 @@ async fn base_test_config(
     } else {
         public_port
     };
-    let mut config = ConfigArgs {
+    let config = ConfigArgs {
         ws_api: WebsocketApiArgs {
             address: Some(Ipv4Addr::LOCALHOST.into()),
-            ws_api_port: Some(50000),
+            ws_api_port: Some(ws_api_port),
+        },
+        network_api: NetworkArgs {
+            public_address: Some(Ipv4Addr::LOCALHOST.into()),
+            public_port,
+            is_gateway,
+            skip_load_from_network: true,
+            gateways: Some(gateways),
+            location: Some(rand::random()),
+            ignore_protocol_checking: true,
+            address: Some(Ipv4Addr::LOCALHOST.into()),
+            network_port,
         },
         ..Default::default()
-    };
-    config.network_api = NetworkArgs {
-        public_address: Some(Ipv4Addr::LOCALHOST.into()),
-        public_port,
-        is_gateway,
-        skip_load_from_network: true,
-        gateways: Some(gateways),
-        location: Some(rand::random()),
-        ignore_protocol_checking: true,
-        address: Some(Ipv4Addr::LOCALHOST.into()),
-        network_port,
     };
     Ok(config)
 }
@@ -69,8 +70,14 @@ async fn test_get_contract() -> anyhow::Result<()> {
     let gw_loc = gw_config.location;
 
     let node_a_tmp_dir = tempfile::tempdir()?;
-    let mut config_a =
-        base_test_config(false, vec![serde_json::to_string(&gw_config)?], None).await?;
+    let ws_api_port_a = TcpListener::bind("127.0.0.1:0")?;
+    let mut config_a = base_test_config(
+        false,
+        vec![serde_json::to_string(&gw_config)?],
+        None,
+        ws_api_port_a.local_addr()?.port(),
+    )
+    .await?;
     config_a.config_paths.config_dir = Some(node_a_tmp_dir.path().to_path_buf());
     config_a.config_paths.data_dir = Some(node_a_tmp_dir.path().to_path_buf());
     let node_a = async move {
@@ -82,11 +89,19 @@ async fn test_get_contract() -> anyhow::Result<()> {
         node.run().await
     };
 
-    let mut config_b = base_test_config(true, vec![], Some(gw_config.address.port())).await?;
+    let ws_api_port_b = TcpListener::bind("127.0.0.1:0")?;
+    let mut config_b = base_test_config(
+        true,
+        vec![],
+        Some(gw_config.address.port()),
+        ws_api_port_b.local_addr()?.port(),
+    )
+    .await?;
     config_b.network_api.location = gw_loc;
     let keypair_file = node_b_tmp_dir.path().join("keypair.pem");
     gw_keypair.save(&keypair_file)?;
     config_b.secrets.transport_keypair = Some(keypair_file);
+    config_b.network_api.is_gateway = true;
     config_b.config_paths.config_dir = Some(node_b_tmp_dir.path().to_path_buf());
     config_b.config_paths.data_dir = Some(node_b_tmp_dir.path().to_path_buf());
     std::mem::drop(reserved_listener); // Free the port so it does not fail on initialization
