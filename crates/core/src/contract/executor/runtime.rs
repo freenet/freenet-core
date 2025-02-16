@@ -198,7 +198,10 @@ impl Executor<Runtime> {
         Executor::new(
             state_store,
             move || {
-                crate::util::set_cleanup_on_exit(config.paths().clone())?;
+                let _ =
+                    crate::util::set_cleanup_on_exit(config.paths().clone()).inspect_err(|error| {
+                        tracing::error!("Failed to set cleanup on exit: {error}");
+                    });
                 Ok(())
             },
             OperationMode::Local,
