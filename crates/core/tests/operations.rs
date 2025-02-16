@@ -138,7 +138,7 @@ async fn test_get_contract() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_secs(60)).await;
 
         // Connect to node A's websocket API
-        let uri = format!("ws://127.0.0.1:{}/contract/command?encodingProtocol=native", ws_api_port);
+        let uri = format!("ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native", ws_api_port);
         let (stream, _) = connect_async(&uri).await?;
         let mut client = WebApi::start(stream);
 
