@@ -65,12 +65,13 @@ async fn test_get_contract() -> anyhow::Result<()> {
     let node_b_tmp_dir = tempfile::tempdir()?;
     let node_b_pub_key = node_b_tmp_dir.path().join("pub_key.pem");
     let reserved_listener = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_a = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_b = TcpListener::bind("127.0.0.1:0")?;
     let (gw_config, gw_keypair) =
         gw_config(reserved_listener.local_addr()?.port(), &node_b_pub_key)?;
     let gw_loc = gw_config.location;
 
     let node_a_tmp_dir = tempfile::tempdir()?;
-    let ws_api_port_a = TcpListener::bind("127.0.0.1:0")?;
     let mut config_a = base_test_config(
         false,
         vec![serde_json::to_string(&gw_config)?],
@@ -80,6 +81,8 @@ async fn test_get_contract() -> anyhow::Result<()> {
     .await?;
     config_a.config_paths.config_dir = Some(node_a_tmp_dir.path().to_path_buf());
     config_a.config_paths.data_dir = Some(node_a_tmp_dir.path().to_path_buf());
+
+    std::mem::drop(ws_api_port_a); // Free the port so it does not fail on initialization
     let node_a = async move {
         let config = config_a.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -89,7 +92,6 @@ async fn test_get_contract() -> anyhow::Result<()> {
         node.run().await
     };
 
-    let ws_api_port_b = TcpListener::bind("127.0.0.1:0")?;
     let mut config_b = base_test_config(
         true,
         vec![],
@@ -105,6 +107,7 @@ async fn test_get_contract() -> anyhow::Result<()> {
     config_b.config_paths.config_dir = Some(node_b_tmp_dir.path().to_path_buf());
     config_b.config_paths.data_dir = Some(node_b_tmp_dir.path().to_path_buf());
     std::mem::drop(reserved_listener); // Free the port so it does not fail on initialization
+    std::mem::drop(ws_api_port_b);
     let node_b = async {
         let config = config_b.build().await?;
         let node = NodeConfig::new(config.clone())
