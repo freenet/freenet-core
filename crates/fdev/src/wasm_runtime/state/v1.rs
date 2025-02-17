@@ -1,10 +1,9 @@
 use super::*;
-use crate::websocket::convert_websocket_stream;
 
 impl AppState {
     pub async fn new_v1(config: &ExecutorConfig) -> anyhow::Result<Self> {
         let target: SocketAddr = (config.address, config.port).into();
-        let stream = tokio_tungstenite::connect_async(&format!(
+        let (stream, _) = tokio_tungstenite::connect_async(&format!(
             "ws://{}/v1/contract/command?encodingProtocol=native",
             target
         ))
@@ -15,7 +14,7 @@ impl AppState {
         })?;
 
         Ok(AppState {
-            local_node: Arc::new(RwLock::new(WebApi::start(convert_websocket_stream(stream.0)))),
+            local_node: Arc::new(RwLock::new(WebApi::start(stream))),
             config: config.clone(),
         })
     }

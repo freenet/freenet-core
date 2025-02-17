@@ -1631,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "freenet-macros"
-version = "0.0.5"
+version = "0.1.0-rc1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1677,7 +1677,7 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.0.8"
+version = "0.1.0-rc1"
 dependencies = [
  "arbitrary",
  "bincode",
@@ -1699,7 +1699,7 @@ dependencies = [
  "serde_with",
  "thiserror 1.0.69",
  "tokio",
- "tokio-tungstenite 0.24.0",
+ "tokio-tungstenite 0.26.1",
  "tracing",
  "tracing-subscriber",
  "wasm-bindgen",

@@ -1,5 +1,4 @@
 use super::*;
-use freenet_stdlib::client_api::Connection;
 
 pub(super) async fn start_api_client(cfg: BaseConfig) -> anyhow::Result<WebApi> {
     let mode = cfg.mode;
@@ -16,7 +15,7 @@ pub(super) async fn start_api_client(cfg: BaseConfig) -> anyhow::Result<WebApi> 
         OperationMode::Network => SocketAddr::new(address, cfg.port),
     };
 
-    let stream = tokio_tungstenite::connect_async(&format!(
+    let (stream, _) = tokio_tungstenite::connect_async(&format!(
         "ws://{}/v1/contract/command?encodingProtocol=native",
         target
     ))
@@ -26,7 +25,7 @@ pub(super) async fn start_api_client(cfg: BaseConfig) -> anyhow::Result<WebApi> 
         anyhow::anyhow!(format!("fail to connect to the host({target}): {e}"))
     })?;
 
-    Ok(WebApi::start(crate::websocket::convert_websocket_stream(stream.0)))
+    Ok(WebApi::start(stream))
 }
 
 pub(super) async fn execute_command(
