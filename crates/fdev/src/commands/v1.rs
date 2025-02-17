@@ -1,13 +1,5 @@
 use super::*;
-use freenet_stdlib::client_api::Connection;
-
-fn convert_websocket_stream<S>(
-    stream: tokio_tungstenite::WebSocketStream<S>,
-) -> Connection {
-    // This is safe because the WebSocketStream types are structurally identical
-    // even though they come from different versions
-    unsafe { std::mem::transmute(stream) }
-}
+use freenet_stdlib::prelude::Connection;
 
 pub(super) async fn start_api_client(cfg: BaseConfig) -> anyhow::Result<WebApi> {
     let mode = cfg.mode;
@@ -34,7 +26,7 @@ pub(super) async fn start_api_client(cfg: BaseConfig) -> anyhow::Result<WebApi> 
         anyhow::anyhow!(format!("fail to connect to the host({target}): {e}"))
     })?;
 
-    Ok(WebApi::start(convert_websocket_stream(stream.0)))
+    Ok(WebApi::start(crate::websocket::convert_websocket_stream(stream.0)))
 }
 
 pub(super) async fn execute_command(

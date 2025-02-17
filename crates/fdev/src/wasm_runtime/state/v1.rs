@@ -1,4 +1,5 @@
 use super::*;
+use crate::websocket::convert_websocket_stream;
 
 impl AppState {
     pub async fn new_v1(config: &ExecutorConfig) -> anyhow::Result<Self> {
