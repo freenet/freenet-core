@@ -1,8 +1,7 @@
-use std::{fs::File, io::Read, net::SocketAddr, path::PathBuf, sync::Arc, io::Cursor};
-use tar::Builder;
+use std::{fs::File, io::Read, net::SocketAddr, path::PathBuf, sync::Arc};
 
-use freenet::dev_tool::OperationMode;
-use freenet::server::WebApp;
+use freenet::{dev_tool::OperationMode, server::WebApp};
+use freenet_stdlib::prelude::{ContractCode, ContractContainer, Parameters, State, WrappedContract, ContractWasmAPIVersion};
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, DelegateRequest, WebApi},
     prelude::*,
@@ -213,6 +212,40 @@ For additional hardening is recommended to use a different cipher and nonce to e
     .into();
     let mut client = start_api_client(other).await?;
     execute_command(request, &mut client).await
+}
+
+#[derive(clap::Parser, Clone, Debug)]
+pub(crate) struct GetContractIdConfig {
+    /// Path to the contract code (WASM file)
+    #[arg(long)]
+    pub(crate) code: PathBuf,
+    
+    /// Path to the parameters file
+    #[arg(long)]
+    pub(crate) parameters: Option<PathBuf>,
+}
+
+pub async fn get_contract_id(config: GetContractIdConfig) -> anyhow::Result<()> {
+    let params = if let Some(params) = &config.parameters {
+        let mut buf = vec![];
+        File::open(params)?.read_to_end(&mut buf)?;
+        Parameters::from(buf)
+    } else {
+        Parameters::from(&[] as &[u8])
+    };
+
+    let contract = if let Ok(raw_code) = ContractCode::load_raw(&config.code) {
+        let code = ContractCode::from(raw_code.data().to_vec());
+        let wrapped = WrappedContract::new(Arc::new(code), params);
+        let api_version = ContractWasmAPIVersion::V1(wrapped);
+        ContractContainer::from(api_version)
+    } else {
+        ContractContainer::try_from((config.code.as_path(), params))?
+    };
+
+    let key = contract.key();
+    println!("{key}");
+    Ok(())
 }
 
 pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<()> {
