@@ -1,5 +1,5 @@
 use super::*;
-use freenet_stdlib::prelude::Connection;
+use freenet_stdlib::client_api::Connection;
 
 pub(super) async fn start_api_client(cfg: BaseConfig) -> anyhow::Result<WebApi> {
     let mode = cfg.mode;

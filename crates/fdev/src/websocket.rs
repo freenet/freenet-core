@@ -1,4 +1,4 @@
-use freenet_stdlib::prelude::Connection;
+use freenet_stdlib::client_api::Connection;
 
 pub fn convert_websocket_stream<S>(
     stream: tokio_tungstenite::WebSocketStream<S>,
