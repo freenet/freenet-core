@@ -25,7 +25,7 @@ pub(super) async fn start_api_client(cfg: BaseConfig) -> anyhow::Result<WebApi> 
         anyhow::anyhow!(format!("fail to connect to the host({target}): {e}"))
     })?;
 
-    Ok(WebApi::start(stream.0.into()))
+    Ok(WebApi::start(stream.0))
 }
 
 pub(super) async fn execute_command(
