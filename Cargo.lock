@@ -1466,7 +1466,7 @@ dependencies = [
  "tar",
  "thiserror 2.0.11",
  "tokio",
- "tokio-tungstenite 0.24.0",
+ "tokio-tungstenite 0.26.1",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -1649,7 +1649,7 @@ dependencies = [
  "futures 0.3.31",
  "serde_json",
  "tokio",
- "tokio-tungstenite 0.24.0",
+ "tokio-tungstenite 0.26.1",
  "tracing",
  "tracing-subscriber",
 ]
