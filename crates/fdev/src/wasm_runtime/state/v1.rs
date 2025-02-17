@@ -14,7 +14,7 @@ impl AppState {
         })?;
 
         Ok(AppState {
-            local_node: Arc::new(RwLock::new(WebApi::start(stream.0))),
+            local_node: Arc::new(RwLock::new(WebApi::start(convert_websocket_stream(stream.0)))),
             config: config.clone(),
         })
     }
