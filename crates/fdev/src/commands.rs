@@ -155,7 +155,7 @@ async fn put_contract(
     };
 
     let key = contract.key();
-    tracing::info!("Publishing contract {key}");
+    println!("Publishing contract {key}");
     tracing::debug!(
         state_size = state.as_ref().len(),
         has_related = related_contracts.states().next().is_some(), // FIXME: Should have a better way to test whether there are related contracts
