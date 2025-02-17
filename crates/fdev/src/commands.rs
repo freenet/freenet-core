@@ -1,5 +1,4 @@
-use std::{fs::File, io::Read, net::SocketAddr, path::PathBuf, sync::Arc, io::Cursor};
-use tar::Builder;
+use std::{fs::File, io::Read, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use freenet::dev_tool::OperationMode;
 use freenet::server::WebApp;

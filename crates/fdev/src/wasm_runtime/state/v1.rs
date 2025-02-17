@@ -3,7 +3,7 @@ use super::*;
 impl AppState {
     pub async fn new_v1(config: &ExecutorConfig) -> anyhow::Result<Self> {
         let target: SocketAddr = (config.address, config.port).into();
-        let (stream, _) = tokio_tungstenite::connect_async(&format!(
+        let stream = tokio_tungstenite::connect_async(&format!(
             "ws://{}/v1/contract/command?encodingProtocol=native",
             target
         ))
@@ -14,7 +14,7 @@ impl AppState {
         })?;
 
         Ok(AppState {
-            local_node: Arc::new(RwLock::new(WebApi::start(stream))),
+            local_node: Arc::new(RwLock::new(WebApi::start(stream.0.into()))),
             config: config.clone(),
         })
     }

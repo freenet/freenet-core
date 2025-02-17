@@ -15,7 +15,7 @@ pub(super) async fn start_api_client(cfg: BaseConfig) -> anyhow::Result<WebApi> 
         OperationMode::Network => SocketAddr::new(address, cfg.port),
     };
 
-    let (stream, _) = tokio_tungstenite::connect_async(&format!(
+    let stream = tokio_tungstenite::connect_async(&format!(
         "ws://{}/v1/contract/command?encodingProtocol=native",
         target
     ))
@@ -25,7 +25,7 @@ pub(super) async fn start_api_client(cfg: BaseConfig) -> anyhow::Result<WebApi> 
         anyhow::anyhow!(format!("fail to connect to the host({target}): {e}"))
     })?;
 
-    Ok(WebApi::start(stream))
+    Ok(WebApi::start(stream.0.into()))
 }
 
 pub(super) async fn execute_command(
