@@ -207,7 +207,7 @@ pub(super) async fn variable_content(
 #[instrument(level = "debug")]
 async fn get_web_body(path: &Path) -> Result<impl IntoResponse, WebSocketApiError> {
     debug!("get_web_body: Attempting to read index.html from path: {:?}", path);
-    let web_path = path.join("web").join("index.html");
+    let web_path = path.join("index.html");
     debug!("get_web_body: Full web path: {:?}", web_path);
     let mut key_file = File::open(&web_path)
         .await
@@ -230,9 +230,8 @@ async fn get_web_body(path: &Path) -> Result<impl IntoResponse, WebSocketApiErro
 fn contract_web_path(key: &ContractKey) -> PathBuf {
     std::env::temp_dir()
         .join("freenet")
-        .join("webs")
+        .join("webapp_cache")
         .join(key.encoded_contract_id())
-        .join("web")
 }
 
 #[inline]
