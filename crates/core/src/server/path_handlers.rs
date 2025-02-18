@@ -176,12 +176,18 @@ pub(super) async fn variable_content(
         error_cause: format!("{err}"),
     })?;
     let base_path = contract_web_path(&key);
+    debug!("variable_content: Base path resolved to: {:?}", base_path);
+    
     let req_uri = req_path
         .parse()
         .map_err(|err| WebSocketApiError::NodeError {
             error_cause: format!("{err}"),
         })?;
+    debug!("variable_content: Parsed request URI: {:?}", req_uri);
+    
     let file_path = base_path.join(get_file_path(req_uri)?);
+    debug!("variable_content: Full file path to serve: {:?}", file_path);
+    debug!("variable_content: Checking if file exists: {}", file_path.exists());
 
     // serve the file
     let mut serve_file = tower_http::services::fs::ServeFile::new(&file_path);
