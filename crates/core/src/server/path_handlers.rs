@@ -90,39 +90,60 @@ pub(super) async fn contract_home(
             Some(contract) => {
                 let key = contract.key();
                 let path = contract_web_path(&key);
+                let state_bytes = state.as_ref();
+                let current_hash = hash_state(state_bytes);
+                let hash_path = state_hash_path(&key);
+            
+                let needs_update = match tokio::fs::read(&hash_path).await {
+                    Ok(stored_hash_bytes) if stored_hash_bytes.len() == 8 => {
+                        let stored_hash = u64::from_be_bytes(stored_hash_bytes.try_into().unwrap());
+                        stored_hash != current_hash
+                    }
+                    _ => true,
+                };
+
+                if needs_update {
+                    debug!("State changed or not cached, unpacking webapp");
+                    let state = State::from(state_bytes);
+
+                    fn err(
+                        err: WebContractError,
+                        contract: &ContractContainer,
+                    ) -> WebSocketApiError {
+                        let key = contract.key();
+                        tracing::error!("{err}");
+                        WebSocketApiError::InvalidParam {
+                            error_cause: format!("failed unpacking contract: {key}"),
+                        }
+                    }
+
+                    // Clear existing cache if any
+                    let _ = tokio::fs::remove_dir_all(&path).await;
+                    tokio::fs::create_dir_all(&path).await.map_err(|e| WebSocketApiError::NodeError {
+                        error_cause: format!("Failed to create cache dir: {e}"),
+                    })?;
+
+                    let mut web = WebApp::try_from(state.as_ref())
+                        .map_err(|e| err(e, &contract))
+                        .unwrap();
+                    web.unpack(path).map_err(|e| err(e, &contract)).unwrap();
+
+                    // Store new hash
+                    tokio::fs::write(&hash_path, current_hash.to_be_bytes()).await.map_err(|e| 
+                        WebSocketApiError::NodeError {
+                            error_cause: format!("Failed to write state hash: {e}"),
+                        }
+                    )?;
+                }
+
                 let web_body = match get_web_body(&path).await {
                     Ok(b) => b.into_response(),
-                    Err(err) => match err {
-                        WebSocketApiError::NodeError {
-                            error_cause: _cause,
-                        } => {
-                            let state = State::from(state.as_ref());
-
-                            fn err(
-                                err: WebContractError,
-                                contract: &ContractContainer,
-                            ) -> WebSocketApiError {
-                                let key = contract.key();
-                                tracing::error!("{err}");
-                                WebSocketApiError::InvalidParam {
-                                    error_cause: format!("failed unpacking contract: {key}"),
-                                }
-                            }
-
-                            let mut web = WebApp::try_from(state.as_ref())
-                                .map_err(|e| err(e, &contract))
-                                .unwrap();
-                            web.unpack(path).map_err(|e| err(e, &contract)).unwrap();
-                            let index = web
-                                .get_file("index.html")
-                                .map_err(|e| err(e, &contract))
-                                .unwrap();
-                            let index_body = String::from_utf8(index).map_err(|err| {
-                                WebSocketApiError::NodeError {
-                                    error_cause: format!("{err}"),
-                                }
-                            })?;
-                            Html(index_body).into_response()
+                    Err(err) => {
+                        tracing::error!("Failed to read webapp after unpacking: {err}");
+                        return Err(WebSocketApiError::NodeError {
+                            error_cause: format!("Failed to read webapp: {err}"),
+                        });
+                    }
                         }
                         other => {
                             tracing::error!("{other}");
@@ -232,6 +253,20 @@ fn contract_web_path(key: &ContractKey) -> PathBuf {
         .join("freenet")
         .join("webapp_cache")
         .join(key.encoded_contract_id())
+}
+
+fn hash_state(state: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = ahash::AHasher::default();
+    hasher.write(state);
+    hasher.finish()
+}
+
+fn state_hash_path(key: &ContractKey) -> PathBuf {
+    std::env::temp_dir()
+        .join("freenet")
+        .join("webapp_cache")
+        .join(format!("{}.hash", key.encoded_contract_id()))
 }
 
 #[inline]
