@@ -144,12 +144,6 @@ pub(super) async fn contract_home(
                             error_cause: format!("Failed to read webapp: {err}"),
                         });
                     }
-                        }
-                        other => {
-                            tracing::error!("{other}");
-                            return Err(other);
-                        }
-                    },
                 };
                 web_body
             }
@@ -170,7 +164,12 @@ pub(super) async fn contract_home(
                 error_cause: format!("Contract not found: {key}"),
             });
         }
-        other => unreachable!("received unexpected node response: {other:?}"),
+        other => {
+            tracing::error!("Unexpected node response: {other:?}");
+            return Err(WebSocketApiError::NodeError {
+                error_cause: format!("Unexpected response from node: {other:?}"),
+            });
+        }
     };
     request_sender
         .send(ClientConnection::Request {
