@@ -126,7 +126,7 @@ pub(super) async fn contract_home(
                     let mut web = WebApp::try_from(state.as_ref())
                         .map_err(|e| err(e, &contract))
                         .unwrap();
-                    web.unpack(path).map_err(|e| err(e, &contract)).unwrap();
+                    web.unpack(&path).map_err(|e| err(e, &contract)).unwrap();
 
                     // Store new hash
                     tokio::fs::write(&hash_path, current_hash.to_be_bytes()).await.map_err(|e| 
