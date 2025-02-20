@@ -21,7 +21,7 @@ pub(super) fn get_file_path(uri: axum::http::Uri) -> Result<String, Box<WebSocke
 pub(super) fn get_path() {
     let req_path = "/v1/contract/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/state.html";
     let base_dir =
-        PathBuf::from("/tmp/freenet/webs/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/");
+        PathBuf::from("/tmp/freenet/webapp_cache/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/");
     let uri: axum::http::Uri = req_path.parse().unwrap();
     let parsed = get_file_path(uri).unwrap();
     let result = base_dir.join(parsed);

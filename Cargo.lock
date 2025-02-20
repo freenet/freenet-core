@@ -59,6 +59,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e89da841a80418a9b391ebaea17f5c112ffaaa96f621d2c285b5174da76b9011"
 dependencies = [
  "cfg-if",
+ "getrandom 0.2.15",
  "once_cell",
  "version_check",
  "zerocopy",
@@ -1557,6 +1558,7 @@ name = "freenet"
 version = "0.1.0-rc1"
 dependencies = [
  "aes-gcm",
+ "ahash",
  "anyhow",
  "arbitrary",
  "arc-swap",

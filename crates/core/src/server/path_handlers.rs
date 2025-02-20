@@ -36,8 +36,7 @@ pub(super) async fn contract_home(
             WebSocketApiError::InvalidParam {
                 error_cause: format!("{err}"),
             }
-        })
-        .unwrap();
+        })?;
     debug!("contract_home: Successfully parsed contract key");
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     debug!("contract_home: Sending NewConnection request");
@@ -49,8 +48,7 @@ pub(super) async fn contract_home(
         .await
         .map_err(|err| WebSocketApiError::NodeError {
             error_cause: format!("{err}"),
-        })
-        .unwrap();
+        })?;
     let client_id = if let Some(HostCallbackResult::NewId { id }) = response_recv.recv().await {
         id
     } else {
@@ -74,8 +72,7 @@ pub(super) async fn contract_home(
         .await
         .map_err(|err| WebSocketApiError::NodeError {
             error_cause: format!("{err}"),
-        })
-        .unwrap();
+        })?;
     debug!("contract_home: Waiting for GET response");
     let response = match response_recv.recv().await {
         Some(HostCallbackResult::Result {
@@ -180,8 +177,7 @@ pub(super) async fn contract_home(
         .await
         .map_err(|err| WebSocketApiError::NodeError {
             error_cause: format!("{err}"),
-        })
-        .unwrap();
+        })?;
     Ok(response)
 }
 
