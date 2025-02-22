@@ -237,7 +237,7 @@ impl PeerConnection {
                     let packet_data = inbound.ok_or(TransportError::ConnectionClosed(self.remote_addr()))?;
                     last_received = std::time::Instant::now();
                     let Ok(decrypted) = packet_data.try_decrypt_sym(&self.remote_conn.inbound_symmetric_key).inspect_err(|error| {
-                        tracing::debug!(%error, remote = ?self.remote_conn.remote_addr, "Failed to decrypt packet, might be an intro packet or a partial packet");
+                        tracing::warn!(%error, remote = ?self.remote_conn.remote_addr, "Failed to decrypt packet, might be an intro packet or a partial packet");
                     }) else {
                         let now = Instant::now();
                         if let Some(first_failure_time) = self.first_failure_time {

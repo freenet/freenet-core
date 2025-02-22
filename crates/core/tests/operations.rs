@@ -23,9 +23,9 @@ use tracing::level_filters::LevelFilter;
 
 mod test_utils;
 
-static RNG: once_cell::sync::Lazy<std::sync::Mutex<rand::rngs::SmallRng>> =
+static RNG: once_cell::sync::Lazy<std::sync::Mutex<rand::rngs::StdRng>> =
     once_cell::sync::Lazy::new(|| {
-        std::sync::Mutex::new(rand::rngs::SmallRng::from_seed(
+        std::sync::Mutex::new(rand::rngs::StdRng::from_seed(
             *b"0102030405060708090a0b0c0d0e0f10",
         ))
     });
@@ -66,7 +66,7 @@ async fn base_test_config(
 
 fn gw_config(port: u16, path: &Path) -> anyhow::Result<(InlineGwConfig, TransportKeypair)> {
     // generate key and store it in a temp file
-    let key = TransportKeypair::new();
+    let key = TransportKeypair::new_with_rng(&mut *RNG.lock().unwrap());
     key.public().save(path)?;
     Ok((
         InlineGwConfig {
@@ -78,9 +78,9 @@ fn gw_config(port: u16, path: &Path) -> anyhow::Result<(InlineGwConfig, Transpor
     ))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_put_contract() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
+    freenet::config::set_logger(Some(LevelFilter::TRACE), None);
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
     let contract_key = contract.key();
@@ -158,7 +158,6 @@ async fn test_put_contract() -> TestResult {
         let mut client = WebApi::start(stream);
 
         // Create a test contract and state
-        let params = Parameters::from(vec![]);
         let state = WrappedState::new(vec![]);
         make_put(&mut client, state.clone(), contract.clone()).await?;
 

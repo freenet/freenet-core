@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use rand::rngs::OsRng;
-use rsa::{pkcs8, Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
+use rsa::{pkcs8, rand_core::CryptoRngCore, Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -36,9 +36,16 @@ impl Default for TransportKeypair {
 impl TransportKeypair {
     pub fn new() -> Self {
         let mut rng = OsRng;
-        // Key size, can be adjusted
+        Self::new_inner(&mut rng)
+    }
+
+    pub fn new_with_rng(rng: &mut impl CryptoRngCore) -> Self {
+        Self::new_inner(rng)
+    }
+
+    fn new_inner(rng: &mut impl CryptoRngCore) -> Self {
         const BITS: usize = 2048;
-        let priv_key = RsaPrivateKey::new(&mut rng, BITS).expect("failed to generate a key");
+        let priv_key = RsaPrivateKey::new(rng, BITS).expect("failed to generate a key");
         let public = TransportPublicKey(RsaPublicKey::from(&priv_key));
         TransportKeypair {
             public,
