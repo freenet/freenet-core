@@ -1622,6 +1622,7 @@ dependencies = [
  "tar",
  "tempfile",
  "test-log",
+ "testresult",
  "thiserror 2.0.11",
  "time",
  "tokio",
@@ -4958,6 +4959,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-contract-integration"
+version = "0.1.0"
+dependencies = [
+ "freenet-stdlib",
+]
+
+[[package]]
 name = "test-log"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4978,6 +4986,12 @@ dependencies = [
  "quote",
  "syn 2.0.96",
 ]
+
+[[package]]
+name = "testresult"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "614b328ff036a4ef882c61570f72918f7e9c5bee1da33f8e7f91e01daee7e56c"
 
 [[package]]
 name = "thiserror"

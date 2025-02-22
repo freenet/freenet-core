@@ -457,7 +457,7 @@ impl SimNetwork {
         for node_no in self.number_of_gateways..num + self.number_of_gateways {
             let label = NodeLabel::node(node_no);
 
-            let mut config_args = ConfigArgs {
+            let config_args = ConfigArgs {
                 id: Some(format!("{label}")),
                 ..Default::default()
             };
