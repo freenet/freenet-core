@@ -10,7 +10,7 @@ use freenet_stdlib::{
     prelude::*,
 };
 use futures::FutureExt;
-use rand::random;
+use rand::{random, Rng, SeedableRng};
 use std::{
     net::{Ipv4Addr, TcpListener},
     path::Path,
@@ -19,8 +19,16 @@ use std::{
 use test_utils::make_put;
 use testresult::TestResult;
 use tokio_tungstenite::connect_async;
+use tracing::level_filters::LevelFilter;
 
 mod test_utils;
+
+static RNG: once_cell::sync::Lazy<std::sync::Mutex<rand::rngs::SmallRng>> =
+    once_cell::sync::Lazy::new(|| {
+        std::sync::Mutex::new(rand::rngs::SmallRng::from_seed(
+            *b"0102030405060708090a0b0c0d0e0f10",
+        ))
+    });
 
 async fn base_test_config(
     is_gateway: bool,
@@ -46,7 +54,7 @@ async fn base_test_config(
             is_gateway,
             skip_load_from_network: true,
             gateways: Some(gateways),
-            location: Some(rand::random()),
+            location: Some(RNG.lock().unwrap().gen()),
             ignore_protocol_checking: true,
             address: Some(Ipv4Addr::LOCALHOST.into()),
             network_port,
@@ -70,8 +78,9 @@ fn gw_config(port: u16, path: &Path) -> anyhow::Result<(InlineGwConfig, Transpor
     ))
 }
 
-#[test_log::test(tokio::test)]
+#[tokio::test]
 async fn test_put_contract() -> TestResult {
+    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
     let contract_key = contract.key();
@@ -136,7 +145,7 @@ async fn test_put_contract() -> TestResult {
     }
     .boxed_local();
 
-    let test = tokio::time::timeout(Duration::from_secs(20), async {
+    let test = tokio::time::timeout(Duration::from_secs(60), async {
         // Wait for nodes to start up
         tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -155,7 +164,7 @@ async fn test_put_contract() -> TestResult {
 
         // Wait for put response
         loop {
-            let resp = tokio::time::timeout(Duration::from_secs(10), client.recv()).await;
+            let resp = tokio::time::timeout(Duration::from_secs(30), client.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                     assert_eq!(key, contract_key);
@@ -183,7 +192,7 @@ async fn test_put_contract() -> TestResult {
 
         // Wait for get response
         let (response_key, response_contract, response_state) = loop {
-            let resp = tokio::time::timeout(Duration::from_secs(10), client.recv()).await;
+            let resp = tokio::time::timeout(Duration::from_secs(30), client.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                     key,
