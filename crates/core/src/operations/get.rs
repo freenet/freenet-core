@@ -130,6 +130,12 @@ enum GetState {
         retries: usize,
         current_hop: usize,
     },
+    /// Operation completed successfully
+    Finished {
+        key: ContractKey,
+        state: WrappedState,
+        contract: Option<ContractContainer>,
+    },
 }
 
 impl Display for GetState {
@@ -155,6 +161,7 @@ impl Display for GetState {
             } => {
                 write!(f, "AwaitingResponse(requester: {:?}, fetch_contract: {}, retries: {}, current_hop: {})", requester, fetch_contract, retries, current_hop)
             }
+            GetState::Finished { key, .. } => write!(f, "Finished(key: {})", key),
         }
     }
 }
@@ -227,7 +234,7 @@ impl GetOp {
     }
 
     pub(super) fn finalized(&self) -> bool {
-        self.result.is_some()
+        self.result.is_some() && matches!(self.state, Some(GetState::Finished { .. }))
     }
 
     pub(super) fn to_host_result(&self) -> HostResult {
@@ -763,7 +770,11 @@ impl Operation for GetOp {
                             requester: None, ..
                         }) => {
                             tracing::info!(tx = %id, %key, "Get response received for contract at original requester");
-                            new_state = None;
+                            new_state = Some(GetState::Finished {
+                                key,
+                                state: value.clone(),
+                                contract: contract.clone(),
+                            });
                             return_msg = None;
                             result = Some(GetResult {
                                 key,
