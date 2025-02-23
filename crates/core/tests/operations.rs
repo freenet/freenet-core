@@ -1,3 +1,4 @@
+use crate::test_utils::verify_contract_exists;
 use anyhow::{anyhow, bail};
 use freenet::{
     config::{ConfigArgs, InlineGwConfig, NetworkArgs, SecretArgs, WebsocketApiArgs},
@@ -6,7 +7,7 @@ use freenet::{
     server::serve_gateway,
 };
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ContractResponse, HostResponse, WebApi},
     prelude::*,
 };
 use futures::FutureExt;
@@ -16,12 +17,11 @@ use std::{
     path::Path,
     time::Duration,
 };
-use test_utils::{make_put, make_update, make_get};
+use test_utils::{make_get, make_put, make_update};
 use testresult::TestResult;
 use tokio::select;
 use tokio_tungstenite::connect_async;
 use tracing::level_filters::LevelFilter;
-use crate::test_utils::verify_contract_exists;
 
 mod test_utils;
 
@@ -200,7 +200,7 @@ async fn test_put_contract() -> TestResult {
                     contract: Some(contract),
                     state,
                 }))) => {
-                    verify_contract_exists(node_a_tmp_dir.path(), contract_key).await?;
+                    verify_contract_exists(preset_cfg_a.temp_dir.path(), contract_key).await?;
                     break (key, contract, state);
                 }
                 Ok(Ok(other)) => {
@@ -247,30 +247,35 @@ async fn test_update_contract() -> TestResult {
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
     let contract_key = contract.key();
 
-    let node_b_tmp_dir = tempfile::tempdir()?;
-    let node_b_pub_key = node_b_tmp_dir.path().join("pub_key.pem");
-    let reserved_listener = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_a = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_b = TcpListener::bind("127.0.0.1:0")?;
-    let (gw_config, gw_keypair) =
-        gw_config(reserved_listener.local_addr()?.port(), &node_b_pub_key)?;
-    let gw_loc = gw_config.location;
-    let node_a_tmp_dir = tempfile::tempdir()?;
-    println!("Node A data dir: {:?}", node_a_tmp_dir.path());
-    println!("Node B data dir: {:?}", node_b_tmp_dir.path());
+    let network_socket_b = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_socket_a = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_socket_b = TcpListener::bind("127.0.0.1:0")?;
 
-    let mut config_a = base_test_config(
+    let (config_b, preset_cfg_b, config_b_gw) = {
+        let (cfg, preset) = base_node_test_config(
+            true,
+            vec![],
+            Some(network_socket_b.local_addr()?.port()),
+            ws_api_port_socket_b.local_addr()?.port(),
+        )
+        .await?;
+        let public_port = cfg.network_api.public_port.unwrap();
+        let path = preset.temp_dir.path().to_path_buf();
+        (cfg, preset, gw_config(public_port, &path)?)
+    };
+
+    let (config_a, preset_cfg_a) = base_node_test_config(
         false,
-        vec![serde_json::to_string(&gw_config)?],
+        vec![serde_json::to_string(&config_b_gw)?],
         None,
-        ws_api_port_a.local_addr()?.port(),
+        ws_api_port_socket_a.local_addr()?.port(),
     )
     .await?;
-    config_a.config_paths.config_dir = Some(node_a_tmp_dir.path().to_path_buf());
-    config_a.config_paths.data_dir = Some(node_a_tmp_dir.path().to_path_buf());
-
     let ws_api_port = config_a.ws_api.ws_api_port.unwrap();
-    std::mem::drop(ws_api_port_a); // Free the port so it does not fail on initialization
+
+    println!("Node A data dir: {:?}", preset_cfg_b.temp_dir.path());
+    println!("Node B data dir: {:?}", preset_cfg_a.temp_dir.path());
+
     let node_a = async move {
         let config = config_a.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -281,22 +286,8 @@ async fn test_update_contract() -> TestResult {
     }
     .boxed_local();
 
-    let mut config_b = base_test_config(
-        true,
-        vec![],
-        Some(gw_config.address.port()),
-        ws_api_port_b.local_addr()?.port(),
-    )
-    .await?;
-    config_b.network_api.location = gw_loc;
-    let keypair_file = node_b_tmp_dir.path().join("keypair.pem");
-    gw_keypair.save(&keypair_file)?;
-    config_b.secrets.transport_keypair = Some(keypair_file);
-    config_b.network_api.is_gateway = true;
-    config_b.config_paths.config_dir = Some(node_b_tmp_dir.path().to_path_buf());
-    config_b.config_paths.data_dir = Some(node_b_tmp_dir.path().to_path_buf());
-    std::mem::drop(reserved_listener); // Free the port so it does not fail on initialization
-    std::mem::drop(ws_api_port_b);
+    std::mem::drop(network_socket_b); // Free the port so it does not fail on initialization
+    std::mem::drop(ws_api_port_socket_b);
     let node_b = async {
         let config = config_b.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -351,7 +342,10 @@ async fn test_update_contract() -> TestResult {
         let summary = loop {
             let resp = tokio::time::timeout(Duration::from_secs(30), client.recv()).await;
             match resp {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, summary }))) => {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                    key,
+                    summary,
+                }))) => {
                     assert_eq!(key, contract_key);
                     break summary;
                 }
@@ -379,7 +373,7 @@ async fn test_update_contract() -> TestResult {
                     contract: Some(contract),
                     state,
                 }))) => {
-                    verify_contract_exists(node_a_tmp_dir.path(), contract_key).await?;
+                    verify_contract_exists(preset_cfg_a.temp_dir.path(), contract_key).await?;
                     break (key, contract, state);
                 }
                 Ok(Ok(other)) => {
