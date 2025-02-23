@@ -6,7 +6,7 @@ struct Contract;
 impl ContractInterface for Contract {
     fn validate_state(
         _parameters: Parameters<'static>,
-        state: State<'static>,
+        _state: State<'static>,
         _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
         Ok(ValidateResult::Valid)
@@ -15,7 +15,7 @@ impl ContractInterface for Contract {
     fn update_state(
         _parameters: Parameters<'static>,
         state: State<'static>,
-        data: Vec<UpdateData<'static>>,
+        _data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
         Ok(UpdateModification::valid(state))
     }
@@ -30,7 +30,7 @@ impl ContractInterface for Contract {
     fn get_state_delta(
         _parameters: Parameters<'static>,
         state: State<'static>,
-        summary: StateSummary<'static>,
+        _summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
         Ok(StateDelta::from(state.to_vec()))
     }
