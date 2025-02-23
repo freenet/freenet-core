@@ -34,24 +34,43 @@ impl PacketRateLimiter<InstantTimeSrc> {
 }
 
 impl<T: TimeSource> PacketRateLimiter<T> {
-    pub(super) async fn rate_limiter<S: Socket>(mut self, bandwidth_limit: usize, socket: Arc<S>) {
+    pub(super) async fn rate_limiter<S: Socket>(
+        mut self,
+        bandwidth_limit: Option<usize>,
+        socket: Arc<S>,
+    ) {
         tracing::info!(bandwidth_limit, "Rate limiter task started");
         while let Some((socket_addr, packet)) = self.outbound_packets.recv().await {
-            // tracing::debug!(%socket_addr, packet_len = %packet.len(), "Sending outbound packet");
-            if let Err(error) = socket.send_to(&packet, socket_addr).await {
-                tracing::debug!("Error sending packet: {:?}", error);
+            // tracing::trace!(%socket_addr, packet_len = %packet.len(), "Sending outbound packet");
+            if let Some(bandwidth_limit) = bandwidth_limit {
+                self.rate_limiting(bandwidth_limit, &*socket, packet, socket_addr)
+                    .await;
+            } else if let Err(error) = socket.send_to(&packet, socket_addr).await {
+                tracing::error!(%socket_addr, "Error sending packet: {}", error);
                 continue;
             }
-            // if let Some(wait_time) = self.can_send_packet(bandwidth_limit, packet.len()) {
-            //     tokio::time::sleep(wait_time).await;
-            //     tracing::debug!(%socket_addr, "Sending outbound packet after waiting {:?}", wait_time);
-            // } else if let Err(error) = socket.send_to(&packet, socket_addr).await {
-            //     tracing::debug!(%socket_addr, "Error sending packet: {:?}", error);
-            //     continue;
-            // }
-            self.add_packet(packet.len());
         }
         tracing::debug!("Rate limiter task ended unexpectedly");
+    }
+
+    #[inline(always)]
+    async fn rate_limiting<S: Socket>(
+        &mut self,
+        bandwidth_limit: usize,
+        socket: &S,
+        packet: Arc<[u8]>,
+        socket_addr: SocketAddr,
+    ) {
+        if let Some(wait_time) = self.can_send_packet(bandwidth_limit, packet.len()) {
+            tokio::time::sleep(wait_time).await;
+            tracing::debug!(%socket_addr, "Sending outbound packet after waiting {:?}", wait_time);
+            if let Err(error) = socket.send_to(&packet, socket_addr).await {
+                tracing::error!("Error sending packet: {}", error);
+            }
+        } else if let Err(error) = socket.send_to(&packet, socket_addr).await {
+            tracing::debug!(%socket_addr, "Error sending packet: {:?}", error);
+        }
+        self.add_packet(packet.len());
     }
 
     /// Report that a packet was sent

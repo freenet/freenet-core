@@ -88,6 +88,7 @@ impl Default for ConfigArgs {
                 ignore_protocol_checking: false,
                 gateways: None,
                 location: None,
+                bandwidth_limit: None,
             },
             ws_api: WebsocketApiArgs {
                 address: Some(default_listening_address()),
@@ -304,7 +305,8 @@ impl ConfigArgs {
                     .unwrap_or_else(default_network_api_port),
                 public_address: self.network_api.public_address,
                 public_port: self.network_api.public_port,
-                ignore_protocol: self.network_api.ignore_protocol_checking,
+                ignore_protocol_version: self.network_api.ignore_protocol_checking,
+                bandwidth_limit: self.network_api.bandwidth_limit,
             },
             ws_api: WebsocketApiConfig {
                 address: self.ws_api.address.unwrap_or_else(|| match mode {
@@ -469,6 +471,10 @@ pub struct NetworkArgs {
     /// Ignores protocol version failures, continuing to run the node if there is a mismatch with the gateway.
     #[arg(long)]
     pub ignore_protocol_checking: bool,
+
+    /// Hard limit the bandwidth usage for upstream traffic.
+    #[arg(long)]
+    pub bandwidth_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -522,8 +528,12 @@ pub struct NetworkApiConfig {
     #[serde(rename = "public_port", skip_serializing_if = "Option::is_none")]
     pub public_port: Option<u16>,
 
+    /// Whether to ignore protocol version compatibility routine while initiating connections.
     #[serde(skip)]
-    pub ignore_protocol: bool,
+    pub ignore_protocol_version: bool,
+
+    /// Hard limit the bandwidth usage for upstream traffic.
+    pub bandwidth_limit: Option<usize>,
 }
 
 mod port_allocation;

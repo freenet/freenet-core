@@ -58,6 +58,7 @@ async fn base_test_config(
             ignore_protocol_checking: true,
             address: Some(Ipv4Addr::LOCALHOST.into()),
             network_port,
+            bandwidth_limit: None,
         },
         ..Default::default()
     };

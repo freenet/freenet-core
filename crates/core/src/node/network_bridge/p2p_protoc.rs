@@ -124,6 +124,7 @@ pub(in crate::node) struct P2pConnManager {
     /// and locations should be derived from IP addresses.
     this_location: Option<Location>,
     check_version: bool,
+    bandwidth_limit: Option<usize>,
 }
 
 impl P2pConnManager {
@@ -151,7 +152,8 @@ impl P2pConnManager {
             listening_port: listen_port,
             is_gateway: config.is_gateway,
             this_location: config.location,
-            check_version: !config.config.network_api.ignore_protocol,
+            check_version: !config.config.network_api.ignore_protocol_version,
+            bandwidth_limit: config.config.network_api.bandwidth_limit,
         })
     }
 
@@ -175,6 +177,7 @@ impl P2pConnManager {
             self.listening_ip,
             self.listening_port,
             self.is_gateway,
+            self.bandwidth_limit,
         )
         .await?;
 
