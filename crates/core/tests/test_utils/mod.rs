@@ -30,6 +30,34 @@ pub async fn make_put(
     Ok(())
 }
 
+pub async fn make_update(
+    client: &mut WebApi,
+    key: ContractKey,
+    state: WrappedState,
+) -> anyhow::Result<()> {
+    client
+        .send(ClientRequest::ContractOp(ContractRequest::Update {
+            key,
+            data: UpdateData::State(State::from(state)),
+        }))
+        .await?;
+    Ok(())
+}
+
+pub async fn make_get(
+    client: &mut WebApi,
+    key: ContractKey,
+    return_contract_code: bool,
+) -> anyhow::Result<()> {
+    client
+        .send(ClientRequest::ContractOp(ContractRequest::Get {
+            key,
+            return_contract_code,
+        }))
+        .await?;
+    Ok(())
+}
+
 pub fn load_contract(name: &str, params: Parameters<'static>) -> anyhow::Result<ContractContainer> {
     let contract_bytes = WrappedContract::new(
         Arc::new(ContractCode::from(compile_contract(name)?)),
@@ -220,6 +248,15 @@ impl std::fmt::Display for PackageType {
         }
     }
 }
+
+pub async fn verify_contract_exists(dir: &Path, key: ContractKey) -> anyhow::Result<bool> {
+    let code_hash = key.encoded_code_hash().unwrap_or_else(|| {
+        panic!("Contract key does not have a code hash");
+    });
+    let contract_path = dir.join("contracts").join(code_hash);
+    Ok(tokio::fs::metadata(contract_path).await.is_ok())
+}
+
 #[test]
 fn test_compile_contract() -> TestResult {
     let contract = compile_contract("test-contract-integration")?;
