@@ -10,18 +10,10 @@ use std::ops::Add;
 pub struct Location(pub(crate) f64);
 
 impl Location {
-    #[cfg(all(not(feature = "local-simulation"), not(test)))]
     pub fn from_address(addr: &std::net::SocketAddr) -> Self {
         Self::deterministic_loc(addr)
     }
 
-    #[cfg(any(feature = "local-simulation", test))]
-    pub fn from_address(_addr: &std::net::SocketAddr) -> Self {
-        let random_component: f64 = rand::random();
-        Location(random_component)
-    }
-
-    #[allow(unused)]
     fn deterministic_loc(addr: &std::net::SocketAddr) -> Self {
         match addr.ip() {
             std::net::IpAddr::V4(ipv4) => {

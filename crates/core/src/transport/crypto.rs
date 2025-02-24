@@ -1,11 +1,30 @@
+use std::path::Path;
+
 use rand::rngs::OsRng;
-use rsa::{pkcs8, Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
+use rsa::{pkcs8, rand_core::CryptoRngCore, Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TransportKeypair {
     pub(super) public: TransportPublicKey,
     pub(super) secret: TransportSecretKey,
+}
+
+impl TransportKeypair {
+    pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        use pkcs8::EncodePrivateKey;
+        use std::fs::File;
+        use std::io::Write;
+
+        let mut file = File::create(path)?;
+        let key = self
+            .secret
+            .0
+            .to_pkcs8_pem(pkcs8::LineEnding::default())
+            .unwrap();
+        file.write_all(key.as_bytes())?;
+        Ok(())
+    }
 }
 
 impl Default for TransportKeypair {
@@ -17,9 +36,16 @@ impl Default for TransportKeypair {
 impl TransportKeypair {
     pub fn new() -> Self {
         let mut rng = OsRng;
-        // Key size, can be adjusted
+        Self::new_inner(&mut rng)
+    }
+
+    pub fn new_with_rng(rng: &mut impl CryptoRngCore) -> Self {
+        Self::new_inner(rng)
+    }
+
+    fn new_inner(rng: &mut impl CryptoRngCore) -> Self {
         const BITS: usize = 2048;
-        let priv_key = RsaPrivateKey::new(&mut rng, BITS).expect("failed to generate a key");
+        let priv_key = RsaPrivateKey::new(rng, BITS).expect("failed to generate a key");
         let public = TransportPublicKey(RsaPublicKey::from(&priv_key));
         TransportKeypair {
             public,
@@ -54,6 +80,21 @@ impl TransportPublicKey {
         self.0
             .encrypt(&mut rng, padding, data)
             .expect("failed to encrypt")
+    }
+
+    /// Save the public key to a file in PEM format.
+    pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        use pkcs8::EncodePublicKey;
+        use std::fs::File;
+        use std::io::Write;
+
+        let mut file = File::create(path)?;
+        let key = self
+            .0
+            .to_public_key_pem(pkcs8::LineEnding::default())
+            .unwrap();
+        file.write_all(key.as_bytes())?;
+        Ok(())
     }
 }
 
@@ -97,15 +138,8 @@ impl TransportSecretKey {
     #[cfg(test)]
     pub fn to_pkcs8_pem(&self) -> Result<Vec<u8>, pkcs8::Error> {
         use pkcs8::EncodePrivateKey;
-
-        #[cfg(unix)]
-        let line_endings = pkcs8::LineEnding::LF;
-
-        #[cfg(windows)]
-        let line_endings = pkcs8::LineEnding::CRLF;
-
         self.0
-            .to_pkcs8_pem(line_endings)
+            .to_pkcs8_pem(pkcs8::LineEnding::default())
             .map(|s| s.as_str().as_bytes().to_vec())
     }
 }

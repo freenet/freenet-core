@@ -135,11 +135,11 @@ impl ContractExecutor for Executor<Runtime> {
             .map_err(|e| ExecutorError::execution(e, None))?
         {
             ValidateResult::Valid => {
-                if updated_state.as_ref() == current_state.as_ref() {
-                    Ok(UpsertResult::NoChange)
-                } else {
-                    Ok(UpsertResult::Updated(updated_state))
-                }
+                // if updated_state.as_ref() == current_state.as_ref() {
+                //     Ok(UpsertResult::NoChange)
+                // } else {
+                // }
+                Ok(UpsertResult::Updated(updated_state))
             }
             ValidateResult::Invalid => Err(ExecutorError::request(
                 freenet_stdlib::client_api::ContractError::Update {
@@ -198,7 +198,10 @@ impl Executor<Runtime> {
         Executor::new(
             state_store,
             move || {
-                crate::util::set_cleanup_on_exit(config.paths().clone())?;
+                let _ =
+                    crate::util::set_cleanup_on_exit(config.paths().clone()).inspect_err(|error| {
+                        tracing::error!("Failed to set cleanup on exit: {error}");
+                    });
                 Ok(())
             },
             OperationMode::Local,
@@ -557,10 +560,10 @@ impl Executor<Runtime> {
         };
         let new_state = WrappedState::new(new_state.into_bytes());
 
-        if new_state.as_ref() == current_state.as_ref() {
-            tracing::debug!("No changes in state for contract {key}, avoiding update");
-            return Ok(Either::Left(current_state.clone()));
-        }
+        // if new_state.as_ref() == current_state.as_ref() {
+        //     tracing::debug!("No changes in state for contract {key}, avoiding update");
+        //     return Ok(Either::Left(current_state.clone()));
+        // }
 
         self.state_store
             .update(key, new_state.clone())

@@ -9,7 +9,10 @@ use super::{
     },
     NetEventRegister, PeerId,
 };
-use crate::{client_events::client_event_handling, ring::ConnectionManager};
+use crate::{
+    client_events::client_event_handling,
+    ring::{ConnectionManager, Location},
+};
 use crate::{
     client_events::{combinator::ClientEventsCombinator, BoxedClient},
     config::GlobalExecutor,
@@ -29,6 +32,8 @@ pub(crate) struct NodeP2P {
     pub(super) conn_manager: P2pConnManager,
     pub(super) peer_id: Option<PeerId>,
     pub(super) is_gateway: bool,
+    /// used for testing with deterministic location
+    pub(super) location: Option<Location>,
     notification_channel: EventLoopNotificationsReceiver,
     client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
     executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
@@ -138,6 +143,7 @@ impl NodeP2P {
             should_try_connect: config.should_connect,
             peer_id: config.peer_id,
             is_gateway: config.is_gateway,
+            location: config.location,
             client_events_task,
             contract_executor_task,
         })
