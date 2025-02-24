@@ -146,7 +146,7 @@ impl Operation for PutOp {
                     let sender = op_manager.ring.connection_manager.own_location();
 
                     let key = contract.key();
-                    tracing::debug!(
+                    tracing::info!(
                         "Requesting put for contract {} from {} to {}",
                         key,
                         sender.peer,

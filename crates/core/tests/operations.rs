@@ -68,7 +68,7 @@ async fn base_node_test_config(
             ignore_protocol_checking: true,
             address: Some(Ipv4Addr::LOCALHOST.into()),
             network_port: public_port,
-            bandwidth_limit: Some(DEFAULT_RATE_LIMIT),
+            bandwidth_limit: None,
         },
         config_paths: {
             let mut args = freenet::config::ConfigPathsArgs::default();
@@ -93,7 +93,37 @@ fn gw_config(port: u16, path: &Path) -> anyhow::Result<InlineGwConfig> {
     })
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_contract(
+    client: &mut WebApi,
+    key: ContractKey,
+    temp_dir: &tempfile::TempDir,
+) -> anyhow::Result<(ContractContainer, WrappedState)> {
+    make_get(client, key, true).await?;
+    loop {
+        let resp = tokio::time::timeout(Duration::from_secs(30), client.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key,
+                contract: Some(contract),
+                state,
+            }))) => {
+                verify_contract_exists(temp_dir.path(), key).await?;
+                return Ok((contract, state));
+            }
+            Ok(Ok(other)) => {
+                tracing::warn!("unexpected response while waiting for get: {:?}", other);
+            }
+            Ok(Err(e)) => {
+                bail!("Error receiving get response: {}", e);
+            }
+            Err(_) => {
+                bail!("Timeout waiting for get response");
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_put_contract() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::INFO), None);
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -116,6 +146,7 @@ async fn test_put_contract() -> TestResult {
         let path = preset.temp_dir.path().to_path_buf();
         (cfg, preset, gw_config(public_port, &path)?)
     };
+    let ws_api_port_peer_b = config_b.ws_api.ws_api_port.unwrap();
 
     let (config_a, preset_cfg_a) = base_node_test_config(
         false,
@@ -124,11 +155,11 @@ async fn test_put_contract() -> TestResult {
         ws_api_port_socket_a.local_addr()?.port(),
     )
     .await?;
+    let ws_api_port_peer_a = config_a.ws_api.ws_api_port.unwrap();
 
     println!("Node A data dir: {:?}", preset_cfg_b.temp_dir.path());
     println!("Node B data dir: {:?}", preset_cfg_a.temp_dir.path());
 
-    let ws_api_port = config_a.ws_api.ws_api_port.unwrap();
     std::mem::drop(ws_api_port_socket_a); // Free the port so it does not fail on initialization
     let node_a = async move {
         let config = config_a.build().await?;
@@ -159,18 +190,18 @@ async fn test_put_contract() -> TestResult {
         // Connect to node A's websocket API
         let uri = format!(
             "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port
+            ws_api_port_peer_a
         );
         let (stream, _) = connect_async(&uri).await?;
-        let mut client = WebApi::start(stream);
+        let mut client_api_a = WebApi::start(stream);
 
         // Create a test contract and state
         let state = WrappedState::new(vec![]);
-        make_put(&mut client, state.clone(), contract.clone()).await?;
+        make_put(&mut client_api_a, state.clone(), contract.clone()).await?;
 
         // Wait for put response
         loop {
-            let resp = tokio::time::timeout(Duration::from_secs(30), client.recv()).await;
+            let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                     assert_eq!(key, contract_key);
@@ -188,37 +219,41 @@ async fn test_put_contract() -> TestResult {
             }
         }
 
-        // Send get request
-        make_get(&mut client, contract_key, true).await?;
+        {
+            // Send get request for node A
+            make_get(&mut client_api_a, contract_key, true).await?;
 
-        // Wait for get response
-        let (response_key, response_contract, response_state) = loop {
-            let resp = tokio::time::timeout(Duration::from_secs(30), client.recv()).await;
-            match resp {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                    key,
-                    contract: Some(contract),
-                    state,
-                }))) => {
-                    verify_contract_exists(preset_cfg_a.temp_dir.path(), contract_key).await?;
-                    break (key, contract, state);
-                }
-                Ok(Ok(other)) => {
-                    tracing::warn!("unexpected response while waiting for get: {:?}", other);
-                }
-                Ok(Err(e)) => {
-                    bail!("Error receiving get response: {}", e);
-                }
-                Err(_) => {
-                    bail!("Timeout waiting for get response");
-                }
-            }
-        };
+            // Wait for get response
+            let (response_contract, response_state) =
+                get_contract(&mut client_api_a, contract_key, &preset_cfg_b.temp_dir).await?;
+            let response_key = response_contract.key();
 
-        // Verify the responses
-        assert_eq!(response_key, contract_key);
-        assert_eq!(response_contract, contract);
-        assert_eq!(response_state, state);
+            // Verify the responses
+            assert_eq!(response_key, contract_key);
+            assert_eq!(response_contract, contract);
+            assert_eq!(response_state, state);
+        }
+
+        {
+            // Connect to node B's websocket API
+            let uri = format!(
+                "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+                ws_api_port_peer_b
+            );
+            let (stream, _) = connect_async(&uri).await?;
+            let mut client_api_b = WebApi::start(stream);
+            make_get(&mut client_api_b, contract_key, true).await?;
+
+            // Wait for get response
+            let (response_contract, response_state) =
+                get_contract(&mut client_api_a, contract_key, &preset_cfg_b.temp_dir).await?;
+            let response_key = response_contract.key();
+
+            // Verify the responses
+            assert_eq!(response_key, contract_key);
+            assert_eq!(response_contract, contract);
+            assert_eq!(response_state, state);
+        }
 
         Ok::<_, anyhow::Error>(())
     });
