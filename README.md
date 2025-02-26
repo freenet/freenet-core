@@ -16,7 +16,7 @@
   </a>
 </div>
 
-This is the freenet-core repository. To learn more about Freenet please visit our website at [freenet.org](https://freenet.org/)).
+This is the freenet-core repository. To learn more about Freenet please visit our website at [freenet.org](https://freenet.org/).
 
 # Decentralize Everything
 
