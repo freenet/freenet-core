@@ -1,14 +1,14 @@
 <div align="center">
   <!-- Github Actions -->
   <a href="https://github.com/freenet/freenet-core/actions/workflows/ci.yml">
-    <img src="https://img.shields.io/github/actions/workflow/status/freenet/locutus/ci.yml?branch=main&label=tests&style=flat-square" alt="continuous integration status" />
+    <img src="https://img.shields.io/github/actions/workflow/status/freenet/freenet-core/ci.yml?branch=main&label=tests&style=flat-square" alt="continuous integration status" />
   </a>
   <a href="https://crates.io/crates/freenet">
     <img src="https://img.shields.io/crates/v/freenet.svg?style=flat-square"
     alt="Crates.io version" />
   </a>
-  <a href="https://matrix.to/#/#freenet-locutus:matrix.org">
-    <img src="https://img.shields.io/matrix/freenet-locutus:matrix.org?label=matrix&logo=matrix&style=flat-square" alt="matrix" />
+  <a href="https://matrix.to/#/#freenet:matrix.org">
+    <img src="https://img.shields.io/matrix/freenet:matrix.org?label=matrix&logo=matrix&style=flat-square" alt="matrix" />
   </a>
   <a href="https://docs.rs/freenet">
     <img src="https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square&label=api%20docs"
@@ -86,7 +86,7 @@ Follow](https://img.shields.io/twitter/follow/freenetorg?color=%2300EE00&logo=tw
 
 ## Chat with us
 
-We're in [#freenet](https://matrix.to/#/#freenet-locutus:matrix.org) on
+We're in [#freenet](https://matrix.to/#/#freenet:matrix.org) on
 [Matrix](https://matrix.org/). If you have questions you can also [ask
 here](https://github.com/freenet/freenet-core/discussions).
 
@@ -112,6 +112,20 @@ development.
 If you are in a position to fund our continued efforts please contact us on
 [twitter](https://twitter.com/FreenetOrg) or by email at _ian at freenet dot
 org_.
+
+## Build Instructions
+
+To install the Freenet core:
+
+```
+$ cargo install --path crates/core
+```
+
+Or for the fdev utility:
+
+```
+$ cargo install --path crates/fdev
+```
 
 ## Build Instructions
 
