@@ -72,11 +72,6 @@ basis for a blog or Twitter feed.
 Freenet is implemented in Rust and will be available across all major operating
 systems, desktop and mobile.
 
-## What is Locutus?
-
-Locutus was the working title used for this successor to the original Freenet,
-in March 2023 it was renamed to "Freenet", this repository was
-renamed from `locutus` to `freenet-core` in September 2023.
 
 ## What is Hyphanet?
 
@@ -91,7 +86,7 @@ Follow](https://img.shields.io/twitter/follow/freenetorg?color=%2300EE00&logo=tw
 
 ## Chat with us
 
-We're in [#freenet-locutus](https://matrix.to/#/#freenet-locutus:matrix.org) on
+We're in [#freenet](https://matrix.to/#/#freenet-locutus:matrix.org) on
 [Matrix](https://matrix.org/). If you have questions you can also [ask
 here](https://github.com/freenet/freenet-core/discussions).
 
@@ -117,6 +112,20 @@ development.
 If you are in a position to fund our continued efforts please contact us on
 [twitter](https://twitter.com/FreenetOrg) or by email at _ian at freenet dot
 org_.
+
+## Build Instructions
+
+To install the Freenet core:
+
+```
+$ cargo install --path crates/core
+```
+
+Or for the fdev utility:
+
+```
+$ cargo install --path crates/fdev
+```
 
 ## License
 
