@@ -16,128 +16,32 @@
   </a>
 </div>
 
-# Freenet
+This is the freenet-core repository. To learn more about Freenet please visit our website at [freenet.org](https://freenet.org/)).
 
-The Internet has grown increasingly centralized over the past two decades, such
-that a handful of companies now effectively control the Internet infrastructure.
-The public square is privately owned, threatening freedom of speech and
-democracy.
+# Decentralize Everything
 
-Freenet is a software platform that makes it easy to create decentralized
-alternatives to today's centralized tech companies. These decentralized apps
-will be easy to use, scalable, and secured through cryptography.
+Freenet is the internet as it should be—fully decentralized, designed to put you back in control. Imagine a global shared 
+computer where you can communicate and collaborate freely, without reliance on big tech. Freenet lets you regain your 
+digital independence.
 
-To learn more about Freenet as a developer read [The User
-Manual](https://docs.freenet.org/). For an introduction to Freenet watch **Ian's
-talk and Q&A** - [YouTube](https://youtu.be/d31jmv5Tx5k).
+Freenet is a peer-to-peer network that transforms users’ computers into a resilient, distributed platform on which anyone 
+can build decentralized services. Every peer contributes to a fault-tolerant collective, ensuring services are always 
+available and robust.
 
-## Status
-
-Freenet is currently under development. Using our [development
-guide](https://docs.freenet.org/tutorial.html), developers can experiment with
-building decentralized applications using our SDK and testing them locally.
-
-## Applications
-
-Examples of what can be built on Freenet include:
-
-- Decentralized email (with a gateway to legacy email via the @freenet.org
-  domain)
-- Decentralized microblogging (think Twitter or Facebook)
-- Instant Messaging (Whatsapp, Signal)
-- Online Store (Amazon)
-- Discussion (Reddit, HN)
-- Video discovery (Youtube, TikTok)
-- Search (Google, Bing)
-
-All will be completely decentralized, scalable, and cryptographically secure. We
-want Freenet to be useful out-of-the-box, so we plan to provide reference
-implementations for some or all of these.
-
-## How does it work?
-
-Freenet is a decentralized key-value database. It uses the same [small
-world](https://freenetproject.org/assets/papers/lic.pdf) routing algorithm as
-the original Freenet design, but each key is a cryptographic contract
-implemented in [Web Assembly](https://webassembly.org/), and the value
-associated with each contract is called its _state_. The role of the
-cryptographic contract is to specify what state is allowed for this contract,
-and how the state is modified.
-
-A very simple contract might require that the state is a list of messages, each
-signed with a specific cryptographic keypair. The state can be updated to add
-new messages if appropriately signed. Something like this could serve as the
-basis for a blog or Twitter feed.
-
-Freenet is implemented in Rust and will be available across all major operating
-systems, desktop and mobile.
-
-
-## What is Hyphanet?
-
-The original Freenet codebase is now called Hyphanet. It is still actively
-developed by the same maintainers as before, and is available
-[here](https://www.hyphanet.org).
-
-## Stay up to date
-
-[![Twitter
-Follow](https://img.shields.io/twitter/follow/freenetorg?color=%2300EE00&logo=twitter&style=plastic)](https://twitter.com/FreenetOrg)
-
-## Chat with us
-
-We're in [#freenet](https://matrix.to/#/#freenet:matrix.org) on
-[Matrix](https://matrix.org/). If you have questions you can also [ask
-here](https://github.com/freenet/freenet-core/discussions).
-
-Many developers are active in [r/freenet](https://www.reddit.com/r/Freenet/),
-but remember that Reddit engages in political and ideological censorship so
-don't make this your only point of contact with us.
-
-## Acknowledgements and Funding
-
-### Protocol Labs
-
-In addition to creating the excellent
-[libp2p](https://github.com/libp2p/rust-libp2p) which we use for low-level
-transport, Protocol Labs has generously supported our work with a grant.
-
-### FUTO
-
-FUTO has generously awarded Freenet two Legendary Grants to support Freenet
-development.
-
-### Supporting Freenet
-
-If you are in a position to fund our continued efforts please contact us on
-[twitter](https://twitter.com/FreenetOrg) or by email at _ian at freenet dot
-org_.
+Today’s web is a series of siloed services, but every system built on Freenet is fully interoperable by default. Freenet 
+apps can be built with popular web frameworks, accessed through any browser just like the web.
 
 ## Build Instructions
 
 To install the Freenet core:
 
-```
+```bash
 $ cargo install --path crates/core
 ```
 
 Or for the fdev utility:
 
-```
-$ cargo install --path crates/fdev
-```
-
-## Build Instructions
-
-To install the Freenet core:
-
-```
-$ cargo install --path crates/core
-```
-
-Or for the fdev utility:
-
-```
+```bash
 $ cargo install --path crates/fdev
 ```
 
