@@ -220,10 +220,8 @@ async fn test_put_contract() -> TestResult {
         }
 
         {
-            // Send get request for node A
-            make_get(&mut client_api_a, contract_key, true).await?;
-
-            // Wait for get response
+            // Wait for get response from node A
+            tracing::info!("getting contract from A");
             let (response_contract, response_state) =
                 get_contract(&mut client_api_a, contract_key, &preset_cfg_b.temp_dir).await?;
             let response_key = response_contract.key();
@@ -242,11 +240,10 @@ async fn test_put_contract() -> TestResult {
             );
             let (stream, _) = connect_async(&uri).await?;
             let mut client_api_b = WebApi::start(stream);
-            make_get(&mut client_api_b, contract_key, true).await?;
 
-            // Wait for get response
+            // Wait for get response from node B
             let (response_contract, response_state) =
-                get_contract(&mut client_api_a, contract_key, &preset_cfg_b.temp_dir).await?;
+                get_contract(&mut client_api_b, contract_key, &preset_cfg_b.temp_dir).await?;
             let response_key = response_contract.key();
 
             // Verify the responses
