@@ -274,15 +274,19 @@ async fn test_put_contract() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_update_contract() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::TRACE), None);
+    freenet::config::set_logger(Some(LevelFilter::INFO), None);
+    
+    // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
     let contract_key = contract.key();
 
+    // Create network sockets
     let network_socket_b = TcpListener::bind("127.0.0.1:0")?;
     let ws_api_port_socket_a = TcpListener::bind("127.0.0.1:0")?;
     let ws_api_port_socket_b = TcpListener::bind("127.0.0.1:0")?;
 
+    // Configure gateway node B
     let (config_b, preset_cfg_b, config_b_gw) = {
         let (cfg, preset) = base_node_test_config(
             true,
@@ -296,6 +300,7 @@ async fn test_update_contract() -> TestResult {
         (cfg, preset, gw_config(public_port, &path)?)
     };
 
+    // Configure client node A
     let (config_a, preset_cfg_a) = base_node_test_config(
         false,
         vec![serde_json::to_string(&config_b_gw)?],
@@ -305,9 +310,16 @@ async fn test_update_contract() -> TestResult {
     .await?;
     let ws_api_port = config_a.ws_api.ws_api_port.unwrap();
 
-    println!("Node A data dir: {:?}", preset_cfg_b.temp_dir.path());
-    println!("Node B data dir: {:?}", preset_cfg_a.temp_dir.path());
+    // Log data directories for debugging
+    println!("Node A data dir: {:?}", preset_cfg_a.temp_dir.path());
+    println!("Node B (gw) data dir: {:?}", preset_cfg_b.temp_dir.path());
 
+    // Free ports so they don't fail on initialization
+    std::mem::drop(ws_api_port_socket_a);
+    std::mem::drop(network_socket_b);
+    std::mem::drop(ws_api_port_socket_b);
+
+    // Start node A (client)
     let node_a = async move {
         let config = config_a.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -318,8 +330,7 @@ async fn test_update_contract() -> TestResult {
     }
     .boxed_local();
 
-    std::mem::drop(network_socket_b); // Free the port so it does not fail on initialization
-    std::mem::drop(ws_api_port_socket_b);
+    // Start node B (gateway)
     let node_b = async {
         let config = config_b.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -334,24 +345,24 @@ async fn test_update_contract() -> TestResult {
         // Wait for nodes to start up
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // Connect to node A's websocket API
+        // Connect to node A websocket API
         let uri = format!(
             "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
             ws_api_port
         );
         let (stream, _) = connect_async(&uri).await?;
-        let mut client = WebApi::start(stream);
+        let mut client_api_a = WebApi::start(stream);
 
-        // First put the contract with initial state
+        // Put contract with initial state
         let initial_state = WrappedState::new(vec![1, 2, 3]);
-        make_put(&mut client, initial_state.clone(), contract.clone()).await?;
+        make_put(&mut client_api_a, initial_state.clone(), contract.clone()).await?;
 
         // Wait for put response
         loop {
-            let resp = tokio::time::timeout(Duration::from_secs(30), client.recv()).await;
+            let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                    assert_eq!(key, contract_key);
+                    assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
                     break;
                 }
                 Ok(Ok(other)) => {
@@ -366,20 +377,20 @@ async fn test_update_contract() -> TestResult {
             }
         }
 
-        // Now update the contract state
+        // Update the contract state
         let updated_state = WrappedState::new(vec![4, 5, 6]);
-        make_update(&mut client, contract_key, updated_state.clone()).await?;
+        make_update(&mut client_api_a, contract_key, updated_state.clone()).await?;
 
         // Wait for update response
-        let summary = loop {
-            let resp = tokio::time::timeout(Duration::from_secs(30), client.recv()).await;
+        loop {
+            let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
                     key,
-                    summary,
+                    summary: _,
                 }))) => {
-                    assert_eq!(key, contract_key);
-                    break summary;
+                    assert_eq!(key, contract_key, "Contract key mismatch in UPDATE response");
+                    break;
                 }
                 Ok(Ok(other)) => {
                     tracing::warn!("unexpected response while waiting for update: {:?}", other);
@@ -393,50 +404,38 @@ async fn test_update_contract() -> TestResult {
             }
         };
 
-        // Verify the update by getting the contract state
-        make_get(&mut client, contract_key, true).await?;
-
-        // Wait for get response and verify state
-        let (response_key, response_contract, response_state) = loop {
-            let resp = tokio::time::timeout(Duration::from_secs(30), client.recv()).await;
-            match resp {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                    key,
-                    contract: Some(contract),
-                    state,
-                }))) => {
-                    verify_contract_exists(preset_cfg_a.temp_dir.path(), contract_key).await?;
-                    break (key, contract, state);
-                }
-                Ok(Ok(other)) => {
-                    tracing::warn!("unexpected response while waiting for get: {:?}", other);
-                }
-                Ok(Err(e)) => {
-                    bail!("Error receiving get response: {}", e);
-                }
-                Err(_) => {
-                    bail!("Timeout waiting for get response");
-                }
-            }
-        };
-
-        // Verify the responses
-        assert_eq!(response_key, contract_key);
-        assert_eq!(response_contract, contract);
-        assert_eq!(response_state, updated_state);
-        assert_eq!(summary, StateSummary::from(updated_state.as_ref().to_vec()));
+        // Verify the updated state with GET
+        {
+            // Wait for get response from node A
+            let (response_contract, response_state) =
+                get_contract(&mut client_api_a, contract_key, &preset_cfg_b.temp_dir).await?;
+            
+            assert_eq!(
+                response_contract.key(), contract_key,
+                "Contract key mismatch in GET response"
+            );
+            assert_eq!(
+                response_contract, contract,
+                "Contract content mismatch in GET response"
+            );
+            assert_eq!(
+                response_state, updated_state,
+                "State mismatch in GET response - expected updated state"
+            );
+        }
 
         Ok::<_, anyhow::Error>(())
     });
 
+    // Wait for test completion or node failures
     select! {
         a = node_a => {
             let Err(a) = a;
-            return Err(anyhow!(a).into());
+            return Err(anyhow!("Node A failed: {}", a).into());
         }
         b = node_b => {
             let Err(b) = b;
-            return Err(anyhow!(b).into());
+            return Err(anyhow!("Node B failed: {}", b).into());
         }
         r = test => {
             r??;

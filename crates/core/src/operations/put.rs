@@ -15,7 +15,7 @@ use freenet_stdlib::{
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::{
     client_events::HostResult,
-    contract::ContractHandlerEvent,
+    contract::{ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, NetMessage, NetMessageV1, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
@@ -400,18 +400,41 @@ impl Operation for PutOp {
                 }
                 PutMsg::SuccessfulPut { id, .. } => {
                     match self.state {
-                        Some(PutState::AwaitingResponse { key, upstream }) => {
+                        Some(PutState::AwaitingResponse { key, upstream, contract, state }) => {
+                            tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching after successful put");
+                            // Always seed the contract locally after a successful put
+                            op_manager.ring.seed_contract(key);
+
+                            tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Storing contract locally");
+                            let contract_stored = match op_manager
+                                .notify_contract_handler(ContractHandlerEvent::PutQuery {
+                                    key,
+                                    state,
+                                    related_contracts: RelatedContracts::default(),
+                                    contract: Some(contract.clone()),
+                                })
+                                .await
+                            {
+                                Ok(_) => true,
+                                Err(err) => {
+                                    tracing::error!(tx = %id, %key, error = %err, "Failed to store contract locally");
+                                    false
+                                }
+                            };
+
                             let is_subscribed_contract = op_manager.ring.is_seeding_contract(&key);
-                            if !is_subscribed_contract && op_manager.ring.should_seed(&key) {
-                                tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
+                            if !is_subscribed_contract {
+                                tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Peer not subscribed to contract, starting subscription request");
+                                // This will make the node subscribe to the contract without doing a get since we're already seeding it locally
                                 super::start_subscription_request(
                                     op_manager,
                                     key,
-                                    true,
+                                    !contract_stored,
                                     HashSet::new(),
                                 )
                                 .await;
                             }
+                            
                             tracing::info!(
                                 tx = %id,
                                 %key,
@@ -627,6 +650,8 @@ async fn try_to_broadcast(
                 new_state = Some(PutState::AwaitingResponse {
                     key,
                     upstream: Some(upstream),
+                    contract: contract.clone(), // No longer optional
+                    state: new_value.clone(),
                 });
                 return_msg = None;
             } else if !broadcast_to.is_empty() {
@@ -707,6 +732,8 @@ pub enum PutState {
     AwaitingResponse {
         key: ContractKey,
         upstream: Option<PeerKeyLocation>,
+        contract: ContractContainer,
+        state: WrappedState,
     },
     /// Broadcasting changes to subscribers.
     BroadcastOngoing,
@@ -718,8 +745,8 @@ pub enum PutState {
 
 /// Request to insert/update a value into a contract.
 pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Result<(), OpError> {
-    let key = if let Some(PutState::PrepareRequest { contract, .. }) = &put_op.state {
-        contract.key()
+    let (key, contract) = if let Some(PutState::PrepareRequest { contract, .. }) = &put_op.state {
+        (contract.key(), contract.clone())
     } else {
         return Err(OpError::UnexpectedOpState);
     };
@@ -752,6 +779,8 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
             let new_state = Some(PutState::AwaitingResponse {
                 key,
                 upstream: None,
+                contract: contract.clone(),
+                state: value.clone(),
             });
             let msg = PutMsg::RequestPut {
                 id,

@@ -1,4 +1,8 @@
 use super::*;
+use super::{
+    ContractExecutor, ContractRequest, ContractResponse, ExecutorError, ExecutorHalve,
+    ExecutorToEventLoopChannel, RequestError, Response, StateStoreError,
+};
 
 impl ContractExecutor for Executor<Runtime> {
     async fn fetch_contract(
@@ -335,7 +339,7 @@ impl Executor<Runtime> {
                 self.register_contract_notifier(key, cli_id, updates, summary)?;
 
                 // by default a subscribe op has an implicit get
-                let _res = self.perform_contract_get(true, key).await?;
+                let _res = self.perform_contract_get(false, key).await?;
                 self.subscribe(key).await?;
                 Ok(ContractResponse::SubscribeResponse {
                     key,
