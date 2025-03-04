@@ -130,6 +130,9 @@ async fn test_put_contract() -> TestResult {
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
     let contract_key = contract.key();
 
+    let initial_state = test_utils::create_empty_todo_list();
+    let wrapped_state = WrappedState::from(initial_state);
+
     let network_socket_b = TcpListener::bind("127.0.0.1:0")?;
     let ws_api_port_socket_a = TcpListener::bind("127.0.0.1:0")?;
     let ws_api_port_socket_b = TcpListener::bind("127.0.0.1:0")?;
@@ -195,9 +198,7 @@ async fn test_put_contract() -> TestResult {
         let (stream, _) = connect_async(&uri).await?;
         let mut client_api_a = WebApi::start(stream);
 
-        // Create a test contract and state
-        let state = WrappedState::new(vec![]);
-        make_put(&mut client_api_a, state.clone(), contract.clone()).await?;
+        make_put(&mut client_api_a, wrapped_state.clone(), contract.clone()).await?;
 
         // Wait for put response
         loop {
@@ -229,7 +230,7 @@ async fn test_put_contract() -> TestResult {
             // Verify the responses
             assert_eq!(response_key, contract_key);
             assert_eq!(response_contract, contract);
-            assert_eq!(response_state, state);
+            assert_eq!(response_state, wrapped_state);
         }
 
         {
@@ -249,7 +250,7 @@ async fn test_put_contract() -> TestResult {
             // Verify the responses
             assert_eq!(response_key, contract_key);
             assert_eq!(response_contract, contract);
-            assert_eq!(response_state, state);
+            assert_eq!(response_state, wrapped_state);
         }
 
         Ok::<_, anyhow::Error>(())
@@ -275,11 +276,15 @@ async fn test_put_contract() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_update_contract() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::INFO), None);
-    
+
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
     let contract_key = contract.key();
+
+    // Create initial state with empty todo list
+    let initial_state = test_utils::create_empty_todo_list();
+    let wrapped_state = WrappedState::from(initial_state);
 
     // Create network sockets
     let network_socket_b = TcpListener::bind("127.0.0.1:0")?;
@@ -354,8 +359,7 @@ async fn test_update_contract() -> TestResult {
         let mut client_api_a = WebApi::start(stream);
 
         // Put contract with initial state
-        let initial_state = WrappedState::new(vec![1, 2, 3]);
-        make_put(&mut client_api_a, initial_state.clone(), contract.clone()).await?;
+        make_put(&mut client_api_a, wrapped_state.clone(), contract.clone()).await?;
 
         // Wait for put response
         loop {
@@ -377,8 +381,28 @@ async fn test_update_contract() -> TestResult {
             }
         }
 
-        // Update the contract state
-        let updated_state = WrappedState::new(vec![4, 5, 6]);
+        // Create a new to-do list by deserializing the current state, adding a task, and serializing it back
+        let mut todo_list: test_utils::TodoList = serde_json::from_slice(wrapped_state.as_ref())
+            .unwrap_or_else(|_| test_utils::TodoList {
+                tasks: Vec::new(),
+                version: 0,
+            });
+
+        // Add a task directly to the list
+        todo_list.tasks.push(test_utils::Task {
+            id: 1,
+            title: "Implement contract".to_string(),
+            description: "Create a smart contract for the todo list".to_string(),
+            completed: false,
+            priority: 3,
+        });
+
+        // Serialize the updated list back to bytes
+        let updated_bytes = serde_json::to_vec(&todo_list).unwrap();
+        let updated_state = WrappedState::from(updated_bytes);
+
+        let expected_version_after_update = todo_list.version + 1;
+
         make_update(&mut client_api_a, contract_key, updated_state.clone()).await?;
 
         // Wait for update response
@@ -389,7 +413,10 @@ async fn test_update_contract() -> TestResult {
                     key,
                     summary: _,
                 }))) => {
-                    assert_eq!(key, contract_key, "Contract key mismatch in UPDATE response");
+                    assert_eq!(
+                        key, contract_key,
+                        "Contract key mismatch in UPDATE response"
+                    );
                     break;
                 }
                 Ok(Ok(other)) => {
@@ -402,25 +429,62 @@ async fn test_update_contract() -> TestResult {
                     bail!("Timeout waiting for update response");
                 }
             }
-        };
+        }
 
         // Verify the updated state with GET
         {
             // Wait for get response from node A
             let (response_contract, response_state) =
                 get_contract(&mut client_api_a, contract_key, &preset_cfg_b.temp_dir).await?;
-            
+
             assert_eq!(
-                response_contract.key(), contract_key,
+                response_contract.key(),
+                contract_key,
                 "Contract key mismatch in GET response"
             );
             assert_eq!(
                 response_contract, contract,
                 "Contract content mismatch in GET response"
             );
+
+            // Compare the deserialized updated content
+            let response_todo_list: test_utils::TodoList =
+                serde_json::from_slice(response_state.as_ref())
+                    .expect("Failed to deserialize response state");
+
+            let expected_todo_list: test_utils::TodoList =
+                serde_json::from_slice(updated_state.as_ref())
+                    .expect("Failed to deserialize expected state");
+
             assert_eq!(
-                response_state, updated_state,
-                "State mismatch in GET response - expected updated state"
+                response_todo_list.version, expected_version_after_update,
+                "Version should match"
+            );
+
+            assert_eq!(
+                response_todo_list.tasks.len(),
+                expected_todo_list.tasks.len(),
+                "Number of tasks should match"
+            );
+
+            // Verify that the task exists and has the correct values
+            assert_eq!(response_todo_list.tasks.len(), 1, "Should have one task");
+            assert_eq!(response_todo_list.tasks[0].id, 1, "Task ID should be 1");
+            assert_eq!(
+                response_todo_list.tasks[0].title, "Implement contract",
+                "Task title should match"
+            );
+
+            tracing::info!(
+                "Successfully verified updated state for contract {}",
+                contract_key
+            );
+
+            // Print states for debugging
+            tracing::debug!(
+                "Response state: {:?}, Expected state: {:?}",
+                response_todo_list,
+                expected_todo_list
             );
         }
 

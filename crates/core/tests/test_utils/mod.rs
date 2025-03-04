@@ -11,6 +11,7 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, WebApi},
     prelude::*,
 };
+use serde::{Deserialize, Serialize};
 use testresult::TestResult;
 
 const TARGET_DIR_VAR: &str = "CARGO_TARGET_DIR";
@@ -262,4 +263,68 @@ fn test_compile_contract() -> TestResult {
     let contract = compile_contract("test-contract-integration")?;
     assert!(!contract.is_empty());
     Ok(())
+}
+
+// Test data structures for contract operations
+
+/// Data model representing a todo list for testing
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TodoList {
+    /// List of tasks
+    pub tasks: Vec<Task>,
+    /// State version for concurrency control
+    pub version: u64,
+}
+
+/// Data model representing a task for testing
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Task {
+    /// Unique task identifier
+    pub id: u64,
+    /// Task title
+    pub title: String,
+    /// Task description
+    pub description: String,
+    /// Completion status
+    pub completed: bool,
+    /// Priority (1-5, where 5 is highest)
+    pub priority: u8,
+}
+
+/// Operations that can be performed on tasks
+#[derive(Serialize, Deserialize, Debug)]
+pub enum TodoOperation {
+    /// Add a new task
+    AddTask(Task),
+    /// Update an existing task
+    UpdateTask(Task),
+    /// Remove a task by ID
+    RemoveTask(u64),
+    /// Mark a task as completed
+    CompleteTask(u64),
+}
+
+/// Creates an empty todo list for testing
+pub fn create_empty_todo_list() -> Vec<u8> {
+    let todo_list = TodoList {
+        tasks: Vec::new(),
+        version: 0,
+    };
+
+    serde_json::to_vec(&todo_list).unwrap_or_default()
+}
+
+/// Creates an operation to add a task for testing
+pub fn create_add_task_operation(id: u64, title: &str, description: &str, priority: u8) -> Vec<u8> {
+    let task = Task {
+        id,
+        title: title.to_string(),
+        description: description.to_string(),
+        completed: false,
+        priority,
+    };
+
+    let operation = TodoOperation::AddTask(task);
+
+    serde_json::to_vec(&operation).unwrap_or_default()
 }
