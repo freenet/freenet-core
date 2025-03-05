@@ -1052,7 +1052,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_serde_config_args() {
-        let args = ConfigArgs::default();
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            ..Default::default()
+        };
         let cfg = args.build().await.unwrap();
         let serialized = toml::to_string(&cfg).unwrap();
         let _: Config = toml::from_str(&serialized).unwrap();
