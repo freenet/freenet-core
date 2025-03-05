@@ -40,13 +40,13 @@ struct TodoListSummary {
 #[derive(Serialize, Deserialize, Debug)]
 enum TodoOperation {
     /// Add a new task
-    AddTask(Task),
+    Add(Task),
     /// Update an existing task
-    UpdateTask(Task),
+    Update(Task),
     /// Remove a task by ID
-    RemoveTask(u64),
+    Remove(u64),
     /// Mark a task as completed
-    CompleteTask(u64),
+    Complete(u64),
 }
 
 struct Contract;
@@ -102,14 +102,14 @@ impl ContractInterface for Contract {
 
                     // Apply the operation to the state
                     match operation {
-                        TodoOperation::AddTask(task) => {
+                        TodoOperation::Add(task) => {
                             // Verify that the ID doesn't already exist
                             if todo_list.tasks.iter().any(|t| t.id == task.id) {
                                 return Err(ContractError::InvalidUpdate);
                             }
                             todo_list.tasks.push(task);
                         }
-                        TodoOperation::UpdateTask(task) => {
+                        TodoOperation::Update(task) => {
                             // Find and update the task
                             if let Some(index) =
                                 todo_list.tasks.iter().position(|t| t.id == task.id)
@@ -119,7 +119,7 @@ impl ContractInterface for Contract {
                                 return Err(ContractError::InvalidUpdate);
                             }
                         }
-                        TodoOperation::RemoveTask(id) => {
+                        TodoOperation::Remove(id) => {
                             // Remove the task
                             if let Some(index) = todo_list.tasks.iter().position(|t| t.id == id) {
                                 todo_list.tasks.remove(index);
@@ -127,7 +127,7 @@ impl ContractInterface for Contract {
                                 return Err(ContractError::InvalidUpdate);
                             }
                         }
-                        TodoOperation::CompleteTask(id) => {
+                        TodoOperation::Complete(id) => {
                             // Mark as completed
                             if let Some(index) = todo_list.tasks.iter().position(|t| t.id == id) {
                                 todo_list.tasks[index].completed = true;
@@ -278,7 +278,7 @@ pub fn create_add_task_operation(id: u64, title: &str, description: &str, priori
         priority,
     };
 
-    let operation = TodoOperation::AddTask(task);
+    let operation = TodoOperation::Add(task);
 
     serde_json::to_vec(&operation).unwrap_or_default()
 }
@@ -308,7 +308,7 @@ mod tests {
 
     // Helper function to create an add task operation
     fn create_add_task_delta(task: Task) -> UpdateData<'static> {
-        let operation = TodoOperation::AddTask(task);
+        let operation = TodoOperation::Add(task);
         let bytes = serde_json::to_vec(&operation).unwrap();
         UpdateData::Delta(StateDelta::from(bytes))
     }
@@ -415,7 +415,7 @@ mod tests {
         let mut updated_task = create_test_task(1, "Updated Task");
         updated_task.completed = true;
 
-        let operation = TodoOperation::UpdateTask(updated_task);
+        let operation = TodoOperation::Update(updated_task);
         let bytes = serde_json::to_vec(&operation).unwrap();
         let update_data = UpdateData::Delta(StateDelta::from(bytes));
 
