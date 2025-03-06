@@ -3,10 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore: ["docs/**", "README.md"]
   pull_request:
     branches: [main]
-    paths-ignore: ["docs/**", "README.md"]
 
 jobs:
   test_all:
