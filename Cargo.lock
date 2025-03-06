@@ -1477,7 +1477,7 @@ dependencies = [
  "tar",
  "thiserror 2.0.11",
  "tokio",
- "tokio-tungstenite 0.24.0",
+ "tokio-tungstenite 0.26.1",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -1565,7 +1565,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.1.0-rc2"
+version = "0.1.0-rc3"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1622,6 +1622,7 @@ dependencies = [
  "tar",
  "tempfile",
  "test-log",
+ "testresult",
  "thiserror 2.0.11",
  "time",
  "tokio",
@@ -1661,7 +1662,7 @@ dependencies = [
  "futures",
  "serde_json",
  "tokio",
- "tokio-tungstenite 0.24.0",
+ "tokio-tungstenite 0.26.1",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1711,7 +1712,7 @@ dependencies = [
  "serde_with",
  "thiserror 1.0.69",
  "tokio",
- "tokio-tungstenite 0.24.0",
+ "tokio-tungstenite 0.26.1",
  "tracing",
  "tracing-subscriber",
  "wasm-bindgen",
@@ -4958,6 +4959,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-contract-integration"
+version = "0.1.0"
+dependencies = [
+ "freenet-stdlib",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "test-log"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4978,6 +4988,12 @@ dependencies = [
  "quote",
  "syn 2.0.96",
 ]
+
+[[package]]
+name = "testresult"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "614b328ff036a4ef882c61570f72918f7e9c5bee1da33f8e7f91e01daee7e56c"
 
 [[package]]
 name = "thiserror"

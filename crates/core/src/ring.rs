@@ -126,7 +126,7 @@ impl Ring {
         };
 
         if let Some(loc) = config.location {
-            if config.peer_id.is_none() {
+            if config.peer_id.is_none() && is_gateway {
                 return Err(anyhow::anyhow!("PeerId is required for gateways"));
             }
             ring.connection_manager.update_location(Some(loc));

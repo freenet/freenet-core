@@ -4,7 +4,8 @@ members = [
 	"crates/*",
 	"apps/freenet-ping/app",
 	"apps/freenet-ping/types",
-	"apps/freenet-ping/contracts/ping"
+	"apps/freenet-ping/contracts/ping",
+	"tests/test-contract-integration"
 ]
 
 [workspace.dependencies]

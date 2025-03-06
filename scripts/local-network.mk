@@ -101,6 +101,7 @@ start-gateways: generate-gw-config
 		if [ -f "$(LOGS_DIR)/gw$$i.log" ]; then : > "$(LOGS_DIR)/gw$$i.log"; fi; \
 		($(ENV_VARS) freenet network \
 			--skip-load-from-network \
+			--config-dir $(BASE_DIR) \
 			--is-gateway \
 			--ws-api-port $$ws_port \
 			--public-network-address 127.0.0.1 \

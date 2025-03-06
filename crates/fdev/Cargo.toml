@@ -29,7 +29,7 @@ semver = { workspace = true }
 tar = "0.4"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signal", "parking_lot", "process"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.26.1"
 toml = { version = "0.8", features = ["default", "preserve_order"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
@@ -38,8 +38,8 @@ reqwest = { version = "0.12", features = ["json"] }
 http = "1.2"
 
 # internal
-freenet = { path = "../core", features = ["local-simulation"]}
-# freenet = { version = "0.1.0-rc1", features = ["local-simulation"]}
+freenet = { path = "../core"}
+# freenet = { version = "0.1.0-rc1"}
 freenet-stdlib = { workspace = true }
 
 [features]

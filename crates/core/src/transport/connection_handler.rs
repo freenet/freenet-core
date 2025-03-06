@@ -40,7 +40,6 @@ const INTERVAL_INCREASE_FACTOR: u64 = 2;
 const MAX_INTERVAL: Duration = Duration::from_millis(5000); // Maximum interval limit
 
 const DEFAULT_BW_TRACKER_WINDOW_SIZE: Duration = Duration::from_secs(10);
-const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
 
 pub type SerializedMessage = Vec<u8>;
 
@@ -64,6 +63,7 @@ pub(crate) async fn create_connection_handler<S: Socket>(
     listen_host: IpAddr,
     listen_port: u16,
     is_gateway: bool,
+    bandwith_limit: Option<usize>,
 ) -> Result<(OutboundConnectionHandler, InboundConnectionHandler), TransportError> {
     // Bind the UDP socket to the specified port
     let socket = S::bind((listen_host, listen_port).into()).await?;
@@ -72,6 +72,7 @@ pub(crate) async fn create_connection_handler<S: Socket>(
         keypair,
         is_gateway,
         (listen_host, listen_port).into(),
+        bandwith_limit,
     )?;
     Ok((
         och,
@@ -120,6 +121,7 @@ impl OutboundConnectionHandler {
         keypair: TransportKeypair,
         is_gateway: bool,
         socket_addr: SocketAddr,
+        bandwith_limit: Option<usize>,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection>), TransportError> {
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
@@ -145,7 +147,7 @@ impl OutboundConnectionHandler {
             send_queue: conn_handler_sender,
         };
 
-        task::spawn(bw_tracker.rate_limiter(BANDWITH_LIMIT, socket));
+        task::spawn(bw_tracker.rate_limiter(bandwith_limit, socket));
         task::spawn(RANDOM_U64.scope(StdRng::from_entropy().gen(), transport.listen()));
 
         Ok((connection_handler, new_connection_notifier))
@@ -158,7 +160,7 @@ impl OutboundConnectionHandler {
         keypair: TransportKeypair,
         is_gateway: bool,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection>), TransportError> {
-        Self::config_listener(socket, keypair, is_gateway, socket_addr)
+        Self::config_listener(socket, keypair, is_gateway, socket_addr, None)
     }
 
     pub async fn connect(
@@ -1061,6 +1063,7 @@ mod test {
     #![allow(clippy::single_range_in_vec_init)]
 
     use std::{
+        fmt::Debug,
         net::Ipv4Addr,
         ops::Range,
         sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
@@ -1257,7 +1260,7 @@ mod test {
     }
 
     trait TestFixture: Clone + Send + Sync + 'static {
-        type Message: DeserializeOwned + Serialize + Send + 'static;
+        type Message: DeserializeOwned + Serialize + Send + Debug + 'static;
         fn expected_iterations(&self) -> usize;
         fn gen_msg(&mut self) -> Self::Message;
         fn assert_message_ok(&self, peer_idx: usize, msg: Self::Message) -> bool;
