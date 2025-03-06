@@ -16,7 +16,8 @@
   </a>
 </div>
 
-This is the freenet-core repository. To learn more about Freenet please visit our website at [freenet.org](https://freenet.org/).
+This is the freenet-core repository. To learn more about Freenet please visit our website 
+at [freenet.org](https://freenet.org/).
 
 # Decentralize Everything
 
@@ -44,12 +45,3 @@ Or for the fdev utility:
 ```bash
 $ cargo install --path crates/fdev
 ```
-
-## License
-
-This project is licensed under either of:
-
-- Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
-  <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or
-  <http://opensource.org/licenses/MIT>)
