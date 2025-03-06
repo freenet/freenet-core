@@ -1,32 +1,45 @@
 /// Clients events related logic and type definitions.
 pub(crate) mod client_events;
+
 /// Peer node configuration.
 pub mod config;
+
 /// Handling of contracts and delegates functionality.
 mod contract;
+
 /// Generated messages from the flatbuffers schema for the network monitor.
 pub mod generated;
+
 /// Network messages for transactions.
 mod message;
+
 /// Node configuration, implementations and execution (entry points for the binaries).
 mod node;
 pub use node::{run_local_node, run_network_node};
+
 /// Network operation/transaction state machines.
 mod operations;
+
 /// Ring connections and routing.
 mod ring;
+
 /// Router implementation.
 mod router;
+
 /// Local server used to communicate with the peer core.
 #[cfg(feature = "websocket")]
 pub mod server;
+
 /// Local network topology management.
 mod topology;
+
 /// Tracing and loging infrastructure. Includes our custom event log register. Tracing collectors, etc.
 mod tracing;
+
 /// Code for communicating with other peers over UDP, handles hole-punching, error handling, etc.
 mod transport;
 pub mod util;
+
 /// WASM code execution runtime, tailored for the contract and delegate APIs.
 mod wasm_runtime;
 
