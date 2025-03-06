@@ -5,7 +5,6 @@ on:
   pull_request:
   push:
     branches: [main]
-    paths-ignore: ["docs/**", "README.md"]
 
 jobs:
   build-x86_64:
