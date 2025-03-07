@@ -307,7 +307,6 @@ export function handleUpdate(
     );
     requester = requester.split(" (@")[0];
 
-    //target = target.split(" (@")[0];
 
     contract_id = contract_id.split(" (@")[0];
 
