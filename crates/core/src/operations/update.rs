@@ -217,7 +217,6 @@ impl Operation for UpdateOp {
                         return Err(OpError::StatePushed);
                     }
 
-                    let target = op_manager.ring.connection_manager.own_location();
 
                     tracing::debug!("Attempting contract value update - BroadcastTo - update");
                     let new_value = update_contract(
