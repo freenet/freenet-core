@@ -8,6 +8,12 @@
 //! - in-memory: a simplifying node used for emulation purposes mainly.
 //! - inter-process: similar to in-memory, but can be rana cross multiple processes, closer to the real p2p impl
 
+use anyhow::Context;
+use either::Either;
+use freenet_stdlib::{
+    client_api::{ClientRequest, ErrorKind},
+    prelude::ContractKey,
+};
 use std::{
     borrow::Cow,
     fmt::Display,
@@ -18,13 +24,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-
-use anyhow::Context;
-use either::Either;
-use freenet_stdlib::{
-    client_api::{ClientRequest, ErrorKind},
-    prelude::ContractKey,
-};
+use std::{collections::HashSet, convert::Infallible};
 
 use rsa::pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
@@ -76,9 +76,8 @@ impl Node {
             .update_location(Some(location));
     }
 
-    pub async fn run(self) -> anyhow::Result<()> {
-        self.0.run_node().await?;
-        Ok(())
+    pub async fn run(self) -> anyhow::Result<Infallible> {
+        self.0.run_node().await
     }
 }
 
@@ -129,6 +128,7 @@ impl NodeConfig {
             let GatewayConfig {
                 address,
                 public_key_path,
+                location,
             } = gw;
 
             let mut key_file = File::open(public_key_path).with_context(|| {
@@ -141,7 +141,10 @@ impl NodeConfig {
 
             let address = Self::parse_socket_addr(address).await?;
             let peer_id = PeerId::new(address, TransportPublicKey::from(pub_key));
-            gateways.push(InitPeerNode::new(peer_id, Location::from_address(&address)));
+            let location = location
+                .map(Location::new)
+                .unwrap_or_else(|| Location::from_address(&address));
+            gateways.push(InitPeerNode::new(peer_id, location));
         }
         tracing::info!(
             "Node will be listening at {}:{} internal address",
@@ -159,8 +162,8 @@ impl NodeConfig {
             peer_id: config.peer_id.clone(),
             network_listener_ip: config.network_api.address,
             network_listener_port: config.network_api.port,
+            location: config.location.map(Location::new),
             config: Arc::new(config),
-            location: None,
             max_hops_to_live: None,
             rnd_if_htl_above: None,
             max_number_conn: None,
@@ -649,7 +652,7 @@ pub async fn subscribe(
         Err(OpError::ContractError(ContractError::ContractNotFound(key))) => {
             tracing::info!(%key, "Trying to subscribe to a contract not present, requesting it first");
             let get_op = get::start_op(key, true);
-            if let Err(error) = get::request_get(&op_manager, get_op, vec![]).await {
+            if let Err(error) = get::request_get(&op_manager, get_op, HashSet::new()).await {
                 tracing::error!(%key, %error, "Failed getting the contract while previously trying to subscribe; bailing");
                 return Err(error);
             }
@@ -969,14 +972,18 @@ pub async fn run_network_node(mut node: Node) -> anyhow::Result<()> {
     tracing::info!("Starting node");
 
     let is_gateway = node.0.is_gateway;
-    let location = is_gateway
-        .then(|| {
-            node.0
-                .peer_id
-                .clone()
-                .map(|id| Location::from_address(&id.addr))
-        })
-        .flatten();
+    let location = if let Some(loc) = node.0.location {
+        Some(loc)
+    } else {
+        is_gateway
+            .then(|| {
+                node.0
+                    .peer_id
+                    .clone()
+                    .map(|id| Location::from_address(&id.addr))
+            })
+            .flatten()
+    };
 
     if let Some(location) = location {
         tracing::info!("Setting initial location: {location}");

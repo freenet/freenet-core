@@ -1,7 +1,9 @@
 pub(crate) mod time_source;
 
 use std::{
+    borrow::Borrow,
     collections::{BTreeMap, HashSet},
+    hash::Hash,
     net::{Ipv4Addr, SocketAddr, TcpListener},
     sync::Arc,
     time::Duration,
@@ -53,21 +55,36 @@ pub fn set_cleanup_on_exit(config: Arc<ConfigPaths>) -> Result<(), ctrlc::Error>
 }
 
 #[derive(Debug)]
-pub struct ExponentialBackoff {
+pub struct Backoff {
     attempt: usize,
     max_attempts: usize,
     base: Duration,
     ceiling: Duration,
+    strategy: BackoffStrategy,
 }
 
-impl ExponentialBackoff {
+#[derive(Debug)]
+enum BackoffStrategy {
+    Exponential,
+    Logarithmic { interval_reduction_factor: f64 },
+}
+
+impl Backoff {
     pub fn new(base: Duration, ceiling: Duration, max_attempts: usize) -> Self {
-        ExponentialBackoff {
+        Backoff {
             attempt: 0,
             max_attempts,
             base,
             ceiling,
+            strategy: BackoffStrategy::Exponential,
         }
+    }
+
+    pub fn logarithmic(mut self, interval_reduction_factor: f64) -> Self {
+        self.strategy = BackoffStrategy::Logarithmic {
+            interval_reduction_factor,
+        };
+        self
     }
 
     /// Record that we made an attempt and sleep for the appropriate amount
@@ -86,17 +103,46 @@ impl ExponentialBackoff {
     }
 
     fn delay(&self) -> Duration {
-        let mut delay = self.base.saturating_mul(1 << self.attempt);
+        let mut delay = match self.strategy {
+            BackoffStrategy::Exponential => self.exponential_delay(),
+            BackoffStrategy::Logarithmic {
+                interval_reduction_factor,
+            } => self.logarithmic_delay(interval_reduction_factor),
+        };
         if delay > self.ceiling {
             delay = self.ceiling;
         }
         delay
     }
 
+    fn exponential_delay(&self) -> Duration {
+        self.base.saturating_mul(1 << self.attempt)
+    }
+
+    fn logarithmic_delay(&self, interval_reduction_factor: f64) -> Duration {
+        const LOG_BASE: f64 = 2.0;
+        Duration::from_millis(
+            ((self.base.as_millis() as f64 * (1.0 + (self.attempt as f64).log(LOG_BASE)))
+                / interval_reduction_factor) as u64,
+        )
+    }
+
     fn next_attempt(&mut self) -> Duration {
         let delay = self.delay();
         self.attempt += 1;
         delay
+    }
+}
+
+impl Iterator for Backoff {
+    type Item = Duration;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.attempt == self.max_attempts {
+            None
+        } else {
+            Some(self.next_attempt())
+        }
     }
 }
 
@@ -197,6 +243,41 @@ pub(crate) mod test {
     use super::*;
 
     #[test]
+    fn backoff_logarithmic() {
+        let base = Duration::from_millis(200);
+        let ceiling = Duration::from_secs(2);
+        let max_attempts = 40;
+        let backoff = Backoff::new(base, ceiling, max_attempts).logarithmic(2.0);
+        let total = backoff
+            .into_iter()
+            .reduce(|acc, x| {
+                // println!("next: {:?}", x);
+                acc + x
+            })
+            .unwrap();
+        assert!(
+            total > Duration::from_secs(18) && total < Duration::from_secs(20),
+            "total: {:?}",
+            total
+        );
+
+        let base = Duration::from_millis(600);
+        let ceiling = Duration::from_secs(30);
+        let max_attempts = 40;
+        let backoff = Backoff::new(base, ceiling, max_attempts).logarithmic(1.0);
+
+        // const MAX: Duration = Duration::from_secs(30);
+        let _ = backoff
+            .into_iter()
+            .reduce(|acc, x| {
+                // println!("next: {:?}", x);
+                acc + x
+            })
+            .unwrap();
+        // println!("total: {:?}", total);
+    }
+
+    #[test]
     fn randomize_iter() {
         let iter = [0, 1, 2, 3, 4, 5];
         let mut times_equal = 0;
@@ -259,23 +340,39 @@ impl std::fmt::Display for EncodingProtocol {
 }
 
 pub(crate) trait Contains<T> {
-    fn has_element(&self, target: &T) -> bool;
+    fn has_element(&self, target: T) -> bool;
 }
 
 impl Contains<PeerId> for &[PeerId] {
+    fn has_element(&self, target: PeerId) -> bool {
+        self.contains(&target)
+    }
+}
+
+impl Contains<&PeerId> for &[PeerId] {
     fn has_element(&self, target: &PeerId) -> bool {
         self.contains(target)
     }
 }
 
 impl Contains<PeerId> for &[&PeerId] {
+    fn has_element(&self, target: PeerId) -> bool {
+        self.contains(&&target)
+    }
+}
+
+impl Contains<&PeerId> for &[&PeerId] {
     fn has_element(&self, target: &PeerId) -> bool {
         self.contains(&target)
     }
 }
 
-impl Contains<PeerId> for &Vec<&PeerId> {
-    fn has_element(&self, target: &PeerId) -> bool {
+impl<Q, T> Contains<Q> for &HashSet<T>
+where
+    T: Borrow<Q> + Eq + Hash,
+    Q: Eq + Hash,
+{
+    fn has_element(&self, target: Q) -> bool {
         self.contains(&target)
     }
 }

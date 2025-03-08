@@ -117,7 +117,7 @@ run:
     @echo "  Put Contract: $(PUT_CONTRACT)"
 	@mkdir -p $(BASE_DIR)/apps
 	@freenet-ping \
-		--host "localhost:$(WS_PORT)" \
+		--host "127.0.0.1:$(WS_PORT)" \
 		--log-level $(LOG_LEVEL) \
 		--frequency $(FREQUENCY) \
 		--ttl $(TTL) \

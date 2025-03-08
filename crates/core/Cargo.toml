@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.1.0-rc1"
+version = "0.1.0-rc3"
 edition = "2021"
 rust-version = "1.80"
 publish = true
@@ -96,12 +96,13 @@ httptest = "0.16"
 pico-args = "0.5"
 statrs = "0.18"
 tempfile = "3"
+test-log = "0.2"
 tracing = "0.1"
+testresult = "0.4"
 # console-subscriber = { version = "0.4" }
 
 [features]
 default = ["redb", "trace", "websocket"]
-local-simulation = []
 sqlite = ["sqlx"]
 trace = ["tracing-subscriber"]
 trace-ot = ["opentelemetry-jaeger", "trace", "tracing-opentelemetry", "opentelemetry-otlp"]

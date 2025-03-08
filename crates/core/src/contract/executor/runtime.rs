@@ -1,4 +1,8 @@
 use super::*;
+use super::{
+    ContractExecutor, ContractRequest, ContractResponse, ExecutorError, ExecutorHalve,
+    ExecutorToEventLoopChannel, RequestError, Response, StateStoreError,
+};
 
 impl ContractExecutor for Executor<Runtime> {
     async fn fetch_contract(
@@ -227,7 +231,10 @@ impl Executor<Runtime> {
         Executor::new(
             state_store,
             move || {
-                crate::util::set_cleanup_on_exit(config.paths().clone())?;
+                let _ =
+                    crate::util::set_cleanup_on_exit(config.paths().clone()).inspect_err(|error| {
+                        tracing::error!("Failed to set cleanup on exit: {error}");
+                    });
                 Ok(())
             },
             OperationMode::Local,
@@ -387,7 +394,7 @@ impl Executor<Runtime> {
                 self.register_contract_notifier(key, cli_id, updates, summary)?;
 
                 // by default a subscribe op has an implicit get
-                let _res = self.perform_contract_get(true, key).await?;
+                let _res = self.perform_contract_get(false, key).await?;
                 self.subscribe(key).await?;
                 Ok(ContractResponse::SubscribeResponse {
                     key,
@@ -629,10 +636,10 @@ impl Executor<Runtime> {
         };
         let new_state = WrappedState::new(new_state.into_bytes());
 
-        if new_state.as_ref() == current_state.as_ref() {
-            tracing::debug!("No changes in state for contract {key}, avoiding update");
-            return Ok(Either::Left(current_state.clone()));
-        }
+        // if new_state.as_ref() == current_state.as_ref() {
+        //     tracing::debug!("No changes in state for contract {key}, avoiding update");
+        //     return Ok(Either::Left(current_state.clone()));
+        // }
 
         self.state_store
             .update(key, new_state.clone())

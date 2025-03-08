@@ -12,6 +12,7 @@ use std::{
 use anyhow::Context;
 use directories::ProjectDirs;
 use either::Either;
+use itertools::Itertools;
 use once_cell::sync::Lazy;
 use pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
@@ -66,7 +67,7 @@ pub struct ConfigArgs {
     pub log_level: Option<tracing::log::LevelFilter>,
 
     #[clap(flatten)]
-    config_paths: ConfigPathsArgs,
+    pub config_paths: ConfigPathsArgs,
 
     /// An arbitrary identifier for the node, mostly for debugging or testing purposes.
     #[clap(long)]
@@ -85,6 +86,9 @@ impl Default for ConfigArgs {
                 is_gateway: false,
                 skip_load_from_network: true,
                 ignore_protocol_checking: false,
+                gateways: None,
+                location: None,
+                bandwidth_limit: None,
             },
             ws_api: WebsocketApiArgs {
                 address: Some(default_listening_address()),
@@ -243,6 +247,19 @@ impl ConfigArgs {
                     );
                 })
                 .unwrap_or_default()
+        } else if let Some(gateways) = self.network_api.gateways {
+            let gateways = gateways
+                .into_iter()
+                .map(|cfg| {
+                    let cfg = serde_json::from_str::<InlineGwConfig>(&cfg)?;
+                    Ok::<_, anyhow::Error>(GatewayConfig {
+                        address: Address::HostAddress(cfg.address),
+                        public_key_path: cfg.public_key_path,
+                        location: cfg.location,
+                    })
+                })
+                .try_collect()?;
+            Gateways { gateways }
         } else {
             Gateways::default()
         };
@@ -255,24 +272,19 @@ impl ConfigArgs {
                 })?
             }
             Err(err) => {
-                // TODO: remove local-simulation feature and use runtime flags
-                #[cfg(all(not(any(test, debug_assertions)), not(feature = "local-simulation")))]
+                if peer_id.is_none()
+                    && mode == OperationMode::Network
+                    && remotely_loaded_gateways.gateways.is_empty()
                 {
-                    if peer_id.is_none()
-                        && mode == OperationMode::Network
-                        && remotely_loaded_gateways.gateways.is_empty()
-                    {
-                        tracing::error!(file = ?gateways_file, "Failed to read gateways file: {err}");
+                    tracing::error!(file = ?gateways_file, "Failed to read gateways file: {err}");
 
-                        return Err(anyhow::Error::new(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            "Cannot initialize node without gateways",
-                        )));
-                    }
+                    return Err(anyhow::Error::new(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "Cannot initialize node without gateways",
+                    )));
                 }
-                let _ = err;
                 if remotely_loaded_gateways.gateways.is_empty() {
-                    tracing::warn!("No gateways file found, initializing disjoint gateway.");
+                    tracing::warn!("No gateways file found, initializing disjoint gateway, initializing a new network.");
                 }
                 Gateways { gateways: vec![] }
             }
@@ -293,7 +305,8 @@ impl ConfigArgs {
                     .unwrap_or_else(default_network_api_port),
                 public_address: self.network_api.public_address,
                 public_port: self.network_api.public_port,
-                ignore_protocol: self.network_api.ignore_protocol_checking,
+                ignore_protocol_version: self.network_api.ignore_protocol_checking,
+                bandwidth_limit: self.network_api.bandwidth_limit,
             },
             ws_api: WebsocketApiConfig {
                 address: self.ws_api.address.unwrap_or_else(|| match mode {
@@ -310,6 +323,7 @@ impl ConfigArgs {
             config_paths: Arc::new(config_paths),
             gateways: gateways.gateways.clone(),
             is_gateway: self.network_api.is_gateway,
+            location: self.network_api.location,
         };
 
         fs::create_dir_all(this.config_dir())?;
@@ -373,7 +387,7 @@ mod serde_log_level_filter {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     /// Node operation mode.
     pub mode: OperationMode,
@@ -392,6 +406,7 @@ pub struct Config {
     #[serde(skip)]
     pub(crate) gateways: Vec<GatewayConfig>,
     pub(crate) is_gateway: bool,
+    pub(crate) location: Option<f64>,
 }
 
 impl Config {
@@ -404,7 +419,7 @@ impl Config {
     }
 }
 
-#[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]
+#[derive(clap::Parser, Debug, Default, Clone, Serialize, Deserialize)]
 pub struct NetworkArgs {
     /// Address to bind to for the network event listener, default is 0.0.0.0
     #[arg(
@@ -445,9 +460,34 @@ pub struct NetworkArgs {
     #[arg(long)]
     pub skip_load_from_network: bool,
 
+    /// Optional list of gateways to connect to in network mode. Used for testing purposes.
+    #[arg(long, hide = true)]
+    pub gateways: Option<Vec<String>>,
+
+    /// Optional location of the node, this is to be able to deterministically set locations for gateways for testing purposes.
+    #[arg(long, hide = true, env = "LOCATION")]
+    pub location: Option<f64>,
+
     /// Ignores protocol version failures, continuing to run the node if there is a mismatch with the gateway.
     #[arg(long)]
     pub ignore_protocol_checking: bool,
+
+    /// Hard limit the bandwidth usage for upstream traffic.
+    #[arg(long)]
+    pub bandwidth_limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InlineGwConfig {
+    /// Address of the gateway.
+    pub address: SocketAddr,
+
+    /// Path to the public key of the gateway in PEM format.
+    #[serde(rename = "public_key")]
+    pub public_key_path: PathBuf,
+
+    /// Optional location of the gateway. Necessary for deterministic testing.
+    pub location: Option<f64>,
 }
 
 impl NetworkArgs {
@@ -488,8 +528,12 @@ pub struct NetworkApiConfig {
     #[serde(rename = "public_port", skip_serializing_if = "Option::is_none")]
     pub public_port: Option<u16>,
 
+    /// Whether to ignore protocol version compatibility routine while initiating connections.
     #[serde(skip)]
-    pub ignore_protocol: bool,
+    pub ignore_protocol_version: bool,
+
+    /// Hard limit the bandwidth usage for upstream traffic.
+    pub bandwidth_limit: Option<usize>,
 }
 
 mod port_allocation;
@@ -565,7 +609,7 @@ const fn default_http_gateway_port() -> u16 {
 pub struct ConfigPathsArgs {
     /// The configuration directory.
     #[arg(long, default_value = None, env = "CONFIG_DIR")]
-    config_dir: Option<PathBuf>,
+    pub config_dir: Option<PathBuf>,
     /// The contracts directory.
     #[arg(long, default_value = None, env = "CONTRACTS_DIR")]
     contracts_dir: Option<PathBuf>,
@@ -583,7 +627,7 @@ pub struct ConfigPathsArgs {
     event_log: Option<PathBuf>,
     /// The data directory.
     #[arg(long, default_value = None, env = "DATA_DIR")]
-    data_dir: Option<PathBuf>,
+    pub data_dir: Option<PathBuf>,
 }
 
 impl ConfigPathsArgs {
@@ -863,7 +907,7 @@ impl Gateways {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GatewayConfig {
     /// Address of the gateway. It can be either a hostname or an IP address and port.
     pub address: Address,
@@ -871,6 +915,24 @@ pub struct GatewayConfig {
     /// Path to the public key of the gateway in PEM format.
     #[serde(rename = "public_key")]
     pub public_key_path: PathBuf,
+
+    /// Optional location of the gateway.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<f64>,
+}
+
+impl PartialEq for GatewayConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.address == other.address
+    }
+}
+
+impl Eq for GatewayConfig {}
+
+impl std::hash::Hash for GatewayConfig {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.address.hash(state);
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone)]
@@ -941,6 +1003,7 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
     let mut valid_gateways = Vec::new();
 
     for gateway in &mut gateways.gateways {
+        gateway.location = None; // always ignore any location from files if set, it should be derived from IP
         let public_key_url = base_url.join(&gateway.public_key_path.to_string_lossy())?;
         let public_key_response = reqwest::get(public_key_url).await?.error_for_status()?;
         let file_name = gateway
@@ -989,7 +1052,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_serde_config_args() {
-        let args = ConfigArgs::default();
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            ..Default::default()
+        };
         let cfg = args.build().await.unwrap();
         let serialized = toml::to_string(&cfg).unwrap();
         let _: Config = toml::from_str(&serialized).unwrap();
@@ -1014,7 +1080,7 @@ mod tests {
         let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 256).unwrap();
         let key = key
             .to_public_key()
-            .to_public_key_pem(pkcs8::LineEnding::LF)
+            .to_public_key_pem(pkcs8::LineEnding::default())
             .unwrap();
         server.expect(
             Expectation::matching(request::path("/path/to/public_key.pem"))
@@ -1047,10 +1113,12 @@ mod tests {
                         ([127, 0, 0, 1], default_network_api_port()).into(),
                     ),
                     public_key_path: PathBuf::from("path/to/key"),
+                    location: None,
                 },
                 GatewayConfig {
                     address: Address::Hostname("technic.locut.us".to_string()),
                     public_key_path: PathBuf::from("path/to/key"),
+                    location: None,
                 },
             ],
         };

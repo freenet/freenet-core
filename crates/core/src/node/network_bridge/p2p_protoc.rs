@@ -2,6 +2,7 @@ use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::contract::WaitingTransaction;
 use crate::message::{NetMessageV1, QueryResult};
 use crate::node::subscribe::SubscribeMsg;
+use crate::ring::Location;
 use dashmap::DashSet;
 use either::{Either, Left, Right};
 use freenet_stdlib::client_api::ErrorKind;
@@ -24,7 +25,6 @@ use tokio::sync::oneshot::{self};
 use tokio::time::timeout;
 use tracing::Instrument;
 
-use crate::dev_tool::Location;
 use crate::node::network_bridge::handshake::{
     Event as HandshakeEvent, ForwardInfo, HandshakeError, HandshakeHandler, HanshakeHandlerMsg,
     OutboundMessage,
@@ -116,7 +116,15 @@ pub(in crate::node) struct P2pConnManager {
     listening_ip: IpAddr,
     listening_port: u16,
     is_gateway: bool,
+    /// If set, will sent the location over network messages.
+    ///
+    /// It will also determine whether to trust the location of peers sent in network messages or derive them from IP.
+    ///
+    /// This is used for testing deterministically with given location. In production this should always be none
+    /// and locations should be derived from IP addresses.
+    this_location: Option<Location>,
     check_version: bool,
+    bandwidth_limit: Option<usize>,
 }
 
 impl P2pConnManager {
@@ -143,7 +151,9 @@ impl P2pConnManager {
             listening_ip: listener_ip,
             listening_port: listen_port,
             is_gateway: config.is_gateway,
-            check_version: !config.config.network_api.ignore_protocol,
+            this_location: config.location,
+            check_version: !config.config.network_api.ignore_protocol_version,
+            bandwidth_limit: config.config.network_api.bandwidth_limit,
         })
     }
 
@@ -167,6 +177,7 @@ impl P2pConnManager {
             self.listening_ip,
             self.listening_port,
             self.is_gateway,
+            self.bandwidth_limit,
         )
         .await?;
 
@@ -176,6 +187,7 @@ impl P2pConnManager {
                 outbound_conn_handler.clone(),
                 self.bridge.op_manager.ring.connection_manager.clone(),
                 self.bridge.op_manager.ring.router.clone(),
+                self.this_location,
             );
 
         loop {
@@ -480,6 +492,7 @@ impl P2pConnManager {
                 id,
                 conn,
                 joiner,
+                location,
                 op,
                 forward_info,
             } => {
@@ -492,11 +505,7 @@ impl P2pConnManager {
                 self.bridge
                     .op_manager
                     .ring
-                    .add_connection(
-                        Location::from_address(&joiner.addr),
-                        joiner.clone(),
-                        was_reserved,
-                    )
+                    .add_connection(location, joiner.clone(), was_reserved)
                     .await;
                 if let Some(op) = op {
                     self.bridge

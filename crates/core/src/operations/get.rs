@@ -1,5 +1,6 @@
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::pin::Pin;
 use std::{future::Future, time::Instant};
@@ -46,7 +47,7 @@ pub(crate) fn start_op(key: ContractKey, fetch_contract: bool) -> GetOp {
 pub(crate) async fn request_get(
     op_manager: &OpManager,
     get_op: GetOp,
-    skip_list: Vec<PeerId>,
+    skip_list: HashSet<PeerId>,
 ) -> Result<(), OpError> {
     let (target, id) = if let Some(GetState::PrepareRequest { key, id, .. }) = &get_op.state {
         // the initial request must provide:
@@ -55,7 +56,7 @@ pub(crate) async fn request_get(
         (
             op_manager
                 .ring
-                .closest_potentially_caching(key, skip_list.as_slice())
+                .closest_potentially_caching(key, &skip_list)
                 .into_iter()
                 .next()
                 .ok_or(RingError::EmptyRing)?,
@@ -129,6 +130,8 @@ enum GetState {
         retries: usize,
         current_hop: usize,
     },
+    /// Operation completed successfully
+    Finished { key: ContractKey },
 }
 
 impl Display for GetState {
@@ -154,6 +157,7 @@ impl Display for GetState {
             } => {
                 write!(f, "AwaitingResponse(requester: {:?}, fetch_contract: {}, retries: {}, current_hop: {})", requester, fetch_contract, retries, current_hop)
             }
+            GetState::Finished { key, .. } => write!(f, "Finished(key: {})", key),
         }
     }
 }
@@ -226,7 +230,7 @@ impl GetOp {
     }
 
     pub(super) fn finalized(&self) -> bool {
-        self.result.is_some()
+        self.result.is_some() && matches!(self.state, Some(GetState::Finished { .. }))
     }
 
     pub(super) fn to_host_result(&self) -> HostResult {
@@ -327,7 +331,7 @@ impl Operation for GetOp {
                     }));
                     let own_loc = op_manager.ring.connection_manager.own_location();
                     let mut new_skip_list = skip_list.clone();
-                    new_skip_list.push(own_loc.peer.clone());
+                    new_skip_list.insert(own_loc.peer.clone());
                     return_msg = Some(GetMsg::SeekNode {
                         key: *key,
                         id: *id,
@@ -358,7 +362,7 @@ impl Operation for GetOp {
                     }
 
                     let mut new_skip_list = skip_list.clone();
-                    new_skip_list.push(this_peer.clone().peer);
+                    new_skip_list.insert(this_peer.clone().peer);
 
                     let get_result = op_manager
                         .notify_contract_handler(ContractHandlerEvent::GetQuery {
@@ -389,7 +393,7 @@ impl Operation for GetOp {
                                 key,
                                 (htl, fetch_contract),
                                 (this_peer, sender.clone()),
-                                skip_list,
+                                new_skip_list,
                                 op_manager,
                                 stats,
                             )
@@ -472,10 +476,10 @@ impl Operation for GetOp {
                             if retries < MAX_RETRIES {
                                 // no response received from this peer, so skip it in the next iteration
                                 let mut new_skip_list = skip_list.clone();
-                                new_skip_list.push(target.peer.clone());
+                                new_skip_list.insert(target.peer.clone());
                                 if let Some(target) = op_manager
                                     .ring
-                                    .closest_potentially_caching(key, new_skip_list.as_slice())
+                                    .closest_potentially_caching(key, &new_skip_list)
                                     .into_iter()
                                     .next()
                                 {
@@ -633,7 +637,7 @@ impl Operation for GetOp {
                         );
 
                         let mut new_skip_list = skip_list.clone();
-                        new_skip_list.push(sender.peer.clone());
+                        new_skip_list.insert(sender.peer.clone());
 
                         let requester = requester.unwrap();
 
@@ -699,7 +703,7 @@ impl Operation for GetOp {
                                     tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
                                     op_manager.ring.seed_contract(key);
                                     let mut new_skip_list = skip_list.clone();
-                                    new_skip_list.push(sender.peer.clone());
+                                    new_skip_list.insert(sender.peer.clone());
                                     super::start_subscription_request(
                                         op_manager,
                                         key,
@@ -717,7 +721,7 @@ impl Operation for GetOp {
                                     return Err(OpError::ExecutorError(err));
                                 } else {
                                     let mut new_skip_list = skip_list.clone();
-                                    new_skip_list.push(sender.peer.clone());
+                                    new_skip_list.insert(sender.peer.clone());
 
                                     let requester = requester.unwrap();
 
@@ -762,7 +766,7 @@ impl Operation for GetOp {
                             requester: None, ..
                         }) => {
                             tracing::info!(tx = %id, %key, "Get response received for contract at original requester");
-                            new_state = None;
+                            new_state = Some(GetState::Finished { key });
                             return_msg = None;
                             result = Some(GetResult {
                                 key,
@@ -849,7 +853,7 @@ async fn try_forward_or_return(
     key: ContractKey,
     (htl, fetch_contract): (usize, bool),
     (this_peer, sender): (PeerKeyLocation, PeerKeyLocation),
-    skip_list: &[PeerId],
+    skip_list: HashSet<PeerId>,
     op_manager: &OpManager,
     stats: Option<Box<GetStats>>,
 ) -> Result<OperationResult, OpError> {
@@ -860,8 +864,8 @@ async fn try_forward_or_return(
         "Contract not found while processing a get request",
     );
 
-    let mut new_skip_list = skip_list.to_vec();
-    new_skip_list.push(this_peer.peer.clone());
+    let mut new_skip_list = skip_list.clone();
+    new_skip_list.insert(this_peer.peer.clone());
 
     let new_htl = htl - 1;
 
@@ -875,7 +879,7 @@ async fn try_forward_or_return(
     } else {
         match op_manager
             .ring
-            .closest_potentially_caching(&key, new_skip_list.as_slice())
+            .closest_potentially_caching(&key, &new_skip_list)
         {
             Some(target) => Some(target),
             None => {
@@ -957,7 +961,7 @@ mod messages {
             target: PeerKeyLocation,
             key: ContractKey,
             fetch_contract: bool,
-            skip_list: Vec<PeerId>,
+            skip_list: HashSet<PeerId>,
         },
         SeekNode {
             id: Transaction,
@@ -966,7 +970,7 @@ mod messages {
             target: PeerKeyLocation,
             sender: PeerKeyLocation,
             htl: usize,
-            skip_list: Vec<PeerId>,
+            skip_list: HashSet<PeerId>,
         },
         ReturnGet {
             id: Transaction,
@@ -974,7 +978,7 @@ mod messages {
             value: StoreResponse,
             sender: PeerKeyLocation,
             target: PeerKeyLocation,
-            skip_list: Vec<PeerId>,
+            skip_list: HashSet<PeerId>,
         },
     }
 

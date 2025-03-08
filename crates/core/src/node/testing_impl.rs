@@ -1,3 +1,7 @@
+use either::Either;
+use freenet_stdlib::prelude::*;
+use futures::Future;
+use rand::seq::SliceRandom;
 use std::{
     collections::{HashMap, HashSet},
     net::Ipv6Addr,
@@ -6,11 +10,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-
-use either::Either;
-use freenet_stdlib::prelude::*;
-use futures::Future;
-use rand::seq::SliceRandom;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{info, Instrument};
 
@@ -381,8 +380,11 @@ impl SimNetwork {
             let id = PeerId::new((Ipv6Addr::LOCALHOST, port).into(), keypair.public().clone());
             let location = Location::random();
 
-            let mut config_args = ConfigArgs::default();
-            config_args.id = Some(format!("{label}"));
+            let config_args = ConfigArgs {
+                id: Some(format!("{label}")),
+                mode: Some(OperationMode::Local),
+                ..Default::default()
+            };
             // TODO: it may be unnecessary use config_args.build() for the simulation. Related with the TODO in Config line 238
             let mut config = NodeConfig::new(config_args.build().await.unwrap())
                 .await
@@ -455,8 +457,11 @@ impl SimNetwork {
         for node_no in self.number_of_gateways..num + self.number_of_gateways {
             let label = NodeLabel::node(node_no);
 
-            let mut config_args = ConfigArgs::default();
-            config_args.id = Some(format!("{label}"));
+            let config_args = ConfigArgs {
+                id: Some(format!("{label}")),
+                mode: Some(OperationMode::Local),
+                ..Default::default()
+            };
             let mut config = NodeConfig::new(config_args.build().await.unwrap())
                 .await
                 .unwrap();
@@ -746,6 +751,7 @@ fn clean_up_tmp_dirs<'a>(labels: impl Iterator<Item = &'a NodeLabel>) {
 
 use super::op_state_manager::OpManager;
 use crate::client_events::ClientEventsProxy;
+use crate::contract::OperationMode;
 
 pub(super) trait NetworkBridgeExt: Clone + 'static {
     fn recv(&mut self) -> impl Future<Output = Result<NetMessage, ConnectionError>> + Send;

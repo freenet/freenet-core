@@ -36,8 +36,13 @@ impl ConnectionManager {
             min_connections,
             max_connections,
             rnd_if_htl_above,
-            pub_key,
-            None,
+            (
+                pub_key,
+                None,
+                AtomicU64::new(u64::from_le_bytes(
+                    Location::random().as_f64().to_le_bytes(),
+                )),
+            ),
         )
     }
 }
@@ -74,14 +79,28 @@ impl ConnectionManager {
             Ring::DEFAULT_RAND_WALK_ABOVE_HTL
         };
 
+        let own_location = if let Some(location) = config.location {
+            AtomicU64::new(u64::from_le_bytes(location.as_f64().to_le_bytes()))
+        } else if let Some(peer_key) = &config.peer_id {
+            // if the peer id is set, then the location must be set, since it is a gateway
+            let location = Location::from_address(&peer_key.addr);
+            AtomicU64::new(u64::from_le_bytes(location.as_f64().to_le_bytes()))
+        } else {
+            // for location here consider -1 == None
+            AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()))
+        };
+
         Self::init(
             max_upstream_bandwidth,
             max_downstream_bandwidth,
             min_connections,
             max_connections,
             rnd_if_htl_above,
-            config.key_pair.public().clone(),
-            config.peer_id.clone(),
+            (
+                config.key_pair.public().clone(),
+                config.peer_id.clone(),
+                own_location,
+            ),
         )
     }
 
@@ -91,18 +110,8 @@ impl ConnectionManager {
         min_connections: usize,
         max_connections: usize,
         rnd_if_htl_above: usize,
-        pub_key: TransportPublicKey,
-        peerid: Option<PeerId>,
+        (pub_key, peer_id, own_location): (TransportPublicKey, Option<PeerId>, AtomicU64),
     ) -> Self {
-        let own_location = if let Some(peer_key) = &peerid {
-            // if the peer id is set, then the location must be set, since it is a gateway
-            let location = Location::from_address(&peer_key.addr);
-            AtomicU64::new(u64::from_le_bytes(location.as_f64().to_le_bytes()))
-        } else {
-            // for location here consider -1 == None
-            AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()))
-        };
-
         let topology_manager = Arc::new(RwLock::new(TopologyManager::new(Limits {
             max_upstream_bandwidth,
             max_downstream_bandwidth,
@@ -117,7 +126,7 @@ impl ConnectionManager {
             reserved_connections: Arc::new(AtomicUsize::new(0)),
             topology_manager,
             own_location: own_location.into(),
-            peer_key: Arc::new(Mutex::new(peerid)),
+            peer_key: Arc::new(Mutex::new(peer_id)),
             min_connections,
             max_connections,
             rnd_if_htl_above,
@@ -153,16 +162,7 @@ impl ConnectionManager {
             return false;
         }
 
-        let my_location = self
-            .own_location()
-            .location
-            .unwrap_or_else(Location::random);
-        let accepted = if location == my_location
-            || self.connections_by_location.read().contains_key(&location)
-        {
-            tracing::debug!(%peer_id, "Rejected connection, same location");
-            false
-        } else if total_conn < self.min_connections {
+        let accepted = if total_conn < self.min_connections {
             tracing::debug!(%peer_id, "Accepted connection, below min connections");
             true
         } else if total_conn >= self.max_connections {
@@ -373,7 +373,7 @@ impl ConnectionManager {
                     return None;
                 }
             }
-            (!skip_list.has_element(&conn.location.peer)).then_some(&conn.location)
+            (!skip_list.has_element(conn.location.peer.clone())).then_some(&conn.location)
         });
         router.select_peer(peers, target).cloned()
     }
