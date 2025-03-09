@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test
+
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        args:
+          [
+            "--no-default-features",
+            "--all-features",
+            "--benches --all-features",
+          ]
+    env:
+      LOCUTUS_LOG: error
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target"
+
+    steps:
+      - name: Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.10.0
+        with:
+          access_token: ${{ github.token }}
+
+      - uses: actions/checkout@v3
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: "true"
+          default: "true"
+
+      - uses: Swatinem/rust-cache@v1
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Add wasm32-unknown-unknown
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install stdlib packages
+        working-directory: apps/stdlib
+        run: npm install
+
+      - name: Test
+        run: cargo test --workspace ${{ matrix.args }}
+
+  clippy_check:
+    name: Clippy
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.10.0
+        with:
+          access_token: ${{ github.token }}
+
+      - uses: actions/checkout@v3
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          components: clippy
+          override: "true"
+          default: "true"
+
+      - uses: Swatinem/rust-cache@v1
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+  fmt_check:
+    name: Fmt
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          components: rustfmt
+          override: "true"
+          default: "true"
+
+      - name: Check code formatting
+        run: cargo fmt -- --check
