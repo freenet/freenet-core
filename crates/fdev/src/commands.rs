@@ -81,6 +81,7 @@ async fn put_contract(
         contract,
         state,
         related_contracts,
+        subscribe: config.subscribe,
     }
     .into();
     let mut client = start_api_client(other).await?;

@@ -114,6 +114,10 @@ pub struct PutConfig {
     /// Type of put to perform.
     #[clap(subcommand)]
     pub(crate) package_type: PutType,
+
+    /// Flag that indicates if the node should subscribe to the contract.
+    #[arg(long)]
+    pub(crate) subscribe: bool,
 }
 
 /// Builds and packages a contract or delegate.
