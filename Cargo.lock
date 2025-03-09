@@ -1459,8 +1459,8 @@ dependencies = [
  "clap",
  "dashmap",
  "either",
- "freenet 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "freenet-stdlib 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "freenet",
+ "freenet-stdlib",
  "futures",
  "glob",
  "http 1.2.0",
@@ -1588,7 +1588,7 @@ dependencies = [
  "directories",
  "either",
  "flatbuffers",
- "freenet-stdlib 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "freenet-stdlib",
  "futures",
  "headers",
  "hickory-resolver",
@@ -1641,91 +1641,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "freenet"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b38d6d143c52b4afa6103ec1cd7538e3bee51f7fd850c55eff24c7c4b5730541"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "arc-swap",
- "asynchronous-codec",
- "axum",
- "bincode",
- "blake3",
- "bs58",
- "byteorder",
- "bytes",
- "cache-padded",
- "chacha20poly1305",
- "chrono",
- "clap",
- "cookie",
- "crossbeam",
- "ctrlc",
- "dashmap",
- "delegate",
- "directories",
- "either",
- "flatbuffers",
- "freenet-stdlib 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
- "futures",
- "headers",
- "hickory-resolver",
- "itertools 0.14.0",
- "notify",
- "once_cell",
- "opentelemetry 0.27.1",
- "opentelemetry-jaeger",
- "opentelemetry-otlp",
- "ordered-float 4.6.0",
- "parking_lot",
- "pav_regression",
- "pkcs8",
- "rand 0.8.5",
- "redb",
- "reqwest",
- "rsa",
- "semver",
- "serde",
- "serde_derive",
- "serde_json",
- "serde_with",
- "stretto",
- "tar",
- "thiserror 2.0.12",
- "time",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "toml",
- "tower-http",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "ulid",
- "unsigned-varint",
- "wasmer",
- "wasmer-compiler-singlepass",
- "wasmer-middlewares",
- "winapi",
- "wmi",
- "xz2",
-]
-
-[[package]]
 name = "freenet-macros"
 version = "0.1.1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.99",
-]
-
-[[package]]
-name = "freenet-macros"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c21b0e54ae3e7c5c9b9c845bd9eb4df94d24c94c0c5815ce5aa097492b984259"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1739,7 +1656,7 @@ dependencies = [
  "chrono",
  "clap",
  "freenet-ping-types",
- "freenet-stdlib 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "freenet-stdlib",
  "futures",
  "serde_json",
  "tokio",
@@ -1753,7 +1670,7 @@ name = "freenet-ping-contract"
 version = "0.1.0"
 dependencies = [
  "freenet-ping-types",
- "freenet-stdlib 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "freenet-stdlib",
  "serde_json",
 ]
 
@@ -1763,7 +1680,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
- "freenet-stdlib 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "freenet-stdlib",
  "humantime",
  "humantime-serde",
  "serde",
@@ -1780,7 +1697,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "flatbuffers",
- "freenet-macros 0.1.1",
+ "freenet-macros",
  "futures",
  "js-sys",
  "once_cell",
@@ -1798,38 +1715,6 @@ dependencies = [
  "tracing-subscriber",
  "wasm-bindgen",
  "wasmer",
- "web-sys",
-]
-
-[[package]]
-name = "freenet-stdlib"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be76992d35469924710cced5caf628fe12551bbfcf1511b214dfa56560ca44f5"
-dependencies = [
- "arbitrary",
- "bincode",
- "blake3",
- "bs58",
- "byteorder",
- "chrono",
- "flatbuffers",
- "freenet-macros 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "futures",
- "js-sys",
- "once_cell",
- "semver",
- "serde",
- "serde-wasm-bindgen 0.6.5",
- "serde_bytes",
- "serde_json",
- "serde_with",
- "thiserror 1.0.69",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "tracing",
- "tracing-subscriber",
- "wasm-bindgen",
  "web-sys",
 ]
 
@@ -5135,7 +5020,7 @@ dependencies = [
 name = "test-contract-integration"
 version = "0.1.0"
 dependencies = [
- "freenet-stdlib 0.1.2",
+ "freenet-stdlib",
  "serde",
  "serde_json",
 ]
