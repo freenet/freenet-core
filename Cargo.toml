@@ -31,8 +31,8 @@ tracing-subscriber = "0.3"
 wasmer = "5.0.4"
 wasmer-compiler-singlepass = "5.0.4"
 
-# freenet-stdlib = { path = "./stdlib/rust/", features = ["unstable"]   }
-freenet-stdlib = { version = "0.1.2" }
+freenet-stdlib = { path = "./stdlib/rust/" }
+# freenet-stdlib = { version = "0.1.2" }
 
 [profile.dev.package."*"]
 opt-level = 3
