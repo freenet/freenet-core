@@ -322,10 +322,8 @@ impl ConfigArgs {
                 bandwidth_limit: self.network_api.bandwidth_limit,
             },
             ws_api: WebsocketApiConfig {
-                address: self.ws_api.address.unwrap_or_else(|| match mode {
-                    OperationMode::Local => default_local_address(),
-                    OperationMode::Network => default_listening_address(),
-                }),
+                // the websocket API is always local
+                address: self.ws_api.address.unwrap_or_else(default_local_address),
                 port: self
                     .ws_api
                     .ws_api_port

@@ -4,7 +4,35 @@
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m' # No Color
+
+# Help function
+show_help() {
+    echo -e "${BLUE}Update Remote Gateways Script${NC}"
+    echo -e "This script deploys binary artifacts from the cross-compile.yml GitHub Actions workflow"
+    echo -e "to remote Freenet gateway servers.\n"
+    echo -e "${YELLOW}Usage:${NC}"
+    echo -e "  $0 [options]\n"
+    echo -e "${YELLOW}Options:${NC}"
+    echo -e "  -h, --help    Show this help message\n"
+    echo -e "${YELLOW}Environment Variables:${NC}"
+    echo -e "  ARTIFACTS_DIR   Directory containing the binary artifacts (default: current directory)"
+    echo -e "  BINARIES_PATH   Temporary path for unpacked binaries (default: $TMPDIR or /tmp)\n"
+    echo -e "${YELLOW}Expected Artifacts:${NC}"
+    echo -e "  The script expects zip files in the format: binaries-<arch>-<binary>.zip"
+    echo -e "  These artifacts are produced by the cross-compile.yml GitHub Actions workflow"
+    echo -e "  Example: binaries-x86_64-freenet.zip, binaries-arm64-fdev.zip\n"
+    echo -e "${YELLOW}Target Servers:${NC}"
+    echo -e "  The script deploys to servers defined in the SERVERS array with their architectures"
+    echo -e "  Each server will receive the appropriate architecture binaries"
+}
+
+# Check for help flags
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    show_help
+    exit 0
+fi
 
 # Configuration
 REMOTE_DIR="/usr/local/bin"  # Remote directory where binaries will be copied
