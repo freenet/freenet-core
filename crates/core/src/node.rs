@@ -651,7 +651,7 @@ pub async fn subscribe(
     match subscribe::request_subscribe(&op_manager, op).await {
         Err(OpError::ContractError(ContractError::ContractNotFound(key))) => {
             tracing::info!(%key, "Trying to subscribe to a contract not present, requesting it first");
-            let get_op = get::start_op(key, true);
+            let get_op = get::start_op(key, true, false);
             if let Err(error) = get::request_get(&op_manager, get_op, HashSet::new()).await {
                 tracing::error!(%key, %error, "Failed getting the contract while previously trying to subscribe; bailing");
                 return Err(error);
