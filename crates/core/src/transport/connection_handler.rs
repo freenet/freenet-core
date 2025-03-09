@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::config::PCK_VERSION;
 use crate::transport::crypto::TransportSecretKey;
 use crate::transport::packet_data::{AssymetricRSA, UnknownEncryption};
 use crate::transport::symmetric_message::OutboundConnection;
@@ -890,7 +891,7 @@ fn handle_ack_connection_error(err: Cow<'static, str>) -> TransportError {
     if let Some(expected) = err.split("expected version").nth(1) {
         TransportError::ProtocolVersionMismatch {
             expected: expected.trim().to_string(),
-            actual: version_cmp::VERSION,
+            actual: PCK_VERSION,
         }
     } else {
         TransportError::ConnectionEstablishmentFailure { cause: err }
@@ -938,9 +939,9 @@ struct InboundRemoteConnection {
 }
 
 mod version_cmp {
-    pub(super) const VERSION: &str = env!("CARGO_PKG_VERSION");
+    use crate::config::PCK_VERSION;
 
-    pub(super) const PROTOC_VERSION: [u8; 8] = parse_version_with_flags(VERSION);
+    pub(super) const PROTOC_VERSION: [u8; 8] = parse_version_with_flags(PCK_VERSION);
 
     const fn parse_version_with_flags(version: &str) -> [u8; 8] {
         let mut major = 0u8;
@@ -1086,7 +1087,7 @@ mod test {
         match handle_ack_connection_error(err_msg.into()) {
             TransportError::ProtocolVersionMismatch { expected, actual } => {
                 assert_eq!(expected, "1.2.3");
-                assert_eq!(actual, version_cmp::VERSION);
+                assert_eq!(actual, PCK_VERSION);
             }
             _ => panic!("Expected ProtocolVersionMismatch error"),
         }
