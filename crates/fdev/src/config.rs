@@ -48,6 +48,8 @@ pub enum SubCommand {
     Execute(RunCliConfig),
     Test(crate::testing::TestConfig),
     NetworkMetricsServer(crate::network_metrics_server::ServerConfig),
+    /// Get the contract ID without publishing
+    GetContractId(crate::commands::GetContractIdConfig),
 }
 
 impl SubCommand {
@@ -76,6 +78,7 @@ pub struct RunCliConfig {
 pub enum NodeCommand {
     Put(PutConfig),
     Update(UpdateConfig),
+    GetContractId(crate::commands::GetContractIdConfig),
 }
 
 /// Updates a contract in the network.

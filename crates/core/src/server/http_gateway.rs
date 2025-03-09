@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
 use axum::extract::Path;
+use tracing::instrument;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Extension, Router};
@@ -48,16 +49,18 @@ impl HttpGateway {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Config {
     localhost: bool,
 }
 
+#[instrument(level = "debug")]
 async fn home() -> axum::response::Response {
     axum::response::Response::default()
 }
 
 impl ClientEventsProxy for HttpGateway {
+    #[instrument(level = "debug", skip(self))]
     fn recv(&mut self) -> BoxFuture<Result<OpenRequest<'static>, ClientError>> {
         async move {
             while let Some(msg) = self.proxy_server_request.recv().await {
@@ -90,6 +93,7 @@ impl ClientEventsProxy for HttpGateway {
         .boxed()
     }
 
+    #[instrument(level = "debug", skip(self))]
     fn send(
         &mut self,
         id: ClientId,

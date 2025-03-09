@@ -212,8 +212,16 @@ async fn websocket_commands(
 ) -> axum::response::Response {
     let on_upgrade = move |ws: WebSocket| async move {
         tracing::debug!(protoc = ?ws.protocol(), "websocket connection established");
-        if let Err(error) = websocket_interface(rs.clone(), auth_token, encoding_protoc, ws).await {
-            tracing::error!("{error}");
+        match websocket_interface(rs.clone(), auth_token, encoding_protoc, ws).await {
+            Ok(_) => {
+                tracing::debug!("WebSocket interface completed normally");
+            }
+            Err(error) => {
+                tracing::error!("WebSocket interface error: {}", error);
+                if let Some(source) = error.source() {
+                    tracing::error!("Caused by: {}", source);
+                }
+            }
         }
     };
     ws.on_upgrade(on_upgrade)
@@ -225,8 +233,12 @@ async fn websocket_interface(
     encoding_protoc: EncodingProtocol,
     ws: WebSocket,
 ) -> anyhow::Result<()> {
+    tracing::debug!("starting websocket interface handler");
     let (mut response_rx, client_id) = new_client_connection(&request_sender).await?;
+    tracing::debug!(client_id = %client_id, "client connection established");
+    
     let (mut server_sink, mut client_stream) = ws.split();
+    tracing::debug!("websocket stream split for bidirectional communication");
     let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::UnboundedReceiver<HostResult>)>>> =
         Arc::new(Mutex::new(VecDeque::new()));
     loop {
@@ -359,27 +371,52 @@ async fn process_client_request(
     encoding_protoc: EncodingProtocol,
 ) -> Result<Option<Message>, Option<anyhow::Error>> {
     let msg = match msg {
-        Ok(Message::Binary(data)) => data,
-        Ok(Message::Text(data)) => data.into_bytes(),
-        Ok(Message::Close(_)) => return Err(None),
-        Ok(Message::Ping(ping)) => return Ok(Some(Message::Pong(ping))),
+        Ok(Message::Binary(data)) => {
+            tracing::debug!(size = data.len(), "received binary message");
+            data
+        }
+        Ok(Message::Text(data)) => {
+            tracing::debug!(size = data.len(), "received text message");
+            data.into_bytes()
+        }
+        Ok(Message::Close(frame)) => {
+            tracing::debug!(?frame, "received close frame");
+            return Err(None);
+        }
+        Ok(Message::Ping(ping)) => {
+            tracing::debug!("received ping");
+            return Ok(Some(Message::Pong(ping)));
+        }
         Ok(m) => {
-            tracing::debug!(msg = ?m, "received random message");
+            tracing::debug!(msg = ?m, "received unexpected message type");
             return Ok(None);
         }
-        Err(err) => return Err(Some(err.into())),
+        Err(err) => {
+            tracing::error!(error = %err, "error receiving websocket message");
+            return Err(Some(err.into()));
+        }
     };
 
     // Try to deserialize the ClientRequest message
     let req = {
         match encoding_protoc {
             EncodingProtocol::Flatbuffers => match ClientRequest::try_decode_fbs(&msg) {
-                Ok(decoded) => decoded.into_owned(),
-                Err(err) => return Ok(Some(Message::Binary(err.into_fbs_bytes()))),
+                Ok(decoded) => {
+                    tracing::debug!(protocol = "flatbuffers", "successfully decoded client request");
+                    decoded.into_owned()
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, protocol = "flatbuffers", "failed to decode client request");
+                    return Ok(Some(Message::Binary(err.into_fbs_bytes())))
+                }
             },
             EncodingProtocol::Native => match bincode::deserialize::<ClientRequest>(&msg) {
-                Ok(decoded) => decoded.into_owned(),
+                Ok(decoded) => {
+                    tracing::debug!(protocol = "native", "successfully decoded client request");
+                    decoded.into_owned()
+                }
                 Err(err) => {
+                    tracing::error!(error = %err, protocol = "native", "failed to decode client request");
                     let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
                         ErrorKind::DeserializationError {
                             cause: format!("{err}").into(),
@@ -394,9 +431,32 @@ async fn process_client_request(
     };
     if let ClientRequest::Authenticate { token } = &req {
         *auth_token = Some(AuthToken::from(token.clone()));
+        tracing::debug!("client authenticated");
     }
 
-    tracing::debug!(req = %req, "received client request");
+    // Log specific details for contract operations
+    match &req {
+        ClientRequest::ContractOp(op) => {
+            match op {
+                ContractRequest::Put { contract, state, .. } => {
+                    tracing::debug!(
+                        contract_key = %contract.key(),
+                        state_size = state.as_ref().len(),
+                        "received PUT contract request"
+                    );
+                }
+                ContractRequest::Get { key, return_contract_code } => {
+                    tracing::debug!(
+                        contract_key = %key,
+                        return_code = return_contract_code,
+                        "received GET contract request"
+                    );
+                }
+                _ => tracing::debug!(operation = ?op, "received contract operation request"),
+            }
+        }
+        _ => tracing::debug!(req = %req, "received client request"),
+    }
     request_sender
         .send(ClientConnection::Request {
             client_id,
@@ -419,20 +479,29 @@ async fn process_host_response(
             debug_assert_eq!(id, client_id);
             let result = match result {
                 Ok(res) => {
-                    tracing::debug!(response = %res, cli_id = %id, "sending response");
-                    match res {
-                        HostResponse::ContractResponse(ContractResponse::GetResponse {
-                            key,
-                            contract,
-                            state,
-                        }) => Ok(ContractResponse::GetResponse {
-                            key,
-                            contract,
-                            state,
+                    match &res {
+                        HostResponse::ContractResponse(resp) => {
+                            match resp {
+                                ContractResponse::GetResponse { key, contract, state } => {
+                                    tracing::debug!(
+                                        contract_key = %key,
+                                        has_contract = contract.is_some(),
+                                        state_size = state.as_ref().len(),
+                                        "sending GET response"
+                                    );
+                                }
+                                ContractResponse::PutResponse { key } => {
+                                    tracing::debug!(
+                                        contract_key = %key,
+                                        "sending PUT response"
+                                    );
+                                }
+                                _ => tracing::debug!(response = ?resp, "sending contract response"),
+                            }
                         }
-                        .into()),
-                        other => Ok(other),
+                        _ => tracing::debug!(response = %res, "sending response"),
                     }
+                    Ok(res)
                 }
                 Err(err) => {
                     tracing::debug!(response = %err, cli_id = %id, "sending response error");
