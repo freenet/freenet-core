@@ -1460,7 +1460,7 @@ dependencies = [
  "dashmap",
  "either",
  "freenet",
- "freenet-stdlib",
+ "freenet-stdlib 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures",
  "glob",
  "http 1.2.0",
@@ -1588,7 +1588,7 @@ dependencies = [
  "directories",
  "either",
  "flatbuffers",
- "freenet-stdlib",
+ "freenet-stdlib 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures",
  "headers",
  "hickory-resolver",
@@ -1650,13 +1650,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "freenet-macros"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c21b0e54ae3e7c5c9b9c845bd9eb4df94d24c94c0c5815ce5aa097492b984259"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.99",
+]
+
+[[package]]
 name = "freenet-ping"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
  "freenet-ping-types",
- "freenet-stdlib",
+ "freenet-stdlib 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures",
  "serde_json",
  "tokio",
@@ -1670,7 +1681,7 @@ name = "freenet-ping-contract"
 version = "0.1.0"
 dependencies = [
  "freenet-ping-types",
- "freenet-stdlib",
+ "freenet-stdlib 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_json",
 ]
 
@@ -1680,7 +1691,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
- "freenet-stdlib",
+ "freenet-stdlib 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "humantime",
  "humantime-serde",
  "serde",
@@ -1697,7 +1708,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "flatbuffers",
- "freenet-macros",
+ "freenet-macros 0.1.1",
  "futures",
  "js-sys",
  "once_cell",
@@ -1715,6 +1726,38 @@ dependencies = [
  "tracing-subscriber",
  "wasm-bindgen",
  "wasmer",
+ "web-sys",
+]
+
+[[package]]
+name = "freenet-stdlib"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b342ad977e00b43d2f09281e3ca14c071efc64038c9bfb4553f2570c9f34d77"
+dependencies = [
+ "arbitrary",
+ "bincode",
+ "blake3",
+ "bs58",
+ "byteorder",
+ "chrono",
+ "flatbuffers",
+ "freenet-macros 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "futures",
+ "js-sys",
+ "once_cell",
+ "semver",
+ "serde",
+ "serde-wasm-bindgen 0.6.5",
+ "serde_bytes",
+ "serde_json",
+ "serde_with",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "tracing-subscriber",
+ "wasm-bindgen",
  "web-sys",
 ]
 
@@ -4995,7 +5038,7 @@ dependencies = [
 name = "test-contract-integration"
 version = "0.1.0"
 dependencies = [
- "freenet-stdlib",
+ "freenet-stdlib 0.1.1",
  "serde",
  "serde_json",
 ]
