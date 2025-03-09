@@ -298,6 +298,7 @@ async fn websocket_interface(
                     Ok(None) => continue,
                     Err(None) => {
                         tracing::debug!("client channel closed on request");
+                        let _ = server_sink.send(Message::Close(None)).await;
                         return Ok(())
                     },
                     Err(Some(err)) => {
