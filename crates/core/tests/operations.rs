@@ -42,7 +42,7 @@ async fn base_node_test_config(
     public_port: Option<u16>,
     ws_api_port: u16,
 ) -> anyhow::Result<(ConfigArgs, PresetConfig)> {
-    const DEFAULT_RATE_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
+    const _DEFAULT_RATE_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
 
     if is_gateway {
         assert!(public_port.is_some());

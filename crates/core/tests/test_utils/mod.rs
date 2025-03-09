@@ -295,13 +295,13 @@ pub struct Task {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum TodoOperation {
     /// Add a new task
-    AddTask(Task),
+    Add(Task),
     /// Update an existing task
-    UpdateTask(Task),
+    Update(Task),
     /// Remove a task by ID
-    RemoveTask(u64),
+    Remove(u64),
     /// Mark a task as completed
-    CompleteTask(u64),
+    Complete(u64),
 }
 
 /// Creates an empty todo list for testing
@@ -312,19 +312,4 @@ pub fn create_empty_todo_list() -> Vec<u8> {
     };
 
     serde_json::to_vec(&todo_list).unwrap_or_default()
-}
-
-/// Creates an operation to add a task for testing
-pub fn create_add_task_operation(id: u64, title: &str, description: &str, priority: u8) -> Vec<u8> {
-    let task = Task {
-        id,
-        title: title.to_string(),
-        description: description.to_string(),
-        completed: false,
-        priority,
-    };
-
-    let operation = TodoOperation::AddTask(task);
-
-    serde_json::to_vec(&operation).unwrap_or_default()
 }

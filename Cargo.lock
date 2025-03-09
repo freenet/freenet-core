@@ -1563,7 +1563,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.1.0-rc3"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "freenet-macros"
-version = "0.1.0-rc1"
+version = "0.1.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1688,7 +1688,7 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.1.0-rc1"
+version = "0.1.1"
 dependencies = [
  "arbitrary",
  "bincode",
