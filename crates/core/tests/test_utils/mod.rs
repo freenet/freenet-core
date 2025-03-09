@@ -26,6 +26,7 @@ pub async fn make_put(
             contract: contract.clone(),
             state: state.clone(),
             related_contracts: RelatedContracts::default(),
+            subscribe: false,
         }))
         .await?;
     Ok(())
@@ -54,6 +55,7 @@ pub async fn make_get(
         .send(ClientRequest::ContractOp(ContractRequest::Get {
             key,
             return_contract_code,
+            subscribe: false,
         }))
         .await?;
     Ok(())
