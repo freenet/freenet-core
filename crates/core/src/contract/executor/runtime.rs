@@ -292,6 +292,7 @@ impl Executor<Runtime> {
                     contract,
                     state,
                     related_contracts,
+                    subscribe: false,
                 },
                 cli_id,
                 None,
@@ -347,6 +348,7 @@ impl Executor<Runtime> {
                 contract,
                 state,
                 related_contracts,
+                ..
             } => {
                 tracing::debug!(
                     client = %cli_id,
@@ -363,6 +365,7 @@ impl Executor<Runtime> {
             ContractRequest::Get {
                 key,
                 return_contract_code,
+                ..
             } => match self.perform_contract_get(return_contract_code, key).await {
                 Ok((state, contract)) => Ok(ContractResponse::GetResponse {
                     key,

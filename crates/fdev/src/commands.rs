@@ -164,6 +164,7 @@ async fn put_contract(
         contract,
         state: state.to_vec().into(),
         related_contracts,
+        subscribe: config.subscribe,
     }
     .into();
     tracing::debug!("Starting WebSocket client connection");

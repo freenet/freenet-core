@@ -301,6 +301,7 @@ async fn process_open_request(
                         state,
                         contract,
                         related_contracts,
+                        subscribe,
                     } => {
                         let Some(peer_id) = op_manager.ring.connection_manager.get_peer_key()
                         else {
@@ -318,6 +319,7 @@ async fn process_open_request(
                             related_contracts,
                             state,
                             op_manager.ring.max_hops_to_live,
+                            subscribe,
                         );
                         let op_id = op.id;
 
@@ -387,6 +389,7 @@ async fn process_open_request(
                     ContractRequest::Get {
                         key,
                         return_contract_code,
+                        subscribe,
                     } => {
                         let Some(peer_id) = op_manager.ring.connection_manager.get_peer_key()
                         else {
@@ -442,7 +445,7 @@ async fn process_open_request(
                                 "Contract not found, starting get op",
                             );
 
-                            let op = get::start_op(key, return_contract_code);
+                            let op = get::start_op(key, return_contract_code, subscribe);
 
                             op_manager
                                 .ch_outbound
@@ -892,6 +895,7 @@ pub(crate) mod test {
                             contract: contract.clone(),
                             state: WrappedState::new(self.random_byte_vec()),
                             related_contracts: RelatedContracts::new(),
+                            subscribe: true,
                         };
                         state.existing_contracts.push(contract);
                         if !for_this_peer {
@@ -909,6 +913,7 @@ pub(crate) mod test {
                                 contract: contract.clone(),
                                 state: WrappedState::new(self.random_byte_vec()),
                                 related_contracts: RelatedContracts::new(),
+                                subscribe: false,
                             };
 
                             tracing::debug!("sending put to an existing contract");
@@ -925,6 +930,7 @@ pub(crate) mod test {
                             let request = ContractRequest::Get {
                                 key,
                                 return_contract_code: true,
+                                subscribe: false,
                             };
                             return Some(request.into());
                         }
