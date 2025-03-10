@@ -445,7 +445,7 @@ async fn process_client_request(
                         "received PUT contract request"
                     );
                 }
-                ContractRequest::Get { key, return_contract_code } => {
+                ContractRequest::Get { key, return_contract_code, .. } => {
                     tracing::debug!(
                         contract_key = %key,
                         return_code = return_contract_code,
