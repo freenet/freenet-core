@@ -129,7 +129,7 @@ impl LogFile {
             let length = DefaultEndian::read_u32(&buf[..4]) as u64;
 
             match buf[4] {
-                0..=6 => {}
+                0..=7 => {}
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
