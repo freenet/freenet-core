@@ -374,22 +374,19 @@ async fn test_update_contract() -> TestResult {
         .await?;
 
         // Wait for put response
-        loop {
-            let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
-            match resp {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                    assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
-                    break;
-                }
-                Ok(Ok(other)) => {
-                    bail!("unexpected response while waiting for put: {:?}", other);
-                }
-                Ok(Err(e)) => {
-                    bail!("Client A: Error receiving put response: {}", e);
-                }
-                Err(_) => {
-                    bail!("Client A: Timeout waiting for put response");
-                }
+        let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
+            }
+            Ok(Ok(other)) => {
+                bail!("unexpected response while waiting for put: {:?}", other);
+            }
+            Ok(Err(e)) => {
+                bail!("Client A: Error receiving put response: {}", e);
+            }
+            Err(_) => {
+                bail!("Client A: Timeout waiting for put response");
             }
         }
 
@@ -418,28 +415,25 @@ async fn test_update_contract() -> TestResult {
         make_update(&mut client_api_a, contract_key, updated_state.clone()).await?;
 
         // Wait for update response
-        loop {
-            let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
-            match resp {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
-                    key,
-                    summary: _,
-                }))) => {
-                    assert_eq!(
-                        key, contract_key,
-                        "Contract key mismatch in UPDATE response"
-                    );
-                    break;
-                }
-                Ok(Ok(other)) => {
-                    bail!("unexpected response while waiting for update: {:?}", other);
-                }
-                Ok(Err(e)) => {
-                    bail!("Client A: Error receiving update response: {}", e);
-                }
-                Err(_) => {
-                    bail!("Client A: Timeout waiting for update response");
-                }
+        let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                key,
+                summary: _,
+            }))) => {
+                assert_eq!(
+                    key, contract_key,
+                    "Contract key mismatch in UPDATE response"
+                );
+            }
+            Ok(Ok(other)) => {
+                bail!("unexpected response while waiting for update: {:?}", other);
+            }
+            Ok(Err(e)) => {
+                bail!("Client A: Error receiving update response: {}", e);
+            }
+            Err(_) => {
+                bail!("Client A: Timeout waiting for update response");
             }
         }
 
@@ -1265,22 +1259,19 @@ async fn test_get_with_subscribe_flag() -> TestResult {
         .await?;
 
         // Wait for put response
-        loop {
-            let resp = tokio::time::timeout(Duration::from_secs(30), client_api1.recv()).await;
-            match resp {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                    assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
-                    break;
-                }
-                Ok(Ok(other)) => {
-                    bail!("unexpected response while waiting for put: {:?}", other);
-                }
-                Ok(Err(e)) => {
-                    bail!("Client 1: Error receiving put response: {}", e);
-                }
-                Err(_) => {
-                    bail!("Client 1: Timeout waiting for put response");
-                }
+        let resp = tokio::time::timeout(Duration::from_secs(30), client_api1.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
+            }
+            Ok(Ok(other)) => {
+                bail!("unexpected response while waiting for put: {:?}", other);
+            }
+            Ok(Err(e)) => {
+                bail!("Client 1: Error receiving put response: {}", e);
+            }
+            Err(_) => {
+                bail!("Client 1: Timeout waiting for put response");
             }
         }
 
@@ -1288,26 +1279,23 @@ async fn test_get_with_subscribe_flag() -> TestResult {
         make_get(&mut client_api2, contract_key, true, true).await?;
 
         // Wait for get response on second client
-        loop {
-            let resp = tokio::time::timeout(Duration::from_secs(30), client_api2.recv()).await;
-            match resp {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                    key,
-                    contract: Some(_),
-                    state: _,
-                }))) => {
-                    assert_eq!(key, contract_key, "Contract key mismatch in GET response");
-                    break;
-                }
-                Ok(Ok(other)) => {
-                    bail!("unexpected response while waiting for get: {:?}", other);
-                }
-                Ok(Err(e)) => {
-                    bail!("Client 2: Error receiving get response: {}", e);
-                }
-                Err(_) => {
-                    bail!("Client 2: Timeout waiting for get response");
-                }
+        let resp = tokio::time::timeout(Duration::from_secs(30), client_api2.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key,
+                contract: Some(_),
+                state: _,
+            }))) => {
+                assert_eq!(key, contract_key, "Contract key mismatch in GET response");
+            }
+            Ok(Ok(other)) => {
+                bail!("unexpected response while waiting for get: {:?}", other);
+            }
+            Ok(Err(e)) => {
+                bail!("Client 2: Error receiving get response: {}", e);
+            }
+            Err(_) => {
+                bail!("Client 2: Timeout waiting for get response");
             }
         }
 
@@ -1335,28 +1323,25 @@ async fn test_get_with_subscribe_flag() -> TestResult {
         make_update(&mut client_api1, contract_key, updated_state.clone()).await?;
 
         // Wait for update response
-        loop {
-            let resp = tokio::time::timeout(Duration::from_secs(30), client_api1.recv()).await;
-            match resp {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
-                    key,
-                    summary: _,
-                }))) => {
-                    assert_eq!(
-                        key, contract_key,
-                        "Contract key mismatch in UPDATE response"
-                    );
-                    break;
-                }
-                Ok(Ok(other)) => {
-                    bail!("unexpected response while waiting for update: {:?}", other);
-                }
-                Ok(Err(e)) => {
-                    bail!("Client 1: Error receiving update response: {}", e);
-                }
-                Err(_) => {
-                    bail!("Client 1: Timeout waiting for update response");
-                }
+        let resp = tokio::time::timeout(Duration::from_secs(30), client_api1.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                key,
+                summary: _,
+            }))) => {
+                assert_eq!(
+                    key, contract_key,
+                    "Contract key mismatch in UPDATE response"
+                );
+            }
+            Ok(Ok(other)) => {
+                bail!("unexpected response while waiting for update: {:?}", other);
+            }
+            Ok(Err(e)) => {
+                bail!("Client 1: Error receiving update response: {}", e);
+            }
+            Err(_) => {
+                bail!("Client 1: Timeout waiting for update response");
             }
         }
 
@@ -1578,7 +1563,7 @@ async fn test_put_with_subscribe_flag() -> TestResult {
                     print!("Client 1: Error receiving put response: {}", e);
                 }
                 Err(_) => {
-                   println!("Client 1: Error receiving put response");
+                    println!("Client 1: Error receiving put response");
                 }
             }
         }
