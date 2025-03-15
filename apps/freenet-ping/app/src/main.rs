@@ -64,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                 contract: container.ok_or("contract not found while putting")?,
                 state: WrappedState::new(serialized),
                 related_contracts: RelatedContracts::new(),
+                subscribe: false,
             }))
             .await?;
     } else {
@@ -71,6 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
             .send(ClientRequest::ContractOp(ContractRequest::Get {
                 key: contract_key,
                 return_contract_code: true,
+                subscribe: false,
             }))
             .await?;
     }
