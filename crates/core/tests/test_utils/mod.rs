@@ -20,13 +20,14 @@ pub async fn make_put(
     client: &mut WebApi,
     state: WrappedState,
     contract: ContractContainer,
+    subscribe: bool,
 ) -> anyhow::Result<()> {
     client
         .send(ClientRequest::ContractOp(ContractRequest::Put {
             contract: contract.clone(),
             state: state.clone(),
             related_contracts: RelatedContracts::default(),
-            subscribe: false,
+            subscribe,
         }))
         .await?;
     Ok(())
@@ -46,16 +47,27 @@ pub async fn make_update(
     Ok(())
 }
 
+pub async fn make_subscribe(client: &mut WebApi, key: ContractKey) -> anyhow::Result<()> {
+    client
+        .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
+            key,
+            summary: None,
+        }))
+        .await?;
+    Ok(())
+}
+
 pub async fn make_get(
     client: &mut WebApi,
     key: ContractKey,
     return_contract_code: bool,
+    subscribe: bool,
 ) -> anyhow::Result<()> {
     client
         .send(ClientRequest::ContractOp(ContractRequest::Get {
             key,
             return_contract_code,
-            subscribe: false,
+            subscribe,
         }))
         .await?;
     Ok(())
