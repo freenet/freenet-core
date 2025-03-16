@@ -10,7 +10,23 @@ impl ContractExecutor for Executor<Runtime> {
         key: ContractKey,
         return_contract_code: bool,
     ) -> Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError> {
-        match self.perform_contract_get(return_contract_code, key).await {
+        tracing::debug!(
+            contract = %key,
+            return_code = return_contract_code,
+            "fetching contract"
+        );
+        let result = self.perform_contract_get(return_contract_code, key).await;
+        if let Ok((Some(ref state), ref code)) = result {
+            let hash = blake3::hash(state.as_ref());
+            tracing::debug!(
+                contract = %key,
+                state_size = state.as_ref().len(),
+                state_hash = %hash,
+                has_code = code.is_some(),
+                "fetched contract state"
+            );
+        }
+        match result {
             Ok((state, code)) => Ok((state, code)),
             Err(err) => Err(err),
         }
@@ -23,6 +39,15 @@ impl ContractExecutor for Executor<Runtime> {
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
     ) -> Result<UpsertResult, ExecutorError> {
+        if let Either::Left(ref state) = update {
+            let hash = blake3::hash(state.as_ref());
+            tracing::debug!(
+                contract = %key,
+                state_size = state.as_ref().len(),
+                state_hash = %hash,
+                "upserting contract state"
+            );
+        }
         let params = if let Some(code) = &code {
             code.params()
         } else {
@@ -192,6 +217,10 @@ impl ContractExecutor for Executor<Runtime> {
 }
 
 impl Executor<Runtime> {
+    // Private implementation methods
+}
+
+impl Executor<Runtime> {
     pub async fn from_config(
         config: Arc<Config>,
         event_loop_channel: Option<ExecutorToEventLoopChannel<ExecutorHalve>>,
@@ -263,6 +292,7 @@ impl Executor<Runtime> {
                     contract,
                     state,
                     related_contracts,
+                    subscribe: false,
                 },
                 cli_id,
                 None,
@@ -291,23 +321,41 @@ impl Executor<Runtime> {
                 }
                 Err(RequestError::Disconnect.into())
             }
-            _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
+            other => {
+                tracing::warn!(
+                    client = %id,
+                    request = ?other,
+                    "unsupported client request"
+                );
+                Err(ExecutorError::other(anyhow::anyhow!("not supported")))
+            }
         }
     }
 
-    /// Responde to requests made through any API's from client applications in local mode.
+    /// Respond to requests made through any API's from client applications in local mode.
     pub async fn contract_requests(
         &mut self,
         req: ContractRequest<'_>,
         cli_id: ClientId,
         updates: Option<mpsc::UnboundedSender<Result<HostResponse, WsClientError>>>,
     ) -> Response {
-        match req {
+        tracing::debug!(
+            client = %cli_id,
+            "received contract request"
+        );
+        let result = match req {
             ContractRequest::Put {
                 contract,
                 state,
                 related_contracts,
+                ..
             } => {
+                tracing::debug!(
+                    client = %cli_id,
+                    contract = %contract.key(),
+                    state_size = state.as_ref().len(),
+                    "putting contract"
+                );
                 self.perform_contract_put(contract, state, related_contracts)
                     .await
             }
@@ -317,10 +365,15 @@ impl Executor<Runtime> {
             ContractRequest::Get {
                 key,
                 return_contract_code,
+                ..
             } => match self.perform_contract_get(return_contract_code, key).await {
                 Ok((state, contract)) => Ok(ContractResponse::GetResponse {
                     key,
                     state: state.ok_or_else(|| {
+                        tracing::debug!(
+                            contract = %key,
+                            "Contract state not found during get request."
+                        );
                         ExecutorError::request(StdContractError::Get {
                             key,
                             cause: "contract state not found".into(),
@@ -332,7 +385,12 @@ impl Executor<Runtime> {
                 Err(err) => Err(err),
             },
             ContractRequest::Subscribe { key, summary } => {
-                tracing::debug!("subscribing to contract {key}");
+                tracing::debug!(
+                    client = %cli_id,
+                    contract = %key,
+                    has_summary = summary.is_some(),
+                    "subscribing to contract"
+                );
                 let updates = updates.ok_or_else(|| {
                     ExecutorError::other(anyhow::anyhow!("missing update channel"))
                 })?;
@@ -347,8 +405,25 @@ impl Executor<Runtime> {
                 }
                 .into())
             }
-            _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
+            other => {
+                tracing::warn!(
+                    client = %cli_id,
+                    request = ?other,
+                    "unsupported contract request"
+                );
+                Err(ExecutorError::other(anyhow::anyhow!("not supported")))
+            }
+        };
+
+        if let Err(ref e) = result {
+            tracing::error!(
+                client = %cli_id,
+                error = %e,
+                "contract request failed"
+            );
         }
+
+        result
     }
 
     pub fn delegate_request(
@@ -687,6 +762,11 @@ impl Executor<Runtime> {
         return_contract_code: bool,
         key: ContractKey,
     ) -> Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError> {
+        tracing::debug!(
+            contract = %key,
+            return_code = return_contract_code,
+            "Getting contract"
+        );
         let mut got_contract: Option<ContractContainer> = None;
 
         if return_contract_code {
@@ -695,15 +775,28 @@ impl Executor<Runtime> {
             }
         }
 
-        match self.state_store.get(&key).await {
+        let state_result = self.state_store.get(&key).await;
+        tracing::debug!(
+            contract = %key,
+            state_found = state_result.is_ok(),
+            has_contract = got_contract.is_some(),
+            "Contract get result"
+        );
+        match state_result {
             Ok(state) => Ok((Some(state), got_contract)),
-            Err(StateStoreError::MissingContract(_)) => Ok((None, got_contract)),
-            Err(err) => Err(ExecutorError::request(RequestError::from(
-                StdContractError::Get {
-                    key,
-                    cause: format!("{err}").into(),
-                },
-            ))),
+            Err(StateStoreError::MissingContract(_)) => {
+                tracing::warn!(contract = %key, "Contract state not found in store");
+                Ok((None, got_contract))
+            }
+            Err(err) => {
+                tracing::error!(contract = %key, error = %err, "Failed to get contract state");
+                Err(ExecutorError::request(RequestError::from(
+                    StdContractError::Get {
+                        key,
+                        cause: format!("{err}").into(),
+                    },
+                )))
+            }
         }
     }
 
@@ -731,6 +824,15 @@ impl Executor<Runtime> {
     ) -> Result<(), ExecutorError> {
         let key = trying_container.key();
         let params = trying_container.params();
+        let state_hash = blake3::hash(state.as_ref());
+
+        tracing::debug!(
+            contract = %key,
+            state_size = state.as_ref().len(),
+            state_hash = %state_hash,
+            params_size = params.as_ref().len(),
+            "starting contract verification and storage"
+        );
 
         const DEPENDENCY_CYCLE_LIMIT_GUARD: usize = 100;
         let mut iterations = 0;
@@ -745,10 +847,21 @@ impl Executor<Runtime> {
 
         while iterations < DEPENDENCY_CYCLE_LIMIT_GUARD {
             if let Some(contract) = trying_contract.take() {
+                tracing::debug!(
+                    contract = %trying_key,
+                    "storing contract in runtime store"
+                );
                 self.runtime
                     .contract_store
                     .store_contract(contract)
-                    .map_err(ExecutorError::other)?;
+                    .map_err(|e| {
+                        tracing::error!(
+                            contract = %trying_key,
+                            error = %e,
+                            "failed to store contract in runtime"
+                        );
+                        ExecutorError::other(e)
+                    })?;
             }
 
             let result = self
@@ -805,10 +918,22 @@ impl Executor<Runtime> {
                 }));
             }
 
+            tracing::debug!(
+                contract = %trying_key,
+                state_size = trying_state.as_ref().len(),
+                "storing contract state"
+            );
             self.state_store
                 .store(trying_key, trying_state.clone(), trying_params.clone())
                 .await
-                .map_err(ExecutorError::other)?;
+                .map_err(|e| {
+                    tracing::error!(
+                        contract = %trying_key,
+                        error = %e,
+                        "failed to store contract state"
+                    );
+                    ExecutorError::other(e)
+                })?;
             if trying_key != original_key {
                 trying_key = original_key;
                 trying_params = original_params.clone();

@@ -57,6 +57,9 @@ fn main() -> anyhow::Result<()> {
                 config::NodeCommand::Update(update_config) => {
                     update(update_config, config.additional).await
                 }
+                config::NodeCommand::GetContractId(get_contract_id_config) => {
+                    commands::get_contract_id(get_contract_id_config).await
+                }
             },
             SubCommand::Test(test_config) => testing::test_framework(test_config).await,
             SubCommand::NetworkMetricsServer(server_config) => {
@@ -70,6 +73,9 @@ fn main() -> anyhow::Result<()> {
             SubCommand::Query {} => {
                 query::query(config.additional).await?;
                 Ok(())
+            }
+            SubCommand::GetContractId(get_contract_id_config) => {
+                commands::get_contract_id(get_contract_id_config).await
             }
         };
         // todo: make all commands return concrete `thiserror` compatible errors so we can use anyhow

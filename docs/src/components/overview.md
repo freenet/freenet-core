@@ -14,11 +14,11 @@ the P2P network via contracts.
 The Freenet Core is the software that enables a user's computer to connect to
 the Freenet network. Its primary functions are:
 
-* Providing a user-friendly interface to access Freenet via a web browser
-* Host the user's [delegates](delegates.md) and the private data they store
-* Host [contracts](contracts.md) and their associated data on behalf of the
+- Providing a user-friendly interface to access Freenet via a web browser
+- Host the user's [delegates](delegates.md) and the private data they store
+- Host [contracts](contracts.md) and their associated data on behalf of the
   network
-* Manage communication between contracts, delegates, and UI components
+- Manage communication between contracts, delegates, and UI components
 
 Built with Rust, the core is designed to be compact (ideally under 5 MB),
 efficient, and capable of running on a variety of devices such as smartphones,

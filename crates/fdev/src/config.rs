@@ -48,6 +48,8 @@ pub enum SubCommand {
     Execute(RunCliConfig),
     Test(crate::testing::TestConfig),
     NetworkMetricsServer(crate::network_metrics_server::ServerConfig),
+    /// Get the contract ID without publishing
+    GetContractId(crate::commands::GetContractIdConfig),
 }
 
 impl SubCommand {
@@ -76,6 +78,7 @@ pub struct RunCliConfig {
 pub enum NodeCommand {
     Put(PutConfig),
     Update(UpdateConfig),
+    GetContractId(crate::commands::GetContractIdConfig),
 }
 
 /// Updates a contract in the network.
@@ -114,6 +117,10 @@ pub struct PutConfig {
     /// Type of put to perform.
     #[clap(subcommand)]
     pub(crate) package_type: PutType,
+
+    /// Flag that indicates if the node should subscribe to the contract.
+    #[arg(long)]
+    pub(crate) subscribe: bool,
 }
 
 /// Builds and packages a contract or delegate.
