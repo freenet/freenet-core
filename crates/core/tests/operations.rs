@@ -21,7 +21,7 @@ use test_utils::{make_get, make_put, make_subscribe, make_update};
 use testresult::TestResult;
 use tokio::select;
 use tokio_tungstenite::connect_async;
-use tracing::level_filters::LevelFilter;
+use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 
 mod test_utils;
 
@@ -160,8 +160,8 @@ async fn test_put_contract() -> TestResult {
     .await?;
     let ws_api_port_peer_a = config_a.ws_api.ws_api_port.unwrap();
 
-    println!("Node A data dir: {:?}", preset_cfg_b.temp_dir.path());
-    println!("Node B data dir: {:?}", preset_cfg_a.temp_dir.path());
+    tracing::info!("Node A data dir: {:?}", preset_cfg_b.temp_dir.path());
+    tracing::info!("Node B data dir: {:?}", preset_cfg_a.temp_dir.path());
 
     std::mem::drop(ws_api_port_socket_a); // Free the port so it does not fail on initialization
     let node_a = async move {
@@ -319,8 +319,8 @@ async fn test_update_contract() -> TestResult {
     let ws_api_port = config_a.ws_api.ws_api_port.unwrap();
 
     // Log data directories for debugging
-    println!("Node A data dir: {:?}", preset_cfg_a.temp_dir.path());
-    println!("Node B (gw) data dir: {:?}", preset_cfg_b.temp_dir.path());
+    tracing::info!("Node A data dir: {:?}", preset_cfg_a.temp_dir.path());
+    tracing::info!("Node B (gw) data dir: {:?}", preset_cfg_b.temp_dir.path());
 
     // Free ports so they don't fail on initialization
     std::mem::drop(ws_api_port_socket_a);
@@ -531,8 +531,8 @@ async fn test_multiple_clients_subscription() -> TestResult {
     let ws_api_port_socket_b = TcpListener::bind("127.0.0.1:0")?;
     let ws_api_port_socket_c = TcpListener::bind("127.0.0.1:0")?; // Socket for node C (second client)
 
-    // Configure gateway node B
-    let (config_b, preset_cfg_b, config_b_gw) = {
+    // Configure gateway node
+    let (config_gw, preset_cfg_b, gw_cfg) = {
         let (cfg, preset) = base_node_test_config(
             true,
             vec![],
@@ -548,27 +548,27 @@ async fn test_multiple_clients_subscription() -> TestResult {
     // Configure client node A
     let (config_a, preset_cfg_a) = base_node_test_config(
         false,
-        vec![serde_json::to_string(&config_b_gw)?],
+        vec![serde_json::to_string(&gw_cfg)?],
         None,
         ws_api_port_socket_a.local_addr()?.port(),
     )
     .await?;
     let ws_api_port_a = config_a.ws_api.ws_api_port.unwrap();
 
-    // Configure client node C (second client node)
-    let (config_c, preset_cfg_c) = base_node_test_config(
+    // Configure client node B (second client node)
+    let (config_b, preset_cfg_c) = base_node_test_config(
         false,
-        vec![serde_json::to_string(&config_b_gw)?],
+        vec![serde_json::to_string(&gw_cfg)?],
         None,
         ws_api_port_socket_c.local_addr()?.port(),
     )
     .await?;
-    let ws_api_port_c = config_c.ws_api.ws_api_port.unwrap();
+    let ws_api_port_b = config_b.ws_api.ws_api_port.unwrap();
 
     // Log data directories for debugging
-    println!("Node A data dir: {:?}", preset_cfg_a.temp_dir.path());
-    println!("Node B (gw) data dir: {:?}", preset_cfg_b.temp_dir.path());
-    println!("Node C data dir: {:?}", preset_cfg_c.temp_dir.path());
+    tracing::info!("Node A data dir: {:?}", preset_cfg_a.temp_dir.path());
+    tracing::info!("Node B (gw) data dir: {:?}", preset_cfg_b.temp_dir.path());
+    tracing::info!("Node C data dir: {:?}", preset_cfg_c.temp_dir.path());
 
     // Free ports so they don't fail on initialization
     std::mem::drop(ws_api_port_socket_a);
@@ -587,9 +587,9 @@ async fn test_multiple_clients_subscription() -> TestResult {
     }
     .boxed_local();
 
-    // Start node B (gateway)
-    let node_b = async {
-        let config = config_b.build().await?;
+    // Start GW node
+    let node_gw = async {
+        let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
             .build(serve_gateway(config.ws_api).await)
@@ -598,9 +598,9 @@ async fn test_multiple_clients_subscription() -> TestResult {
     }
     .boxed_local();
 
-    // Start node C (second client)
-    let node_c = async {
-        let config = config_c.build().await?;
+    // Start node B (second client)
+    let node_b = async {
+        let config = config_b.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
             .build(serve_gateway(config.ws_api).await)
@@ -619,23 +619,23 @@ async fn test_multiple_clients_subscription() -> TestResult {
             ws_api_port_a
         );
         let (stream1, _) = connect_async(&uri_a).await?;
-        let mut client_api1 = WebApi::start(stream1);
+        let mut client_api1_node_a = WebApi::start(stream1);
 
         // Connect second client to node A's websocket API
         let (stream2, _) = connect_async(&uri_a).await?;
-        let mut client_api2 = WebApi::start(stream2);
+        let mut client_api2_node_a = WebApi::start(stream2);
 
         // Connect third client to node C's websocket API (different node)
         let uri_c = format!(
             "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_c
+            ws_api_port_b
         );
         let (stream3, _) = connect_async(&uri_c).await?;
-        let mut client_api3 = WebApi::start(stream3);
+        let mut client_api_node_b = WebApi::start(stream3);
 
         // First client puts contract with initial state (without subscribing)
         make_put(
-            &mut client_api1,
+            &mut client_api1_node_a,
             wrapped_state.clone(),
             contract.clone(),
             false, // subscribe=false - no automatic subscription
@@ -644,7 +644,8 @@ async fn test_multiple_clients_subscription() -> TestResult {
 
         // Wait for put response
         loop {
-            let resp = tokio::time::timeout(Duration::from_secs(60), client_api1.recv()).await;
+            let resp =
+                tokio::time::timeout(Duration::from_secs(60), client_api1_node_a.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                     assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
@@ -663,11 +664,12 @@ async fn test_multiple_clients_subscription() -> TestResult {
         }
 
         // Explicitly subscribe client 1 to the contract using make_subscribe
-        make_subscribe(&mut client_api1, contract_key).await?;
+        make_subscribe(&mut client_api1_node_a, contract_key).await?;
 
         // Wait for subscribe response
         loop {
-            let resp = tokio::time::timeout(Duration::from_secs(30), client_api1.recv()).await;
+            let resp =
+                tokio::time::timeout(Duration::from_secs(30), client_api1_node_a.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
                     key,
@@ -697,11 +699,12 @@ async fn test_multiple_clients_subscription() -> TestResult {
         }
 
         // Second client gets the contract (without subscribing)
-        make_get(&mut client_api2, contract_key, true, false).await?;
+        make_get(&mut client_api2_node_a, contract_key, true, false).await?;
 
         // Wait for get response on second client
         loop {
-            let resp = tokio::time::timeout(Duration::from_secs(30), client_api2.recv()).await;
+            let resp =
+                tokio::time::timeout(Duration::from_secs(30), client_api2_node_a.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                     key,
@@ -724,11 +727,12 @@ async fn test_multiple_clients_subscription() -> TestResult {
         }
 
         // Explicitly subscribe client 2 to the contract using make_subscribe
-        make_subscribe(&mut client_api2, contract_key).await?;
+        make_subscribe(&mut client_api2_node_a, contract_key).await?;
 
         // Wait for subscribe response
         loop {
-            let resp = tokio::time::timeout(Duration::from_secs(30), client_api2.recv()).await;
+            let resp =
+                tokio::time::timeout(Duration::from_secs(30), client_api2_node_a.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
                     key,
@@ -758,11 +762,12 @@ async fn test_multiple_clients_subscription() -> TestResult {
         }
 
         // Third client gets the contract from node C (without subscribing)
-        make_get(&mut client_api3, contract_key, true, false).await?;
+        make_get(&mut client_api_node_b, contract_key, true, false).await?;
 
         // Wait for get response on third client
         loop {
-            let resp = tokio::time::timeout(Duration::from_secs(30), client_api3.recv()).await;
+            let resp =
+                tokio::time::timeout(Duration::from_secs(30), client_api_node_b.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                     key,
@@ -791,11 +796,12 @@ async fn test_multiple_clients_subscription() -> TestResult {
         }
 
         // Explicitly subscribe client 3 to the contract using make_subscribe
-        make_subscribe(&mut client_api3, contract_key).await?;
+        make_subscribe(&mut client_api_node_b, contract_key).await?;
 
         // Wait for subscribe response
         loop {
-            let resp = tokio::time::timeout(Duration::from_secs(30), client_api3.recv()).await;
+            let resp =
+                tokio::time::timeout(Duration::from_secs(30), client_api_node_b.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
                     key,
@@ -846,12 +852,12 @@ async fn test_multiple_clients_subscription() -> TestResult {
         let updated_state = WrappedState::from(updated_bytes);
 
         // First client updates the contract
-        make_update(&mut client_api1, contract_key, updated_state.clone()).await?;
+        make_update(&mut client_api1_node_a, contract_key, updated_state.clone()).await?;
 
         // Wait for update response and notifications on all clients
         let mut client1_received_notification = false;
         let mut client2_received_notification = false;
-        let mut client3_received_notification = false;
+        let mut client_node_b_received_notification = false;
         let mut received_update_response = false;
 
         // Expected task after update
@@ -869,11 +875,12 @@ async fn test_multiple_clients_subscription() -> TestResult {
             && (!received_update_response
                 || !client1_received_notification
                 || !client2_received_notification
-                || !client3_received_notification)
+                || !client_node_b_received_notification)
         {
             // Check for messages on client 1
             if !received_update_response || !client1_received_notification {
-                let resp = tokio::time::timeout(Duration::from_secs(1), client_api1.recv()).await;
+                let resp =
+                    tokio::time::timeout(Duration::from_secs(1), client_api1_node_a.recv()).await;
                 match resp {
                     Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
                         key,
@@ -959,7 +966,8 @@ async fn test_multiple_clients_subscription() -> TestResult {
 
             // Check for notification on client 2
             if !client2_received_notification {
-                let resp = tokio::time::timeout(Duration::from_secs(1), client_api2.recv()).await;
+                let resp =
+                    tokio::time::timeout(Duration::from_secs(1), client_api2_node_a.recv()).await;
                 match resp {
                     Ok(Ok(HostResponse::ContractResponse(
                         ContractResponse::UpdateNotification { key, update },
@@ -1033,8 +1041,9 @@ async fn test_multiple_clients_subscription() -> TestResult {
             }
 
             // Check for notification on client 3 (on different node)
-            if !client3_received_notification {
-                let resp = tokio::time::timeout(Duration::from_secs(1), client_api3.recv()).await;
+            if !client_node_b_received_notification {
+                let resp =
+                    tokio::time::timeout(Duration::from_secs(1), client_api_node_b.recv()).await;
                 match resp {
                     Ok(Ok(HostResponse::ContractResponse(
                         ContractResponse::UpdateNotification { key, update },
@@ -1095,7 +1104,7 @@ async fn test_multiple_clients_subscription() -> TestResult {
                             "✅ Client 3: Successfully received update notification for contract {} (cross-node)",
                             key
                         );
-                        client3_received_notification = true;
+                        client_node_b_received_notification = true;
                     }
                     Ok(Ok(other)) => {
                         tracing::debug!("Client 3: Received unexpected response: {:?}", other);
@@ -1127,7 +1136,7 @@ async fn test_multiple_clients_subscription() -> TestResult {
             "Client 2 did not receive update notification within timeout period"
         );
         assert!(
-            client3_received_notification,
+            client_node_b_received_notification,
             "Client 3 did not receive update notification within timeout period (cross-node)"
         );
 
@@ -1140,11 +1149,11 @@ async fn test_multiple_clients_subscription() -> TestResult {
             let Err(a) = a;
             return Err(anyhow!("Node A failed: {}", a).into());
         }
-        b = node_b => {
+        b = node_gw => {
             let Err(b) = b;
             return Err(anyhow!("Node B failed: {}", b).into());
         }
-        c = node_c => {
+        c = node_b => {
             let Err(c) = c;
             return Err(anyhow!("Node C failed: {}", c).into());
         }
@@ -1200,8 +1209,8 @@ async fn test_get_with_subscribe_flag() -> TestResult {
     let ws_api_port_a = config_a.ws_api.ws_api_port.unwrap();
 
     // Log data directories for debugging
-    println!("Node A data dir: {:?}", preset_cfg_a.temp_dir.path());
-    println!("Node B (gw) data dir: {:?}", preset_cfg_b.temp_dir.path());
+    tracing::info!("Node A data dir: {:?}", preset_cfg_a.temp_dir.path());
+    tracing::info!("Node B (gw) data dir: {:?}", preset_cfg_b.temp_dir.path());
 
     // Free ports so they don't fail on initialization
     std::mem::drop(ws_api_port_socket_a);
@@ -1240,23 +1249,27 @@ async fn test_get_with_subscribe_flag() -> TestResult {
             ws_api_port_a
         );
         let (stream1, _) = connect_async(&uri_a).await?;
-        let mut client_api1 = WebApi::start(stream1);
+        let mut client_api1_node_a = WebApi::start(stream1);
 
         // Connect second client to node A's websocket API (for getting with auto-subscribe)
         let (stream2, _) = connect_async(&uri_a).await?;
-        let mut client_api2 = WebApi::start(stream2);
+        let mut client_api2_node_a = WebApi::start(stream2);
+
+        tracing::info!("Client 1: Put contract with initial state");
+
 
         // First client puts contract with initial state (without subscribing)
         make_put(
-            &mut client_api1,
+            &mut client_api1_node_a,
             wrapped_state.clone(),
             contract.clone(),
             false, // subscribe=false
         )
         .await?;
 
+
         // Wait for put response
-        let resp = tokio::time::timeout(Duration::from_secs(30), client_api1.recv()).await;
+        let resp = tokio::time::timeout(Duration::from_secs(30), client_api1_node_a.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                 assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
@@ -1272,11 +1285,13 @@ async fn test_get_with_subscribe_flag() -> TestResult {
             }
         }
 
+        tracing::warn!("Client 1: Successfully put contract {}", contract_key);
+
         // Second client gets the contract with auto-subscribe
-        make_get(&mut client_api2, contract_key, true, true).await?;
+        make_get(&mut client_api2_node_a, contract_key, true, true).await?;
 
         // Wait for get response on second client
-        let resp = tokio::time::timeout(Duration::from_secs(30), client_api2.recv()).await;
+        let resp = tokio::time::timeout(Duration::from_secs(30), client_api2_node_a.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                 key,
@@ -1317,10 +1332,10 @@ async fn test_get_with_subscribe_flag() -> TestResult {
         let updated_state = WrappedState::from(updated_bytes);
 
         // First client updates the contract
-        make_update(&mut client_api1, contract_key, updated_state.clone()).await?;
+        make_update(&mut client_api1_node_a, contract_key, updated_state.clone()).await?;
 
         // Wait for update response
-        let resp = tokio::time::timeout(Duration::from_secs(30), client_api1.recv()).await;
+        let resp = tokio::time::timeout(Duration::from_secs(30), client_api1_node_a.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
                 key,
@@ -1352,12 +1367,12 @@ async fn test_get_with_subscribe_flag() -> TestResult {
         };
 
         // Wait for update notification on client 2 (should be auto-subscribed)
-        let mut client2_received_notification = false;
+        let mut client2_node_a_received_notification = false;
 
         // Try for up to 30 seconds to receive the notification
         let start_time = std::time::Instant::now();
-        while start_time.elapsed() < Duration::from_secs(30) && !client2_received_notification {
-            let resp = tokio::time::timeout(Duration::from_secs(1), client_api2.recv()).await;
+        while start_time.elapsed() < Duration::from_secs(30) && !client2_node_a_received_notification {
+            let resp = tokio::time::timeout(Duration::from_secs(1), client_api2_node_a.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
                     key,
@@ -1401,17 +1416,17 @@ async fn test_get_with_subscribe_flag() -> TestResult {
                             bail!("Client 2: Timeout waiting for update notification");
                         }
                     }
-                    client2_received_notification = true;
+                    client2_node_a_received_notification = true;
                     break;
                 }
                 Ok(Ok(other)) => {
                     bail!("unexpected response while waiting for update: {:?}", other);
                 }
                 Ok(Err(e)) => {
-                    println!("Client 2: Timeout waiting for update: {}", e);
+                    tracing::error!("Client 2: Timeout waiting for update: {}", e);
                 }
                 Err(_) => {
-                    println!("Client 2: Timeout waiting for update response");
+                    tracing::error!("Client 2: Timeout waiting for update response");
                 }
             }
 
@@ -1421,12 +1436,12 @@ async fn test_get_with_subscribe_flag() -> TestResult {
 
         // Assert that client 2 received the notification (proving auto-subscribe worked)
         assert!(
-            client2_received_notification,
+            client2_node_a_received_notification,
             "Client 2 did not receive update notification within timeout period (auto-subscribe via GET failed)"
         );
 
         Ok::<_, anyhow::Error>(())
-    });
+    }).instrument(span!(Level::INFO, "test_get_with_subscribe_flag"));
 
     // Wait for test completion or node failures
     select! {
@@ -1490,8 +1505,8 @@ async fn test_put_with_subscribe_flag() -> TestResult {
     let ws_api_port_a = config_a.ws_api.ws_api_port.unwrap();
 
     // Log data directories for debugging
-    println!("Node A data dir: {:?}", preset_cfg_a.temp_dir.path());
-    println!("Node B (gw) data dir: {:?}", preset_cfg_b.temp_dir.path());
+    tracing::info!("Node A data dir: {:?}", preset_cfg_a.temp_dir.path());
+    tracing::info!("Node B (gw) data dir: {:?}", preset_cfg_b.temp_dir.path());
 
     // Free ports so they don't fail on initialization
     std::mem::drop(ws_api_port_socket_a);
@@ -1557,10 +1572,10 @@ async fn test_put_with_subscribe_flag() -> TestResult {
                     bail!("Contract key mismatch in PUT response: {:?}", other);
                 }
                 Ok(Err(e)) => {
-                    print!("Client 1: Error receiving put response: {}", e);
+                    tracing::error!("Client 1: Error receiving put response: {}", e);
                 }
                 Err(_) => {
-                    println!("Client 1: Error receiving put response");
+                    tracing::error!("Client 1: Error receiving put response");
                 }
             }
         }
@@ -1584,10 +1599,10 @@ async fn test_put_with_subscribe_flag() -> TestResult {
                     bail!("unexpected response while waiting for get: {:?}", other);
                 }
                 Ok(Err(e)) => {
-                    println!("Client 2: Error receiving get response: {}", e);
+                    tracing::error!("Client 2: Error receiving get response: {}", e);
                 }
                 Err(_) => {
-                    println!("Client 2: Error receiving get response");
+                    tracing::error!("Client 2: Error receiving get response");
                 }
             }
         }
@@ -1634,10 +1649,10 @@ async fn test_put_with_subscribe_flag() -> TestResult {
                     bail!("unexpected response while waiting for update: {:?}", other);
                 }
                 Ok(Err(e)) => {
-                    println!("Client 2: Error receiving update response: {}", e);
+                    tracing::error!("Client 2: Error receiving update response: {}", e);
                 }
                 Err(_) => {
-                    println!("Client 2: Error receiving update response");
+                    tracing::error!("Client 2: Error receiving update response");
                 }
             }
         }
@@ -1713,10 +1728,10 @@ async fn test_put_with_subscribe_flag() -> TestResult {
                     bail!("unexpected response while waiting for update: {:?}", other);
                 }
                 Ok(Err(e)) => {
-                    println!("Client 2: Error receiving update response: {}", e);
+                    tracing::error!("Client 2: Error receiving update response: {}", e);
                 }
                 Err(_) => {
-                    println!("Client 2: Error receiving update response");
+                    tracing::error!("Client 2: Error receiving update response");
                 }
             }
 

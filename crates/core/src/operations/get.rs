@@ -763,6 +763,7 @@ impl Operation for GetOp {
                                     op_manager.ring.seed_contract(key);
                                     let mut new_skip_list = skip_list.clone();
                                     new_skip_list.insert(sender.peer.clone());
+                                    
                                     super::start_subscription_request(
                                         op_manager,
                                         key,

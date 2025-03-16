@@ -103,6 +103,7 @@ impl WebSocketProxy {
             } => {
                 let open_req = match &*req {
                     ClientRequest::ContractOp(ContractRequest::Subscribe { key, .. }) => {
+                        tracing::debug!(%client_id, contract = %key, "subscribing to contract");
                         // intercept subscription messages because they require a callback subscription channel
                         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                         if let Some(ch) = self.response_channels.get(&client_id) {
