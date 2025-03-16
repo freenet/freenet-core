@@ -95,7 +95,6 @@ const TransactionPeersHistory = ({
     useEffect(() => {
         let transaction_description_to_render = get_peers_description_to_render(tx_peer_list);
 
-        console.log("Transaction description to render=", transaction_description_to_render);
         set_mermaid_text(transaction_description_to_render);
 
         setTimeout(() => {
