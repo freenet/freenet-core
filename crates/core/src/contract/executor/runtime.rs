@@ -372,7 +372,7 @@ impl Executor<Runtime> {
                     state: state.ok_or_else(|| {
                         tracing::debug!(
                             contract = %key,
-                            "Contract state not found during get request." 
+                            "Contract state not found during get request."
                         );
                         ExecutorError::request(StdContractError::Get {
                             key,
@@ -787,14 +787,14 @@ impl Executor<Runtime> {
             Err(StateStoreError::MissingContract(_)) => {
                 tracing::warn!(contract = %key, "Contract state not found in store");
                 Ok((None, got_contract))
-            },
+            }
             Err(err) => {
                 tracing::error!(contract = %key, error = %err, "Failed to get contract state");
                 Err(ExecutorError::request(RequestError::from(
                     StdContractError::Get {
                         key,
                         cause: format!("{err}").into(),
-                    }
+                    },
                 )))
             }
         }
@@ -825,7 +825,7 @@ impl Executor<Runtime> {
         let key = trying_container.key();
         let params = trying_container.params();
         let state_hash = blake3::hash(state.as_ref());
-        
+
         tracing::debug!(
             contract = %key,
             state_size = state.as_ref().len(),

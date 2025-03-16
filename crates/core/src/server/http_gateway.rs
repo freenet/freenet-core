@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
 use axum::extract::Path;
-use tracing::instrument;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Extension, Router};
@@ -11,6 +10,7 @@ use freenet_stdlib::prelude::ContractInstanceId;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use tokio::sync::mpsc;
+use tracing::instrument;
 
 use crate::client_events::{ClientEventsProxy, ClientId, OpenRequest};
 use crate::server::HostCallbackResult;

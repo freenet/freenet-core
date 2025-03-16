@@ -236,7 +236,7 @@ async fn websocket_interface(
     tracing::debug!("starting websocket interface handler");
     let (mut response_rx, client_id) = new_client_connection(&request_sender).await?;
     tracing::debug!(client_id = %client_id, "client connection established");
-    
+
     let (mut server_sink, mut client_stream) = ws.split();
     tracing::debug!("websocket stream split for bidirectional communication");
     let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::UnboundedReceiver<HostResult>)>>> =
@@ -402,12 +402,15 @@ async fn process_client_request(
         match encoding_protoc {
             EncodingProtocol::Flatbuffers => match ClientRequest::try_decode_fbs(&msg) {
                 Ok(decoded) => {
-                    tracing::debug!(protocol = "flatbuffers", "successfully decoded client request");
+                    tracing::debug!(
+                        protocol = "flatbuffers",
+                        "successfully decoded client request"
+                    );
                     decoded.into_owned()
                 }
                 Err(err) => {
                     tracing::error!(error = %err, protocol = "flatbuffers", "failed to decode client request");
-                    return Ok(Some(Message::Binary(err.into_fbs_bytes())))
+                    return Ok(Some(Message::Binary(err.into_fbs_bytes())));
                 }
             },
             EncodingProtocol::Native => match bincode::deserialize::<ClientRequest>(&msg) {
@@ -436,25 +439,29 @@ async fn process_client_request(
 
     // Log specific details for contract operations
     match &req {
-        ClientRequest::ContractOp(op) => {
-            match op {
-                ContractRequest::Put { contract, state, .. } => {
-                    tracing::debug!(
-                        contract_key = %contract.key(),
-                        state_size = state.as_ref().len(),
-                        "received PUT contract request"
-                    );
-                }
-                ContractRequest::Get { key, return_contract_code, .. } => {
-                    tracing::debug!(
-                        contract_key = %key,
-                        return_code = return_contract_code,
-                        "received GET contract request"
-                    );
-                }
-                _ => tracing::debug!(operation = ?op, "received contract operation request"),
+        ClientRequest::ContractOp(op) => match op {
+            ContractRequest::Put {
+                contract, state, ..
+            } => {
+                tracing::debug!(
+                    contract_key = %contract.key(),
+                    state_size = state.as_ref().len(),
+                    "received PUT contract request"
+                );
             }
-        }
+            ContractRequest::Get {
+                key,
+                return_contract_code,
+                ..
+            } => {
+                tracing::debug!(
+                    contract_key = %key,
+                    return_code = return_contract_code,
+                    "received GET contract request"
+                );
+            }
+            _ => tracing::debug!(operation = ?op, "received contract operation request"),
+        },
         _ => tracing::debug!(req = %req, "received client request"),
     }
     request_sender
@@ -480,25 +487,27 @@ async fn process_host_response(
             let result = match result {
                 Ok(res) => {
                     match &res {
-                        HostResponse::ContractResponse(resp) => {
-                            match resp {
-                                ContractResponse::GetResponse { key, contract, state } => {
-                                    tracing::debug!(
-                                        contract_key = %key,
-                                        has_contract = contract.is_some(),
-                                        state_size = state.as_ref().len(),
-                                        "sending GET response"
-                                    );
-                                }
-                                ContractResponse::PutResponse { key } => {
-                                    tracing::debug!(
-                                        contract_key = %key,
-                                        "sending PUT response"
-                                    );
-                                }
-                                _ => tracing::debug!(response = ?resp, "sending contract response"),
+                        HostResponse::ContractResponse(resp) => match resp {
+                            ContractResponse::GetResponse {
+                                key,
+                                contract,
+                                state,
+                            } => {
+                                tracing::debug!(
+                                    contract_key = %key,
+                                    has_contract = contract.is_some(),
+                                    state_size = state.as_ref().len(),
+                                    "sending GET response"
+                                );
                             }
-                        }
+                            ContractResponse::PutResponse { key } => {
+                                tracing::debug!(
+                                    contract_key = %key,
+                                    "sending PUT response"
+                                );
+                            }
+                            _ => tracing::debug!(response = ?resp, "sending contract response"),
+                        },
                         _ => tracing::debug!(response = %res, "sending response"),
                     }
                     Ok(res)

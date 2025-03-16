@@ -146,7 +146,10 @@ fn get_out_lib(work_dir: &Path, cli_config: &BuildToolConfig) -> anyhow::Result<
         .unwrap_or_else(|_| {
             // For tests, use a temporary directory if CARGO_TARGET_DIR is not set
             if cfg!(test) {
-                env::temp_dir().join("cargo_target").to_string_lossy().to_string()
+                env::temp_dir()
+                    .join("cargo_target")
+                    .to_string_lossy()
+                    .to_string()
             } else {
                 panic!("Missing environment variable CARGO_TARGET_DIR")
             }

@@ -1,7 +1,9 @@
 use std::{fs::File, io::Read, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use freenet::{dev_tool::OperationMode, server::WebApp};
-use freenet_stdlib::prelude::{ContractCode, ContractContainer, Parameters, State, WrappedContract, ContractWasmAPIVersion};
+use freenet_stdlib::prelude::{
+    ContractCode, ContractContainer, ContractWasmAPIVersion, Parameters, State, WrappedContract,
+};
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, DelegateRequest, WebApi},
     prelude::*,
@@ -94,7 +96,7 @@ async fn put_contract(
             vec![]
         };
 
-        // Validate archive has index.html (warning only) 
+        // Validate archive has index.html (warning only)
         use std::io::Cursor;
         use tar::Archive;
         let mut found_index = false;
@@ -128,10 +130,7 @@ async fn put_contract(
             );
         }
         let packed = webapp.pack()?;
-        tracing::info!(
-            packed_len = packed.len(),
-            "WebApp state after packing"
-        );
+        tracing::info!(packed_len = packed.len(), "WebApp state after packing");
         if !packed.is_empty() {
             tracing::info!(
                 first_32_bytes = format!("{:02x?}", &packed[..packed.len().min(32)]),
@@ -147,11 +146,12 @@ async fn put_contract(
         tracing::warn!("no state provided for contract, if your contract cannot handle empty state correctly, this will always cause an error.");
         freenet_stdlib::prelude::State::from(vec![])
     };
-    let related_contracts: freenet_stdlib::prelude::RelatedContracts = if let Some(_related) = &contract_config.related_contracts {
-        todo!("use `related` contracts")
-    } else {
-        Default::default()
-    };
+    let related_contracts: freenet_stdlib::prelude::RelatedContracts =
+        if let Some(_related) = &contract_config.related_contracts {
+            todo!("use `related` contracts")
+        } else {
+            Default::default()
+        };
 
     let key = contract.key();
     println!("Publishing contract {key}");
@@ -220,7 +220,7 @@ pub(crate) struct GetContractIdConfig {
     /// Path to the contract code (WASM file)
     #[arg(long)]
     pub(crate) code: PathBuf,
-    
+
     /// Path to the parameters file
     #[arg(long)]
     pub(crate) parameters: Option<PathBuf>,

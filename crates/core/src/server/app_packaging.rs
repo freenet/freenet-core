@@ -46,8 +46,11 @@ impl WebApp {
         metadata: Vec<u8>,
         compressed_web: Vec<u8>,
     ) -> Result<Self, WebContractError> {
-        debug!("Creating WebApp with metadata size {} bytes and pre-compressed web content {} bytes", 
-            metadata.len(), compressed_web.len());
+        debug!(
+            "Creating WebApp with metadata size {} bytes and pre-compressed web content {} bytes",
+            metadata.len(),
+            compressed_web.len()
+        );
         Ok(Self {
             metadata,
             web: compressed_web,
@@ -102,7 +105,7 @@ impl WebApp {
         debug!("Decoding compressed web content ({} bytes)", self.web.len());
         let decoder = XzDecoder::new(self.web.as_slice());
         let mut archive = Archive::new(decoder);
-        
+
         // Debug log the archive contents
         match archive.entries() {
             Ok(entries) => {
@@ -117,7 +120,7 @@ impl WebApp {
             }
             Err(e) => debug!("Failed to read archive entries: {}", e),
         }
-        
+
         // Create a fresh archive since we consumed the entries
         Archive::new(XzDecoder::new(self.web.as_slice()))
     }
@@ -127,7 +130,10 @@ impl<'a> TryFrom<&'a [u8]> for WebApp {
     type Error = WebContractError;
 
     fn try_from(state: &'a [u8]) -> Result<Self, Self::Error> {
-        debug!("Attempting to create WebApp from {} bytes of state", state.len());
+        debug!(
+            "Attempting to create WebApp from {} bytes of state",
+            state.len()
+        );
         const MAX_METADATA_SIZE: u64 = 1024;
         const MAX_WEB_SIZE: u64 = 1024 * 1024 * 100;
         // Decompose the state and extract the compressed web interface

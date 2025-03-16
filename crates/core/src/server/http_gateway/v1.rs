@@ -81,7 +81,10 @@ async fn web_home(
 async fn web_subpages(
     Path((key, last_path)): Path<(String, String)>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
-    debug!("Handling web subpage request for contract: {}, path: {}", key, last_path);
+    debug!(
+        "Handling web subpage request for contract: {}, path: {}",
+        key, last_path
+    );
     let full_path: String = format!("/v1/contract/web/{}/{}", key, last_path);
     debug!("Constructed full path: {}", full_path);
     path_handlers::variable_content(key, full_path)
