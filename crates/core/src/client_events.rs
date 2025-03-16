@@ -185,16 +185,14 @@ where
                         node_controller.send(NodeEvent::Disconnect { cause: None }).await.ok();
                         anyhow::bail!("shutdown event");
                     }
+                    Err(error) if matches!(error.kind(), ErrorKind::TransportProtocolDisconnect) => {
+                        return Err(anyhow::anyhow!(error));
+                    }
                     Err(error) => {
                         tracing::debug!(%error, "client error");
                         continue;
                     }
                 };
-                // fixme: only allow in certain modes (e.g. while testing)
-                if let ClientRequest::Disconnect { cause } = &*req.request {
-                    node_controller.send(NodeEvent::Disconnect { cause: cause.clone() }).await.ok();
-                    anyhow::bail!("shutdown event");
-                }
                 let cli_id = req.client_id;
                 let res = process_open_request(req, op_manager.clone()).await;
                 results.push(async move {
@@ -207,6 +205,10 @@ where
                             }
                         }
                         Ok(None) => (cli_id, Ok(None)),
+                        Err(Error::Disconnected) => {
+                            tracing::debug!("client disconnected");
+                            (cli_id, Err(ClientError::from(ErrorKind::Disconnect)))
+                        }
                         Err(err) => (cli_id, Err(ErrorKind::OperationError { cause: format!("{err}").into() }.into())),
                     }
                 });
@@ -543,6 +545,9 @@ async fn process_open_request(
                 }
 
                 return Ok(Some(Either::Right(callback_rx.unwrap())));
+            }
+            ClientRequest::Close => {
+                return Err(Error::Disconnected);
             }
             _ => {
                 tracing::error!("Op not supported");
