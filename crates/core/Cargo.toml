@@ -59,7 +59,7 @@ thiserror = "2"
 tokio = { features = ["fs", "macros", "rt-multi-thread", "sync", "process"], version = "1" }
 tokio-tungstenite = "0.26.1"
 tower-http = { features = ["fs", "trace"], version = "0.6" }
-ulid = { features = ["serde"], version = "1.1" }
+ulid = { features = ["serde"], version = "1.2" }
 unsigned-varint = { version = "0.8", features = ["codec", "asynchronous_codec"] }
 wasmer = { features = ["sys"], workspace = true }
 wasmer-middlewares = "5.0.4"
