@@ -204,7 +204,7 @@ impl Display for OperationMode {
 }
 
 pub struct ExecutorToEventLoopChannel<End: sealed::ChannelHalve> {
-    op_manager: Arc<OpManager>,
+    pub(super) op_manager: Arc<OpManager>,
     end: End,
 }
 
@@ -248,31 +248,12 @@ enum CallbackError {
 }
 
 impl ExecutorToEventLoopChannel<ExecutorHalve> {
-    async fn send_to_event_loop<Op, T>(&mut self, message: T) -> anyhow::Result<Transaction>
-    where
-        T: ComposeNetworkMessage<Op>,
-        Op: Operation + Send + 'static,
-    {
-        let op = message.initiate_op(&self.op_manager);
-        let tx = *op.id();
-        self.end.waiting_for_op_tx.send(tx).await.inspect_err(|_| {
-            tracing::debug!("failed to send request to executor, channel closed");
-        })?;
-        <T as ComposeNetworkMessage<Op>>::resume_op(op, &self.op_manager)
-            .await
-            .map_err(|e| {
-                tracing::debug!("failed to resume operation: {e}");
-                e
-            })?;
-        Ok(tx)
-    }
-
-    async fn receive_op_result<Op>(&mut self, transaction: Transaction) -> Result<Op, CallbackError>
-    where
-        Op: Operation + TryFrom<OpEnum, Error = OpError>,
-    {
+    async fn receive_op_result(
+        &mut self,
+        transaction: Transaction,
+    ) -> Result<OpEnum, CallbackError> {
         if let Some(result) = self.end.completed.remove(&transaction) {
-            return result.try_into().map_err(CallbackError::Conversion);
+            return Ok(result);
         }
         let op_result = self
             .end
@@ -284,7 +265,54 @@ impl ExecutorToEventLoopChannel<ExecutorHalve> {
             self.end.completed.insert(*op_result.id(), op_result);
             return Err(CallbackError::MissingResult);
         }
-        op_result.try_into().map_err(CallbackError::Conversion)
+        Ok(op_result)
+    }
+
+    pub async fn handle_operation_result(
+        mut self,
+        mut to_process: mpsc::Receiver<(
+            Transaction,
+            tokio::sync::oneshot::Sender<Result<OpEnum, CallbackError>>,
+        )>,
+    ) {
+        let mut waiting = Vec::new();
+        // This loop should never exit under normal operation
+        loop {
+            tokio::select! {
+                // Process any new transaction request
+                Some((tx, cb)) = to_process.recv() => {
+                    // Try to get the result for this transaction
+                    let op_res = self.receive_op_result(tx).await;
+                    if let Err(CallbackError::MissingResult) = &op_res {
+                        waiting.push((tx, cb));
+                    } else {
+                        cb.send(op_res).unwrap_or_else(|_| {
+                            tracing::debug!("Error sending callback result to executor");
+                        });
+                    }
+                }
+                // Process any received response that might match a waiting transaction
+                Some(op_result) = self.end.response_for_rx.recv(), if !waiting.is_empty() => {
+                    let tx = *op_result.id();
+                    // Check if this response matches any waiting transaction
+                    if let Some(position) = waiting.iter().position(|(wait_tx, _)| *wait_tx == tx) {
+                        let (_, cb) = waiting.swap_remove(position);
+                        cb.send(Ok(op_result)).unwrap_or_else(|_| {
+                            tracing::debug!("Error sending callback result for waiting transaction");
+                        });
+                    } else {
+                        // Store the result for future requests
+                        self.end.completed.insert(tx, op_result);
+                    }
+                }
+                else => {
+                    tracing::debug!("All channels closed, shutting down operation result handler");
+                    break;
+                }
+            }
+        }
+
+        tracing::warn!("Operation result handler shutting down unexpectedly");
     }
 }
 
@@ -450,22 +478,43 @@ impl ComposeNetworkMessage<operations::update::UpdateOp> for UpdateContract {
     }
 }
 
+pub(crate) type FetchContractR =
+    Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError>;
+pub(crate) type UpsertContractR = Result<UpsertResult, ExecutorError>;
+
+/// A trait for contract execution, storage, and notification.
+///
+/// This trait abstracts the capabilities required for contract lifecycle management:
+/// - Fetching contracts from storage
+/// - Updating contract state
+/// - Managing notifications to interested clients
+/// - Handling executor instances
+///
+/// Implementations must be thread-safe (Send) and have a static lifetime.
 pub(crate) trait ContractExecutor: Send + 'static {
+    type InnerExecutor: Send + 'static;
+
+    /// Fetches a contract from the store.
     fn fetch_contract(
         &mut self,
         key: ContractKey,
         return_contract_code: bool,
-    ) -> impl Future<Output = Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError>>
-           + Send;
+    ) -> impl Future<
+        Output = impl Future<Output = (Self::InnerExecutor, FetchContractR)> + Send + 'static,
+    > + Send;
 
+    /// Updates the contract state in the store.
     fn upsert_contract_state(
         &mut self,
         key: ContractKey,
         update: Either<WrappedState, StateDelta<'static>>,
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
-    ) -> impl Future<Output = Result<UpsertResult, ExecutorError>> + Send;
+    ) -> impl Future<
+        Output = impl Future<Output = (Self::InnerExecutor, UpsertContractR)> + Send + 'static,
+    > + Send;
 
+    /// Registers a contract notifier for a specific contract key.
     fn register_contract_notifier(
         &mut self,
         key: ContractKey,
@@ -473,6 +522,13 @@ pub(crate) trait ContractExecutor: Send + 'static {
         notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
         summary: Option<StateSummary<'_>>,
     ) -> Result<(), Box<RequestError>>;
+
+    /// Returns the current executor instance.
+    fn return_executor(&mut self, executor: Self::InnerExecutor);
+
+    /// Creates a new executor instance when an error occurs with the current one.
+    /// This method should never fail - it must always return a working executor.
+    fn create_new_executor(&mut self) -> impl Future<Output = Self::InnerExecutor> + Send;
 
     fn execute_delegate_request(
         &mut self,
@@ -499,19 +555,24 @@ pub struct Executor<R = Runtime> {
     /// Attested contract instances for a given delegate.
     delegate_attested_ids: HashMap<DelegateKey, Vec<ContractInstanceId>>,
 
-    event_loop_channel: Option<ExecutorToEventLoopChannel<ExecutorHalve>>,
+    op_sender: mpsc::Sender<(
+        Transaction,
+        tokio::sync::oneshot::Sender<Result<OpEnum, CallbackError>>,
+    )>,
+    op_manager: Arc<OpManager>,
 }
 
 impl<R> Executor<R> {
     pub async fn new(
         state_store: StateStore<Storage>,
-        ctrl_handler: impl FnOnce() -> anyhow::Result<()>,
         mode: OperationMode,
         runtime: R,
-        event_loop_channel: Option<ExecutorToEventLoopChannel<ExecutorHalve>>,
+        op_sender: mpsc::Sender<(
+            Transaction,
+            tokio::sync::oneshot::Sender<Result<OpEnum, CallbackError>>,
+        )>,
+        op_manager: Arc<OpManager>,
     ) -> anyhow::Result<Self> {
-        ctrl_handler()?;
-
         Ok(Self {
             mode,
             runtime,
@@ -519,7 +580,8 @@ impl<R> Executor<R> {
             update_notifications: HashMap::default(),
             subscriber_summaries: HashMap::default(),
             delegate_attested_ids: HashMap::default(),
-            event_loop_channel,
+            op_sender,
+            op_manager,
         })
     }
 
@@ -558,33 +620,42 @@ impl<R> Executor<R> {
         <Op as Operation>::Result: TryFrom<Op, Error = OpError>,
         M: ComposeNetworkMessage<Op>,
     {
-        let Some(ch) = &mut self.event_loop_channel else {
-            return Err(ExecutorError::other(anyhow::anyhow!(
-                "missing event loop channel"
-            )));
-        };
-        let transaction = ch
-            .send_to_event_loop(request)
+        let op = request.initiate_op(&self.op_manager);
+        let tx = *op.id();
+        let (cb_s, cb) = tokio::sync::oneshot::channel();
+        self.op_sender
+            .send((tx, cb_s))
             .await
-            .map_err(ExecutorError::other)?;
-        // FIXME: must add a way to suspend a request while waiting for result and resume upon getting
-        // an answer back so we don't block the executor itself.
-        // otherwise it may be possible to end up in a deadlock waiting for a tree of contract
-        // dependencies to be resolved
-        let result = loop {
-            match ch.receive_op_result::<Op>(transaction).await {
-                Ok(result) => break result,
-                Err(CallbackError::MissingResult) => {
-                    tokio::time::sleep(Duration::from_secs(10)).await;
-                    continue;
-                }
-                Err(CallbackError::Conversion(err)) => {
-                    tracing::error!("expect message of one type but got an other: {err}");
-                    return Err(ExecutorError::other(err));
-                }
+            .inspect_err(|_| {
+                tracing::debug!("failed to send request to executor, channel closed");
+            })
+            .map_err(|e| {
+                tracing::debug!("failed to send request to executor: {e}");
+                ExecutorError::other(anyhow::anyhow!("channel closed"))
+            })?;
+        <M as ComposeNetworkMessage<Op>>::resume_op(op, &self.op_manager)
+            .await
+            .map_err(|e| {
+                tracing::debug!("failed to resume operation: {e}");
+                ExecutorError::other(e)
+            })?;
+
+        let result = cb.await.map_err(|_| {
+            tracing::debug!("failed to receive callback from executor, channel closed");
+            ExecutorError::other(anyhow::anyhow!("channel closed"))
+        })?;
+
+        let result: Op = {
+            match result {
+                Ok(result) => result.try_into().map_err(|err| {
+                    tracing::debug!("failed to convert callback result: {err}");
+                    ExecutorError::other(err)
+                })?,
                 Err(CallbackError::Err(other)) => return Err(other),
+                _ => unreachable!(),
             }
         };
+
         let result = <Op::Result>::try_from(result).map_err(|err| {
             tracing::debug!("didn't get result back: {err}");
             ExecutorError::other(err)
