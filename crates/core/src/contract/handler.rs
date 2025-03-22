@@ -18,12 +18,10 @@ use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
+use super::executor::runtime::RuntimePool;
 use super::executor::{ExecutorHalve, ExecutorToEventLoopChannel};
 use super::ExecutorError;
-use super::{
-    executor::{ContractExecutor, Executor},
-    ContractError,
-};
+use super::{executor::ContractExecutor, ContractError};
 use crate::client_events::HostResult;
 use crate::config::Config;
 use crate::message::{QueryResult, Transaction};
@@ -79,13 +77,14 @@ pub(crate) trait ContractHandler {
 }
 
 pub(crate) struct NetworkContractHandler<R = Runtime> {
-    executor: Executor<R>,
+    executor: RuntimePool<R>,
     channel: ContractHandlerChannel<ContractHandlerHalve>,
+    op_res_handle: tokio::task::JoinHandle<()>,
 }
 
 impl ContractHandler for NetworkContractHandler<Runtime> {
     type Builder = Arc<Config>;
-    type ContractExecutor = Executor<Runtime>;
+    type ContractExecutor = RuntimePool<Runtime>;
 
     async fn build(
         channel: ContractHandlerChannel<ContractHandlerHalve>,
@@ -95,8 +94,17 @@ impl ContractHandler for NetworkContractHandler<Runtime> {
     where
         Self: Sized + 'static,
     {
-        let executor = Executor::from_config(config.clone(), Some(executor_request_sender)).await?;
-        Ok(Self { executor, channel })
+        let num_executors = std::thread::available_parallelism()?;
+        let (to_process_tx, to_process) = mpsc::channel(num_executors.into());
+        let op_manager = executor_request_sender.op_manager.clone();
+        let op_res_handle =
+            tokio::spawn(executor_request_sender.handle_operation_result(to_process));
+        let executor = RuntimePool::new(config, to_process_tx, op_manager, num_executors).await?;
+        Ok(Self {
+            executor,
+            channel,
+            op_res_handle,
+        })
     }
 
     fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve> {
@@ -104,6 +112,9 @@ impl ContractHandler for NetworkContractHandler<Runtime> {
     }
 
     fn executor(&mut self) -> &mut Self::ContractExecutor {
+        if self.op_res_handle.is_finished() {
+            panic!("executor handle is finished");
+        }
         &mut self.executor
     }
 }
