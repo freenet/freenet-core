@@ -6,10 +6,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use freenet_stdlib::prelude::{ContractContainer, ContractKey, WrappedState};
-use serde::{Deserialize, Serialize};
-use ulid::Ulid;
-
+use crate::contract::ClientResponsesSender;
 use crate::{
     node::PeerId,
     operations::{
@@ -17,7 +14,10 @@ use crate::{
     },
     ring::{Location, PeerKeyLocation},
 };
+use freenet_stdlib::prelude::{ContractContainer, ContractKey, WrappedState};
 pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
+use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 /// An transaction is a unique, universal and efficient identifier for any
 /// roundtrip transaction as it is broadcasted around the Freenet network.
@@ -235,12 +235,12 @@ pub(crate) trait MessageStats {
     fn requested_location(&self) -> Option<Location>;
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) enum NetMessage {
     V1(NetMessageV1),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) enum NetMessageV1 {
     Connect(ConnectMsg),
     Put(PutMsg),
@@ -317,6 +317,11 @@ pub(crate) enum NodeEvent {
         callback: tokio::sync::mpsc::Sender<QueryResult>,
     },
     TransactionTimedOut(Transaction),
+    PerformOp {
+        message: NetMessage,
+        client_id: Option<crate::client_events::ClientId>,
+        op_response_sender: ClientResponsesSender,
+    },
 }
 
 pub(crate) enum QueryResult {
@@ -348,6 +353,9 @@ impl Display for NodeEvent {
             }
             NodeEvent::TransactionTimedOut(transaction) => {
                 write!(f, "Transaction timed out ({})", transaction)
+            }
+            NodeEvent::PerformOp { .. } => {
+                write!(f, "PerformOp")
             }
         }
     }

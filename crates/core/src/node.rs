@@ -369,7 +369,7 @@ async fn report_result(
             if let Some((client_ids, cb)) = client_req_handler_callback {
                 for client_id in client_ids {
                     tracing::debug!(?tx, %client_id,  "Sending response to client");
-                    let _ = cb.send((client_id, op_res.to_host_result()));
+                    let _ = cb.send_client_result(client_id, op_res.to_host_result());
                 }
             }
             // check operations.rs:handle_op_result to see what's the meaning of each state

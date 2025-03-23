@@ -895,7 +895,7 @@ where
                     continue;
                 }
                 NodeEvent::ConnectPeer { peer, .. } => {
-                    tracing::info!("TNotifying connection to {peer}");
+                    tracing::info!("Notifying connection to {peer}");
                     continue;
                 }
                 NodeEvent::Disconnect { cause: Some(cause) } => {
@@ -911,6 +911,10 @@ where
                 }
                 NodeEvent::TransactionTimedOut(_) => {
                     unimplemented!()
+                }
+                NodeEvent::PerformOp { .. } => {
+                    tracing::info!("Performing operation");
+                    return Ok(());
                 }
             },
             Err(err) => {
