@@ -7,20 +7,20 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-pub(in crate::contract) struct RuntimePool<R = Runtime> {
+pub(crate) struct RuntimePool<C = Arc<Config>, R = Runtime> {
     // Keeping track of available executors
-    runtimes: Vec<Option<Executor<R>>>,
+    pub runtimes: Vec<Option<Executor<R>>>,
     // Semaphore to control access to executors
-    available: Semaphore,
-    config: Arc<Config>,
-    op_sender: mpsc::Sender<(
+    pub available: Semaphore,
+    pub config: C,
+    pub op_sender: mpsc::Sender<(
         Transaction,
         tokio::sync::oneshot::Sender<Result<OpEnum, CallbackError>>,
     )>,
-    op_manager: Arc<OpManager>,
+    pub op_manager: Arc<OpManager>,
 }
 
-impl RuntimePool<Runtime> {
+impl RuntimePool<Arc<Config>, Runtime> {
     /// Create a new pool with the given number of runtime executors
     pub async fn new(
         config: Arc<Config>,
@@ -34,9 +34,12 @@ impl RuntimePool<Runtime> {
         let mut runtimes = Vec::with_capacity(pool_size.into());
 
         for _ in 0..pool_size.into() {
-            let executor =
-                Executor::from_config(config.clone(), op_sender.clone(), op_manager.clone())
-                    .await?;
+            let executor = Executor::from_config(
+                config.clone(),
+                Some(op_sender.clone()),
+                Some(op_manager.clone()),
+            )
+            .await?;
             runtimes.push(Some(executor));
         }
 
@@ -66,7 +69,7 @@ impl RuntimePool<Runtime> {
     }
 }
 
-impl ContractExecutor for RuntimePool {
+impl ContractExecutor for RuntimePool<Arc<Config>, Runtime> {
     type InnerExecutor = Executor<Runtime>;
 
     async fn fetch_contract(
@@ -94,7 +97,7 @@ impl ContractExecutor for RuntimePool {
         let mut executor = self.pop_executor().await;
 
         async move {
-            let result = match update {
+            match update {
                 Either::Left(state) => {
                     // For state updates with simplified implementation
                     let params = if let Some(code) = &code {
@@ -221,9 +224,7 @@ impl ContractExecutor for RuntimePool {
                         Err(err) => (executor, Err(ExecutorError::other(err))),
                     }
                 }
-            };
-
-            result
+            }
         }
     }
 
@@ -282,8 +283,8 @@ impl ContractExecutor for RuntimePool {
     async fn create_new_executor(&mut self) -> Self::InnerExecutor {
         Executor::from_config(
             self.config.clone(),
-            self.op_sender.clone(),
-            self.op_manager.clone(),
+            Some(self.op_sender.clone()),
+            Some(self.op_manager.clone()),
         )
         .await
         .expect("Failed to create new executor")
@@ -405,13 +406,17 @@ impl Executor<Runtime> {
 }
 
 impl Executor<Runtime> {
-    pub async fn from_config(
+    pub async fn local(config: Arc<Config>) -> anyhow::Result<Self> {
+        let (contract_store, delegate_store, secret_store, state_store) =
+            Self::get_stores(&config).await?;
+        let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+        Executor::new(state_store, OperationMode::Local, rt, None, None).await
+    }
+
+    async fn from_config(
         config: Arc<Config>,
-        op_sender: mpsc::Sender<(
-            Transaction,
-            tokio::sync::oneshot::Sender<Result<OpEnum, CallbackError>>,
-        )>,
-        op_manager: Arc<OpManager>,
+        op_sender: Option<OpResult>,
+        op_manager: Option<Arc<OpManager>>,
     ) -> anyhow::Result<Self> {
         let (contract_store, delegate_store, secret_store, state_store) =
             Self::get_stores(&config).await?;
