@@ -238,7 +238,7 @@ pub(crate) fn executor_channel(
 }
 
 #[derive(thiserror::Error, Debug)]
-enum CallbackError {
+pub(crate) enum CallbackError {
     #[error(transparent)]
     Err(#[from] ExecutorError),
     #[error(transparent)]
@@ -539,6 +539,11 @@ pub(crate) trait ContractExecutor: Send + 'static {
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo>;
 }
 
+pub(super) type OpResult = mpsc::Sender<(
+    Transaction,
+    tokio::sync::oneshot::Sender<Result<OpEnum, CallbackError>>,
+)>;
+
 /// A WASM executor which will run any contracts, delegates, etc. registered.
 ///
 /// This executor will monitor the store directories and databases to detect state changes.
@@ -555,23 +560,17 @@ pub struct Executor<R = Runtime> {
     /// Attested contract instances for a given delegate.
     delegate_attested_ids: HashMap<DelegateKey, Vec<ContractInstanceId>>,
 
-    op_sender: mpsc::Sender<(
-        Transaction,
-        tokio::sync::oneshot::Sender<Result<OpEnum, CallbackError>>,
-    )>,
-    op_manager: Arc<OpManager>,
+    op_sender: Option<OpResult>,
+    op_manager: Option<Arc<OpManager>>,
 }
 
 impl<R> Executor<R> {
-    pub async fn new(
+    pub(crate) async fn new(
         state_store: StateStore<Storage>,
         mode: OperationMode,
         runtime: R,
-        op_sender: mpsc::Sender<(
-            Transaction,
-            tokio::sync::oneshot::Sender<Result<OpEnum, CallbackError>>,
-        )>,
-        op_manager: Arc<OpManager>,
+        op_sender: Option<OpResult>,
+        op_manager: Option<Arc<OpManager>>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             mode,
@@ -620,10 +619,18 @@ impl<R> Executor<R> {
         <Op as Operation>::Result: TryFrom<Op, Error = OpError>,
         M: ComposeNetworkMessage<Op>,
     {
-        let op = request.initiate_op(&self.op_manager);
+        let op_manager = self
+            .op_manager
+            .as_ref()
+            .ok_or_else(|| ExecutorError::other(anyhow::anyhow!("no op manager")))?;
+        let op_sender = self
+            .op_sender
+            .as_ref()
+            .ok_or_else(|| ExecutorError::other(anyhow::anyhow!("no op sender")))?;
+        let op = request.initiate_op(op_manager);
         let tx = *op.id();
         let (cb_s, cb) = tokio::sync::oneshot::channel();
-        self.op_sender
+        op_sender
             .send((tx, cb_s))
             .await
             .inspect_err(|_| {
@@ -633,7 +640,7 @@ impl<R> Executor<R> {
                 tracing::debug!("failed to send request to executor: {e}");
                 ExecutorError::other(anyhow::anyhow!("channel closed"))
             })?;
-        <M as ComposeNetworkMessage<Op>>::resume_op(op, &self.op_manager)
+        <M as ComposeNetworkMessage<Op>>::resume_op(op, op_manager)
             .await
             .map_err(|e| {
                 tracing::debug!("failed to resume operation: {e}");
