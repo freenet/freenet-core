@@ -171,7 +171,7 @@ async fn client_fn(
             }
         }
     }
-    tracing::error!("Client shut down");
+    tracing::error!("Peer client interface shut down");
 }
 
 #[cfg(test)]

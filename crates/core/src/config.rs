@@ -37,7 +37,11 @@ pub const DEFAULT_RANDOM_PEER_CONN_THRESHOLD: usize = 7;
 /// Default maximum number of hops to live for any operation
 /// (if it applies, e.g. connect requests).
 pub const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
+
 pub(crate) const OPERATION_TTL: Duration = Duration::from_secs(60);
+
+/// Current version of the crate.
+pub(crate) const PCK_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Initialize the executor once.
 static ASYNC_RT: Lazy<Option<Runtime>> = Lazy::new(GlobalExecutor::initialize_async_rt);
@@ -51,27 +55,31 @@ const FREENET_GATEWAYS_INDEX: &str = "https://freenet.org/keys/gateways.toml";
 #[derive(clap::Parser, Debug)]
 pub struct ConfigArgs {
     /// Node operation mode. Default is network mode.
-    #[clap(value_enum, env = "MODE")]
+    #[arg(value_enum, env = "MODE")]
     pub mode: Option<OperationMode>,
 
-    #[clap(flatten)]
+    #[command(flatten)]
     pub ws_api: WebsocketApiArgs,
 
-    #[clap(flatten)]
+    #[command(flatten)]
     pub network_api: NetworkArgs,
 
-    #[clap(flatten)]
+    #[command(flatten)]
     pub secrets: SecretArgs,
 
-    #[clap(long, env = "LOG_LEVEL")]
+    #[arg(long, env = "LOG_LEVEL")]
     pub log_level: Option<tracing::log::LevelFilter>,
 
-    #[clap(flatten)]
+    #[command(flatten)]
     pub config_paths: ConfigPathsArgs,
 
     /// An arbitrary identifier for the node, mostly for debugging or testing purposes.
-    #[clap(long)]
+    #[arg(long, hide = true)]
     pub id: Option<String>,
+
+    /// Show the version of the application.
+    #[arg(long, short)]
+    pub version: bool,
 }
 
 impl Default for ConfigArgs {
@@ -98,11 +106,16 @@ impl Default for ConfigArgs {
             log_level: Some(tracing::log::LevelFilter::Info),
             config_paths: Default::default(),
             id: None,
+            version: false,
         }
     }
 }
 
 impl ConfigArgs {
+    pub fn current_version(&self) -> &str {
+        PCK_VERSION
+    }
+
     fn read_config(dir: &PathBuf) -> std::io::Result<Option<Config>> {
         if !dir.exists() {
             return Ok(None);
@@ -309,10 +322,8 @@ impl ConfigArgs {
                 bandwidth_limit: self.network_api.bandwidth_limit,
             },
             ws_api: WebsocketApiConfig {
-                address: self.ws_api.address.unwrap_or_else(|| match mode {
-                    OperationMode::Local => default_local_address(),
-                    OperationMode::Network => default_listening_address(),
-                }),
+                // the websocket API is always local
+                address: self.ws_api.address.unwrap_or_else(default_local_address),
                 port: self
                     .ws_api
                     .ws_api_port
@@ -610,21 +621,6 @@ pub struct ConfigPathsArgs {
     /// The configuration directory.
     #[arg(long, default_value = None, env = "CONFIG_DIR")]
     pub config_dir: Option<PathBuf>,
-    /// The contracts directory.
-    #[arg(long, default_value = None, env = "CONTRACTS_DIR")]
-    contracts_dir: Option<PathBuf>,
-    /// The delegates directory.
-    #[arg(long, default_value = None, env = "DELEGATES_DIR")]
-    delegates_dir: Option<PathBuf>,
-    /// The secrets directory.
-    #[arg(long, default_value = None, env = "SECRECTS_DIR")]
-    secrets_dir: Option<PathBuf>,
-    /// The database directory.
-    #[arg(long, default_value = None, env = "DB_DIR")]
-    db_dir: Option<PathBuf>,
-    /// The event log file.
-    #[arg(long, default_value = None, env = "EVENT_LOG")]
-    event_log: Option<PathBuf>,
     /// The data directory.
     #[arg(long, default_value = None, env = "DATA_DIR")]
     pub data_dir: Option<PathBuf>,
@@ -633,11 +629,6 @@ pub struct ConfigPathsArgs {
 impl ConfigPathsArgs {
     fn merge(&mut self, other: ConfigPaths) {
         self.config_dir.get_or_insert(other.config_dir);
-        self.contracts_dir.get_or_insert(other.contracts_dir);
-        self.delegates_dir.get_or_insert(other.delegates_dir);
-        self.secrets_dir.get_or_insert(other.secrets_dir);
-        self.db_dir.get_or_insert(other.db_dir);
-        self.event_log.get_or_insert(other.event_log);
         self.data_dir.get_or_insert(other.data_dir);
     }
 
@@ -669,16 +660,10 @@ impl ConfigPathsArgs {
                 };
                 Ok(defaults.data_dir().to_path_buf())
             })?;
-        let contracts_dir = self
-            .contracts_dir
-            .unwrap_or_else(|| app_data_dir.join("contracts"));
-        let delegates_dir = self
-            .delegates_dir
-            .unwrap_or_else(|| app_data_dir.join("delegates"));
-        let secrets_dir = self
-            .secrets_dir
-            .unwrap_or_else(|| app_data_dir.join("secrets"));
-        let db_dir = self.db_dir.unwrap_or_else(|| app_data_dir.join("db"));
+        let contracts_dir = app_data_dir.join("contracts");
+        let delegates_dir = app_data_dir.join("delegates");
+        let secrets_dir = app_data_dir.join("secrets");
+        let db_dir = app_data_dir.join("db");
 
         if !contracts_dir.exists() {
             fs::create_dir_all(&contracts_dir)?;
@@ -720,13 +705,13 @@ impl ConfigPathsArgs {
             })?;
 
         Ok(ConfigPaths {
+            config_dir,
+            data_dir: app_data_dir,
             contracts_dir,
             delegates_dir,
             secrets_dir,
             db_dir,
-            data_dir: app_data_dir,
             event_log,
-            config_dir,
         })
     }
 }

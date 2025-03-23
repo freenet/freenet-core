@@ -50,11 +50,11 @@ pub struct SecretArgs {
     #[clap(long, value_parser, default_value=None, env = "TRANSPORT_KEYPAIR")]
     pub transport_keypair: Option<PathBuf>,
 
-    /// Path to the nonce file.
+    /// Path to the nonce file for encrypting data.
     #[clap(long, value_parser, default_value=None, env = "NONCE")]
     pub nonce: Option<PathBuf>,
 
-    /// Path to the cipher file.
+    /// Path to the cipher file for encrypting data.
     #[clap(long, value_parser, default_value=None, env = "CIPHER")]
     pub cipher: Option<PathBuf>,
 }
