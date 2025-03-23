@@ -305,12 +305,38 @@ impl P2pConnManager {
                                     );
                                 })??;
                             }
+                            NodeEvent::PerformOp {
+                                message,
+                                client_id,
+                                op_response_sender,
+                            } => {
+                                let client_id = client_id.unwrap_or_else(|| ClientId::next());
+                                let client_ids = vec![client_id];
+
+                                let op_manager_clone = op_manager.clone();
+                                let bridge_clone = self.bridge.clone();
+                                let event_listener_clone = self.event_listener.trait_clone();
+                                let executor_callback = executor_listener.callback();
+
+                                process_message(
+                                    message,
+                                    op_manager_clone,
+                                    bridge_clone,
+                                    event_listener_clone,
+                                    Some(executor_callback),
+                                    Some(op_response_sender),
+                                    Some(client_ids),
+                                )
+                                .await;
+                            }
                             NodeEvent::TransactionTimedOut(tx) => {
                                 let Some(client) = state.tx_to_client.remove(&tx) else {
                                     continue;
                                 };
-                                cli_response_sender
-                                    .send((client, Err(ErrorKind::FailedOperation.into())))?;
+                                cli_response_sender.send_client_result(
+                                    client,
+                                    Err(ErrorKind::FailedOperation.into()),
+                                )?;
                             }
                             NodeEvent::Disconnect { cause } => {
                                 tracing::info!(

@@ -625,7 +625,7 @@ mod messages {
         ring::{Location, PeerKeyLocation},
     };
 
-    #[derive(Debug, Serialize, Deserialize)]
+    #[derive(Debug, Serialize, Deserialize, Clone)]
     pub(crate) enum UpdateMsg {
         RequestUpdate {
             id: Transaction,

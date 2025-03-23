@@ -442,7 +442,7 @@ mod messages {
 
     use super::*;
 
-    #[derive(Debug, Serialize, Deserialize)]
+    #[derive(Debug, Serialize, Deserialize, Clone)]
     pub(crate) enum SubscribeMsg {
         FetchRouting {
             id: Transaction,

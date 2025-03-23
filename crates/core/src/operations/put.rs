@@ -943,7 +943,7 @@ mod messages {
 
     use serde::{Deserialize, Serialize};
 
-    #[derive(Debug, Serialize, Deserialize)]
+    #[derive(Debug, Serialize, Deserialize, Clone)]
     pub(crate) enum PutMsg {
         /// Internal node instruction to find a route to the target node.
         RequestPut {

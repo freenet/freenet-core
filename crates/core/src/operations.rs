@@ -345,3 +345,42 @@ async fn has_contract(op_manager: &OpManager, key: ContractKey) -> Result<bool, 
         _ => Ok(false),
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum OpCompletionResult {
+    Put,
+    Get,
+    Subscribe,
+    Update,
+    Connect,
+}
+
+impl From<&OpEnum> for OpCompletionResult {
+    fn from(op: &OpEnum) -> Self {
+        match op {
+            OpEnum::Put(_) => Self::Put,
+            OpEnum::Get(_) => Self::Get,
+            OpEnum::Subscribe(_) => Self::Subscribe,
+            OpEnum::Update(_) => Self::Update,
+            OpEnum::Connect(_) => Self::Connect,
+        }
+    }
+}
+
+impl From<OpEnum> for OpCompletionResult {
+    fn from(op: OpEnum) -> Self {
+        (&op).into()
+    }
+}
+
+impl From<&Transaction> for OpCompletionResult {
+    fn from(tx: &Transaction) -> Self {
+        match tx.transaction_type() {
+            TransactionType::Put => Self::Put,
+            TransactionType::Get => Self::Get,
+            TransactionType::Subscribe => Self::Subscribe,
+            TransactionType::Update => Self::Update,
+            TransactionType::Connect => Self::Connect,
+        }
+    }
+}

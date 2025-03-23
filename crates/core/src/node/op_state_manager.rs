@@ -4,18 +4,18 @@ use dashmap::{DashMap, DashSet};
 use either::Either;
 use tracing::Instrument;
 
+use super::{network_bridge::EventLoopNotificationsSender, NetEventRegister, NodeConfig, PeerId};
+use crate::contract::{ClientResponsesReceiver, ClientResponsesSender};
 use crate::{
     config::GlobalExecutor,
     contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent, SenderHalve},
     message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
     operations::{
         connect::ConnectOp, get::GetOp, put::PutOp, subscribe::SubscribeOp, update::UpdateOp,
-        OpEnum, OpError,
+        OpCompletionResult, OpEnum, OpError,
     },
     ring::{ConnectionManager, LiveTransactionTracker, Ring},
 };
-
-use super::{network_bridge::EventLoopNotificationsSender, NetEventRegister, NodeConfig, PeerId};
 
 #[cfg(debug_assertions)]
 macro_rules! check_id_op {
@@ -123,6 +123,42 @@ impl OpManager {
             .send(Either::Right(msg))
             .await
             .map_err(Into::into)
+    }
+
+    /// Send an operation to the operation loop and wait for its completion.
+    /// This function will block until the operation has completed and a response has been received.
+    /// Returns the type of operation that was completed.
+    pub async fn notify_event_perform_op(
+        &self,
+        msg: NetMessage,
+        client_id: Option<crate::client_events::ClientId>,
+    ) -> Result<OpCompletionResult, OpError> {
+        let (response_sender, mut response_receiver) = tokio::sync::mpsc::channel(1);
+
+        let op_response_sender = ClientResponsesSender::from(response_sender);
+        let mut op_response_receiver = ClientResponsesReceiver::Bounded(response_receiver);
+
+        let event = NodeEvent::PerformOp {
+            message: msg,
+            client_id,
+            op_response_sender,
+        };
+
+        // Send the op through the to_event_listener
+        self.to_event_listener.send(Either::Right(event)).await?;
+
+        // Wait for the operation to complete and return the result
+        op_response_receiver
+            .recv()
+            .await
+            .ok_or(OpError::NotificationError)
+            .and_then(|msg| {
+                if let crate::contract::ClientResponseMessage::OperationCompleted(_, result) = msg {
+                    Ok(result)
+                } else {
+                    Err(OpError::UnexpectedOpState)
+                }
+            })
     }
 
     /// Send an event to the contract handler and await a response event from it if successful.

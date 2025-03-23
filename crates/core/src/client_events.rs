@@ -214,13 +214,21 @@ where
                 });
             }
             res = client_responses.recv() => {
-                if let Some((cli_id, res)) = res {
-                    if let Ok(result) = &res {
-                        tracing::debug!(%result, "sending client response");
-                    }
-                    if let Err(err) = client_events.send(cli_id, res).await {
-                        tracing::debug!("channel closed: {err}");
-                        anyhow::bail!(err);
+                if let Some(msg) = res {
+                    match msg {
+                        crate::contract::ClientResponseMessage::ClientResult(cli_id, res) => {
+                            if let Ok(result) = &res {
+                                tracing::debug!(%result, "sending client response");
+                            }
+                            if let Err(err) = client_events.send(cli_id, res).await {
+                                tracing::debug!("channel closed: {err}");
+                                anyhow::bail!(err);
+                            }
+                        },
+                        crate::contract::ClientResponseMessage::OperationCompleted(cli_id, _) => {
+                            // Ignore operation completed messages
+                            tracing::debug!(client=%cli_id, "received operation completed message");
+                        }
                     }
                 }
             }
