@@ -281,6 +281,10 @@ impl ExecutorToEventLoopChannel<ExecutorHalve> {
             tokio::select! {
                 // Process any new transaction request
                 Some((tx, cb)) = to_process.recv() => {
+                    if self.end.waiting_for_op_tx.send(tx).await.is_err() {
+                        tracing::debug!("failed to send request to executor, channel closed");
+                        break;
+                    }
                     // Try to get the result for this transaction
                     let op_res = self.receive_op_result(tx).await;
                     if let Err(CallbackError::MissingResult) = &op_res {
