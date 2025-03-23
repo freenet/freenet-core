@@ -430,7 +430,7 @@ impl Config {
         self.secrets.transport_keypair()
     }
 
-    pub(crate) fn paths(&self) -> Arc<ConfigPaths> {
+    pub fn paths(&self) -> Arc<ConfigPaths> {
         self.config_paths.clone()
     }
 }
