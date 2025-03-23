@@ -296,6 +296,7 @@ impl Executor<Runtime> {
         let (contract_store, delegate_store, secret_store, state_store) =
             Self::get_stores(&config).await?;
         let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+        assert!(config.mode == OperationMode::Local);
         Executor::new(state_store, OperationMode::Local, rt, None, None).await
     }
 
@@ -307,7 +308,7 @@ impl Executor<Runtime> {
         let (contract_store, delegate_store, secret_store, state_store) =
             Self::get_stores(&config).await?;
         let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
-        Executor::new(state_store, OperationMode::Local, rt, op_sender, op_manager).await
+        Executor::new(state_store, config.mode, rt, op_sender, op_manager).await
     }
 
     pub fn register_contract_notifier(
