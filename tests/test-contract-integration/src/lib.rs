@@ -434,7 +434,7 @@ mod tests {
             assert_eq!(todo_list.tasks.len(), 1);
             assert_eq!(todo_list.tasks[0].id, 1);
             assert_eq!(todo_list.tasks[0].title, "Updated Task");
-            assert_eq!(todo_list.tasks[0].completed, true);
+            assert!(todo_list.tasks[0].completed);
             assert_eq!(todo_list.version, 2); // Version should be incremented
         } else {
             panic!("Unexpected result type");

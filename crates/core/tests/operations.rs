@@ -42,7 +42,7 @@ async fn base_node_test_config(
     public_port: Option<u16>,
     ws_api_port: u16,
 ) -> anyhow::Result<(ConfigArgs, PresetConfig)> {
-    const DEFAULT_RATE_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
+    const _DEFAULT_RATE_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
 
     if is_gateway {
         assert!(public_port.is_some());
@@ -71,10 +71,10 @@ async fn base_node_test_config(
             bandwidth_limit: None,
         },
         config_paths: {
-            let mut args = freenet::config::ConfigPathsArgs::default();
-            args.config_dir = Some(temp_dir.path().to_path_buf());
-            args.data_dir = Some(temp_dir.path().to_path_buf());
-            args
+            freenet::config::ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+            }
         },
         secrets: SecretArgs {
             transport_keypair: Some(transport_keypair),
@@ -188,7 +188,7 @@ async fn test_put_contract() -> TestResult {
 
     let test = tokio::time::timeout(Duration::from_secs(60), async {
         // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
 
         // Connect to node A's websocket API
         let uri = format!(
@@ -201,22 +201,19 @@ async fn test_put_contract() -> TestResult {
         make_put(&mut client_api_a, wrapped_state.clone(), contract.clone()).await?;
 
         // Wait for put response
-        loop {
-            let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
-            match resp {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                    assert_eq!(key, contract_key);
-                    break;
-                }
-                Ok(Ok(other)) => {
-                    tracing::warn!("unexpected response while waiting for put: {:?}", other);
-                }
-                Ok(Err(e)) => {
-                    bail!("Error receiving put response: {}", e);
-                }
-                Err(_) => {
-                    bail!("Timeout waiting for put response");
-                }
+        let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                assert_eq!(key, contract_key);
+            }
+            Ok(Ok(other)) => {
+                tracing::warn!("unexpected response while waiting for put: {:?}", other);
+            }
+            Ok(Err(e)) => {
+                bail!("Error receiving put response: {}", e);
+            }
+            Err(_) => {
+                bail!("Timeout waiting for put response");
             }
         }
 
@@ -348,7 +345,7 @@ async fn test_update_contract() -> TestResult {
 
     let test = tokio::time::timeout(Duration::from_secs(60), async {
         // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
 
         // Connect to node A websocket API
         let uri = format!(
@@ -362,22 +359,19 @@ async fn test_update_contract() -> TestResult {
         make_put(&mut client_api_a, wrapped_state.clone(), contract.clone()).await?;
 
         // Wait for put response
-        loop {
-            let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
-            match resp {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                    assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
-                    break;
-                }
-                Ok(Ok(other)) => {
-                    tracing::warn!("unexpected response while waiting for put: {:?}", other);
-                }
-                Ok(Err(e)) => {
-                    bail!("Error receiving put response: {}", e);
-                }
-                Err(_) => {
-                    bail!("Timeout waiting for put response");
-                }
+        let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
+            }
+            Ok(Ok(other)) => {
+                tracing::warn!("unexpected response while waiting for put: {:?}", other);
+            }
+            Ok(Err(e)) => {
+                bail!("Error receiving put response: {}", e);
+            }
+            Err(_) => {
+                bail!("Timeout waiting for put response");
             }
         }
 

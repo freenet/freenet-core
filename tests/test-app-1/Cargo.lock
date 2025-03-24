@@ -269,7 +269,11 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "freenet-macros"
+<<<<<<< HEAD
 version = "0.1.0-rc1"
+=======
+version = "0.1.1"
+>>>>>>> b6e0a622fa1d0df066959aa9e0a0a17b6a05a4ee
 dependencies = [
  "proc-macro2",
  "quote",
@@ -278,7 +282,11 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
+<<<<<<< HEAD
 version = "0.1.0-rc1"
+=======
+version = "0.1.1"
+>>>>>>> b6e0a622fa1d0df066959aa9e0a0a17b6a05a4ee
 dependencies = [
  "bincode",
  "blake3",

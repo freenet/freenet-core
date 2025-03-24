@@ -105,6 +105,7 @@ pub struct RuntimeConfig {
     pub cpu_cycles_per_second: Option<u64>,
     /// Safety margin for CPU speed variations (0.0 to 1.0)
     pub safety_margin: f64,
+    pub enable_metering: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -113,6 +114,7 @@ impl Default for RuntimeConfig {
             max_execution_seconds: 5.0,
             cpu_cycles_per_second: None,
             safety_margin: 0.2,
+            enable_metering: false,
         }
     }
 }
@@ -134,6 +136,7 @@ pub struct Runtime {
     pub(crate) contract_store: ContractStore,
     /// loaded contract modules
     pub(super) contract_modules: HashMap<ContractKey, Module>,
+    pub(crate) enabled_metering: bool,
 }
 
 impl Runtime {
@@ -171,6 +174,7 @@ impl Runtime {
 
             contract_store,
             delegate_modules: HashMap::new(),
+            enabled_metering: config.enable_metering,
         })
     }
 
@@ -338,7 +342,9 @@ impl Runtime {
 
         let metering = Arc::new(Metering::new(max_cycles, operation_cost));
         let mut compiler_config = Singlepass::default();
-        compiler_config.push_middleware(metering);
+        if config.enable_metering {
+            compiler_config.push_middleware(metering.clone());
+        }
 
         let engine = wasmer::EngineBuilder::new(compiler_config).engine();
 
@@ -351,19 +357,24 @@ impl Runtime {
         instance: &wasmer::Instance,
         function_name: &str,
     ) -> super::error::ContractError {
-        let remaining_points = get_remaining_points(self.wasm_store.as_mut().unwrap(), instance);
-        match remaining_points {
-            MeteringPoints::Remaining(..) => {
-                tracing::error!("Error while calling {}: {:?}", function_name, error);
-                error.into()
+        if self.enabled_metering {
+            let remaining_points =
+                get_remaining_points(self.wasm_store.as_mut().unwrap(), instance);
+            match remaining_points {
+                MeteringPoints::Remaining(..) => {
+                    tracing::error!("Error while calling {}: {:?}", function_name, error);
+                    error.into()
+                }
+                MeteringPoints::Exhausted => {
+                    tracing::error!(
+                        "{} ran out of gas, not enough points remaining",
+                        function_name
+                    );
+                    ContractExecError::OutOfGas.into()
+                }
             }
-            MeteringPoints::Exhausted => {
-                tracing::error!(
-                    "{} ran out of gas, not enough points remaining",
-                    function_name
-                );
-                ContractExecError::OutOfGas.into()
-            }
+        } else {
+            error.into()
         }
     }
 }
