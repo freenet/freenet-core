@@ -367,11 +367,11 @@ impl Executor<Runtime> {
     ) -> Response {
         match &req {
             ClientRequest::ContractOp(op) => {
-                tracing::debug!(operation = ?op.kind(), "Processing contract operation");
+                tracing::debug!("Processing contract operation");
                 self.contract_requests(op.clone(), id, updates).await
             },
             ClientRequest::DelegateOp(op) => {
-                tracing::debug!(operation = ?op.kind(), "Processing delegate operation");
+                tracing::debug!("Processing delegate operation");
                 self.delegate_request(op.clone(), None)
             },
             ClientRequest::Disconnect { cause } => {
@@ -394,7 +394,7 @@ impl Executor<Runtime> {
         level = "debug",
         name = "process_contract_request",
         skip(self, req, updates),
-        fields(client_id = %cli_id, request_type = ?req.kind())
+        fields(client_id = %cli_id)
     )]
     pub async fn contract_requests(
         &mut self,
@@ -422,7 +422,7 @@ impl Executor<Runtime> {
             ContractRequest::Update { key, data } => {
                 tracing::info!(
                     contract = %key,
-                    update_type = ?data.kind(),
+                    update_type = ?std::any::type_name_of_val(&data),
                     "Processing contract update request"
                 );
                 self.perform_contract_update(key, data).await
@@ -522,7 +522,7 @@ impl Executor<Runtime> {
         level = "debug",
         name = "process_delegate_request",
         skip(self, req),
-        fields(request_type = ?req.kind(), has_attested_contract = attestaded_contract.is_some())
+        fields(has_attested_contract = attestaded_contract.is_some())
     )]
     pub fn delegate_request(
         &mut self,
@@ -771,7 +771,7 @@ impl Executor<Runtime> {
         level = "debug",
         name = "perform_contract_update",
         skip(self, update),
-        fields(contract_key = %key, update_type = ?update.kind())
+        fields(contract_key = %key, update_type = ?update.is_left())
     )]
     async fn perform_contract_update(
         &mut self,
