@@ -19,8 +19,6 @@ use super::{errors::WebSocketApiError, path_handlers, AuthToken, ClientConnectio
 
 mod v1;
 
-// Please redo the tracing logging in this file according to best practices AI!
-
 #[derive(Clone)]
 pub(super) struct HttpGatewayRequest(mpsc::Sender<ClientConnection>);
 
@@ -56,51 +54,62 @@ struct Config {
     localhost: bool,
 }
 
-#[instrument(level = "debug")]
+#[instrument(level = "trace", name = "http_gateway_home")]
 async fn home() -> axum::response::Response {
+    trace!("Serving home endpoint");
     axum::response::Response::default()
 }
 
 impl ClientEventsProxy for HttpGateway {
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(
+        level = "debug",
+        name = "http_gateway_recv",
+        skip(self),
+        fields(gateway_connections = %self.response_channels.len())
+    )]
     fn recv(&mut self) -> BoxFuture<Result<OpenRequest<'static>, ClientError>> {
         async move {
+            trace!("Waiting for incoming client connection");
             while let Some(msg) = self.proxy_server_request.recv().await {
                 match msg {
                     ClientConnection::NewConnection {
                         callbacks,
                         assigned_token,
                     } => {
-                        debug!("Received new connection request");
-                        trace!("New connection assigned_token: {:?}", assigned_token);
-                        
                         let cli_id = ClientId::next();
-                        debug!("Generated client ID: {}", cli_id);
+                        info!(client_id = %cli_id, "New client connection established");
                         
-                        callbacks
-                            .send(HostCallbackResult::NewId { id: cli_id })
-                            .map_err(|e| {
-                                error!("Failed to send new ID to client: {:?}", e);
-                                ErrorKind::NodeUnavailable
-                            })?;
+                        if let Some(ref token) = assigned_token {
+                            trace!(client_id = %cli_id, token = ?token.0, "Connection has assigned token");
+                        }
+                        
+                        match callbacks.send(HostCallbackResult::NewId { id: cli_id }) {
+                            Ok(_) => debug!(client_id = %cli_id, "Sent client ID to new connection"),
+                            Err(e) => {
+                                error!(client_id = %cli_id, error = %e, "Failed to send client ID");
+                                return Err(ErrorKind::NodeUnavailable.into());
+                            }
+                        }
                         
                         if let Some((assigned_token, contract)) = assigned_token {
-                            debug!(
-                                "Registering attested contract: token={:?}, contract={:?}, client={}",
-                                assigned_token, contract, cli_id
+                            info!(
+                                client_id = %cli_id,
+                                token = ?assigned_token,
+                                contract = %contract,
+                                "Registering attested contract"
                             );
                             
                             self.attested_contracts
                                 .insert(assigned_token, (contract, cli_id));
                             
-                            debug!(
-                                "Updated attested_contracts map: {} entries",
-                                self.attested_contracts.len()
+                            trace!(
+                                client_id = %cli_id,
+                                contract_count = self.attested_contracts.len(),
+                                "Updated attested contracts map"
                             );
-                            trace!("Full attested_contracts map: {:?}", self.attested_contracts);
                         }
                         
-                        debug!("Storing response channel for client {}", cli_id);
+                        debug!(client_id = %cli_id, "Storing response channel");
                         self.response_channels.insert(cli_id, callbacks);
                         continue;
                     }
@@ -110,44 +119,54 @@ impl ClientEventsProxy for HttpGateway {
                         auth_token,
                     } => {
                         debug!(
-                            "Processing request from client {}, auth_token: {:?}",
-                            client_id, auth_token
+                            client_id = %client_id,
+                            auth_token = ?auth_token,
+                            request_type = ?req.kind(),
+                            "Processing client request"
                         );
                         return Ok(OpenRequest::new(client_id, req).with_token(auth_token));
                     }
                 }
             }
-            warn!("Shutting down http gateway receiver");
+            warn!("HTTP gateway receiver channel closed");
             Err(ErrorKind::Disconnect.into())
         }
         .boxed()
     }
 
-    #[instrument(level = "debug", skip(self, result))]
+    #[instrument(
+        level = "debug",
+        name = "http_gateway_send",
+        skip(self, result),
+        fields(client_id = %id, result_type = ?result.as_ref().map(|_| "success").unwrap_or("error"))
+    )]
     fn send(
         &mut self,
         id: ClientId,
         result: Result<HostResponse, ClientError>,
     ) -> BoxFuture<Result<(), ClientError>> {
         async move {
-            debug!("Sending response to client {}", id);
+            trace!(client_id = %id, "Preparing to send response");
             
             if let Some(ch) = self.response_channels.remove(&id) {
-                let should_rm = result
-                    .as_ref()
-                    .map_err(|err| {
-                        let is_disconnect = matches!(err.kind(), ErrorKind::Disconnect);
-                        if is_disconnect {
-                            debug!("Client {} disconnected", id);
-                        }
-                        is_disconnect
-                    })
-                    .err()
-                    .unwrap_or(false);
+                // Check if this is a disconnect error
+                let should_disconnect = match &result {
+                    Err(err) if matches!(err.kind(), ErrorKind::Disconnect) => {
+                        info!(client_id = %id, "Client disconnected");
+                        true
+                    },
+                    Err(err) => {
+                        debug!(client_id = %id, error = %err, "Sending error response");
+                        false
+                    },
+                    Ok(_) => {
+                        trace!(client_id = %id, "Sending successful response");
+                        false
+                    }
+                };
                 
-                // Check if we need to update attested_contracts on disconnect
-                if should_rm {
-                    debug!("Checking for attested contracts to clean up for client {}", id);
+                // Clean up attested contracts if client is disconnecting
+                if should_disconnect {
                     let tokens_to_remove: Vec<AuthToken> = self
                         .attested_contracts
                         .iter()
@@ -160,25 +179,41 @@ impl ClientEventsProxy for HttpGateway {
                         })
                         .collect();
                     
-                    for token in tokens_to_remove {
-                        if let Some((contract, _)) = self.attested_contracts.remove(&token) {
-                            debug!(
-                                "Removed attested contract mapping: token={:?}, contract={:?}, client={}",
-                                token, contract, id
-                            );
+                    if !tokens_to_remove.is_empty() {
+                        debug!(
+                            client_id = %id,
+                            token_count = tokens_to_remove.len(),
+                            "Cleaning up attested contracts"
+                        );
+                        
+                        for token in tokens_to_remove {
+                            if let Some((contract, _)) = self.attested_contracts.remove(&token) {
+                                trace!(
+                                    client_id = %id,
+                                    token = ?token,
+                                    contract = %contract,
+                                    "Removed attested contract mapping"
+                                );
+                            }
                         }
                     }
                 }
                 
-                if ch.send(HostCallbackResult::Result { id, result }).is_ok() && !should_rm {
-                    // still alive connection, keep it
-                    debug!("Connection to client {} still alive, keeping channel", id);
-                    self.response_channels.insert(id, ch);
-                } else {
-                    info!("Dropped connection to client #{}", id);
+                // Send the result and handle channel state
+                match ch.send(HostCallbackResult::Result { id, result }) {
+                    Ok(_) if !should_disconnect => {
+                        trace!(client_id = %id, "Connection still active, preserving channel");
+                        self.response_channels.insert(id, ch);
+                    },
+                    Ok(_) => {
+                        info!(client_id = %id, "Response sent, client disconnected");
+                    },
+                    Err(_) => {
+                        info!(client_id = %id, "Failed to send response, client disconnected");
+                    }
                 }
             } else {
-                warn!("Client {} not found in response_channels", id);
+                warn!(client_id = %id, "Client not found in response channels");
             }
             
             Ok(())
