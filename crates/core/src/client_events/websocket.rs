@@ -431,7 +431,7 @@ async fn process_client_request(
         }
         Ok(Message::Close(frame)) => {
             tracing::info!(
-                code = frame.as_ref().map(|f| f.code.into()),
+                code = frame.as_ref().map(|f| f.code as u16),
                 reason = frame.as_ref().map(|f| f.reason.to_string()),
                 "Received close frame"
             );
@@ -695,11 +695,13 @@ async fn process_host_response(
                         Err(err) => err.into_fbs_bytes(),
                     }
                 },
-                EncodingProtocol::Native => match bincode::serialize(&result) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to serialize response with bincode");
-                        return Err(e.into());
+                EncodingProtocol::Native => {
+                    match bincode::serialize(&result) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            tracing::error!(error = %e, "Failed to serialize response with bincode");
+                            return Err(e.into());
+                        }
                     }
                 },
             };
