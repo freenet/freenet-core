@@ -544,7 +544,7 @@ async fn process_client_request(
                     "Received SUBSCRIBE contract request"
                 );
             }
-            ContractRequest::Update { key, data } => {
+            ContractRequest::Update { key, data: _ } => {
                 tracing::info!(
                     contract_key = %key,
                     "Received UPDATE contract request"
@@ -688,7 +688,7 @@ async fn process_host_response(
             };
             // Serialize the response based on protocol
             tracing::debug!("Serializing response");
-            let serialized_res = match encoding_protoc {
+            let serialized_res: Vec<u8> = match encoding_protoc {
                 EncodingProtocol::Flatbuffers => {
                     match result {
                         Ok(res) => res.into_fbs_bytes(),
