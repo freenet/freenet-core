@@ -10,7 +10,7 @@ use freenet_stdlib::prelude::ContractInstanceId;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use tokio::sync::mpsc;
-use tracing::{debug, instrument};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 use crate::client_events::{ClientEventsProxy, ClientId, OpenRequest};
 use crate::server::HostCallbackResult;
@@ -18,10 +18,6 @@ use crate::server::HostCallbackResult;
 use super::{errors::WebSocketApiError, path_handlers, AuthToken, ClientConnection};
 
 mod v1;
-
-// Please redo the tracing logging in this file according to best practices, should mostly
-// be debug! level with particular attention paid to the attested_contracts and interactions
-// with it because that's what I'm having trouble with AI!
 
 #[derive(Clone)]
 pub(super) struct HttpGatewayRequest(mpsc::Sender<ClientConnection>);
@@ -73,16 +69,36 @@ impl ClientEventsProxy for HttpGateway {
                         callbacks,
                         assigned_token,
                     } => {
-                        debug!("New connection request: assigned_token: {:?}", assigned_token);
+                        debug!("Received new connection request");
+                        trace!("New connection assigned_token: {:?}", assigned_token);
+                        
                         let cli_id = ClientId::next();
+                        debug!("Generated client ID: {}", cli_id);
+                        
                         callbacks
                             .send(HostCallbackResult::NewId { id: cli_id })
-                            .map_err(|_e| ErrorKind::NodeUnavailable)?;
+                            .map_err(|e| {
+                                error!("Failed to send new ID to client: {:?}", e);
+                                ErrorKind::NodeUnavailable
+                            })?;
+                        
                         if let Some((assigned_token, contract)) = assigned_token {
+                            debug!(
+                                "Registering attested contract: token={:?}, contract={:?}, client={}",
+                                assigned_token, contract, cli_id
+                            );
+                            
                             self.attested_contracts
                                 .insert(assigned_token, (contract, cli_id));
-                            debug!("attested_contracts map after insert: {:?}", self.attested_contracts);
+                            
+                            debug!(
+                                "Updated attested_contracts map: {} entries",
+                                self.attested_contracts.len()
+                            );
+                            trace!("Full attested_contracts map: {:?}", self.attested_contracts);
                         }
+                        
+                        debug!("Storing response channel for client {}", cli_id);
                         self.response_channels.insert(cli_id, callbacks);
                         continue;
                     }
@@ -90,37 +106,79 @@ impl ClientEventsProxy for HttpGateway {
                         client_id,
                         req,
                         auth_token,
-                    } => return Ok(OpenRequest::new(client_id, req).with_token(auth_token)),
+                    } => {
+                        debug!(
+                            "Processing request from client {}, auth_token: {:?}",
+                            client_id, auth_token
+                        );
+                        return Ok(OpenRequest::new(client_id, req).with_token(auth_token));
+                    }
                 }
             }
-            tracing::warn!("Shutting down http gateway receiver");
+            warn!("Shutting down http gateway receiver");
             Err(ErrorKind::Disconnect.into())
         }
         .boxed()
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, result))]
     fn send(
         &mut self,
         id: ClientId,
         result: Result<HostResponse, ClientError>,
     ) -> BoxFuture<Result<(), ClientError>> {
         async move {
+            debug!("Sending response to client {}", id);
+            
             if let Some(ch) = self.response_channels.remove(&id) {
                 let should_rm = result
                     .as_ref()
-                    .map_err(|err| matches!(err.kind(), ErrorKind::Disconnect))
+                    .map_err(|err| {
+                        let is_disconnect = matches!(err.kind(), ErrorKind::Disconnect);
+                        if is_disconnect {
+                            debug!("Client {} disconnected", id);
+                        }
+                        is_disconnect
+                    })
                     .err()
                     .unwrap_or(false);
+                
+                // Check if we need to update attested_contracts on disconnect
+                if should_rm {
+                    debug!("Checking for attested contracts to clean up for client {}", id);
+                    let tokens_to_remove: Vec<AuthToken> = self
+                        .attested_contracts
+                        .iter()
+                        .filter_map(|(token, (_, client_id))| {
+                            if *client_id == id {
+                                Some(token.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    
+                    for token in tokens_to_remove {
+                        if let Some((contract, _)) = self.attested_contracts.remove(&token) {
+                            debug!(
+                                "Removed attested contract mapping: token={:?}, contract={:?}, client={}",
+                                token, contract, id
+                            );
+                        }
+                    }
+                }
+                
                 if ch.send(HostCallbackResult::Result { id, result }).is_ok() && !should_rm {
                     // still alive connection, keep it
+                    debug!("Connection to client {} still alive, keeping channel", id);
                     self.response_channels.insert(id, ch);
                 } else {
-                    tracing::info!("dropped connection to client #{id}");
+                    info!("Dropped connection to client #{}", id);
                 }
             } else {
-                tracing::warn!("client: {id} not found");
+                warn!("Client {} not found in response_channels", id);
             }
+            
             Ok(())
         }
         .boxed()
