@@ -4,8 +4,6 @@ use std::{
     time::Duration,
 };
 
-// Please redo the tracing logging in this file according to best practices AI!
-
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -206,22 +204,35 @@ async fn connection_info(
     next.run(req).await
 }
 
+#[tracing::instrument(
+    level = "debug",
+    name = "websocket_handler",
+    skip(ws, rs),
+    fields(has_auth = auth_token.is_some(), protocol = ?encoding_protoc)
+)]
 async fn websocket_commands(
     ws: WebSocketUpgrade,
     Extension(auth_token): Extension<Option<AuthToken>>,
     Extension(encoding_protoc): Extension<EncodingProtocol>,
     Extension(rs): Extension<WebSocketRequest>,
 ) -> axum::response::Response {
+    tracing::info!("Upgrading connection to WebSocket");
+    
     let on_upgrade = move |ws: WebSocket| async move {
-        tracing::debug!(protoc = ?ws.protocol(), "websocket connection established");
+        let protocol = ws.protocol().map(|p| p.to_string());
+        tracing::info!(
+            protocol = protocol.as_deref().unwrap_or("none"),
+            "WebSocket connection established"
+        );
+        
         match websocket_interface(rs.clone(), auth_token, encoding_protoc, ws).await {
             Ok(_) => {
-                tracing::debug!("WebSocket interface completed normally");
+                tracing::info!("WebSocket interface completed normally");
             }
             Err(error) => {
-                tracing::error!("WebSocket interface error: {}", error);
+                tracing::error!(error = %error, "WebSocket interface error");
                 if let Some(source) = error.source() {
-                    tracing::error!("Caused by: {}", source);
+                    tracing::error!(source = %source, "Caused by");
                 }
             }
         }
@@ -229,18 +240,25 @@ async fn websocket_commands(
     ws.on_upgrade(on_upgrade)
 }
 
+#[tracing::instrument(
+    level = "debug",
+    name = "websocket_interface",
+    skip(request_sender, auth_token, ws),
+    fields(protocol = ?encoding_protoc)
+)]
 async fn websocket_interface(
     request_sender: WebSocketRequest,
     mut auth_token: Option<AuthToken>,
     encoding_protoc: EncodingProtocol,
     ws: WebSocket,
 ) -> anyhow::Result<()> {
-    tracing::debug!("starting websocket interface handler");
+    tracing::debug!("Starting WebSocket interface handler");
+    
     let (mut response_rx, client_id) = new_client_connection(&request_sender).await?;
-    tracing::debug!(client_id = %client_id, "client connection established");
+    tracing::info!(client_id = %client_id, "Client connection established");
 
     let (mut server_sink, mut client_stream) = ws.split();
-    tracing::debug!("websocket stream split for bidirectional communication");
+    tracing::debug!("WebSocket stream split for bidirectional communication");
     let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::UnboundedReceiver<HostResult>)>>> =
         Arc::new(Mutex::new(VecDeque::new()));
     loop {
@@ -342,21 +360,45 @@ async fn websocket_interface(
     }
 }
 
+#[tracing::instrument(
+    level = "debug",
+    name = "new_client_connection",
+    skip(request_sender)
+)]
 async fn new_client_connection(
     request_sender: &WebSocketRequest,
 ) -> Result<(mpsc::UnboundedReceiver<HostCallbackResult>, ClientId), ClientError> {
+    tracing::debug!("Creating new client connection");
+    
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
-    request_sender
+    
+    match request_sender
         .send(ClientConnection::NewConnection {
             callbacks: response_sender,
             assigned_token: None,
         })
         .await
-        .map_err(|_| ErrorKind::NodeUnavailable)?;
+    {
+        Ok(_) => tracing::trace!("Sent new connection request"),
+        Err(_) => {
+            tracing::error!("Failed to send new connection request");
+            return Err(ErrorKind::NodeUnavailable.into());
+        }
+    }
+    
     match response_recv.recv().await {
-        Some(HostCallbackResult::NewId { id: client_id, .. }) => Ok((response_recv, client_id)),
-        None => Err(ErrorKind::NodeUnavailable.into()),
-        other => unreachable!("received unexpected message: {other:?}"),
+        Some(HostCallbackResult::NewId { id: client_id, .. }) => {
+            tracing::info!(client_id = %client_id, "Received client ID for new connection");
+            Ok((response_recv, client_id))
+        },
+        None => {
+            tracing::error!("No response received for new connection");
+            Err(ErrorKind::NodeUnavailable.into())
+        },
+        other => {
+            tracing::error!(response = ?other, "Unexpected response for new connection");
+            unreachable!("received unexpected message: {other:?}")
+        },
     }
 }
 
@@ -365,6 +407,12 @@ struct NewSubscription {
     callback: mpsc::UnboundedReceiver<HostResult>,
 }
 
+#[tracing::instrument(
+    level = "debug",
+    name = "process_client_request",
+    skip(msg, request_sender, auth_token),
+    fields(client_id = %client_id, protocol = ?encoding_protoc)
+)]
 async fn process_client_request(
     client_id: ClientId,
     msg: Result<Message, axum::Error>,
@@ -374,69 +422,100 @@ async fn process_client_request(
 ) -> Result<Option<Message>, Option<anyhow::Error>> {
     let msg = match msg {
         Ok(Message::Binary(data)) => {
-            tracing::debug!(size = data.len(), "received binary message");
+            tracing::debug!(size = data.len(), "Received binary message");
             data
         }
         Ok(Message::Text(data)) => {
-            tracing::debug!(size = data.len(), "received text message");
+            tracing::debug!(size = data.len(), "Received text message");
             data.into_bytes()
         }
         Ok(Message::Close(frame)) => {
-            tracing::debug!(?frame, "received close frame");
+            tracing::info!(
+                code = frame.as_ref().map(|f| f.code.into()),
+                reason = frame.as_ref().map(|f| f.reason.to_string()),
+                "Received close frame"
+            );
             return Err(None);
         }
         Ok(Message::Ping(ping)) => {
-            tracing::debug!("received ping");
+            tracing::debug!(size = ping.len(), "Received ping, sending pong");
             return Ok(Some(Message::Pong(ping)));
         }
         Ok(m) => {
-            tracing::debug!(msg = ?m, "received unexpected message type");
+            tracing::debug!(message_type = ?m, "Received unexpected message type");
             return Ok(None);
         }
         Err(err) => {
-            tracing::error!(error = %err, "error receiving websocket message");
+            tracing::error!(error = %err, "Error receiving WebSocket message");
             return Err(Some(err.into()));
         }
     };
 
     // Try to deserialize the ClientRequest message
+    tracing::trace!(message_size = msg.len(), "Attempting to deserialize client request");
+    
     let req = {
         match encoding_protoc {
             EncodingProtocol::Flatbuffers => match ClientRequest::try_decode_fbs(&msg) {
                 Ok(decoded) => {
                     tracing::debug!(
                         protocol = "flatbuffers",
-                        "successfully decoded client request"
+                        "Successfully decoded client request"
                     );
                     decoded.into_owned()
                 }
                 Err(err) => {
-                    tracing::error!(error = %err, protocol = "flatbuffers", "failed to decode client request");
-                    return Ok(Some(Message::Binary(err.into_fbs_bytes())));
+                    tracing::error!(
+                        error = %err, 
+                        protocol = "flatbuffers", 
+                        "Failed to decode client request"
+                    );
+                    match err.into_fbs_bytes() {
+                        Ok(bytes) => return Ok(Some(Message::Binary(bytes))),
+                        Err(e) => {
+                            tracing::error!(error = %e, "Failed to serialize error response");
+                            return Err(Some(e.into()));
+                        }
+                    }
                 }
             },
             EncodingProtocol::Native => match bincode::deserialize::<ClientRequest>(&msg) {
                 Ok(decoded) => {
-                    tracing::debug!(protocol = "native", "successfully decoded client request");
+                    tracing::debug!(
+                        protocol = "native", 
+                        "Successfully decoded client request"
+                    );
                     decoded.into_owned()
                 }
                 Err(err) => {
-                    tracing::error!(error = %err, protocol = "native", "failed to decode client request");
-                    let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
+                    tracing::error!(
+                        error = %err, 
+                        protocol = "native", 
+                        "Failed to decode client request"
+                    );
+                    
+                    let error_response = Err::<HostResponse, ClientError>(
                         ErrorKind::DeserializationError {
                             cause: format!("{err}").into(),
                         }
                         .into(),
-                    ))
-                    .map_err(|err| Some(err.into()))?;
-                    return Ok(Some(Message::Binary(result_error)));
+                    );
+                    
+                    match bincode::serialize(&error_response) {
+                        Ok(bytes) => return Ok(Some(Message::Binary(bytes))),
+                        Err(e) => {
+                            tracing::error!(error = %e, "Failed to serialize error response");
+                            return Err(Some(e.into()));
+                        }
+                    }
                 }
             },
         }
     };
+    // Handle authentication
     if let ClientRequest::Authenticate { token } = &req {
         *auth_token = Some(AuthToken::from(token.clone()));
-        tracing::debug!("client authenticated");
+        tracing::info!("Client authenticated with token");
     }
 
     // Log specific details for contract operations
@@ -445,10 +524,11 @@ async fn process_client_request(
             ContractRequest::Put {
                 contract, state, ..
             } => {
-                tracing::debug!(
+                tracing::info!(
                     contract_key = %contract.key(),
                     state_size = state.as_ref().len(),
-                    "received PUT contract request"
+                    state_hash = %blake3::hash(state.as_ref()),
+                    "Received PUT contract request"
                 );
             }
             ContractRequest::Get {
@@ -456,27 +536,74 @@ async fn process_client_request(
                 return_contract_code,
                 ..
             } => {
-                tracing::debug!(
+                tracing::info!(
                     contract_key = %key,
                     return_code = return_contract_code,
-                    "received GET contract request"
+                    "Received GET contract request"
                 );
             }
-            _ => tracing::debug!(operation = ?op, "received contract operation request"),
+            ContractRequest::Subscribe { key, summary } => {
+                tracing::info!(
+                    contract_key = %key,
+                    has_summary = summary.is_some(),
+                    "Received SUBSCRIBE contract request"
+                );
+            }
+            ContractRequest::Update { key, data } => {
+                tracing::info!(
+                    contract_key = %key,
+                    "Received UPDATE contract request"
+                );
+            }
+            _ => tracing::debug!(
+                operation_type = ?std::any::type_name_of_val(op),
+                "Received contract operation request"
+            ),
         },
-        _ => tracing::debug!(req = %req, "received client request"),
+        ClientRequest::DelegateOp(op) => {
+            tracing::info!(
+                delegate_type = ?std::any::type_name_of_val(op),
+                "Received delegate operation request"
+            );
+        }
+        ClientRequest::Disconnect { cause } => {
+            tracing::info!(
+                cause = cause.as_deref().unwrap_or("none"),
+                "Received disconnect request"
+            );
+        }
+        _ => tracing::debug!(
+            request_type = ?std::any::type_name_of_val(&req),
+            "Received client request"
+        ),
     }
-    request_sender
+    // Forward the request to the server
+    tracing::debug!("Forwarding request to server");
+    match request_sender
         .send(ClientConnection::Request {
             client_id,
             req: Box::new(req),
             auth_token: auth_token.clone(),
         })
         .await
-        .map_err(|err| Some(err.into()))?;
-    Ok(None)
+    {
+        Ok(_) => {
+            tracing::debug!("Request successfully forwarded");
+            Ok(None)
+        },
+        Err(err) => {
+            tracing::error!(error = %err, "Failed to forward request to server");
+            Err(Some(err.into()))
+        }
+    }
 }
 
+#[tracing::instrument(
+    level = "debug",
+    name = "process_host_response",
+    skip(msg, tx),
+    fields(client_id = %client_id, protocol = ?encoding_protoc)
+)]
 async fn process_host_response(
     msg: Option<HostCallbackResult>,
     client_id: ClientId,
@@ -485,7 +612,14 @@ async fn process_host_response(
 ) -> anyhow::Result<Option<NewSubscription>> {
     match msg {
         Some(HostCallbackResult::Result { id, result }) => {
-            debug_assert_eq!(id, client_id);
+            if id != client_id {
+                tracing::warn!(
+                    expected_id = %client_id,
+                    actual_id = %id,
+                    "Client ID mismatch in response"
+                );
+            }
+            
             let result = match result {
                 Ok(res) => {
                     match &res {
@@ -495,79 +629,212 @@ async fn process_host_response(
                                 contract,
                                 state,
                             } => {
-                                tracing::debug!(
+                                tracing::info!(
                                     contract_key = %key,
                                     has_contract = contract.is_some(),
                                     state_size = state.as_ref().len(),
-                                    "sending GET response"
+                                    state_hash = %blake3::hash(state.as_ref()),
+                                    "Sending GET response"
                                 );
                             }
                             ContractResponse::PutResponse { key } => {
-                                tracing::debug!(
+                                tracing::info!(
                                     contract_key = %key,
-                                    "sending PUT response"
+                                    "Sending PUT response"
                                 );
                             }
-                            _ => tracing::debug!(response = ?resp, "sending contract response"),
+                            ContractResponse::UpdateResponse { key, summary } => {
+                                tracing::info!(
+                                    contract_key = %key,
+                                    has_summary = !summary.is_empty(),
+                                    "Sending UPDATE response"
+                                );
+                            }
+                            ContractResponse::SubscribeResponse { key, subscribed } => {
+                                tracing::info!(
+                                    contract_key = %key,
+                                    subscribed = subscribed,
+                                    "Sending SUBSCRIBE response"
+                                );
+                            }
+                            ContractResponse::UpdateNotification { key, .. } => {
+                                tracing::info!(
+                                    contract_key = %key,
+                                    "Sending update notification"
+                                );
+                            }
+                            _ => tracing::debug!(
+                                response_type = ?std::any::type_name_of_val(resp),
+                                "Sending contract response"
+                            ),
                         },
-                        _ => tracing::debug!(response = %res, "sending response"),
+                        HostResponse::DelegateResponse { key, values } => {
+                            tracing::info!(
+                                delegate_key = %key,
+                                values_count = values.len(),
+                                "Sending delegate response"
+                            );
+                        }
+                        _ => tracing::debug!(
+                            response_type = ?std::any::type_name_of_val(&res),
+                            "Sending response"
+                        ),
                     }
                     Ok(res)
                 }
                 Err(err) => {
-                    tracing::debug!(response = %err, cli_id = %id, "sending response error");
+                    tracing::warn!(
+                        error = %err,
+                        error_kind = ?err.kind(),
+                        "Sending error response"
+                    );
                     Err(err)
                 }
             };
+            // Serialize the response based on protocol
+            tracing::debug!("Serializing response");
             let serialized_res = match encoding_protoc {
-                EncodingProtocol::Flatbuffers => match result {
-                    Ok(res) => res.into_fbs_bytes()?,
-                    Err(err) => err.into_fbs_bytes()?,
+                EncodingProtocol::Flatbuffers => {
+                    match result {
+                        Ok(res) => match res.into_fbs_bytes() {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::error!(error = %e, "Failed to serialize response to flatbuffers");
+                                return Err(e.into());
+                            }
+                        },
+                        Err(err) => match err.into_fbs_bytes() {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::error!(error = %e, "Failed to serialize error to flatbuffers");
+                                return Err(e.into());
+                            }
+                        },
+                    }
                 },
-                EncodingProtocol::Native => bincode::serialize(&result)?,
+                EncodingProtocol::Native => match bincode::serialize(&result) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to serialize response with bincode");
+                        return Err(e.into());
+                    }
+                },
             };
-            tx.send(Message::Binary(serialized_res)).await?;
-            Ok(None)
+            
+            // Send the response
+            tracing::debug!(response_size = serialized_res.len(), "Sending response to client");
+            match tx.send(Message::Binary(serialized_res)).await {
+                Ok(_) => {
+                    tracing::debug!("Response sent successfully");
+                    Ok(None)
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to send response to client");
+                    Err(e.into())
+                }
+            }
         }
         Some(HostCallbackResult::SubscriptionChannel { key, id, callback }) => {
-            debug_assert_eq!(id, client_id);
+            if id != client_id {
+                tracing::warn!(
+                    expected_id = %client_id,
+                    actual_id = %id,
+                    "Client ID mismatch in subscription channel"
+                );
+            }
+            
+            tracing::info!(
+                contract_key = %key,
+                "Received subscription channel for contract"
+            );
             Ok(Some(NewSubscription { key, callback }))
         }
         Some(HostCallbackResult::NewId { id: cli_id }) => {
-            tracing::debug!(%cli_id, "new client registered");
+            tracing::info!(client_id = %cli_id, "New client registered");
             Ok(None)
         }
         None => {
-            let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
-                ErrorKind::NodeUnavailable.into(),
-            ))?;
-            tx.send(Message::Binary(result_error)).await?;
-            tx.send(Message::Close(None)).await?;
-            tracing::warn!("node shut down while handling responses for {client_id}");
+            tracing::error!("Node shut down while handling responses");
+            
+            // Create error response
+            let error_response = Err::<HostResponse, ClientError>(
+                ErrorKind::NodeUnavailable.into()
+            );
+            
+            // Serialize and send error
+            match bincode::serialize(&error_response) {
+                Ok(bytes) => {
+                    if let Err(e) = tx.send(Message::Binary(bytes)).await {
+                        tracing::error!(error = %e, "Failed to send error response");
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to serialize error response");
+                }
+            }
+            
+            // Send close frame
+            if let Err(e) = tx.send(Message::Close(None)).await {
+                tracing::error!(error = %e, "Failed to send close frame");
+            }
+            
             Err(anyhow::anyhow!(
-                "node shut down while handling responses for {client_id}"
+                "Node shut down while handling responses for client {client_id}"
             ))
         }
     }
 }
 
 impl ClientEventsProxy for WebSocketProxy {
+    #[tracing::instrument(
+        level = "debug",
+        name = "websocket_proxy_recv",
+        skip(self),
+        fields(active_connections = %self.response_channels.len())
+    )]
     fn recv(&mut self) -> BoxFuture<Result<OpenRequest<'static>, ClientError>> {
         async move {
+            tracing::trace!("Waiting for incoming client request");
+            
             loop {
-                let msg = self.proxy_server_request.recv().await;
-                if let Some(msg) = msg {
-                    if let Some(reply) = self.internal_proxy_recv(msg).await? {
-                        break Ok(reply.into_owned());
+                match self.proxy_server_request.recv().await {
+                    Some(msg) => {
+                        tracing::debug!("Received client connection message");
+                        match self.internal_proxy_recv(msg).await {
+                            Ok(Some(reply)) => {
+                                tracing::debug!("Processing client request");
+                                break Ok(reply.into_owned());
+                            }
+                            Ok(None) => {
+                                tracing::trace!("Connection setup message, continuing");
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "Error processing client message");
+                                break Err(e);
+                            }
+                        }
                     }
-                } else {
-                    break Err(ClientError::from(ErrorKind::ChannelClosed));
+                    None => {
+                        tracing::warn!("WebSocket proxy channel closed");
+                        break Err(ClientError::from(ErrorKind::ChannelClosed));
+                    }
                 }
             }
         }
         .boxed()
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        name = "websocket_proxy_send",
+        skip(self, result),
+        fields(
+            client_id = %id,
+            result_type = ?result.as_ref().map(|_| "success").unwrap_or("error"),
+            active_connections = %self.response_channels.len()
+        )
+    )]
     fn send(
         &mut self,
         id: ClientId,
@@ -575,19 +842,42 @@ impl ClientEventsProxy for WebSocketProxy {
     ) -> BoxFuture<Result<(), ClientError>> {
         async move {
             if let Some(ch) = self.response_channels.remove(&id) {
-                let should_rm = result
-                    .as_ref()
-                    .map_err(|err| matches!(err.kind(), ErrorKind::Disconnect))
-                    .err()
-                    .unwrap_or(false);
-                if ch.send(HostCallbackResult::Result { id, result }).is_ok() && !should_rm {
-                    // still alive connection, keep it
-                    self.response_channels.insert(id, ch);
-                } else {
-                    tracing::info!("dropped connection to client #{id}");
+                // Check if this is a disconnect error
+                let should_disconnect = match &result {
+                    Err(err) if matches!(err.kind(), ErrorKind::Disconnect) => {
+                        tracing::info!(client_id = %id, "Client disconnecting");
+                        true
+                    },
+                    Err(err) => {
+                        tracing::debug!(
+                            client_id = %id,
+                            error = %err,
+                            error_kind = ?err.kind(),
+                            "Sending error response"
+                        );
+                        false
+                    },
+                    Ok(_) => {
+                        tracing::trace!(client_id = %id, "Sending successful response");
+                        false
+                    }
+                };
+                
+                // Send the result
+                match ch.send(HostCallbackResult::Result { id, result }) {
+                    Ok(_) if !should_disconnect => {
+                        tracing::debug!(client_id = %id, "Connection still active, preserving channel");
+                        self.response_channels.insert(id, ch);
+                    },
+                    Ok(_) => {
+                        tracing::info!(client_id = %id, "Response sent, client disconnected");
+                    },
+                    Err(_) => {
+                        tracing::info!(client_id = %id, "Failed to send response, client disconnected");
+                    }
                 }
             } else {
-                tracing::warn!("client: {id} not found");
+                tracing::warn!(client_id = %id, "Client not found in response channels");
             }
             Ok(())
         }
