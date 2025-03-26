@@ -1,40 +1,51 @@
-use tracing::debug;
 use super::*;
 use super::{
     ContractExecutor, ContractRequest, ContractResponse, ExecutorError, ExecutorHalve,
     ExecutorToEventLoopChannel, RequestError, Response, StateStoreError,
 };
 
-// Please redo the tracing logging in this file according to best practices AI!
-
 impl ContractExecutor for Executor<Runtime> {
+    #[tracing::instrument(
+        level = "debug",
+        name = "fetch_contract",
+        skip(self),
+        fields(contract = %key, return_code = return_contract_code)
+    )]
     async fn fetch_contract(
         &mut self,
         key: ContractKey,
         return_contract_code: bool,
     ) -> Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError> {
-        tracing::debug!(
-            contract = %key,
-            return_code = return_contract_code,
-            "fetching contract"
-        );
+        tracing::trace!("Starting contract fetch operation");
         let result = self.perform_contract_get(return_contract_code, key).await;
-        if let Ok((Some(ref state), ref code)) = result {
-            let hash = blake3::hash(state.as_ref());
-            tracing::debug!(
-                contract = %key,
-                state_size = state.as_ref().len(),
-                state_hash = %hash,
-                has_code = code.is_some(),
-                "fetched contract state"
-            );
+        
+        match &result {
+            Ok((Some(state), code)) => {
+                let hash = blake3::hash(state.as_ref());
+                tracing::debug!(
+                    state_size = state.as_ref().len(),
+                    state_hash = %hash,
+                    has_code = code.is_some(),
+                    "Successfully fetched contract state"
+                );
+            }
+            Ok((None, _)) => {
+                tracing::debug!("Contract state not found");
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "Failed to fetch contract");
+            }
         }
-        match result {
-            Ok((state, code)) => Ok((state, code)),
-            Err(err) => Err(err),
-        }
+        
+        result
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        name = "upsert_contract_state",
+        skip(self, update, related_contracts, code),
+        fields(contract = %key, update_type = ?update.is_left())
+    )]
     async fn upsert_contract_state(
         &mut self,
         key: ContractKey,
@@ -45,11 +56,12 @@ impl ContractExecutor for Executor<Runtime> {
         if let Either::Left(ref state) = update {
             let hash = blake3::hash(state.as_ref());
             tracing::debug!(
-                contract = %key,
                 state_size = state.as_ref().len(),
                 state_hash = %hash,
-                "upserting contract state"
+                "Processing full state update"
             );
+        } else {
+            tracing::debug!("Processing delta update");
         }
         let params = if let Some(code) = &code {
             code.params()
@@ -183,6 +195,12 @@ impl ContractExecutor for Executor<Runtime> {
         }
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        name = "register_contract_notifier",
+        skip(self, notification_ch, summary),
+        fields(contract = %key, client_id = %cli_id, has_summary = summary.is_some())
+    )]
     fn register_contract_notifier(
         &mut self,
         key: ContractKey,
@@ -190,31 +208,42 @@ impl ContractExecutor for Executor<Runtime> {
         notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
         summary: Option<StateSummary<'_>>,
     ) -> Result<(), Box<RequestError>> {
+        tracing::trace!("Registering contract notification channel");
+        
         let channels = self.update_notifications.entry(key).or_default();
         if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
             let (_, existing_ch) = &channels[i];
             if !existing_ch.same_channel(&notification_ch) {
+                tracing::warn!("Client already has a different notification channel registered");
                 return Err(RequestError::from(StdContractError::Subscribe {
                     key,
                     cause: format!("Peer {cli_id} already subscribed").into(),
                 })
                 .into());
             }
+            tracing::debug!("Client already registered with same channel");
         } else {
+            tracing::debug!("Adding new notification channel for client");
             channels.push((cli_id, notification_ch));
         }
 
-        if self
+        let replaced = self
             .subscriber_summaries
             .entry(key)
             .or_default()
             .insert(cli_id, summary.map(StateSummary::into_owned))
-            .is_some()
-        {
-            tracing::warn!(
-                "contract {key} already was registered for peer {cli_id}; replaced summary"
-            );
+            .is_some();
+            
+        if replaced {
+            tracing::warn!("Replaced existing summary for client");
+        } else {
+            tracing::debug!("Added new summary for client");
         }
+        
+        tracing::debug!(
+            subscribers = channels.len(),
+            "Contract notification registration complete"
+        );
         Ok(())
     }
 }
@@ -282,6 +311,12 @@ impl Executor<Runtime> {
         Ok(())
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        name = "preload_contract",
+        skip(self, contract, state, related_contracts),
+        fields(client_id = %cli_id, contract_key = %contract.key())
+    )]
     pub async fn preload(
         &mut self,
         cli_id: ClientId,
@@ -289,7 +324,13 @@ impl Executor<Runtime> {
         state: WrappedState,
         related_contracts: RelatedContracts<'static>,
     ) {
-        if let Err(err) = self
+        tracing::debug!(
+            state_size = state.as_ref().len(),
+            state_hash = %blake3::hash(state.as_ref()),
+            "Preloading contract"
+        );
+        
+        let result = self
             .contract_requests(
                 ContractRequest::Put {
                     contract,
@@ -300,52 +341,67 @@ impl Executor<Runtime> {
                 cli_id,
                 None,
             )
-            .await
-        {
+            .await;
+            
+        if let Err(err) = result {
             match err.inner {
-                Either::Left(err) => tracing::error!("req error: {err}"),
-                Either::Right(err) => tracing::error!("other error: {err}"),
+                Either::Left(err) => tracing::error!(error = %err, "Request error during preload"),
+                Either::Right(err) => tracing::error!(error = %err, "Other error during preload"),
             }
+        } else {
+            tracing::info!("Contract successfully preloaded");
         }
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        name = "handle_client_request",
+        skip(self, req, updates),
+        fields(client_id = %id)
+    )]
     pub async fn handle_request(
         &mut self,
         id: ClientId,
         req: ClientRequest<'_>,
         updates: Option<mpsc::UnboundedSender<Result<HostResponse, WsClientError>>>,
     ) -> Response {
-        match req {
-            ClientRequest::ContractOp(op) => self.contract_requests(op, id, updates).await,
-            ClientRequest::DelegateOp(op) => self.delegate_request(op, None),
+        match &req {
+            ClientRequest::ContractOp(op) => {
+                tracing::debug!(operation = ?op.kind(), "Processing contract operation");
+                self.contract_requests(op.clone(), id, updates).await
+            },
+            ClientRequest::DelegateOp(op) => {
+                tracing::debug!(operation = ?op.kind(), "Processing delegate operation");
+                self.delegate_request(op.clone(), None)
+            },
             ClientRequest::Disconnect { cause } => {
                 if let Some(cause) = cause {
-                    tracing::info!("disconnecting cause: {cause}");
+                    tracing::info!(cause = %cause, "Client disconnecting with cause");
+                } else {
+                    tracing::info!("Client disconnecting");
                 }
                 Err(RequestError::Disconnect.into())
             }
             other => {
-                tracing::warn!(
-                    client = %id,
-                    request = ?other,
-                    "unsupported client request"
-                );
-                Err(ExecutorError::other(anyhow::anyhow!("not supported")))
+                tracing::warn!(request_type = ?std::any::type_name_of_val(&other), "Unsupported client request");
+                Err(ExecutorError::other(anyhow::anyhow!("Request type not supported")))
             }
         }
     }
 
     /// Respond to requests made through any API's from client applications in local mode.
+    #[tracing::instrument(
+        level = "debug",
+        name = "process_contract_request",
+        skip(self, req, updates),
+        fields(client_id = %cli_id, request_type = ?req.kind())
+    )]
     pub async fn contract_requests(
         &mut self,
         req: ContractRequest<'_>,
         cli_id: ClientId,
         updates: Option<mpsc::UnboundedSender<Result<HostResponse, WsClientError>>>,
     ) -> Response {
-        tracing::debug!(
-            client = %cli_id,
-            "received contract request"
-        );
         let result = match req {
             ContractRequest::Put {
                 contract,
@@ -353,55 +409,95 @@ impl Executor<Runtime> {
                 related_contracts,
                 ..
             } => {
-                tracing::debug!(
-                    client = %cli_id,
-                    contract = %contract.key(),
+                let key = contract.key();
+                tracing::info!(
+                    contract = %key,
                     state_size = state.as_ref().len(),
-                    "putting contract"
+                    state_hash = %blake3::hash(state.as_ref()),
+                    "Processing contract put request"
                 );
                 self.perform_contract_put(contract, state, related_contracts)
                     .await
             }
-            ContractRequest::Update { key, data } => self.perform_contract_update(key, data).await,
-            // FIXME
-            // Handle Get requests by returning the contract state and optionally the contract code
+            ContractRequest::Update { key, data } => {
+                tracing::info!(
+                    contract = %key,
+                    update_type = ?data.kind(),
+                    "Processing contract update request"
+                );
+                self.perform_contract_update(key, data).await
+            }
             ContractRequest::Get {
                 key,
                 return_contract_code,
                 ..
-            } => match self.perform_contract_get(return_contract_code, key).await {
-                Ok((state, contract)) => Ok(ContractResponse::GetResponse {
-                    key,
-                    state: state.ok_or_else(|| {
-                        tracing::debug!(
-                            contract = %key,
-                            "Contract state not found during get request."
-                        );
-                        ExecutorError::request(StdContractError::Get {
+            } => {
+                tracing::info!(
+                    contract = %key,
+                    return_code = return_contract_code,
+                    "Processing contract get request"
+                );
+                
+                match self.perform_contract_get(return_contract_code, key).await {
+                    Ok((state, contract)) => {
+                        if let Some(ref state) = state {
+                            tracing::debug!(
+                                state_size = state.as_ref().len(),
+                                state_hash = %blake3::hash(state.as_ref()),
+                                has_contract = contract.is_some(),
+                                "Contract state retrieved successfully"
+                            );
+                        } else {
+                            tracing::debug!("Contract state not found");
+                            return Err(ExecutorError::request(StdContractError::Get {
+                                key,
+                                cause: "contract state not found".into(),
+                            }));
+                        }
+                        
+                        Ok(ContractResponse::GetResponse {
                             key,
-                            cause: "contract state not found".into(),
-                        })
-                    })?,
-                    contract,
+                            state: state.unwrap(),
+                            contract,
+                        }
+                        .into())
+                    }
+                    Err(err) => Err(err),
                 }
-                .into()),
-                Err(err) => Err(err),
-            },
+            }
             ContractRequest::Subscribe { key, summary } => {
-                tracing::debug!(
-                    client = %cli_id,
+                tracing::info!(
                     contract = %key,
                     has_summary = summary.is_some(),
-                    "subscribing to contract"
+                    "Processing contract subscribe request"
                 );
-                let updates = updates.ok_or_else(|| {
-                    ExecutorError::other(anyhow::anyhow!("missing update channel"))
-                })?;
-                self.register_contract_notifier(key, cli_id, updates, summary)?;
+                
+                let updates = match updates {
+                    Some(ch) => ch,
+                    None => {
+                        tracing::error!("Missing update channel for subscription");
+                        return Err(ExecutorError::other(anyhow::anyhow!("Missing update channel")));
+                    }
+                };
+                
+                if let Err(e) = self.register_contract_notifier(key, cli_id, updates, summary) {
+                    tracing::error!(error = %e, "Failed to register contract notifier");
+                    return Err(e.into());
+                }
 
                 // by default a subscribe op has an implicit get
-                let _res = self.perform_contract_get(false, key).await?;
-                self.subscribe(key).await?;
+                tracing::debug!("Performing implicit get for subscription");
+                if let Err(e) = self.perform_contract_get(false, key).await {
+                    tracing::error!(error = %e, "Failed implicit get during subscription");
+                    return Err(e);
+                }
+                
+                if let Err(e) = self.subscribe(key).await {
+                    tracing::error!(error = %e, "Failed to subscribe to contract");
+                    return Err(e);
+                }
+                
+                tracing::info!("Successfully subscribed to contract");
                 Ok(ContractResponse::SubscribeResponse {
                     key,
                     subscribed: true,
@@ -409,34 +505,30 @@ impl Executor<Runtime> {
                 .into())
             }
             other => {
-                tracing::warn!(
-                    client = %cli_id,
-                    request = ?other,
-                    "unsupported contract request"
-                );
-                Err(ExecutorError::other(anyhow::anyhow!("not supported")))
+                tracing::warn!(request_type = ?std::any::type_name_of_val(&other), "Unsupported contract request");
+                Err(ExecutorError::other(anyhow::anyhow!("Request type not supported")))
             }
         };
 
-        if let Err(ref e) = result {
-            tracing::error!(
-                client = %cli_id,
-                error = %e,
-                "contract request failed"
-            );
+        match &result {
+            Ok(_) => tracing::debug!("Contract request completed successfully"),
+            Err(e) => tracing::error!(error = %e, "Contract request failed"),
         }
 
         result
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        name = "process_delegate_request",
+        skip(self, req),
+        fields(request_type = ?req.kind(), has_attested_contract = attestaded_contract.is_some())
+    )]
     pub fn delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
         attestaded_contract: Option<&ContractInstanceId>,
     ) -> Response {
-        debug!(request = ?req,
-            attested_contract = ?attestaded_contract,
-            "received delegate request");
         match req {
             DelegateRequest::RegisterDelegate {
                 delegate,
@@ -445,33 +537,61 @@ impl Executor<Runtime> {
             } => {
                 use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
                 let key = delegate.key().clone();
+                
+                tracing::info!(
+                    delegate_key = %key,
+                    "Registering delegate"
+                );
+                
                 let arr = GenericArray::from_slice(&cipher);
                 let cipher = XChaCha20Poly1305::new(arr);
                 let nonce = GenericArray::from_slice(&nonce).to_owned();
-                tracing::debug!("registering delegate `{key}");
+                
                 if let Some(contract) = attestaded_contract {
+                    tracing::debug!(
+                        delegate_key = %key,
+                        contract = %contract,
+                        "Registering attested contract for delegate"
+                    );
                     self.delegate_attested_ids
                         .entry(key.clone())
                         .or_default()
                         .push(*contract);
                 }
+                
                 match self.runtime.register_delegate(delegate, cipher, nonce) {
-                    Ok(_) => Ok(DelegateResponse {
-                        key,
-                        values: Vec::new(),
-                    }),
+                    Ok(_) => {
+                        tracing::info!(delegate_key = %key, "Delegate registered successfully");
+                        Ok(DelegateResponse {
+                            key,
+                            values: Vec::new(),
+                        })
+                    },
                     Err(err) => {
-                        tracing::error!("failed registering delegate `{key}`: {err}");
+                        tracing::error!(
+                            delegate_key = %key,
+                            error = %err,
+                            "Failed to register delegate"
+                        );
                         Err(ExecutorError::other(StdDelegateError::RegisterError(key)))
                     }
                 }
             }
             DelegateRequest::UnregisterDelegate(key) => {
+                tracing::info!(delegate_key = %key, "Unregistering delegate");
+                
                 self.delegate_attested_ids.remove(&key);
                 match self.runtime.unregister_delegate(&key) {
-                    Ok(_) => Ok(HostResponse::Ok),
+                    Ok(_) => {
+                        tracing::info!(delegate_key = %key, "Delegate unregistered successfully");
+                        Ok(HostResponse::Ok)
+                    },
                     Err(err) => {
-                        tracing::error!("failed unregistering delegate `{key}`: {err}");
+                        tracing::warn!(
+                            delegate_key = %key,
+                            error = %err,
+                            "Error during delegate unregistration, continuing anyway"
+                        );
                         Ok(HostResponse::Ok)
                     }
                 }
@@ -481,22 +601,50 @@ impl Executor<Runtime> {
                 params,
                 get_request,
             } => {
+                tracing::info!(
+                    delegate_key = %key,
+                    "Processing get secret request"
+                );
+                
                 let attested = attestaded_contract.and_then(|contract| {
                     self.delegate_attested_ids
                         .get(&key)
                         .and_then(|contracts| contracts.iter().find(|c| *c == contract))
                 });
+                
+                if let Some(contract) = attested {
+                    tracing::debug!(
+                        delegate_key = %key,
+                        contract = %contract,
+                        "Request has attested contract"
+                    );
+                }
+                
                 match self.runtime.inbound_app_message(
                     &key,
                     &params,
                     attested.map(|c| c.as_bytes()),
                     vec![InboundDelegateMsg::GetSecretRequest(get_request)],
                 ) {
-                    Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
-                    Err(err) => Err(ExecutorError::execution(
-                        err,
-                        Some(InnerOpError::Delegate(key.clone())),
-                    )),
+                    Ok(values) => {
+                        tracing::debug!(
+                            delegate_key = %key,
+                            values_count = values.len(),
+                            "Secret request processed successfully"
+                        );
+                        Ok(HostResponse::DelegateResponse { key, values })
+                    },
+                    Err(err) => {
+                        tracing::error!(
+                            delegate_key = %key,
+                            error = %err,
+                            "Failed to process secret request"
+                        );
+                        Err(ExecutorError::execution(
+                            err,
+                            Some(InnerOpError::Delegate(key.clone())),
+                        ))
+                    }
                 }
             }
             DelegateRequest::ApplicationMessages {
@@ -504,11 +652,26 @@ impl Executor<Runtime> {
                 inbound,
                 params,
             } => {
+                tracing::info!(
+                    delegate_key = %key,
+                    messages_count = inbound.len(),
+                    "Processing application messages"
+                );
+                
                 let attested = attestaded_contract.and_then(|contract| {
                     self.delegate_attested_ids
                         .get(&key)
                         .and_then(|contracts| contracts.iter().find(|c| *c == contract))
                 });
+                
+                if let Some(contract) = attested {
+                    tracing::debug!(
+                        delegate_key = %key,
+                        contract = %contract,
+                        "Request has attested contract"
+                    );
+                }
+                
                 match self.runtime.inbound_app_message(
                     &key,
                     &params,
@@ -518,9 +681,20 @@ impl Executor<Runtime> {
                         .map(InboundDelegateMsg::into_owned)
                         .collect(),
                 ) {
-                    Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
+                    Ok(values) => {
+                        tracing::debug!(
+                            delegate_key = %key,
+                            values_count = values.len(),
+                            "Application messages processed successfully"
+                        );
+                        Ok(HostResponse::DelegateResponse { key, values })
+                    },
                     Err(err) => {
-                        tracing::error!("failed executing delegate `{key}`: {err}");
+                        tracing::error!(
+                            delegate_key = %key,
+                            error = %err,
+                            "Failed to process application messages"
+                        );
                         Err(ExecutorError::execution(
                             err,
                             Some(InnerOpError::Delegate(key)),
@@ -528,10 +702,19 @@ impl Executor<Runtime> {
                     }
                 }
             }
-            _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
+            _ => {
+                tracing::warn!("Unsupported delegate request type");
+                Err(ExecutorError::other(anyhow::anyhow!("Request type not supported")))
+            }
         }
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        name = "perform_contract_put",
+        skip(self, contract, state, related_contracts),
+        fields(contract_key = %contract.key(), state_size = state.as_ref().len())
+    )]
     async fn perform_contract_put(
         &mut self,
         contract: ContractContainer,
@@ -540,74 +723,132 @@ impl Executor<Runtime> {
     ) -> Response {
         let key = contract.key();
         let params = contract.params();
+        let state_hash = blake3::hash(state.as_ref());
+        
+        tracing::debug!(
+            state_hash = %state_hash,
+            params_size = params.as_ref().len(),
+            "Starting contract put operation"
+        );
 
-        if self.get_local_contract(key.id()).await.is_ok() {
-            // already existing contract, just try to merge states
+        // Check if contract already exists
+        let contract_exists = self.get_local_contract(key.id()).await.is_ok();
+        if contract_exists {
+            tracing::info!(
+                "Contract already exists, performing update instead of put"
+            );
             return self
                 .perform_contract_update(key, UpdateData::State(state.into()))
                 .await;
         }
 
-        self.verify_and_store_contract(state.clone(), contract, related_contracts)
-            .await?;
+        tracing::debug!("Verifying and storing new contract");
+        if let Err(e) = self.verify_and_store_contract(state.clone(), contract, related_contracts).await {
+            tracing::error!(
+                error = %e,
+                "Failed to verify and store contract"
+            );
+            return Err(e);
+        }
 
-        self.send_update_notification(&key, &params, &state)
-            .await
-            .map_err(|_| {
-                ExecutorError::request(StdContractError::Put {
-                    key,
-                    cause: "failed while sending notifications".into(),
-                })
-            })?;
+        tracing::debug!("Sending update notifications");
+        if let Err(e) = self.send_update_notification(&key, &params, &state).await {
+            tracing::error!(
+                error = %e,
+                "Failed to send update notifications"
+            );
+            return Err(ExecutorError::request(StdContractError::Put {
+                key,
+                cause: "failed while sending notifications".into(),
+            }));
+        }
+        
+        tracing::info!("Contract put operation completed successfully");
         Ok(ContractResponse::PutResponse { key }.into())
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        name = "perform_contract_update",
+        skip(self, update),
+        fields(contract_key = %key, update_type = ?update.kind())
+    )]
     async fn perform_contract_update(
         &mut self,
         key: ContractKey,
         update: UpdateData<'_>,
     ) -> Response {
-        let parameters = {
-            self.state_store
-                .get_params(&key)
-                .await
-                .map_err(ExecutorError::other)?
-                .ok_or_else(|| {
-                    RequestError::ContractError(StdContractError::Update {
-                        cause: "missing contract parameters".into(),
-                        key,
-                    })
-                })?
+        tracing::debug!("Retrieving contract parameters");
+        let parameters = match self.state_store.get_params(&key).await {
+            Ok(Some(params)) => params,
+            Ok(None) => {
+                tracing::error!("Missing contract parameters");
+                return Err(ExecutorError::request(StdContractError::Update {
+                    cause: "missing contract parameters".into(),
+                    key,
+                }));
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to retrieve contract parameters");
+                return Err(ExecutorError::other(e));
+            }
         };
 
-        let current_state = self
-            .state_store
-            .get(&key)
-            .await
-            .map_err(ExecutorError::other)?
-            .clone();
+        tracing::debug!("Retrieving current contract state");
+        let current_state = match self.state_store.get(&key).await {
+            Ok(state) => state.clone(),
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to retrieve current contract state");
+                return Err(ExecutorError::other(e));
+            }
+        };
 
         let updates = vec![update];
-        let new_state = self
-            .get_updated_state(&parameters, current_state, key, updates)
-            .await?;
+        tracing::debug!("Calculating updated state");
+        let new_state = match self.get_updated_state(&parameters, current_state, key, updates).await {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to calculate updated state");
+                return Err(e);
+            }
+        };
 
-        // in the network impl this would be sent over the network
-        let summary = self
-            .runtime
-            .summarize_state(&key, &parameters, &new_state)
-            .map_err(|e| ExecutorError::execution(e, None))?;
-        self.send_update_notification(&key, &parameters, &new_state)
-            .await?;
+        // Generate state summary
+        tracing::debug!("Generating state summary");
+        let summary = match self.runtime.summarize_state(&key, &parameters, &new_state) {
+            Ok(summary) => summary,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to generate state summary");
+                return Err(ExecutorError::execution(e, None));
+            }
+        };
+        
+        // Send update notifications
+        tracing::debug!("Sending update notifications");
+        if let Err(e) = self.send_update_notification(&key, &parameters, &new_state).await {
+            tracing::error!(error = %e, "Failed to send update notifications");
+            return Err(e);
+        }
 
+        // Handle local vs network mode
         if self.mode == OperationMode::Local {
+            tracing::info!("Update completed in local mode");
             return Ok(ContractResponse::UpdateResponse { key, summary }.into());
         }
-        // notify peers with deltas from summary in network
+        
+        // In network mode, notify peers with deltas
+        tracing::debug!("Sending update to network peers");
         let request = UpdateContract { key, new_state };
-        let _op: operations::update::UpdateResult = self.op_request(request).await?;
-
-        Ok(ContractResponse::UpdateResponse { key, summary }.into())
+        match self.op_request(request).await {
+            Ok(_) => {
+                tracing::info!("Network update completed successfully");
+                Ok(ContractResponse::UpdateResponse { key, summary }.into())
+            },
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to send update to network");
+                Err(e)
+            }
+        }
     }
 
     /// Attempts to update the state with the provided updates.
@@ -763,39 +1004,61 @@ impl Executor<Runtime> {
         Ok(new_state)
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        name = "perform_contract_get",
+        skip(self),
+        fields(contract_key = %key, return_code = return_contract_code)
+    )]
     async fn perform_contract_get(
         &mut self,
         return_contract_code: bool,
         key: ContractKey,
     ) -> Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError> {
-        tracing::debug!(
-            contract = %key,
-            return_code = return_contract_code,
-            "Getting contract"
-        );
         let mut got_contract: Option<ContractContainer> = None;
 
+        // Fetch contract code if requested
         if return_contract_code {
-            if let Some(contract) = self.get_contract_locally(&key).await? {
-                got_contract = Some(contract);
+            tracing::debug!("Attempting to fetch contract code");
+            match self.get_contract_locally(&key).await {
+                Ok(Some(contract)) => {
+                    tracing::debug!("Contract code retrieved successfully");
+                    got_contract = Some(contract);
+                }
+                Ok(None) => {
+                    tracing::debug!("Contract code not found locally");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Error retrieving contract code");
+                    return Err(e);
+                }
             }
         }
 
+        // Fetch contract state
+        tracing::debug!("Retrieving contract state");
         let state_result = self.state_store.get(&key).await;
-        tracing::debug!(
-            contract = %key,
-            state_found = state_result.is_ok(),
-            has_contract = got_contract.is_some(),
-            "Contract get result"
-        );
+        
         match state_result {
-            Ok(state) => Ok((Some(state), got_contract)),
+            Ok(state) => {
+                let state_size = state.as_ref().len();
+                let state_hash = blake3::hash(state.as_ref());
+                
+                tracing::info!(
+                    state_size = state_size,
+                    state_hash = %state_hash,
+                    has_contract_code = got_contract.is_some(),
+                    "Contract state retrieved successfully"
+                );
+                
+                Ok((Some(state), got_contract))
+            }
             Err(StateStoreError::MissingContract(_)) => {
-                tracing::warn!(contract = %key, "Contract state not found in store");
+                tracing::warn!("Contract state not found in store");
                 Ok((None, got_contract))
             }
             Err(err) => {
-                tracing::error!(contract = %key, error = %err, "Failed to get contract state");
+                tracing::error!(error = %err, "Failed to get contract state");
                 Err(ExecutorError::request(RequestError::from(
                     StdContractError::Get {
                         key,
@@ -956,47 +1219,108 @@ impl Executor<Runtime> {
         Ok(())
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        name = "send_update_notifications",
+        skip(self, params, new_state),
+        fields(contract_key = %key)
+    )]
     async fn send_update_notification(
         &mut self,
         key: &ContractKey,
         params: &Parameters<'_>,
         new_state: &WrappedState,
     ) -> Result<(), ExecutorError> {
-        tracing::debug!(contract = %key, "notify of contract update");
         let key = *key;
+        
+        // Check if there are any subscribers for this contract
         if let Some(notifiers) = self.update_notifications.get_mut(&key) {
-            let summaries = self.subscriber_summaries.get_mut(&key).unwrap();
-            // in general there should be less than 32 failures
+            let subscriber_count = notifiers.len();
+            if subscriber_count == 0 {
+                tracing::debug!("No subscribers for this contract");
+                return Ok(());
+            }
+            
+            tracing::info!(subscribers = subscriber_count, "Sending update notifications");
+            
+            let summaries = match self.subscriber_summaries.get_mut(&key) {
+                Some(s) => s,
+                None => {
+                    tracing::error!("Subscriber summaries missing for contract");
+                    return Err(ExecutorError::other(anyhow::anyhow!(
+                        "Subscriber summaries missing for contract"
+                    )));
+                }
+            };
+            
+            // Track notification failures
             let mut failures = Vec::with_capacity(32);
+            
+            // Send notifications to each subscriber
             for (peer_key, notifier) in notifiers.iter() {
-                let peer_summary = summaries.get_mut(peer_key).unwrap();
-                let update = match peer_summary {
-                    Some(summary) => self
-                        .runtime
-                        .get_state_delta(&key, params, new_state, &*summary)
-                        .map_err(|err| {
-                            tracing::error!("{err}");
-                            ExecutorError::execution(err, Some(InnerOpError::Upsert(key)))
-                        })?
-                        .to_owned()
-                        .into(),
-                    None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
+                tracing::debug!(client_id = %peer_key, "Preparing notification for client");
+                
+                let peer_summary = match summaries.get_mut(peer_key) {
+                    Some(s) => s,
+                    None => {
+                        tracing::error!(client_id = %peer_key, "Missing summary for client");
+                        failures.push(*peer_key);
+                        continue;
+                    }
                 };
-                if let Err(err) =
-                    notifier.send(Ok(
-                        ContractResponse::UpdateNotification { key, update }.into()
-                    ))
-                {
-                    failures.push(*peer_key);
-                    tracing::error!(cli_id = %peer_key, "{err}");
-                } else {
-                    tracing::debug!(cli_id = %peer_key, contract = %key, "notified of update");
+                
+                // Generate update data based on client's summary
+                let update = match peer_summary {
+                    Some(summary) => {
+                        tracing::debug!(client_id = %peer_key, "Generating delta update");
+                        match self.runtime.get_state_delta(&key, params, new_state, &*summary) {
+                            Ok(delta) => delta.to_owned().into(),
+                            Err(err) => {
+                                tracing::error!(
+                                    client_id = %peer_key,
+                                    error = %err,
+                                    "Failed to generate delta update"
+                                );
+                                failures.push(*peer_key);
+                                continue;
+                            }
+                        }
+                    },
+                    None => {
+                        tracing::debug!(client_id = %peer_key, "Sending full state update");
+                        UpdateData::State(State::from(new_state.as_ref()).into_owned())
+                    },
+                };
+                
+                // Send the notification
+                let notification = ContractResponse::UpdateNotification { key, update };
+                match notifier.send(Ok(notification.into())) {
+                    Ok(_) => {
+                        tracing::debug!(client_id = %peer_key, "Notification sent successfully");
+                    },
+                    Err(err) => {
+                        tracing::error!(
+                            client_id = %peer_key,
+                            error = %err,
+                            "Failed to send notification"
+                        );
+                        failures.push(*peer_key);
+                    }
                 }
             }
+            
+            // Clean up failed notifiers
             if !failures.is_empty() {
+                tracing::warn!(
+                    failure_count = failures.len(),
+                    "Removing failed notification channels"
+                );
                 notifiers.retain(|(c, _)| !failures.contains(c));
             }
+        } else {
+            tracing::debug!("No notification channels registered for this contract");
         }
+        
         Ok(())
     }
 
