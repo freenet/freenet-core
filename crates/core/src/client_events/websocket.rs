@@ -691,8 +691,20 @@ async fn process_host_response(
             let serialized_res: Vec<u8> = match encoding_protoc {
                 EncodingProtocol::Flatbuffers => {
                     match result {
-                        Ok(res) => res.into_fbs_bytes(),
-                        Err(err) => err.into_fbs_bytes(),
+                        Ok(res) => match res.into_fbs_bytes() {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::error!(error = %e, "Failed to serialize response to flatbuffers");
+                                return Err(e.into());
+                            }
+                        },
+                        Err(err) => match err.into_fbs_bytes() {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::error!(error = %e, "Failed to serialize error to flatbuffers");
+                                return Err(e.into());
+                            }
+                        },
                     }
                 },
                 EncodingProtocol::Native => {
