@@ -10,7 +10,7 @@ use freenet_stdlib::prelude::ContractInstanceId;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use tokio::sync::mpsc;
-use tracing::instrument;
+use tracing::{debug, instrument};
 
 use crate::client_events::{ClientEventsProxy, ClientId, OpenRequest};
 use crate::server::HostCallbackResult;
@@ -18,6 +18,10 @@ use crate::server::HostCallbackResult;
 use super::{errors::WebSocketApiError, path_handlers, AuthToken, ClientConnection};
 
 mod v1;
+
+// Please redo the tracing logging in this file according to best practices, should mostly
+// be debug! level with particular attention paid to the attested_contracts and interactions
+// with it because that's what I'm having trouble with AI!
 
 #[derive(Clone)]
 pub(super) struct HttpGatewayRequest(mpsc::Sender<ClientConnection>);
@@ -69,6 +73,7 @@ impl ClientEventsProxy for HttpGateway {
                         callbacks,
                         assigned_token,
                     } => {
+                        debug!("New connection request: assigned_token: {:?}", assigned_token);
                         let cli_id = ClientId::next();
                         callbacks
                             .send(HostCallbackResult::NewId { id: cli_id })
@@ -76,6 +81,7 @@ impl ClientEventsProxy for HttpGateway {
                         if let Some((assigned_token, contract)) = assigned_token {
                             self.attested_contracts
                                 .insert(assigned_token, (contract, cli_id));
+                            debug!("attested_contracts map after insert: {:?}", self.attested_contracts);
                         }
                         self.response_channels.insert(cli_id, callbacks);
                         continue;
