@@ -121,7 +121,6 @@ impl ClientEventsProxy for HttpGateway {
                         debug!(
                             client_id = %client_id,
                             auth_token = ?auth_token,
-                            request_type = ?req.kind(),
                             "Processing client request"
                         );
                         return Ok(OpenRequest::new(client_id, req).with_token(auth_token));
