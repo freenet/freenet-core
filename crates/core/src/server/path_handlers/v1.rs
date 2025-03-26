@@ -7,15 +7,14 @@ pub(super) fn get_file_path(uri: axum::http::Uri) -> Result<String, Box<WebSocke
             error_cause: format!("{uri} not valid"),
         })
     })?;
-    
-    // Find the second slash which separates the contract ID from the file path
-    if let Some(idx) = p.find('/') {
-        // Return everything after the first slash
-        return Ok(p[idx+1..].to_string());
-    }
-    
-    // If no slash found, return empty string
-    Ok(String::new())
+    let path = p
+        .chars()
+        .skip_while(|c| ALPHABET.contains(*c))
+        .skip_while(|c| c == &'/')
+        .skip_while(|c| ALPHABET.contains(*c))
+        .skip_while(|c| c == &'/')
+        .collect::<String>();
+    Ok(path)
 }
 
 #[test]
