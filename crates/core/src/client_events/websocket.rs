@@ -4,6 +4,8 @@ use std::{
     time::Duration,
 };
 
+// Please redo the tracing logging in this file according to best practices AI!
+
 use axum::{
     extract::{
         ws::{Message, WebSocket},
