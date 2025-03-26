@@ -1,8 +1,11 @@
+use tracing::debug;
 use super::*;
 use super::{
     ContractExecutor, ContractRequest, ContractResponse, ExecutorError, ExecutorHalve,
     ExecutorToEventLoopChannel, RequestError, Response, StateStoreError,
 };
+
+// Please redo the tracing logging in this file according to best practices AI!
 
 impl ContractExecutor for Executor<Runtime> {
     async fn fetch_contract(
@@ -431,6 +434,9 @@ impl Executor<Runtime> {
         req: DelegateRequest<'_>,
         attestaded_contract: Option<&ContractInstanceId>,
     ) -> Response {
+        debug!(request = ?req,
+            attested_contract = ?attestaded_contract,
+            "received delegate request");
         match req {
             DelegateRequest::RegisterDelegate {
                 delegate,
