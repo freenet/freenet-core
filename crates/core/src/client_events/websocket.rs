@@ -219,7 +219,7 @@ async fn websocket_commands(
     tracing::info!("Upgrading connection to WebSocket");
     
     let on_upgrade = move |ws: WebSocket| async move {
-        let protocol = ws.protocol().map(|p| p.to_string());
+        let protocol = ws.protocol().and_then(|p| p.to_str().ok().map(|s| s.to_string()));
         tracing::info!(
             protocol = protocol.as_deref().unwrap_or("none"),
             "WebSocket connection established"
@@ -470,13 +470,8 @@ async fn process_client_request(
                         protocol = "flatbuffers", 
                         "Failed to decode client request"
                     );
-                    match err.into_fbs_bytes() {
-                        Ok(bytes) => return Ok(Some(Message::Binary(bytes))),
-                        Err(e) => {
-                            tracing::error!(error = %e, "Failed to serialize error response");
-                            return Err(Some(e.into()));
-                        }
-                    }
+                    let bytes = err.into_fbs_bytes();
+                    return Ok(Some(Message::Binary(bytes)));
                 }
             },
             EncodingProtocol::Native => match bincode::deserialize::<ClientRequest>(&msg) {
@@ -696,20 +691,8 @@ async fn process_host_response(
             let serialized_res = match encoding_protoc {
                 EncodingProtocol::Flatbuffers => {
                     match result {
-                        Ok(res) => match res.into_fbs_bytes() {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                tracing::error!(error = %e, "Failed to serialize response to flatbuffers");
-                                return Err(e.into());
-                            }
-                        },
-                        Err(err) => match err.into_fbs_bytes() {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                tracing::error!(error = %e, "Failed to serialize error to flatbuffers");
-                                return Err(e.into());
-                            }
-                        },
+                        Ok(res) => res.into_fbs_bytes(),
+                        Err(err) => err.into_fbs_bytes(),
                     }
                 },
                 EncodingProtocol::Native => match bincode::serialize(&result) {
