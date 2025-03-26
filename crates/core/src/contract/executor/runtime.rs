@@ -771,7 +771,7 @@ impl Executor<Runtime> {
         level = "debug",
         name = "perform_contract_update",
         skip(self, update),
-        fields(contract_key = %key, update_type = ?update.is_left())
+        fields(contract_key = %key)
     )]
     async fn perform_contract_update(
         &mut self,
