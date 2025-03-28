@@ -914,7 +914,7 @@ pub async fn run_local_node(
                     let contracts = gw.attested_contracts.read().unwrap();
                     contracts.get(&token).map(|(t, _)| *t)
                 });
-                executor.delegate_request(op, attested_contract)
+                executor.delegate_request(op, attested_contract.as_ref())
             }
             ClientRequest::Disconnect { cause } => {
                 if let Some(cause) = cause {
