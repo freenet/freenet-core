@@ -234,7 +234,7 @@ async fn websocket_interface(
     ws: WebSocket,
 ) -> anyhow::Result<()> {
     tracing::debug!("starting websocket interface handler");
-    let (mut response_rx, client_id) = new_client_connection(&request_sender).await?;
+    let (mut response_rx, client_id) = new_client_connection(&request_sender, auth_token).await?;
     tracing::debug!(client_id = %client_id, "client connection established");
 
     let (mut server_sink, mut client_stream) = ws.split();
@@ -342,12 +342,13 @@ async fn websocket_interface(
 
 async fn new_client_connection(
     request_sender: &WebSocketRequest,
+    assigned_token: Option<(AuthToken, ContractInstanceId)>,
 ) -> Result<(mpsc::UnboundedReceiver<HostCallbackResult>, ClientId), ClientError> {
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     request_sender
         .send(ClientConnection::NewConnection {
             callbacks: response_sender,
-            assigned_token: None,
+            assigned_token,
         })
         .await
         .map_err(|_| ErrorKind::NodeUnavailable)?;
