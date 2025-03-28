@@ -72,8 +72,8 @@ impl ClientEventsProxy for HttpGateway {
                             .send(HostCallbackResult::NewId { id: cli_id })
                             .map_err(|_e| ErrorKind::NodeUnavailable)?;
                         if let Some((assigned_token, contract)) = assigned_token {
-                            self.attested_contracts
-                                .insert(assigned_token, (contract, cli_id));
+                            let mut contracts = self.attested_contracts.write().unwrap();
+                            contracts.insert(assigned_token, (contract, cli_id));
                         }
                         self.response_channels.insert(cli_id, callbacks);
                         continue;
