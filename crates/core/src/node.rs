@@ -910,6 +910,7 @@ pub async fn run_local_node(
                     .await
             }
             ClientRequest::DelegateOp(op) => {
+                // Please add tracing logging here, trying to figure out why attested_contract is None AI!
                 let attested_contract = token.and_then(|token| {
                     let contracts = gw.attested_contracts.read().unwrap();
                     contracts.get(&token).map(|(t, _)| *t)
