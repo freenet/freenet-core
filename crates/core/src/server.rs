@@ -122,27 +122,21 @@ pub mod local_node {
                         .await
                 }
                 ClientRequest::DelegateOp(op) => {
-                    let attested_contract = token.and_then(|token| {
-                        let contracts = gw.attested_contracts.read().unwrap();
-                        contracts.get(&token).map(|(t, _)| *t)
-                    });
-                    executor.delegate_request(op, attested_contract.as_ref())
+                    let attested_contract =
+                        token.and_then(|token| gw.attested_contracts.get(&token).map(|(t, _)| t));
+                    executor.delegate_request(op, attested_contract)
                 }
                 ClientRequest::Disconnect { cause } => {
                     if let Some(cause) = cause {
                         tracing::info!("disconnecting cause: {cause}");
                     }
                     // fixme: token must live for a bit to allow reconnections
-                    let rm_token = {
-                        let contracts = gw.attested_contracts.read().unwrap();
-                        contracts
-                            .iter()
-                            .find_map(|(k, (_, eid))| (eid == &id).then(|| k.clone()))
-                    };
-                    
-                    if let Some(rm_token) = rm_token {
-                        let mut contracts = gw.attested_contracts.write().unwrap();
-                        contracts.remove(&rm_token);
+                    if let Some(rm_token) = gw
+                        .attested_contracts
+                        .iter()
+                        .find_map(|(k, (_, eid))| (eid == &id).then(|| k.clone()))
+                    {
+                        gw.attested_contracts.remove(&rm_token);
                     }
                     continue;
                 }

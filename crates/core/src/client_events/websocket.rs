@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, OnceLock, RwLock},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -32,9 +32,6 @@ use crate::{
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
 
 mod v1;
-
-#[derive(Clone)]
-pub(crate) struct AttestedContracts(pub(crate) Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>);
 
 #[derive(Clone)]
 struct WebSocketRequest(mpsc::Sender<ClientConnection>);
@@ -212,19 +209,10 @@ async fn websocket_commands(
     Extension(auth_token): Extension<Option<AuthToken>>,
     Extension(encoding_protoc): Extension<EncodingProtocol>,
     Extension(rs): Extension<WebSocketRequest>,
-    Extension(attested_contracts): Extension<AttestedContracts>,
 ) -> axum::response::Response {
-    let assigned_token = match &auth_token {
-        Some(token) => {
-            let contracts = attested_contracts.0.read().unwrap();
-            contracts.get(token).map(|(contract_id, _)| (token.clone(), *contract_id))
-        }
-        None => None
-    };
-    
     let on_upgrade = move |ws: WebSocket| async move {
         tracing::debug!(protoc = ?ws.protocol(), "websocket connection established");
-        if let Err(error) = websocket_interface(rs.clone(), auth_token, encoding_protoc, ws, assigned_token).await {
+        if let Err(error) = websocket_interface(rs.clone(), auth_token, encoding_protoc, ws).await {
             tracing::error!("{error}");
         }
     };
@@ -236,9 +224,8 @@ async fn websocket_interface(
     mut auth_token: Option<AuthToken>,
     encoding_protoc: EncodingProtocol,
     ws: WebSocket,
-    assigned_token: Option<(AuthToken, ContractInstanceId)>,
 ) -> anyhow::Result<()> {
-    let (mut response_rx, client_id) = new_client_connection(&request_sender, assigned_token).await?;
+    let (mut response_rx, client_id) = new_client_connection(&request_sender).await?;
     let (mut server_sink, mut client_stream) = ws.split();
     let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::UnboundedReceiver<HostResult>)>>> =
         Arc::new(Mutex::new(VecDeque::new()));
@@ -343,13 +330,12 @@ async fn websocket_interface(
 
 async fn new_client_connection(
     request_sender: &WebSocketRequest,
-    assigned_token: Option<(AuthToken, ContractInstanceId)>,
 ) -> Result<(mpsc::UnboundedReceiver<HostCallbackResult>, ClientId), ClientError> {
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     request_sender
         .send(ClientConnection::NewConnection {
             callbacks: response_sender,
-            assigned_token,
+            assigned_token: None,
         })
         .await
         .map_err(|_| ErrorKind::NodeUnavailable)?;

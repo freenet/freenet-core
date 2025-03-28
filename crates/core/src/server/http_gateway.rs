@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, RwLock};
 
 use axum::extract::Path;
 use axum::response::IntoResponse;
@@ -37,7 +36,7 @@ impl std::ops::Deref for HttpGatewayRequest {
 ///
 /// Check the Locutus book for [more information](https://docs.freenet.org/dev-guide.html).
 pub(crate) struct HttpGateway {
-    pub attested_contracts: Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>,
+    pub attested_contracts: HashMap<AuthToken, (ContractInstanceId, ClientId)>,
     proxy_server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
 }
@@ -72,8 +71,8 @@ impl ClientEventsProxy for HttpGateway {
                             .send(HostCallbackResult::NewId { id: cli_id })
                             .map_err(|_e| ErrorKind::NodeUnavailable)?;
                         if let Some((assigned_token, contract)) = assigned_token {
-                            let mut contracts = self.attested_contracts.write().unwrap();
-                            contracts.insert(assigned_token, (contract, cli_id));
+                            self.attested_contracts
+                                .insert(assigned_token, (contract, cli_id));
                         }
                         self.response_channels.insert(cli_id, callbacks);
                         continue;

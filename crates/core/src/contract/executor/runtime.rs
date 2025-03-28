@@ -1,5 +1,3 @@
-use std::backtrace::Backtrace;
-use tracing::{instrument};
 use super::*;
 use super::{
     ContractExecutor, ContractRequest, ContractResponse, ExecutorError, ExecutorHalve,
@@ -284,7 +282,6 @@ impl Executor<Runtime> {
         req: ClientRequest<'_>,
         updates: Option<mpsc::UnboundedSender<Result<HostResponse, WsClientError>>>,
     ) -> Response {
-        tracing::debug!(?id, ?req, "handling request");
         match req {
             ClientRequest::ContractOp(op) => self.contract_requests(op, id, updates).await,
             ClientRequest::DelegateOp(op) => self.delegate_request(op, None),
@@ -357,11 +354,8 @@ impl Executor<Runtime> {
     pub fn delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
-        attested_contract: Option<&ContractInstanceId>,
+        attestaded_contract: Option<&ContractInstanceId>,
     ) -> Response {
-        let bt = Backtrace::capture();
-        tracing::debug!(?bt, ?req, ?attested_contract, "delegate_request backtrace");
-
         match req {
             DelegateRequest::RegisterDelegate {
                 delegate,
@@ -373,8 +367,8 @@ impl Executor<Runtime> {
                 let arr = GenericArray::from_slice(&cipher);
                 let cipher = XChaCha20Poly1305::new(arr);
                 let nonce = GenericArray::from_slice(&nonce).to_owned();
-                tracing::debug!(?key, ?attested_contract, "registering delegate");
-                if let Some(contract) = attested_contract {
+                tracing::debug!("registering delegate `{key}");
+                if let Some(contract) = attestaded_contract {
                     self.delegate_attested_ids
                         .entry(key.clone())
                         .or_default()
@@ -406,7 +400,7 @@ impl Executor<Runtime> {
                 params,
                 get_request,
             } => {
-                let attested = attested_contract.and_then(|contract| {
+                let attested = attestaded_contract.and_then(|contract| {
                     self.delegate_attested_ids
                         .get(&key)
                         .and_then(|contracts| contracts.iter().find(|c| *c == contract))
@@ -429,7 +423,7 @@ impl Executor<Runtime> {
                 inbound,
                 params,
             } => {
-                let attested = attested_contract.and_then(|contract| {
+                let attested = attestaded_contract.and_then(|contract| {
                     self.delegate_attested_ids
                         .get(&key)
                         .and_then(|contracts| contracts.iter().find(|c| *c == contract))
