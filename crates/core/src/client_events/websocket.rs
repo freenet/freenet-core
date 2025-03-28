@@ -234,8 +234,19 @@ async fn websocket_interface(
     ws: WebSocket,
 ) -> anyhow::Result<()> {
     tracing::debug!("starting websocket interface handler");
-    // Pass None for the assigned token - we don't have a ContractInstanceId at this point
-    let (mut response_rx, client_id) = new_client_connection(&request_sender, None).await?;
+    
+    // If we have an auth token, we need to find the associated ContractInstanceId
+    let assigned_token = if let Some(token) = &auth_token {
+        // Extract contract ID from the auth token if available
+        // This assumes the token is associated with a specific contract
+        // You might need to implement a lookup mechanism based on your authentication system
+        let contract_id = ContractInstanceId::from(token.0.as_ref());
+        Some((token.clone(), contract_id))
+    } else {
+        None
+    };
+    
+    let (mut response_rx, client_id) = new_client_connection(&request_sender, assigned_token).await?;
     tracing::debug!(client_id = %client_id, "client connection established");
 
     let (mut server_sink, mut client_stream) = ws.split();
