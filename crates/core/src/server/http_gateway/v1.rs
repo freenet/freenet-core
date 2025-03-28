@@ -1,4 +1,6 @@
+use std::sync::{Arc, RwLock};
 use super::*;
+use crate::client_events::websocket::AttestedContracts;
 
 impl HttpGateway {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
@@ -22,10 +24,15 @@ impl HttpGateway {
             .route("/v1/contract/web/:key/*path", get(web_subpages))
             .layer(Extension(HttpGatewayRequest(proxy_request_sender)));
 
+        let attested_contracts = Arc::new(RwLock::new(HashMap::new()));
+        
+        let router = router
+            .layer(Extension(AttestedContracts(attested_contracts.clone())));
+            
         (
             Self {
                 proxy_server_request: request_to_server,
-                attested_contracts: HashMap::new(),
+                attested_contracts,
                 response_channels: HashMap::new(),
             },
             router,
