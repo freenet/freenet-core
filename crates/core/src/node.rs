@@ -910,11 +910,32 @@ pub async fn run_local_node(
                     .await
             }
             ClientRequest::DelegateOp(op) => {
-                // Please add tracing logging here, trying to figure out why attested_contract is None AI!
+                tracing::debug!(
+                    ?token, 
+                    has_token = token.is_some(), 
+                    "Processing DelegateOp request"
+                );
+                
                 let attested_contract = token.and_then(|token| {
                     let contracts = gw.attested_contracts.read().unwrap();
-                    contracts.get(&token).map(|(t, _)| *t)
+                    tracing::debug!(
+                        token_str = %token.as_str(),
+                        contracts_count = contracts.len(),
+                        "Looking up token in attested_contracts"
+                    );
+                    
+                    let contract = contracts.get(&token).map(|(t, _)| *t);
+                    tracing::debug!(
+                        found_contract = contract.is_some(),
+                        "Contract lookup result"
+                    );
+                    contract
                 });
+                
+                tracing::debug!(
+                    has_attested_contract = attested_contract.is_some(),
+                    "Calling delegate_request with attested_contract"
+                );
                 executor.delegate_request(op, attested_contract.as_ref())
             }
             ClientRequest::Disconnect { cause } => {
