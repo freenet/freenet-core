@@ -330,12 +330,13 @@ async fn websocket_interface(
 
 async fn new_client_connection(
     request_sender: &WebSocketRequest,
+    assigned_token: Option<(AuthToken, ContractInstanceId)>,
 ) -> Result<(mpsc::UnboundedReceiver<HostCallbackResult>, ClientId), ClientError> {
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     request_sender
         .send(ClientConnection::NewConnection {
             callbacks: response_sender,
-            assigned_token: None,
+            assigned_token,
         })
         .await
         .map_err(|_| ErrorKind::NodeUnavailable)?;
