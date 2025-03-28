@@ -33,11 +33,8 @@ use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
 
 mod v1;
 
-// Make AttestedContracts public so it can be used by http_gateway
-pub(crate) use self::AttestedContracts;
-
 #[derive(Clone)]
-struct AttestedContracts(Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>);
+pub(crate) struct AttestedContracts(pub(crate) Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>);
 
 #[derive(Clone)]
 struct WebSocketRequest(mpsc::Sender<ClientConnection>);
