@@ -234,7 +234,8 @@ async fn websocket_interface(
     ws: WebSocket,
 ) -> anyhow::Result<()> {
     tracing::debug!("starting websocket interface handler");
-    let (mut response_rx, client_id) = new_client_connection(&request_sender, auth_token).await?;
+    // Pass None for the assigned token - we don't have a ContractInstanceId at this point
+    let (mut response_rx, client_id) = new_client_connection(&request_sender, None).await?;
     tracing::debug!(client_id = %client_id, "client connection established");
 
     let (mut server_sink, mut client_stream) = ws.split();
