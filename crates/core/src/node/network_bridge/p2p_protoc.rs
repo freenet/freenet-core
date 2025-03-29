@@ -737,13 +737,16 @@ impl P2pConnManager {
         }
     }
 
-    fn handle_op_execution(&self, msg: Option<(Sender<NetMessage>, NetMessage)>, state: &mut EventListenerState) -> EventResult {
-
+    fn handle_op_execution(
+        &self,
+        msg: Option<(Sender<NetMessage>, NetMessage)>,
+        state: &mut EventListenerState,
+    ) -> EventResult {
         match msg {
             Some((callback, msg)) => {
                 state.pending_op_results.insert(*msg.id(), callback);
                 EventResult::Event(ConnEvent::InboundMessage(msg))
-            },
+            }
             _ => EventResult::Continue,
         }
     }

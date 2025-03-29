@@ -8,10 +8,12 @@ use std::time::Duration;
 use freenet_stdlib::client_api::HostResponse;
 use futures::Future;
 
+pub(crate) use self::messages::{ConnectMsg, ConnectRequest, ConnectResponse};
 use super::{connect, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
 use crate::message::{NetMessageV1, NodeEvent};
+use crate::node::IsOperationCompleted;
 use crate::ring::ConnectionManager;
 use crate::router::Router;
 use crate::transport::TransportPublicKey;
@@ -22,8 +24,6 @@ use crate::{
     ring::PeerKeyLocation,
     util::Backoff,
 };
-use crate::node::IsOperationCompleted;
-pub(crate) use self::messages::{ConnectMsg, ConnectRequest, ConnectResponse};
 
 #[derive(Debug)]
 pub(crate) struct ConnectOp {

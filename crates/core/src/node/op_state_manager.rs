@@ -130,7 +130,7 @@ impl OpManager {
     pub async fn notify_op_execution(&self, msg: NetMessage) -> Result<NetMessage, OpError> {
         let (response_sender, response_receiver): (
             tokio::sync::mpsc::Sender<NetMessage>,
-            tokio::sync::mpsc::Receiver<NetMessage>
+            tokio::sync::mpsc::Receiver<NetMessage>,
         ) = tokio::sync::mpsc::channel(1);
 
         self.to_event_listener

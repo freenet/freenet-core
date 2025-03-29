@@ -2,17 +2,17 @@
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 
+pub(crate) use self::messages::UpdateMsg;
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::contract::ContractHandlerEvent;
 use crate::message::{InnerMessage, NetMessage, Transaction};
+use crate::node::IsOperationCompleted;
+use crate::operations::put::PutOp;
 use crate::ring::{Location, PeerKeyLocation, RingError};
 use crate::{
     client_events::HostResult,
     node::{NetworkBridge, OpManager, PeerId},
 };
-use crate::node::IsOperationCompleted;
-use crate::operations::put::PutOp;
-pub(crate) use self::messages::UpdateMsg;
 
 pub(crate) struct UpdateOp {
     pub id: Transaction,

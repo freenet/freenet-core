@@ -14,6 +14,9 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ErrorKind},
     prelude::ContractKey,
 };
+use rsa::pkcs8::DecodePublicKey;
+use serde::{Deserialize, Serialize};
+use std::sync::mpsc::Sender;
 use std::{
     borrow::Cow,
     fmt::Display,
@@ -25,9 +28,6 @@ use std::{
     time::Duration,
 };
 use std::{collections::HashSet, convert::Infallible};
-use std::sync::mpsc::Sender;
-use rsa::pkcs8::DecodePublicKey;
-use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use self::p2p_impl::NodeP2P;
@@ -505,7 +505,7 @@ async fn process_message<CB>(
                 executor_callback,
                 client_req_handler_callback,
                 client_ids,
-                pending_op_result
+                pending_op_result,
             )
             .await
         }
@@ -547,7 +547,7 @@ async fn process_message_v1<CB>(
                     handle_op_request::<connect::ConnectOp, _>(&op_manager, &mut conn_manager, op)
                         .instrument(span)
                         .await;
-                
+
                 handle_op_not_available!(op_result);
                 return report_result(
                     tx,
@@ -565,7 +565,8 @@ async fn process_message_v1<CB>(
 
                 if is_operation_completed(&op_result) {
                     if let Some(op_execution_callback) = pending_op_result {
-                        let _ = op_execution_callback.send(NetMessage::V1(NetMessageV1::Put((*op).clone())));
+                        let _ = op_execution_callback
+                            .send(NetMessage::V1(NetMessageV1::Put((*op).clone())));
                     }
                 }
 
@@ -585,7 +586,8 @@ async fn process_message_v1<CB>(
                     handle_op_request::<get::GetOp, _>(&op_manager, &mut conn_manager, op).await;
                 if is_operation_completed(&op_result) {
                     if let Some(ref op_execution_callback) = pending_op_result {
-                        let _ = op_execution_callback.send(NetMessage::V1(NetMessageV1::Get((*op).clone())));
+                        let _ = op_execution_callback
+                            .send(NetMessage::V1(NetMessageV1::Get((*op).clone())));
                     }
                 }
                 handle_op_not_available!(op_result);
@@ -608,7 +610,8 @@ async fn process_message_v1<CB>(
                 .await;
                 if is_operation_completed(&op_result) {
                     if let Some(ref op_execution_callback) = pending_op_result {
-                        let _ = op_execution_callback.send(NetMessage::V1(NetMessageV1::Subscribe((*op).clone())));
+                        let _ = op_execution_callback
+                            .send(NetMessage::V1(NetMessageV1::Subscribe((*op).clone())));
                     }
                 }
                 handle_op_not_available!(op_result);
@@ -628,7 +631,8 @@ async fn process_message_v1<CB>(
                         .await;
                 if is_operation_completed(&op_result) {
                     if let Some(ref op_execution_callback) = pending_op_result {
-                        let _ = op_execution_callback.send(NetMessage::V1(NetMessageV1::Update((*op).clone())));
+                        let _ = op_execution_callback
+                            .send(NetMessage::V1(NetMessageV1::Update((*op).clone())));
                     }
                 }
                 handle_op_not_available!(op_result);
