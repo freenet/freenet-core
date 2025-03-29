@@ -8,7 +8,6 @@ use std::{future::Future, time::Instant};
 use super::{OpEnum, OpError, OpOutcome, OperationResult};
 use crate::client_events::HostResult;
 use crate::node::IsOperationCompleted;
-use crate::operations::put::PutOp;
 use crate::{
     contract::{ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, NetMessage, Transaction},
@@ -236,7 +235,7 @@ impl GetOp {
         }
     }
 
-    pub(super) fn finaliºzed(&self) -> bool {
+    pub(super) fn finalized(&self) -> bool {
         self.result.is_some() && matches!(self.state, Some(GetState::Finished { .. }))
     }
 

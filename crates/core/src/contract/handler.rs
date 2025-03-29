@@ -5,6 +5,10 @@ use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::Arc;
 use std::time::Duration;
 
+use freenet_stdlib::prelude::*;
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+
 use super::executor::{ExecutorHalve, ExecutorToEventLoopChannel};
 use super::ExecutorError;
 use super::{
@@ -14,116 +18,37 @@ use super::{
 use crate::client_events::HostResult;
 use crate::config::Config;
 use crate::message::Transaction;
-use crate::operations::OpCompletionResult;
 use crate::{client_events::ClientId, wasm_runtime::Runtime};
-use freenet_stdlib::prelude::*;
-use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::error::SendError;
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-#[derive(Debug, Clone)]
-pub(crate) enum ClientResponseMessage {
-    ClientResult(ClientId, HostResult),
-    OperationCompleted(ClientId, OpCompletionResult),
-}
+pub(crate) struct ClientResponsesReceiver(UnboundedReceiver<(ClientId, HostResult)>);
 
-impl From<(ClientId, HostResult)> for ClientResponseMessage {
-    fn from((client_id, result): (ClientId, HostResult)) -> Self {
-        Self::ClientResult(client_id, result)
-    }
-}
-
-impl From<(ClientId, OpCompletionResult)> for ClientResponseMessage {
-    fn from((client_id, result): (ClientId, OpCompletionResult)) -> Self {
-        Self::OperationCompleted(client_id, result)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum ClientResponsesSender {
-    /// Unbounded channel sender with no back-pressure
-    Unbounded(UnboundedSender<ClientResponseMessage>),
-    /// Bounded channel sender with back-pressure (capacity=1)
-    Bounded(mpsc::Sender<ClientResponseMessage>),
-}
-
-impl ClientResponsesSender {
-    pub fn send_client_result(
-        &self,
-        client_id: ClientId,
-        result: HostResult,
-    ) -> Result<(), SendError<ClientResponseMessage>> {
-        let message = ClientResponseMessage::ClientResult(client_id, result);
-        match self {
-            Self::Unbounded(tx) => tx.send(message),
-            Self::Bounded(tx) => tx.try_send(message).map_err(|e| SendError(e.into_inner())),
-        }
-    }
-
-    pub fn send_op_completion(
-        &self,
-        client_id: ClientId,
-        result: OpCompletionResult,
-    ) -> Result<(), SendError<ClientResponseMessage>> {
-        let message = ClientResponseMessage::OperationCompleted(client_id, result);
-        match self {
-            Self::Unbounded(tx) => tx.send(message),
-            Self::Bounded(tx) => tx.try_send(message).map_err(|e| SendError(e.into_inner())),
-        }
-    }
-}
-
-/// Convert from UnboundedSender to ClientResponsesSender
-impl From<UnboundedSender<ClientResponseMessage>> for ClientResponsesSender {
-    fn from(sender: UnboundedSender<ClientResponseMessage>) -> Self {
-        Self::Unbounded(sender)
-    }
-}
-
-/// Convert from bounded Sender to ClientResponsesSender
-impl From<mpsc::Sender<ClientResponseMessage>> for ClientResponsesSender {
-    fn from(sender: mpsc::Sender<ClientResponseMessage>) -> Self {
-        Self::Bounded(sender)
-    }
-}
-
-pub(crate) enum ClientResponsesReceiver {
-    /// Unbounded channel receiver that can handle unlimited messages
-    Unbounded(UnboundedReceiver<ClientResponseMessage>),
-    /// Bounded channel receiver with capacity limit (capacity=1)
-    Bounded(mpsc::Receiver<ClientResponseMessage>),
-}
-
-/// Creates an unbounded channel for client responses
-///
-/// Returns a tuple of (receiver, sender) with no backpressure
 pub(crate) fn client_responses_channel() -> (ClientResponsesReceiver, ClientResponsesSender) {
     let (tx, rx) = mpsc::unbounded_channel();
-    (
-        ClientResponsesReceiver::Unbounded(rx),
-        ClientResponsesSender::Unbounded(tx),
-    )
+    (ClientResponsesReceiver(rx), ClientResponsesSender(tx))
 }
 
-/// Creates a bounded channel for client responses with capacity=1
-///
-/// Returns a tuple of (receiver, sender) with backpressure for flow control
-pub(crate) fn client_responses_bounded_channel() -> (ClientResponsesReceiver, ClientResponsesSender)
-{
-    let (tx, rx) = mpsc::channel(1);
-    (
-        ClientResponsesReceiver::Bounded(rx),
-        ClientResponsesSender::Bounded(tx),
-    )
+impl std::ops::Deref for ClientResponsesReceiver {
+    type Target = UnboundedReceiver<(ClientId, HostResult)>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
-impl ClientResponsesReceiver {
-    /// Receives the next message asynchronously from either channel type
-    pub async fn recv(&mut self) -> Option<ClientResponseMessage> {
-        match self {
-            Self::Unbounded(rx) => rx.recv().await,
-            Self::Bounded(rx) => rx.recv().await,
-        }
+impl std::ops::DerefMut for ClientResponsesReceiver {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ClientResponsesSender(UnboundedSender<(ClientId, HostResult)>);
+
+impl std::ops::Deref for ClientResponsesSender {
+    type Target = UnboundedSender<(ClientId, HostResult)>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 

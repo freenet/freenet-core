@@ -128,7 +128,7 @@ impl OpManager {
     }
 
     pub async fn notify_op_execution(&self, msg: NetMessage) -> Result<NetMessage, OpError> {
-        let (response_sender, response_receiver): (
+        let (response_sender, mut response_receiver): (
             tokio::sync::mpsc::Sender<NetMessage>,
             tokio::sync::mpsc::Receiver<NetMessage>,
         ) = tokio::sync::mpsc::channel(1);
@@ -137,8 +137,11 @@ impl OpManager {
             .op_execution_sender
             .send((response_sender, msg))
             .await
-            .map_err(Into::into)?;
-        response_receiver.await
+            .map_err(|_| OpError::NotificationError)?;
+        match response_receiver.recv().await {
+            Some(msg) => Ok(msg),
+            None => Err(OpError::NotificationError),
+        }
     }
 
     /// Send an event to the contract handler and await a response event from it if successful.
@@ -287,7 +290,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         ops.under_progress.remove(&tx);
                         ops.completed.remove(&tx);
                         tracing::debug!("Transaction timed out: {tx}");
-                        event_loop_notifier.send(Either::Right(NodeEvent::TransactionTimedOut(tx))).await.unwrap();
+                        event_loop_notifier.notifications_sender.send(Either::Right(NodeEvent::TransactionTimedOut(tx))).await.unwrap();
                         live_tx_tracker.remove_finished_transaction(tx);
                     }
                 }
@@ -316,7 +319,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     };
                     if removed {
                         tracing::debug!("Transaction timed out: {tx}");
-                        event_loop_notifier.send(Either::Right(NodeEvent::TransactionTimedOut(tx))).await.unwrap();
+                        event_loop_notifier.notifications_sender.send(Either::Right(NodeEvent::TransactionTimedOut(tx))).await.unwrap();
                         live_tx_tracker.remove_finished_transaction(tx);
                     }
                 }

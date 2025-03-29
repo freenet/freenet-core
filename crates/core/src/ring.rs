@@ -444,6 +444,7 @@ impl Ring {
                 TopologyAdjustment::RemoveConnections(mut should_disconnect_peers) => {
                     for peer in should_disconnect_peers.drain(..) {
                         notifier
+                            .notifications_sender
                             .send(Either::Right(crate::message::NodeEvent::DropConnection(
                                 peer.peer,
                             )))
@@ -523,7 +524,10 @@ impl Ring {
                 skip_forwards: HashSet::new(),
             },
         };
-        notifier.send(Either::Left(msg.into())).await?;
+        notifier
+            .notifications_sender
+            .send(Either::Left(msg.into()))
+            .await?;
         Ok(Some(id))
     }
 }

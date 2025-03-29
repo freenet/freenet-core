@@ -15,9 +15,9 @@ pub(crate) use executor::{
 };
 pub(crate) use handler::{
     client_responses_channel, contract_handler_channel, in_memory::MemoryContractHandler,
-    ClientResponseMessage, ClientResponsesReceiver, ClientResponsesSender, ContractHandler,
-    ContractHandlerChannel, ContractHandlerEvent, NetworkContractHandler, SenderHalve,
-    StoreResponse, WaitingResolution, WaitingTransaction,
+    ClientResponsesReceiver, ClientResponsesSender, ContractHandler, ContractHandlerChannel,
+    ContractHandlerEvent, NetworkContractHandler, SenderHalve, StoreResponse, WaitingResolution,
+    WaitingTransaction,
 };
 
 pub use executor::{Executor, ExecutorError, OperationMode};

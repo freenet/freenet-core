@@ -843,7 +843,7 @@ where
     loop {
         let msg = tokio::select! {
             msg = conn_manager.recv() => { msg.map(Either::Left) }
-            msg = notification_channel.recv() => {
+            msg = notification_channel.notifications_receiver.recv() => {
                 if let Some(msg) = msg {
                     Ok(msg)
                 } else {
@@ -912,10 +912,6 @@ where
                 NodeEvent::TransactionTimedOut(_) => {
                     unimplemented!()
                 }
-                NodeEvent::PerformOp { .. } => {
-                    tracing::info!("Performing operation");
-                    return Ok(());
-                }
             },
             Err(err) => {
                 super::report_result(
@@ -972,6 +968,7 @@ where
             executor_callback,
             client_req_handler_callback,
             pending_client_req,
+            None,
         )
         .instrument(span);
         GlobalExecutor::spawn(msg);

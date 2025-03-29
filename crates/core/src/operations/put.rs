@@ -12,9 +12,7 @@ use freenet_stdlib::{
     prelude::*,
 };
 
-use super::{
-    connect, put, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult,
-};
+use super::{put, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::node::IsOperationCompleted;
 use crate::{
     client_events::HostResult,

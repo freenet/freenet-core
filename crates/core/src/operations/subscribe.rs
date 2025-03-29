@@ -5,7 +5,6 @@ use std::pin::Pin;
 pub(crate) use self::messages::SubscribeMsg;
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::node::IsOperationCompleted;
-use crate::operations::put::PutOp;
 use crate::{
     client_events::HostResult,
     contract::ContractError,
