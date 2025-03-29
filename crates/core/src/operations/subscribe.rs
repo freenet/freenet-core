@@ -2,7 +2,10 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
+pub(crate) use self::messages::SubscribeMsg;
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
+use crate::node::IsOperationCompleted;
+use crate::operations::put::PutOp;
 use crate::{
     client_events::HostResult,
     contract::ContractError,
@@ -15,9 +18,6 @@ use freenet_stdlib::{
     prelude::*,
 };
 use serde::{Deserialize, Serialize};
-use crate::node::IsOperationCompleted;
-use crate::operations::put::PutOp;
-pub(crate) use self::messages::SubscribeMsg;
 
 const MAX_RETRIES: usize = 10;
 

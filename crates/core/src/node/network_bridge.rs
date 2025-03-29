@@ -83,18 +83,18 @@ pub(crate) fn event_loop_notification_channel(
     let (notification_tx, notification_rx) = mpsc::channel(100);
     let (op_execution_tx, op_execution_rx) = mpsc::channel(100);
     (
-        EventLoopNotificationsReceiver{
+        EventLoopNotificationsReceiver {
             notifications_receiver: notification_rx,
             op_execution_receiver: op_execution_rx,
         },
-        EventLoopNotificationsSender{
+        EventLoopNotificationsSender {
             notifications_sender: notification_tx,
             op_execution_sender: op_execution_tx,
         },
     )
 }
 
-pub(crate) struct EventLoopNotificationsReceiver{
+pub(crate) struct EventLoopNotificationsReceiver {
     pub(crate) notifications_receiver: Receiver<Either<NetMessage, NodeEvent>>,
     pub(crate) op_execution_receiver: Receiver<(Sender<NetMessage>, NetMessage)>,
 }
@@ -103,16 +103,20 @@ impl EventLoopNotificationsReceiver {
     pub(crate) fn notifications_receiver(&self) -> &Receiver<Either<NetMessage, NodeEvent>> {
         &self.notifications_receiver
     }
-    
-    pub(crate) fn notifications_receiver_mut(&mut self) -> &mut Receiver<Either<NetMessage, NodeEvent>> {
+
+    pub(crate) fn notifications_receiver_mut(
+        &mut self,
+    ) -> &mut Receiver<Either<NetMessage, NodeEvent>> {
         &mut self.notifications_receiver
     }
-    
+
     pub(crate) fn op_execution_receiver(&self) -> &Receiver<(Sender<NetMessage>, NetMessage)> {
         &self.op_execution_receiver
     }
-    
-    pub(crate) fn op_execution_receiver_mut(&mut self) -> &mut Receiver<(Sender<NetMessage>, NetMessage)> {
+
+    pub(crate) fn op_execution_receiver_mut(
+        &mut self,
+    ) -> &mut Receiver<(Sender<NetMessage>, NetMessage)> {
         &mut self.op_execution_receiver
     }
 }
@@ -127,16 +131,20 @@ impl EventLoopNotificationsSender {
     pub(crate) fn notifications_sender(&self) -> &Sender<Either<NetMessage, NodeEvent>> {
         &self.notifications_sender
     }
-    
-    pub(crate) fn notifications_sender_mut(&mut self) -> &mut Sender<Either<NetMessage, NodeEvent>> {
+
+    pub(crate) fn notifications_sender_mut(
+        &mut self,
+    ) -> &mut Sender<Either<NetMessage, NodeEvent>> {
         &mut self.notifications_sender
     }
-    
+
     pub(crate) fn op_execution_sender(&self) -> &Sender<(Sender<NetMessage>, NetMessage)> {
         &self.op_execution_sender
     }
-    
-    pub(crate) fn op_execution_sender_mut(&mut self) -> &mut Sender<(Sender<NetMessage>, NetMessage)> {
+
+    pub(crate) fn op_execution_sender_mut(
+        &mut self,
+    ) -> &mut Sender<(Sender<NetMessage>, NetMessage)> {
         &mut self.op_execution_sender
     }
 }

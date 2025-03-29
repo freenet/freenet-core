@@ -5,7 +5,10 @@ use std::fmt::Display;
 use std::pin::Pin;
 use std::{future::Future, time::Instant};
 
+use super::{OpEnum, OpError, OpOutcome, OperationResult};
 use crate::client_events::HostResult;
+use crate::node::IsOperationCompleted;
+use crate::operations::put::PutOp;
 use crate::{
     contract::{ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, NetMessage, Transaction},
@@ -13,9 +16,6 @@ use crate::{
     operations::{OpInitialization, Operation},
     ring::{Location, PeerKeyLocation, RingError},
 };
-use crate::node::IsOperationCompleted;
-use crate::operations::put::PutOp;
-use super::{OpEnum, OpError, OpOutcome, OperationResult};
 
 pub(crate) use self::messages::GetMsg;
 
