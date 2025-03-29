@@ -6,7 +6,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::contract::ClientResponsesSender;
 use crate::{
     node::PeerId,
     operations::{
@@ -317,11 +316,6 @@ pub(crate) enum NodeEvent {
         callback: tokio::sync::mpsc::Sender<QueryResult>,
     },
     TransactionTimedOut(Transaction),
-    PerformOp {
-        message: NetMessage,
-        client_id: Option<crate::client_events::ClientId>,
-        op_response_sender: ClientResponsesSender,
-    },
 }
 
 pub(crate) enum QueryResult {
@@ -353,9 +347,6 @@ impl Display for NodeEvent {
             }
             NodeEvent::TransactionTimedOut(transaction) => {
                 write!(f, "Transaction timed out ({})", transaction)
-            }
-            NodeEvent::PerformOp { .. } => {
-                write!(f, "PerformOp")
             }
         }
     }

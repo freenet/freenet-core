@@ -16,7 +16,6 @@ use freenet_stdlib::{
 };
 use rsa::pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
-use std::sync::mpsc::Sender;
 use std::{
     borrow::Cow,
     fmt::Display,
@@ -369,7 +368,7 @@ async fn report_result(
             if let Some((client_ids, cb)) = client_req_handler_callback {
                 for client_id in client_ids {
                     tracing::debug!(?tx, %client_id,  "Sending response to client");
-                    let _ = cb.send_client_result(client_id, op_res.to_host_result());
+                    let _ = cb.send((client_id, op_res.to_host_result()));
                 }
             }
             // check operations.rs:handle_op_result to see what's the meaning of each state
@@ -489,7 +488,7 @@ async fn process_message<CB>(
     executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
     client_req_handler_callback: Option<ClientResponsesSender>,
     client_ids: Option<Vec<ClientId>>,
-    pending_op_result: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
+    pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
 ) where
     CB: NetworkBridge,
 {
@@ -522,7 +521,7 @@ async fn process_message_v1<CB>(
     executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
     client_req_handler_callback: Option<ClientResponsesSender>,
     client_id: Option<Vec<ClientId>>,
-    pending_op_result: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
+    pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
 ) where
     CB: NetworkBridge,
 {
@@ -564,7 +563,7 @@ async fn process_message_v1<CB>(
                     handle_op_request::<put::PutOp, _>(&op_manager, &mut conn_manager, op).await;
 
                 if is_operation_completed(&op_result) {
-                    if let Some(op_execution_callback) = pending_op_result {
+                    if let Some(ref op_execution_callback) = pending_op_result {
                         let _ = op_execution_callback
                             .send(NetMessage::V1(NetMessageV1::Put((*op).clone())));
                     }

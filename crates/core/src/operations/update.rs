@@ -7,7 +7,6 @@ use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationRe
 use crate::contract::ContractHandlerEvent;
 use crate::message::{InnerMessage, NetMessage, Transaction};
 use crate::node::IsOperationCompleted;
-use crate::operations::put::PutOp;
 use crate::ring::{Location, PeerKeyLocation, RingError};
 use crate::{
     client_events::HostResult,

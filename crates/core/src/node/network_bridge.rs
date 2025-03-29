@@ -1,7 +1,6 @@
 //! Types and definitions to handle all inter-peer communication.
 
 use std::future::Future;
-use std::ops::{Deref, DerefMut};
 
 use either::Either;
 use serde::{Deserialize, Serialize};
@@ -104,20 +103,8 @@ impl EventLoopNotificationsReceiver {
         &self.notifications_receiver
     }
 
-    pub(crate) fn notifications_receiver_mut(
-        &mut self,
-    ) -> &mut Receiver<Either<NetMessage, NodeEvent>> {
-        &mut self.notifications_receiver
-    }
-
     pub(crate) fn op_execution_receiver(&self) -> &Receiver<(Sender<NetMessage>, NetMessage)> {
         &self.op_execution_receiver
-    }
-
-    pub(crate) fn op_execution_receiver_mut(
-        &mut self,
-    ) -> &mut Receiver<(Sender<NetMessage>, NetMessage)> {
-        &mut self.op_execution_receiver
     }
 }
 
@@ -132,19 +119,7 @@ impl EventLoopNotificationsSender {
         &self.notifications_sender
     }
 
-    pub(crate) fn notifications_sender_mut(
-        &mut self,
-    ) -> &mut Sender<Either<NetMessage, NodeEvent>> {
-        &mut self.notifications_sender
-    }
-
     pub(crate) fn op_execution_sender(&self) -> &Sender<(Sender<NetMessage>, NetMessage)> {
         &self.op_execution_sender
-    }
-
-    pub(crate) fn op_execution_sender_mut(
-        &mut self,
-    ) -> &mut Sender<(Sender<NetMessage>, NetMessage)> {
-        &mut self.op_execution_sender
     }
 }
