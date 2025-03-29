@@ -10,7 +10,8 @@ use crate::{
     client_events::HostResult,
     node::{NetworkBridge, OpManager, PeerId},
 };
-
+use crate::node::IsOperationCompleted;
+use crate::operations::put::PutOp;
 pub(crate) use self::messages::UpdateMsg;
 
 pub(crate) struct UpdateOp {
@@ -612,6 +613,12 @@ pub(crate) async fn request_update(
     };
 
     Ok(())
+}
+
+impl IsOperationCompleted for UpdateOp {
+    fn is_completed(&self) -> bool {
+        matches!(self.state, Some(UpdateState::Finished { .. }))
+    }
 }
 
 mod messages {

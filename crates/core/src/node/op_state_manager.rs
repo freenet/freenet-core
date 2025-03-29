@@ -4,18 +4,18 @@ use dashmap::{DashMap, DashSet};
 use either::Either;
 use tracing::Instrument;
 
-use super::{network_bridge::EventLoopNotificationsSender, NetEventRegister, NodeConfig, PeerId};
-use crate::contract::{ClientResponsesReceiver, ClientResponsesSender};
 use crate::{
     config::GlobalExecutor,
     contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent, SenderHalve},
     message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
     operations::{
         connect::ConnectOp, get::GetOp, put::PutOp, subscribe::SubscribeOp, update::UpdateOp,
-        OpCompletionResult, OpEnum, OpError,
+        OpEnum, OpError,
     },
     ring::{ConnectionManager, LiveTransactionTracker, Ring},
 };
+
+use super::{network_bridge::EventLoopNotificationsSender, NetEventRegister, NodeConfig, PeerId};
 
 #[cfg(debug_assertions)]
 macro_rules! check_id_op {
@@ -108,6 +108,7 @@ impl OpManager {
         // push back the state to the stack
         self.push(*msg.id(), op).await?;
         self.to_event_listener
+            .notifications_sender()
             .send(Either::Left(msg))
             .await
             .map_err(Into::into)
@@ -120,45 +121,24 @@ impl OpManager {
     // network communication with other nodes.
     pub async fn notify_node_event(&self, msg: NodeEvent) -> Result<(), OpError> {
         self.to_event_listener
+            .notifications_sender
             .send(Either::Right(msg))
             .await
             .map_err(Into::into)
     }
 
-    /// Send an operation to the operation loop and wait for its completion.
-    /// This function will block until the operation has completed and a response has been received.
-    /// Returns the type of operation that was completed.
-    pub async fn notify_event_perform_op(
-        &self,
-        msg: NetMessage,
-        client_id: Option<crate::client_events::ClientId>,
-    ) -> Result<OpCompletionResult, OpError> {
-        let (response_sender, mut response_receiver) = tokio::sync::mpsc::channel(1);
+    pub async fn notify_op_execution(&self, msg: NetMessage) -> Result<NetMessage, OpError> {
+        let (response_sender, response_receiver): (
+            tokio::sync::mpsc::Sender<NetMessage>,
+            tokio::sync::mpsc::Receiver<NetMessage>
+        ) = tokio::sync::mpsc::channel(1);
 
-        let op_response_sender = ClientResponsesSender::from(response_sender);
-        let mut op_response_receiver = ClientResponsesReceiver::Bounded(response_receiver);
-
-        let event = NodeEvent::PerformOp {
-            message: msg,
-            client_id,
-            op_response_sender,
-        };
-
-        // Send the op through the to_event_listener
-        self.to_event_listener.send(Either::Right(event)).await?;
-
-        // Wait for the operation to complete and return the result
-        op_response_receiver
-            .recv()
+        self.to_event_listener
+            .op_execution_sender
+            .send((response_sender, msg))
             .await
-            .ok_or(OpError::NotificationError)
-            .and_then(|msg| {
-                if let crate::contract::ClientResponseMessage::OperationCompleted(_, result) = msg {
-                    Ok(result)
-                } else {
-                    Err(OpError::UnexpectedOpState)
-                }
-            })
+            .map_err(Into::into)?;
+        response_receiver.await
     }
 
     /// Send an event to the contract handler and await a response event from it if successful.

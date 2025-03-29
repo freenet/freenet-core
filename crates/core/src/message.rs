@@ -287,7 +287,7 @@ impl From<NetMessage> for semver::Version {
     }
 }
 
-pub(crate) trait InnerMessage: Into<NetMessage> {
+pub trait InnerMessage: Into<NetMessage> {
     fn id(&self) -> &Transaction;
 
     fn target(&self) -> Option<impl Borrow<PeerKeyLocation>>;

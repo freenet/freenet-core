@@ -370,8 +370,11 @@ impl P2pConnManager {
             msg = state.peer_connections.next(), if !state.peer_connections.is_empty() => {
                 self.handle_peer_connection_msg(msg, state, handshake_handler_msg).await
             }
-            msg = notification_channel.0.recv() => {
+            msg = notification_channel.notifications_receiver.recv() => {
                 Ok(self.handle_notification_msg(msg))
+            }
+            msg = notification_channel.op_execution_receiver.recv() => {
+                Ok(self.handle_op_execution(msg, state))
             }
             msg = self.conn_bridge_rx.recv() => {
                 Ok(self.handle_bridge_msg(msg))
@@ -463,6 +466,8 @@ impl P2pConnManager {
             tx_type = %msg.id().transaction_type()
         );
 
+        let pending_op_result: Option<&Sender<NetMessage>> = state.pending_op_results.get(msg.id());
+
         GlobalExecutor::spawn(
             process_message(
                 msg,
@@ -472,6 +477,7 @@ impl P2pConnManager {
                 executor_callback,
                 client_req_handler_callback,
                 pending_client_req,
+                pending_op_result,
             )
             .instrument(span),
         );
@@ -731,6 +737,17 @@ impl P2pConnManager {
         }
     }
 
+    fn handle_op_execution(&self, msg: Option<(Sender<NetMessage>, NetMessage)>, state: &mut EventListenerState) -> EventResult {
+
+        match msg {
+            Some((callback, msg)) => {
+                state.pending_op_results.insert(*msg.id(), callback);
+                EventResult::Event(ConnEvent::InboundMessage(msg))
+            },
+            _ => EventResult::Continue,
+        }
+    }
+
     fn handle_bridge_msg(&self, msg: Option<P2pBridgeEvent>) -> EventResult {
         match msg {
             Some(Left((_, msg))) => EventResult::Event(ConnEvent::OutboundMessage(*msg)),
@@ -855,6 +872,7 @@ struct EventListenerState {
     client_waiting_transaction: Vec<(WaitingTransaction, HashSet<ClientId>)>,
     transient_conn: HashMap<Transaction, SocketAddr>,
     awaiting_connection: HashMap<SocketAddr, Box<dyn ConnectResultSender>>,
+    pending_op_results: HashMap<Transaction, Sender<NetMessage>>,
 }
 
 impl EventListenerState {
@@ -866,6 +884,7 @@ impl EventListenerState {
             client_waiting_transaction: Vec::new(),
             transient_conn: HashMap::new(),
             awaiting_connection: HashMap::new(),
+            pending_op_results: HashMap::new(),
         }
     }
 }
