@@ -8,7 +8,7 @@ use std::time::Duration;
 use freenet_stdlib::client_api::HostResponse;
 use futures::Future;
 
-use super::{OpError, OpInitialization, OpOutcome, Operation, OperationResult};
+use super::{connect, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
 use crate::message::{NetMessageV1, NodeEvent};
@@ -22,13 +22,13 @@ use crate::{
     ring::PeerKeyLocation,
     util::Backoff,
 };
-
+use crate::node::IsOperationCompleted;
 pub(crate) use self::messages::{ConnectMsg, ConnectRequest, ConnectResponse};
 
 #[derive(Debug)]
 pub(crate) struct ConnectOp {
     id: Transaction,
-    state: Option<ConnectState>,
+    pub(crate) state: Option<ConnectState>,
     pub gateway: Option<Box<PeerKeyLocation>>,
     /// keeps track of the number of retries and applies an exponential backoff cooldown period
     pub backoff: Option<Backoff>,
@@ -64,6 +64,12 @@ impl ConnectOp {
     pub(super) fn to_host_result(&self) -> HostResult {
         // this should't ever be called since clients can't request explicit connects
         Ok(HostResponse::Ok)
+    }
+}
+
+impl IsOperationCompleted for ConnectOp {
+    fn is_completed(&self) -> bool {
+        matches!(self.state, Some(connect::ConnectState::Connected))
     }
 }
 

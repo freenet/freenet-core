@@ -13,7 +13,8 @@ use crate::{
     operations::{OpInitialization, Operation},
     ring::{Location, PeerKeyLocation, RingError},
 };
-
+use crate::node::IsOperationCompleted;
+use crate::operations::put::PutOp;
 use super::{OpEnum, OpError, OpOutcome, OperationResult};
 
 pub(crate) use self::messages::GetMsg;
@@ -235,7 +236,7 @@ impl GetOp {
         }
     }
 
-    pub(super) fn finalized(&self) -> bool {
+    pub(super) fn finaliºzed(&self) -> bool {
         self.result.is_some() && matches!(self.state, Some(GetState::Finished { .. }))
     }
 
@@ -1011,6 +1012,12 @@ async fn try_forward_or_return(
             None,
             stats,
         )
+    }
+}
+
+impl IsOperationCompleted for GetOp {
+    fn is_completed(&self) -> bool {
+        matches!(self.state, Some(GetState::Finished { .. }))
     }
 }
 

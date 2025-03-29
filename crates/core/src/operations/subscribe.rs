@@ -15,7 +15,8 @@ use freenet_stdlib::{
     prelude::*,
 };
 use serde::{Deserialize, Serialize};
-
+use crate::node::IsOperationCompleted;
+use crate::operations::put::PutOp;
 pub(crate) use self::messages::SubscribeMsg;
 
 const MAX_RETRIES: usize = 10;
@@ -435,6 +436,12 @@ fn build_op_result(
         return_msg: msg.map(NetMessage::from),
         state: output_op.map(OpEnum::Subscribe),
     })
+}
+
+impl IsOperationCompleted for SubscribeOp {
+    fn is_completed(&self) -> bool {
+        matches!(self.state, Some(SubscribeState::Completed { .. }))
+    }
 }
 
 mod messages {

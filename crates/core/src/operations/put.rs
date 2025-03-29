@@ -12,7 +12,7 @@ use freenet_stdlib::{
     prelude::*,
 };
 
-use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
+use super::{connect, put, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::{
     client_events::HostResult,
     contract::ContractHandlerEvent,
@@ -20,6 +20,7 @@ use crate::{
     node::{NetworkBridge, OpManager, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
 };
+use crate::node::IsOperationCompleted;
 
 pub(crate) struct PutOp {
     pub id: Transaction,
@@ -78,6 +79,13 @@ impl PutOp {
 struct PutStats {
     target: Option<PeerKeyLocation>,
 }
+
+impl IsOperationCompleted for PutOp {
+    fn is_completed(&self) -> bool {
+        matches!(self.state, Some(put::PutState::Finished { .. }))
+    }
+}
+
 
 pub(crate) struct PutResult {}
 
