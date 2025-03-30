@@ -254,6 +254,7 @@ impl Ring {
         skip_list: impl Contains<PeerId>,
     ) -> Option<PeerKeyLocation> {
         let router = self.router.read();
+
         self.connection_manager
             .routing(Location::from(contract_key), None, skip_list, &router)
     }
