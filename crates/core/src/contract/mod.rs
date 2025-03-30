@@ -76,7 +76,10 @@ where
                 return_contract_code,
             } => {
                 // Clone needed values for the task
-                let fetch_contract = contract_handler.executor().fetch_contract(key, return_contract_code).await;
+                let fetch_contract = contract_handler
+                    .executor()
+                    .fetch_contract(key, return_contract_code)
+                    .await;
                 let id_clone = id;
 
                 pending_tasks.spawn(async move {
@@ -120,7 +123,15 @@ where
                 contract,
             } => {
                 // Clone needed values for the task
-                let put_future = contract_handler.executor().upsert_contract_state(key, Either::Left(state.clone()), related_contracts, contract).await;
+                let put_future = contract_handler
+                    .executor()
+                    .upsert_contract_state(
+                        key,
+                        Either::Left(state.clone()),
+                        related_contracts,
+                        contract,
+                    )
+                    .await;
 
                 pending_tasks.spawn(async move {
                     let span = tracing::info_span!("upsert_contract_state", %key);
@@ -161,7 +172,10 @@ where
                     freenet_stdlib::prelude::UpdateData::Delta(delta) => Either::Right(delta),
                     _ => unreachable!(),
                 };
-                let update_future = contract_handler.executor().upsert_contract_state(key, update_value, related_contracts, None).await;
+                let update_future = contract_handler
+                    .executor()
+                    .upsert_contract_state(key, update_value, related_contracts, None)
+                    .await;
 
                 pending_tasks.spawn(async move {
                     let span = tracing::info_span!("upsert_contract_state", %key);
