@@ -1,4 +1,5 @@
 use super::{runtime::RuntimePool, *};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::Semaphore;
@@ -76,7 +77,7 @@ impl RuntimePool<String, MockRuntime> {
 
         let state_store = StateStore::new(Storage::new(&exec_dir).await?, u16::MAX as u32).unwrap();
 
-        let executor = Executor::new(
+        let mut executor = Executor::new(
             state_store,
             OperationMode::Local,
             MockRuntime { contract_store },
@@ -84,6 +85,9 @@ impl RuntimePool<String, MockRuntime> {
             Some(op_manager.clone()),
         )
         .await?;
+
+        // Assign ID to executor
+        executor.id = 0;
 
         runtimes.push(Some(executor));
 
@@ -93,6 +97,8 @@ impl RuntimePool<String, MockRuntime> {
             op_sender: to_process_tx,
             op_manager,
             config: identifier.to_string(),
+            pending_registrations: HashMap::new(),
+            next_executor_id: 1, // We start at 1 since the initial executor has ID 0
         })
     }
 
@@ -104,6 +110,8 @@ impl RuntimePool<String, MockRuntime> {
         // Find the first available executor
         for slot in &mut self.runtimes {
             if let Some(executor) = slot.take() {
+                // Create an empty entry for pending registrations
+                self.pending_registrations.insert(executor.id(), Vec::new());
                 return executor;
             }
         }
@@ -117,6 +125,9 @@ impl ContractExecutor for RuntimePool<String, MockRuntime> {
     type InnerExecutor = Executor<MockRuntime>;
 
     fn return_executor(&mut self, executor: Self::InnerExecutor) {
+        // Clear any pending registrations for this executor
+        self.pending_registrations.remove(&executor.id());
+
         // Find an empty slot and return the executor
         if let Some(empty_slot) = self.runtimes.iter_mut().find(|slot| slot.is_none()) {
             *empty_slot = Some(executor);
@@ -147,7 +158,7 @@ impl ContractExecutor for RuntimePool<String, MockRuntime> {
         let state_store =
             StateStore::new(Storage::new(&exec_dir).await.unwrap(), u16::MAX as u32).unwrap();
 
-        Executor::new(
+        let mut executor = Executor::new(
             state_store,
             OperationMode::Local,
             MockRuntime { contract_store },
@@ -155,7 +166,13 @@ impl ContractExecutor for RuntimePool<String, MockRuntime> {
             Some(self.op_manager.clone()),
         )
         .await
-        .expect("Failed to create new executor")
+        .expect("Failed to create new executor");
+
+        // Assign a new ID to this executor
+        executor.id = self.next_executor_id;
+        self.next_executor_id += 1;
+
+        executor
     }
 
     async fn fetch_contract(
@@ -230,6 +247,9 @@ impl ContractExecutor for RuntimePool<String, MockRuntime> {
         _notification_ch: UnboundedSender<HostResult>,
         _summary: Option<StateSummary<'_>>,
     ) -> Result<(), Box<RequestError>> {
+        // Add to all pending registration entries
+        // In the mock implementation we don't need to actually store anything
+
         // For mock, we just acknowledge the registration without actually implementing notification
         Ok(())
     }

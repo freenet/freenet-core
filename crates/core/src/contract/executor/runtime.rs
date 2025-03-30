@@ -3,9 +3,28 @@ use super::{
     ContractExecutor, ContractRequest, ContractResponse, ExecutorError, RequestError, Response,
     StateStoreError,
 };
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+
+/// Trait for executors that can identify themselves
+pub trait ExecutorWithId: Send + 'static {
+    fn id(&self) -> usize;
+}
+
+impl<T: Send + Sync + 'static> ExecutorWithId for Executor<T> {
+    fn id(&self) -> usize {
+        self.id
+    }
+}
+
+pub(super) struct PendingRegistration {
+    key: ContractKey,
+    cli_id: ClientId,
+    notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
+    summary: Option<StateSummary<'static>>,
+}
 
 pub(crate) struct RuntimePool<C = Arc<Config>, R = Runtime> {
     // Keeping track of available executors
@@ -18,6 +37,10 @@ pub(crate) struct RuntimePool<C = Arc<Config>, R = Runtime> {
         tokio::sync::oneshot::Sender<Result<OpEnum, CallbackError>>,
     )>,
     pub op_manager: Arc<OpManager>,
+    // Track pending registrations by executor index
+    pub(super) pending_registrations: HashMap<usize, Vec<PendingRegistration>>,
+    // Next executor ID to assign
+    pub next_executor_id: usize,
 }
 
 impl RuntimePool<Arc<Config>, Runtime> {
@@ -32,14 +55,20 @@ impl RuntimePool<Arc<Config>, Runtime> {
         pool_size: NonZeroUsize,
     ) -> anyhow::Result<Self> {
         let mut runtimes = Vec::with_capacity(pool_size.into());
+        let mut next_id = 0;
 
         for _ in 0..pool_size.into() {
-            let executor = Executor::from_config(
+            let mut executor = Executor::from_config(
                 config.clone(),
                 Some(op_sender.clone()),
                 Some(op_manager.clone()),
             )
             .await?;
+
+            // Assign an ID to the executor
+            executor.id = next_id;
+            next_id += 1;
+
             runtimes.push(Some(executor));
         }
 
@@ -49,6 +78,8 @@ impl RuntimePool<Arc<Config>, Runtime> {
             config,
             op_sender,
             op_manager,
+            pending_registrations: HashMap::new(),
+            next_executor_id: next_id,
         })
     }
 
@@ -60,6 +91,14 @@ impl RuntimePool<Arc<Config>, Runtime> {
         // Find the first available executor
         for slot in &mut self.runtimes {
             if let Some(executor) = slot.take() {
+                let id = executor.id();
+                // Ensure there's an entry in pending_registrations for this executor
+                // This will track any registrations that happen while it's out of the pool
+                let existing = self.pending_registrations.insert(id, Vec::new());
+                assert!(
+                    existing.is_none(),
+                    "Executor ID already exists in pending registrations"
+                );
                 return executor;
             }
         }
@@ -110,43 +149,51 @@ impl ContractExecutor for RuntimePool<Arc<Config>, Runtime> {
         notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
         summary: Option<StateSummary<'_>>,
     ) -> Result<(), Box<RequestError>> {
-        // We need to register with all executors
         let mut last_error = None;
+        let owned_summary = summary.map(StateSummary::into_owned);
 
-        // Temporarily collect all executors
-        let mut executors = Vec::new();
-        for slot in &mut self.runtimes {
-            if let Some(executor) = slot.take() {
-                executors.push(executor);
-            }
-        }
-
-        // Register with each executor
-        // FIXME: potentially missing registers
-        for executor in &mut executors {
+        // Register with all available executors
+        for executor in self.runtimes.iter_mut().flatten() {
             if let Err(err) = executor.register_contract_notifier(
                 key,
                 cli_id,
                 notification_ch.clone(),
-                summary.clone(),
+                owned_summary.clone(),
             ) {
                 last_error = Some(err);
             }
         }
 
-        // Return executors to pool
-        for executor in executors {
-            if let Some(empty_slot) = self.runtimes.iter_mut().find(|slot| slot.is_none()) {
-                *empty_slot = Some(executor);
-                self.available.add_permits(1);
-            }
+        // Add to all pending registration entries
+        // These represent executors that are currently out of the pool
+        for pending in self.pending_registrations.values_mut() {
+            pending.push(PendingRegistration {
+                key,
+                cli_id,
+                notification_ch: notification_ch.clone(),
+                summary: owned_summary.clone(),
+            });
         }
 
         last_error.map_or(Ok(()), Err)
     }
 
-    fn return_executor(&mut self, executor: Self::InnerExecutor) {
-        // Find an empty slot and return the executor
+    fn return_executor(&mut self, mut executor: Self::InnerExecutor) {
+        let executor_id = executor.id();
+
+        // Apply any pending registrations for this executor
+        if let Some(pending) = self.pending_registrations.remove(&executor_id) {
+            for registration in pending {
+                let _ = executor.register_contract_notifier(
+                    registration.key,
+                    registration.cli_id,
+                    registration.notification_ch,
+                    registration.summary.clone(),
+                );
+            }
+        }
+
+        // Return the executor to the pool
         if let Some(empty_slot) = self.runtimes.iter_mut().find(|slot| slot.is_none()) {
             *empty_slot = Some(executor);
             self.available.add_permits(1);
@@ -156,13 +203,19 @@ impl ContractExecutor for RuntimePool<Arc<Config>, Runtime> {
     }
 
     async fn create_new_executor(&mut self) -> Self::InnerExecutor {
-        Executor::from_config(
+        let mut executor = Executor::from_config(
             self.config.clone(),
             Some(self.op_sender.clone()),
             Some(self.op_manager.clone()),
         )
         .await
-        .expect("Failed to create new executor")
+        .expect("Failed to create new executor");
+
+        // Assign a new ID to this executor
+        executor.id = self.next_executor_id;
+        self.next_executor_id += 1;
+
+        executor
     }
 
     fn execute_delegate_request(
@@ -437,7 +490,9 @@ impl Executor<Runtime> {
             Self::get_stores(&config).await?;
         let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
         assert!(config.mode == OperationMode::Local);
-        Executor::new(state_store, OperationMode::Local, rt, None, None).await
+        let mut executor = Executor::new(state_store, OperationMode::Local, rt, None, None).await?;
+        executor.id = 0; // Default ID for local executors
+        Ok(executor)
     }
 
     async fn from_config(
@@ -448,7 +503,10 @@ impl Executor<Runtime> {
         let (contract_store, delegate_store, secret_store, state_store) =
             Self::get_stores(&config).await?;
         let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
-        Executor::new(state_store, config.mode, rt, op_sender, op_manager).await
+        let mut executor =
+            Executor::new(state_store, config.mode, rt, op_sender, op_manager).await?;
+        executor.id = 0; // ID will be assigned by the pool
+        Ok(executor)
     }
 
     pub fn register_contract_notifier(
