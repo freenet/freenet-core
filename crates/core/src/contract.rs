@@ -39,7 +39,7 @@ where
                 Ok((id, event, executor)) => {
                     // Return the executor back to the pool
                     contract_handler.executor().return_executor(executor);
-                    
+
                     // Send the result using the contract_handler's channel
                     if let Err(error) = contract_handler.channel().send_to_sender(id, event).await {
                         tracing::debug!(%error, "shutting down contract handler");
@@ -76,7 +76,10 @@ where
                 return_contract_code,
             } => {
                 // Clone needed values for the task
-                let fetch_contract = contract_handler.executor().fetch_contract(key, return_contract_code).await;
+                let fetch_contract = contract_handler
+                    .executor()
+                    .fetch_contract(key, return_contract_code)
+                    .await;
                 let id_clone = id;
 
                 pending_tasks.spawn(async move {
@@ -87,8 +90,8 @@ where
 
                     let response_event = match result {
                         Ok((state, contract)) => {
-                            tracing::debug!(with_contract_code = %return_contract_code, 
-                                           has_contract = %contract.is_some(), 
+                            tracing::debug!(with_contract_code = %return_contract_code,
+                                           has_contract = %contract.is_some(),
                                            "Fetched contract {key}");
 
                             ContractHandlerEvent::GetResponse {
@@ -120,7 +123,15 @@ where
                 contract,
             } => {
                 // Clone needed values for the task
-                let put_future = contract_handler.executor().upsert_contract_state(key, Either::Left(state.clone()), related_contracts, contract).await;
+                let put_future = contract_handler
+                    .executor()
+                    .upsert_contract_state(
+                        key,
+                        Either::Left(state.clone()),
+                        related_contracts,
+                        contract,
+                    )
+                    .await;
 
                 pending_tasks.spawn(async move {
                     let span = tracing::info_span!("upsert_contract_state", %key);
@@ -161,7 +172,10 @@ where
                     freenet_stdlib::prelude::UpdateData::Delta(delta) => Either::Right(delta),
                     _ => unreachable!(),
                 };
-                let update_future = contract_handler.executor().upsert_contract_state(key, update_value, related_contracts, None).await;
+                let update_future = contract_handler
+                    .executor()
+                    .upsert_contract_state(key, update_value, related_contracts, None)
+                    .await;
 
                 pending_tasks.spawn(async move {
                     let span = tracing::info_span!("upsert_contract_state", %key);
