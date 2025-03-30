@@ -16,6 +16,7 @@ use freenet_stdlib::client_api::{
     RequestError,
 };
 use freenet_stdlib::prelude::*;
+use runtime::ExecutorWithId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self};
 
@@ -493,7 +494,7 @@ pub(crate) type UpsertContractR = Result<UpsertResult, ExecutorError>;
 ///
 /// Implementations must be thread-safe (Send) and have a static lifetime.
 pub(crate) trait ContractExecutor: Send + 'static {
-    type InnerExecutor: Send + 'static;
+    type InnerExecutor: ExecutorWithId;
 
     /// Fetches a contract from the store.
     fn fetch_contract(
@@ -543,6 +544,7 @@ pub(super) type OpResult = mpsc::Sender<(
 /// Consumers of the executor are required to poll for new changes in order to be notified
 /// of changes or can alternatively use the notification channel.
 pub struct Executor<R = Runtime> {
+    pub id: usize,
     mode: OperationMode,
     runtime: R,
     pub state_store: StateStore<Storage>,
@@ -566,6 +568,7 @@ impl<R> Executor<R> {
         op_manager: Option<Arc<OpManager>>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
+            id: 0, // Default ID, will be set by the pool
             mode,
             runtime,
             state_store,
