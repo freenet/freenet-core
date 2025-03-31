@@ -3,6 +3,15 @@ use super::*;
 impl HttpGateway {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
     pub fn as_router_v1(socket: &SocketAddr) -> (Self, Router) {
+        let attested_contracts = Arc::new(RwLock::new(HashMap::new()));
+        Self::as_router_v1_with_attested_contracts(socket, attested_contracts)
+    }
+    
+    /// Returns the uninitialized axum router with a provided attested_contracts map.
+    pub fn as_router_v1_with_attested_contracts(
+        socket: &SocketAddr,
+        attested_contracts: Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>,
+    ) -> (Self, Router) {
         let localhost = match socket.ip() {
             IpAddr::V4(ip) if ip.is_loopback() => true,
             IpAddr::V6(ip) if ip.is_loopback() => true,
@@ -14,8 +23,6 @@ impl HttpGateway {
         let (proxy_request_sender, request_to_server) = mpsc::channel(1);
 
         let config = Config { localhost };
-
-        let attested_contracts = Arc::new(RwLock::new(HashMap::new()));
 
         let router = Router::new()
             .route("/v1", get(home))

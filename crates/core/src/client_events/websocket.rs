@@ -50,7 +50,15 @@ const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optima
 
 impl WebSocketProxy {
     pub fn as_router(server_routing: Router) -> (Self, Router) {
-        WebSocketProxy::as_router_v1(server_routing)
+        let attested_contracts = Arc::new(RwLock::new(HashMap::<AuthToken, (ContractInstanceId, ClientId)>::new()));
+        WebSocketProxy::as_router_with_attested_contracts(server_routing, attested_contracts)
+    }
+    
+    pub fn as_router_with_attested_contracts(
+        server_routing: Router,
+        attested_contracts: Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>,
+    ) -> (Self, Router) {
+        WebSocketProxy::as_router_v1_with_attested_contracts(server_routing, attested_contracts)
     }
 
     async fn internal_proxy_recv(

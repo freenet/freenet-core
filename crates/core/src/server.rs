@@ -4,6 +4,8 @@ mod http_gateway;
 pub(crate) mod path_handlers;
 
 use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use freenet_stdlib::{
     client_api::{ClientError, ClientRequest, HostResponse},
@@ -194,8 +196,14 @@ pub async fn serve_gateway(config: WebsocketApiConfig) -> [BoxedClient; 2] {
 
 pub(crate) async fn serve_gateway_in(config: WebsocketApiConfig) -> (HttpGateway, WebSocketProxy) {
     let ws_socket = (config.address, config.port).into();
-    let (gw, gw_router) = HttpGateway::as_router(&ws_socket);
-    let (ws_proxy, ws_router) = WebSocketProxy::as_router(gw_router);
+    
+    // Create a shared attested_contracts map
+    let attested_contracts = Arc::new(RwLock::new(HashMap::<AuthToken, (ContractInstanceId, ClientId)>::new()));
+    
+    // Pass the shared map to both HttpGateway and WebSocketProxy
+    let (gw, gw_router) = HttpGateway::as_router_with_attested_contracts(&ws_socket, attested_contracts.clone());
+    let (ws_proxy, ws_router) = WebSocketProxy::as_router_with_attested_contracts(gw_router, attested_contracts);
+    
     serve(ws_socket, ws_router.layer(TraceLayer::new_for_http()));
     (gw, ws_proxy)
 }

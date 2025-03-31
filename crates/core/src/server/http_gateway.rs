@@ -45,7 +45,16 @@ pub(crate) struct HttpGateway {
 impl HttpGateway {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
     pub fn as_router(socket: &SocketAddr) -> (Self, Router) {
-        Self::as_router_v1(socket)
+        let attested_contracts = Arc::new(RwLock::new(HashMap::new()));
+        Self::as_router_with_attested_contracts(socket, attested_contracts)
+    }
+    
+    /// Returns the uninitialized axum router with a provided attested_contracts map.
+    pub fn as_router_with_attested_contracts(
+        socket: &SocketAddr,
+        attested_contracts: Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>,
+    ) -> (Self, Router) {
+        Self::as_router_v1_with_attested_contracts(socket, attested_contracts)
     }
 }
 
