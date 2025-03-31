@@ -217,16 +217,21 @@ async fn websocket_commands(
 ) -> axum::response::Response {
     let on_upgrade = move |ws: WebSocket| async move {
         // Get the data we need and immediately drop the lock
-        let auth_and_instance = {
+        let auth_and_instance = if let Some(token) = auth_token.as_ref() {
             let attested_contracts = attested_contracts.read().unwrap();
-            auth_token.as_ref().and_then(|token| {
-                attested_contracts
-                    .get(token)
-                    .map(|(cid, _)| (token.clone(), *cid))
-            })
+            if let Some((cid, _)) = attested_contracts.get(token) {
+                tracing::debug!(?token, ?cid, "Found token in attested_contracts map");
+                Some((token.clone(), *cid))
+            } else {
+                tracing::warn!(?token, "Auth token not found in attested_contracts map");
+                None
+            }
+        } else {
+            tracing::debug!("No auth token provided in WebSocket request");
+            None
         }; // RwLockReadGuard is dropped here
         
-        tracing::debug!(protoc = ?ws.protocol(), "websocket connection established");
+        tracing::debug!(protoc = ?ws.protocol(), ?auth_and_instance, "websocket connection established");
         if let Err(error) = websocket_interface(rs.clone(), auth_and_instance, encoding_protoc, ws).await {
             tracing::error!("{error}");
         }
