@@ -1,4 +1,5 @@
 use super::*;
+use freenet_stdlib::prelude::ContractInstanceId;
 
 impl HttpGateway {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
@@ -68,7 +69,16 @@ async fn web_home(
         .build();
 
     let token_header = headers::Authorization::bearer(token.as_str()).unwrap();
-    let contract_idx = path_handlers::contract_home(key, rs, token.clone()).await?;
+    let contract_response = path_handlers::contract_home(key, rs, token.clone()).await?;
+    
+    // Extract the ContractInstanceId from the response
+    let contract_idx = match contract_response.extensions().get::<ContractInstanceId>() {
+        Some(id) => *id,
+        None => {
+            tracing::warn!("No ContractInstanceId found in response");
+            ContractInstanceId::default()
+        }
+    };
     
     // Store the token in the attested_contracts map
     if let Ok(mut guard) = attested_contracts.write() {
