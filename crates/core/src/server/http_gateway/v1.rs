@@ -72,7 +72,7 @@ async fn web_home(
     let contract_response = path_handlers::contract_home(key, rs, token.clone()).await?;
     
     // Note: We can't store the token in attested_contracts here because we don't have the ContractInstanceId
-    // The actual ContractInstanceId will be set when the contract is loaded by the node
+    // This will typically be stored when the websocket connection is established.
     
     let mut response = contract_response.into_response();
     response.headers_mut().typed_insert(token_header);
