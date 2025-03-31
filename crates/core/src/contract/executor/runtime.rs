@@ -434,15 +434,12 @@ impl Executor<Runtime> {
                 inbound,
                 params,
             } => {
-                let attested = attested_contract.and_then(|contract| {
-                    self.delegate_attested_ids
-                        .get(&key)
-                        .and_then(|contracts| contracts.iter().find(|c| *c == contract))
-                });
+                // Use the attested_contract directly instead of looking it up in delegate_attested_ids
+                let attested_bytes = attested_contract.map(|c| c.as_bytes());
                 match self.runtime.inbound_app_message(
                     &key,
                     &params,
-                    attested.map(|c| c.as_bytes()),
+                    attested_bytes,
                     inbound
                         .into_iter()
                         .map(InboundDelegateMsg::into_owned)
