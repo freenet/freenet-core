@@ -7,7 +7,7 @@ impl HttpGateway {
         let attested_contracts = Arc::new(RwLock::new(HashMap::new()));
         Self::as_router_v1_with_attested_contracts(socket, attested_contracts)
     }
-    
+
     /// Returns the uninitialized axum router with a provided attested_contracts map.
     pub fn as_router_v1_with_attested_contracts(
         socket: &SocketAddr,
@@ -47,7 +47,9 @@ impl HttpGateway {
 async fn web_home(
     Path(key): Path<String>,
     Extension(rs): Extension<HttpGatewayRequest>,
-    Extension(attested_contracts): Extension<Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>>,
+    Extension(attested_contracts): Extension<
+        Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>,
+    >,
     axum::extract::State(config): axum::extract::State<Config>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     use headers::{Header, HeaderMapExt};
@@ -70,10 +72,10 @@ async fn web_home(
 
     let token_header = headers::Authorization::bearer(token.as_str()).unwrap();
     let contract_response = path_handlers::contract_home(key, rs, token.clone()).await?;
-    
+
     // Note: We can't store the token in attested_contracts here because we don't have the ContractInstanceId
     // This will typically be stored when the websocket connection is established.
-    
+
     let mut response = contract_response.into_response();
     response.headers_mut().typed_insert(token_header);
     response.headers_mut().insert(

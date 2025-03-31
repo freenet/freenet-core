@@ -48,7 +48,7 @@ impl HttpGateway {
         let attested_contracts = Arc::new(RwLock::new(HashMap::new()));
         Self::as_router_with_attested_contracts(socket, attested_contracts)
     }
-    
+
     /// Returns the uninitialized axum router with a provided attested_contracts map.
     pub fn as_router_with_attested_contracts(
         socket: &SocketAddr,
@@ -85,7 +85,12 @@ impl ClientEventsProxy for HttpGateway {
                                 .write()
                                 .map_err(|_| ErrorKind::FailedOperation)?
                                 .insert(assigned_token.clone(), (contract, cli_id));
-                            tracing::debug!(?assigned_token, ?contract, ?cli_id, "Stored assigned token in attested_contracts map");
+                            tracing::debug!(
+                                ?assigned_token,
+                                ?contract,
+                                ?cli_id,
+                                "Stored assigned token in attested_contracts map"
+                            );
                         }
                         self.response_channels.insert(cli_id, callbacks);
                         continue;

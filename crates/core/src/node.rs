@@ -916,7 +916,10 @@ pub async fn run_local_node(
                         .ok()
                         .and_then(|guard| guard.get(&token).map(|(t, _)| t.clone()))
                 });
-                tracing::debug!(?attested_contract, "Delegate request with attested contract");
+                tracing::debug!(
+                    ?attested_contract,
+                    "Delegate request with attested contract"
+                );
                 executor.delegate_request(op, attested_contract.as_ref())
             }
             ClientRequest::Disconnect { cause } => {

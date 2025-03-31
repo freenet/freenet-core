@@ -366,7 +366,12 @@ impl Executor<Runtime> {
             _ => "Unknown",
         };
         let stack_trace = Backtrace::capture();
-        tracing::debug!(?request_type, ?attested_contract, ?stack_trace, "DelegateRequest received");
+        tracing::debug!(
+            ?request_type,
+            ?attested_contract,
+            ?stack_trace,
+            "DelegateRequest received"
+        );
         match req {
             DelegateRequest::RegisterDelegate {
                 delegate,

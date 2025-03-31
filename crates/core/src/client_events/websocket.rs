@@ -1,10 +1,14 @@
 use std::{
-    backtrace::Backtrace, collections::{HashMap, VecDeque}, sync::{Arc, OnceLock, RwLock}, time::Duration
+    backtrace::Backtrace,
+    collections::{HashMap, VecDeque},
+    sync::{Arc, OnceLock, RwLock},
+    time::Duration,
 };
 
 use axum::{
     extract::{
-        ws::{Message, WebSocket}, Query, WebSocketUpgrade
+        ws::{Message, WebSocket},
+        Query, WebSocketUpgrade,
     },
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -50,10 +54,13 @@ const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optima
 
 impl WebSocketProxy {
     pub fn as_router(server_routing: Router) -> (Self, Router) {
-        let attested_contracts = Arc::new(RwLock::new(HashMap::<AuthToken, (ContractInstanceId, ClientId)>::new()));
+        let attested_contracts = Arc::new(RwLock::new(HashMap::<
+            AuthToken,
+            (ContractInstanceId, ClientId),
+        >::new()));
         WebSocketProxy::as_router_with_attested_contracts(server_routing, attested_contracts)
     }
-    
+
     pub fn as_router_with_attested_contracts(
         server_routing: Router,
         attested_contracts: Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>,
@@ -213,7 +220,9 @@ async fn websocket_commands(
     Extension(auth_token): Extension<Option<AuthToken>>,
     Extension(encoding_protoc): Extension<EncodingProtocol>,
     Extension(rs): Extension<WebSocketRequest>,
-    Extension(attested_contracts): Extension<Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>>,
+    Extension(attested_contracts): Extension<
+        Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>,
+    >,
 ) -> axum::response::Response {
     let on_upgrade = move |ws: WebSocket| async move {
         // Get the data we need and immediately drop the lock
@@ -222,7 +231,7 @@ async fn websocket_commands(
             let attested_contracts_read = attested_contracts.read().unwrap();
             let map_contents: Vec<_> = attested_contracts_read.keys().cloned().collect();
             tracing::debug!(?token, "attested_contracts map keys: {:?}", map_contents);
-            
+
             if let Some((cid, _)) = attested_contracts_read.get(token) {
                 tracing::debug!(?token, ?cid, "Found token in attested_contracts map");
                 Some((token.clone(), *cid))
@@ -234,9 +243,11 @@ async fn websocket_commands(
             tracing::debug!("No auth token provided in WebSocket request");
             None
         }; // RwLockReadGuard is dropped here
-        
+
         tracing::debug!(protoc = ?ws.protocol(), ?auth_and_instance, "websocket connection established");
-        if let Err(error) = websocket_interface(rs.clone(), auth_and_instance, encoding_protoc, ws).await {
+        if let Err(error) =
+            websocket_interface(rs.clone(), auth_and_instance, encoding_protoc, ws).await
+        {
             tracing::error!("{error}");
         }
     };
@@ -250,8 +261,12 @@ async fn websocket_interface(
     encoding_protoc: EncodingProtocol,
     ws: WebSocket,
 ) -> anyhow::Result<()> {
-    tracing::debug!(?auth_token, "websocket_interface called, calling new_client_connection");
-    let (mut response_rx, client_id) = new_client_connection(&request_sender, auth_token.clone()).await?;
+    tracing::debug!(
+        ?auth_token,
+        "websocket_interface called, calling new_client_connection"
+    );
+    let (mut response_rx, client_id) =
+        new_client_connection(&request_sender, auth_token.clone()).await?;
     let (mut server_sink, mut client_stream) = ws.split();
     let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::UnboundedReceiver<HostResult>)>>> =
         Arc::new(Mutex::new(VecDeque::new()));

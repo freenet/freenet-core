@@ -2,10 +2,13 @@ use super::*;
 
 impl WebSocketProxy {
     pub fn as_router_v1(server_routing: Router) -> (Self, Router) {
-        let attested_contracts = Arc::new(RwLock::new(HashMap::<AuthToken, (ContractInstanceId, ClientId)>::new()));
+        let attested_contracts = Arc::new(RwLock::new(HashMap::<
+            AuthToken,
+            (ContractInstanceId, ClientId),
+        >::new()));
         Self::as_router_v1_with_attested_contracts(server_routing, attested_contracts)
     }
-    
+
     pub fn as_router_v1_with_attested_contracts(
         server_routing: Router,
         attested_contracts: Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>,
@@ -18,7 +21,7 @@ impl WebSocketProxy {
             .layer(Extension(attested_contracts))
             .layer(Extension(WebSocketRequest(proxy_request_sender)))
             .layer(axum::middleware::from_fn(connection_info));
-        
+
         (
             WebSocketProxy {
                 proxy_server_request,
