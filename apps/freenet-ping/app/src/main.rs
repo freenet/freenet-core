@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     // Step 1: Put the contract or get it, and wait for response
     let mut is_subscribed = false;
     let mut local_state: Ping;
-    
+
     if args.put_contract {
         // Put contract and wait for response
         let ping = Ping::default();
@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                 subscribe: false,
             }))
             .await?;
-        
+
         // Wait for put response
         let key = wait_for_put_response(&mut client, &contract_key).await?;
         tracing::info!(key=%key, "put ping contract successfully!");
@@ -85,11 +85,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                 subscribe: false,
             }))
             .await?;
-        
+
         // Wait for get response
         local_state = wait_for_get_response(&mut client, &contract_key).await?;
     }
-    
+
     // Step 2: Subscribe to the contract and wait for subscription confirmation
     tracing::info!("Subscribing to contract...");
     client
@@ -98,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
             summary: None,
         }))
         .await?;
-    
+
     // Wait for subscription response
     wait_for_subscribe_response(&mut client, &contract_key).await?;
     is_subscribed = true;
@@ -243,7 +243,7 @@ async fn wait_for_get_response(
                 if &key != expected_key {
                     return Err("unexpected key".into());
                 }
-                
+
                 let old_ping = serde_json::from_slice::<Ping>(&state)?;
                 tracing::info!(num_entries = %old_ping.len(), "old state fetched successfully!");
                 return Ok(old_ping);
@@ -277,7 +277,7 @@ async fn wait_for_subscribe_response(
                 if &key != expected_key {
                     return Err("unexpected key".into());
                 }
-                
+
                 if subscribed {
                     return Ok(());
                 } else {
