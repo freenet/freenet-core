@@ -68,7 +68,12 @@ async fn web_home(
         .build();
 
     let token_header = headers::Authorization::bearer(token.as_str()).unwrap();
-    let contract_idx = path_handlers::contract_home(key, rs, token).await?;
+    let contract_idx = path_handlers::contract_home(key, rs, token.clone()).await?;
+    
+    // Store the token in the attested_contracts map
+    if let Ok(mut guard) = attested_contracts.write() {
+        guard.insert(token, (contract_idx, ClientId::next()));
+    }
     let mut response = contract_idx.into_response();
     response.headers_mut().typed_insert(token_header);
     response.headers_mut().insert(
