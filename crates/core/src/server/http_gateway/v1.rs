@@ -69,13 +69,12 @@ async fn web_home(
         .build();
 
     let token_header = headers::Authorization::bearer(token.as_str()).unwrap();
-    let contract_idx = path_handlers::contract_home(key, rs, token.clone()).await?;
+    let contract_response = path_handlers::contract_home(key, rs, token.clone()).await?;
     
-    // Store the token in the attested_contracts map
-    if let Ok(mut guard) = attested_contracts.write() {
-        guard.insert(token, (contract_idx, ClientId::next()));
-    }
-    let mut response = contract_idx.into_response();
+    // Note: We can't store the token in attested_contracts here because we don't have the ContractInstanceId
+    // The actual ContractInstanceId will be set when the contract is loaded by the node
+    
+    let mut response = contract_response.into_response();
     response.headers_mut().typed_insert(token_header);
     response.headers_mut().insert(
         headers::SetCookie::name(),
