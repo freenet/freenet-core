@@ -75,7 +75,8 @@ impl ClientEventsProxy for HttpGateway {
                             self.attested_contracts
                                 .write()
                                 .map_err(|_| ErrorKind::FailedOperation)?
-                                .insert(assigned_token, (contract, cli_id));
+                                .insert(assigned_token.clone(), (contract, cli_id));
+                            tracing::debug!(?assigned_token, ?contract, ?cli_id, "Stored assigned token in attested_contracts map");
                         }
                         self.response_channels.insert(cli_id, callbacks);
                         continue;
