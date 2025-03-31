@@ -4,10 +4,11 @@ impl WebSocketProxy {
     pub fn as_router_v1(server_routing: Router) -> (Self, Router) {
         let (proxy_request_sender, proxy_server_request) = mpsc::channel(PARALLELISM);
 
+        // Using Extension instead of with_state to avoid changing the Router's type parameter
         let attested_contracts = Arc::new(RwLock::new(HashMap::new()));
         let router = server_routing
-            .with_state(attested_contracts)
             .route("/v1/contract/command", get(websocket_commands))
+            .layer(Extension(attested_contracts))
             .layer(Extension(WebSocketRequest(proxy_request_sender)))
             .layer(axum::middleware::from_fn(connection_info));
         

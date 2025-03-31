@@ -205,7 +205,7 @@ async fn websocket_commands(
     Extension(auth_token): Extension<Option<AuthToken>>,
     Extension(encoding_protoc): Extension<EncodingProtocol>,
     Extension(rs): Extension<WebSocketRequest>,
-    State(attested_contracts): State<Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>>,
+    Extension(attested_contracts): Extension<Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>>,
 ) -> axum::response::Response {
     let on_upgrade = move |ws: WebSocket| async move {
         // Get the data we need and immediately drop the lock
