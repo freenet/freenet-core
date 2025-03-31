@@ -21,8 +21,8 @@ impl HttpGateway {
             .route("/v1", get(home))
             .route("/v1/contract/web/:key/", get(web_home))
             .with_state(config)
-            .with_state(attested_contracts.clone())
             .route("/v1/contract/web/:key/*path", get(web_subpages))
+            .layer(Extension(attested_contracts.clone()))
             .layer(Extension(HttpGatewayRequest(proxy_request_sender)));
 
         (
@@ -39,6 +39,7 @@ impl HttpGateway {
 async fn web_home(
     Path(key): Path<String>,
     Extension(rs): Extension<HttpGatewayRequest>,
+    Extension(attested_contracts): Extension<Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>>,
     axum::extract::State(config): axum::extract::State<Config>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     use headers::{Header, HeaderMapExt};
