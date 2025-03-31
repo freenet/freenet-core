@@ -66,7 +66,7 @@ setup: build-freenet create-dirs generate-keys
 
 build-freenet:
 	@echo "→ Building Freenet..."
-	@cargo install --path $(FREENET_CORE_PATH) --features "local-simulation"
+	@cargo install --path $(FREENET_CORE_PATH)
 
 create-dirs:
 	@echo "→ Creating directories..."
@@ -106,7 +106,7 @@ start-gateways: generate-gw-config
 			--ws-api-port $$ws_port \
 			--public-network-address 127.0.0.1 \
 			--public-network-port $$port \
-			--db-dir $(BASE_DIR)/gw$$i \
+			--data-dir $(BASE_DIR)/gw$$i \
 			--transport-keypair $(KEYS_DIR)/gw$${i}_private_key.pem \
 			--network-port $$port $(call LOG_CMD,$(LOGS_DIR)/gw$$i.log)) & \
 		echo $$! > $(PID_DIR)/gw$$i.pid; \
@@ -127,7 +127,7 @@ start-nodes:
 			--config-dir $(BASE_DIR) \
 			--ws-api-port $$ws_port \
 			--public-network-port $$public_port \
-			--db-dir $(BASE_DIR)/n$$i \
+			--data-dir $(BASE_DIR)/n$$i \
 			--network-port $$network_port \
 			$(call LOG_CMD,$(LOGS_DIR)/n$$i.log)) & \
 		echo $$! > $(PID_DIR)/n$$i.pid; \
