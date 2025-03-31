@@ -76,7 +76,7 @@ async fn web_home(
         Some(id) => *id,
         None => {
             tracing::warn!("No ContractInstanceId found in response");
-            ContractInstanceId::default()
+            ContractInstanceId::default() // Are you sure it should just create a default here? AI!
         }
     };
     
