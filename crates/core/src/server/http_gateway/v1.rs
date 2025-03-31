@@ -69,16 +69,7 @@ async fn web_home(
         .build();
 
     let token_header = headers::Authorization::bearer(token.as_str()).unwrap();
-    let contract_response = path_handlers::contract_home(key, rs, token.clone()).await?;
-    
-    // Extract the ContractInstanceId from the response
-    let contract_idx = match contract_response.extensions().get::<ContractInstanceId>() {
-        Some(id) => *id,
-        None => {
-            tracing::warn!("No ContractInstanceId found in response");
-            ContractInstanceId::default() // Are you sure it should just create a default here? AI!
-        }
-    };
+    let contract_idx = path_handlers::contract_home(key, rs, token.clone()).await?;
     
     // Store the token in the attested_contracts map
     if let Ok(mut guard) = attested_contracts.write() {
