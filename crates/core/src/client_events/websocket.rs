@@ -4,7 +4,7 @@ use std::{
 
 use axum::{
     extract::{
-        ws::{Message, WebSocket}, Query, State, WebSocketUpgrade
+        ws::{Message, WebSocket}, Query, WebSocketUpgrade
     },
     http::StatusCode,
     response::{IntoResponse, Response},
