@@ -246,8 +246,7 @@ async fn websocket_interface(
     encoding_protoc: EncodingProtocol,
     ws: WebSocket,
 ) -> anyhow::Result<()> {
-    let stack_trace = Backtrace::capture(); // TODO: remove this
-    tracing::debug!(?stack_trace, ?auth_token, "websocket_interface called, calling new_client_connection");
+    tracing::debug!(?auth_token, "websocket_interface called, calling new_client_connection");
     let (mut response_rx, client_id) = new_client_connection(&request_sender, auth_token.clone()).await?;
     let (mut server_sink, mut client_stream) = ws.split();
     let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::UnboundedReceiver<HostResult>)>>> =
@@ -356,8 +355,7 @@ async fn new_client_connection(
     assigned_token: Option<(AuthToken, ContractInstanceId)>,
 ) -> Result<(mpsc::UnboundedReceiver<HostCallbackResult>, ClientId), ClientError> {
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
-    let stack_trace = Backtrace::capture(); // TODO: remove this
-    tracing::debug!(?stack_trace, ?assigned_token, "sending new client connection request");
+    tracing::debug!(?assigned_token, "sending new client connection request");
     request_sender
         .send(ClientConnection::NewConnection {
             callbacks: response_sender,
