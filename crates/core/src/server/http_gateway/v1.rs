@@ -15,17 +15,20 @@ impl HttpGateway {
 
         let config = Config { localhost };
 
+        let attested_contracts = Arc::new(RwLock::new(HashMap::new()));
+
         let router = Router::new()
             .route("/v1", get(home))
             .route("/v1/contract/web/:key/", get(web_home))
             .with_state(config)
+            .with_state(attested_contracts.clone())
             .route("/v1/contract/web/:key/*path", get(web_subpages))
             .layer(Extension(HttpGatewayRequest(proxy_request_sender)));
 
         (
             Self {
                 proxy_server_request: request_to_server,
-                attested_contracts: HashMap::new(),
+                attested_contracts: attested_contracts.clone(),
                 response_channels: HashMap::new(),
             },
             router,

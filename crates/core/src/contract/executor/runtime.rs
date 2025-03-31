@@ -1,3 +1,5 @@
+use std::backtrace::Backtrace;
+
 use super::*;
 use super::{
     ContractExecutor, ContractRequest, ContractResponse, ExecutorError, ExecutorHalve,
@@ -354,8 +356,17 @@ impl Executor<Runtime> {
     pub fn delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
-        attestaded_contract: Option<&ContractInstanceId>,
+        attested_contract: Option<&ContractInstanceId>,
     ) -> Response {
+        let request_type = match req {
+            DelegateRequest::RegisterDelegate { .. } => "RegisterDelegate",
+            DelegateRequest::UnregisterDelegate { .. } => "UnregisterDelegate",
+            DelegateRequest::GetSecretRequest { .. } => "GetSecretRequest",
+            DelegateRequest::ApplicationMessages { .. } => "ApplicationMessages",
+            _ => "Unknown",
+        };
+        let stack_trace = Backtrace::capture();
+        tracing::debug!(?request_type, ?attested_contract, ?stack_trace, "DelegateRequest received");
         match req {
             DelegateRequest::RegisterDelegate {
                 delegate,
@@ -368,7 +379,7 @@ impl Executor<Runtime> {
                 let cipher = XChaCha20Poly1305::new(arr);
                 let nonce = GenericArray::from_slice(&nonce).to_owned();
                 tracing::debug!("registering delegate `{key}");
-                if let Some(contract) = attestaded_contract {
+                if let Some(contract) = attested_contract {
                     self.delegate_attested_ids
                         .entry(key.clone())
                         .or_default()
@@ -400,7 +411,7 @@ impl Executor<Runtime> {
                 params,
                 get_request,
             } => {
-                let attested = attestaded_contract.and_then(|contract| {
+                let attested = attested_contract.and_then(|contract| {
                     self.delegate_attested_ids
                         .get(&key)
                         .and_then(|contracts| contracts.iter().find(|c| *c == contract))
@@ -423,7 +434,7 @@ impl Executor<Runtime> {
                 inbound,
                 params,
             } => {
-                let attested = attestaded_contract.and_then(|contract| {
+                let attested = attested_contract.and_then(|contract| {
                     self.delegate_attested_ids
                         .get(&key)
                         .and_then(|contracts| contracts.iter().find(|c| *c == contract))

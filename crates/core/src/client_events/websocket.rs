@@ -1,13 +1,10 @@
 use std::{
-    collections::{HashMap, VecDeque},
-    sync::{Arc, OnceLock},
-    time::Duration,
+    backtrace::Backtrace, collections::{HashMap, VecDeque}, sync::{Arc, OnceLock, RwLock}, time::Duration
 };
 
 use axum::{
     extract::{
-        ws::{Message, WebSocket},
-        Query, WebSocketUpgrade,
+        ws::{Message, WebSocket}, Query, State, WebSocketUpgrade
     },
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -181,7 +178,7 @@ async fn connection_info(
 
     let auth_token = match req.headers().typed_try_get::<Authorization<Bearer>>() {
         Ok(Some(value)) => Some(AuthToken::from(value.token().to_owned())),
-        Ok(None) => auth_token_q,
+        Ok(None) => auth_token_q.clone(),
         Err(_error) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -195,8 +192,7 @@ async fn connection_info(
     };
 
     tracing::debug!(
-        "establishing connection with encoding protocol: {encoding_protoc}, authenticated: {auth}",
-        auth = auth_token.is_some()
+        ?auth_token_q, ?auth_token, request_uri = ?req.uri(), "connection_info middleware extracting auth token and encoding protocol",
     );
     req.extensions_mut().insert(encoding_protoc);
     req.extensions_mut().insert(auth_token);
@@ -209,23 +205,37 @@ async fn websocket_commands(
     Extension(auth_token): Extension<Option<AuthToken>>,
     Extension(encoding_protoc): Extension<EncodingProtocol>,
     Extension(rs): Extension<WebSocketRequest>,
+    State(attested_contracts): State<Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>>,
 ) -> axum::response::Response {
     let on_upgrade = move |ws: WebSocket| async move {
+        // Get the data we need and immediately drop the lock
+        let auth_and_instance = {
+            let attested_contracts = attested_contracts.read().unwrap();
+            auth_token.as_ref().and_then(|token| {
+                attested_contracts
+                    .get(token)
+                    .map(|(cid, _)| (token.clone(), *cid))
+            })
+        }; // RwLockReadGuard is dropped here
+        
         tracing::debug!(protoc = ?ws.protocol(), "websocket connection established");
-        if let Err(error) = websocket_interface(rs.clone(), auth_token, encoding_protoc, ws).await {
+        if let Err(error) = websocket_interface(rs.clone(), auth_and_instance, encoding_protoc, ws).await {
             tracing::error!("{error}");
         }
     };
+
     ws.on_upgrade(on_upgrade)
 }
 
 async fn websocket_interface(
     request_sender: WebSocketRequest,
-    mut auth_token: Option<AuthToken>,
+    mut auth_token: Option<(AuthToken, ContractInstanceId)>,
     encoding_protoc: EncodingProtocol,
     ws: WebSocket,
 ) -> anyhow::Result<()> {
-    let (mut response_rx, client_id) = new_client_connection(&request_sender).await?;
+    let stack_trace = Backtrace::capture(); // TODO: remove this
+    tracing::debug!(?stack_trace, ?auth_token, "websocket_interface called, calling new_client_connection");
+    let (mut response_rx, client_id) = new_client_connection(&request_sender, auth_token.clone()).await?;
     let (mut server_sink, mut client_stream) = ws.split();
     let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::UnboundedReceiver<HostResult>)>>> =
         Arc::new(Mutex::new(VecDeque::new()));
@@ -273,7 +283,7 @@ async fn websocket_interface(
                 client_id,
                 next_msg,
                 &request_sender,
-                &mut auth_token,
+                &mut auth_token.as_mut().map(|t| t.0.clone()),
                 encoding_protoc,
             )
             .await
@@ -330,12 +340,15 @@ async fn websocket_interface(
 
 async fn new_client_connection(
     request_sender: &WebSocketRequest,
+    assigned_token: Option<(AuthToken, ContractInstanceId)>,
 ) -> Result<(mpsc::UnboundedReceiver<HostCallbackResult>, ClientId), ClientError> {
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
+    let stack_trace = Backtrace::capture(); // TODO: remove this
+    tracing::debug!(?stack_trace, ?assigned_token, "sending new client connection request");
     request_sender
         .send(ClientConnection::NewConnection {
             callbacks: response_sender,
-            assigned_token: None,
+            assigned_token: assigned_token,
         })
         .await
         .map_err(|_| ErrorKind::NodeUnavailable)?;
