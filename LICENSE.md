@@ -1,6 +1,6 @@
 **Note:** While `freenet-core` is licensed under the GNU Affero General 
 Public License (AGPL), this does *not* mean that all software built on 
-Freenet must also be [AGPL-licensed.
+Freenet must also be AGPL-licensed.
 
 Applications that *use* Freenet—such as apps published to the network or
 clients that connect to it—are typically built against `freenet-stdlib`, 
