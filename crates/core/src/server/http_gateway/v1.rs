@@ -47,9 +47,6 @@ impl HttpGateway {
 async fn web_home(
     Path(key): Path<String>,
     Extension(rs): Extension<HttpGatewayRequest>,
-    Extension(attested_contracts): Extension<
-        Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>,
-    >,
     axum::extract::State(config): axum::extract::State<Config>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     use headers::{Header, HeaderMapExt};

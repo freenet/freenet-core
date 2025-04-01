@@ -1,5 +1,4 @@
 use std::{
-    backtrace::Backtrace,
     collections::{HashMap, VecDeque},
     sync::{Arc, OnceLock, RwLock},
     time::Duration,
@@ -378,7 +377,7 @@ async fn new_client_connection(
     request_sender
         .send(ClientConnection::NewConnection {
             callbacks: response_sender,
-            assigned_token: assigned_token,
+            assigned_token,
         })
         .await
         .map_err(|_| ErrorKind::NodeUnavailable)?;
