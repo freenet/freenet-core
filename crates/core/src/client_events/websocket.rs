@@ -30,6 +30,7 @@ use crate::{
 };
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
+use crate::server::http_gateway::AttestedContractMap;
 
 mod v1;
 
@@ -62,7 +63,7 @@ impl WebSocketProxy {
 
     pub fn as_router_with_attested_contracts(
         server_routing: Router,
-        attested_contracts: Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>,
+        attested_contracts: AttestedContractMap,
     ) -> (Self, Router) {
         WebSocketProxy::as_router_v1_with_attested_contracts(server_routing, attested_contracts)
     }
@@ -220,7 +221,7 @@ async fn websocket_commands(
     Extension(encoding_protoc): Extension<EncodingProtocol>,
     Extension(rs): Extension<WebSocketRequest>,
     Extension(attested_contracts): Extension<
-        Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>,
+        AttestedContractMap,
     >,
 ) -> axum::response::Response {
     let on_upgrade = move |ws: WebSocket| async move {

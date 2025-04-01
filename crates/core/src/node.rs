@@ -914,7 +914,7 @@ pub async fn run_local_node(
                     gw.attested_contracts
                         .read()
                         .ok()
-                        .and_then(|guard| guard.get(&token).map(|(t, _)| t.clone()))
+                        .and_then(|guard| guard.get(&token).map(|(t, _)| *t))
                 });
                 tracing::debug!(
                     ?attested_contract,

@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::server::http_gateway::AttestedContractMap;
+
 impl WebSocketProxy {
     pub fn as_router_v1(server_routing: Router) -> (Self, Router) {
         let attested_contracts = Arc::new(RwLock::new(HashMap::<
@@ -11,7 +13,7 @@ impl WebSocketProxy {
 
     pub fn as_router_v1_with_attested_contracts(
         server_routing: Router,
-        attested_contracts: Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>,
+        attested_contracts: AttestedContractMap,
     ) -> (Self, Router) {
         let (proxy_request_sender, proxy_server_request) = mpsc::channel(PARALLELISM);
 

@@ -30,6 +30,8 @@ impl std::ops::Deref for HttpGatewayRequest {
     }
 }
 
+pub type AttestedContractMap = Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>;
+
 /// A gateway to access and interact with contracts through an HTTP interface.
 ///
 /// Contracts initially accessed through the gateway have to be compliant with the container contract
@@ -37,7 +39,7 @@ impl std::ops::Deref for HttpGatewayRequest {
 ///
 /// Check the Locutus book for [more information](https://docs.freenet.org/dev-guide.html).
 pub(crate) struct HttpGateway {
-    pub attested_contracts: Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>,
+    pub attested_contracts: AttestedContractMap,
     proxy_server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
 }
@@ -52,7 +54,7 @@ impl HttpGateway {
     /// Returns the uninitialized axum router with a provided attested_contracts map.
     pub fn as_router_with_attested_contracts(
         socket: &SocketAddr,
-        attested_contracts: Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>,
+        attested_contracts: AttestedContractMap,
     ) -> (Self, Router) {
         Self::as_router_v1_with_attested_contracts(socket, attested_contracts)
     }

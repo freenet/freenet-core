@@ -1,6 +1,6 @@
 pub(crate) mod app_packaging;
 pub(crate) mod errors;
-mod http_gateway;
+pub(crate) mod http_gateway;
 pub(crate) mod path_handlers;
 
 use std::collections::HashMap;

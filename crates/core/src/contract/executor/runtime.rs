@@ -1,5 +1,3 @@
-use std::backtrace::Backtrace;
-
 use super::*;
 use super::{
     ContractExecutor, ContractRequest, ContractResponse, ExecutorError, ExecutorHalve,

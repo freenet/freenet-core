@@ -1,5 +1,4 @@
 use super::*;
-use freenet_stdlib::prelude::ContractInstanceId;
 
 impl HttpGateway {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
@@ -11,7 +10,7 @@ impl HttpGateway {
     /// Returns the uninitialized axum router with a provided attested_contracts map.
     pub fn as_router_v1_with_attested_contracts(
         socket: &SocketAddr,
-        attested_contracts: Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>,
+        attested_contracts: AttestedContractMap,
     ) -> (Self, Router) {
         let localhost = match socket.ip() {
             IpAddr::V4(ip) if ip.is_loopback() => true,
