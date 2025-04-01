@@ -1,3 +1,26 @@
+**Note:** While `freenet-core` is licensed under the GNU Affero General 
+Public License (AGPL), this does *not* mean that all software built on 
+Freenet must also be AGPL-licensed.
+
+Applications that *use* Freenet—such as apps published to the network or
+clients that connect to it—are typically built against `freenet-stdlib`, 
+which is licensed under the more permissive LGPL. This means your app 
+can be licensed however you choose, including under a permissive or 
+proprietary license, as long as it only links against `freenet-stdlib`.
+
+The AGPL applies if you modify and deploy a custom version of 
+`freenet-core` itself. For example, if a company created a fork of 
+`freenet-core` and used it to run a modified Freenet node in production, 
+they would be required to publish their changes to the core under the 
+same license.
+
+This licensing structure is designed to ensure that improvements to the 
+Freenet core are shared with the community, while giving developers 
+freedom and flexibility when building on top of it.
+
+If your organization has concerns about the AGPL or would like to discuss
+alternative licensing terms, feel free to reach out to us.
+
 # GNU AFFERO GENERAL PUBLIC LICENSE
 
 Version 3, 19 November 2007
