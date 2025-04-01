@@ -21,6 +21,7 @@ use crate::{
 };
 
 pub use app_packaging::WebApp;
+use crate::server::http_gateway::AttestedContractMap;
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -198,9 +199,8 @@ pub(crate) async fn serve_gateway_in(config: WebsocketApiConfig) -> (HttpGateway
     let ws_socket = (config.address, config.port).into();
 
     // Create a shared attested_contracts map
-    let attested_contracts = Arc::new(RwLock::new(HashMap::<
-        AuthToken,
-        (ContractInstanceId, ClientId),
+    let attested_contracts : AttestedContractMap = Arc::new(RwLock::new(HashMap::<
+        AuthToken, (ContractInstanceId, ClientId),
     >::new()));
 
     // Pass the shared map to both HttpGateway and WebSocketProxy

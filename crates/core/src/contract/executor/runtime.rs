@@ -356,18 +356,6 @@ impl Executor<Runtime> {
         req: DelegateRequest<'_>,
         attested_contract: Option<&ContractInstanceId>,
     ) -> Response {
-        let request_type = match req {
-            DelegateRequest::RegisterDelegate { .. } => "RegisterDelegate",
-            DelegateRequest::UnregisterDelegate { .. } => "UnregisterDelegate",
-            DelegateRequest::GetSecretRequest { .. } => "GetSecretRequest",
-            DelegateRequest::ApplicationMessages { .. } => "ApplicationMessages",
-            _ => "Unknown",
-        };
-        tracing::debug!(
-            ?request_type,
-            ?attested_contract,
-            "DelegateRequest received"
-        );
         match req {
             DelegateRequest::RegisterDelegate {
                 delegate,
@@ -379,7 +367,6 @@ impl Executor<Runtime> {
                 let arr = GenericArray::from_slice(&cipher);
                 let cipher = XChaCha20Poly1305::new(arr);
                 let nonce = GenericArray::from_slice(&nonce).to_owned();
-                tracing::debug!("registering delegate `{key}");
                 if let Some(contract) = attested_contract {
                     self.delegate_attested_ids
                         .entry(key.clone())
@@ -392,7 +379,7 @@ impl Executor<Runtime> {
                         values: Vec::new(),
                     }),
                     Err(err) => {
-                        tracing::error!("failed registering delegate `{key}`: {err}");
+                        tracing::warn!("failed registering delegate `{key}`: {err}");
                         Err(ExecutorError::other(StdDelegateError::RegisterError(key)))
                     }
                 }
@@ -402,7 +389,7 @@ impl Executor<Runtime> {
                 match self.runtime.unregister_delegate(&key) {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {
-                        tracing::error!("failed unregistering delegate `{key}`: {err}");
+                        tracing::warn!("failed unregistering delegate `{key}`: {err}");
                         Ok(HostResponse::Ok)
                     }
                 }
@@ -423,7 +410,7 @@ impl Executor<Runtime> {
                     attested.map(|c| c.as_bytes()),
                     vec![InboundDelegateMsg::GetSecretRequest(get_request)],
                 ) {
-                    Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
+                    Ok(values) => Ok(DelegateResponse { key, values }),
                     Err(err) => Err(ExecutorError::execution(
                         err,
                         Some(InnerOpError::Delegate(key.clone())),
@@ -446,7 +433,7 @@ impl Executor<Runtime> {
                         .map(InboundDelegateMsg::into_owned)
                         .collect(),
                 ) {
-                    Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
+                    Ok(values) => Ok(DelegateResponse { key, values }),
                     Err(err) => {
                         tracing::error!("failed executing delegate `{key}`: {err}");
                         Err(ExecutorError::execution(

@@ -221,28 +221,28 @@ async fn websocket_commands(
     Extension(encoding_protoc): Extension<EncodingProtocol>,
     Extension(rs): Extension<WebSocketRequest>,
     Extension(attested_contracts): Extension<AttestedContractMap>,
-) -> axum::response::Response {
+) -> Response {
     let on_upgrade = move |ws: WebSocket| async move {
         // Get the data we need and immediately drop the lock
         let auth_and_instance = if let Some(token) = auth_token.as_ref() {
             // Debug the contents of the attested_contracts map
             let attested_contracts_read = attested_contracts.read().unwrap();
             let map_contents: Vec<_> = attested_contracts_read.keys().cloned().collect();
-            tracing::debug!(?token, "attested_contracts map keys: {:?}", map_contents);
+            tracing::trace!(?token, "attested_contracts map keys: {:?}", map_contents);
 
             if let Some((cid, _)) = attested_contracts_read.get(token) {
-                tracing::debug!(?token, ?cid, "Found token in attested_contracts map");
+                tracing::trace!(?token, ?cid, "Found token in attested_contracts map");
                 Some((token.clone(), *cid))
             } else {
                 tracing::warn!(?token, "Auth token not found in attested_contracts map");
                 None
             }
         } else {
-            tracing::debug!("No auth token provided in WebSocket request");
+            tracing::trace!("No auth token provided in WebSocket request");
             None
         }; // RwLockReadGuard is dropped here
 
-        tracing::debug!(protoc = ?ws.protocol(), ?auth_and_instance, "websocket connection established");
+        tracing::trace!(protoc = ?ws.protocol(), ?auth_and_instance, "websocket connection established");
         if let Err(error) =
             websocket_interface(rs.clone(), auth_and_instance, encoding_protoc, ws).await
         {
@@ -259,10 +259,6 @@ async fn websocket_interface(
     encoding_protoc: EncodingProtocol,
     ws: WebSocket,
 ) -> anyhow::Result<()> {
-    tracing::debug!(
-        ?auth_token,
-        "websocket_interface called, calling new_client_connection"
-    );
     let (mut response_rx, client_id) =
         new_client_connection(&request_sender, auth_token.clone()).await?;
     let (mut server_sink, mut client_stream) = ws.split();
