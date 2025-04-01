@@ -3,14 +3,6 @@ use super::*;
 use crate::server::http_gateway::AttestedContractMap;
 
 impl WebSocketProxy {
-    pub fn as_router_v1(server_routing: Router) -> (Self, Router) {
-        let attested_contracts = Arc::new(RwLock::new(HashMap::<
-            AuthToken,
-            (ContractInstanceId, ClientId),
-        >::new()));
-        Self::as_router_v1_with_attested_contracts(server_routing, attested_contracts)
-    }
-
     pub fn as_router_v1_with_attested_contracts(
         server_routing: Router,
         attested_contracts: AttestedContractMap,
