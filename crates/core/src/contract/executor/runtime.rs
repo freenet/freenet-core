@@ -365,11 +365,9 @@ impl Executor<Runtime> {
             DelegateRequest::ApplicationMessages { .. } => "ApplicationMessages",
             _ => "Unknown",
         };
-        let stack_trace = Backtrace::capture();
         tracing::debug!(
             ?request_type,
             ?attested_contract,
-            ?stack_trace,
             "DelegateRequest received"
         );
         match req {
