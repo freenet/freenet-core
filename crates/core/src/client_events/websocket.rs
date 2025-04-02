@@ -226,8 +226,12 @@ async fn websocket_commands(
         // Get the data we need and immediately drop the lock
         let auth_and_instance = if let Some(token) = auth_token.as_ref() {
             let attested_contracts_read = attested_contracts.read().unwrap();
-            let map_contents: Vec<_> = attested_contracts_read.keys().cloned().collect();
-            tracing::trace!(?token, "attested_contracts map keys: {:?}", map_contents);
+            
+            // Only collect and log map contents when trace is enabled
+            if tracing::enabled!(tracing::Level::TRACE) {
+                let map_contents: Vec<_> = attested_contracts_read.keys().cloned().collect();
+                tracing::trace!(?token, "attested_contracts map keys: {:?}", map_contents);
+            }
 
             if let Some((cid, _)) = attested_contracts_read.get(token) {
                 tracing::trace!(?token, ?cid, "Found token in attested_contracts map");
@@ -241,7 +245,12 @@ async fn websocket_commands(
             None
         }; // RwLockReadGuard is dropped here
 
-        tracing::trace!(protoc = ?ws.protocol(), ?auth_and_instance, "websocket connection established");
+        // Only evaluate auth_and_instance for trace when trace is enabled
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(protoc = ?ws.protocol(), ?auth_and_instance, "websocket connection established");
+        } else {
+            tracing::trace!(protoc = ?ws.protocol(), "websocket connection established");
+        }
         if let Err(error) =
             websocket_interface(rs.clone(), auth_and_instance, encoding_protoc, ws).await
         {
