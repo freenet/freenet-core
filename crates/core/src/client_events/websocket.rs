@@ -32,8 +32,6 @@ use crate::{
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
 use crate::server::http_gateway::AttestedContractMap;
 
-mod v1;
-
 #[derive(Clone)]
 struct WebSocketRequest(mpsc::Sender<ClientConnection>);
 
@@ -63,13 +61,6 @@ impl WebSocketProxy {
     }
 
     pub fn as_router_with_attested_contracts(
-        server_routing: Router,
-        attested_contracts: AttestedContractMap,
-    ) -> (Self, Router) {
-        WebSocketProxy::as_router_v1_with_attested_contracts(server_routing, attested_contracts)
-    }
-
-    pub fn as_router_v1_with_attested_contracts(
         server_routing: Router,
         attested_contracts: AttestedContractMap,
     ) -> (Self, Router) {
