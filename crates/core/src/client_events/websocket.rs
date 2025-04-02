@@ -225,7 +225,6 @@ async fn websocket_commands(
     let on_upgrade = move |ws: WebSocket| async move {
         // Get the data we need and immediately drop the lock
         let auth_and_instance = if let Some(token) = auth_token.as_ref() {
-            // Debug the contents of the attested_contracts map
             let attested_contracts_read = attested_contracts.read().unwrap();
             let map_contents: Vec<_> = attested_contracts_read.keys().cloned().collect();
             tracing::trace!(?token, "attested_contracts map keys: {:?}", map_contents);
