@@ -32,8 +32,6 @@ use crate::{
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
 use crate::server::http_gateway::AttestedContractMap;
 
-mod v1;
-
 #[derive(Clone)]
 struct WebSocketRequest(mpsc::Sender<ClientConnection>);
 
@@ -54,20 +52,34 @@ const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optima
 
 impl WebSocketProxy {
     pub fn as_router(server_routing: Router) -> (Self, Router) {
-        // TODO: This function should probably be merged with as_router_with_attested_contracts()
-
+        // Create a default empty attested contracts map
         let attested_contracts = Arc::new(RwLock::new(HashMap::<
             AuthToken,
             (ContractInstanceId, ClientId),
         >::new()));
-        WebSocketProxy::as_router_with_attested_contracts(server_routing, attested_contracts)
+        Self::as_router_with_attested_contracts(server_routing, attested_contracts)
     }
 
     pub fn as_router_with_attested_contracts(
         server_routing: Router,
         attested_contracts: AttestedContractMap,
     ) -> (Self, Router) {
-        WebSocketProxy::as_router_v1_with_attested_contracts(server_routing, attested_contracts)
+        let (proxy_request_sender, proxy_server_request) = mpsc::channel(PARALLELISM);
+
+        // Using Extension instead of with_state to avoid changing the Router's type parameter
+        let router = server_routing
+            .route("/v1/contract/command", get(websocket_commands))
+            .layer(Extension(attested_contracts))
+            .layer(Extension(WebSocketRequest(proxy_request_sender)))
+            .layer(axum::middleware::from_fn(connection_info));
+
+        (
+            WebSocketProxy {
+                proxy_server_request,
+                response_channels: HashMap::new(),
+            },
+            router,
+        )
     }
 
     async fn internal_proxy_recv(
