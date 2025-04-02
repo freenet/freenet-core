@@ -86,7 +86,7 @@ pub mod local_node {
             _ => {}
         }
         let (mut gw, gw_router) = HttpGateway::as_router(&socket);
-        let (mut ws_proxy, ws_router) = WebSocketProxy::as_router(gw_router);
+        let (mut ws_proxy, ws_router) = WebSocketProxy::create_router(gw_router);
 
         serve(socket, ws_router.layer(TraceLayer::new_for_http()));
 
@@ -208,7 +208,7 @@ pub(crate) async fn serve_gateway_in(config: WebsocketApiConfig) -> (HttpGateway
     let (gw, gw_router) =
         HttpGateway::as_router_with_attested_contracts(&ws_socket, attested_contracts.clone());
     let (ws_proxy, ws_router) =
-        WebSocketProxy::as_router_with_attested_contracts(gw_router, attested_contracts);
+        WebSocketProxy::create_router_with_attested_contracts(gw_router, attested_contracts);
 
     serve(ws_socket, ws_router.layer(TraceLayer::new_for_http()));
     (gw, ws_proxy)

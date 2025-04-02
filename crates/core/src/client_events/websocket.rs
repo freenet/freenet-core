@@ -51,16 +51,16 @@ pub(crate) struct WebSocketProxy {
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
 
 impl WebSocketProxy {
-    pub fn as_router(server_routing: Router) -> (Self, Router) {
+    pub fn create_router(server_routing: Router) -> (Self, Router) {
         // Create a default empty attested contracts map
         let attested_contracts = Arc::new(RwLock::new(HashMap::<
             AuthToken,
             (ContractInstanceId, ClientId),
         >::new()));
-        Self::as_router_with_attested_contracts(server_routing, attested_contracts)
+        Self::create_router_with_attested_contracts(server_routing, attested_contracts)
     }
 
-    pub fn as_router_with_attested_contracts(
+    pub fn create_router_with_attested_contracts(
         server_routing: Router,
         attested_contracts: AttestedContractMap,
     ) -> (Self, Router) {
