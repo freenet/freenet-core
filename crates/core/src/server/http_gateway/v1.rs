@@ -2,7 +2,7 @@ use super::*;
 
 impl HttpGateway {
     /// Returns the uninitialized axum router with a provided attested_contracts map.
-    pub fn as_router_v1_with_attested_contracts(
+    pub fn create_router_v1_with_attested_contracts(
         socket: &SocketAddr,
         attested_contracts: AttestedContractMap,
     ) -> (Self, Router) {
@@ -63,8 +63,8 @@ async fn web_home(
     let token_header = headers::Authorization::bearer(token.as_str()).unwrap();
     let contract_response = path_handlers::contract_home(key, rs, token.clone()).await?;
 
-    // Note: We can't store the token in attested_contracts here because we don't have the ContractInstanceId
-    // This will typically be stored when the websocket connection is established.
+    // FIXME: We may be able to store the token in attested_contracts here if we can get the ContractInstanceId
+    // from the `key` but leaving it for now based on "if it ain't broke, don't fix it" principle.
 
     let mut response = contract_response.into_response();
     response.headers_mut().typed_insert(token_header);

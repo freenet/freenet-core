@@ -56,7 +56,7 @@ impl HttpGateway {
         socket: &SocketAddr,
         attested_contracts: AttestedContractMap,
     ) -> (Self, Router) {
-        Self::as_router_v1_with_attested_contracts(socket, attested_contracts)
+        Self::create_router_v1_with_attested_contracts(socket, attested_contracts)
     }
 }
 

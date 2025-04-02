@@ -240,7 +240,7 @@ async fn websocket_commands(
         // Get the data we need and immediately drop the lock
         let auth_and_instance = if let Some(token) = auth_token.as_ref() {
             let attested_contracts_read = attested_contracts.read().unwrap();
-            
+
             // Only collect and log map contents when trace is enabled
             if tracing::enabled!(tracing::Level::TRACE) {
                 let map_contents: Vec<_> = attested_contracts_read.keys().cloned().collect();
