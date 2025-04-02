@@ -354,7 +354,7 @@ impl Executor<Runtime> {
     pub fn delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
-        attestaded_contract: Option<&ContractInstanceId>,
+        attested_contract: Option<&ContractInstanceId>,
     ) -> Response {
         match req {
             DelegateRequest::RegisterDelegate {
@@ -367,8 +367,7 @@ impl Executor<Runtime> {
                 let arr = GenericArray::from_slice(&cipher);
                 let cipher = XChaCha20Poly1305::new(arr);
                 let nonce = GenericArray::from_slice(&nonce).to_owned();
-                tracing::debug!("registering delegate `{key}");
-                if let Some(contract) = attestaded_contract {
+                if let Some(contract) = attested_contract {
                     self.delegate_attested_ids
                         .entry(key.clone())
                         .or_default()
@@ -380,7 +379,7 @@ impl Executor<Runtime> {
                         values: Vec::new(),
                     }),
                     Err(err) => {
-                        tracing::error!("failed registering delegate `{key}`: {err}");
+                        tracing::warn!("failed registering delegate `{key}`: {err}");
                         Err(ExecutorError::other(StdDelegateError::RegisterError(key)))
                     }
                 }
@@ -390,7 +389,7 @@ impl Executor<Runtime> {
                 match self.runtime.unregister_delegate(&key) {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {
-                        tracing::error!("failed unregistering delegate `{key}`: {err}");
+                        tracing::warn!("failed unregistering delegate `{key}`: {err}");
                         Ok(HostResponse::Ok)
                     }
                 }
@@ -400,7 +399,7 @@ impl Executor<Runtime> {
                 params,
                 get_request,
             } => {
-                let attested = attestaded_contract.and_then(|contract| {
+                let attested = attested_contract.and_then(|contract| {
                     self.delegate_attested_ids
                         .get(&key)
                         .and_then(|contracts| contracts.iter().find(|c| *c == contract))
@@ -411,7 +410,7 @@ impl Executor<Runtime> {
                     attested.map(|c| c.as_bytes()),
                     vec![InboundDelegateMsg::GetSecretRequest(get_request)],
                 ) {
-                    Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
+                    Ok(values) => Ok(DelegateResponse { key, values }),
                     Err(err) => Err(ExecutorError::execution(
                         err,
                         Some(InnerOpError::Delegate(key.clone())),
@@ -423,21 +422,18 @@ impl Executor<Runtime> {
                 inbound,
                 params,
             } => {
-                let attested = attestaded_contract.and_then(|contract| {
-                    self.delegate_attested_ids
-                        .get(&key)
-                        .and_then(|contracts| contracts.iter().find(|c| *c == contract))
-                });
+                // Use the attested_contract directly instead of looking it up in delegate_attested_ids
+                let attested_bytes = attested_contract.map(|c| c.as_bytes());
                 match self.runtime.inbound_app_message(
                     &key,
                     &params,
-                    attested.map(|c| c.as_bytes()),
+                    attested_bytes,
                     inbound
                         .into_iter()
                         .map(InboundDelegateMsg::into_owned)
                         .collect(),
                 ) {
-                    Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
+                    Ok(values) => Ok(DelegateResponse { key, values }),
                     Err(err) => {
                         tracing::error!("failed executing delegate `{key}`: {err}");
                         Err(ExecutorError::execution(

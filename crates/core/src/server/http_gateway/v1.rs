@@ -1,8 +1,11 @@
 use super::*;
 
 impl HttpGateway {
-    /// Returns the uninitialized axum router to compose with other routing handling or websockets.
-    pub fn as_router_v1(socket: &SocketAddr) -> (Self, Router) {
+    /// Returns the uninitialized axum router with a provided attested_contracts map.
+    pub fn create_router_v1_with_attested_contracts(
+        socket: &SocketAddr,
+        attested_contracts: AttestedContractMap,
+    ) -> (Self, Router) {
         let localhost = match socket.ip() {
             IpAddr::V4(ip) if ip.is_loopback() => true,
             IpAddr::V6(ip) if ip.is_loopback() => true,
@@ -20,12 +23,13 @@ impl HttpGateway {
             .route("/v1/contract/web/:key/", get(web_home))
             .with_state(config)
             .route("/v1/contract/web/:key/*path", get(web_subpages))
+            .layer(Extension(attested_contracts.clone()))
             .layer(Extension(HttpGatewayRequest(proxy_request_sender)));
 
         (
             Self {
                 proxy_server_request: request_to_server,
-                attested_contracts: HashMap::new(),
+                attested_contracts: attested_contracts.clone(),
                 response_channels: HashMap::new(),
             },
             router,
@@ -57,8 +61,12 @@ async fn web_home(
         .build();
 
     let token_header = headers::Authorization::bearer(token.as_str()).unwrap();
-    let contract_idx = path_handlers::contract_home(key, rs, token).await?;
-    let mut response = contract_idx.into_response();
+    let contract_response = path_handlers::contract_home(key, rs, token.clone()).await?;
+
+    // FIXME: We may be able to store the token in attested_contracts here if we can get the ContractInstanceId
+    // from the `key` but leaving it for now based on "if it ain't broke, don't fix it" principle.
+
+    let mut response = contract_response.into_response();
     response.headers_mut().typed_insert(token_header);
     response.headers_mut().insert(
         headers::SetCookie::name(),

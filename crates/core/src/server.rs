@@ -1,9 +1,11 @@
 pub(crate) mod app_packaging;
 pub(crate) mod errors;
-mod http_gateway;
+pub(crate) mod http_gateway;
 pub(crate) mod path_handlers;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{Arc, RwLock};
 
 use freenet_stdlib::{
     client_api::{ClientError, ClientRequest, HostResponse},
@@ -18,6 +20,7 @@ use crate::{
     config::WebsocketApiConfig,
 };
 
+use crate::server::http_gateway::AttestedContractMap;
 pub use app_packaging::WebApp;
 
 #[derive(Debug)]
@@ -83,7 +86,7 @@ pub mod local_node {
             _ => {}
         }
         let (mut gw, gw_router) = HttpGateway::as_router(&socket);
-        let (mut ws_proxy, ws_router) = WebSocketProxy::as_router(gw_router);
+        let (mut ws_proxy, ws_router) = WebSocketProxy::create_router(gw_router);
 
         serve(socket, ws_router.layer(TraceLayer::new_for_http()));
 
@@ -122,21 +125,27 @@ pub mod local_node {
                         .await
                 }
                 ClientRequest::DelegateOp(op) => {
-                    let attested_contract =
-                        token.and_then(|token| gw.attested_contracts.get(&token).map(|(t, _)| t));
-                    executor.delegate_request(op, attested_contract)
+                    let attested_contract = token.and_then(|token| {
+                        gw.attested_contracts
+                            .read()
+                            .map(|guard| guard.get(&token).cloned().map(|(t, _)| t))
+                            .ok()
+                            .flatten()
+                    });
+                    executor.delegate_request(op, attested_contract.as_ref())
                 }
                 ClientRequest::Disconnect { cause } => {
                     if let Some(cause) = cause {
                         tracing::info!("disconnecting cause: {cause}");
                     }
                     // fixme: token must live for a bit to allow reconnections
-                    if let Some(rm_token) = gw
-                        .attested_contracts
-                        .iter()
-                        .find_map(|(k, (_, eid))| (eid == &id).then(|| k.clone()))
-                    {
-                        gw.attested_contracts.remove(&rm_token);
+                    if let Ok(mut guard) = gw.attested_contracts.write() {
+                        if let Some(rm_token) = guard
+                            .iter()
+                            .find_map(|(k, (_, eid))| (eid == &id).then(|| k.clone()))
+                        {
+                            guard.remove(&rm_token);
+                        }
                     }
                     continue;
                 }
@@ -188,8 +197,19 @@ pub async fn serve_gateway(config: WebsocketApiConfig) -> [BoxedClient; 2] {
 
 pub(crate) async fn serve_gateway_in(config: WebsocketApiConfig) -> (HttpGateway, WebSocketProxy) {
     let ws_socket = (config.address, config.port).into();
-    let (gw, gw_router) = HttpGateway::as_router(&ws_socket);
-    let (ws_proxy, ws_router) = WebSocketProxy::as_router(gw_router);
+
+    // Create a shared attested_contracts map
+    let attested_contracts: AttestedContractMap = Arc::new(RwLock::new(HashMap::<
+        AuthToken,
+        (ContractInstanceId, ClientId),
+    >::new()));
+
+    // Pass the shared map to both HttpGateway and WebSocketProxy
+    let (gw, gw_router) =
+        HttpGateway::as_router_with_attested_contracts(&ws_socket, attested_contracts.clone());
+    let (ws_proxy, ws_router) =
+        WebSocketProxy::create_router_with_attested_contracts(gw_router, attested_contracts);
+
     serve(ws_socket, ws_router.layer(TraceLayer::new_for_http()));
     (gw, ws_proxy)
 }

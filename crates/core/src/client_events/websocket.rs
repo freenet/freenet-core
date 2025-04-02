@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, RwLock},
     time::Duration,
 };
 
@@ -30,8 +30,7 @@ use crate::{
 };
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
-
-mod v1;
+use crate::server::http_gateway::AttestedContractMap;
 
 #[derive(Clone)]
 struct WebSocketRequest(mpsc::Sender<ClientConnection>);
@@ -52,8 +51,35 @@ pub(crate) struct WebSocketProxy {
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
 
 impl WebSocketProxy {
-    pub fn as_router(server_routing: Router) -> (Self, Router) {
-        WebSocketProxy::as_router_v1(server_routing)
+    pub fn create_router(server_routing: Router) -> (Self, Router) {
+        // Create a default empty attested contracts map
+        let attested_contracts = Arc::new(RwLock::new(HashMap::<
+            AuthToken,
+            (ContractInstanceId, ClientId),
+        >::new()));
+        Self::create_router_with_attested_contracts(server_routing, attested_contracts)
+    }
+
+    pub fn create_router_with_attested_contracts(
+        server_routing: Router,
+        attested_contracts: AttestedContractMap,
+    ) -> (Self, Router) {
+        let (proxy_request_sender, proxy_server_request) = mpsc::channel(PARALLELISM);
+
+        // Using Extension instead of with_state to avoid changing the Router's type parameter
+        let router = server_routing
+            .route("/v1/contract/command", get(websocket_commands))
+            .layer(Extension(attested_contracts))
+            .layer(Extension(WebSocketRequest(proxy_request_sender)))
+            .layer(axum::middleware::from_fn(connection_info));
+
+        (
+            WebSocketProxy {
+                proxy_server_request,
+                response_channels: HashMap::new(),
+            },
+            router,
+        )
     }
 
     async fn internal_proxy_recv(
@@ -181,7 +207,7 @@ async fn connection_info(
 
     let auth_token = match req.headers().typed_try_get::<Authorization<Bearer>>() {
         Ok(Some(value)) => Some(AuthToken::from(value.token().to_owned())),
-        Ok(None) => auth_token_q,
+        Ok(None) => auth_token_q.clone(),
         Err(_error) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -195,8 +221,7 @@ async fn connection_info(
     };
 
     tracing::debug!(
-        "establishing connection with encoding protocol: {encoding_protoc}, authenticated: {auth}",
-        auth = auth_token.is_some()
+        ?auth_token_q, ?auth_token, request_uri = ?req.uri(), "connection_info middleware extracting auth token and encoding protocol",
     );
     req.extensions_mut().insert(encoding_protoc);
     req.extensions_mut().insert(auth_token);
@@ -209,23 +234,55 @@ async fn websocket_commands(
     Extension(auth_token): Extension<Option<AuthToken>>,
     Extension(encoding_protoc): Extension<EncodingProtocol>,
     Extension(rs): Extension<WebSocketRequest>,
-) -> axum::response::Response {
+    Extension(attested_contracts): Extension<AttestedContractMap>,
+) -> Response {
     let on_upgrade = move |ws: WebSocket| async move {
-        tracing::debug!(protoc = ?ws.protocol(), "websocket connection established");
-        if let Err(error) = websocket_interface(rs.clone(), auth_token, encoding_protoc, ws).await {
+        // Get the data we need and immediately drop the lock
+        let auth_and_instance = if let Some(token) = auth_token.as_ref() {
+            let attested_contracts_read = attested_contracts.read().unwrap();
+
+            // Only collect and log map contents when trace is enabled
+            if tracing::enabled!(tracing::Level::TRACE) {
+                let map_contents: Vec<_> = attested_contracts_read.keys().cloned().collect();
+                tracing::trace!(?token, "attested_contracts map keys: {:?}", map_contents);
+            }
+
+            if let Some((cid, _)) = attested_contracts_read.get(token) {
+                tracing::trace!(?token, ?cid, "Found token in attested_contracts map");
+                Some((token.clone(), *cid))
+            } else {
+                tracing::warn!(?token, "Auth token not found in attested_contracts map");
+                None
+            }
+        } else {
+            tracing::trace!("No auth token provided in WebSocket request");
+            None
+        }; // RwLockReadGuard is dropped here
+
+        // Only evaluate auth_and_instance for trace when trace is enabled
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(protoc = ?ws.protocol(), ?auth_and_instance, "websocket connection established");
+        } else {
+            tracing::trace!(protoc = ?ws.protocol(), "websocket connection established");
+        }
+        if let Err(error) =
+            websocket_interface(rs.clone(), auth_and_instance, encoding_protoc, ws).await
+        {
             tracing::error!("{error}");
         }
     };
+
     ws.on_upgrade(on_upgrade)
 }
 
 async fn websocket_interface(
     request_sender: WebSocketRequest,
-    mut auth_token: Option<AuthToken>,
+    mut auth_token: Option<(AuthToken, ContractInstanceId)>,
     encoding_protoc: EncodingProtocol,
     ws: WebSocket,
 ) -> anyhow::Result<()> {
-    let (mut response_rx, client_id) = new_client_connection(&request_sender).await?;
+    let (mut response_rx, client_id) =
+        new_client_connection(&request_sender, auth_token.clone()).await?;
     let (mut server_sink, mut client_stream) = ws.split();
     let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::UnboundedReceiver<HostResult>)>>> =
         Arc::new(Mutex::new(VecDeque::new()));
@@ -273,7 +330,7 @@ async fn websocket_interface(
                 client_id,
                 next_msg,
                 &request_sender,
-                &mut auth_token,
+                &mut auth_token.as_mut().map(|t| t.0.clone()),
                 encoding_protoc,
             )
             .await
@@ -330,12 +387,14 @@ async fn websocket_interface(
 
 async fn new_client_connection(
     request_sender: &WebSocketRequest,
+    assigned_token: Option<(AuthToken, ContractInstanceId)>,
 ) -> Result<(mpsc::UnboundedReceiver<HostCallbackResult>, ClientId), ClientError> {
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
+    tracing::debug!(?assigned_token, "sending new client connection request");
     request_sender
         .send(ClientConnection::NewConnection {
             callbacks: response_sender,
-            assigned_token: None,
+            assigned_token,
         })
         .await
         .map_err(|_| ErrorKind::NodeUnavailable)?;

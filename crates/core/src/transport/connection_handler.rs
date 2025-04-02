@@ -675,7 +675,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
             while failures < NAT_TRAVERSAL_MAX_ATTEMPTS {
                 match state {
-                    ConnectionState::StartOutbound { .. } => {
+                    ConnectionState::StartOutbound => {
                         tracing::debug!(%remote_addr, "sending protocol version and inbound key");
                         outbound_packets
                             .send((remote_addr, outbound_intro_packet.data().into()))
@@ -704,7 +704,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     Ok(Some(packet)) => {
                         tracing::debug!(%remote_addr, "received packet after sending it");
                         match state {
-                            ConnectionState::StartOutbound { .. } => {
+                            ConnectionState::StartOutbound => {
                                 // at this point it's either the remote sending us an intro packet or a symmetric packet
                                 // cause is the first packet that passes through the NAT
                                 tracing::debug!(%remote_addr, "received packet from remote: {:?}", packet.data());
