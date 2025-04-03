@@ -1,18 +1,128 @@
 use super::*;
 use super::{
-    ContractExecutor, ContractRequest, ContractResponse, ExecutorError, ExecutorHalve,
-    ExecutorToEventLoopChannel, RequestError, Response, StateStoreError,
+    ContractExecutor, ContractRequest, ContractResponse, ExecutorError, RequestError, Response,
+    StateStoreError,
 };
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
-impl ContractExecutor for Executor<Runtime> {
+/// Trait for executors that can identify themselves
+pub trait ExecutorWithId: Send + 'static {
+    fn id(&self) -> usize;
+}
+
+impl<T: Send + Sync + 'static> ExecutorWithId for Executor<T> {
+    fn id(&self) -> usize {
+        self.id
+    }
+}
+
+pub(super) struct PendingRegistration {
+    key: ContractKey,
+    cli_id: ClientId,
+    notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
+    summary: Option<StateSummary<'static>>,
+}
+
+pub(crate) struct RuntimePool<C = Arc<Config>, R = Runtime> {
+    // Keeping track of available executors
+    pub runtimes: Vec<Option<Executor<R>>>,
+    // Semaphore to control access to executors
+    pub available: Semaphore,
+    pub config: C,
+    pub op_sender: mpsc::Sender<(
+        Transaction,
+        tokio::sync::oneshot::Sender<Result<OpEnum, CallbackError>>,
+    )>,
+    pub op_manager: Arc<OpManager>,
+    // Track pending registrations by executor index
+    pub(super) pending_registrations: HashMap<usize, Vec<PendingRegistration>>,
+    // Next executor ID to assign
+    pub next_executor_id: usize,
+}
+
+impl RuntimePool<Arc<Config>, Runtime> {
+    /// Create a new pool with the given number of runtime executors
+    pub async fn new(
+        config: Arc<Config>,
+        op_sender: mpsc::Sender<(
+            Transaction,
+            tokio::sync::oneshot::Sender<Result<OpEnum, CallbackError>>,
+        )>,
+        op_manager: Arc<OpManager>,
+        pool_size: NonZeroUsize,
+    ) -> anyhow::Result<Self> {
+        let mut runtimes = Vec::with_capacity(pool_size.into());
+        let mut next_id = 0;
+
+        for _ in 0..pool_size.into() {
+            let mut executor = Executor::from_config(
+                config.clone(),
+                Some(op_sender.clone()),
+                Some(op_manager.clone()),
+            )
+            .await?;
+
+            // Assign an ID to the executor
+            executor.id = next_id;
+            next_id += 1;
+
+            runtimes.push(Some(executor));
+        }
+
+        Ok(Self {
+            runtimes,
+            available: Semaphore::new(pool_size.into()),
+            config,
+            op_sender,
+            op_manager,
+            pending_registrations: HashMap::new(),
+            next_executor_id: next_id,
+        })
+    }
+
+    // Pop an executor from the pool - blocks until one is available
+    async fn pop_executor(&mut self) -> Executor<Runtime> {
+        // Wait for an available permit
+        let _ = self.available.acquire().await.expect("Semaphore is closed");
+
+        // Find the first available executor
+        for slot in &mut self.runtimes {
+            if let Some(executor) = slot.take() {
+                let id = executor.id();
+                // Ensure there's an entry in pending_registrations for this executor
+                // This will track any registrations that happen while it's out of the pool
+                let existing = self.pending_registrations.insert(id, Vec::new());
+                assert!(
+                    existing.is_none(),
+                    "Executor ID already exists in pending registrations"
+                );
+                return executor;
+            }
+        }
+
+        // This should never happen because of the semaphore
+        unreachable!("No executors available despite semaphore permit")
+    }
+}
+
+impl ContractExecutor for RuntimePool<Arc<Config>, Runtime> {
+    type InnerExecutor = Executor<Runtime>;
+
     async fn fetch_contract(
         &mut self,
         key: ContractKey,
         return_contract_code: bool,
-    ) -> Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError> {
-        match self.perform_contract_get(return_contract_code, key).await {
-            Ok((state, code)) => Ok((state, code)),
-            Err(err) => Err(err),
+    ) -> impl Future<Output = (Self::InnerExecutor, FetchContractR)> + Send + 'static {
+        let mut executor = self.pop_executor().await;
+
+        async move {
+            let result = executor
+                .perform_contract_get(return_contract_code, key)
+                .await;
+            (executor, result)
         }
     }
 
@@ -22,136 +132,13 @@ impl ContractExecutor for Executor<Runtime> {
         update: Either<WrappedState, StateDelta<'static>>,
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
-    ) -> Result<UpsertResult, ExecutorError> {
-        let params = if let Some(code) = &code {
-            code.params()
-        } else {
-            self.state_store
-                .get_params(&key)
-                .await
-                .map_err(ExecutorError::other)?
-                .ok_or_else(|| {
-                    ExecutorError::request(StdContractError::Put {
-                        key,
-                        cause: "missing contract parameters".into(),
-                    })
-                })?
-        };
-
-        let remove_if_fail = if self
-            .runtime
-            .contract_store
-            .fetch_contract(&key, &params)
-            .is_none()
-        {
-            let code = code.ok_or_else(|| {
-                ExecutorError::request(StdContractError::MissingContract { key: key.into() })
-            })?;
-            self.runtime
-                .contract_store
-                .store_contract(code.clone())
-                .map_err(ExecutorError::other)?;
-            true
-        } else {
-            false
-        };
-
-        let mut updates = match update {
-            Either::Left(incoming_state) => {
-                let result = self
-                    .runtime
-                    .validate_state(&key, &params, &incoming_state, &related_contracts)
-                    .map_err(|err| {
-                        if remove_if_fail {
-                            let _ = self.runtime.contract_store.remove_contract(&key);
-                        }
-                        ExecutorError::execution(err, None)
-                    })?;
-                match result {
-                    ValidateResult::Valid => {
-                        self.state_store
-                            .store(key, incoming_state.clone(), params.clone())
-                            .await
-                            .map_err(ExecutorError::other)?;
-                    }
-                    ValidateResult::Invalid => {
-                        return Err(ExecutorError::request(StdContractError::invalid_put(key)));
-                    }
-                    ValidateResult::RequestRelated(mut related) => {
-                        if let Some(key) = related.pop() {
-                            return Err(ExecutorError::request(StdContractError::MissingRelated {
-                                key,
-                            }));
-                        } else {
-                            return Err(ExecutorError::internal_error());
-                        }
-                    }
-                }
-
-                vec![UpdateData::State(incoming_state.clone().into())]
-            }
-            Either::Right(delta) => {
-                // todo: forward delta like we are doing with puts
-                tracing::warn!("Delta updates are not yet supported");
-                vec![UpdateData::Delta(delta)]
-            }
-        };
-
-        let current_state = match self.state_store.get(&key).await {
-            Ok(s) => s,
-            Err(StateStoreError::MissingContract(_)) => {
-                tracing::warn!("Missing contract {key} for upsert");
-                return Err(ExecutorError::request(StdContractError::MissingContract {
-                    key: key.into(),
-                }));
-            }
-            Err(StateStoreError::Any(err)) => return Err(ExecutorError::other(err)),
-        };
-
-        for (id, state) in related_contracts
-            .states()
-            .filter_map(|(id, c)| c.as_ref().map(|c| (id, c)))
-        {
-            updates.push(UpdateData::RelatedState {
-                related_to: *id,
-                state: state.clone(),
-            });
-        }
-
-        let updated_state = match self
-            .attempt_state_update(&params, &current_state, &key, &updates)
-            .await?
-        {
-            Either::Left(s) => s,
-            Either::Right(mut r) => {
-                let Some(c) = r.pop() else {
-                    // this branch should be unreachable since attempt_state_update should only
-                    return Err(ExecutorError::internal_error());
-                };
-                return Err(ExecutorError::request(StdContractError::MissingRelated {
-                    key: c.contract_instance_id,
-                }));
-            }
-        };
-        match self
-            .runtime
-            .validate_state(&key, &params, &updated_state, &related_contracts)
-            .map_err(|e| ExecutorError::execution(e, None))?
-        {
-            ValidateResult::Valid => {
-                if updated_state.as_ref() == current_state.as_ref() {
-                    Ok(UpsertResult::NoChange)
-                } else {
-                    Ok(UpsertResult::Updated(updated_state))
-                }
-            }
-            ValidateResult::Invalid => Err(ExecutorError::request(
-                freenet_stdlib::client_api::ContractError::Update {
-                    key,
-                    cause: "invalid outcome state".into(),
-                },
-            )),
-            ValidateResult::RequestRelated(_) => todo!(),
+    ) -> impl Future<Output = (Self::InnerExecutor, UpsertContractR)> + Send + 'static {
+        let mut executor = self.pop_executor().await;
+        async move {
+            let res =
+                upsert_contract_state_inner(&mut executor, key, update, related_contracts, code)
+                    .await;
+            (executor, res)
         }
     }
 
@@ -162,57 +149,250 @@ impl ContractExecutor for Executor<Runtime> {
         notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
         summary: Option<StateSummary<'_>>,
     ) -> Result<(), Box<RequestError>> {
-        let channels = self.update_notifications.entry(key).or_default();
-        if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
-            let (_, existing_ch) = &channels[i];
-            if !existing_ch.same_channel(&notification_ch) {
-                return Err(RequestError::from(StdContractError::Subscribe {
-                    key,
-                    cause: format!("Peer {cli_id} already subscribed").into(),
-                })
-                .into());
+        let mut last_error = None;
+        let owned_summary = summary.map(StateSummary::into_owned);
+
+        // Register with all available executors
+        for executor in self.runtimes.iter_mut().flatten() {
+            if let Err(err) = executor.register_contract_notifier(
+                key,
+                cli_id,
+                notification_ch.clone(),
+                owned_summary.clone(),
+            ) {
+                last_error = Some(err);
             }
-        } else {
-            channels.push((cli_id, notification_ch));
         }
 
-        if self
-            .subscriber_summaries
-            .entry(key)
-            .or_default()
-            .insert(cli_id, summary.map(StateSummary::into_owned))
-            .is_some()
-        {
-            tracing::warn!(
-                "contract {key} already was registered for peer {cli_id}; replaced summary"
-            );
+        // Add to all pending registration entries
+        // These represent executors that are currently out of the pool
+        for pending in self.pending_registrations.values_mut() {
+            pending.push(PendingRegistration {
+                key,
+                cli_id,
+                notification_ch: notification_ch.clone(),
+                summary: owned_summary.clone(),
+            });
         }
-        Ok(())
+
+        last_error.map_or(Ok(()), Err)
+    }
+
+    fn return_executor(&mut self, mut executor: Self::InnerExecutor) {
+        let executor_id = executor.id();
+
+        // Apply any pending registrations for this executor
+        if let Some(pending) = self.pending_registrations.remove(&executor_id) {
+            for registration in pending {
+                let _ = executor.register_contract_notifier(
+                    registration.key,
+                    registration.cli_id,
+                    registration.notification_ch,
+                    registration.summary.clone(),
+                );
+            }
+        }
+
+        // Return the executor to the pool
+        if let Some(empty_slot) = self.runtimes.iter_mut().find(|slot| slot.is_none()) {
+            *empty_slot = Some(executor);
+            self.available.add_permits(1);
+        } else {
+            unreachable!("No empty slot found in the pool");
+        }
+    }
+
+    async fn create_new_executor(&mut self) -> Self::InnerExecutor {
+        let mut executor = Executor::from_config(
+            self.config.clone(),
+            Some(self.op_sender.clone()),
+            Some(self.op_manager.clone()),
+        )
+        .await
+        .expect("Failed to create new executor");
+
+        // Assign a new ID to this executor
+        executor.id = self.next_executor_id;
+        self.next_executor_id += 1;
+
+        executor
+    }
+}
+
+async fn upsert_contract_state_inner(
+    executor: &mut Executor<Runtime>,
+    key: ContractKey,
+    update: Either<WrappedState, StateDelta<'static>>,
+    related_contracts: RelatedContracts<'static>,
+    code: Option<ContractContainer>,
+) -> UpsertContractR {
+    let params = if let Some(code) = &code {
+        code.params()
+    } else {
+        executor
+            .state_store
+            .get_params(&key)
+            .await
+            .transpose()
+            .ok_or_else(|| {
+                ExecutorError::request(StdContractError::Put {
+                    key,
+                    cause: "missing contract parameters".into(),
+                })
+            })?
+            .map_err(ExecutorError::other)?
+    };
+
+    let remove_if_fail = if executor
+        .runtime
+        .contract_store
+        .fetch_contract(&key, &params)
+        .is_none()
+    {
+        let Some(code) = code else {
+            return Err(ExecutorError::request(StdContractError::MissingContract {
+                key: key.into(),
+            }));
+        };
+        executor
+            .runtime
+            .contract_store
+            .store_contract(code.clone())
+            .map_err(ExecutorError::other)?;
+        true
+    } else {
+        false
+    };
+
+    let mut updates = match update {
+        Either::Left(incoming_state) => {
+            let result = match executor.runtime.validate_state(
+                &key,
+                &params,
+                &incoming_state,
+                &related_contracts,
+            ) {
+                Ok(result) => result,
+                Err(err) => {
+                    if remove_if_fail {
+                        let _ = executor.runtime.contract_store.remove_contract(&key);
+                    }
+                    return Err(ExecutorError::execution(err, None));
+                }
+            };
+            match result {
+                ValidateResult::Valid => {
+                    executor
+                        .state_store
+                        .store(key, incoming_state.clone(), params.clone())
+                        .await
+                        .map_err(ExecutorError::other)?;
+                }
+                ValidateResult::Invalid => {
+                    return Err(ExecutorError::request(StdContractError::invalid_put(key)));
+                }
+                ValidateResult::RequestRelated(mut related) => {
+                    if let Some(key) = related.pop() {
+                        // TODO: support recursive related contracts
+                        return Err(ExecutorError::request(StdContractError::MissingRelated {
+                            key,
+                        }));
+                    } else {
+                        return Err(ExecutorError::internal_error());
+                    }
+                }
+            }
+
+            vec![UpdateData::State(incoming_state.clone().into())]
+        }
+        Either::Right(delta) => {
+            // todo: forward delta like we are doing with puts
+            tracing::warn!("Delta updates are not yet supported");
+            vec![UpdateData::Delta(delta)]
+        }
+    };
+
+    let current_state = match executor.state_store.get(&key).await {
+        Ok(s) => s,
+        Err(StateStoreError::MissingContract(_)) => {
+            tracing::warn!("Missing contract {key} for upsert");
+            return Err(ExecutorError::request(StdContractError::MissingContract {
+                key: key.into(),
+            }));
+        }
+        Err(StateStoreError::Any(err)) => return Err(ExecutorError::other(err)),
+    };
+
+    for (id, state) in related_contracts
+        .states()
+        .filter_map(|(id, c)| c.as_ref().map(|c| (id, c)))
+    {
+        updates.push(UpdateData::RelatedState {
+            related_to: *id,
+            state: state.clone(),
+        });
+    }
+
+    let updated_state = match executor
+        .attempt_state_update(&params, &current_state, &key, &updates)
+        .await?
+    {
+        Either::Left(s) => s,
+        Either::Right(mut r) => {
+            let Some(c) = r.pop() else {
+                // this branch should be unreachable since attempt_state_update should only
+                return Err(ExecutorError::internal_error());
+            };
+            return Err(ExecutorError::request(StdContractError::MissingRelated {
+                key: c.contract_instance_id,
+            }));
+        }
+    };
+    match executor
+        .runtime
+        .validate_state(&key, &params, &updated_state, &related_contracts)
+        .map_err(|e| ExecutorError::execution(e, None))?
+    {
+        ValidateResult::Valid => {
+            if updated_state.as_ref() == current_state.as_ref() {
+                Ok(UpsertResult::NoChange)
+            } else {
+                Ok(UpsertResult::Updated(updated_state))
+            }
+        }
+        ValidateResult::Invalid => Err(ExecutorError::request(
+            freenet_stdlib::client_api::ContractError::Update {
+                key,
+                cause: "invalid outcome state".into(),
+            },
+        )),
+        ValidateResult::RequestRelated(_) => todo!(),
     }
 }
 
 impl Executor<Runtime> {
-    pub async fn from_config(
+    pub async fn local(config: Arc<Config>) -> anyhow::Result<Self> {
+        let (contract_store, delegate_store, secret_store, state_store) =
+            Self::get_stores(&config).await?;
+        let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+        assert!(config.mode == OperationMode::Local);
+        let mut executor = Executor::new(state_store, OperationMode::Local, rt, None, None).await?;
+        executor.id = 0; // Default ID for local executors
+        Ok(executor)
+    }
+
+    async fn from_config(
         config: Arc<Config>,
-        event_loop_channel: Option<ExecutorToEventLoopChannel<ExecutorHalve>>,
+        op_sender: Option<OpResult>,
+        op_manager: Option<Arc<OpManager>>,
     ) -> anyhow::Result<Self> {
         let (contract_store, delegate_store, secret_store, state_store) =
             Self::get_stores(&config).await?;
         let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
-        Executor::new(
-            state_store,
-            move || {
-                let _ =
-                    crate::util::set_cleanup_on_exit(config.paths().clone()).inspect_err(|error| {
-                        tracing::error!("Failed to set cleanup on exit: {error}");
-                    });
-                Ok(())
-            },
-            OperationMode::Local,
-            rt,
-            event_loop_channel,
-        )
-        .await
+        let mut executor =
+            Executor::new(state_store, config.mode, rt, op_sender, op_manager).await?;
+        executor.id = 0; // ID will be assigned by the pool
+        Ok(executor)
     }
 
     pub fn register_contract_notifier(
