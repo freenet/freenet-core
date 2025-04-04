@@ -1,4 +1,10 @@
-use super::{OpEnum, OpError, OpOutcome, OperationResult};
+use freenet_stdlib::client_api::{ErrorKind, HostResponse};
+use freenet_stdlib::prelude::*;
+use std::collections::HashSet;
+use std::fmt::Display;
+use std::pin::Pin;
+use std::{future::Future, time::Instant};
+
 use crate::client_events::HostResult;
 use crate::node::IsOperationCompleted;
 use crate::{
@@ -8,13 +14,8 @@ use crate::{
     operations::{OpInitialization, Operation},
     ring::{Location, PeerKeyLocation, RingError},
 };
-use freenet_stdlib::client_api::{ErrorKind, HostResponse};
-use freenet_stdlib::prelude::*;
-use std::collections::HashSet;
-use std::fmt::Display;
-use std::pin::Pin;
-use std::{future::Future, time::Instant};
-use tracing::{span, Instrument};
+
+use super::{OpEnum, OpError, OpOutcome, OperationResult};
 
 pub(crate) use self::messages::GetMsg;
 
@@ -764,38 +765,13 @@ impl Operation for GetOp {
                                     let mut new_skip_list = skip_list.clone();
                                     new_skip_list.insert(sender.peer.clone());
 
-                                    let sub_op = super::subscribe::start_op(key);
-                                    let msg = super::subscribe::SubscribeMsg::RequestSub {
-                                        id: sub_op.id,
+                                    super::start_subscription_request(
+                                        op_manager,
                                         key,
-                                        target: op_manager
-                                            .ring
-                                            .closest_potentially_caching(&key, &new_skip_list)
-                                            .into_iter()
-                                            .next()
-                                            .expect("At least one peer should be available"),
-                                    };
-
-                                    let net_msg = NetMessage::from(msg);
-                                    let span = span!(
-                                        tracing::Level::INFO,
-                                        "notify_op_execution",
-                                        tx = %sub_op.id,
-                                        key = %key,
-                                    );
-                                    let result = op_manager
-                                        .notify_op_execution(net_msg)
-                                        .instrument(span)
-                                        .await;
-
-                                    if let Err(err) = result {
-                                        tracing::warn!(
-                                            tx = %id,
-                                            %key,
-                                            error = %err,
-                                            "Failed to subscribe to contract updates"
-                                        );
-                                    }
+                                        false,
+                                        new_skip_list,
+                                    )
+                                    .await;
                                 }
                             }
                             ContractHandlerEvent::PutResponse {
