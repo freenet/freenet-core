@@ -399,6 +399,12 @@ impl Operation for SubscribeOp {
 
                         new_state = Some(SubscribeState::Completed { key: *key });
                         if let Some(upstream_subscriber) = upstream_subscriber {
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                upstream_subscriber = %upstream_subscriber.peer,
+                                "Forwarding subscription to upstream subscriber"
+                            );
                             return_msg = Some(SubscribeMsg::ReturnSub {
                                 id: *id,
                                 key: *key,
@@ -407,6 +413,11 @@ impl Operation for SubscribeOp {
                                 subscribed: true,
                             });
                         } else {
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                "No upstream subscriber, subscription completed"
+                            );
                             return_msg = None;
                         }
                     }

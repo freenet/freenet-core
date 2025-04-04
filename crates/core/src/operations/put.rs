@@ -2,17 +2,19 @@
 //! a given radius will cache a copy of the contract and it's current value,
 //! as well as will broadcast updates to the contract value to all subscribers.
 
+use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
+
 pub(crate) use self::messages::PutMsg;
 use freenet_stdlib::{
     client_api::{ErrorKind, HostResponse},
     prelude::*,
 };
-use std::collections::HashSet;
-use std::future::Future;
-use std::pin::Pin;
-use tracing::{span, Instrument};
 
-use super::{put, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
+use super::{
+    connect, put, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult,
+};
 use crate::node::IsOperationCompleted;
 use crate::{
     client_events::HostResult,
@@ -253,54 +255,8 @@ impl Operation for PutOp {
                             skip_list.insert(target.peer.clone());
                         }
 
-                        tracing::debug!(
-                            tx = %id,
-                            %key,
-                            peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
-                            "Starting subscription request"
-                        );
-                        // TODO: Make put operation atomic by linking it to the completion of this subscription request.
-                        // Currently we can't link one transaction to another transaction's result, which would be needed
-                        // to make this fully atomic. This should be addressed in a future refactoring.
-
-                        // Start subscription and handle dropped contracts
-                        let (_, _) = {
-                            let sub_op = super::subscribe::start_op(key);
-
-                            let msg = super::subscribe::SubscribeMsg::RequestSub {
-                                id: sub_op.id,
-                                key,
-                                target: op_manager
-                                    .ring
-                                    .closest_potentially_caching(&key, &skip_list)
-                                    .into_iter()
-                                    .next()
-                                    .expect("At least one peer should be available"),
-                            };
-
-                            let net_msg = NetMessage::from(msg);
-                            let span = span!(
-                                tracing::Level::INFO,
-                                "put::notify_op_execution",
-                                tx = %sub_op.id,
-                                key = %key,
-                            );
-                            let result = op_manager
-                                .notify_op_execution(net_msg)
-                                .instrument(span)
-                                .await;
-
-                            if let Err(err) = result {
-                                tracing::warn!(
-                                    tx = %id,
-                                    %key,
-                                    error = %err,
-                                    "Failed to subscribe to contract updates"
-                                );
-                            }
-
-                            op_manager.ring.seed_contract(key)
-                        };
+                        super::start_subscription_request(op_manager, key, false, skip_list).await;
+                        op_manager.ring.seed_contract(key);
 
                         true
                     } else {
@@ -615,39 +571,13 @@ impl Operation for PutOp {
 
                         // Start subscription and handle dropped contracts
                         let (dropped_contract, old_subscribers) = {
-                            let sub_op = super::subscribe::start_op(key);
-                            let msg = super::subscribe::SubscribeMsg::RequestSub {
-                                id: sub_op.id,
+                            super::start_subscription_request(
+                                op_manager,
                                 key,
-                                target: op_manager
-                                    .ring
-                                    .closest_potentially_caching(&key, &new_skip_list)
-                                    .into_iter()
-                                    .next()
-                                    .expect("At least one peer should be available"),
-                            };
-
-                            let net_msg = NetMessage::from(msg);
-                            let span = span!(
-                                tracing::Level::INFO,
-                                "notify_op_execution",
-                                tx = %sub_op.id,
-                                key = %key,
-                            );
-                            let result = op_manager
-                                .notify_op_execution(net_msg)
-                                .instrument(span)
-                                .await;
-
-                            if let Err(err) = result {
-                                tracing::warn!(
-                                    tx = %id,
-                                    %key,
-                                    error = %err,
-                                    "Failed to subscribe to contract updates"
-                                );
-                            }
-
+                                true,
+                                new_skip_list.clone(),
+                            )
+                            .await;
                             op_manager.ring.seed_contract(key)
                         };
 

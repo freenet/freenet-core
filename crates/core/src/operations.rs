@@ -107,6 +107,7 @@ where
             state: Some(final_state),
         }) if final_state.finalized() => {
             // operation finished_completely with result
+            tracing::debug!(%tx_id, "operation finished_completely with result");
             op_manager.completed(tx_id);
             return Ok(Some(final_state));
         }
