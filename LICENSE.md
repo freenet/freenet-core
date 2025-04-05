@@ -1,22 +1,32 @@
-**Note:** While `freenet-core` is licensed under the GNU Affero General 
-Public License (AGPL), this does *not* mean that all software built on 
-Freenet must also be AGPL-licensed.
+# How Freenet Licensing Works
+
+While `freenet-core` is licensed under the GNU Affero General Public
+License (AGPL), this does *not* mean that all software built on Freenet
+must also be AGPL-licensed.
 
 Applications that *use* Freenet—such as apps published to the network or
-clients that connect to it—are typically built against `freenet-stdlib`, 
-which is licensed under the more permissive LGPL. This means your app 
-can be licensed however you choose, including under a permissive or 
-proprietary license, as long as it only links against `freenet-stdlib`.
+clients that connect to it—are typically built against `freenet-stdlib`,
+which is licensed under the more permissive LGPL. This means your app can
+be licensed however you choose, including under a permissive or proprietary
+license, as long as it only links against `freenet-stdlib`.
 
-The AGPL applies if you modify and deploy a custom version of 
-`freenet-core` itself. For example, if a company created a fork of 
-`freenet-core` and used it to run a modified Freenet node in production, 
-they would be required to publish their changes to the core under the 
-same license.
+Similarly, if your application **communicates with a Freenet node over a
+network protocol** (such as HTTP or WebSocket), but does not **link to** or
+include code from `freenet-core` directly, it is **not considered a
+derivative work** under the AGPL. You are free to license your software
+however you choose in this case. Simply bundling or distributing the
+unmodified `freenet-core` binary alongside your app does **not** trigger
+the AGPL’s copyleft requirements for your own code.
 
-This licensing structure is designed to ensure that improvements to the 
-Freenet core are shared with the community, while giving developers 
-freedom and flexibility when building on top of it.
+The AGPL applies only if you **modify** and **deploy** a custom version of
+`freenet-core` itself. For example, if a company created a fork of
+`freenet-core` and used it to run a modified Freenet node in production,
+they would be required to publish their changes to the core under the same
+license.
+
+This licensing structure is designed to ensure that improvements to the
+Freenet core are shared with the community, while giving developers freedom
+and flexibility when building on top of it.
 
 If your organization has concerns about the AGPL or would like to discuss
 alternative licensing terms, feel free to reach out to us.
@@ -25,8 +35,7 @@ alternative licensing terms, feel free to reach out to us.
 
 Version 3, 19 November 2007
 
-Copyright (C) 2007 Free Software Foundation, Inc.
-<https://fsf.org/>
+Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
 
 Everyone is permitted to copy and distribute verbatim copies of this
 license document, but changing it is not allowed.
