@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, RwLock};
 
 use axum::extract::Path;
 use axum::response::IntoResponse;
@@ -30,6 +31,8 @@ impl std::ops::Deref for HttpGatewayRequest {
     }
 }
 
+pub type AttestedContractMap = Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>;
+
 /// A gateway to access and interact with contracts through an HTTP interface.
 ///
 /// Contracts initially accessed through the gateway have to be compliant with the container contract
@@ -37,7 +40,7 @@ impl std::ops::Deref for HttpGatewayRequest {
 ///
 /// Check the Locutus book for [more information](https://docs.freenet.org/dev-guide.html).
 pub(crate) struct HttpGateway {
-    pub attested_contracts: HashMap<AuthToken, (ContractInstanceId, ClientId)>,
+    pub attested_contracts: AttestedContractMap,
     proxy_server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
 }
@@ -45,7 +48,16 @@ pub(crate) struct HttpGateway {
 impl HttpGateway {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
     pub fn as_router(socket: &SocketAddr) -> (Self, Router) {
-        Self::as_router_v1(socket)
+        let attested_contracts = Arc::new(RwLock::new(HashMap::new()));
+        Self::as_router_with_attested_contracts(socket, attested_contracts)
+    }
+
+    /// Returns the uninitialized axum router with a provided attested_contracts map.
+    pub fn as_router_with_attested_contracts(
+        socket: &SocketAddr,
+        attested_contracts: AttestedContractMap,
+    ) -> (Self, Router) {
+        Self::create_router_v1_with_attested_contracts(socket, attested_contracts)
     }
 }
 
@@ -75,7 +87,15 @@ impl ClientEventsProxy for HttpGateway {
                             .map_err(|_e| ErrorKind::NodeUnavailable)?;
                         if let Some((assigned_token, contract)) = assigned_token {
                             self.attested_contracts
-                                .insert(assigned_token, (contract, cli_id));
+                                .write()
+                                .map_err(|_| ErrorKind::FailedOperation)?
+                                .insert(assigned_token.clone(), (contract, cli_id));
+                            tracing::debug!(
+                                ?assigned_token,
+                                ?contract,
+                                ?cli_id,
+                                "Stored assigned token in attested_contracts map"
+                            );
                         }
                         self.response_channels.insert(cli_id, callbacks);
                         continue;

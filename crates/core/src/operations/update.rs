@@ -380,7 +380,7 @@ async fn try_to_broadcast(
     let return_msg;
 
     match state {
-        Some(UpdateState::ReceivedRequest | UpdateState::BroadcastOngoing { .. }) => {
+        Some(UpdateState::ReceivedRequest | UpdateState::BroadcastOngoing) => {
             if broadcast_to.is_empty() && !last_hop {
                 // broadcast complete
                 tracing::debug!(

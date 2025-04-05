@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, RwLock},
     time::Duration,
 };
 
@@ -30,8 +30,7 @@ use crate::{
 };
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
-
-mod v1;
+use crate::server::http_gateway::AttestedContractMap;
 
 #[derive(Clone)]
 struct WebSocketRequest(mpsc::Sender<ClientConnection>);
@@ -52,8 +51,35 @@ pub(crate) struct WebSocketProxy {
 const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optimal way
 
 impl WebSocketProxy {
-    pub fn as_router(server_routing: Router) -> (Self, Router) {
-        WebSocketProxy::as_router_v1(server_routing)
+    pub fn create_router(server_routing: Router) -> (Self, Router) {
+        // Create a default empty attested contracts map
+        let attested_contracts = Arc::new(RwLock::new(HashMap::<
+            AuthToken,
+            (ContractInstanceId, ClientId),
+        >::new()));
+        Self::create_router_with_attested_contracts(server_routing, attested_contracts)
+    }
+
+    pub fn create_router_with_attested_contracts(
+        server_routing: Router,
+        attested_contracts: AttestedContractMap,
+    ) -> (Self, Router) {
+        let (proxy_request_sender, proxy_server_request) = mpsc::channel(PARALLELISM);
+
+        // Using Extension instead of with_state to avoid changing the Router's type parameter
+        let router = server_routing
+            .route("/v1/contract/command", get(websocket_commands))
+            .layer(Extension(attested_contracts))
+            .layer(Extension(WebSocketRequest(proxy_request_sender)))
+            .layer(axum::middleware::from_fn(connection_info));
+
+        (
+            WebSocketProxy {
+                proxy_server_request,
+                response_channels: HashMap::new(),
+            },
+            router,
+        )
     }
 
     async fn internal_proxy_recv(
@@ -181,7 +207,7 @@ async fn connection_info(
 
     let auth_token = match req.headers().typed_try_get::<Authorization<Bearer>>() {
         Ok(Some(value)) => Some(AuthToken::from(value.token().to_owned())),
-        Ok(None) => auth_token_q,
+        Ok(None) => auth_token_q.clone(),
         Err(_error) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -195,8 +221,7 @@ async fn connection_info(
     };
 
     tracing::debug!(
-        "establishing connection with encoding protocol: {encoding_protoc}, authenticated: {auth}",
-        auth = auth_token.is_some()
+        ?auth_token_q, ?auth_token, request_uri = ?req.uri(), "connection_info middleware extracting auth token and encoding protocol",
     );
     req.extensions_mut().insert(encoding_protoc);
     req.extensions_mut().insert(auth_token);
@@ -209,48 +234,56 @@ async fn websocket_commands(
     Extension(auth_token): Extension<Option<AuthToken>>,
     Extension(encoding_protoc): Extension<EncodingProtocol>,
     Extension(rs): Extension<WebSocketRequest>,
-) -> axum::response::Response {
+    Extension(attested_contracts): Extension<AttestedContractMap>,
+) -> Response {
     let on_upgrade = move |ws: WebSocket| async move {
-        tracing::debug!(protoc = ?ws.protocol(), "websocket connection established");
-        match websocket_interface(rs.clone(), auth_token, encoding_protoc, ws).await {
-            Ok(_) => {
-                tracing::debug!("WebSocket interface completed normally");
+        // Get the data we need and immediately drop the lock
+        let auth_and_instance = if let Some(token) = auth_token.as_ref() {
+            let attested_contracts_read = attested_contracts.read().unwrap();
+
+            // Only collect and log map contents when trace is enabled
+            if tracing::enabled!(tracing::Level::TRACE) {
+                let map_contents: Vec<_> = attested_contracts_read.keys().cloned().collect();
+                tracing::trace!(?token, "attested_contracts map keys: {:?}", map_contents);
             }
-            Err(error) => {
-                tracing::error!("WebSocket interface error: {}", error);
-                if let Some(source) = error.source() {
-                    tracing::error!("Caused by: {}", source);
-                }
+
+            if let Some((cid, _)) = attested_contracts_read.get(token) {
+                tracing::trace!(?token, ?cid, "Found token in attested_contracts map");
+                Some((token.clone(), *cid))
+            } else {
+                tracing::warn!(?token, "Auth token not found in attested_contracts map");
+                None
             }
+        } else {
+            tracing::trace!("No auth token provided in WebSocket request");
+            None
+        }; // RwLockReadGuard is dropped here
+
+        // Only evaluate auth_and_instance for trace when trace is enabled
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(protoc = ?ws.protocol(), ?auth_and_instance, "websocket connection established");
+        } else {
+            tracing::trace!(protoc = ?ws.protocol(), "websocket connection established");
+        }
+        if let Err(error) =
+            websocket_interface(rs.clone(), auth_and_instance, encoding_protoc, ws).await
+        {
+            tracing::error!("{error}");
         }
     };
+
     ws.on_upgrade(on_upgrade)
 }
 
 async fn websocket_interface(
     request_sender: WebSocketRequest,
-    mut auth_token: Option<AuthToken>,
+    mut auth_token: Option<(AuthToken, ContractInstanceId)>,
     encoding_protoc: EncodingProtocol,
     ws: WebSocket,
 ) -> anyhow::Result<()> {
-    tracing::debug!("starting websocket interface handler");
-    
-    // If we have an auth token, we need to find the associated ContractInstanceId
-    let assigned_token = if let Some(token) = &auth_token {
-        // Extract contract ID from the auth token if available
-        // This assumes the token is associated with a specific contract
-        // You might need to implement a lookup mechanism based on your authentication system
-        let contract_id = ContractInstanceId::from(token.0.as_ref());
-        Some((token.clone(), contract_id))
-    } else {
-        None
-    };
-    
-    let (mut response_rx, client_id) = new_client_connection(&request_sender, assigned_token).await?;
-    tracing::debug!(client_id = %client_id, "client connection established");
-
+    let (mut response_rx, client_id) =
+        new_client_connection(&request_sender, auth_token.clone()).await?;
     let (mut server_sink, mut client_stream) = ws.split();
-    tracing::debug!("websocket stream split for bidirectional communication");
     let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::UnboundedReceiver<HostResult>)>>> =
         Arc::new(Mutex::new(VecDeque::new()));
     loop {
@@ -297,7 +330,7 @@ async fn websocket_interface(
                 client_id,
                 next_msg,
                 &request_sender,
-                &mut auth_token,
+                &mut auth_token.as_mut().map(|t| t.0.clone()),
                 encoding_protoc,
             )
             .await
@@ -357,6 +390,7 @@ async fn new_client_connection(
     assigned_token: Option<(AuthToken, ContractInstanceId)>,
 ) -> Result<(mpsc::UnboundedReceiver<HostCallbackResult>, ClientId), ClientError> {
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
+    tracing::debug!(?assigned_token, "sending new client connection request");
     request_sender
         .send(ClientConnection::NewConnection {
             callbacks: response_sender,
@@ -384,55 +418,27 @@ async fn process_client_request(
     encoding_protoc: EncodingProtocol,
 ) -> Result<Option<Message>, Option<anyhow::Error>> {
     let msg = match msg {
-        Ok(Message::Binary(data)) => {
-            tracing::debug!(size = data.len(), "received binary message");
-            data
-        }
-        Ok(Message::Text(data)) => {
-            tracing::debug!(size = data.len(), "received text message");
-            data.into_bytes()
-        }
-        Ok(Message::Close(frame)) => {
-            tracing::debug!(?frame, "received close frame");
-            return Err(None);
-        }
-        Ok(Message::Ping(ping)) => {
-            tracing::debug!("received ping");
-            return Ok(Some(Message::Pong(ping)));
-        }
+        Ok(Message::Binary(data)) => data,
+        Ok(Message::Text(data)) => data.into_bytes(),
+        Ok(Message::Close(_)) => return Err(None),
+        Ok(Message::Ping(ping)) => return Ok(Some(Message::Pong(ping))),
         Ok(m) => {
-            tracing::debug!(msg = ?m, "received unexpected message type");
+            tracing::debug!(msg = ?m, "received random message");
             return Ok(None);
         }
-        Err(err) => {
-            tracing::error!(error = %err, "error receiving websocket message");
-            return Err(Some(err.into()));
-        }
+        Err(err) => return Err(Some(err.into())),
     };
 
     // Try to deserialize the ClientRequest message
     let req = {
         match encoding_protoc {
             EncodingProtocol::Flatbuffers => match ClientRequest::try_decode_fbs(&msg) {
-                Ok(decoded) => {
-                    tracing::debug!(
-                        protocol = "flatbuffers",
-                        "successfully decoded client request"
-                    );
-                    decoded.into_owned()
-                }
-                Err(err) => {
-                    tracing::error!(error = %err, protocol = "flatbuffers", "failed to decode client request");
-                    return Ok(Some(Message::Binary(err.into_fbs_bytes())));
-                }
+                Ok(decoded) => decoded.into_owned(),
+                Err(err) => return Ok(Some(Message::Binary(err.into_fbs_bytes()))),
             },
             EncodingProtocol::Native => match bincode::deserialize::<ClientRequest>(&msg) {
-                Ok(decoded) => {
-                    tracing::debug!(protocol = "native", "successfully decoded client request");
-                    decoded.into_owned()
-                }
+                Ok(decoded) => decoded.into_owned(),
                 Err(err) => {
-                    tracing::error!(error = %err, protocol = "native", "failed to decode client request");
                     let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
                         ErrorKind::DeserializationError {
                             cause: format!("{err}").into(),
@@ -447,36 +453,9 @@ async fn process_client_request(
     };
     if let ClientRequest::Authenticate { token } = &req {
         *auth_token = Some(AuthToken::from(token.clone()));
-        tracing::debug!("client authenticated");
     }
 
-    // Log specific details for contract operations
-    match &req {
-        ClientRequest::ContractOp(op) => match op {
-            ContractRequest::Put {
-                contract, state, ..
-            } => {
-                tracing::debug!(
-                    contract_key = %contract.key(),
-                    state_size = state.as_ref().len(),
-                    "received PUT contract request"
-                );
-            }
-            ContractRequest::Get {
-                key,
-                return_contract_code,
-                ..
-            } => {
-                tracing::debug!(
-                    contract_key = %key,
-                    return_code = return_contract_code,
-                    "received GET contract request"
-                );
-            }
-            _ => tracing::debug!(operation = ?op, "received contract operation request"),
-        },
-        _ => tracing::debug!(req = %req, "received client request"),
-    }
+    tracing::debug!(req = %req, "received client request");
     request_sender
         .send(ClientConnection::Request {
             client_id,
@@ -499,31 +478,20 @@ async fn process_host_response(
             debug_assert_eq!(id, client_id);
             let result = match result {
                 Ok(res) => {
-                    match &res {
-                        HostResponse::ContractResponse(resp) => match resp {
-                            ContractResponse::GetResponse {
-                                key,
-                                contract,
-                                state,
-                            } => {
-                                tracing::debug!(
-                                    contract_key = %key,
-                                    has_contract = contract.is_some(),
-                                    state_size = state.as_ref().len(),
-                                    "sending GET response"
-                                );
-                            }
-                            ContractResponse::PutResponse { key } => {
-                                tracing::debug!(
-                                    contract_key = %key,
-                                    "sending PUT response"
-                                );
-                            }
-                            _ => tracing::debug!(response = ?resp, "sending contract response"),
-                        },
-                        _ => tracing::debug!(response = %res, "sending response"),
+                    tracing::debug!(response = %res, cli_id = %id, "sending response");
+                    match res {
+                        HostResponse::ContractResponse(ContractResponse::GetResponse {
+                            key,
+                            contract,
+                            state,
+                        }) => Ok(ContractResponse::GetResponse {
+                            key,
+                            contract,
+                            state,
+                        }
+                        .into()),
+                        other => Ok(other),
                     }
-                    Ok(res)
                 }
                 Err(err) => {
                     tracing::debug!(response = %err, cli_id = %id, "sending response error");
