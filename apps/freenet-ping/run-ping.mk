@@ -114,7 +114,7 @@ run:
 	@echo "  Update Frequency: $(FREQUENCY)"
 	@echo "  TTL: $(TTL)"
 	@echo "  Tag: $(TAG)"
-    @echo "  Put Contract: $(PUT_CONTRACT)"
+	@echo "  Put Contract: $(PUT_CONTRACT)"
 	@mkdir -p $(BASE_DIR)/apps
 	@freenet-ping \
 		--host "127.0.0.1:$(WS_PORT)" \
@@ -123,8 +123,7 @@ run:
 		--ttl $(TTL) \
 		--tag $(TAG) \
 		--code-key $(CODE_KEY) \
-		$(if $(PUT_CONTRACT),--put-contract) \
-		$(call LOG_CMD,$(BASE_DIR)/apps/ping_$(WS_PORT).log)
+		$(if $(PUT_CONTRACT),--put-contract)
 
 # ------------------------------------------
 # Cleanup
