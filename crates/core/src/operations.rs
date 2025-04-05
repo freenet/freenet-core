@@ -107,6 +107,7 @@ where
             state: Some(final_state),
         }) if final_state.finalized() => {
             // operation finished_completely with result
+            tracing::debug!(%tx_id, "operation finished_completely with result");
             op_manager.completed(tx_id);
             return Ok(Some(final_state));
         }
@@ -320,7 +321,7 @@ async fn start_subscription_request(
         }
         if let OpError::ContractError(ContractError::ContractNotFound(key)) = &error {
             tracing::debug!(%key, "Contract not found, trying to get it first");
-            let get_op = get::start_op(*key, true);
+            let get_op = get::start_op(*key, true, true);
             if let Err(error) = get::request_get(op_manager, get_op, skip_list).await {
                 tracing::warn!(%error, "Error getting contract");
             }

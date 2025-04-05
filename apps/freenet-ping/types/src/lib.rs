@@ -72,7 +72,7 @@ impl Ping {
             if now <= created_time + ttl {
                 match self.from.entry(name.clone()) {
                     std::collections::hash_map::Entry::Occupied(mut occupied_entry) => {
-                        if occupied_entry.get() > &created_time {
+                        if occupied_entry.get() < &created_time {
                             occupied_entry.insert(created_time);
                             updates.insert(name, created_time);
                         }

@@ -843,7 +843,7 @@ where
     loop {
         let msg = tokio::select! {
             msg = conn_manager.recv() => { msg.map(Either::Left) }
-            msg = notification_channel.recv() => {
+            msg = notification_channel.notifications_receiver.recv() => {
                 if let Some(msg) = msg {
                     Ok(msg)
                 } else {
@@ -895,7 +895,7 @@ where
                     continue;
                 }
                 NodeEvent::ConnectPeer { peer, .. } => {
-                    tracing::info!("TNotifying connection to {peer}");
+                    tracing::info!("Notifying connection to {peer}");
                     continue;
                 }
                 NodeEvent::Disconnect { cause: Some(cause) } => {
@@ -968,6 +968,7 @@ where
             executor_callback,
             client_req_handler_callback,
             pending_client_req,
+            None,
         )
         .instrument(span);
         GlobalExecutor::spawn(msg);

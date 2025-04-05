@@ -2,16 +2,16 @@
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 
+pub(crate) use self::messages::UpdateMsg;
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::contract::ContractHandlerEvent;
 use crate::message::{InnerMessage, NetMessage, Transaction};
+use crate::node::IsOperationCompleted;
 use crate::ring::{Location, PeerKeyLocation, RingError};
 use crate::{
     client_events::HostResult,
     node::{NetworkBridge, OpManager, PeerId},
 };
-
-pub(crate) use self::messages::UpdateMsg;
 
 pub(crate) struct UpdateOp {
     pub id: Transaction,
@@ -614,6 +614,12 @@ pub(crate) async fn request_update(
     Ok(())
 }
 
+impl IsOperationCompleted for UpdateOp {
+    fn is_completed(&self) -> bool {
+        matches!(self.state, Some(UpdateState::Finished { .. }))
+    }
+}
+
 mod messages {
     use std::{borrow::Borrow, fmt::Display};
 
@@ -625,7 +631,7 @@ mod messages {
         ring::{Location, PeerKeyLocation},
     };
 
-    #[derive(Debug, Serialize, Deserialize)]
+    #[derive(Debug, Serialize, Deserialize, Clone)]
     pub(crate) enum UpdateMsg {
         RequestUpdate {
             id: Transaction,

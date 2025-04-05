@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
+pub(crate) use self::messages::SubscribeMsg;
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
+use crate::node::IsOperationCompleted;
 use crate::{
     client_events::HostResult,
     contract::ContractError,
@@ -15,8 +17,6 @@ use freenet_stdlib::{
     prelude::*,
 };
 use serde::{Deserialize, Serialize};
-
-pub(crate) use self::messages::SubscribeMsg;
 
 const MAX_RETRIES: usize = 10;
 
@@ -399,6 +399,12 @@ impl Operation for SubscribeOp {
 
                         new_state = Some(SubscribeState::Completed { key: *key });
                         if let Some(upstream_subscriber) = upstream_subscriber {
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                upstream_subscriber = %upstream_subscriber.peer,
+                                "Forwarding subscription to upstream subscriber"
+                            );
                             return_msg = Some(SubscribeMsg::ReturnSub {
                                 id: *id,
                                 key: *key,
@@ -407,6 +413,11 @@ impl Operation for SubscribeOp {
                                 subscribed: true,
                             });
                         } else {
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                "No upstream subscriber, subscription completed"
+                            );
                             return_msg = None;
                         }
                     }
@@ -437,12 +448,18 @@ fn build_op_result(
     })
 }
 
+impl IsOperationCompleted for SubscribeOp {
+    fn is_completed(&self) -> bool {
+        matches!(self.state, Some(SubscribeState::Completed { .. }))
+    }
+}
+
 mod messages {
     use std::{borrow::Borrow, fmt::Display};
 
     use super::*;
 
-    #[derive(Debug, Serialize, Deserialize)]
+    #[derive(Debug, Serialize, Deserialize, Clone)]
     pub(crate) enum SubscribeMsg {
         FetchRouting {
             id: Transaction,

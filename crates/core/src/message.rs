@@ -6,10 +6,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use freenet_stdlib::prelude::{ContractContainer, ContractKey, WrappedState};
-use serde::{Deserialize, Serialize};
-use ulid::Ulid;
-
 use crate::{
     node::PeerId,
     operations::{
@@ -17,7 +13,10 @@ use crate::{
     },
     ring::{Location, PeerKeyLocation},
 };
+use freenet_stdlib::prelude::{ContractContainer, ContractKey, WrappedState};
 pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
+use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 /// An transaction is a unique, universal and efficient identifier for any
 /// roundtrip transaction as it is broadcasted around the Freenet network.
@@ -235,12 +234,12 @@ pub(crate) trait MessageStats {
     fn requested_location(&self) -> Option<Location>;
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) enum NetMessage {
     V1(NetMessageV1),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) enum NetMessageV1 {
     Connect(ConnectMsg),
     Put(PutMsg),
@@ -287,7 +286,7 @@ impl From<NetMessage> for semver::Version {
     }
 }
 
-pub(crate) trait InnerMessage: Into<NetMessage> {
+pub trait InnerMessage: Into<NetMessage> {
     fn id(&self) -> &Transaction;
 
     fn target(&self) -> Option<impl Borrow<PeerKeyLocation>>;
