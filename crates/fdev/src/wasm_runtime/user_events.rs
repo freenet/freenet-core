@@ -218,6 +218,7 @@ impl From<CommandInfo> for OpenRequest<'static> {
             Command::Get => ContractRequest::Get {
                 key,
                 return_contract_code: false,
+                subscribe: false,
             }
             .into(),
             Command::Put => {
@@ -226,6 +227,7 @@ impl From<CommandInfo> for OpenRequest<'static> {
                     contract: cmd.contract,
                     state: WrappedState::new(state.into_bytes()),
                     related_contracts: Default::default(),
+                    subscribe: false,
                 }
                 .into()
             }
@@ -306,6 +308,7 @@ impl ClientEventsProxy for StdInput {
                             node.send(ClientRequest::ContractOp(ContractRequest::Get {
                                 key,
                                 return_contract_code: true,
+                                subscribe: false,
                             }))
                             .await
                             .map_err(|e| {
