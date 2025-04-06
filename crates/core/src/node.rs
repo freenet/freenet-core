@@ -38,7 +38,7 @@ use crate::{
         NetworkContractHandler, WaitingTransaction,
     },
     local_node::Executor,
-    message::{NetMessage, Transaction, TransactionType},
+    message::{InnerMessage, NetMessage, Transaction, TransactionType},
     operations::{
         connect::{self, ConnectOp},
         get, put, subscribe, update, OpEnum, OpError, OpOutcome,
@@ -480,6 +480,7 @@ macro_rules! handle_op_not_available {
     };
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_message<CB>(
     msg: NetMessage,
     op_manager: Arc<OpManager>,
@@ -564,8 +565,13 @@ async fn process_message_v1<CB>(
 
                 if is_operation_completed(&op_result) {
                     if let Some(ref op_execution_callback) = pending_op_result {
+                        let tx_id = *op.id();
                         let _ = op_execution_callback
-                            .send(NetMessage::V1(NetMessageV1::Put((*op).clone())));
+                            .send(NetMessage::V1(NetMessageV1::Put((*op).clone())))
+                            .await
+                            .inspect_err(
+                                |err| tracing::error!(%err, %tx_id, "Failed to send message to client"),
+                            );
                     }
                 }
 
@@ -585,8 +591,11 @@ async fn process_message_v1<CB>(
                     handle_op_request::<get::GetOp, _>(&op_manager, &mut conn_manager, op).await;
                 if is_operation_completed(&op_result) {
                     if let Some(ref op_execution_callback) = pending_op_result {
+                        let tx_id = *op.id();
                         let _ = op_execution_callback
-                            .send(NetMessage::V1(NetMessageV1::Get((*op).clone())));
+                            .send(NetMessage::V1(NetMessageV1::Get((*op).clone()))).await.inspect_err(|err|
+                                tracing::error!(%err, %tx_id, "Failed to send message to client")
+                            );
                     }
                 }
                 handle_op_not_available!(op_result);
@@ -609,8 +618,11 @@ async fn process_message_v1<CB>(
                 .await;
                 if is_operation_completed(&op_result) {
                     if let Some(ref op_execution_callback) = pending_op_result {
+                        let tx_id = *op.id();
                         let _ = op_execution_callback
-                            .send(NetMessage::V1(NetMessageV1::Subscribe((*op).clone())));
+                            .send(NetMessage::V1(NetMessageV1::Subscribe((*op).clone()))).await.inspect_err(|err|
+                                tracing::error!(%err, %tx_id, "Failed to send message to client")
+                            );
                     }
                 }
                 handle_op_not_available!(op_result);
@@ -630,8 +642,11 @@ async fn process_message_v1<CB>(
                         .await;
                 if is_operation_completed(&op_result) {
                     if let Some(ref op_execution_callback) = pending_op_result {
+                        let tx_id = *op.id();
                         let _ = op_execution_callback
-                            .send(NetMessage::V1(NetMessageV1::Update((*op).clone())));
+                                .send(NetMessage::V1(NetMessageV1::Update((*op).clone()))).await.inspect_err(|err| 
+                                    tracing::error!(%err, %tx_id, "Failed to send message to client")
+                                );
                     }
                 }
                 handle_op_not_available!(op_result);
@@ -1047,33 +1062,6 @@ pub async fn run_network_node(mut node: Node) -> anyhow::Result<()> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::net::{Ipv4Addr, Ipv6Addr};
-
-    use super::*;
-
-    #[tokio::test]
-    async fn test_hostname_resolution() {
-        let addr = Address::Hostname("localhost".to_string());
-        let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
-        assert!(
-            socket_addr.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST)
-                || socket_addr.ip() == IpAddr::V6(Ipv6Addr::LOCALHOST)
-        );
-        // Port should be in valid range
-        assert!(socket_addr.port() > 1024); // Ensure we're using unprivileged ports
-
-        let addr = Address::Hostname("google.com".to_string());
-        let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
-        // Port should be in valid range
-        assert!(socket_addr.port() > 1024); // Ensure we're using unprivileged ports
-
-        let addr = Address::Hostname("google.com:8080".to_string());
-        let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
-        assert_eq!(socket_addr.port(), 8080);
-    }
-}
 
 /// Trait to determine if an operation has completed, regardless of its specific type.
 pub trait IsOperationCompleted {
@@ -1099,5 +1087,33 @@ pub fn is_operation_completed(op_result: &Result<Option<OpEnum>, OpError>) -> bo
         // If we got an OpEnum, check its specific completion status using the trait
         Ok(Some(op)) => op.is_completed(),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_hostname_resolution() {
+        let addr = Address::Hostname("localhost".to_string());
+        let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
+        assert!(
+            socket_addr.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST)
+                || socket_addr.ip() == IpAddr::V6(Ipv6Addr::LOCALHOST)
+        );
+        // Port should be in valid range
+        assert!(socket_addr.port() > 1024); // Ensure we're using unprivileged ports
+
+        let addr = Address::Hostname("google.com".to_string());
+        let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
+        // Port should be in valid range
+        assert!(socket_addr.port() > 1024); // Ensure we're using unprivileged ports
+
+        let addr = Address::Hostname("google.com:8080".to_string());
+        let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
+        assert_eq!(socket_addr.port(), 8080);
     }
 }

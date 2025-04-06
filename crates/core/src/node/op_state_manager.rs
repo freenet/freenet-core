@@ -127,6 +127,7 @@ impl OpManager {
             .map_err(Into::into)
     }
 
+    #[allow(dead_code)] // FIXME: enable async sub-transactions
     pub async fn notify_op_execution(&self, msg: NetMessage) -> Result<NetMessage, OpError> {
         let (response_sender, mut response_receiver): (
             tokio::sync::mpsc::Sender<NetMessage>,

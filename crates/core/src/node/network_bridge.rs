@@ -98,6 +98,7 @@ pub(crate) struct EventLoopNotificationsReceiver {
     pub(crate) op_execution_receiver: Receiver<(Sender<NetMessage>, NetMessage)>,
 }
 
+#[allow(dead_code)] // FIXME: enable async sub-transactions
 impl EventLoopNotificationsReceiver {
     pub(crate) fn notifications_receiver(&self) -> &Receiver<Either<NetMessage, NodeEvent>> {
         &self.notifications_receiver
@@ -119,6 +120,7 @@ impl EventLoopNotificationsSender {
         &self.notifications_sender
     }
 
+    #[allow(dead_code)] // FIXME: enable async sub-transactions
     pub(crate) fn op_execution_sender(&self) -> &Sender<(Sender<NetMessage>, NetMessage)> {
         &self.op_execution_sender
     }

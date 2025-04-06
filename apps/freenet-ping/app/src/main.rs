@@ -56,7 +56,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     let contract_key = ContractKey::from_params(args.parameters.code_key, params.clone())?;
 
     // Step 1: Put the contract or get it, and wait for response
-    let mut is_subscribed = false;
     let mut local_state: Ping;
 
     if args.put_contract {
@@ -101,7 +100,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
 
     // Wait for subscription response
     wait_for_subscribe_response(&mut client, &contract_key).await?;
-    is_subscribed = true;
     tracing::info!(key=%contract_key, "subscribed successfully!");
 
     // Start the ping timer only after subscription confirmed
@@ -115,15 +113,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         }
         tokio::select! {
             _ = send_tick.tick() => {
-                if is_subscribed {
-                    let mut ping = Ping::default();
-                    ping.insert(args.parameters.tag.clone());
-                    if let Err(e) = client.send(ClientRequest::ContractOp(ContractRequest::Update {
-                        key: contract_key,
-                        data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&ping).unwrap())),
-                    })).await {
-                        tracing::error!(err=%e, "failed to send update request");
-                    }
+                let mut ping = Ping::default();
+                ping.insert(args.parameters.tag.clone());
+                if let Err(e) = client.send(ClientRequest::ContractOp(ContractRequest::Update {
+                    key: contract_key,
+                    data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&ping).unwrap())),
+                })).await {
+                    tracing::error!(err=%e, "failed to send update request");
                 }
             },
             res = client.recv() => {
