@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     net::{Ipv4Addr, TcpListener},
     path::PathBuf,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{anyhow, bail};
@@ -399,80 +399,52 @@ async fn test_ping_multi_node() -> TestResult {
             }))
             .await?;
 
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
-        // Wait for update response on gateway
-		let started = Instant::now();
         loop {
-            select! {
-                resp = client_gw.recv() => {
-                    tracing::info!("Gateway: received update response");
-					match resp {
-						Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
-							key,
-							..
-						})) => {
-							assert_eq!(
-								key, contract_key,
-								"Contract key mismatch in UPDATE response"
-							);
-							tracing::info!("Gateway: update sent successfully");
-							break;
-						}
-						Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
-							key,
-							update,
-						})) => {
-							match &update {
-								UpdateData::State(state) => {
-									let ping = serde_json::from_slice::<Ping>(state).unwrap();
-									tracing::info!("Gateway: update notification with ping: {}", ping);
-								}
-								UpdateData::Delta(delta) => {
-									let ping = serde_json::from_slice::<Ping>(delta).unwrap();
-									tracing::info!("Gateway: update notification with ping: {}", ping);
-								}
-								_ => unreachable!(),
-							}
-							if key == contract_key {
-								match process_ping_update(&mut gw_local_state, ping_options.ttl, update) {
-									Ok(updates) => {
-										for (name, _timestamp) in updates {
-											tracing::info!("Gateway saw update from: {}", name);
-											if name == node1_tag {
-												gw_seen_node1 = true;
-											} else if name == node2_tag {
-												gw_seen_node2 = true;
-											}
-										}
-									}
-									Err(e) => tracing::error!("Gateway error processing update: {}", e),
-								}
-							}
-						}
-						Ok(other) => {
-							tracing::warn!(
-								"Gateway: unexpected response while waiting for update: {:?}",
-								other
-							);
-						}
-						Err(e) => {
-							bail!("Gateway: Error receiving update response: {}", e);
-						}
-					}
+            let resp = tokio::time::timeout(Duration::from_secs(10), client_gw.recv()).await;
+            match resp {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                    key,
+                    ..
+                }))) => {
+                    assert_eq!(
+                        key, contract_key,
+                        "Contract key mismatch in UPDATE response"
+                    );
+                    tracing::info!("Gateway: update sent successfully");
+                    break;
                 }
-				_ = tick.tick() => {
-					if started.elapsed() > Duration::from_secs(5) {
-						bail!("Gateway: Timeout waiting for update response");
-					}
-					gw_ping.insert(gw_tag.clone());
-					tracing::info!(%gw_ping, "Gateway sending update with tag: {}", gw_tag);
-					client_gw
-						.send(ClientRequest::ContractOp(ContractRequest::Update {
-							key: contract_key,
-							data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&gw_ping).unwrap())),
-						}))
-						.await?;
-				}
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                    key,
+                    update,
+                }))) => {
+                    if key == contract_key {
+                        match process_ping_update(&mut gw_local_state, ping_options.ttl, update) {
+                            Ok(updates) => {
+                                for (name, _timestamp) in updates {
+                                    tracing::info!("Gateway saw update from: {}", name);
+                                    if name == node1_tag {
+                                        gw_seen_node1 = true;
+                                    } else if name == node2_tag {
+                                        gw_seen_node2 = true;
+                                    }
+                                }
+                            }
+                            Err(e) => tracing::error!("Gateway error processing update: {}", e),
+                        }
+                    }
+                }
+                Ok(Ok(other)) => {
+                    tracing::warn!(
+                        "Gateway: unexpected response while waiting for update: {:?}",
+                        other
+                    );
+                }
+                Ok(Err(e)) => {
+                    bail!("Gateway: Error receiving update response: {}", e);
+                }
+                Err(_) => {
+                    bail!("Gateway: Timeout waiting for update response");
+                }
             }
         }
 

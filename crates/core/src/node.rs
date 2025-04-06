@@ -644,7 +644,7 @@ async fn process_message_v1<CB>(
                     if let Some(ref op_execution_callback) = pending_op_result {
                         let tx_id = *op.id();
                         let _ = op_execution_callback
-                                .send(NetMessage::V1(NetMessageV1::Update((*op).clone()))).await.inspect_err(|err| 
+                                .send(NetMessage::V1(NetMessageV1::Update((*op).clone()))).await.inspect_err(|err|
                                     tracing::error!(%err, %tx_id, "Failed to send message to client")
                                 );
                     }
@@ -1061,7 +1061,6 @@ pub async fn run_network_node(mut node: Node) -> anyhow::Result<()> {
         }
     }
 }
-
 
 /// Trait to determine if an operation has completed, regardless of its specific type.
 pub trait IsOperationCompleted {

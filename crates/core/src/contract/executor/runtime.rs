@@ -56,6 +56,8 @@ impl ContractExecutor for Executor<Runtime> {
             false
         };
 
+        let is_new_contract = self.state_store.get(&key).await.is_err();
+
         let mut updates = match update {
             Either::Left(incoming_state) => {
                 let result = self
@@ -69,10 +71,19 @@ impl ContractExecutor for Executor<Runtime> {
                     })?;
                 match result {
                     ValidateResult::Valid => {
-                        self.state_store
-                            .store(key, incoming_state.clone(), params.clone())
-                            .await
-                            .map_err(ExecutorError::other)?;
+                        tracing::debug!("The incoming state is valid");
+
+                        // If the contract is new, we store the incoming state as the initial state avoiding the update
+                        if is_new_contract {
+                            tracing::debug!("Contract is new, storing initial state");
+                            let state_to_store = incoming_state.clone();
+                            self.state_store
+                                .store(key, state_to_store, params.clone())
+                                .await
+                                .map_err(ExecutorError::other)?;
+
+                            return Ok(UpsertResult::Updated(incoming_state));
+                        }
                     }
                     ValidateResult::Invalid => {
                         return Err(ExecutorError::request(StdContractError::invalid_put(key)));
