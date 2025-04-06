@@ -91,8 +91,6 @@ impl ContractExecutor for Executor<Runtime> {
                 vec![UpdateData::State(incoming_state.clone().into())]
             }
             Either::Right(delta) => {
-                // todo: forward delta like we are doing with puts
-                tracing::warn!("Delta updates are not yet supported");
                 vec![UpdateData::Delta(delta)]
             }
         };
@@ -142,6 +140,8 @@ impl ContractExecutor for Executor<Runtime> {
                 if updated_state.as_ref() == current_state.as_ref() {
                     Ok(UpsertResult::NoChange)
                 } else {
+                    // todo: forward delta like we are doing with puts
+                    tracing::warn!("Delta updates are not yet supported");
                     Ok(UpsertResult::Updated(updated_state))
                 }
             }

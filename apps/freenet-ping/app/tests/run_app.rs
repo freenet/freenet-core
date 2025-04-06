@@ -133,6 +133,8 @@ fn process_ping_update(
     }
 }
 
+const APP_TAG: &str = "ping-app";
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ping_multi_node() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
@@ -259,12 +261,13 @@ async fn test_ping_multi_node() -> TestResult {
             .ok()
             .ok_or_else(|| anyhow!("Failed to read contract code"))?;
         let code_hash = CodeHash::from_code(&code);
+        tracing::info!(code_hash=%code_hash, "loaded contract code");
 
         // Load the ping contract
         let ping_options = PingContractOptions {
             frequency: Duration::from_secs(5),
             ttl: Duration::from_secs(30),
-            tag: "node-gw".to_string(),
+            tag: APP_TAG.to_string(),
             code_key: code_hash.to_string(),
         };
         let params = Parameters::from(serde_json::to_vec(&ping_options).unwrap());
@@ -386,6 +389,7 @@ async fn test_ping_multi_node() -> TestResult {
         // Gateway sends update with its tag
         let mut gw_ping = Ping::default();
         gw_ping.insert(gw_tag.clone());
+        tracing::info!(%ping, "Gateway sending update with tag: {}", gw_tag);
         client_gw
             .send(ClientRequest::ContractOp(ContractRequest::Update {
                 key: contract_key,
@@ -408,6 +412,26 @@ async fn test_ping_multi_node() -> TestResult {
                     tracing::info!("Gateway: update sent successfully");
                     break;
                 }
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                    key,
+                    update,
+                }))) => {
+                    if key == contract_key {
+                        match process_ping_update(&mut gw_local_state, ping_options.ttl, update) {
+                            Ok(updates) => {
+                                for (name, _timestamp) in updates {
+                                    tracing::info!("Gateway saw update from: {}", name);
+                                    if name == node1_tag {
+                                        gw_seen_node1 = true;
+                                    } else if name == node2_tag {
+                                        gw_seen_node2 = true;
+                                    }
+                                }
+                            }
+                            Err(e) => tracing::error!("Gateway error processing update: {}", e),
+                        }
+                    }
+                }
                 Ok(Ok(other)) => {
                     tracing::warn!(
                         "Gateway: unexpected response while waiting for update: {:?}",
@@ -426,6 +450,7 @@ async fn test_ping_multi_node() -> TestResult {
         // Node 1 sends update with its tag
         let mut node1_ping = Ping::default();
         node1_ping.insert(node1_tag.clone());
+        tracing::info!(%node1_ping, "Node 1 sending update with tag: {}", node1_tag);
         client_node1
             .send(ClientRequest::ContractOp(ContractRequest::Update {
                 key: contract_key,
@@ -466,6 +491,7 @@ async fn test_ping_multi_node() -> TestResult {
         // Node 2 sends update with its tag
         let mut node2_ping = Ping::default();
         node2_ping.insert(node2_tag.clone());
+        tracing::info!(%node2_ping, "Node 2 sending update with tag: {}", node2_tag);
         client_node2
             .send(ClientRequest::ContractOp(ContractRequest::Update {
                 key: contract_key,
@@ -755,7 +781,6 @@ async fn test_ping_application_loop() -> TestResult {
             .ok_or_else(|| anyhow!("Failed to read contract code"))?;
         let code_hash = CodeHash::from_code(&code);
 
-        const APP_TAG: &str = "ping-app";
         // Create ping contract options for each node with different tags
         let gw_options = PingContractOptions {
             frequency: Duration::from_secs(1), // Faster for testing
