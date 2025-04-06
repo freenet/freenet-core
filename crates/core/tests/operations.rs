@@ -1,10 +1,10 @@
-use crate::test_utils::verify_contract_exists;
 use anyhow::{anyhow, bail};
 use freenet::{
     config::{ConfigArgs, InlineGwConfig, NetworkArgs, SecretArgs, WebsocketApiArgs},
     dev_tool::TransportKeypair,
     local_node::NodeConfig,
     server::serve_gateway,
+    test_utils::{self, make_get, make_put, make_subscribe, make_update, verify_contract_exists},
 };
 use freenet_stdlib::{
     client_api::{ContractResponse, HostResponse, WebApi},
@@ -17,13 +17,10 @@ use std::{
     path::Path,
     time::Duration,
 };
-use test_utils::{make_get, make_put, make_subscribe, make_update};
 use testresult::TestResult;
 use tokio::select;
 use tokio_tungstenite::connect_async;
 use tracing::{level_filters::LevelFilter, span, Instrument, Level};
-
-mod test_utils;
 
 static RNG: once_cell::sync::Lazy<std::sync::Mutex<rand::rngs::StdRng>> =
     once_cell::sync::Lazy::new(|| {
@@ -1166,8 +1163,8 @@ async fn test_multiple_clients_subscription() -> TestResult {
 }
 
 // FIXME Update notification is not received
+#[ignore = "Update notification is not received"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
 async fn test_get_with_subscribe_flag() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::INFO), None);
 
@@ -1463,8 +1460,8 @@ async fn test_get_with_subscribe_flag() -> TestResult {
 }
 
 // FIXME Update notification is not received
+#[ignore = "Update notification is not received"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
 async fn test_put_with_subscribe_flag() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::INFO), None);
 
