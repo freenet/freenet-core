@@ -157,6 +157,7 @@ pub async fn run_ping_client(
     client: &mut WebApi,
     contract_key: ContractKey,
     parameters: PingContractOptions,
+    node_id: String,
     local_state: &mut Ping,
     // For testing, allow external control of when to shut down
     mut shutdown_signal: Option<tokio::sync::oneshot::Receiver<()>>,
@@ -186,7 +187,7 @@ pub async fn run_ping_client(
         tokio::select! {
             _ = send_tick.tick() => {
                 let mut ping = Ping::default();
-                ping.insert(parameters.tag.clone());
+                ping.insert(node_id.clone());
                 stats.record_sent();
                 if let Err(e) = client.send(ClientRequest::ContractOp(ContractRequest::Update {
                     key: contract_key,

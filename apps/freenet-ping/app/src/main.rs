@@ -23,6 +23,8 @@ struct Args {
     parameters: PingContractOptions,
     #[clap(long)]
     put_contract: bool,
+    #[clap(long)]
+    node_id: String,
 }
 
 const PACKAGE_DIR: &str = env!("CARGO_MANIFEST_DIR");
@@ -104,6 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         &mut client,
         contract_key,
         args.parameters,
+        args.node_id,
         &mut local_state,
         None,
         None,

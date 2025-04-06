@@ -755,25 +755,26 @@ async fn test_ping_application_loop() -> TestResult {
             .ok_or_else(|| anyhow!("Failed to read contract code"))?;
         let code_hash = CodeHash::from_code(&code);
 
+        const APP_TAG: &str = "ping-app";
         // Create ping contract options for each node with different tags
         let gw_options = PingContractOptions {
             frequency: Duration::from_secs(1), // Faster for testing
             ttl: Duration::from_secs(30),
-            tag: "ping-from-gw".to_string(),
+            tag: APP_TAG.to_string(),
             code_key: code_hash.to_string(),
         };
 
         let node1_options = PingContractOptions {
             frequency: Duration::from_secs(1),
             ttl: Duration::from_secs(30),
-            tag: "ping-from-node1".to_string(),
+            tag: APP_TAG.to_string(),
             code_key: code_hash.to_string(),
         };
 
         let node2_options = PingContractOptions {
             frequency: Duration::from_secs(1),
             ttl: Duration::from_secs(30),
-            tag: "ping-from-node2".to_string(),
+            tag: APP_TAG.to_string(),
             code_key: code_hash.to_string(),
         };
 
@@ -892,6 +893,7 @@ async fn test_ping_application_loop() -> TestResult {
                 &mut client_gw_clone,
                 contract_key,
                 gw_options,
+                "gateway".into(),
                 &mut local_state,
                 Some(gw_shutdown_rx),
                 Some(test_duration),
@@ -905,6 +907,7 @@ async fn test_ping_application_loop() -> TestResult {
                 &mut client_node1_clone,
                 contract_key,
                 node1_options,
+                "node1".into(),
                 &mut local_state,
                 Some(node1_shutdown_rx),
                 Some(test_duration),
@@ -918,6 +921,7 @@ async fn test_ping_application_loop() -> TestResult {
                 &mut client_node2_clone,
                 contract_key,
                 node2_options,
+                "node2".into(),
                 &mut local_state,
                 Some(node2_shutdown_rx),
                 Some(test_duration),
