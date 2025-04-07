@@ -137,7 +137,6 @@ impl WebSocketProxy {
             }
         }
     }
-}
 
 struct EncodingProtocolExt(EncodingProtocol);
 
@@ -294,9 +293,6 @@ async fn websocket_commands(
 async fn websocket_interface(
     request_sender: WebSocketRequest,
     mut auth_token: Option<(AuthToken, ContractInstanceId)>,
-    encoding_protoc: EncodingProtocol,
-    ws: WebSocket,
-) -> anyhow::Result<()> {
     encoding_protoc: EncodingProtocol,
     ws: WebSocket,
 ) -> anyhow::Result<()> {
