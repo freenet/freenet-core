@@ -474,12 +474,17 @@ impl Executor<Runtime> {
                     }
                 }
             }
-            // Please add logging to this code block AI!
             DelegateRequest::GetSecretRequest {
                 key,
                 params,
                 get_request,
             } => {
+                tracing::debug!(
+                    delegate_key = %key,
+                    params_size = params.as_ref().len(),
+                    attested_contract = ?attested_contract,
+                    "Handling GetSecretRequest for delegate"
+                );
                 let attested = attested_contract.and_then(|contract| {
                     self.delegate_attested_ids
                         .get(&key)
