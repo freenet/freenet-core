@@ -917,6 +917,7 @@ pub async fn run_local_node(
                         .and_then(|guard| guard.get(&token).map(|(t, _)| *t))
                 });
                 tracing::debug!(
+                    delegate_op = %op,
                     ?attested_contract,
                     "Delegate request with attested contract"
                 );
