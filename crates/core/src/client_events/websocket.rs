@@ -473,6 +473,12 @@ async fn process_host_response(
     encoding_protoc: EncodingProtocol,
     tx: &mut SplitSink<WebSocket, Message>,
 ) -> anyhow::Result<Option<NewSubscription>> {
+    tracing::debug!(
+        ?msg,
+        client_id = %client_id,
+        encoding_protoc = ?encoding_protoc,
+        "processing host response",
+    );
     match msg {
         Some(HostCallbackResult::Result { id, result }) => {
             debug_assert_eq!(id, client_id);
