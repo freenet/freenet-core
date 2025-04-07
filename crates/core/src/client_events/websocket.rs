@@ -526,7 +526,7 @@ async fn process_client_request(
         match encoding_protoc {
             EncodingProtocol::Flatbuffers => match ClientRequest::try_decode_fbs(&msg_bytes) {
                 Ok(decoded) => {
-                    tracing::debug!(%client_id, request_type = %decoded.request_type(), "Successfully deserialized Flatbuffers request");
+                    tracing::debug!(%client_id, request_type = %decoded.type_name(), "Successfully deserialized Flatbuffers request");
                     decoded.into_owned()
                 },
                 Err(err) => {
@@ -536,7 +536,7 @@ async fn process_client_request(
             },
             EncodingProtocol::Native => match bincode::deserialize::<ClientRequest>(&msg_bytes) {
                 Ok(decoded) => {
-                    tracing::debug!(%client_id, request_type = %decoded.request_type(), "Successfully deserialized Native request");
+                    tracing::debug!(%client_id, request_type = %decoded.type_name(), "Successfully deserialized Native request");
                     decoded.into_owned()
                 },
                 Err(err) => {
@@ -746,7 +746,7 @@ impl TypeName for HostResponse {
 }
 
 impl TypeName for ClientRequest<'_> {
-     fn request_type(&self) -> &'static str {
+     fn type_name(&self) -> &'static str {
          match self {
             ClientRequest::ContractOp(_) => "ContractOp",
             ClientRequest::DelegateOp(_) => "DelegateOp",
