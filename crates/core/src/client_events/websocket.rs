@@ -100,8 +100,6 @@ impl WebSocketProxy {
             ClientConnection::Request {
                 client_id,
                 req,
-                client_id,
-                req,
                 auth_token,
             } => {
                 tracing::debug!(%client_id, request = %req, ?auth_token, "Client request received by proxy");
@@ -114,7 +112,6 @@ impl WebSocketProxy {
                             tracing::debug!(%client_id, %key, "Sending subscription channel back to client handler");
                             ch.send(HostCallbackResult::SubscriptionChannel {
                                 key: *key,
-                                id: client_id,
                                 id: client_id,
                                 callback: rx,
                             })
@@ -244,7 +241,6 @@ async fn websocket_commands(
     Extension(auth_token): Extension<Option<AuthToken>>,
     Extension(encoding_protoc): Extension<EncodingProtocol>,
     Extension(rs): Extension<WebSocketRequest>,
-    Extension(rs): Extension<WebSocketRequest>,
     Extension(attested_contracts): Extension<AttestedContractMap>,
 ) -> Response {
     tracing::debug!(?auth_token, ?encoding_protoc, "Received WebSocket upgrade request");
@@ -368,9 +364,9 @@ async fn websocket_interface(
 
             process_client_request(
                 client_id,
-                next_msg,
+                msg,
                 &request_sender,
-                &mut auth_token.as_mut().map(|t| t.0.clone()),
+                auth_token.as_ref().map(|(token, _)| token.clone()), // Pass current token immutably
                 encoding_protoc,
             )
             .await
@@ -493,8 +489,7 @@ async fn process_client_request(
     client_id: ClientId,
     msg: Result<Message, axum::Error>,
     request_sender: &mpsc::Sender<ClientConnection>,
-    auth_token: &mut Option<AuthToken>,
-    auth_token: &mut Option<AuthToken>,
+    current_auth_token: Option<AuthToken>, // Renamed and made immutable
     encoding_protoc: EncodingProtocol,
 ) -> Result<Option<Message>, Option<anyhow::Error>> {
     tracing::trace!(%client_id, ?encoding_protoc, "Processing client message");
@@ -560,17 +555,15 @@ async fn process_client_request(
         }
     };
 
-    if let ClientRequest::Authenticate { token } = &req {
-        tracing::debug!(%client_id, "Processing Authenticate request, updating auth token");
-        *auth_token = Some(AuthToken::from(token.clone()));
-    }
+    // Removed the logic that updated auth_token based on Authenticate message.
+    // The token state is managed in websocket_interface.
 
-    tracing::debug!(%client_id, request = %req, ?auth_token, "Sending client request to proxy");
+    tracing::debug!(%client_id, request = %req, ?current_auth_token, "Sending client request to proxy");
     request_sender
         .send(ClientConnection::Request {
             client_id,
             req: Box::new(req),
-            auth_token: auth_token.clone(),
+            auth_token: current_auth_token.clone(), // Use the passed-in token
         })
         .await
         .map_err(|err| {
