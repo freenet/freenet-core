@@ -134,6 +134,7 @@ impl WebSocketProxy {
             }
         }
     }
+} // Added missing closing brace for impl WebSocketProxy
 
 struct EncodingProtocolExt(EncodingProtocol);
 
