@@ -919,7 +919,7 @@ pub async fn run_local_node(
                 tracing::debug!(
                     delegate_op = %op,
                     ?attested_contract,
-                    "Delegate request with attested contract"
+                    "Handling ClientRequest::DelegateOp"
                 );
                 executor.delegate_request(op, attested_contract.as_ref())
             }
