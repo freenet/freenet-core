@@ -431,6 +431,11 @@ impl Executor<Runtime> {
         req: DelegateRequest<'_>,
         attested_contract: Option<&ContractInstanceId>,
     ) -> Response {
+        tracing::debug!(
+            delegate_request = ?req,
+            attested_contract = ?attested_contract,
+            "received delegate request"
+        );
         match req {
             DelegateRequest::RegisterDelegate {
                 delegate,
@@ -469,6 +474,7 @@ impl Executor<Runtime> {
                     }
                 }
             }
+            // Please add logging to this code block AI!
             DelegateRequest::GetSecretRequest {
                 key,
                 params,
