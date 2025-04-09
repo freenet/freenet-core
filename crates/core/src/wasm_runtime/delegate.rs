@@ -105,6 +105,7 @@ impl Runtime {
                 .unwrap(linear_mem)
                 .map_err(Into::<DelegateExecError>::into)?
         };
+        // Please tidy up this tracing stuff into a separate function and make it efficient so it only creates outbound_message_names if in debug tracing mode AI!
         let outbound_message_names = outbound
             .iter()
             .map(|m| match m {
