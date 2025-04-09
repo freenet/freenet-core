@@ -105,17 +105,29 @@ impl Runtime {
                 .unwrap(linear_mem)
                 .map_err(Into::<DelegateExecError>::into)?
         };
-        let outbound_message_names = outbound.iter().map(|m| match m {
-            OutboundDelegateMsg::ApplicationMessage(am) =>
-                format!("ApplicationMessage(app={}, payload_len={}, processed={}, context_len={})"
-                        , am.app, am.payload.len(), am.processed, am.context.as_ref().len()).as_str(),
-            OutboundDelegateMsg::RequestUserInput(_) => "RequestUserInput",
-            OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdated",
-            OutboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest",
-            OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretRequest",
-            OutboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse",
-        }).join(", ");
-        tracing::debug!(inbound_msg_name, outbound_message_names, "Delegate returned outbound messages");
+        let outbound_message_names = outbound
+            .iter()
+            .map(|m| match m {
+                OutboundDelegateMsg::ApplicationMessage(am) => format!(
+                    "ApplicationMessage(app={}, payload_len={}, processed={}, context_len={})",
+                    am.app,
+                    am.payload.len(),
+                    am.processed,
+                    am.context.as_ref().len()
+                ),
+                OutboundDelegateMsg::RequestUserInput(_) => "RequestUserInput".to_string(),
+                OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdated".to_string(),
+                OutboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest".to_string(),
+                OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretRequest".to_string(),
+                OutboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse".to_string(),
+            })
+            .collect::<Vec<String>>()
+            .join(", ");
+        tracing::debug!(
+            inbound_msg_name,
+            outbound_message_names,
+            "Delegate returned outbound messages"
+        );
         Ok(outbound)
     }
 
