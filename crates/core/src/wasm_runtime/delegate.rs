@@ -105,31 +105,42 @@ impl Runtime {
                 .unwrap(linear_mem)
                 .map_err(Into::<DelegateExecError>::into)?
         };
-        // Please tidy up this tracing stuff into a separate function and make it efficient so it only creates outbound_message_names if in debug tracing mode AI!
-        let outbound_message_names = outbound
-            .iter()
-            .map(|m| match m {
-                OutboundDelegateMsg::ApplicationMessage(am) => format!(
-                    "ApplicationMessage(app={}, payload_len={}, processed={}, context_len={})",
-                    am.app,
-                    am.payload.len(),
-                    am.processed,
-                    am.context.as_ref().len()
-                ),
-                OutboundDelegateMsg::RequestUserInput(_) => "RequestUserInput".to_string(),
-                OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdated".to_string(),
-                OutboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest".to_string(),
-                OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretRequest".to_string(),
-                OutboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse".to_string(),
-            })
-            .collect::<Vec<String>>()
-            .join(", ");
-        tracing::debug!(
-            inbound_msg_name,
-            outbound_message_names,
-            "Delegate returned outbound messages"
-        );
+        self.log_delegate_exec_result(inbound_msg_name, &outbound);
         Ok(outbound)
+    }
+
+    fn log_delegate_exec_result(&self, inbound_msg_name: &str, outbound: &[OutboundDelegateMsg]) {
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let outbound_message_names = outbound
+                .iter()
+                .map(|m| match m {
+                    OutboundDelegateMsg::ApplicationMessage(am) => format!(
+                        "ApplicationMessage(app={}, payload_len={}, processed={}, context_len={})",
+                        am.app,
+                        am.payload.len(),
+                        am.processed,
+                        am.context.as_ref().len()
+                    ),
+                    OutboundDelegateMsg::RequestUserInput(_) => "RequestUserInput".to_string(),
+                    OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdated".to_string(),
+                    OutboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest".to_string(),
+                    OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretRequest".to_string(),
+                    OutboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse".to_string(),
+                })
+                .collect::<Vec<String>>()
+                .join(", ");
+            tracing::debug!(
+                inbound_msg_name,
+                outbound_message_names,
+                "Delegate returned outbound messages"
+            );
+        } else {
+            tracing::debug!(
+                inbound_msg_name,
+                outbound_len = outbound.len(),
+                "Delegate returned outbound messages"
+            );
+        }
     }
 
     fn log_get_outbound_entry(
