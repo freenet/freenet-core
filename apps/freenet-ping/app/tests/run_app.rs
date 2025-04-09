@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, bail};
+use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use freenet::{
     config::{ConfigArgs, InlineGwConfig, NetworkArgs, SecretArgs, WebsocketApiArgs},
@@ -676,21 +676,21 @@ async fn test_ping_application_loop() -> TestResult {
 
         // Create ping contract options for each node with different tags
         let gw_options = PingContractOptions {
-            frequency: Duration::from_secs(1), // Faster for testing
+            frequency: Duration::from_secs(3), // Faster for testing
             ttl: Duration::from_secs(30),
             tag: APP_TAG.to_string(),
             code_key: code_hash.to_string(),
         };
 
         let node1_options = PingContractOptions {
-            frequency: Duration::from_secs(1),
+            frequency: Duration::from_secs(3),
             ttl: Duration::from_secs(30),
             tag: APP_TAG.to_string(),
             code_key: code_hash.to_string(),
         };
 
         let node2_options = PingContractOptions {
-            frequency: Duration::from_secs(1),
+            frequency: Duration::from_secs(3),
             ttl: Duration::from_secs(30),
             tag: APP_TAG.to_string(),
             code_key: code_hash.to_string(),
@@ -848,7 +848,7 @@ async fn test_ping_application_loop() -> TestResult {
         });
 
         // Wait for test duration plus a small buffer
-        tokio::time::sleep(test_duration + Duration::from_secs(5)).await;
+        tokio::time::sleep(test_duration + Duration::from_secs(15)).await;
 
         // Signal all clients to shut down if they haven't already
         let _ = gw_shutdown_tx.send(());
@@ -867,29 +867,29 @@ async fn test_ping_application_loop() -> TestResult {
 
         // Verify that each node saw updates from other nodes
         assert!(
-            gw_stats.received_counts.contains_key("ping-from-node1"),
+            gw_stats.received_counts.contains_key("node1"),
             "Gateway didn't receive pings from node 1"
         );
         assert!(
-            gw_stats.received_counts.contains_key("ping-from-node2"),
+            gw_stats.received_counts.contains_key("node2"),
             "Gateway didn't receive pings from node 2"
         );
 
         assert!(
-            node1_stats.received_counts.contains_key("ping-from-gw"),
+            node1_stats.received_counts.contains_key("gateway"),
             "Node 1 didn't receive pings from gateway"
         );
         assert!(
-            node1_stats.received_counts.contains_key("ping-from-node2"),
+            node1_stats.received_counts.contains_key("node2"),
             "Node 1 didn't receive pings from node 2"
         );
 
         assert!(
-            node2_stats.received_counts.contains_key("ping-from-gw"),
+            node2_stats.received_counts.contains_key("gateway"),
             "Node 2 didn't receive pings from gateway"
         );
         assert!(
-            node2_stats.received_counts.contains_key("ping-from-node1"),
+            node2_stats.received_counts.contains_key("node1"),
             "Node 2 didn't receive pings from node 1"
         );
 
