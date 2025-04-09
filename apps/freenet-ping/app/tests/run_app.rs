@@ -423,7 +423,7 @@ async fn test_ping_multi_node() -> TestResult {
 
         // Wait for update notifications and check for all tags
         let start_time = std::time::Instant::now();
-        let timeout_duration = Duration::from_secs(60); // Aumentar el timeout general
+        let timeout_duration = Duration::from_secs(60);
 
         tracing::info!("Starting unified update monitoring loop");
 
@@ -504,7 +504,7 @@ async fn test_ping_multi_node() -> TestResult {
                 },
 
                 _ = sleep(Duration::from_secs(1)) => {
-                    tracing::info!("Timeout: GW({},{}), Node1({},{}), Node2({},{})",
+                    tracing::info!("Seelp waiting responses: GW({},{}), Node1({},{}), Node2({},{})",
                                   gw_seen_node1, gw_seen_node2,
                                   node1_seen_gw, node1_seen_node2,
                                   node2_seen_gw, node2_seen_node1);
@@ -676,7 +676,7 @@ async fn test_ping_application_loop() -> TestResult {
 
         // Create ping contract options for each node with different tags
         let gw_options = PingContractOptions {
-            frequency: Duration::from_secs(3), // Faster for testing
+            frequency: Duration::from_secs(3),
             ttl: Duration::from_secs(30),
             tag: APP_TAG.to_string(),
             code_key: code_hash.to_string(),

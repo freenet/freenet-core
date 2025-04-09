@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "bincode",
  "blake3",
