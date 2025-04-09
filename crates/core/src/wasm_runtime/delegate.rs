@@ -100,19 +100,12 @@ impl Runtime {
         Ok(outbound)
     }
 
-    // FIXME: modify the context atomically from the delegates, requires some changes to handle function calls with envs
-    #[allow(clippy::too_many_arguments)]
-    fn get_outbound(
-        &mut self,
+    fn log_get_outbound_entry(
+        &self,
         delegate_key: &DelegateKey,
-        instance: &Instance,
-        process_func: &TypedFunction<(i64, i64, i64), i64>,
-        params: &Parameters<'_>,
         attested: Option<&[u8]>,
-        outbound_msgs: &mut VecDeque<OutboundDelegateMsg>,
-        results: &mut Vec<OutboundDelegateMsg>,
-    ) -> RuntimeResult<DelegateContext> {
-        // This is good but kinda complicated, can it be moved into a separate function so as not to clutter this one? AI!
+        outbound_msgs: &VecDeque<OutboundDelegateMsg>,
+    ) {
         tracing::debug!(
             delegate_key = ?delegate_key,
             ?attested,
@@ -135,6 +128,21 @@ impl Runtime {
             }),
             "get_outbound called"
         );
+    }
+
+    // FIXME: modify the context atomically from the delegates, requires some changes to handle function calls with envs
+    #[allow(clippy::too_many_arguments)]
+    fn get_outbound(
+        &mut self,
+        delegate_key: &DelegateKey,
+        instance: &Instance,
+        process_func: &TypedFunction<(i64, i64, i64), i64>,
+        params: &Parameters<'_>,
+        attested: Option<&[u8]>,
+        outbound_msgs: &mut VecDeque<OutboundDelegateMsg>,
+        results: &mut Vec<OutboundDelegateMsg>,
+    ) -> RuntimeResult<DelegateContext> {
+        self.log_get_outbound_entry(delegate_key, attested, outbound_msgs);
 
         const MAX_ITERATIONS: usize = 100;
         let mut recurssion = 0;
