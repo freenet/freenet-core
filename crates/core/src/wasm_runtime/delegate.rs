@@ -112,7 +112,7 @@ impl Runtime {
         outbound_msgs: &mut VecDeque<OutboundDelegateMsg>,
         results: &mut Vec<OutboundDelegateMsg>,
     ) -> RuntimeResult<DelegateContext> {
-        tracing::debug!(delegate_key, attested, outbound_msgs_len = outbound_msgs.len(), "get_outbound called");
+        tracing::debug!(delegate_key = ?delegate_key, ?attested, outbound_msgs_len = outbound_msgs.len(), "get_outbound called");
 
         const MAX_ITERATIONS: usize = 100;
         let mut recurssion = 0;
