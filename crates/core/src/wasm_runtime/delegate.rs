@@ -112,12 +112,13 @@ impl Runtime {
         outbound_msgs: &mut VecDeque<OutboundDelegateMsg>,
         results: &mut Vec<OutboundDelegateMsg>,
     ) -> RuntimeResult<DelegateContext> {
+        // This is good but kinda complicated, can it be moved into a separate function so as not to clutter this one? AI!
         tracing::debug!(
             delegate_key = ?delegate_key,
             ?attested,
             outbound_msgs_len = outbound_msgs.len(),
             // Generate message details only if DEBUG level is enabled
-            outbound_msg_details = tracing::field::debug(if tracing::enabled!(tracing::Level::DEBUG) {
+            outbound_msg_details = debug(if tracing::enabled!(tracing::Level::DEBUG) {
                 outbound_msgs.iter().map(|msg| {
                     match msg {
                         OutboundDelegateMsg::ApplicationMessage(m) => format!("AppMsg(payload_len={})", m.payload.len()),
