@@ -24,6 +24,7 @@ impl ContractInterface for Contract {
 
             return Ok(ValidateResult::Valid);
         }
+        #[cfg(feature = "contract")]
         let ping = serde_json::from_slice::<Ping>(bytes)
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
@@ -204,6 +205,7 @@ impl ContractInterface for Contract {
 
             return Ok(StateSummary::from(vec![]));
         }
+        #[cfg(feature = "contract")]
         let ping = serde_json::from_slice::<Ping>(state)
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
