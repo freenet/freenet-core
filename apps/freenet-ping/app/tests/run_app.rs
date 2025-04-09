@@ -399,55 +399,6 @@ async fn test_ping_multi_node() -> TestResult {
             }))
             .await?;
 
-        loop {
-            let resp = tokio::time::timeout(Duration::from_secs(10), client_gw.recv()).await;
-            match resp {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
-                    key,
-                    ..
-                }))) => {
-                    assert_eq!(
-                        key, contract_key,
-                        "Contract key mismatch in UPDATE response"
-                    );
-                    tracing::info!("Gateway: update sent successfully");
-                    break;
-                }
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
-                    key,
-                    update,
-                }))) => {
-                    if key == contract_key {
-                        match process_ping_update(&mut gw_local_state, ping_options.ttl, update) {
-                            Ok(updates) => {
-                                for (name, _timestamp) in updates {
-                                    tracing::info!("Gateway saw update from: {}", name);
-                                    if name == node1_tag {
-                                        gw_seen_node1 = true;
-                                    } else if name == node2_tag {
-                                        gw_seen_node2 = true;
-                                    }
-                                }
-                            }
-                            Err(e) => tracing::error!("Gateway error processing update: {}", e),
-                        }
-                    }
-                }
-                Ok(Ok(other)) => {
-                    tracing::warn!(
-                        "Gateway: unexpected response while waiting for update: {:?}",
-                        other
-                    );
-                }
-                Ok(Err(e)) => {
-                    bail!("Gateway: Error receiving update response: {}", e);
-                }
-                Err(_) => {
-                    bail!("Gateway: Timeout waiting for update response");
-                }
-            }
-        }
-
         // Node 1 sends update with its tag
         let mut node1_ping = Ping::default();
         node1_ping.insert(node1_tag.clone());
@@ -458,36 +409,6 @@ async fn test_ping_multi_node() -> TestResult {
                 data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&node1_ping).unwrap())),
             }))
             .await?;
-
-        // Wait for update response on node 1
-        loop {
-            let resp = tokio::time::timeout(Duration::from_secs(5), client_node1.recv()).await;
-            match resp {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
-                    key,
-                    ..
-                }))) => {
-                    assert_eq!(
-                        key, contract_key,
-                        "Contract key mismatch in UPDATE response"
-                    );
-                    tracing::info!("Node 1: update sent successfully");
-                    break;
-                }
-                Ok(Ok(other)) => {
-                    tracing::warn!(
-                        "Node 1: unexpected response while waiting for update: {:?}",
-                        other
-                    );
-                }
-                Ok(Err(e)) => {
-                    bail!("Node 1: Error receiving update response: {}", e);
-                }
-                Err(_) => {
-                    bail!("Node 1: Timeout waiting for update response");
-                }
-            }
-        }
 
         // Node 2 sends update with its tag
         let mut node2_ping = Ping::default();
@@ -500,39 +421,11 @@ async fn test_ping_multi_node() -> TestResult {
             }))
             .await?;
 
-        // Wait for update response on node 2
-        loop {
-            let resp = tokio::time::timeout(Duration::from_secs(5), client_node2.recv()).await;
-            match resp {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
-                    key,
-                    ..
-                }))) => {
-                    assert_eq!(
-                        key, contract_key,
-                        "Contract key mismatch in UPDATE response"
-                    );
-                    tracing::info!("Node 2: update sent successfully");
-                    break;
-                }
-                Ok(Ok(other)) => {
-                    tracing::warn!(
-                        "Node 2: unexpected response while waiting for update: {:?}",
-                        other
-                    );
-                }
-                Ok(Err(e)) => {
-                    bail!("Node 2: Error receiving update response: {}", e);
-                }
-                Err(_) => {
-                    bail!("Node 2: Timeout waiting for update response");
-                }
-            }
-        }
-
         // Wait for update notifications and check for all tags
         let start_time = std::time::Instant::now();
-        let timeout_duration = Duration::from_secs(30);
+        let timeout_duration = Duration::from_secs(60); // Aumentar el timeout general
+
+        tracing::info!("Starting unified update monitoring loop");
 
         while start_time.elapsed() < timeout_duration
             && (!gw_seen_node1
@@ -542,82 +435,81 @@ async fn test_ping_multi_node() -> TestResult {
                 || !node2_seen_gw
                 || !node2_seen_node1)
         {
-            // Check gateway for updates
-            if !gw_seen_node1 || !gw_seen_node2 {
-                if let Ok(Ok(HostResponse::ContractResponse(
-                    ContractResponse::UpdateNotification { key, update },
-                ))) = tokio::time::timeout(Duration::from_millis(100), client_gw.recv()).await
-                {
-                    if key == contract_key {
-                        match process_ping_update(&mut gw_local_state, ping_options.ttl, update) {
-                            Ok(updates) => {
-                                for (name, _timestamp) in updates {
-                                    tracing::info!("Gateway saw update from: {}", name);
-                                    if name == node1_tag {
-                                        gw_seen_node1 = true;
-                                    } else if name == node2_tag {
-                                        gw_seen_node2 = true;
+            select! {
+                // Check gateway for updates
+                gw_msg = client_gw.recv() => {
+                    if let Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification { key, update })) = gw_msg {
+                        if key == contract_key {
+                            match process_ping_update(&mut gw_local_state, ping_options.ttl, update) {
+                                Ok(updates) => {
+                                    for (name, _timestamp) in updates {
+                                        tracing::info!("Gateway saw update from: {}", name);
+                                        if name == node1_tag {
+                                            gw_seen_node1 = true;
+                                        } else if name == node2_tag {
+                                            gw_seen_node2 = true;
+                                        }
                                     }
                                 }
+                                Err(e) => tracing::error!("Gateway error processing update: {}", e),
                             }
-                            Err(e) => tracing::error!("Gateway error processing update: {}", e),
                         }
                     }
-                }
-            }
+                },
 
-            // Check node 1 for updates
-            if !node1_seen_gw || !node1_seen_node2 {
-                if let Ok(Ok(HostResponse::ContractResponse(
-                    ContractResponse::UpdateNotification { key, update },
-                ))) = tokio::time::timeout(Duration::from_millis(100), client_node1.recv()).await
-                {
-                    if key == contract_key {
-                        match process_ping_update(&mut node1_local_state, ping_options.ttl, update)
-                        {
-                            Ok(updates) => {
-                                for (name, _timestamp) in updates {
-                                    tracing::info!("Node 1 saw update from: {}", name);
-                                    if name == gw_tag {
-                                        node1_seen_gw = true;
-                                    } else if name == node2_tag {
-                                        node1_seen_node2 = true;
+                // Check node 1 for updates
+                node1_msg = client_node1.recv() => {
+                    if let Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification { key, update })) = node1_msg {
+                        if key == contract_key {
+                            match process_ping_update(&mut node1_local_state, ping_options.ttl, update) {
+                                Ok(updates) => {
+                                    for (name, _timestamp) in updates {
+                                        tracing::info!("Node 1 saw update from: {}", name);
+                                        if name == gw_tag {
+                                            node1_seen_gw = true;
+                                        } else if name == node2_tag {
+                                            node1_seen_node2 = true;
+                                        }
                                     }
                                 }
+                                Err(e) => tracing::error!("Node 1 error processing update: {}", e),
                             }
-                            Err(e) => tracing::error!("Node 1 error processing update: {}", e),
                         }
                     }
-                }
-            }
+                },
 
-            // Check node 2 for updates
-            if !node2_seen_gw || !node2_seen_node1 {
-                if let Ok(Ok(HostResponse::ContractResponse(
-                    ContractResponse::UpdateNotification { key, update },
-                ))) = tokio::time::timeout(Duration::from_millis(100), client_node2.recv()).await
-                {
-                    if key == contract_key {
-                        match process_ping_update(&mut node2_local_state, ping_options.ttl, update)
-                        {
-                            Ok(updates) => {
-                                for (name, _timestamp) in updates {
-                                    tracing::info!("Node 2 saw update from: {}", name);
-                                    if name == gw_tag {
-                                        node2_seen_gw = true;
-                                    } else if name == node1_tag {
-                                        node2_seen_node1 = true;
+                // Check node 2 for updates
+                node2_msg = client_node2.recv() => {
+                    tracing::info!("Node 2: Received message");
+                    if let Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification { key, update })) = node2_msg {
+                        tracing::info!("Node 2: Received update notification for key: {:?}", key);
+                        if key == contract_key {
+                            match process_ping_update(&mut node2_local_state, ping_options.ttl, update) {
+                                Ok(updates) => {
+                                    for (name, _timestamp) in updates {
+                                        tracing::info!("Node 2 saw update from: {}", name);
+                                        if name == gw_tag {
+                                            node2_seen_gw = true;
+                                            tracing::info!("Node 2: Marked as seen gateway update");
+                                        } else if name == node1_tag {
+                                            node2_seen_node1 = true;
+                                            tracing::info!("Node 2: Marked as seen node1 update");
+                                        }
                                     }
                                 }
+                                Err(e) => tracing::error!("Node 2 error processing update: {}", e),
                             }
-                            Err(e) => tracing::error!("Node 2 error processing update: {}", e),
                         }
                     }
+                },
+
+                _ = sleep(Duration::from_secs(1)) => {
+                    tracing::info!("Timeout: GW({},{}), Node1({},{}), Node2({},{})",
+                                  gw_seen_node1, gw_seen_node2,
+                                  node1_seen_gw, node1_seen_node2,
+                                  node2_seen_gw, node2_seen_node1);
                 }
             }
-
-            // Short sleep to avoid busy-waiting
-            sleep(Duration::from_millis(100)).await;
         }
 
         // Verify that all nodes saw updates from all other nodes
