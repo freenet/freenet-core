@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use itertools::Itertools;
 use freenet_stdlib::prelude::{
     ApplicationMessage, ClientResponse, DelegateContainer, DelegateContext, DelegateError,
     DelegateInterfaceResult, DelegateKey, GetSecretRequest, GetSecretResponse, InboundDelegateMsg,
@@ -85,6 +86,13 @@ impl Runtime {
             msg_buf.write(msg)?;
             msg_buf.ptr()
         };
+        let inbound_msg_name = match msg {
+            InboundDelegateMsg::ApplicationMessage(_) => "ApplicationMessage",
+            InboundDelegateMsg::UserResponse(_) => "UserResponse",
+            InboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse",
+            InboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest",
+        };
+        tracing::debug!(inbound_msg_name, "Calling delegate with inbound message");
         let res = process_func.call(
             self.wasm_store.as_mut().unwrap(),
             param_buf_ptr as i64,
@@ -97,6 +105,17 @@ impl Runtime {
                 .unwrap(linear_mem)
                 .map_err(Into::<DelegateExecError>::into)?
         };
+        let outbound_message_names = outbound.iter().map(|m| match m {
+            OutboundDelegateMsg::ApplicationMessage(am) =>
+                format!("ApplicationMessage(app={}, payload_len={}, processed={}, context_len={})"
+                        , am.app, am.payload.len(), am.processed, am.context.as_ref().len()).as_str(),
+            OutboundDelegateMsg::RequestUserInput(_) => "RequestUserInput",
+            OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdated",
+            OutboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest",
+            OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretRequest",
+            OutboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse",
+        }).join(", ");
+        tracing::debug!(inbound_msg_name, outbound_message_names, "Delegate returned outbound messages");
         Ok(outbound)
     }
 
@@ -145,7 +164,7 @@ impl Runtime {
         self.log_get_outbound_entry(delegate_key, attested, outbound_msgs);
 
         const MAX_ITERATIONS: usize = 100;
-        let mut recurssion = 0;
+        let mut recursion = 0;
         let Some(mut last_context) = outbound_msgs.back().and_then(|m| m.get_context().cloned())
         else {
             return Ok(DelegateContext::default());
@@ -155,18 +174,20 @@ impl Runtime {
                 OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
                     key, processed, ..
                 }) if !processed => {
+                    tracing::debug!(%key, "Handling OutboundDelegateMsg::GetSecretRequest received from delegate");
                     let secret = self.secret_store.get_secret(delegate_key, &key)?;
+                    tracing::debug!(%key, secret_length = ?secret.len(), "Secret successfully retrieved from store");
                     let inbound = InboundDelegateMsg::GetSecretResponse(GetSecretResponse {
                         key,
                         value: Some(secret),
                         context: last_context.clone(),
                     });
-                    if recurssion >= MAX_ITERATIONS {
+                    if recursion >= MAX_ITERATIONS {
                         return Err(ContractError::from(RuntimeInnerError::DelegateExecError(DelegateError::Other("The maximum number of attempts to get the secret has been exceeded".to_string()).into())));
                     }
                     let new_msgs =
                         self.exec_inbound(params, attested, &inbound, process_func, instance)?;
-                    recurssion += 1;
+                    recursion += 1;
                     let Some(last_msg) = new_msgs.last() else {
                         return Err(ContractError::from(RuntimeInnerError::DelegateExecError(
                             DelegateError::Other(
@@ -207,7 +228,7 @@ impl Runtime {
                     }
                 }
                 OutboundDelegateMsg::ApplicationMessage(msg) if !msg.processed => {
-                    if recurssion >= MAX_ITERATIONS {
+                    if recursion >= MAX_ITERATIONS {
                         return Err(DelegateExecError::DelegateError(DelegateError::Other(
                             "max recurssion (100) limit hit".into(),
                         ))
@@ -224,7 +245,7 @@ impl Runtime {
                         process_func,
                         instance,
                     )?;
-                    recurssion += 1;
+                    recursion += 1;
                     for msg in outbound {
                         outbound_msgs.push_back(msg);
                     }
