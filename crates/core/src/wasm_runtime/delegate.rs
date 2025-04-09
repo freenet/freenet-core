@@ -112,6 +112,7 @@ impl Runtime {
         outbound_msgs: &mut VecDeque<OutboundDelegateMsg>,
         results: &mut Vec<OutboundDelegateMsg>,
     ) -> RuntimeResult<DelegateContext> {
+        // Please enhance this to show a list of the outbound message lengths and do it in a way that's efficient (only compile list if in debug tracing mode) AI!
         tracing::debug!(delegate_key = ?delegate_key, ?attested, outbound_msgs_len = outbound_msgs.len(), "get_outbound called");
 
         const MAX_ITERATIONS: usize = 100;
