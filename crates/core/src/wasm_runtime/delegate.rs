@@ -210,6 +210,7 @@ impl Runtime {
                     }
                     let new_msgs =
                         self.exec_inbound(params, attested, &inbound, process_func, instance)?;
+                    tracing::debug!(?new_msgs, "Messages returned from exec_inbound after GetSecretResponse");
                     recursion += 1;
                     let Some(last_msg) = new_msgs.last() else {
                         return Err(ContractError::from(RuntimeInnerError::DelegateExecError(
@@ -274,6 +275,7 @@ impl Runtime {
                     }
                 }
                 OutboundDelegateMsg::ApplicationMessage(mut msg) => {
+                    tracing::debug!(?msg, "Adding processed ApplicationMessage to results in get_outbound");
                     msg.context = DelegateContext::default();
                     results.push(OutboundDelegateMsg::ApplicationMessage(msg));
                     break;
@@ -437,6 +439,7 @@ impl DelegateRuntimeInterface for Runtime {
                 _ => unreachable!(),
             }
         }
+        tracing::debug!(?results, "Final results returned by inbound_app_message");
         Ok(results)
     }
 
