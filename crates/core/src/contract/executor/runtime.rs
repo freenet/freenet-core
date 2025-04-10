@@ -432,7 +432,6 @@ impl Executor<Runtime> {
         attested_contract: Option<&ContractInstanceId>,
     ) -> Response {
         tracing::debug!(
-            delegate_request = ?req,
             attested_contract = ?attested_contract,
             "received delegate request"
         );

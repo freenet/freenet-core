@@ -243,9 +243,11 @@ impl Runtime {
                                 *ctx = last_context.clone();
                             };
                         }
-                        if !pending.processed() {
+                        // My understanding is that processed should be true for the last message in a chain, but this
+                        // line was causing that message to be dropped. Disabling check experimentally.
+                        //   if !pending.processed() { // Possible bug?
                             outbound_msgs.push_back(pending);
-                        }
+                     //   }
                     }
                 }
                 OutboundDelegateMsg::GetSecretRequest(GetSecretRequest { context, .. }) => {

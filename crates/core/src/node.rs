@@ -29,7 +29,7 @@ use std::{collections::HashSet, convert::Infallible};
 use rsa::pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
-
+use freenet_stdlib::client_api::DelegateRequest;
 use self::p2p_impl::NodeP2P;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
@@ -916,8 +916,15 @@ pub async fn run_local_node(
                         .ok()
                         .and_then(|guard| guard.get(&token).map(|(t, _)| *t))
                 });
+                let op_name = match op {
+                    DelegateRequest::RegisterDelegate { .. } => "RegisterDelegate",
+                    DelegateRequest::ApplicationMessages { .. } => "ApplicationMessages",
+                    DelegateRequest::GetSecretRequest { .. } => "GetSecretRequest",
+                    DelegateRequest::UnregisterDelegate(_) => "UnregisterDelegate",
+                    _ => "Unknown",
+                };
                 tracing::debug!(
-                    delegate_op = ?op,
+                    op_name = ?op_name,
                     ?attested_contract,
                     "Handling ClientRequest::DelegateOp"
                 );

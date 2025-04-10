@@ -478,7 +478,14 @@ async fn process_host_response(
             debug_assert_eq!(id, client_id);
             let result = match result {
                 Ok(res) => {
-                    tracing::debug!(response = %res, cli_id = %id, "sending response");
+                    let response_type = match res {
+                        HostResponse::ContractResponse { .. } => "ContractResponse",
+                        HostResponse::DelegateResponse { .. } => "DelegateResponse",
+                        HostResponse::QueryResponse(_) => "QueryResponse",
+                        HostResponse::Ok => "HostResponse::Ok",
+                        _ => "Unknown",
+                    };
+                    tracing::debug!(response = %res, response_type, cli_id = %id, "sending response");
                     match res {
                         HostResponse::ContractResponse(ContractResponse::GetResponse {
                             key,
