@@ -198,11 +198,11 @@ impl Runtime {
                     key, processed, ..
                 }) if !processed => {
                     tracing::debug!(%key, "Handling OutboundDelegateMsg::GetSecretRequest received from delegate");
-                    let secret_value = self.secret_store.get_secret(delegate_key, &key)?;
-                    tracing::debug!(%key, secret_length = secret_value.len(), "Secret successfully retrieved from store");
+                    let secret_result = self.secret_store.get_secret(delegate_key, &key).ok();
+                    tracing::debug!(%key, secret_is_some = secret_result.is_some(), "Secret store responded");
                     let inbound = InboundDelegateMsg::GetSecretResponse(GetSecretResponse {
                         key,
-                        value: Some(secret_value),
+                        value: secret_result,
                         context: last_context.clone(),
                     });
                     if recursion >= MAX_ITERATIONS {
@@ -243,8 +243,6 @@ impl Runtime {
                                 *ctx = last_context.clone();
                             };
                         }
-                        // My understanding is that processed should be true for the last message in a chain, but this
-                        // line was causing that message to be dropped. Disabling check experimentally.
                         if !pending.processed() {
                             outbound_msgs.push_back(pending);
                         }
@@ -265,7 +263,10 @@ impl Runtime {
                         self.secret_store.remove_secret(delegate_key, &key)?;
                     }
                 }
-                OutboundDelegateMsg::ApplicationMessage(msg) if !msg.processed => {
+           /*  Why would it take the payload from an ApplicationMessage coming from the delegate and
+               send it back to the delegate?
+
+           OutboundDelegateMsg::ApplicationMessage(msg) if !msg.processed => {
                     if recursion >= MAX_ITERATIONS {
                         return Err(DelegateExecError::DelegateError(DelegateError::Other(
                             "max recurssion (100) limit hit".into(),
@@ -287,7 +288,7 @@ impl Runtime {
                     for msg in outbound {
                         outbound_msgs.push_back(msg);
                     }
-                }
+                } */
                 OutboundDelegateMsg::ApplicationMessage(mut msg) => {
                     tracing::debug!(app = %msg.app, payload_len = msg.payload.len(), processed = msg.processed, "Adding processed ApplicationMessage to results in get_outbound");
                     msg.context = DelegateContext::default();
