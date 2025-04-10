@@ -26,10 +26,6 @@ use std::{
 };
 use std::{collections::HashSet, convert::Infallible};
 
-use rsa::pkcs8::DecodePublicKey;
-use serde::{Deserialize, Serialize};
-use tracing::Instrument;
-use freenet_stdlib::client_api::DelegateRequest;
 use self::p2p_impl::NodeP2P;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
@@ -52,6 +48,10 @@ use crate::{
     config::Config,
     message::{MessageStats, NetMessageV1},
 };
+use freenet_stdlib::client_api::DelegateRequest;
+use rsa::pkcs8::DecodePublicKey;
+use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 use crate::operations::handle_op_request;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};

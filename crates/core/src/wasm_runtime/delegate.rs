@@ -211,17 +211,22 @@ impl Runtime {
                     let new_msgs =
                         self.exec_inbound(params, attested, &inbound, process_func, instance)?;
                     if tracing::enabled!(tracing::Level::DEBUG) {
-                        let summary = new_msgs.iter().map(|m| {
-                            match m {
+                        let summary = new_msgs
+                            .iter()
+                            .map(|m| match m {
                                 OutboundDelegateMsg::ApplicationMessage(_) => "ApplicationMessage",
                                 OutboundDelegateMsg::RequestUserInput(_) => "RequestUserInput",
                                 OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdated",
                                 OutboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest",
                                 OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretRequest",
                                 OutboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse",
-                            }
-                        }).collect::<Vec<_>>();
-                        tracing::debug!(count = new_msgs.len(), ?summary, "Messages returned from exec_inbound after GetSecretResponse");
+                            })
+                            .collect::<Vec<_>>();
+                        tracing::debug!(
+                            count = new_msgs.len(),
+                            ?summary,
+                            "Messages returned from exec_inbound after GetSecretResponse"
+                        );
                     }
                     recursion += 1;
                     let Some(last_msg) = new_msgs.last() else {
@@ -263,32 +268,32 @@ impl Runtime {
                         self.secret_store.remove_secret(delegate_key, &key)?;
                     }
                 }
-           /*  Why would it take the payload from an ApplicationMessage coming from the delegate and
-               send it back to the delegate?
+                /*  Why would it take the payload from an ApplicationMessage coming from the delegate and
+                    send it back to the delegate?
 
-           OutboundDelegateMsg::ApplicationMessage(msg) if !msg.processed => {
-                    if recursion >= MAX_ITERATIONS {
-                        return Err(DelegateExecError::DelegateError(DelegateError::Other(
-                            "max recurssion (100) limit hit".into(),
-                        ))
-                        .into());
-                    }
-                    let outbound = self.exec_inbound(
-                        params,
-                        attested,
-                        &InboundDelegateMsg::ApplicationMessage(
-                            ApplicationMessage::new(msg.app, msg.payload)
-                                .processed(msg.processed)
-                                .with_context(last_context.clone()),
-                        ),
-                        process_func,
-                        instance,
-                    )?;
-                    recursion += 1;
-                    for msg in outbound {
-                        outbound_msgs.push_back(msg);
-                    }
-                } */
+                OutboundDelegateMsg::ApplicationMessage(msg) if !msg.processed => {
+                         if recursion >= MAX_ITERATIONS {
+                             return Err(DelegateExecError::DelegateError(DelegateError::Other(
+                                 "max recurssion (100) limit hit".into(),
+                             ))
+                             .into());
+                         }
+                         let outbound = self.exec_inbound(
+                             params,
+                             attested,
+                             &InboundDelegateMsg::ApplicationMessage(
+                                 ApplicationMessage::new(msg.app, msg.payload)
+                                     .processed(msg.processed)
+                                     .with_context(last_context.clone()),
+                             ),
+                             process_func,
+                             instance,
+                         )?;
+                         recursion += 1;
+                         for msg in outbound {
+                             outbound_msgs.push_back(msg);
+                         }
+                     } */
                 OutboundDelegateMsg::ApplicationMessage(mut msg) => {
                     tracing::debug!(app = %msg.app, payload_len = msg.payload.len(), processed = msg.processed, "Adding processed ApplicationMessage to results in get_outbound");
                     msg.context = DelegateContext::default();
@@ -454,7 +459,10 @@ impl DelegateRuntimeInterface for Runtime {
                 _ => unreachable!(),
             }
         }
-        tracing::debug!(count = results.len(), "Final results returned by inbound_app_message");
+        tracing::debug!(
+            count = results.len(),
+            "Final results returned by inbound_app_message"
+        );
         Ok(results)
     }
 
