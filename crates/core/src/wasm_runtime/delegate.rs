@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use itertools::Itertools;
 use freenet_stdlib::prelude::{
     ApplicationMessage, ClientResponse, DelegateContainer, DelegateContext, DelegateError,
     DelegateInterfaceResult, DelegateKey, GetSecretRequest, GetSecretResponse, InboundDelegateMsg,
