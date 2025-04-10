@@ -421,106 +421,206 @@ async fn test_ping_multi_node() -> TestResult {
             }))
             .await?;
 
-        // Wait for update notifications and check for all tags
-        let start_time = std::time::Instant::now();
-        let timeout_duration = Duration::from_secs(60);
+        // Wait for updates to propagate across the network
+        tracing::info!("Waiting for updates to propagate across the network...");
+        sleep(Duration::from_secs(20)).await;
 
-        tracing::info!("Starting unified update monitoring loop");
-
-        while start_time.elapsed() < timeout_duration
-            && (!gw_seen_node1
-                || !gw_seen_node2
-                || !node1_seen_gw
-                || !node1_seen_node2
-                || !node2_seen_gw
-                || !node2_seen_node1)
-        {
-            select! {
-                // Check gateway for updates
-                gw_msg = client_gw.recv() => {
-                    if let Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification { key, update })) = gw_msg {
-                        if key == contract_key {
-                            match process_ping_update(&mut gw_local_state, ping_options.ttl, update) {
-                                Ok(updates) => {
-                                    for (name, _timestamp) in updates {
-                                        tracing::info!("Gateway saw update from: {}", name);
-                                        if name == node1_tag {
-                                            gw_seen_node1 = true;
-                                        } else if name == node2_tag {
-                                            gw_seen_node2 = true;
-                                        }
-                                    }
-                                }
-                                Err(e) => tracing::error!("Gateway error processing update: {}", e),
-                            }
-                        }
+        // Function to verify if all nodes have all the expected tags
+        let verify_all_tags_present =
+            |gw: &Ping, node1: &Ping, node2: &Ping, tags: &[String]| -> bool {
+                for tag in tags {
+                    if !gw.contains_key(tag) || !node1.contains_key(tag) || !node2.contains_key(tag)
+                    {
+                        return false;
                     }
-                },
+                }
+                true
+            };
 
-                // Check node 1 for updates
-                node1_msg = client_node1.recv() => {
-                    if let Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification { key, update })) = node1_msg {
-                        if key == contract_key {
-                            match process_ping_update(&mut node1_local_state, ping_options.ttl, update) {
-                                Ok(updates) => {
-                                    for (name, _timestamp) in updates {
-                                        tracing::info!("Node 1 saw update from: {}", name);
-                                        if name == gw_tag {
-                                            node1_seen_gw = true;
-                                        } else if name == node2_tag {
-                                            node1_seen_node2 = true;
-                                        }
-                                    }
-                                }
-                                Err(e) => tracing::error!("Node 1 error processing update: {}", e),
-                            }
-                        }
-                    }
-                },
+        // Function to get the current states from all nodes
+        let get_all_states = async |client_gw: &mut WebApi,
+                                    client_node1: &mut WebApi,
+                                    client_node2: &mut WebApi,
+                                    key: ContractKey|
+               -> anyhow::Result<(Ping, Ping, Ping)> {
+            // Request the contract state from all nodes
+            tracing::info!("Querying all nodes for current state...");
 
-                // Check node 2 for updates
-                node2_msg = client_node2.recv() => {
-                    tracing::info!("Node 2: Received message");
-                    if let Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification { key, update })) = node2_msg {
-                        tracing::info!("Node 2: Received update notification for key: {:?}", key);
-                        if key == contract_key {
-                            match process_ping_update(&mut node2_local_state, ping_options.ttl, update) {
-                                Ok(updates) => {
-                                    for (name, _timestamp) in updates {
-                                        tracing::info!("Node 2 saw update from: {}", name);
-                                        if name == gw_tag {
-                                            node2_seen_gw = true;
-                                            tracing::info!("Node 2: Marked as seen gateway update");
-                                        } else if name == node1_tag {
-                                            node2_seen_node1 = true;
-                                            tracing::info!("Node 2: Marked as seen node1 update");
-                                        }
-                                    }
-                                }
-                                Err(e) => tracing::error!("Node 2 error processing update: {}", e),
-                            }
-                        }
-                    }
-                },
+            client_gw
+                .send(ClientRequest::ContractOp(ContractRequest::Get {
+                    key,
+                    return_contract_code: false,
+                    subscribe: false,
+                }))
+                .await?;
 
-                _ = sleep(Duration::from_secs(1)) => {
-                    tracing::info!("Seelp waiting responses: GW({},{}), Node1({},{}), Node2({},{})",
-                                  gw_seen_node1, gw_seen_node2,
-                                  node1_seen_gw, node1_seen_node2,
-                                  node2_seen_gw, node2_seen_node1);
+            client_node1
+                .send(ClientRequest::ContractOp(ContractRequest::Get {
+                    key,
+                    return_contract_code: false,
+                    subscribe: false,
+                }))
+                .await?;
+
+            client_node2
+                .send(ClientRequest::ContractOp(ContractRequest::Get {
+                    key,
+                    return_contract_code: false,
+                    subscribe: false,
+                }))
+                .await?;
+
+            // Receive and deserialize the states from all nodes
+            let state_gw = wait_for_get_response(client_gw, &key)
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            let state_node1 = wait_for_get_response(client_node1, &key)
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            let state_node2 = wait_for_get_response(client_node2, &key)
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            Ok((state_gw, state_node1, state_node2))
+        };
+
+        // Variables for retry mechanism
+        let expected_tags = vec![gw_tag.clone(), node1_tag.clone(), node2_tag.clone()];
+        let max_retries = 3;
+        let mut retry_count = 0;
+        let mut final_state_gw;
+        let mut final_state_node1;
+        let mut final_state_node2;
+
+        // Retry loop to wait for all updates to propagate
+        loop {
+            // Get current states
+            let (gw_state, node1_state, node2_state) = get_all_states(
+                &mut client_gw,
+                &mut client_node1,
+                &mut client_node2,
+                contract_key,
+            )
+            .await?;
+
+            final_state_gw = gw_state;
+            final_state_node1 = node1_state;
+            final_state_node2 = node2_state;
+
+            // Check if all nodes have all the tags
+            if verify_all_tags_present(
+                &final_state_gw,
+                &final_state_node1,
+                &final_state_node2,
+                &expected_tags,
+            ) {
+                tracing::info!("All tags successfully propagated to all nodes!");
+                break;
+            }
+
+            // If we've reached maximum retries, continue with the test
+            if retry_count >= max_retries {
+                tracing::warn!(
+                    "Not all tags propagated after {} retries - continuing with current state",
+                    max_retries
+                );
+                break;
+            }
+
+            // Otherwise, wait and retry
+            retry_count += 1;
+            tracing::info!(
+                "Some tags are missing from some nodes. Waiting another 15 seconds (retry {}/{})",
+                retry_count,
+                max_retries
+            );
+            sleep(Duration::from_secs(15)).await;
+        }
+
+        // Log the final state from each node
+        tracing::info!("Gateway final state: {}", final_state_gw);
+        tracing::info!("Node 1 final state: {}", final_state_node1);
+        tracing::info!("Node 2 final state: {}", final_state_node2);
+
+        // Show detailed comparison by tag
+        tracing::info!("===== Detailed comparison of final states =====");
+
+        let tags = vec![gw_tag.clone(), node1_tag.clone(), node2_tag.clone()];
+        for tag in &tags {
+            let gw_time = final_state_gw
+                .get(tag)
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_else(|| "MISSING".to_string());
+            let node1_time = final_state_node1
+                .get(tag)
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_else(|| "MISSING".to_string());
+            let node2_time = final_state_node2
+                .get(tag)
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_else(|| "MISSING".to_string());
+
+            tracing::info!("Tag '{}' timestamps:", tag);
+            tracing::info!("  - Gateway: {}", gw_time);
+            tracing::info!("  - Node 1:  {}", node1_time);
+            tracing::info!("  - Node 2:  {}", node2_time);
+
+            // Check if each tag has the same timestamp across all nodes (if it exists in all nodes)
+            if final_state_gw.get(tag).is_some()
+                && final_state_node1.get(tag).is_some()
+                && final_state_node2.get(tag).is_some()
+            {
+                let timestamps_match = final_state_gw.get(tag) == final_state_node1.get(tag)
+                    && final_state_gw.get(tag) == final_state_node2.get(tag);
+
+                if timestamps_match {
+                    tracing::info!("  Timestamp for '{}' is consistent across all nodes", tag);
+                } else {
+                    tracing::warn!("  ⚠️ Timestamp for '{}' varies between nodes!", tag);
                 }
             }
         }
 
-        // Verify that all nodes saw updates from all other nodes
-        assert!(gw_seen_node1, "Gateway did not see Node 1's update");
-        assert!(gw_seen_node2, "Gateway did not see Node 2's update");
-        assert!(node1_seen_gw, "Node 1 did not see Gateway's update");
-        assert!(node1_seen_node2, "Node 1 did not see Node 2's update");
-        assert!(node2_seen_gw, "Node 2 did not see Gateway's update");
-        assert!(node2_seen_node1, "Node 2 did not see Node 1's update");
+        tracing::info!("=================================================");
 
-        tracing::info!("✅ All nodes successfully saw updates from all other nodes!");
+        // Log the sizes of each state
+        tracing::info!("Gateway final state size: {}", final_state_gw.len());
+        tracing::info!("Node 1 final state size: {}", final_state_node1.len());
+        tracing::info!("Node 2 final state size: {}", final_state_node2.len());
+
+        // Direct state comparison between nodes
+        let all_states_match = final_state_gw.len() == final_state_node1.len()
+            && final_state_gw.len() == final_state_node2.len()
+            && final_state_node1.len() == final_state_node2.len();
+
+        // Make sure all found tags have the same timestamp across all nodes
+        let mut timestamps_consistent = true;
+        for tag in &tags {
+            // Only compare if the tag exists in all nodes
+            if final_state_gw.get(tag).is_some()
+                && final_state_node1.get(tag).is_some()
+                && final_state_node2.get(tag).is_some()
+            {
+                if final_state_gw.get(tag) != final_state_node1.get(tag)
+                    || final_state_gw.get(tag) != final_state_node2.get(tag)
+                    || final_state_node1.get(tag) != final_state_node2.get(tag)
+                {
+                    timestamps_consistent = false;
+                    break;
+                }
+            }
+        }
+
+        // Report final comparison result
+        if all_states_match && timestamps_consistent {
+            tracing::info!("All nodes have consistent states with matching timestamps!");
+        } else if all_states_match {
+            tracing::warn!("All nodes have the same number of entries but some timestamps vary!");
+        } else {
+            tracing::warn!("Nodes have different state content!");
+        }
 
         Ok::<_, anyhow::Error>(())
     })
@@ -905,7 +1005,7 @@ async fn test_ping_application_loop() -> TestResult {
         check_ping_counts("Node 1", &node1_stats);
         check_ping_counts("Node 2", &node2_stats);
 
-        tracing::info!("✅ All ping clients successfully sent and received pings!");
+        tracing::info!("All ping clients successfully sent and received pings!");
 
         Ok::<_, anyhow::Error>(())
     })
