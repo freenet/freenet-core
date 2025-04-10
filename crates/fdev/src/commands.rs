@@ -2,7 +2,7 @@ use std::{fs::File, io::Read, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use freenet::{dev_tool::OperationMode, server::WebApp};
 use freenet_stdlib::prelude::{
-    ContractCode, ContractContainer, ContractWasmAPIVersion, Parameters, State, WrappedContract,
+    ContractCode, ContractContainer, ContractWasmAPIVersion, Parameters, WrappedContract,
 };
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, DelegateRequest, WebApi},
