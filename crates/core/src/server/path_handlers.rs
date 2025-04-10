@@ -137,7 +137,7 @@ pub(super) async fn contract_home(
                         })?;
                 }
 
-                let web_body = match get_web_body(&path).await {
+                match get_web_body(&path).await {
                     Ok(b) => b.into_response(),
                     Err(err) => {
                         tracing::error!("Failed to read webapp after unpacking: {err}");
@@ -145,8 +145,7 @@ pub(super) async fn contract_home(
                             error_cause: format!("Failed to read webapp: {err}"),
                         });
                     }
-                };
-                web_body
+                }
             }
             None => {
                 return Err(WebSocketApiError::MissingContract { key });

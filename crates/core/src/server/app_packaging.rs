@@ -110,11 +110,9 @@ impl WebApp {
         match archive.entries() {
             Ok(entries) => {
                 debug!("Archive contents:");
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        if let Ok(path) = entry.path() {
-                            debug!("  {}", path.display());
-                        }
+                for entry in entries.flatten() {
+                    if let Ok(path) = entry.path() {
+                        debug!("  {}", path.display());
                     }
                 }
             }
