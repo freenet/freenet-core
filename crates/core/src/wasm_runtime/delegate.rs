@@ -198,12 +198,11 @@ impl Runtime {
                     key, processed, ..
                 }) if !processed => {
                     tracing::debug!(%key, "Handling OutboundDelegateMsg::GetSecretRequest received from delegate");
-                    let secret = self.secret_store.get_secret(delegate_key, &key);
-                    //Please rewrite this to provide better error handling AI!
-                    tracing::debug!(%key, secret.is_some() = ?secret.is_some(), "Secret successfully retrieved from store");
+                    let secret_value = self.secret_store.get_secret(delegate_key, &key)?;
+                    tracing::debug!(%key, secret_length = secret_value.len(), "Secret successfully retrieved from store");
                     let inbound = InboundDelegateMsg::GetSecretResponse(GetSecretResponse {
                         key,
-                        value: secret.ok(),
+                        value: Some(secret_value),
                         context: last_context.clone(),
                     });
                     if recursion >= MAX_ITERATIONS {
