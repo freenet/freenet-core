@@ -198,11 +198,12 @@ impl Runtime {
                     key, processed, ..
                 }) if !processed => {
                     tracing::debug!(%key, "Handling OutboundDelegateMsg::GetSecretRequest received from delegate");
-                    let secret = self.secret_store.get_secret(delegate_key, &key)?;
-                    tracing::debug!(%key, secret_length = ?secret.len(), "Secret successfully retrieved from store");
+                    let secret = self.secret_store.get_secret(delegate_key, &key);
+                    //Please rewrite this to provide better error handling AI!
+                    tracing::debug!(%key, secret.is_some() = ?secret.is_some(), "Secret successfully retrieved from store");
                     let inbound = InboundDelegateMsg::GetSecretResponse(GetSecretResponse {
                         key,
-                        value: Some(secret),
+                        value: secret.ok(),
                         context: last_context.clone(),
                     });
                     if recursion >= MAX_ITERATIONS {
@@ -245,9 +246,9 @@ impl Runtime {
                         }
                         // My understanding is that processed should be true for the last message in a chain, but this
                         // line was causing that message to be dropped. Disabling check experimentally.
-                        //   if !pending.processed() { // Possible bug?
+                        if !pending.processed() {
                             outbound_msgs.push_back(pending);
-                     //   }
+                        }
                     }
                 }
                 OutboundDelegateMsg::GetSecretRequest(GetSecretRequest { context, .. }) => {
