@@ -211,7 +211,16 @@ impl Runtime {
                     let new_msgs =
                         self.exec_inbound(params, attested, &inbound, process_func, instance)?;
                     if tracing::enabled!(tracing::Level::DEBUG) {
-                        let summary = new_msgs.iter().map(|m| format!("{:?}", m.get_type_summary())).collect::<Vec<_>>();
+                        let summary = new_msgs.iter().map(|m| {
+                            match m {
+                                OutboundDelegateMsg::ApplicationMessage(_) => "ApplicationMessage",
+                                OutboundDelegateMsg::RequestUserInput(_) => "RequestUserInput",
+                                OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdated",
+                                OutboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest",
+                                OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretRequest",
+                                OutboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse",
+                            }
+                        }).collect::<Vec<_>>();
                         tracing::debug!(count = new_msgs.len(), ?summary, "Messages returned from exec_inbound after GetSecretResponse");
                     }
                     recursion += 1;
