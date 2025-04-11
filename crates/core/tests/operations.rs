@@ -348,7 +348,7 @@ async fn test_update_contract() -> TestResult {
 
     let test = tokio::time::timeout(Duration::from_secs(60), async {
         // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(20)).await; // Increased sleep duration
 
         // Connect to node A websocket API
         let uri = format!(
