@@ -283,8 +283,3 @@ fn state_hash_path(key: &ContractKey) -> PathBuf {
         .join("webapp_cache")
         .join(format!("{}.hash", key.encoded_contract_id()))
 }
-
-#[inline]
-fn get_file_path(uri: axum::http::Uri) -> Result<String, Box<WebSocketApiError>> {
-    v1::get_file_path(uri)
-}
