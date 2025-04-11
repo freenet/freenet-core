@@ -200,14 +200,9 @@ pub(super) async fn variable_content(
     let base_path = contract_web_path(&key);
     debug!("variable_content: Base path resolved to: {:?}", base_path);
 
-    let req_uri = req_path
-        .parse()
-        .map_err(|err| WebSocketApiError::NodeError {
-            error_cause: format!("{err}"),
-        })?;
-    debug!("variable_content: Parsed request URI: {:?}", req_uri);
-
-    let file_path = base_path.join(get_file_path(req_uri)?);
+    // The req_path already contains the correct relative path needed.
+    // No need to call get_file_path here, as it expects the full original URI.
+    let file_path = base_path.join(req_path);
     debug!("variable_content: Full file path to serve: {:?}", file_path);
     debug!(
         "variable_content: Checking if file exists: {}",
