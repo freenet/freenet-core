@@ -21,8 +21,6 @@ use tracing::{debug, instrument};
 
 mod v1;
 
-const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
 #[instrument(level = "debug", skip(request_sender))]
 pub(super) async fn contract_home(
     key: String,
