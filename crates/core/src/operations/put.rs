@@ -12,7 +12,8 @@ use freenet_stdlib::{
     prelude::*,
 };
 
-use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
+use super::{put, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
+use crate::node::IsOperationCompleted;
 use crate::{
     client_events::HostResult,
     contract::ContractHandlerEvent,
@@ -77,6 +78,12 @@ impl PutOp {
 
 struct PutStats {
     target: Option<PeerKeyLocation>,
+}
+
+impl IsOperationCompleted for PutOp {
+    fn is_completed(&self) -> bool {
+        matches!(self.state, Some(put::PutState::Finished { .. }))
+    }
 }
 
 pub(crate) struct PutResult {}
@@ -943,7 +950,7 @@ mod messages {
 
     use serde::{Deserialize, Serialize};
 
-    #[derive(Debug, Serialize, Deserialize)]
+    #[derive(Debug, Serialize, Deserialize, Clone)]
     pub(crate) enum PutMsg {
         /// Internal node instruction to find a route to the target node.
         RequestPut {

@@ -1,7 +1,6 @@
 //! Types and definitions to handle all inter-peer communication.
 
 use std::future::Future;
-use std::ops::{Deref, DerefMut};
 
 use either::Either;
 use serde::{Deserialize, Serialize};
@@ -81,34 +80,48 @@ impl Clone for ConnectionError {
 pub(crate) fn event_loop_notification_channel(
 ) -> (EventLoopNotificationsReceiver, EventLoopNotificationsSender) {
     let (notification_tx, notification_rx) = mpsc::channel(100);
+    let (op_execution_tx, op_execution_rx) = mpsc::channel(100);
     (
-        EventLoopNotificationsReceiver(notification_rx),
-        EventLoopNotificationsSender(notification_tx),
+        EventLoopNotificationsReceiver {
+            notifications_receiver: notification_rx,
+            op_execution_receiver: op_execution_rx,
+        },
+        EventLoopNotificationsSender {
+            notifications_sender: notification_tx,
+            op_execution_sender: op_execution_tx,
+        },
     )
 }
-pub(crate) struct EventLoopNotificationsReceiver(Receiver<Either<NetMessage, NodeEvent>>);
 
-impl Deref for EventLoopNotificationsReceiver {
-    type Target = Receiver<Either<NetMessage, NodeEvent>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+pub(crate) struct EventLoopNotificationsReceiver {
+    pub(crate) notifications_receiver: Receiver<Either<NetMessage, NodeEvent>>,
+    pub(crate) op_execution_receiver: Receiver<(Sender<NetMessage>, NetMessage)>,
 }
 
-impl DerefMut for EventLoopNotificationsReceiver {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+#[allow(dead_code)] // FIXME: enable async sub-transactions
+impl EventLoopNotificationsReceiver {
+    pub(crate) fn notifications_receiver(&self) -> &Receiver<Either<NetMessage, NodeEvent>> {
+        &self.notifications_receiver
+    }
+
+    pub(crate) fn op_execution_receiver(&self) -> &Receiver<(Sender<NetMessage>, NetMessage)> {
+        &self.op_execution_receiver
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct EventLoopNotificationsSender(Sender<Either<NetMessage, NodeEvent>>);
+pub(crate) struct EventLoopNotificationsSender {
+    pub(crate) notifications_sender: Sender<Either<NetMessage, NodeEvent>>,
+    pub(crate) op_execution_sender: Sender<(Sender<NetMessage>, NetMessage)>,
+}
 
-impl Deref for EventLoopNotificationsSender {
-    type Target = Sender<Either<NetMessage, NodeEvent>>;
+impl EventLoopNotificationsSender {
+    pub(crate) fn notifications_sender(&self) -> &Sender<Either<NetMessage, NodeEvent>> {
+        &self.notifications_sender
+    }
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    #[allow(dead_code)] // FIXME: enable async sub-transactions
+    pub(crate) fn op_execution_sender(&self) -> &Sender<(Sender<NetMessage>, NetMessage)> {
+        &self.op_execution_sender
     }
 }

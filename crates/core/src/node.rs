@@ -35,7 +35,7 @@ use crate::{
         NetworkContractHandler, WaitingTransaction,
     },
     local_node::Executor,
-    message::{NetMessage, Transaction, TransactionType},
+    message::{InnerMessage, NetMessage, Transaction, TransactionType},
     operations::{
         connect::{self, ConnectOp},
         get, put, subscribe, update, OpEnum, OpError, OpOutcome,
@@ -481,6 +481,7 @@ macro_rules! handle_op_not_available {
     };
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_message<CB>(
     msg: NetMessage,
     op_manager: Arc<OpManager>,
@@ -489,6 +490,7 @@ async fn process_message<CB>(
     executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
     client_req_handler_callback: Option<ClientResponsesSender>,
     client_ids: Option<Vec<ClientId>>,
+    pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
 ) where
     CB: NetworkBridge,
 {
@@ -504,6 +506,7 @@ async fn process_message<CB>(
                 executor_callback,
                 client_req_handler_callback,
                 client_ids,
+                pending_op_result,
             )
             .await
         }
@@ -520,6 +523,7 @@ async fn process_message_v1<CB>(
     executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
     client_req_handler_callback: Option<ClientResponsesSender>,
     client_id: Option<Vec<ClientId>>,
+    pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
 ) where
     CB: NetworkBridge,
 {
@@ -544,6 +548,7 @@ async fn process_message_v1<CB>(
                     handle_op_request::<connect::ConnectOp, _>(&op_manager, &mut conn_manager, op)
                         .instrument(span)
                         .await;
+
                 handle_op_not_available!(op_result);
                 return report_result(
                     tx,
@@ -558,6 +563,19 @@ async fn process_message_v1<CB>(
             NetMessageV1::Put(ref op) => {
                 let op_result =
                     handle_op_request::<put::PutOp, _>(&op_manager, &mut conn_manager, op).await;
+
+                if is_operation_completed(&op_result) {
+                    if let Some(ref op_execution_callback) = pending_op_result {
+                        let tx_id = *op.id();
+                        let _ = op_execution_callback
+                            .send(NetMessage::V1(NetMessageV1::Put((*op).clone())))
+                            .await
+                            .inspect_err(
+                                |err| tracing::error!(%err, %tx_id, "Failed to send message to client"),
+                            );
+                    }
+                }
+
                 handle_op_not_available!(op_result);
                 return report_result(
                     tx,
@@ -572,6 +590,15 @@ async fn process_message_v1<CB>(
             NetMessageV1::Get(ref op) => {
                 let op_result =
                     handle_op_request::<get::GetOp, _>(&op_manager, &mut conn_manager, op).await;
+                if is_operation_completed(&op_result) {
+                    if let Some(ref op_execution_callback) = pending_op_result {
+                        let tx_id = *op.id();
+                        let _ = op_execution_callback
+                            .send(NetMessage::V1(NetMessageV1::Get((*op).clone()))).await.inspect_err(|err|
+                                tracing::error!(%err, %tx_id, "Failed to send message to client")
+                            );
+                    }
+                }
                 handle_op_not_available!(op_result);
                 return report_result(
                     tx,
@@ -590,6 +617,15 @@ async fn process_message_v1<CB>(
                     op,
                 )
                 .await;
+                if is_operation_completed(&op_result) {
+                    if let Some(ref op_execution_callback) = pending_op_result {
+                        let tx_id = *op.id();
+                        let _ = op_execution_callback
+                            .send(NetMessage::V1(NetMessageV1::Subscribe((*op).clone()))).await.inspect_err(|err|
+                                tracing::error!(%err, %tx_id, "Failed to send message to client")
+                            );
+                    }
+                }
                 handle_op_not_available!(op_result);
                 return report_result(
                     tx,
@@ -605,6 +641,15 @@ async fn process_message_v1<CB>(
                 let op_result =
                     handle_op_request::<update::UpdateOp, _>(&op_manager, &mut conn_manager, op)
                         .await;
+                if is_operation_completed(&op_result) {
+                    if let Some(ref op_execution_callback) = pending_op_result {
+                        let tx_id = *op.id();
+                        let _ = op_execution_callback
+                                .send(NetMessage::V1(NetMessageV1::Update((*op).clone()))).await.inspect_err(|err|
+                                    tracing::error!(%err, %tx_id, "Failed to send message to client")
+                                );
+                    }
+                }
                 handle_op_not_available!(op_result);
                 return report_result(
                     tx,
@@ -1023,6 +1068,33 @@ pub async fn run_network_node(mut node: Node) -> anyhow::Result<()> {
             tracing::error!("{e}");
             Err(e)
         }
+    }
+}
+
+/// Trait to determine if an operation has completed, regardless of its specific type.
+pub trait IsOperationCompleted {
+    /// Returns true if the operation has completed (successfully or with error)
+    fn is_completed(&self) -> bool;
+}
+
+impl IsOperationCompleted for OpEnum {
+    fn is_completed(&self) -> bool {
+        match self {
+            OpEnum::Connect(op) => op.is_completed(),
+            OpEnum::Put(op) => op.is_completed(),
+            OpEnum::Get(op) => op.is_completed(),
+            OpEnum::Subscribe(op) => op.is_completed(),
+            OpEnum::Update(op) => op.is_completed(),
+        }
+    }
+}
+
+/// Check if an operation result indicates completion
+pub fn is_operation_completed(op_result: &Result<Option<OpEnum>, OpError>) -> bool {
+    match op_result {
+        // If we got an OpEnum, check its specific completion status using the trait
+        Ok(Some(op)) => op.is_completed(),
+        _ => false,
     }
 }
 

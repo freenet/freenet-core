@@ -1,12 +1,17 @@
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
 
 use clap::Parser;
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractRequest},
     prelude::*,
 };
-use tokio::time::timeout;
+
+mod ping_client;
+use ping_client::{
+    connect_to_host, run_ping_client, wait_for_get_response, wait_for_put_response,
+    wait_for_subscribe_response,
+};
 
 #[derive(clap::Parser)]
 struct Args {
@@ -18,6 +23,8 @@ struct Args {
     parameters: PingContractOptions,
     #[clap(long)]
     put_contract: bool,
+    #[clap(long)]
+    node_id: String,
 }
 
 const PACKAGE_DIR: &str = env!("CARGO_MANIFEST_DIR");
@@ -34,16 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         .with_line_number(true)
         .init();
 
-    // create a websocket connection to host.
-    let uri = format!(
-        "ws://{}/v1/contract/command?encodingProtocol=native",
-        args.host
-    );
-    let (stream, _resp) = tokio_tungstenite::connect_async(&uri).await.map_err(|e| {
-        tracing::error!(err=%e);
-        e
-    })?;
-    let mut client = WebApi::start(stream);
+    // Connect to host using our utility function
+    let mut client = connect_to_host(&args.host).await?;
 
     let params = Parameters::from(serde_json::to_vec(&args.parameters).unwrap());
     let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
@@ -53,10 +52,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     let container = code
         .map(|bytes| ContractContainer::try_from((bytes, &params)))
         .transpose()?;
-    let contract_key = ContractKey::from_params(args.parameters.code_key, params.clone())?;
+    let contract_key = ContractKey::from_params(args.parameters.code_key.clone(), params.clone())?;
 
-    // try to fetch the old state from the host.
+    // Step 1: Put the contract or get it, and wait for response
+    let mut local_state: Ping;
+
     if args.put_contract {
+        // Put contract and wait for response
         let ping = Ping::default();
         let serialized = serde_json::to_vec(&ping)?;
         client
@@ -67,7 +69,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                 subscribe: false,
             }))
             .await?;
+
+        // Wait for put response
+        let key = wait_for_put_response(&mut client, &contract_key).await?;
+        tracing::info!(key=%key, "put ping contract successfully!");
+        local_state = Ping::default();
     } else {
+        // Get contract and wait for response
         client
             .send(ClientRequest::ContractOp(ContractRequest::Get {
                 key: contract_key,
@@ -75,195 +83,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                 subscribe: false,
             }))
             .await?;
+
+        // Wait for get response
+        local_state = wait_for_get_response(&mut client, &contract_key).await?;
     }
 
-    let mut is_subcribed = false;
-    let mut local_state = loop {
-        let resp = timeout(Duration::from_secs(30), client.recv()).await;
-        match resp {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                key,
-                contract: _,
-                state,
-            }))) => {
-                tracing::info!(key=%key, "fetched state successfully!");
-                if contract_key != key {
-                    return Err("unexpected key".into());
-                } else {
-                    let old_ping = serde_json::from_slice::<Ping>(&state)?;
-                    tracing::info!(num_entries = %old_ping.len(), "old state fetched successfully!");
+    // Step 2: Subscribe to the contract and wait for subscription confirmation
+    tracing::info!("Subscribing to contract...");
+    client
+        .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
+            key: contract_key,
+            summary: None,
+        }))
+        .await?;
 
-                    // the contract already put, so we subscribe to the contract.
-                    client
-                        .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
-                            key: contract_key,
-                            summary: None,
-                        }))
-                        .await?;
+    // Wait for subscription response
+    wait_for_subscribe_response(&mut client, &contract_key).await?;
+    tracing::info!(key=%contract_key, "subscribed successfully!");
 
-                    break old_ping;
-                }
-            }
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                tracing::info!(key=%key, "put ping contract successfully!");
-                // we successfully put the contract, so we subscribe to the contract.
-                if key == contract_key {
-                    if let Err(e) = client
-                        .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
-                            key,
-                            summary: None,
-                        }))
-                        .await
-                    {
-                        tracing::error!(err=%e);
-                        return Err(e.into());
-                    }
-                } else {
-                    return Err("unexpected key".into());
-                }
-                break Ping::default();
-            }
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
-                key,
-                subscribed,
-                ..
-            }))) => {
-                if key == contract_key {
-                    tracing::debug!(key=%key, "Marking as subscribed");
-                    is_subcribed = true;
-                } else {
-                    return Err("unexpected key".into());
-                }
-                if subscribed {
-                    tracing::info!(key=%key, "subscribed successfully!");
-                } else {
-                    tracing::error!(key=%key, "failed to subscribe");
-                    return Err("failed to subscribe".into());
-                }
-                tracing::info!("subscribed successfully!");
-            }
-            Ok(Ok(other)) => {
-                tracing::warn!("unexpected response: {}", other);
-            }
-            Ok(Err(err)) => {
-                tracing::error!(err=%err);
-                return Err(err.into());
-            }
-            Err(_) => {
-                tracing::error!("failed to fetch state, timeout");
-                return Err("failed to fetch state".into());
-            }
-        }
-    };
+    // Run the main ping client logic
+    run_ping_client(
+        &mut client,
+        contract_key,
+        args.parameters,
+        args.node_id,
+        &mut local_state,
+        None,
+        None,
+    )
+    .await?;
 
-    let mut send_tick = tokio::time::interval(args.parameters.frequency);
-
-    let mut errors = 0;
-    loop {
-        if errors > 100 {
-            tracing::error!("too many errors, shutting down...");
-            return Err("too many errors".into());
-        }
-        tokio::select! {
-            _ = send_tick.tick() => {
-                if is_subcribed {
-                    let mut ping = Ping::default();
-                    ping.insert(args.parameters.tag.clone());
-                    if let Err(e) = client.send(ClientRequest::ContractOp(ContractRequest::Update {
-                        key: contract_key,
-                        data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&ping).unwrap())),
-                    })).await {
-                        tracing::error!(err=%e, "failed to send update request");
-                    }
-                }
-            },
-            res = client.recv() => {
-                match res {
-                    Ok(resp) => match resp {
-                        HostResponse::ContractResponse(resp) => {
-                            match resp {
-                                ContractResponse::PutResponse { key } => {
-                                    tracing::info!(key=%key, "put ping contract successfully!");
-                                    // we successfully put the contract, so we subscribe to the contract.
-                                    if key != contract_key {
-                                        return Err("unexpected key".into());
-                                    }
-                                    client.send(ClientRequest::ContractOp(ContractRequest::Subscribe { key, summary: None })).await.inspect_err(|e| {
-                                        tracing::error!(err=%e);
-                                    })?;
-                                },
-                                ContractResponse::SubscribeResponse { key, .. } => {
-                                    if key != contract_key {
-                                        return Err("unexpected key".into());
-                                    }
-                                    tracing::debug!(key=%key, "Marking as subscribed");
-                                    is_subcribed = true;
-                                },
-                                ContractResponse::UpdateNotification { key, update } => {
-                                    if key != contract_key {
-                                        return Err("unexpected key".into());
-                                    }
-                                    let mut handle_update = |state: &[u8]| {
-                                        let new_ping = if state.is_empty() {
-                                            Ping::default()
-                                        } else {
-                                            match serde_json::from_slice::<Ping>(state) {
-                                                Ok(p) => p,
-                                                Err(e) => return Err(e),
-                                            }
-                                        };
-
-
-                                        let updates = local_state.merge(new_ping, args.parameters.ttl);
-
-                                        for (name, update) in updates.into_iter() {
-
-                                            tracing::info!("{} last updated at {}", name, update);
-                                        }
-                                        Ok(())
-                                    };
-
-                                    match update {
-                                        UpdateData::State(state) =>  {
-                                            if let Err(e) = handle_update(&state) {
-                                                tracing::error!(err=%e);
-                                            }
-                                        },
-                                        UpdateData::Delta(delta) => {
-                                            if let Err(e) = handle_update(&delta) {
-                                                tracing::error!(err=%e);
-                                            }
-                                        },
-                                        UpdateData::StateAndDelta { state, delta } => {
-                                            if let Err(e) = handle_update(&state) {
-                                                tracing::error!(err=%e);
-                                            }
-
-                                            if let Err(e) = handle_update(&delta) {
-                                                tracing::error!(err=%e);
-                                            }
-                                        },
-                                        _ => unreachable!("unknown state"),
-                                    }
-                                },
-                                _ => {},
-                            }
-                        },
-                        HostResponse::DelegateResponse { .. } => {},
-                        HostResponse::Ok => {},
-                        _ => unreachable!(),
-                    },
-                    Err(e) => {
-                        tracing::error!(err=%e);
-                        errors += 1;
-                    },
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("shutting down...");
-                break;
-            }
-        }
-    }
     Ok(())
 }

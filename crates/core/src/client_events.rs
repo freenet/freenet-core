@@ -351,6 +351,11 @@ async fn process_open_request(
 
                         let related_contracts = RelatedContracts::default();
 
+                        tracing::debug!(
+                            this_peer = %peer_id,
+                            ?data,
+                            "Starting update op",
+                        );
                         let new_state = match op_manager
                             .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
                                 key,
@@ -374,6 +379,11 @@ async fn process_open_request(
                         }
                         .inspect_err(|err| tracing::error!(%key, "update query failed: {}", err))?;
 
+                        tracing::debug!(
+                            this_peer = %peer_id,
+                            ?new_state,
+                            "Sending update op",
+                        );
                         let op = update::start_op(key, new_state, related_contracts);
 
                         op_manager

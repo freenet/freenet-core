@@ -81,6 +81,8 @@ impl ContractExecutor for Executor<Runtime> {
             false
         };
 
+        let is_new_contract = self.state_store.get(&key).await.is_err();
+
         let mut updates = match update {
             Either::Left(incoming_state) => {
                 let result = self
@@ -94,10 +96,19 @@ impl ContractExecutor for Executor<Runtime> {
                     })?;
                 match result {
                     ValidateResult::Valid => {
-                        self.state_store
-                            .store(key, incoming_state.clone(), params.clone())
-                            .await
-                            .map_err(ExecutorError::other)?;
+                        tracing::debug!("The incoming state is valid");
+
+                        // If the contract is new, we store the incoming state as the initial state avoiding the update
+                        if is_new_contract {
+                            tracing::debug!("Contract is new, storing initial state");
+                            let state_to_store = incoming_state.clone();
+                            self.state_store
+                                .store(key, state_to_store, params.clone())
+                                .await
+                                .map_err(ExecutorError::other)?;
+
+                            return Ok(UpsertResult::Updated(incoming_state));
+                        }
                     }
                     ValidateResult::Invalid => {
                         return Err(ExecutorError::request(StdContractError::invalid_put(key)));
@@ -116,8 +127,6 @@ impl ContractExecutor for Executor<Runtime> {
                 vec![UpdateData::State(incoming_state.clone().into())]
             }
             Either::Right(delta) => {
-                // todo: forward delta like we are doing with puts
-                tracing::warn!("Delta updates are not yet supported");
                 vec![UpdateData::Delta(delta)]
             }
         };
@@ -167,6 +176,8 @@ impl ContractExecutor for Executor<Runtime> {
                 if updated_state.as_ref() == current_state.as_ref() {
                     Ok(UpsertResult::NoChange)
                 } else {
+                    // todo: forward delta like we are doing with puts
+                    tracing::warn!("Delta updates are not yet supported");
                     Ok(UpsertResult::Updated(updated_state))
                 }
             }

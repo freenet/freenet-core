@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::{future::Future, time::Instant};
 
 use crate::client_events::HostResult;
+use crate::node::IsOperationCompleted;
 use crate::{
     contract::{ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, NetMessage, Transaction},
@@ -763,6 +764,7 @@ impl Operation for GetOp {
                                     op_manager.ring.seed_contract(key);
                                     let mut new_skip_list = skip_list.clone();
                                     new_skip_list.insert(sender.peer.clone());
+
                                     super::start_subscription_request(
                                         op_manager,
                                         key,
@@ -1013,6 +1015,12 @@ async fn try_forward_or_return(
     }
 }
 
+impl IsOperationCompleted for GetOp {
+    fn is_completed(&self) -> bool {
+        matches!(self.state, Some(GetState::Finished { .. }))
+    }
+}
+
 mod messages {
     use std::{borrow::Borrow, fmt::Display};
 
@@ -1020,7 +1028,7 @@ mod messages {
 
     use super::*;
 
-    #[derive(Debug, Serialize, Deserialize)]
+    #[derive(Debug, Serialize, Deserialize, Clone)]
     pub(crate) enum GetMsg {
         RequestGet {
             id: Transaction,
