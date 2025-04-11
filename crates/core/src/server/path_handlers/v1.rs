@@ -7,14 +7,19 @@ pub(super) fn get_file_path(uri: axum::http::Uri) -> Result<String, Box<WebSocke
             error_cause: format!("{uri} not valid"),
         })
     })?;
-    let path = p
-        .chars()
-        .skip_while(|c| ALPHABET.contains(*c))
-        .skip_while(|c| c == &'/')
-        .skip_while(|c| ALPHABET.contains(*c))
-        .skip_while(|c| c == &'/')
-        .collect::<String>();
-    Ok(path)
+    // p now contains something like "CONTRACT_KEY/path/to/file.html" or "CONTRACT_KEY/"
+
+    // Find the first '/' which separates the key from the actual path.
+    let file_path = match p.split_once('/') {
+        // If a '/' exists, everything after it is the path.
+        Some((_key, path)) => path.to_string(),
+        // If no '/' exists after the key (e.g., URL was just "/v1/contract/CONTRACT_KEY"),
+        // it implies the root. An empty path string is appropriate here,
+        // potentially mapping to index.html later in the logic.
+        None => "".to_string(),
+    };
+
+    Ok(file_path)
 }
 
 #[test]
