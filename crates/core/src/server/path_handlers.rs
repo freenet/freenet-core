@@ -200,9 +200,10 @@ pub(super) async fn variable_content(
     let base_path = contract_web_path(&key);
     debug!("variable_content: Base path resolved to: {:?}", base_path);
 
-    // The req_path already contains the correct relative path needed.
-    // No need to call get_file_path here, as it expects the full original URI.
-    let file_path = base_path.join(req_path);
+    // The req_path might have a leading '/' depending on the exact request URI and router capture.
+    // Strip it before joining to ensure correct path construction.
+    let relative_path = req_path.strip_prefix('/').unwrap_or(&req_path);
+    let file_path = base_path.join(relative_path);
     debug!("variable_content: Full file path to serve: {:?}", file_path);
     debug!(
         "variable_content: Checking if file exists: {}",
