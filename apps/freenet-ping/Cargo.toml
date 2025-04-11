@@ -6,6 +6,7 @@ members = ["contracts/ping", "app", "types"]
 freenet-stdlib = { path = "../../stdlib/rust", features = ["contract"] }
 freenet-ping-types = { path = "types", default-features = false }
 chrono = { version = "0.4", default-features = false }
+testresult = "0.4"
 
 [profile.dev.package."*"]
 opt-level = 3

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, fmt::Display, time::Duration};
 
 use chrono::{DateTime, Utc};
 
@@ -72,7 +72,7 @@ impl Ping {
             if now <= created_time + ttl {
                 match self.from.entry(name.clone()) {
                     std::collections::hash_map::Entry::Occupied(mut occupied_entry) => {
-                        if occupied_entry.get() > &created_time {
+                        if occupied_entry.get() < &created_time {
                             occupied_entry.insert(created_time);
                             updates.insert(name, created_time);
                         }
@@ -90,6 +90,21 @@ impl Ping {
     }
 }
 
+impl Display for Ping {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut entries: Vec<_> = self.from.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        write!(
+            f,
+            "Ping {{ {} }}",
+            entries
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, v))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

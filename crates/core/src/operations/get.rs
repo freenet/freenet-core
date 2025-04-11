@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::{future::Future, time::Instant};
 
 use crate::client_events::HostResult;
+use crate::node::IsOperationCompleted;
 use crate::{
     contract::{ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, NetMessage, Transaction},
@@ -21,7 +22,7 @@ pub(crate) use self::messages::GetMsg;
 /// Maximum number of retries to get values.
 const MAX_RETRIES: usize = 10;
 
-pub(crate) fn start_op(key: ContractKey, fetch_contract: bool) -> GetOp {
+pub(crate) fn start_op(key: ContractKey, fetch_contract: bool, subscribe: bool) -> GetOp {
     let contract_location = Location::from(&key);
     let id = Transaction::new::<GetMsg>();
     tracing::debug!(tx = %id, "Requesting get contract {key} @ loc({contract_location})");
@@ -29,6 +30,7 @@ pub(crate) fn start_op(key: ContractKey, fetch_contract: bool) -> GetOp {
         key,
         id,
         fetch_contract,
+        subscribe,
     });
     GetOp {
         id,
@@ -76,13 +78,14 @@ pub(crate) async fn request_get(
             fetch_contract,
             key,
             id,
-            ..
+            subscribe,
         }) => {
             let new_state = Some(GetState::AwaitingResponse {
                 retries: 0,
                 fetch_contract,
                 requester: None,
                 current_hop: op_manager.ring.max_hops_to_live,
+                subscribe,
             });
 
             let msg = GetMsg::RequestGet {
@@ -121,6 +124,7 @@ enum GetState {
         key: ContractKey,
         id: Transaction,
         fetch_contract: bool,
+        subscribe: bool,
     },
     /// Awaiting response from petition.
     AwaitingResponse {
@@ -129,6 +133,7 @@ enum GetState {
         fetch_contract: bool,
         retries: usize,
         current_hop: usize,
+        subscribe: bool,
     },
     /// Operation completed successfully
     Finished { key: ContractKey },
@@ -142,11 +147,12 @@ impl Display for GetState {
                 key,
                 id,
                 fetch_contract,
+                subscribe,
             } => {
                 write!(
                     f,
-                    "PrepareRequest(key: {}, id: {}, fetch_contract: {})",
-                    key, id, fetch_contract
+                    "PrepareRequest(key: {}, id: {}, fetch_contract: {}, subscribe: {})",
+                    key, id, fetch_contract, subscribe
                 )
             }
             GetState::AwaitingResponse {
@@ -154,8 +160,9 @@ impl Display for GetState {
                 fetch_contract,
                 retries,
                 current_hop,
+                subscribe,
             } => {
-                write!(f, "AwaitingResponse(requester: {:?}, fetch_contract: {}, retries: {}, current_hop: {})", requester, fetch_contract, retries, current_hop)
+                write!(f, "AwaitingResponse(requester: {:?}, fetch_contract: {}, retries: {}, current_hop: {}, subscribe: {})", requester, fetch_contract, retries, current_hop, subscribe)
             }
             GetState::Finished { key, .. } => write!(f, "Finished(key: {})", key),
         }
@@ -322,16 +329,24 @@ impl Operation for GetOp {
                         Some(GetState::AwaitingResponse { .. })
                     ));
                     tracing::info!(tx = %id, %key, target = %target.peer, "Seek contract");
-                    new_state = self.state;
+
+                    // Initialize stats for tracking the operation
                     stats = Some(Box::new(GetStats {
                         contract_location: Location::from(key),
                         next_peer: None,
                         transfer_time: None,
                         first_response_time: None,
                     }));
+
+                    // Keep current state
+                    new_state = self.state;
+
+                    // Prepare skip list with own peer ID
                     let own_loc = op_manager.ring.connection_manager.own_location();
                     let mut new_skip_list = skip_list.clone();
                     new_skip_list.insert(own_loc.peer.clone());
+
+                    // Create seek node message
                     return_msg = Some(GetMsg::SeekNode {
                         key: *key,
                         id: *id,
@@ -357,13 +372,16 @@ impl Operation for GetOp {
                     let fetch_contract = *fetch_contract;
                     let this_peer = target.clone();
 
+                    // Update stats with next peer
                     if let Some(s) = stats.as_mut() {
                         s.next_peer = Some(this_peer.clone());
                     }
 
+                    // Update skip list with current peer
                     let mut new_skip_list = skip_list.clone();
                     new_skip_list.insert(this_peer.clone().peer);
 
+                    // Try to get contract from local storage
                     let get_result = op_manager
                         .notify_contract_handler(ContractHandlerEvent::GetQuery {
                             key,
@@ -371,7 +389,8 @@ impl Operation for GetOp {
                         })
                         .await;
 
-                    let (returned_key, contract, state) = match get_result {
+                    // Process get result
+                    match get_result {
                         Ok(ContractHandlerEvent::GetResponse {
                             key,
                             response:
@@ -379,8 +398,57 @@ impl Operation for GetOp {
                                     state: Some(state),
                                     contract,
                                 }),
-                        }) => (key, contract, state),
+                        }) => {
+                            tracing::debug!(tx = %id, "Contract {key} found @ peer {}", target.peer);
+
+                            match self.state {
+                                Some(GetState::AwaitingResponse { requester, .. }) => {
+                                    if let Some(requester) = requester {
+                                        // Forward contract to requester
+                                        new_state = None;
+                                        tracing::debug!(tx = %id, "Returning contract {} to {}", key, sender.peer);
+                                        return_msg = Some(GetMsg::ReturnGet {
+                                            id,
+                                            key,
+                                            value: StoreResponse {
+                                                state: Some(state),
+                                                contract,
+                                            },
+                                            sender: target.clone(),
+                                            target: requester,
+                                            skip_list: skip_list.clone(),
+                                        });
+                                    } else {
+                                        // Operation completed for original requester
+                                        tracing::debug!(
+                                            tx = %id,
+                                            "Completed operation, get response received for contract {key}"
+                                        );
+                                        new_state = None;
+                                        return_msg = None;
+                                    }
+                                }
+                                Some(GetState::ReceivedRequest) => {
+                                    // Return contract to sender
+                                    new_state = None;
+                                    tracing::debug!(tx = %id, "Returning contract {} to {}", key, sender.peer);
+                                    return_msg = Some(GetMsg::ReturnGet {
+                                        id,
+                                        key,
+                                        value: StoreResponse {
+                                            state: Some(state),
+                                            contract,
+                                        },
+                                        sender: target.clone(),
+                                        target: sender.clone(),
+                                        skip_list: skip_list.clone(),
+                                    });
+                                }
+                                _ => return Err(OpError::invalid_transition(self.id)),
+                            }
+                        }
                         _ => {
+                            // Contract not found locally, try forwarding to other peers
                             tracing::debug!(
                                 tx = %id,
                                 %key,
@@ -399,52 +467,6 @@ impl Operation for GetOp {
                             )
                             .await;
                         }
-                    };
-
-                    tracing::debug!(tx = %id, "Contract {returned_key} found @ peer {}", target.peer);
-
-                    match self.state {
-                        Some(GetState::AwaitingResponse { requester, .. }) => {
-                            if let Some(requester) = requester {
-                                new_state = None;
-                                tracing::debug!(tx = %id, "Returning contract {} to {}", key, sender.peer);
-                                return_msg = Some(GetMsg::ReturnGet {
-                                    id,
-                                    key,
-                                    value: StoreResponse {
-                                        state: Some(state),
-                                        contract,
-                                    },
-                                    sender: target.clone(),
-                                    target: requester,
-                                    skip_list: skip_list.clone(),
-                                });
-                            } else {
-                                tracing::debug!(
-                                    tx = %id,
-                                    "Completed operation, get response received for contract {key}"
-                                );
-                                // Completed op
-                                new_state = None;
-                                return_msg = None;
-                            }
-                        }
-                        Some(GetState::ReceivedRequest) => {
-                            new_state = None;
-                            tracing::debug!(tx = %id, "Returning contract {} to {}", key, sender.peer);
-                            return_msg = Some(GetMsg::ReturnGet {
-                                id,
-                                key,
-                                value: StoreResponse {
-                                    state: Some(state),
-                                    contract,
-                                },
-                                sender: target.clone(),
-                                target: sender.clone(),
-                                skip_list: skip_list.clone(),
-                            });
-                        }
-                        _ => return Err(OpError::invalid_transition(self.id)),
                     }
                 }
                 GetMsg::ReturnGet {
@@ -455,6 +477,7 @@ impl Operation for GetOp {
                     target,
                     skip_list,
                 } => {
+                    // Handle case where neither contract nor state was found
                     let this_peer = target;
                     tracing::warn!(
                         tx = %id,
@@ -471,18 +494,23 @@ impl Operation for GetOp {
                             retries,
                             requester,
                             current_hop,
+                            subscribe,
                         }) => {
                             // todo: register in the stats for the outcome of the op that failed to get a response from this peer
                             if retries < MAX_RETRIES {
                                 // no response received from this peer, so skip it in the next iteration
+                                // Update skip list with current peer
                                 let mut new_skip_list = skip_list.clone();
                                 new_skip_list.insert(target.peer.clone());
+
+                                // Try to find another peer to query
                                 if let Some(target) = op_manager
                                     .ring
                                     .closest_potentially_caching(key, &new_skip_list)
                                     .into_iter()
                                     .next()
                                 {
+                                    // Try with another peer
                                     return_msg = Some(GetMsg::SeekNode {
                                         id: *id,
                                         key: *key,
@@ -493,6 +521,7 @@ impl Operation for GetOp {
                                         skip_list: new_skip_list.clone(),
                                     });
                                 } else if let Some(requester_peer) = requester.clone() {
+                                    // No more peers to try, return failure to requester
                                     tracing::warn!(
                                         tx = %id,
                                         %key,
@@ -512,6 +541,7 @@ impl Operation for GetOp {
                                         skip_list: new_skip_list.clone(),
                                     });
                                 } else {
+                                    // Original requester, operation failed
                                     tracing::error!(
                                         tx = %id,
                                         "Failed getting a value for contract {}, reached max retries",
@@ -524,19 +554,25 @@ impl Operation for GetOp {
                                         contract: None,
                                     });
                                 }
+
+                                // Update state with incremented retries
                                 new_state = Some(GetState::AwaitingResponse {
                                     retries: retries + 1,
                                     fetch_contract,
                                     requester,
                                     current_hop,
+                                    subscribe,
                                 });
                             } else {
+                                // Max retries reached
                                 tracing::error!(
                                     tx = %id,
                                     "Failed getting a value for contract {}, reached max retries",
                                     key
                                 );
+
                                 if let Some(requester_peer) = requester.clone() {
+                                    // Return failure to requester
                                     tracing::warn!(
                                         tx = %id,
                                         %key,
@@ -557,6 +593,7 @@ impl Operation for GetOp {
                                     });
                                     new_state = None;
                                 } else {
+                                    // Original requester, operation failed
                                     tracing::error!(
                                         tx = %id,
                                         "Failed getting a value for contract {}, reached max retries",
@@ -568,6 +605,7 @@ impl Operation for GetOp {
                                         fetch_contract,
                                         requester,
                                         current_hop,
+                                        subscribe,
                                     });
                                     result = Some(GetResult {
                                         key: *key,
@@ -578,6 +616,7 @@ impl Operation for GetOp {
                             }
                         }
                         Some(GetState::ReceivedRequest) => {
+                            // Return failure to sender
                             tracing::debug!(tx = %id, "Returning contract {} to {}", key, sender.peer);
                             new_state = None;
                             return_msg = Some(GetMsg::ReturnGet {
@@ -611,6 +650,8 @@ impl Operation for GetOp {
                     let key = *key;
 
                     tracing::info!(tx = %id, %key, "Received get response with state: {:?}", self.state.as_ref().unwrap());
+
+                    // Check if contract is required
                     let require_contract = matches!(
                         self.state,
                         Some(GetState::AwaitingResponse {
@@ -619,6 +660,7 @@ impl Operation for GetOp {
                         })
                     );
 
+                    // Get requester from current state
                     let requester = if let Some(GetState::AwaitingResponse { requester, .. }) =
                         self.state.as_ref()
                     {
@@ -627,7 +669,7 @@ impl Operation for GetOp {
                         return Err(OpError::UnexpectedOpState);
                     };
 
-                    // received a response with a contract value
+                    // Handle case where contract is required but not provided
                     if require_contract && contract.is_none() && requester.is_some() {
                         // no contract, consider this like an error ignoring the incoming update value
                         tracing::warn!(
@@ -649,6 +691,7 @@ impl Operation for GetOp {
                             "Contract not received while required, returning response to requester",
                         );
 
+                        // Forward error to requester
                         op_manager
                             .notify_op_change(
                                 NetMessage::from(GetMsg::ReturnGet {
@@ -673,6 +716,7 @@ impl Operation for GetOp {
                         return Err(OpError::StatePushed);
                     }
 
+                    // Check if this is the original requester
                     let is_original_requester = matches!(
                         self.state,
                         Some(GetState::AwaitingResponse {
@@ -680,12 +724,25 @@ impl Operation for GetOp {
                             ..
                         })
                     );
-                    let should_subscribe = op_manager.ring.should_seed(&key);
-                    // TODO: In case of original requester, we should check if is possible to cache the contract
-                    let should_put = is_original_requester || should_subscribe;
 
+                    // Check if subscription was requested
+                    let subscribe_requested =
+                        if let Some(GetState::AwaitingResponse { subscribe, .. }) = &self.state {
+                            *subscribe
+                        } else {
+                            false
+                        };
+
+                    // Determine if we should put the contract locally
+                    let should_put = if is_original_requester && subscribe_requested {
+                        true
+                    } else {
+                        op_manager.ring.should_seed(&key)
+                    };
+
+                    // Put contract locally if needed
                     if should_put {
-                        tracing::debug!(tx = %id, %key, %is_original_requester, %should_subscribe, "Putting contract at executor");
+                        tracing::debug!(tx = %id, %key, %is_original_requester, %subscribe_requested, "Putting contract at executor");
                         let res = op_manager
                             .notify_contract_handler(ContractHandlerEvent::PutQuery {
                                 key,
@@ -694,16 +751,20 @@ impl Operation for GetOp {
                                 contract: contract.clone(),
                             })
                             .await?;
+
                         match res {
                             ContractHandlerEvent::PutResponse { new_value: Ok(_) } => {
                                 tracing::debug!(tx = %id, %key, "Contract put at executor");
                                 let is_subscribed_contract =
                                     op_manager.ring.is_seeding_contract(&key);
-                                if !is_subscribed_contract && should_subscribe {
+
+                                // Start subscription if not already seeding
+                                if !is_subscribed_contract {
                                     tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
                                     op_manager.ring.seed_contract(key);
                                     let mut new_skip_list = skip_list.clone();
                                     new_skip_list.insert(sender.peer.clone());
+
                                     super::start_subscription_request(
                                         op_manager,
                                         key,
@@ -717,9 +778,11 @@ impl Operation for GetOp {
                                 new_value: Err(err),
                             } => {
                                 if is_original_requester {
+                                    // Original requester, return error
                                     tracing::debug!(tx = %id, error = %err, "Failed put at executor");
                                     return Err(OpError::ExecutorError(err));
                                 } else {
+                                    // Forward error to requester
                                     let mut new_skip_list = skip_list.clone();
                                     new_skip_list.insert(sender.peer.clone());
 
@@ -761,10 +824,12 @@ impl Operation for GetOp {
                         }
                     }
 
+                    // Process based on current state
                     match self.state {
                         Some(GetState::AwaitingResponse {
                             requester: None, ..
                         }) => {
+                            // Original requester, operation completed successfully
                             tracing::info!(tx = %id, %key, "Get response received for contract at original requester");
                             new_state = Some(GetState::Finished { key });
                             return_msg = None;
@@ -778,6 +843,7 @@ impl Operation for GetOp {
                             requester: Some(requester),
                             ..
                         }) => {
+                            // Forward response to requester
                             tracing::info!(tx = %id, %key, "Get response received for contract at hop peer");
                             new_state = None;
                             return_msg = Some(GetMsg::ReturnGet {
@@ -799,6 +865,7 @@ impl Operation for GetOp {
                             });
                         }
                         Some(GetState::ReceivedRequest) => {
+                            // Return response to sender
                             tracing::info!(tx = %id, "Returning contract {} to {}", key, sender.peer);
                             new_state = None;
                             return_msg = Some(GetMsg::ReturnGet {
@@ -907,6 +974,7 @@ async fn try_forward_or_return(
                 retries: 0,
                 fetch_contract,
                 current_hop: new_htl,
+                subscribe: false,
             }),
             Some(GetMsg::SeekNode {
                 id,
@@ -947,6 +1015,12 @@ async fn try_forward_or_return(
     }
 }
 
+impl IsOperationCompleted for GetOp {
+    fn is_completed(&self) -> bool {
+        matches!(self.state, Some(GetState::Finished { .. }))
+    }
+}
+
 mod messages {
     use std::{borrow::Borrow, fmt::Display};
 
@@ -954,7 +1028,7 @@ mod messages {
 
     use super::*;
 
-    #[derive(Debug, Serialize, Deserialize)]
+    #[derive(Debug, Serialize, Deserialize, Clone)]
     pub(crate) enum GetMsg {
         RequestGet {
             id: Transaction,

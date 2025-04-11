@@ -367,7 +367,7 @@ struct GetContract {
 
 impl ComposeNetworkMessage<operations::get::GetOp> for GetContract {
     fn initiate_op(self, _op_manager: &OpManager) -> operations::get::GetOp {
-        operations::get::start_op(self.key, self.return_contract_code)
+        operations::get::start_op(self.key, self.return_contract_code, false)
     }
 
     async fn resume_op(op: operations::get::GetOp, op_manager: &OpManager) -> Result<(), OpError> {
@@ -412,6 +412,7 @@ impl ComposeNetworkMessage<operations::put::PutOp> for PutContract {
             related_contracts,
             state,
             op_manager.ring.max_hops_to_live,
+            false,
         )
     }
 
