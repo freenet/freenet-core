@@ -200,9 +200,20 @@ pub(super) async fn variable_content(
     let base_path = contract_web_path(&key);
     debug!("variable_content: Base path resolved to: {:?}", base_path);
 
-    // The req_path might have a leading '/' depending on the exact request URI and router capture.
-    // Strip it before joining to ensure correct path construction.
-    let relative_path = req_path.strip_prefix('/').unwrap_or(&req_path);
+    // Parse the full request path URI to extract the relative path using the v1 helper.
+    let req_uri = req_path
+        .parse::<axum::http::Uri>()
+        .map_err(|err| WebSocketApiError::InvalidParam {
+            error_cause: format!("Failed to parse request path as URI: {err}"),
+        })?;
+    debug!("variable_content: Parsed request URI: {:?}", req_uri);
+
+    let relative_path = v1::get_file_path(req_uri)?;
+    debug!(
+        "variable_content: Extracted relative path: {}",
+        relative_path
+    );
+
     let file_path = base_path.join(relative_path);
     debug!("variable_content: Full file path to serve: {:?}", file_path);
     debug!(
