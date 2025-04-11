@@ -232,7 +232,8 @@ impl Runtime {
                     let Some(last_msg) = new_msgs.last() else {
                         return Err(ContractError::from(RuntimeInnerError::DelegateExecError(
                             DelegateError::Other(
-                                "Error trying to update the context from the secret".to_string(),
+                                "Delegate did not return any messages after GetSecretResponse"
+                                    .to_string(),
                             )
                             .into(),
                         )));
@@ -248,7 +249,19 @@ impl Runtime {
                                 *ctx = last_context.clone();
                             };
                         }
-                        if !pending.processed() {
+                        // Check if the message is processed AND an ApplicationMessage
+                        if pending.processed() {
+                            if let OutboundDelegateMsg::ApplicationMessage(mut app_msg) = pending {
+                                // Add processed ApplicationMessages directly to results
+                                tracing::debug!(app = %app_msg.app, payload_len = app_msg.payload.len(), "Adding processed ApplicationMessage from GetSecretResponse handling to results");
+                                app_msg.context = DelegateContext::default(); // Ensure context is cleared
+                                results.push(OutboundDelegateMsg::ApplicationMessage(app_msg));
+                            } else {
+                                // Handle other processed messages if necessary (currently none expected here)
+                                tracing::warn!(?pending, "Ignoring unexpected processed message during GetSecretRequest handling");
+                            }
+                        } else {
+                            // Push non-processed messages back for further handling
                             outbound_msgs.push_back(pending);
                         }
                     }
