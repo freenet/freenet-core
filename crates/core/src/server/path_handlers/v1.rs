@@ -13,7 +13,9 @@ pub(super) fn get_file_path(uri: axum::http::Uri) -> Result<String, Box<WebSocke
     } else {
         // Path doesn't match expected prefixes
         return Err(Box::new(WebSocketApiError::InvalidParam {
-            error_cause: format!("URI path '{path_str}' does not start with /v1/contract/ or /v1/contract/web/"),
+            error_cause: format!(
+                "URI path '{path_str}' does not start with /v1/contract/ or /v1/contract/web/"
+            ),
         }));
     };
 

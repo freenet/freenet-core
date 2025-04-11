@@ -201,11 +201,12 @@ pub(super) async fn variable_content(
     debug!("variable_content: Base path resolved to: {:?}", base_path);
 
     // Parse the full request path URI to extract the relative path using the v1 helper.
-    let req_uri = req_path
-        .parse::<axum::http::Uri>()
-        .map_err(|err| WebSocketApiError::InvalidParam {
-            error_cause: format!("Failed to parse request path as URI: {err}"),
-        })?;
+    let req_uri =
+        req_path
+            .parse::<axum::http::Uri>()
+            .map_err(|err| WebSocketApiError::InvalidParam {
+                error_cause: format!("Failed to parse request path as URI: {err}"),
+            })?;
     debug!("variable_content: Parsed request URI: {:?}", req_uri);
 
     let relative_path = v1::get_file_path(req_uri)?;
