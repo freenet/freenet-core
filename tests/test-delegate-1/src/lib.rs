@@ -24,7 +24,7 @@ impl From<SecretsContext> for DelegateContext {
 #[derive(Debug, Serialize, Deserialize)]
 enum InboundAppMessage {
     CreateInboxRequest,
-    PleaseSignMessage(Vec<u8>),
+    PleaseSignMessage(Vec<u8>)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
