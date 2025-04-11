@@ -179,6 +179,7 @@ fn check_signing() -> Result<(), Box<dyn std::error::Error>> {
     let create_inbox_request_msg = ApplicationMessage::new(app, payload).processed(false);
 
     let inbound = InboundDelegateMsg::ApplicationMessage(create_inbox_request_msg);
+    // Note: The test signature for DelegateInterface::process changed, adding Option<&[u8]>
     let output1 = Delegate::process(Parameters::from(vec![]), None, inbound)?;
     assert_eq!(output1.len(), 2);
     assert!(matches!(
