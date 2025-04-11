@@ -75,18 +75,6 @@ impl DelegateInterface for Delegate {
                     InboundAppMessage::PleaseSignMessage(inbox_priv_key) => {
                         let key = SecretsId::new(inbox_priv_key);
                         if incoming_app.context.as_ref().is_empty() {
-                            let request_secret = GetSecretRequest {
-                                key,
-                                context: SecretsContext::default().into(),
-                                processed: false,
-                            }
-                            .into();
-                            let payload = incoming_app.payload;
-                            let app = incoming_app.app;
-                            let please_sign_message_content = ApplicationMessage::new(app, payload)
-                                .processed(false)
-                                .into();
-                            return Ok(vec![request_secret, please_sign_message_content]);
                             // Store the payload we need to sign later in the context
                             // and request the secret.
                             let context = SecretsContext {
@@ -99,10 +87,13 @@ impl DelegateInterface for Delegate {
                                 processed: false, // This flag is internal to the runtime, doesn't matter here
                             }
                             .into();
+                            // Only return the GetSecretRequest
                             return Ok(vec![request_secret]);
                         }
 
-                        // If we have context, it means GetSecretResponse should be called next.
+                        // If we received this message again but *with* context,
+                        // it implies something went wrong in the expected flow (e.g., runtime error).
+                        // For robustness, we could re-request the secret, preserving the context.
                         // This branch should ideally not be hit if the flow is correct,
                         // but if it is, we re-request the secret.
                         let secrets_context: SecretsContext =
@@ -121,12 +112,19 @@ impl DelegateInterface for Delegate {
                 }
             }
             InboundDelegateMsg::GetSecretResponse(secret_response) => {
-                let pk_bytes = secret_response
+                // Use the retrieved secret bytes (though not for actual crypto in this test)
+                let _pk_bytes = secret_response
                     .value
                     .ok_or(DelegateError::Other("Missing secret value".into()))?;
+
+                // Deserialize the context that was sent with the GetSecretRequest
                 let secrets_context: SecretsContext =
                     bincode::deserialize(secret_response.context.as_ref())
-                        .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                        .map_err(|err| {
+                            DelegateError::Other(format!(
+                                "Failed to deserialize context in GetSecretResponse: {err}"
+                            ))
+                        })?;
 
                 if let Some(_payload_to_sign) = secrets_context.message_to_sign_payload {
                     // Use pk_bytes and _payload_to_sign to generate a real signature here
