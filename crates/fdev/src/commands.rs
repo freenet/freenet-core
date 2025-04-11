@@ -246,6 +246,7 @@ pub async fn get_contract_id(config: GetContractIdConfig) -> anyhow::Result<()> 
 
     let key = contract.key();
     tracing::info!("{key}");
+    Ok(())
 }
 
 pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<()> {
