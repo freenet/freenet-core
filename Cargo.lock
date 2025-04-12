@@ -604,9 +604,9 @@ checksum = "a2698f953def977c68f935bb0dfa959375ad4638570e969e2f1e9f433cbf1af6"
 
 [[package]]
 name = "cc"
-version = "1.2.18"
+version = "1.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "525046617d8376e3db1deffb079e91cef90a89fc3ca5c185bbf8c9ecdd15cd5c"
+checksum = "8e3a13707ac958681c13b39b458c073d0d9bc8a22cb1b2f4c8e55eb72c13f362"
 dependencies = [
  "jobserver",
  "libc",
@@ -698,9 +698,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.5.35"
+version = "4.5.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8aa86934b44c19c50f87cc2790e19f54f7a67aedb64101c2e1a2e5ecfb73944"
+checksum = "2df961d8c8a0d08aa9945718ccf584145eee3f3aa06cddbeac12933781102e04"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -708,9 +708,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.5.35"
+version = "4.5.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2414dbb2dd0695280da6ea9261e327479e9d37b0630f6b53ba2a11c60c679fd9"
+checksum = "132dbda40fb6753878316a489d5a1242a8ef2f0d9e47ba01c951ea8aa7d013a5"
 dependencies = [
  "anstream",
  "anstyle",
@@ -1122,9 +1122,9 @@ dependencies = [
 
 [[package]]
 name = "data-encoding"
-version = "2.8.0"
+version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "575f75dfd25738df5b91b8e43e14d44bda14637a58fae779fd2b064f8bf3e010"
+checksum = "2a2330da5de22e8a3cb63252ce2abb30116bf5265e89c0e01bc17015ce30a476"
 
 [[package]]
 name = "deflate64"
@@ -1471,7 +1471,7 @@ dependencies = [
  "dashmap",
  "either",
  "freenet",
- "freenet-stdlib 0.1.4",
+ "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures 0.3.31",
  "glob",
  "http 1.3.1",
@@ -1600,7 +1600,7 @@ dependencies = [
  "directories",
  "either",
  "flatbuffers",
- "freenet-stdlib 0.1.4",
+ "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures 0.3.31",
  "headers",
  "hickory-resolver",
@@ -1681,7 +1681,7 @@ dependencies = [
  "clap",
  "freenet",
  "freenet-ping-types",
- "freenet-stdlib 0.1.4",
+ "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures 0.3.31",
  "once_cell",
  "rand 0.8.5",
@@ -1700,7 +1700,7 @@ name = "freenet-ping-contract"
 version = "0.1.0"
 dependencies = [
  "freenet-ping-types",
- "freenet-stdlib 0.1.4",
+ "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_json",
 ]
 
@@ -1710,42 +1710,10 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
- "freenet-stdlib 0.1.4",
+ "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "humantime",
  "humantime-serde",
  "serde",
-]
-
-[[package]]
-name = "freenet-stdlib"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2bf70ff9910f15a9aee81db4ade54711d1f38697bd3a264d5479f1d451cbd23"
-dependencies = [
- "arbitrary",
- "bincode",
- "blake3",
- "bs58",
- "byteorder",
- "chrono",
- "flatbuffers",
- "freenet-macros 0.1.1",
- "futures 0.3.31",
- "js-sys",
- "once_cell",
- "semver",
- "serde",
- "serde-wasm-bindgen 0.6.5",
- "serde_bytes",
- "serde_json",
- "serde_with",
- "thiserror 1.0.69",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "tracing",
- "tracing-subscriber",
- "wasm-bindgen",
- "web-sys",
 ]
 
 [[package]]
@@ -1777,6 +1745,38 @@ dependencies = [
  "tracing-subscriber",
  "wasm-bindgen",
  "wasmer",
+ "web-sys",
+]
+
+[[package]]
+name = "freenet-stdlib"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1637f0e80197acbabcc12cf366b6322fbbf9b695de68659af6ba01a1d3dac642"
+dependencies = [
+ "arbitrary",
+ "bincode",
+ "blake3",
+ "bs58",
+ "byteorder",
+ "chrono",
+ "flatbuffers",
+ "freenet-macros 0.1.1",
+ "futures 0.3.31",
+ "js-sys",
+ "once_cell",
+ "semver",
+ "serde",
+ "serde-wasm-bindgen 0.6.5",
+ "serde_bytes",
+ "serde_json",
+ "serde_with",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "tracing-subscriber",
+ "wasm-bindgen",
  "web-sys",
 ]
 
@@ -4445,9 +4445,9 @@ dependencies = [
 
 [[package]]
 name = "self_cell"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2fdfc24bc566f839a2da4c4295b82db7d25a24253867d5c64355abb5799bdbe"
+checksum = "0f7d95a54511e0c7be3f51e8867aa8cf35148d7b9445d44de2f943e2b206e749"
 
 [[package]]
 name = "semver"
