@@ -1,9 +1,9 @@
 # Delegates
 
-In Freenet, Delegates are software components that can act on the user's behalf. 
-Think of them as a more sophisticated version of a web browser's local storage, 
-with similarities to Unix "Daemons". Operating within the Freenet core on your 
-device, Delegates are a secure and flexible mechanism for managing private data, 
+In Freenet, Delegates are software components that can act on the user's behalf.
+Think of them as a more sophisticated version of a web browser's local storage,
+with similarities to Unix "Daemons". Operating within the Freenet core on your
+device, Delegates are a secure and flexible mechanism for managing private data,
 such as cryptographic keys, tokens, and passwords, and executing complex tasks.
 
 Delegates interact with various components within Freenet, including Contracts,

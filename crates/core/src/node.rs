@@ -14,8 +14,6 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ErrorKind},
     prelude::ContractKey,
 };
-use rsa::pkcs8::DecodePublicKey;
-use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
     fmt::Display,
@@ -27,7 +25,6 @@ use std::{
     time::Duration,
 };
 use std::{collections::HashSet, convert::Infallible};
-use tracing::Instrument;
 
 use self::p2p_impl::NodeP2P;
 use crate::{
@@ -51,6 +48,10 @@ use crate::{
     config::Config,
     message::{MessageStats, NetMessageV1},
 };
+use freenet_stdlib::client_api::DelegateRequest;
+use rsa::pkcs8::DecodePublicKey;
+use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 use crate::operations::handle_op_request;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
@@ -960,9 +961,17 @@ pub async fn run_local_node(
                         .ok()
                         .and_then(|guard| guard.get(&token).map(|(t, _)| *t))
                 });
+                let op_name = match op {
+                    DelegateRequest::RegisterDelegate { .. } => "RegisterDelegate",
+                    DelegateRequest::ApplicationMessages { .. } => "ApplicationMessages",
+                    DelegateRequest::GetSecretRequest { .. } => "GetSecretRequest",
+                    DelegateRequest::UnregisterDelegate(_) => "UnregisterDelegate",
+                    _ => "Unknown",
+                };
                 tracing::debug!(
+                    op_name = ?op_name,
                     ?attested_contract,
-                    "Delegate request with attested contract"
+                    "Handling ClientRequest::DelegateOp"
                 );
                 executor.delegate_request(op, attested_contract.as_ref())
             }

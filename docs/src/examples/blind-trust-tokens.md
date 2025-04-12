@@ -51,7 +51,7 @@ struct Attestation {
     pub authorization : Authorization,
     pub authorization_sig : Signature,
 
-    /// 
+    ///
     fn is_valid(&self) -> Result<Authorization, String> {
         if (!signature.verify(&authorization.pubkey, &self.target)) {
             return Err("The target's signature is invalid");

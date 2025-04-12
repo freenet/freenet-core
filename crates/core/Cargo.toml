@@ -13,6 +13,7 @@ name = "freenet"
 path = "src/bin/freenet.rs"
 
 [dependencies]
+ahash = "0.8"
 anyhow = "1"
 arc-swap = "1"
 asynchronous-codec = "0.7"

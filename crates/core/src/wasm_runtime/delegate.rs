@@ -85,6 +85,13 @@ impl Runtime {
             msg_buf.write(msg)?;
             msg_buf.ptr()
         };
+        let inbound_msg_name = match msg {
+            InboundDelegateMsg::ApplicationMessage(_) => "ApplicationMessage",
+            InboundDelegateMsg::UserResponse(_) => "UserResponse",
+            InboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse",
+            InboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest",
+        };
+        tracing::debug!(inbound_msg_name, "Calling delegate with inbound message");
         let res = process_func.call(
             self.wasm_store.as_mut().unwrap(),
             param_buf_ptr as i64,
@@ -97,7 +104,72 @@ impl Runtime {
                 .unwrap(linear_mem)
                 .map_err(Into::<DelegateExecError>::into)?
         };
+        self.log_delegate_exec_result(inbound_msg_name, &outbound);
         Ok(outbound)
+    }
+
+    fn log_delegate_exec_result(&self, inbound_msg_name: &str, outbound: &[OutboundDelegateMsg]) {
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let outbound_message_names = outbound
+                .iter()
+                .map(|m| match m {
+                    OutboundDelegateMsg::ApplicationMessage(am) => format!(
+                        "ApplicationMessage(app={}, payload_len={}, processed={}, context_len={})",
+                        am.app,
+                        am.payload.len(),
+                        am.processed,
+                        am.context.as_ref().len()
+                    ),
+                    OutboundDelegateMsg::RequestUserInput(_) => "RequestUserInput".to_string(),
+                    OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdated".to_string(),
+                    OutboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest".to_string(),
+                    OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretRequest".to_string(),
+                    OutboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse".to_string(),
+                })
+                .collect::<Vec<String>>()
+                .join(", ");
+            tracing::debug!(
+                inbound_msg_name,
+                outbound_message_names,
+                "Delegate returned outbound messages"
+            );
+        } else {
+            tracing::debug!(
+                inbound_msg_name,
+                outbound_len = outbound.len(),
+                "Delegate returned outbound messages"
+            );
+        }
+    }
+
+    fn log_get_outbound_entry(
+        &self,
+        delegate_key: &DelegateKey,
+        attested: Option<&[u8]>,
+        outbound_msgs: &VecDeque<OutboundDelegateMsg>,
+    ) {
+        tracing::debug!(
+            delegate_key = ?delegate_key,
+            ?attested,
+            outbound_msgs_len = outbound_msgs.len(),
+            // Generate message details only if DEBUG level is enabled
+            outbound_msg_details = debug(if tracing::enabled!(tracing::Level::DEBUG) {
+                outbound_msgs.iter().map(|msg| {
+                    match msg {
+                        OutboundDelegateMsg::ApplicationMessage(m) => format!("AppMsg(payload_len={})", m.payload.len()),
+                        OutboundDelegateMsg::GetSecretRequest(_) => "GetSecretReq".to_string(),
+                        OutboundDelegateMsg::GetSecretResponse(_) => "GetSecretResp".to_string(),
+                        OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretReq".to_string(),
+                        OutboundDelegateMsg::RequestUserInput(_) => "UserInputReq".to_string(),
+                        OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdate".to_string(),
+                    }
+                }).collect::<Vec<_>>()
+            } else {
+                // Avoid computation if tracing level is disabled
+                Vec::new()
+            }),
+            "get_outbound called"
+        );
     }
 
     // FIXME: modify the context atomically from the delegates, requires some changes to handle function calls with envs
@@ -112,8 +184,10 @@ impl Runtime {
         outbound_msgs: &mut VecDeque<OutboundDelegateMsg>,
         results: &mut Vec<OutboundDelegateMsg>,
     ) -> RuntimeResult<DelegateContext> {
+        self.log_get_outbound_entry(delegate_key, attested, outbound_msgs);
+
         const MAX_ITERATIONS: usize = 100;
-        let mut recurssion = 0;
+        let mut recursion = 0;
         let Some(mut last_context) = outbound_msgs.back().and_then(|m| m.get_context().cloned())
         else {
             return Ok(DelegateContext::default());
@@ -123,22 +197,43 @@ impl Runtime {
                 OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
                     key, processed, ..
                 }) if !processed => {
-                    let secret = self.secret_store.get_secret(delegate_key, &key)?;
+                    tracing::debug!(%key, "Handling OutboundDelegateMsg::GetSecretRequest received from delegate");
+                    let secret_result = self.secret_store.get_secret(delegate_key, &key).ok();
+                    tracing::debug!(%key, secret_is_some = secret_result.is_some(), "Secret store responded");
                     let inbound = InboundDelegateMsg::GetSecretResponse(GetSecretResponse {
                         key,
-                        value: Some(secret),
+                        value: secret_result,
                         context: last_context.clone(),
                     });
-                    if recurssion >= MAX_ITERATIONS {
+                    if recursion >= MAX_ITERATIONS {
                         return Err(ContractError::from(RuntimeInnerError::DelegateExecError(DelegateError::Other("The maximum number of attempts to get the secret has been exceeded".to_string()).into())));
                     }
                     let new_msgs =
                         self.exec_inbound(params, attested, &inbound, process_func, instance)?;
-                    recurssion += 1;
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        let summary = new_msgs
+                            .iter()
+                            .map(|m| match m {
+                                OutboundDelegateMsg::ApplicationMessage(_) => "ApplicationMessage",
+                                OutboundDelegateMsg::RequestUserInput(_) => "RequestUserInput",
+                                OutboundDelegateMsg::ContextUpdated(_) => "ContextUpdated",
+                                OutboundDelegateMsg::GetSecretRequest(_) => "GetSecretRequest",
+                                OutboundDelegateMsg::SetSecretRequest(_) => "SetSecretRequest",
+                                OutboundDelegateMsg::GetSecretResponse(_) => "GetSecretResponse",
+                            })
+                            .collect::<Vec<_>>();
+                        tracing::debug!(
+                            count = new_msgs.len(),
+                            ?summary,
+                            "Messages returned from exec_inbound after GetSecretResponse"
+                        );
+                    }
+                    recursion += 1;
                     let Some(last_msg) = new_msgs.last() else {
                         return Err(ContractError::from(RuntimeInnerError::DelegateExecError(
                             DelegateError::Other(
-                                "Error trying to update the context from the secret".to_string(),
+                                "Delegate did not return any messages after GetSecretResponse"
+                                    .to_string(),
                             )
                             .into(),
                         )));
@@ -154,7 +249,19 @@ impl Runtime {
                                 *ctx = last_context.clone();
                             };
                         }
-                        if !pending.processed() {
+                        // Check if the message is processed AND an ApplicationMessage
+                        if pending.processed() {
+                            if let OutboundDelegateMsg::ApplicationMessage(mut app_msg) = pending {
+                                // Add processed ApplicationMessages directly to results
+                                tracing::debug!(app = %app_msg.app, payload_len = app_msg.payload.len(), "Adding processed ApplicationMessage from GetSecretResponse handling to results");
+                                app_msg.context = DelegateContext::default(); // Ensure context is cleared
+                                results.push(OutboundDelegateMsg::ApplicationMessage(app_msg));
+                            } else {
+                                // Handle other processed messages if necessary (currently none expected here)
+                                tracing::warn!(?pending, "Ignoring unexpected processed message during GetSecretRequest handling");
+                            }
+                        } else {
+                            // Push non-processed messages back for further handling
                             outbound_msgs.push_back(pending);
                         }
                     }
@@ -174,30 +281,34 @@ impl Runtime {
                         self.secret_store.remove_secret(delegate_key, &key)?;
                     }
                 }
+                /*  Why would it take the payload from an ApplicationMessage coming from the delegate and
+                    send it back to the delegate?
+
                 OutboundDelegateMsg::ApplicationMessage(msg) if !msg.processed => {
-                    if recurssion >= MAX_ITERATIONS {
-                        return Err(DelegateExecError::DelegateError(DelegateError::Other(
-                            "max recurssion (100) limit hit".into(),
-                        ))
-                        .into());
-                    }
-                    let outbound = self.exec_inbound(
-                        params,
-                        attested,
-                        &InboundDelegateMsg::ApplicationMessage(
-                            ApplicationMessage::new(msg.app, msg.payload)
-                                .processed(msg.processed)
-                                .with_context(last_context.clone()),
-                        ),
-                        process_func,
-                        instance,
-                    )?;
-                    recurssion += 1;
-                    for msg in outbound {
-                        outbound_msgs.push_back(msg);
-                    }
-                }
+                         if recursion >= MAX_ITERATIONS {
+                             return Err(DelegateExecError::DelegateError(DelegateError::Other(
+                                 "max recurssion (100) limit hit".into(),
+                             ))
+                             .into());
+                         }
+                         let outbound = self.exec_inbound(
+                             params,
+                             attested,
+                             &InboundDelegateMsg::ApplicationMessage(
+                                 ApplicationMessage::new(msg.app, msg.payload)
+                                     .processed(msg.processed)
+                                     .with_context(last_context.clone()),
+                             ),
+                             process_func,
+                             instance,
+                         )?;
+                         recursion += 1;
+                         for msg in outbound {
+                             outbound_msgs.push_back(msg);
+                         }
+                     } */
                 OutboundDelegateMsg::ApplicationMessage(mut msg) => {
+                    tracing::debug!(app = %msg.app, payload_len = msg.payload.len(), processed = msg.processed, "Adding processed ApplicationMessage to results in get_outbound");
                     msg.context = DelegateContext::default();
                     results.push(OutboundDelegateMsg::ApplicationMessage(msg));
                     break;
@@ -361,6 +472,10 @@ impl DelegateRuntimeInterface for Runtime {
                 _ => unreachable!(),
             }
         }
+        tracing::debug!(
+            count = results.len(),
+            "Final results returned by inbound_app_message"
+        );
         Ok(results)
     }
 
