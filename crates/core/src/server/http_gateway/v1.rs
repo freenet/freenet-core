@@ -7,8 +7,8 @@ impl HttpGateway {
         attested_contracts: AttestedContractMap,
     ) -> (Self, Router) {
         let localhost = match socket.ip() {
-            IpAddr::V4(ip) if ip.is_loopback() => true,
-            IpAddr::V6(ip) if ip.is_loopback() => true,
+            IpAddr::V4(ip) if ip.is_loopback() || ip.is_unspecified() => true,
+            IpAddr::V6(ip) if ip.is_loopback() || ip.is_unspecified() => true,
             _ => false,
         };
         let contract_web_path = std::env::temp_dir().join("freenet").join("webs");
