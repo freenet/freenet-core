@@ -1600,7 +1600,7 @@ dependencies = [
  "directories",
  "either",
  "flatbuffers",
- "freenet-stdlib 0.1.4",
+ "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures 0.3.31",
  "headers",
  "hickory-resolver",
@@ -1728,6 +1728,8 @@ dependencies = [
 [[package]]
 name = "freenet-macros"
 version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c21b0e54ae3e7c5c9b9c845bd9eb4df94d24c94c0c5815ce5aa097492b984259"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1736,9 +1738,7 @@ dependencies = [
 
 [[package]]
 name = "freenet-macros"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c21b0e54ae3e7c5c9b9c845bd9eb4df94d24c94c0c5815ce5aa097492b984259"
+version = "0.1.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1754,7 +1754,7 @@ dependencies = [
  "clap",
  "freenet 0.1.2",
  "freenet-ping-types",
- "freenet-stdlib 0.1.4",
+ "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures 0.3.31",
  "once_cell",
  "rand 0.8.5",
@@ -1773,7 +1773,7 @@ name = "freenet-ping-contract"
 version = "0.1.0"
 dependencies = [
  "freenet-ping-types",
- "freenet-stdlib 0.1.4",
+ "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_json",
 ]
 
@@ -1783,7 +1783,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
- "freenet-stdlib 0.1.4",
+ "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "humantime",
  "humantime-serde",
  "serde",
@@ -1791,9 +1791,7 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2bf70ff9910f15a9aee81db4ade54711d1f38697bd3a264d5479f1d451cbd23"
+version = "0.1.5"
 dependencies = [
  "arbitrary",
  "bincode",
@@ -1826,6 +1824,8 @@ dependencies = [
 [[package]]
 name = "freenet-stdlib"
 version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1637f0e80197acbabcc12cf366b6322fbbf9b695de68659af6ba01a1d3dac642"
 dependencies = [
  "arbitrary",
  "bincode",
@@ -1834,7 +1834,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "flatbuffers",
- "freenet-macros 0.1.2",
+ "freenet-macros 0.1.1",
  "futures 0.3.31",
  "js-sys",
  "once_cell",
@@ -5176,7 +5176,7 @@ dependencies = [
 name = "test-contract-integration"
 version = "0.1.0"
 dependencies = [
- "freenet-stdlib 0.1.4",
+ "freenet-stdlib 0.1.5",
  "serde",
  "serde_json",
 ]
