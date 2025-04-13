@@ -1608,7 +1608,7 @@ dependencies = [
  "itertools 0.14.0",
  "notify",
  "once_cell",
- "opentelemetry 0.27.1",
+ "opentelemetry 0.29.1",
  "opentelemetry-jaeger",
  "opentelemetry-otlp",
  "opentelemetry_sdk 0.29.0",
