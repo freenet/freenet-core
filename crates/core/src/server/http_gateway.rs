@@ -34,11 +34,7 @@ impl std::ops::Deref for HttpGatewayRequest {
 pub type AttestedContractMap = Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>;
 
 /// A gateway to access and interact with contracts through an HTTP interface.
-///
-/// Contracts initially accessed through the gateway have to be compliant with the container contract
-/// [specification](https://docs.freenet.org/glossary.html#container-contract) for Locutus.
-///
-/// Check the Locutus book for [more information](https://docs.freenet.org/dev-guide.html).
+
 pub(crate) struct HttpGateway {
     pub attested_contracts: AttestedContractMap,
     proxy_server_request: mpsc::Receiver<ClientConnection>,
