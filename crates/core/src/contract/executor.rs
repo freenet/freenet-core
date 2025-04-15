@@ -471,6 +471,14 @@ pub(crate) trait ContractExecutor: Send + 'static {
         notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
         summary: Option<StateSummary<'_>>,
     ) -> Result<(), Box<RequestError>>;
+
+    fn inbound_app_message(
+        &mut self,
+        key: &DelegateKey,
+        params: &Parameters,
+        attested: Option<&[u8]>,
+        inbound: Vec<InboundDelegateMsg>,
+    ) -> RuntimeResult<Vec<OutboundDelegateMsg>>;
 }
 
 /// A WASM executor which will run any contracts, delegates, etc. registered.

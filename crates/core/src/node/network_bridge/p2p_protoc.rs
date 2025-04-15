@@ -784,6 +784,9 @@ impl P2pConnManager {
                     ));
                 }
             }
+            WaitingTransaction::DelegateResult(outbound_delegate_msg) => {
+                todo!("Route to the client")
+            }
         }
         EventResult::Continue
     }
@@ -847,6 +850,7 @@ struct EventListenerState {
     // FIXME: we are potentially leaving trash here when transacrions are completed
     tx_to_client: HashMap<Transaction, ClientId>,
     client_waiting_transaction: Vec<(WaitingTransaction, HashSet<ClientId>)>,
+    client_waiting_delegate_msg: Vec<()>,
     transient_conn: HashMap<Transaction, SocketAddr>,
     awaiting_connection: HashMap<SocketAddr, Box<dyn ConnectResultSender>>,
     pending_op_results: HashMap<Transaction, Sender<NetMessage>>,

@@ -535,8 +535,33 @@ async fn process_open_request(
                     }
                 }
             }
-            ClientRequest::DelegateOp(_op) => {
-                todo!("FIXME: delegate op");
+            ClientRequest::DelegateOp(req) => {
+                 let res = match op_manager
+                    .notify_contract_handler(ContractHandlerEvent::DelegateRequest(req)) {
+                        key,
+                        return_contract_code,
+                    })
+                    .await
+                {
+                    Ok(ContractHandlerEvent::DelegateResponse(res)) => res,
+                    Err(err) => {
+                        tracing::error!("get query failed: {}", err);
+                        return Err(Error::Contract(err));
+                    }
+                    Ok(_) => {
+                        tracing::error!("get query failed: UnexpectedOpState");
+                        return Err(Error::Op(OpError::UnexpectedOpState));
+                    }
+                };
+
+                // FIXME: 
+                op_manager
+                    .ch_outbound
+                    .waiting_for_delegate_msg(client_id)
+                    .await
+                    .inspect_err(|err| {
+                        tracing::error!("Error waiting for transaction result: {}", err);
+                    })?;
             }
             ClientRequest::Disconnect { .. } => {
                 unreachable!();

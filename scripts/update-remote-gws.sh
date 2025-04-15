@@ -75,14 +75,19 @@ unpack_binary() {
     local binary=$2
     local zip_file="${ARTIFACTS_DIR}/binaries-${arch}-${binary}.zip"
     
-    # Create output directory if it doesn't exist
-    mkdir -p "${BINARIES_PATH}"
+    # Create a truly random directory name using timestamp and random number
+    local timestamp=$(date +%s)
+    local random_num=$((RANDOM + RANDOM))
+    local random_dir="${BINARIES_PATH}/freenet-${timestamp}-${random_num}"
+    mkdir -p "${random_dir}"
     
-    # Unzip the binary to the output directory
-    unzip -o "${zip_file}" -d "${BINARIES_PATH}"
+    # Unzip the binary to the random directory
+    unzip -o "${zip_file}" -d "${random_dir}"
     
     # Return success if the binary now exists
-    if [ -f "${BINARIES_PATH}/${binary}" ]; then
+    if [ -f "${random_dir}/${binary}" ]; then
+        # Export the path so it can be used outside the function
+        export CURRENT_BINARY_PATH="${random_dir}/${binary}"
         return 0
     else
         return 1
@@ -271,9 +276,9 @@ for server_info in "${SERVERS[@]}"; do
                 
                 # Use our custom scp_with_timeout function
                 if [ "$server" = "technic.locut.us" ]; then
-                    scp_with_timeout "${BINARIES_PATH}/${binary}" "freenet@$server:${binary}.new" "23"
+                    scp_with_timeout "${CURRENT_BINARY_PATH}" "freenet@$server:${binary}.new" "23"
                 else
-                    scp_with_timeout "${BINARIES_PATH}/${binary}" "freenet@$server:${binary}.new" ""
+                    scp_with_timeout "${CURRENT_BINARY_PATH}" "freenet@$server:${binary}.new" ""
                 fi
                 
                 SCP_RESULT=$?

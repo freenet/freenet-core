@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::Arc;
 use std::time::Duration;
 
+use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -162,6 +163,7 @@ pub(crate) struct SenderHalve {
 pub(crate) enum WaitingTransaction {
     Transaction(Transaction),
     Subscription { contract_key: ContractInstanceId },
+    DelegateResult(OutboundDelegateMsg),
 }
 
 impl From<Transaction> for WaitingTransaction {
@@ -303,6 +305,8 @@ struct InternalCHEvent {
 
 #[derive(Debug)]
 pub(crate) enum ContractHandlerEvent {
+    // FIXME:
+    DelegateRequest(DelegateRequest<'static>),
     /// Try to push/put a new value into the contract
     PutQuery {
         key: ContractKey,
