@@ -34,7 +34,6 @@ impl std::ops::Deref for HttpGatewayRequest {
 pub type AttestedContractMap = Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>;
 
 /// A gateway to access and interact with contracts through an HTTP interface.
-
 pub(crate) struct HttpGateway {
     pub attested_contracts: AttestedContractMap,
     proxy_server_request: mpsc::Receiver<ClientConnection>,
