@@ -604,9 +604,9 @@ checksum = "a2698f953def977c68f935bb0dfa959375ad4638570e969e2f1e9f433cbf1af6"
 
 [[package]]
 name = "cc"
-version = "1.2.18"
+version = "1.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "525046617d8376e3db1deffb079e91cef90a89fc3ca5c185bbf8c9ecdd15cd5c"
+checksum = "8e3a13707ac958681c13b39b458c073d0d9bc8a22cb1b2f4c8e55eb72c13f362"
 dependencies = [
  "jobserver",
  "libc",
@@ -698,9 +698,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.5.35"
+version = "4.5.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8aa86934b44c19c50f87cc2790e19f54f7a67aedb64101c2e1a2e5ecfb73944"
+checksum = "2df961d8c8a0d08aa9945718ccf584145eee3f3aa06cddbeac12933781102e04"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -708,9 +708,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.5.35"
+version = "4.5.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2414dbb2dd0695280da6ea9261e327479e9d37b0630f6b53ba2a11c60c679fd9"
+checksum = "132dbda40fb6753878316a489d5a1242a8ef2f0d9e47ba01c951ea8aa7d013a5"
 dependencies = [
  "anstream",
  "anstyle",
@@ -1122,9 +1122,9 @@ dependencies = [
 
 [[package]]
 name = "data-encoding"
-version = "2.8.0"
+version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "575f75dfd25738df5b91b8e43e14d44bda14637a58fae779fd2b064f8bf3e010"
+checksum = "2a2330da5de22e8a3cb63252ce2abb30116bf5265e89c0e01bc17015ce30a476"
 
 [[package]]
 name = "deflate64"
@@ -1460,7 +1460,7 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "fdev"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -1470,8 +1470,8 @@ dependencies = [
  "clap",
  "dashmap",
  "either",
- "freenet",
- "freenet-stdlib",
+ "freenet 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures 0.3.31",
  "glob",
  "http 1.3.1",
@@ -1574,7 +1574,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -1600,7 +1600,7 @@ dependencies = [
  "directories",
  "either",
  "flatbuffers",
- "freenet-stdlib",
+ "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures 0.3.31",
  "headers",
  "hickory-resolver",
@@ -1608,11 +1608,11 @@ dependencies = [
  "itertools 0.14.0",
  "notify",
  "once_cell",
- "opentelemetry 0.27.1",
+ "opentelemetry 0.29.1",
  "opentelemetry-jaeger",
  "opentelemetry-otlp",
- "opentelemetry_sdk 0.27.1",
- "ordered-float 4.6.0",
+ "opentelemetry_sdk 0.29.0",
+ "ordered-float 5.0.0",
  "parking_lot",
  "pav_regression",
  "pico-args",
@@ -1640,7 +1640,80 @@ dependencies = [
  "toml",
  "tower-http",
  "tracing",
- "tracing-opentelemetry",
+ "tracing-opentelemetry 0.30.0",
+ "tracing-subscriber",
+ "ulid",
+ "unsigned-varint",
+ "wasmer",
+ "wasmer-compiler-singlepass",
+ "wasmer-middlewares",
+ "winapi",
+ "wmi",
+ "xz2",
+]
+
+[[package]]
+name = "freenet"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7de85a86aaa710dc8900c0c7f3711c6ad2a79a7d15b2c3a84181b2cb4391bcb7"
+dependencies = [
+ "aes-gcm",
+ "ahash",
+ "anyhow",
+ "arc-swap",
+ "asynchronous-codec",
+ "axum",
+ "bincode",
+ "blake3",
+ "bs58",
+ "byteorder",
+ "bytes 1.10.1",
+ "cache-padded",
+ "chacha20poly1305",
+ "chrono",
+ "clap",
+ "cookie",
+ "crossbeam",
+ "ctrlc",
+ "dashmap",
+ "delegate",
+ "directories",
+ "either",
+ "flatbuffers",
+ "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "futures 0.3.31",
+ "headers",
+ "hickory-resolver",
+ "itertools 0.14.0",
+ "notify",
+ "once_cell",
+ "opentelemetry 0.27.1",
+ "opentelemetry-jaeger",
+ "opentelemetry-otlp",
+ "ordered-float 5.0.0",
+ "parking_lot",
+ "pav_regression",
+ "pkcs8",
+ "rand 0.8.5",
+ "redb",
+ "reqwest",
+ "rsa",
+ "semver",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "serde_with",
+ "stretto",
+ "tar",
+ "thiserror 2.0.12",
+ "time",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "toml",
+ "tower-http",
+ "tracing",
+ "tracing-opentelemetry 0.28.0",
  "tracing-subscriber",
  "ulid",
  "unsigned-varint",
@@ -1655,6 +1728,17 @@ dependencies = [
 [[package]]
 name = "freenet-macros"
 version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c21b0e54ae3e7c5c9b9c845bd9eb4df94d24c94c0c5815ce5aa097492b984259"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.100",
+]
+
+[[package]]
+name = "freenet-macros"
+version = "0.1.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1668,9 +1752,9 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
- "freenet",
+ "freenet 0.1.2",
  "freenet-ping-types",
- "freenet-stdlib",
+ "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures 0.3.31",
  "once_cell",
  "rand 0.9.0",
@@ -1689,7 +1773,7 @@ name = "freenet-ping-contract"
 version = "0.1.0"
 dependencies = [
  "freenet-ping-types",
- "freenet-stdlib",
+ "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_json",
 ]
 
@@ -1699,7 +1783,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
- "freenet-stdlib",
+ "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "humantime",
  "humantime-serde",
  "serde",
@@ -1707,7 +1791,7 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.1.3"
+version = "0.1.5"
 dependencies = [
  "arbitrary",
  "bincode",
@@ -1716,7 +1800,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "flatbuffers",
- "freenet-macros",
+ "freenet-macros 0.1.2",
  "futures 0.3.31",
  "js-sys",
  "once_cell",
@@ -1734,6 +1818,38 @@ dependencies = [
  "tracing-subscriber",
  "wasm-bindgen",
  "wasmer",
+ "web-sys",
+]
+
+[[package]]
+name = "freenet-stdlib"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1637f0e80197acbabcc12cf366b6322fbbf9b695de68659af6ba01a1d3dac642"
+dependencies = [
+ "arbitrary",
+ "bincode",
+ "blake3",
+ "bs58",
+ "byteorder",
+ "chrono",
+ "flatbuffers",
+ "freenet-macros 0.1.1",
+ "futures 0.3.31",
+ "js-sys",
+ "once_cell",
+ "semver",
+ "serde",
+ "serde-wasm-bindgen 0.6.5",
+ "serde_bytes",
+ "serde_json",
+ "serde_with",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "tracing-subscriber",
+ "wasm-bindgen",
  "web-sys",
 ]
 
@@ -2753,7 +2869,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc2f4eb4bc735547cfed7c0a4922cbd04a4655978c09b54f1f7b228750664c34"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -3311,6 +3427,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "opentelemetry"
+version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e87237e2775f74896f9ad219d26a2081751187eb7c9f5c58dde20a23b95d16c"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "pin-project-lite",
+ "thiserror 2.0.12",
+ "tracing",
+]
+
+[[package]]
 name = "opentelemetry-http"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3415,6 +3545,23 @@ dependencies = [
  "rand 0.8.5",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "opentelemetry_sdk"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "afdefb21d1d47394abc1ba6c57363ab141be19e27cc70d0e422b7f303e4d290b"
+dependencies = [
+ "futures-channel",
+ "futures-executor",
+ "futures-util",
+ "glob",
+ "opentelemetry 0.29.1",
+ "percent-encoding",
+ "rand 0.9.0",
+ "serde_json",
+ "thiserror 2.0.12",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -3449,6 +3596,15 @@ name = "ordered-float"
 version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "ordered-float"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2c1f9f56e534ac6a9b8a4600bdf0f530fb393b5f393e7b4d03489c3cf0c3f01"
 dependencies = [
  "num-traits",
 ]
@@ -4393,9 +4549,9 @@ dependencies = [
 
 [[package]]
 name = "self_cell"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2fdfc24bc566f839a2da4c4295b82db7d25a24253867d5c64355abb5799bdbe"
+checksum = "0f7d95a54511e0c7be3f51e8867aa8cf35148d7b9445d44de2f943e2b206e749"
 
 [[package]]
 name = "semver"
@@ -5051,7 +5207,7 @@ dependencies = [
 name = "test-contract-integration"
 version = "0.1.0"
 dependencies = [
- "freenet-stdlib",
+ "freenet-stdlib 0.1.5",
  "serde",
  "serde_json",
 ]
@@ -5532,6 +5688,24 @@ dependencies = [
  "once_cell",
  "opentelemetry 0.27.1",
  "opentelemetry_sdk 0.27.1",
+ "smallvec",
+ "tracing",
+ "tracing-core",
+ "tracing-log",
+ "tracing-subscriber",
+ "web-time",
+]
+
+[[package]]
+name = "tracing-opentelemetry"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd8e764bd6f5813fd8bebc3117875190c5b0415be8f7f8059bffb6ecd979c444"
+dependencies = [
+ "js-sys",
+ "once_cell",
+ "opentelemetry 0.29.1",
+ "opentelemetry_sdk 0.29.0",
  "smallvec",
  "tracing",
  "tracing-core",
