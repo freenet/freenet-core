@@ -225,6 +225,112 @@ impl ContractExecutor for Executor<Runtime> {
         }
         Ok(())
     }
+
+    fn execute_delegate_request(
+        &mut self,
+        req: DelegateRequest<'_>,
+        attested_contract: Option<&ContractInstanceId>,
+    ) -> Response {
+        tracing::debug!(
+            attested_contract = ?attested_contract,
+            "received delegate request"
+        );
+        match req {
+            DelegateRequest::RegisterDelegate {
+                delegate,
+                cipher,
+                nonce,
+            } => {
+                use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
+                let key = delegate.key().clone();
+                let arr = GenericArray::from_slice(&cipher);
+                let cipher = XChaCha20Poly1305::new(arr);
+                let nonce = GenericArray::from_slice(&nonce).to_owned();
+                if let Some(contract) = attested_contract {
+                    self.delegate_attested_ids
+                        .entry(key.clone())
+                        .or_default()
+                        .push(*contract);
+                }
+                match self.runtime.register_delegate(delegate, cipher, nonce) {
+                    Ok(_) => Ok(DelegateResponse {
+                        key,
+                        values: Vec::new(),
+                    }),
+                    Err(err) => {
+                        tracing::warn!("failed registering delegate `{key}`: {err}");
+                        Err(ExecutorError::other(StdDelegateError::RegisterError(key)))
+                    }
+                }
+            }
+            DelegateRequest::UnregisterDelegate(key) => {
+                self.delegate_attested_ids.remove(&key);
+                match self.runtime.unregister_delegate(&key) {
+                    Ok(_) => Ok(HostResponse::Ok),
+                    Err(err) => {
+                        tracing::warn!("failed unregistering delegate `{key}`: {err}");
+                        Ok(HostResponse::Ok)
+                    }
+                }
+            }
+            DelegateRequest::GetSecretRequest {
+                key,
+                params,
+                get_request,
+            } => {
+                tracing::debug!(
+                    delegate_key = %key,
+                    params_size = params.as_ref().len(),
+                    attested_contract = ?attested_contract,
+                    "Handling GetSecretRequest for delegate"
+                );
+                let attested = attested_contract.and_then(|contract| {
+                    self.delegate_attested_ids
+                        .get(&key)
+                        .and_then(|contracts| contracts.iter().find(|c| *c == contract))
+                });
+                match self.runtime.inbound_app_message(
+                    &key,
+                    &params,
+                    attested.map(|c| c.as_bytes()),
+                    vec![InboundDelegateMsg::GetSecretRequest(get_request)],
+                ) {
+                    Ok(values) => Ok(DelegateResponse { key, values }),
+                    Err(err) => Err(ExecutorError::execution(
+                        err,
+                        Some(InnerOpError::Delegate(key.clone())),
+                    )),
+                }
+            }
+            DelegateRequest::ApplicationMessages {
+                key,
+                inbound,
+                params,
+            } => {
+                // Use the attested_contract directly instead of looking it up in delegate_attested_ids
+                let attested_bytes = attested_contract.map(|c| c.as_bytes());
+                match self.runtime.inbound_app_message(
+                    &key,
+                    &params,
+                    attested_bytes,
+                    inbound
+                        .into_iter()
+                        .map(InboundDelegateMsg::into_owned)
+                        .collect(),
+                ) {
+                    Ok(values) => Ok(DelegateResponse { key, values }),
+                    Err(err) => {
+                        tracing::error!("failed executing delegate `{key}`: {err}");
+                        Err(ExecutorError::execution(
+                            err,
+                            Some(InnerOpError::Delegate(key)),
+                        ))
+                    }
+                }
+            }
+            _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
+        }
+    }
 }
 
 impl Executor<Runtime> {
@@ -253,41 +359,6 @@ impl Executor<Runtime> {
             event_loop_channel,
         )
         .await
-    }
-
-    pub fn register_contract_notifier(
-        &mut self,
-        key: ContractKey,
-        cli_id: ClientId,
-        notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
-        summary: Option<StateSummary<'_>>,
-    ) -> Result<(), Box<RequestError>> {
-        let channels = self.update_notifications.entry(key).or_default();
-        if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
-            let (_, existing_ch) = &channels[i];
-            if !existing_ch.same_channel(&notification_ch) {
-                return Err(RequestError::from(StdContractError::Subscribe {
-                    key,
-                    cause: format!("Peer {cli_id} already subscribed").into(),
-                })
-                .into());
-            }
-        } else {
-            channels.push((cli_id, notification_ch));
-        }
-
-        if self
-            .subscriber_summaries
-            .entry(key)
-            .or_default()
-            .insert(cli_id, summary.map(StateSummary::into_owned))
-            .is_some()
-        {
-            tracing::warn!(
-                "contract {key} already was registered for peer {cli_id}; replaced summary"
-            );
-        }
-        Ok(())
     }
 
     pub async fn preload(

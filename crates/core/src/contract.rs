@@ -167,6 +167,41 @@ where
                         error
                     })?;
             }
+            ContractHandlerEvent::DelegateRequest(req) => {
+                let delegate_key = req.key().clone();
+                tracing::debug!(
+                    delegate_key = %delegate_key,
+                    "Processing delegate request"
+                );
+
+                let response = match contract_handler
+                    .executor()
+                    .execute_delegate_request(req, None)
+                {
+                    Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
+                        key,
+                        values,
+                    }) => values,
+                    Ok(freenet_stdlib::client_api::HostResponse::Ok) => Vec::new(),
+                    Ok(_other) => {
+                        tracing::error!("unexpected response type from delegate request");
+                        return Err(ContractError::NoEvHandlerResponse);
+                    }
+                    Err(err) => {
+                        tracing::error!("failed executing delegate request: {}", err);
+                        return Err(ContractError::NoEvHandlerResponse);
+                    }
+                };
+
+                contract_handler
+                    .channel()
+                    .send_to_sender(id, ContractHandlerEvent::DelegateResponse(response))
+                    .await
+                    .map_err(|error| {
+                        tracing::debug!(%error, "shutting down contract handler");
+                        error
+                    })?;
+            }
             ContractHandlerEvent::RegisterSubscriberListener {
                 key,
                 client_id,
