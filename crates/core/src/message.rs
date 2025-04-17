@@ -7,13 +7,14 @@ use std::{
 };
 
 use crate::{
+    client_events::HostResult,
     node::PeerId,
     operations::{
         connect::ConnectMsg, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg, update::UpdateMsg,
     },
     ring::{Location, PeerKeyLocation},
 };
-use freenet_stdlib::prelude::{ContractContainer, ContractKey, WrappedState};
+use freenet_stdlib::prelude::{ContractContainer, ContractKey, DelegateKey, WrappedState};
 pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -324,6 +325,10 @@ pub(crate) enum QueryResult {
         key: ContractKey,
         state: WrappedState,
         contract: Option<ContractContainer>,
+    },
+    DelegateResult {
+        key: DelegateKey,
+        response: HostResult,
     },
 }
 

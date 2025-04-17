@@ -163,7 +163,6 @@ pub(crate) struct SenderHalve {
 pub(crate) enum WaitingTransaction {
     Transaction(Transaction),
     Subscription { contract_key: ContractInstanceId },
-    DelegateResult(OutboundDelegateMsg),
 }
 
 impl From<Transaction> for WaitingTransaction {
@@ -307,6 +306,7 @@ struct InternalCHEvent {
 pub(crate) enum ContractHandlerEvent {
     // FIXME:
     DelegateRequest(DelegateRequest<'static>),
+    DelegateResponse(Vec<OutboundDelegateMsg>),
     /// Try to push/put a new value into the contract
     PutQuery {
         key: ContractKey,
@@ -354,6 +354,12 @@ pub(crate) enum ContractHandlerEvent {
 impl std::fmt::Display for ContractHandlerEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ContractHandlerEvent::DelegateRequest(req) => {
+                write!(f, "delegate request {{ {:?} }}", req.key())
+            }
+            ContractHandlerEvent::DelegateResponse(_) => {
+                write!(f, "delegate response")
+            }
             ContractHandlerEvent::PutQuery { key, contract, .. } => {
                 if let Some(contract) = contract {
                     use std::fmt::Write;

@@ -118,6 +118,16 @@ impl ContractExecutor for Executor<MockRuntime> {
     ) -> Result<(), Box<RequestError>> {
         Ok(())
     }
+
+    fn execute_delegate_request(
+        &mut self,
+        _req: DelegateRequest<'_>,
+        _attested_contract: Option<&ContractInstanceId>,
+    ) -> Response {
+        Err(ExecutorError::other(anyhow::anyhow!(
+            "not supported in mock runtime"
+        )))
+    }
 }
 
 #[cfg(test)]

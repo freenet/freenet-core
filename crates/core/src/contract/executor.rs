@@ -472,13 +472,11 @@ pub(crate) trait ContractExecutor: Send + 'static {
         summary: Option<StateSummary<'_>>,
     ) -> Result<(), Box<RequestError>>;
 
-    fn inbound_app_message(
+    fn execute_delegate_request(
         &mut self,
-        key: &DelegateKey,
-        params: &Parameters,
-        attested: Option<&[u8]>,
-        inbound: Vec<InboundDelegateMsg>,
-    ) -> RuntimeResult<Vec<OutboundDelegateMsg>>;
+        req: DelegateRequest<'_>,
+        attested_contract: Option<&ContractInstanceId>,
+    ) -> Response;
 }
 
 /// A WASM executor which will run any contracts, delegates, etc. registered.

@@ -243,7 +243,13 @@ where
                                     contract,
                                 }))
                             }
+                            QueryResult::DelegateResult { response, .. } => {
+                                response
+                            }
                         };
+                        if let Ok(result) = &res {
+                            tracing::debug!(%result, "sending client operation response");
+                        }
                         if let Err(err) = client_events.send(cli_id, res).await {
                             tracing::debug!("channel closed: {err}");
                             anyhow::bail!(err);
@@ -536,32 +542,41 @@ async fn process_open_request(
                 }
             }
             ClientRequest::DelegateOp(req) => {
-                 let res = match op_manager
-                    .notify_contract_handler(ContractHandlerEvent::DelegateRequest(req)) {
-                        key,
-                        return_contract_code,
-                    })
+                let delegate_key = req.key().clone();
+                let res = match op_manager
+                    .notify_contract_handler(ContractHandlerEvent::DelegateRequest(req))
                     .await
                 {
                     Ok(ContractHandlerEvent::DelegateResponse(res)) => res,
                     Err(err) => {
-                        tracing::error!("get query failed: {}", err);
+                        tracing::error!("delegate operation failed: {}", err);
                         return Err(Error::Contract(err));
                     }
                     Ok(_) => {
-                        tracing::error!("get query failed: UnexpectedOpState");
+                        tracing::error!("delegate operation failed: UnexpectedOpState");
                         return Err(Error::Op(OpError::UnexpectedOpState));
                     }
                 };
 
-                // FIXME: 
-                op_manager
-                    .ch_outbound
-                    .waiting_for_delegate_msg(client_id)
-                    .await
-                    .inspect_err(|err| {
-                        tracing::error!("Error waiting for transaction result: {}", err);
-                    })?;
+                let host_response = Ok(HostResponse::DelegateResponse {
+                    key: delegate_key.clone(),
+                    values: res,
+                });
+
+                if let Some(ch) = &subscription_listener {
+                    if ch.send(host_response).is_err() {
+                        tracing::error!(
+                            "Failed to send delegate response through subscription channel"
+                        );
+                    }
+                    return Ok(None);
+                }
+
+                // Return the response to be sent by client_event_handling
+                return Ok(Some(Either::Left(QueryResult::DelegateResult {
+                    key: delegate_key,
+                    response: host_response,
+                })));
             }
             ClientRequest::Disconnect { .. } => {
                 unreachable!();
