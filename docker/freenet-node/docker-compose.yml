@@ -1,0 +1,16 @@
+services:
+  freenet-node:
+    build:
+      context: .
+      dockerfile: Dockerfile.yml
+    image: freenet-node:latest
+    environment:
+      - WS_API_PORT=50509
+    network_mode: host
+    volumes:
+      - freenet-data:/root/.cache/freenet
+    restart: unless-stopped
+
+volumes:
+  freenet-data:
+    driver: local
