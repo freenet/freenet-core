@@ -1,0 +1,19 @@
+services:
+  freenet-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: freenet-gateway:latest
+    environment:
+      TRANSPORT_KEYPAIR: /root/.cache/freenet/keys/transport-keypair.pem
+      PUBLIC_NETWORK_ADDRESS: 0.0.0.0
+      PUBLIC_NETWORK_PORT: 31337
+      NETWORK_PORT: 31337
+    network_mode: host
+    volumes:
+      - freenet-gateway-data:/root/.cache/freenet
+    restart: unless-stopped
+
+volumes:
+  freenet-gateway-data:
+    driver: local
