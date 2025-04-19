@@ -179,7 +179,7 @@ where
                     .execute_delegate_request(req, None)
                 {
                     Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
-                        key,
+                        key: _,
                         values,
                     }) => values,
                     Ok(freenet_stdlib::client_api::HostResponse::Ok) => Vec::new(),

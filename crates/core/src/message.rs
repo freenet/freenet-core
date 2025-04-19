@@ -327,6 +327,7 @@ pub(crate) enum QueryResult {
         contract: Option<ContractContainer>,
     },
     DelegateResult {
+        #[allow(dead_code)]
         key: DelegateKey,
         response: HostResult,
     },

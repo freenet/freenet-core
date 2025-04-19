@@ -542,6 +542,7 @@ async fn process_open_request(
                 }
             }
             ClientRequest::DelegateOp(req) => {
+                tracing::debug!("Received delegate operation from user event");
                 let delegate_key = req.key().clone();
                 let res = match op_manager
                     .notify_contract_handler(ContractHandlerEvent::DelegateRequest(req))
