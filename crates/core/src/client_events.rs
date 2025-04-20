@@ -109,6 +109,7 @@ pub struct OpenRequest<'a> {
     pub request: Box<ClientRequest<'a>>,
     pub notification_channel: Option<UnboundedSender<HostResult>>,
     pub token: Option<AuthToken>,
+    pub attested_contract: Option<ContractInstanceId>,
 }
 
 impl Display for OpenRequest<'_> {
@@ -135,6 +136,7 @@ impl<'a> OpenRequest<'a> {
             request,
             notification_channel: None,
             token: None,
+            attested_contract: None,
         }
     }
 
@@ -145,6 +147,11 @@ impl<'a> OpenRequest<'a> {
 
     pub fn with_token(mut self, token: Option<AuthToken>) -> Self {
         self.token = token;
+        self
+    }
+
+    pub fn with_attested_contract(mut self, contract: Option<ContractInstanceId>) -> Self {
+        self.attested_contract = contract;
         self
     }
 }
@@ -544,8 +551,13 @@ async fn process_open_request(
             ClientRequest::DelegateOp(req) => {
                 tracing::debug!("Received delegate operation from user event");
                 let delegate_key = req.key().clone();
+                let attested_contract = request.attested_contract;
+
                 let res = match op_manager
-                    .notify_contract_handler(ContractHandlerEvent::DelegateRequest(req))
+                    .notify_contract_handler(ContractHandlerEvent::DelegateRequest {
+                        req,
+                        attested_contract,
+                    })
                     .await
                 {
                     Ok(ContractHandlerEvent::DelegateResponse(res)) => res,
@@ -757,6 +769,7 @@ pub(crate) mod test {
                                     .into(),
                                 notification_channel: None,
                                 token: None,
+                                attested_contract: None,
                             };
                             return Ok(res.into_owned());
                         } else if pk == self.key {
@@ -768,6 +781,7 @@ pub(crate) mod test {
                                     .into(),
                                 notification_channel: None,
                                 token: None,
+                                attested_contract: None,
                             };
                             return Ok(res.into_owned());
                         }
@@ -860,6 +874,7 @@ pub(crate) mod test {
                                             .into(),
                                         notification_channel: None,
                                         token: None,
+                                        attested_contract: None,
                                     };
                                     return Ok(res.into_owned());
                                 }

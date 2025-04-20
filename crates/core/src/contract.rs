@@ -167,16 +167,20 @@ where
                         error
                     })?;
             }
-            ContractHandlerEvent::DelegateRequest(req) => {
+            ContractHandlerEvent::DelegateRequest {
+                req,
+                attested_contract,
+            } => {
                 let delegate_key = req.key().clone();
                 tracing::debug!(
                     delegate_key = %delegate_key,
+                    ?attested_contract,
                     "Processing delegate request"
                 );
 
                 let response = match contract_handler
                     .executor()
-                    .execute_delegate_request(req, None)
+                    .execute_delegate_request(req, attested_contract.as_ref())
                 {
                     Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
                         key: _,

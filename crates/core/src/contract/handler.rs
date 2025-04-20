@@ -304,8 +304,10 @@ struct InternalCHEvent {
 
 #[derive(Debug)]
 pub(crate) enum ContractHandlerEvent {
-    // FIXME:
-    DelegateRequest(DelegateRequest<'static>),
+    DelegateRequest {
+        req: DelegateRequest<'static>,
+        attested_contract: Option<ContractInstanceId>,
+    },
     DelegateResponse(Vec<OutboundDelegateMsg>),
     /// Try to push/put a new value into the contract
     PutQuery {
@@ -354,8 +356,16 @@ pub(crate) enum ContractHandlerEvent {
 impl std::fmt::Display for ContractHandlerEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ContractHandlerEvent::DelegateRequest(req) => {
-                write!(f, "delegate request {{ {:?} }}", req.key())
+            ContractHandlerEvent::DelegateRequest {
+                req,
+                attested_contract,
+            } => {
+                write!(
+                    f,
+                    "delegate request {{ key: {:?}, attested: {:?} }}",
+                    req.key(),
+                    attested_contract
+                )
             }
             ContractHandlerEvent::DelegateResponse(_) => {
                 write!(f, "delegate response")
