@@ -99,26 +99,6 @@ pub fn load_delegate(name: &str, params: Parameters<'static>) -> anyhow::Result<
     Ok(delegate)
 }
 
-pub async fn make_delegate_request(
-    client: &mut WebApi,
-    key: DelegateKey,
-    params: Parameters<'static>,
-    inbound: Vec<InboundDelegateMsg<'static>>,
-) -> anyhow::Result<()> {
-    use freenet_stdlib::client_api::DelegateRequest;
-
-    let delegate_request = DelegateRequest::ApplicationMessages {
-        key,
-        params,
-        inbound,
-    };
-
-    client
-        .send(ClientRequest::DelegateOp(delegate_request))
-        .await?;
-    Ok(())
-}
-
 // TODO: refactor so we share the implementation with fdev (need to extract to )
 fn compile_contract(name: &str) -> anyhow::Result<Vec<u8>> {
     let contract_path = {

@@ -5,12 +5,11 @@ use freenet::{
     local_node::NodeConfig,
     server::serve_gateway,
     test_utils::{
-        self, load_delegate, make_delegate_request, make_get, make_put, make_subscribe,
-        make_update, verify_contract_exists,
+        self, load_delegate, make_get, make_put, make_subscribe, make_update,
+        verify_contract_exists,
     },
 };
 use freenet_stdlib::client_api::ClientRequest;
-use freenet_stdlib::client_api::HostResponse::DelegateResponse;
 use freenet_stdlib::{
     client_api::{ContractResponse, HostResponse, WebApi},
     prelude::*,
@@ -1908,7 +1907,7 @@ async fn test_delegate_request() -> TestResult {
         let payload = bincode::serialize(&InboundAppMessage::TestRequest(request_data.clone()))?;
         let app_msg = ApplicationMessage::new(app_id, payload);
 
-        // Send request to the delegate directly without using make_delegate_request
+        // Send request to the delegate
         client
             .send(ClientRequest::DelegateOp(
                 freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
