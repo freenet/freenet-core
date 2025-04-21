@@ -34,6 +34,13 @@ apps can be built with popular web frameworks, accessed through any browser just
 
 ## Build Instructions
 
+Before installing anything you need to run the following in the repository,
+or the commands will fail:
+
+```bash
+$ git submodule update --init --recursive
+```
+
 To install the Freenet core:
 
 ```bash
