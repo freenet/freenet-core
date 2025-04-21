@@ -138,9 +138,23 @@ fn compile_delegate(name: &str) -> anyhow::Result<Vec<u8>> {
     };
 
     println!("delegate path: {delegate_path:?}");
+
+    // Check if the delegate directory exists
+    if !delegate_path.exists() {
+        return Err(anyhow::anyhow!(
+            "Delegate directory does not exist: {delegate_path:?}"
+        ));
+    }
+
     let target = std::env::var(TARGET_DIR_VAR)
-        .map_err(|_| anyhow::anyhow!("CARGO_TARGET_DIR should be set"))?;
+        .map_err(|e| anyhow::anyhow!("CARGO_TARGET_DIR not set: {e}"))?;
     println!("trying to compile the test delegate, target: {target}");
+
+    // Check if Cargo.toml exists in the delegate path
+    let cargo_toml = delegate_path.join("Cargo.toml");
+    if !cargo_toml.exists() {
+        return Err(anyhow::anyhow!("Cargo.toml not found at: {cargo_toml:?}"));
+    }
 
     compile_rust_wasm_lib(
         &BuildToolConfig {
@@ -158,7 +172,15 @@ fn compile_delegate(name: &str) -> anyhow::Result<Vec<u8>> {
         .with_extension("wasm");
     println!("output file: {output_file:?}");
 
-    let wasm_data = std::fs::read(&output_file)?;
+    // Check if output file exists before reading
+    if !output_file.exists() {
+        return Err(anyhow::anyhow!(
+            "Compiled WASM file not found at: {output_file:?}"
+        ));
+    }
+
+    let wasm_data = std::fs::read(&output_file)
+        .map_err(|e| anyhow::anyhow!("Failed to read output file {output_file:?}: {e}"))?;
     println!("WASM size: {} bytes", wasm_data.len());
 
     Ok(wasm_data)
@@ -210,6 +232,15 @@ fn compile_rust_wasm_lib(cli_config: &BuildToolConfig, work_dir: &Path) -> anyho
     };
 
     let package_type = cli_config.package_type;
+
+    let command_str = format!("cargo {}", cmd_args.join(" "));
+    println!("Executing command: {}", command_str);
+    println!("In directory: {}", work_dir.display());
+    println!(
+        "Environment: CARGO_TARGET_DIR={:?}",
+        std::env::var(TARGET_DIR_VAR).ok()
+    );
+
     println!("Compiling {package_type} with rust");
     let child = Command::new("cargo")
         .args(&cmd_args)
