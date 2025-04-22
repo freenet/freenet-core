@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::Arc;
 use std::time::Duration;
 
+use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -303,6 +304,11 @@ struct InternalCHEvent {
 
 #[derive(Debug)]
 pub(crate) enum ContractHandlerEvent {
+    DelegateRequest {
+        req: DelegateRequest<'static>,
+        attested_contract: Option<ContractInstanceId>,
+    },
+    DelegateResponse(Vec<OutboundDelegateMsg>),
     /// Try to push/put a new value into the contract
     PutQuery {
         key: ContractKey,
@@ -350,6 +356,20 @@ pub(crate) enum ContractHandlerEvent {
 impl std::fmt::Display for ContractHandlerEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ContractHandlerEvent::DelegateRequest {
+                req,
+                attested_contract,
+            } => {
+                write!(
+                    f,
+                    "delegate request {{ key: {:?}, attested: {:?} }}",
+                    req.key(),
+                    attested_contract
+                )
+            }
+            ContractHandlerEvent::DelegateResponse(_) => {
+                write!(f, "delegate response")
+            }
             ContractHandlerEvent::PutQuery { key, contract, .. } => {
                 if let Some(contract) = contract {
                     use std::fmt::Write;

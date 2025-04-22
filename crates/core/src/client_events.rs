@@ -109,6 +109,7 @@ pub struct OpenRequest<'a> {
     pub request: Box<ClientRequest<'a>>,
     pub notification_channel: Option<UnboundedSender<HostResult>>,
     pub token: Option<AuthToken>,
+    pub attested_contract: Option<ContractInstanceId>,
 }
 
 impl Display for OpenRequest<'_> {
@@ -135,6 +136,7 @@ impl<'a> OpenRequest<'a> {
             request,
             notification_channel: None,
             token: None,
+            attested_contract: None,
         }
     }
 
@@ -145,6 +147,11 @@ impl<'a> OpenRequest<'a> {
 
     pub fn with_token(mut self, token: Option<AuthToken>) -> Self {
         self.token = token;
+        self
+    }
+
+    pub fn with_attested_contract(mut self, contract: Option<ContractInstanceId>) -> Self {
+        self.attested_contract = contract;
         self
     }
 }
@@ -243,7 +250,13 @@ where
                                     contract,
                                 }))
                             }
+                            QueryResult::DelegateResult { response, .. } => {
+                                response
+                            }
                         };
+                        if let Ok(result) = &res {
+                            tracing::debug!(%result, "sending client operation response");
+                        }
                         if let Err(err) = client_events.send(cli_id, res).await {
                             tracing::debug!("channel closed: {err}");
                             anyhow::bail!(err);
@@ -535,8 +548,48 @@ async fn process_open_request(
                     }
                 }
             }
-            ClientRequest::DelegateOp(_op) => {
-                todo!("FIXME: delegate op");
+            ClientRequest::DelegateOp(req) => {
+                tracing::debug!("Received delegate operation from user event");
+                let delegate_key = req.key().clone();
+                let attested_contract = request.attested_contract;
+
+                let res = match op_manager
+                    .notify_contract_handler(ContractHandlerEvent::DelegateRequest {
+                        req,
+                        attested_contract,
+                    })
+                    .await
+                {
+                    Ok(ContractHandlerEvent::DelegateResponse(res)) => res,
+                    Err(err) => {
+                        tracing::error!("delegate operation failed: {}", err);
+                        return Err(Error::Contract(err));
+                    }
+                    Ok(_) => {
+                        tracing::error!("delegate operation failed: UnexpectedOpState");
+                        return Err(Error::Op(OpError::UnexpectedOpState));
+                    }
+                };
+
+                let host_response = Ok(HostResponse::DelegateResponse {
+                    key: delegate_key.clone(),
+                    values: res,
+                });
+
+                if let Some(ch) = &subscription_listener {
+                    if ch.send(host_response).is_err() {
+                        tracing::error!(
+                            "Failed to send delegate response through subscription channel"
+                        );
+                    }
+                    return Ok(None);
+                }
+
+                // Return the response to be sent by client_event_handling
+                return Ok(Some(Either::Left(QueryResult::DelegateResult {
+                    key: delegate_key,
+                    response: host_response,
+                })));
             }
             ClientRequest::Disconnect { .. } => {
                 unreachable!();
@@ -716,6 +769,7 @@ pub(crate) mod test {
                                     .into(),
                                 notification_channel: None,
                                 token: None,
+                                attested_contract: None,
                             };
                             return Ok(res.into_owned());
                         } else if pk == self.key {
@@ -727,6 +781,7 @@ pub(crate) mod test {
                                     .into(),
                                 notification_channel: None,
                                 token: None,
+                                attested_contract: None,
                             };
                             return Ok(res.into_owned());
                         }
@@ -819,6 +874,7 @@ pub(crate) mod test {
                                             .into(),
                                         notification_channel: None,
                                         token: None,
+                                        attested_contract: None,
                                     };
                                     return Ok(res.into_owned());
                                 }

@@ -91,6 +91,14 @@ pub fn load_contract(name: &str, params: Parameters<'static>) -> anyhow::Result<
     Ok(contract)
 }
 
+pub fn load_delegate(name: &str, params: Parameters<'static>) -> anyhow::Result<DelegateContainer> {
+    let delegate_bytes = compile_delegate(name)?;
+    let delegate_code = DelegateCode::from(delegate_bytes);
+    let delegate = Delegate::from((&delegate_code, &params));
+    let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate));
+    Ok(delegate)
+}
+
 // TODO: refactor so we share the implementation with fdev (need to extract to )
 fn compile_contract(name: &str) -> anyhow::Result<Vec<u8>> {
     let contract_path = {
@@ -120,6 +128,56 @@ fn compile_contract(name: &str) -> anyhow::Result<Vec<u8>> {
         .with_extension("wasm");
     println!("output file: {output_file:?}");
     Ok(std::fs::read(output_file)?)
+}
+
+fn compile_delegate(name: &str) -> anyhow::Result<Vec<u8>> {
+    let delegate_path = {
+        const CRATE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/");
+        let delegates = PathBuf::from(CRATE_DIR);
+        delegates.join(name)
+    };
+
+    println!("delegate path: {delegate_path:?}");
+
+    // Check if the delegate directory exists
+    if !delegate_path.exists() {
+        return Err(anyhow::anyhow!(
+            "Delegate directory does not exist: {delegate_path:?}"
+        ));
+    }
+
+    let target = std::env::var(TARGET_DIR_VAR)
+        .map_err(|_| anyhow::anyhow!("CARGO_TARGET_DIR should be set"))?;
+    println!("trying to compile the test delegate, target: {target}");
+
+    compile_rust_wasm_lib(
+        &BuildToolConfig {
+            features: None,
+            package_type: PackageType::Delegate,
+            debug: false,
+        },
+        &delegate_path,
+    )?;
+
+    let output_file = Path::new(&target)
+        .join(WASM_TARGET)
+        .join("release")
+        .join(name.replace('-', "_"))
+        .with_extension("wasm");
+    println!("output file: {output_file:?}");
+
+    // Check if output file exists before reading
+    if !output_file.exists() {
+        return Err(anyhow::anyhow!(
+            "Compiled WASM file not found at: {output_file:?}"
+        ));
+    }
+
+    let wasm_data = std::fs::read(&output_file)
+        .map_err(|e| anyhow::anyhow!("Failed to read output file {output_file:?}: {e}"))?;
+    println!("WASM size: {} bytes", wasm_data.len());
+
+    Ok(wasm_data)
 }
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";

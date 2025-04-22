@@ -99,7 +99,12 @@ impl ClientEventsProxy for HttpGateway {
                         client_id,
                         req,
                         auth_token,
-                    } => return Ok(OpenRequest::new(client_id, req).with_token(auth_token)),
+                        attested_contract,
+                    } => {
+                        return Ok(OpenRequest::new(client_id, req)
+                            .with_token(auth_token)
+                            .with_attested_contract(attested_contract))
+                    }
                 }
             }
             tracing::warn!("Shutting down http gateway receiver");

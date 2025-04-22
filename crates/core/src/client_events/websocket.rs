@@ -100,6 +100,7 @@ impl WebSocketProxy {
                 client_id,
                 req,
                 auth_token,
+                attested_contract,
             } => {
                 let open_req = match &*req {
                     ClientRequest::ContractOp(ContractRequest::Subscribe { key, .. }) => {
@@ -116,6 +117,7 @@ impl WebSocketProxy {
                             OpenRequest::new(client_id, req)
                                 .with_notification(tx)
                                 .with_token(auth_token)
+                                .with_attested_contract(attested_contract)
                         } else {
                             tracing::warn!("client: {client_id} not found");
                             return Err(ErrorKind::UnknownClient(client_id.into()).into());
@@ -123,7 +125,9 @@ impl WebSocketProxy {
                     }
                     _ => {
                         // just forward the request to the node
-                        OpenRequest::new(client_id, req).with_token(auth_token)
+                        OpenRequest::new(client_id, req)
+                            .with_token(auth_token)
+                            .with_attested_contract(attested_contract)
                     }
                 };
                 Ok(Some(open_req))
@@ -332,6 +336,7 @@ async fn websocket_interface(
                 next_msg,
                 &request_sender,
                 &mut auth_token.as_mut().map(|t| t.0.clone()),
+                auth_token.as_mut().map(|t| t.1),
                 encoding_protoc,
             )
             .await
@@ -416,6 +421,7 @@ async fn process_client_request(
     msg: Result<Message, axum::Error>,
     request_sender: &mpsc::Sender<ClientConnection>,
     auth_token: &mut Option<AuthToken>,
+    attested_contract: Option<ContractInstanceId>,
     encoding_protoc: EncodingProtocol,
 ) -> Result<Option<Message>, Option<anyhow::Error>> {
     let msg = match msg {
@@ -462,6 +468,7 @@ async fn process_client_request(
             client_id,
             req: Box::new(req),
             auth_token: auth_token.clone(),
+            attested_contract,
         })
         .await
         .map_err(|err| Some(err.into()))?;

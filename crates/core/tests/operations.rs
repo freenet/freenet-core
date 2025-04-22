@@ -4,14 +4,19 @@ use freenet::{
     dev_tool::TransportKeypair,
     local_node::NodeConfig,
     server::serve_gateway,
-    test_utils::{self, make_get, make_put, make_subscribe, make_update, verify_contract_exists},
+    test_utils::{
+        self, load_delegate, make_get, make_put, make_subscribe, make_update,
+        verify_contract_exists,
+    },
 };
+use freenet_stdlib::client_api::ClientRequest;
 use freenet_stdlib::{
     client_api::{ContractResponse, HostResponse, WebApi},
     prelude::*,
 };
 use futures::FutureExt;
 use rand::{random, Rng, SeedableRng};
+use serde::Deserialize;
 use std::{
     net::{Ipv4Addr, TcpListener},
     path::Path,
@@ -1409,9 +1414,14 @@ async fn test_get_with_subscribe_flag() -> TestResult {
                                 received_todo_list.tasks[0].priority, expected_task.priority,
                                 "Task priority should match"
                             );
+
+                            tracing::info!("Client 1: Successfully verified update content");
                         }
                         _ => {
-                            bail!("Client 2: Timeout waiting for update notification");
+                            tracing::warn!(
+                                "Client 1: Received unexpected update type: {:?}",
+                                update
+                            );
                         }
                     }
                     client2_node_a_received_notification = true;
@@ -1432,7 +1442,7 @@ async fn test_get_with_subscribe_flag() -> TestResult {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        // Assert that client 2 received the notification (proving auto-subscribe worked)
+        // Assert that client 1 received the notification (proving auto-subscribe worked)
         assert!(
             client2_node_a_received_notification,
             "Client 2 did not receive update notification within timeout period (auto-subscribe via GET failed)"
@@ -1756,6 +1766,221 @@ async fn test_put_with_subscribe_flag() -> TestResult {
         b = node_b => {
             let Err(b) = b;
             return Err(anyhow!("Node B failed: {}", b).into());
+        }
+        r = test => {
+            r??;
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_delegate_request() -> TestResult {
+    freenet::config::set_logger(Some(LevelFilter::INFO), None);
+    const TEST_DELEGATE: &str = "test-delegate-integration";
+
+    // Configure environment variables for optimized release build
+    std::env::set_var("CARGO_PROFILE_RELEASE_LTO", "true");
+    std::env::set_var("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1");
+    std::env::set_var("CARGO_PROFILE_RELEASE_STRIP", "true");
+
+    // Load delegate (moving this outside the async block)
+    let params = Parameters::from(vec![]);
+    let delegate = load_delegate(TEST_DELEGATE, params.clone())?;
+    let delegate_key = delegate.key().clone();
+
+    // Create sockets for ports
+    let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_socket_client = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_socket_gw = TcpListener::bind("127.0.0.1:0")?;
+
+    // Configure gateway node
+    let (config_gw, preset_cfg_gw, gw_cfg) = {
+        let (cfg, preset) = base_node_test_config(
+            true,
+            vec![],
+            Some(network_socket_gw.local_addr()?.port()),
+            ws_api_port_socket_gw.local_addr()?.port(),
+        )
+        .await?;
+        let public_port = cfg.network_api.public_port.unwrap();
+        let path = preset.temp_dir.path().to_path_buf();
+        (cfg, preset, gw_config(public_port, &path)?)
+    };
+
+    // Configure client node
+    let (config_client, preset_cfg_client) = base_node_test_config(
+        false,
+        vec![serde_json::to_string(&gw_cfg)?],
+        None,
+        ws_api_port_socket_client.local_addr()?.port(),
+    )
+    .await?;
+    let ws_api_port_client = config_client.ws_api.ws_api_port.unwrap();
+
+    // Log data directories for debugging
+    tracing::info!(
+        "Client node data dir: {:?}",
+        preset_cfg_client.temp_dir.path()
+    );
+    tracing::info!("Gateway node data dir: {:?}", preset_cfg_gw.temp_dir.path());
+
+    // Free ports so they don't fail on initialization
+    std::mem::drop(ws_api_port_socket_client);
+    std::mem::drop(network_socket_gw);
+    std::mem::drop(ws_api_port_socket_gw);
+
+    // Start gateway node
+    let node_gw = async {
+        let config = config_gw.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    // Start client node
+    let node_client = async move {
+        let config = config_client.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    // Wait for the nodes to start and run the test
+    let test = tokio::time::timeout(Duration::from_secs(60), async {
+        // Wait for nodes to start up
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        // Connect to the client node's WebSocket API
+        let uri = format!(
+            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+            ws_api_port_client
+        );
+        let (stream, _) = connect_async(&uri).await?;
+        let mut client = WebApi::start(stream);
+
+        // Register the delegate in the node
+        client
+            .send(ClientRequest::DelegateOp(
+                freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
+                    delegate: delegate.clone(),
+                    cipher: freenet_stdlib::client_api::DelegateRequest::DEFAULT_CIPHER,
+                    nonce: freenet_stdlib::client_api::DelegateRequest::DEFAULT_NONCE,
+                },
+            ))
+            .await?;
+
+        // Wait for registration response
+        let resp = tokio::time::timeout(Duration::from_secs(10), client.recv()).await??;
+        match resp {
+            HostResponse::DelegateResponse { key, values: _ } => {
+                assert_eq!(
+                    key, delegate_key,
+                    "Delegate key mismatch in register response"
+                );
+                println!("Successfully registered delegate with key: {}", key);
+            }
+            other => {
+                bail!(
+                    "Unexpected response while waiting for register: {:?}",
+                    other
+                );
+            }
+        }
+
+        // Create message for the delegate
+        use serde::{Deserialize, Serialize};
+        #[derive(Debug, Serialize, Deserialize)]
+        enum InboundAppMessage {
+            TestRequest(String),
+        }
+
+        let app_id = ContractInstanceId::new([0; 32]);
+        let request_data = "test-request-data".to_string();
+        let payload = bincode::serialize(&InboundAppMessage::TestRequest(request_data.clone()))?;
+        let app_msg = ApplicationMessage::new(app_id, payload);
+
+        // Send request to the delegate
+        client
+            .send(ClientRequest::DelegateOp(
+                freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                    key: delegate_key.clone(),
+                    params: params.clone(),
+                    inbound: vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+                },
+            ))
+            .await?;
+
+        // Wait for delegate response
+        let resp = tokio::time::timeout(Duration::from_secs(10), client.recv()).await??;
+
+        match resp {
+            HostResponse::DelegateResponse {
+                key,
+                values: outbound,
+            } => {
+                assert_eq!(key, delegate_key, "Delegate key mismatch in response");
+
+                assert!(!outbound.is_empty(), "No output messages from delegate");
+
+                let app_msg = match &outbound[0] {
+                    OutboundDelegateMsg::ApplicationMessage(msg) => msg,
+                    other => bail!("Expected ApplicationMessage, got {:?}", other),
+                };
+
+                assert!(app_msg.processed, "Message not marked as processed");
+
+                #[derive(Debug, Deserialize)]
+                enum OutboundAppMessage {
+                    TestResponse(String, Vec<u8>),
+                }
+
+                let response: OutboundAppMessage = bincode::deserialize(&app_msg.payload)?;
+
+                match response {
+                    OutboundAppMessage::TestResponse(text, data) => {
+                        assert_eq!(
+                            text,
+                            format!("Processed: {}", request_data),
+                            "Response text doesn't match expected format"
+                        );
+                        assert_eq!(
+                            data,
+                            vec![4, 5, 6],
+                            "Response data doesn't match expected value"
+                        );
+
+                        println!("Successfully received and verified delegate response");
+                    }
+                }
+            }
+            other => {
+                bail!(
+                    "Unexpected response while waiting for delegate response: {:?}",
+                    other
+                );
+            }
+        }
+
+        Ok::<_, anyhow::Error>(())
+    });
+
+    // Wait for test completion or node failures
+    select! {
+        gw = node_gw => {
+            let Err(e) = gw;
+            return Err(anyhow!("Gateway node failed: {}", e).into())
+        }
+        client = node_client => {
+            let Err(e) = client;
+            return Err(anyhow!("Client node failed: {}", e).into())
         }
         r = test => {
             r??;
