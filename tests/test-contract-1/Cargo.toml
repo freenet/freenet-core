@@ -9,7 +9,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-freenet-stdlib = { path = "../../stdlib/rust", features = ["contract"] }
+freenet-stdlib = { version = "0.1.5", features = ["contract"] }
 
 [features]
 default = ["freenet-main-contract"]
