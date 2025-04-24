@@ -458,6 +458,14 @@ async fn process_client_request(
             },
         }
     };
+
+    // Intercept explicit disconnect requests sent by the client as data messages
+    if matches!(req, ClientRequest::Disconnect { .. }) {
+        // Treat this like a WebSocket close message
+        tracing::debug!("Client explicitly sent a Disconnect request, closing connection.");
+        return Err(None); // Signal graceful closure to websocket_interface
+    }
+
     if let ClientRequest::Authenticate { token } = &req {
         *auth_token = Some(AuthToken::from(token.clone()));
     }
