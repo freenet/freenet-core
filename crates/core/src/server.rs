@@ -34,6 +34,7 @@ pub(crate) enum ClientConnection {
         client_id: ClientId,
         req: Box<ClientRequest<'static>>,
         auth_token: Option<AuthToken>,
+        attested_contract: Option<ContractInstanceId>,
     },
 }
 

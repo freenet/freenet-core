@@ -59,6 +59,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e89da841a80418a9b391ebaea17f5c112ffaaa96f621d2c285b5174da76b9011"
 dependencies = [
  "cfg-if",
+ "getrandom 0.2.15",
  "once_cell",
  "version_check",
  "zerocopy 0.7.35",
@@ -1302,9 +1303,10 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
+ "ahash",
  "anyhow",
  "arc-swap",
  "asynchronous-codec",
@@ -1326,7 +1328,7 @@ dependencies = [
  "directories",
  "either",
  "flatbuffers",
- "freenet-stdlib",
+ "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures",
  "headers",
  "hickory-resolver",
@@ -1334,7 +1336,7 @@ dependencies = [
  "notify",
  "once_cell",
  "opentelemetry",
- "ordered-float 4.6.0",
+ "ordered-float 5.0.0",
  "parking_lot",
  "pav_regression",
  "pkcs8",
@@ -1370,6 +1372,17 @@ dependencies = [
 [[package]]
 name = "freenet-macros"
 version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c21b0e54ae3e7c5c9b9c845bd9eb4df94d24c94c0c5815ce5aa097492b984259"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.100",
+]
+
+[[package]]
+name = "freenet-macros"
+version = "0.1.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1385,7 +1398,7 @@ dependencies = [
  "clap",
  "freenet",
  "freenet-ping-types",
- "freenet-stdlib",
+ "freenet-stdlib 0.1.5",
  "futures",
  "once_cell",
  "rand 0.8.5",
@@ -1404,7 +1417,7 @@ name = "freenet-ping-contract"
 version = "0.1.0"
 dependencies = [
  "freenet-ping-types",
- "freenet-stdlib",
+ "freenet-stdlib 0.1.5",
  "serde_json",
 ]
 
@@ -1414,7 +1427,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
- "freenet-stdlib",
+ "freenet-stdlib 0.1.5",
  "humantime",
  "humantime-serde",
  "serde",
@@ -1422,7 +1435,7 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.1.3"
+version = "0.1.5"
 dependencies = [
  "bincode",
  "blake3",
@@ -1430,7 +1443,38 @@ dependencies = [
  "byteorder",
  "chrono",
  "flatbuffers",
- "freenet-macros",
+ "freenet-macros 0.1.2",
+ "futures",
+ "js-sys",
+ "once_cell",
+ "semver",
+ "serde",
+ "serde-wasm-bindgen 0.6.5",
+ "serde_bytes",
+ "serde_json",
+ "serde_with",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "tracing-subscriber",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
+name = "freenet-stdlib"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1637f0e80197acbabcc12cf366b6322fbbf9b695de68659af6ba01a1d3dac642"
+dependencies = [
+ "bincode",
+ "blake3",
+ "bs58",
+ "byteorder",
+ "chrono",
+ "flatbuffers",
+ "freenet-macros 0.1.1",
  "futures",
  "js-sys",
  "once_cell",
@@ -2712,15 +2756,15 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry"
-version = "0.27.1"
+version = "0.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab70038c28ed37b97d8ed414b6429d343a8bbf44c9f79ec854f3a643029ba6d7"
+checksum = "9e87237e2775f74896f9ad219d26a2081751187eb7c9f5c58dde20a23b95d16c"
 dependencies = [
  "futures-core",
  "futures-sink",
  "js-sys",
  "pin-project-lite",
- "thiserror 1.0.69",
+ "thiserror 2.0.12",
  "tracing",
 ]
 
@@ -2741,9 +2785,9 @@ dependencies = [
 
 [[package]]
 name = "ordered-float"
-version = "4.6.0"
+version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
+checksum = "e2c1f9f56e534ac6a9b8a4600bdf0f530fb393b5f393e7b4d03489c3cf0c3f01"
 dependencies = [
  "num-traits",
 ]
