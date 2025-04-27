@@ -1,3 +1,11 @@
+//! Handles external client connections (HTTP/WebSocket).
+//!
+//! This module acts as the bridge between external clients and the Freenet node's core logic.
+//! It parses `ClientRequest`s, sends them to the main node event loop (`node::Node`) via an
+//! internal channel, and forwards `HostResponse`s back to the clients.
+//!
+//! See [`../architecture.md`](../architecture.md) for its place in the overall architecture.
+
 pub(crate) mod app_packaging;
 pub(crate) mod errors;
 pub(crate) mod http_gateway;

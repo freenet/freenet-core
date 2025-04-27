@@ -1,3 +1,11 @@
+//! Manages the state and execution of diverse network operations (e.g., Get, Put, Subscribe).
+//!
+//! The `OpManager` runs its own event loop (`garbage_cleanup_task`) to handle the lifecycle
+//! of operations, ensuring they progress correctly and are eventually cleaned up.
+//! It communicates with the main node event loop and the network bridge via channels.
+//!
+//! See [`../../architecture.md`](../../architecture.md) for details on its role and interaction with other components.
+
 use std::{cmp::Reverse, collections::BTreeSet, sync::Arc, time::Duration};
 
 use dashmap::{DashMap, DashSet};

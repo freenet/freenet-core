@@ -1,4 +1,6 @@
 //! Network messaging between peers.
+//! Defines the `NetMessage` enum, the standard format for all peer-to-peer communication within the Freenet network.
+//! See `architecture.md`.
 
 use std::{
     borrow::{Borrow, Cow},
