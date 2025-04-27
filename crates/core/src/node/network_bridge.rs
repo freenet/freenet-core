@@ -1,4 +1,11 @@
 //! Types and definitions to handle all inter-peer communication.
+//!
+//! This module provides the `NetworkBridge` trait, an abstraction layer for network interactions.
+//! Implementations manage peer connections, message serialization, and routing.
+//! It receives outgoing messages from the `Node` and `OpManager` event loops and forwards
+//! incoming network messages (`NetMessage`) to the `Node`'s event loop via channels.
+//!
+//! See [`../../architecture.md`](../../architecture.md) for its interactions with event loops and other components.
 
 use std::future::Future;
 

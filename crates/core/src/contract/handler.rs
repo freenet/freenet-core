@@ -1,3 +1,11 @@
+//! Handles interactions with contracts, managing their state and execution requests.
+//!
+//! It receives events via `ContractHandlerChannel` from the main node event loop (`node::Node`)
+//! and interacts with the `ContractExecutor` to perform actions. Results are sent back
+//! to the node loop.
+//!
+//! See [`../architecture.md`](../architecture.md) for its role and communication patterns.
+
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::hash::Hash;

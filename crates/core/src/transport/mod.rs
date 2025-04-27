@@ -2,6 +2,10 @@
 //!
 //! Please see `docs/architecture/transport.md` for more information.
 //!
+//! Provides the low-level network transport abstraction (e.g., UDP).
+//! Handles the raw sending and receiving of byte packets over the network.
+//! See `architecture.md`.
+
 use std::{borrow::Cow, io, net::SocketAddr};
 
 use futures::Future;

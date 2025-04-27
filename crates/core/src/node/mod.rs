@@ -1,12 +1,19 @@
 //! The main node data type which encapsulates all the behaviour for maintaining a connection
 //! and performing operations within the network.
 //!
+//! This module contains the primary event loop (`NodeP2P::run_node`) that orchestrates
+//! interactions between different components like the network, operations, contracts, and clients.
+//! It receives events and dispatches actions via channels.
+//!
 //! # Implementations
 //! Node comes with different underlying implementations that can be used upon construction.
 //! Those implementations are:
 //! - libp2p: all the connection is handled by libp2p.
 //! - in-memory: a simplifying node used for emulation purposes mainly.
 //! - inter-process: similar to in-memory, but can be rana cross multiple processes, closer to the real p2p impl
+//!
+//! The main node data structure and execution loop.
+//! See [`../../architecture.md`](../../architecture.md) for a high-level overview of the node's role and the event loop interactions.
 
 use anyhow::Context;
 use either::Either;

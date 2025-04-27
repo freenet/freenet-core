@@ -1,4 +1,6 @@
-//! Contract executor.
+//! Executes WASM contract and delegate code within a sandboxed environment (`WasmRuntime`).
+//! Communicates with the `ContractHandler` and potentially the `OpManager` (via `ExecutorToEventLoopChannel`).
+//! See `architecture.md`.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
