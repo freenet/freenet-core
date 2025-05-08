@@ -479,7 +479,11 @@ impl P2pConnManager {
             if blocked_addrs.contains(&peer.addr) {
                 tracing::info!(tx = %tx, remote = %peer.addr, "Outgoing connection to peer blocked by local policy");
                 // Ensure ConnectionError is correctly namespaced if HandshakeError::ConnectionError expects it directly
-                callback.send_result(Err(HandshakeError::ConnectionError(crate::node::network_bridge::ConnectionError::AddressBlocked(peer.addr)))).await?;
+                callback
+                    .send_result(Err(HandshakeError::ConnectionError(
+                        crate::node::network_bridge::ConnectionError::AddressBlocked(peer.addr),
+                    )))
+                    .await?;
                 return Ok(());
             }
         }
@@ -523,7 +527,9 @@ impl P2pConnManager {
                     if blocked_addrs.contains(&joiner.addr) {
                         tracing::info!(%id, remote = %joiner.addr, "Inbound connection from peer blocked by local policy");
                         // Not proceeding with adding connection or processing the operation.
-                        handshake_handler_msg.drop_connection_by_addr(joiner.addr).await?;
+                        handshake_handler_msg
+                            .drop_connection_by_addr(joiner.addr)
+                            .await?;
                         return Ok(());
                     }
                 }
