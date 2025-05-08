@@ -46,4 +46,3 @@ opt-level = 3
 # panic = "abort"
 
 [patch.crates-io]
-freenet-stdlib = { version = "0.1.5" }
