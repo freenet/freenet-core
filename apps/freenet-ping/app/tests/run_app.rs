@@ -95,8 +95,7 @@ fn gw_config(port: u16, path: &std::path::Path) -> anyhow::Result<InlineGwConfig
 }
 
 const PACKAGE_DIR: &str = env!("CARGO_MANIFEST_DIR");
-// Path relative to the `apps/freenet-ping/app` directory where the test is located.
-const PATH_TO_CONTRACT: &str = "../../../contracts/ping/build/freenet/freenet_ping_contract";
+const PATH_TO_CONTRACT: &str = "../contracts/ping/build/freenet/freenet_ping_contract";
 
 const APP_TAG: &str = "ping-app";
 
