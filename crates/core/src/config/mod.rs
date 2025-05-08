@@ -321,7 +321,10 @@ impl ConfigArgs {
                 public_port: self.network_api.public_port,
                 ignore_protocol_version: self.network_api.ignore_protocol_checking,
                 bandwidth_limit: self.network_api.bandwidth_limit,
-                blocked_addresses: self.network_api.blocked_addresses.map(|addrs| addrs.into_iter().collect()),
+                blocked_addresses: self
+                    .network_api
+                    .blocked_addresses
+                    .map(|addrs| addrs.into_iter().collect()),
             },
             ws_api: WebsocketApiConfig {
                 // the websocket API is always local
