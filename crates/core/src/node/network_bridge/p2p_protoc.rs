@@ -125,6 +125,7 @@ pub(in crate::node) struct P2pConnManager {
     this_location: Option<Location>,
     check_version: bool,
     bandwidth_limit: Option<usize>,
+    blocked_addresses: Option<HashSet<SocketAddr>>,
 }
 
 impl P2pConnManager {
@@ -154,6 +155,7 @@ impl P2pConnManager {
             this_location: config.location,
             check_version: !config.config.network_api.ignore_protocol_version,
             bandwidth_limit: config.config.network_api.bandwidth_limit,
+            blocked_addresses: config.blocked_addresses.clone(),
         })
     }
 
@@ -467,6 +469,13 @@ impl P2pConnManager {
         is_gw: bool,
     ) -> anyhow::Result<()> {
         tracing::info!(tx = %tx, remote = %peer, "Connecting to peer");
+        if let Some(blocked_addrs) = &self.blocked_addresses {
+            if blocked_addrs.contains(&peer.addr) {
+                tracing::info!(tx = %tx, remote = %peer.addr, "Outgoing connection to peer blocked by local policy");
+                callback.send_result(Err(HandshakeError::ConnectionError(ConnectionError::AddressBlocked(peer.addr)))).await?;
+                return Ok(());
+            }
+        }
         state.awaiting_connection.insert(peer.addr, callback);
         let res = timeout(
             Duration::from_secs(10),
@@ -502,6 +511,16 @@ impl P2pConnManager {
                 op,
                 forward_info,
             } => {
+                if let Some(blocked_addrs) = &self.blocked_addresses {
+                    if blocked_addrs.contains(&joiner.addr) {
+                        tracing::info!(%id, remote = %joiner.addr, "Inbound connection from peer blocked by local policy");
+                        // Not proceeding with adding connection or processing the operation.
+                        // Ideally, the handshake handler would also be notified to drop the raw connection.
+                        // For now, we just don't integrate it into the Freenet node.
+                        handshake_handler_msg.drop_connection_by_addr(joiner.addr).await?;
+                        return Ok(());
+                    }
+                }
                 let (tx, rx) = mpsc::channel(1);
                 self.connections.insert(joiner.clone(), tx);
                 let was_reserved = {
