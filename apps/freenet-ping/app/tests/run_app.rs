@@ -15,7 +15,7 @@ use freenet::{
 };
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractRequest, WebApi},
     prelude::*,
 };
 use futures::FutureExt;
