@@ -125,6 +125,7 @@ pub struct NodeConfig {
     pub(crate) min_number_conn: Option<usize>,
     pub(crate) max_upstream_bandwidth: Option<Rate>,
     pub(crate) max_downstream_bandwidth: Option<Rate>,
+    pub(crate) blocked_addresses: Option<HashSet<SocketAddr>>,
 }
 
 impl NodeConfig {
@@ -177,6 +178,7 @@ impl NodeConfig {
             min_number_conn: None,
             max_upstream_bandwidth: None,
             max_downstream_bandwidth: None,
+            blocked_addresses: config.network_api.blocked_addresses.clone(),
         })
     }
 

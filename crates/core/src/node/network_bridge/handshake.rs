@@ -49,6 +49,8 @@ pub(super) enum HandshakeError {
     TransportError(#[from] TransportError),
     #[error("receibed an unexpected message at this point: {0}")]
     UnexpectedMessage(Box<NetMessage>),
+    #[error("connection error: {0}")]
+    ConnectionError(#[from] super::ConnectionError),
 }
 
 #[derive(Debug)]
@@ -124,6 +126,7 @@ pub(super) enum ExternConnection {
     Dropped {
         peer: PeerId,
     },
+    DropConnectionByAddr(SocketAddr),
 }
 
 /// Used for communicating with the HandshakeHandler.
@@ -145,6 +148,22 @@ impl HanshakeHandlerMsg {
     pub async fn drop_connection(&self, remote: PeerId) -> Result<()> {
         self.0
             .send(ExternConnection::Dropped { peer: remote })
+            .await
+            .map_err(|_| HandshakeError::ChannelClosed)?;
+        Ok(())
+    }
+
+    pub async fn drop_connection_by_addr(&self, remote_addr: SocketAddr) -> Result<()> {
+        self.0
+            .send(ExternConnection::DropConnectionByAddr(remote_addr))
+            .await
+            .map_err(|_| HandshakeError::ChannelClosed)?;
+        Ok(())
+    }
+
+    pub async fn drop_connection_by_addr(&self, remote_addr: SocketAddr) -> Result<()> {
+        self.0
+            .send(ExternConnection::DropConnectionByAddr(remote_addr))
             .await
             .map_err(|_| HandshakeError::ChannelClosed)?;
         Ok(())
@@ -526,6 +545,12 @@ impl HandshakeHandler {
                         Some(ExternConnection::Dropped { peer }) => {
                             self.connected.remove(&peer.addr);
                             self.outbound_messages.remove(&peer.addr);
+                            self.connecting.remove(&peer.addr);
+                        }
+                        Some(ExternConnection::DropConnectionByAddr(addr)) => {
+                            self.connected.remove(&addr);
+                            self.outbound_messages.remove(&addr);
+                            self.connecting.remove(&addr);
                         }
                         None => return Err(HandshakeError::ChannelClosed),
                     }
