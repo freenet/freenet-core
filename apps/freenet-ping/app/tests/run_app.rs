@@ -159,6 +159,7 @@ async fn test_ping_multi_node() -> TestResult {
             vec![],
             Some(network_socket_gw.local_addr()?.port()),
             ws_api_port_socket_gw.local_addr()?.port(),
+            None, // blocked_addresses_for_this_node
         )
         .await?;
         let public_port = cfg.network_api.public_port.unwrap();
@@ -173,6 +174,7 @@ async fn test_ping_multi_node() -> TestResult {
         vec![serde_json::to_string(&config_gw_info)?],
         None,
         ws_api_port_socket_node1.local_addr()?.port(),
+        None, // blocked_addresses_for_this_node
     )
     .await?;
     let ws_api_port_node1 = config_node1.ws_api.ws_api_port.unwrap();
@@ -183,6 +185,7 @@ async fn test_ping_multi_node() -> TestResult {
         vec![serde_json::to_string(&config_gw_info)?],
         None,
         ws_api_port_socket_node2.local_addr()?.port(),
+        None, // blocked_addresses_for_this_node
     )
     .await?;
     let ws_api_port_node2 = config_node2.ws_api.ws_api_port.unwrap();
@@ -672,6 +675,7 @@ async fn test_ping_application_loop() -> TestResult {
             vec![],
             Some(network_socket_gw.local_addr()?.port()),
             ws_api_port_socket_gw.local_addr()?.port(),
+            None, // blocked_addresses_for_this_node
         )
         .await?;
         let public_port = cfg.network_api.public_port.unwrap();
@@ -686,6 +690,7 @@ async fn test_ping_application_loop() -> TestResult {
         vec![serde_json::to_string(&config_gw_info)?],
         None,
         ws_api_port_socket_node1.local_addr()?.port(),
+        None, // blocked_addresses_for_this_node
     )
     .await?;
     let ws_api_port_node1 = config_node1.ws_api.ws_api_port.unwrap();
@@ -696,6 +701,7 @@ async fn test_ping_application_loop() -> TestResult {
         vec![serde_json::to_string(&config_gw_info)?],
         None,
         ws_api_port_socket_node2.local_addr()?.port(),
+        None, // blocked_addresses_for_this_node
     )
     .await?;
     let ws_api_port_node2 = config_node2.ws_api.ws_api_port.unwrap();
