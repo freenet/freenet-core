@@ -71,6 +71,7 @@ async fn base_node_test_config(
             address: Some(Ipv4Addr::LOCALHOST.into()),
             network_port: public_port,
             bandwidth_limit: None,
+            blocked_addresses: None,
         },
         config_paths: {
             freenet::config::ConfigPathsArgs {
