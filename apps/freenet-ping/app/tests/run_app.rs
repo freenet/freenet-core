@@ -371,9 +371,9 @@ async fn test_ping_multi_node() -> TestResult {
         // Step 5: All nodes send updates and verify they receive updates from others
 
         // Setup local state trackers for each node
-        let mut gw_local_state = Ping::default();
-        let mut node1_local_state = Ping::default();
-        let mut node2_local_state = Ping::default();
+        let mut _gw_local_state = Ping::default();
+        let mut _node1_local_state = Ping::default();
+        let mut _node2_local_state = Ping::default();
 
         // Create different tags for each node
         let gw_tag = "ping-from-gw".to_string();
@@ -381,12 +381,12 @@ async fn test_ping_multi_node() -> TestResult {
         let node2_tag = "ping-from-node2".to_string();
 
         // Track which nodes have seen updates from each other
-        let mut gw_seen_node1 = false;
-        let mut gw_seen_node2 = false;
-        let mut node1_seen_gw = false;
-        let mut node1_seen_node2 = false;
-        let mut node2_seen_gw = false;
-        let mut node2_seen_node1 = false;
+        let mut _gw_seen_node1 = false;
+        let mut _gw_seen_node2 = false;
+        let mut _node1_seen_gw = false;
+        let mut _node1_seen_node2 = false;
+        let mut _node2_seen_gw = false;
+        let mut _node2_seen_node1 = false;
 
         // Gateway sends update with its tag
         let mut gw_ping = Ping::default();
