@@ -320,6 +320,7 @@ impl ConfigArgs {
                 public_port: self.network_api.public_port,
                 ignore_protocol_version: self.network_api.ignore_protocol_checking,
                 bandwidth_limit: self.network_api.bandwidth_limit,
+                blocked_addresses: self.network_api.blocked_addresses.map(|addrs| addrs.into_iter().collect()),
             },
             ws_api: WebsocketApiConfig {
                 // the websocket API is always local
@@ -486,6 +487,10 @@ pub struct NetworkArgs {
     /// Hard limit the bandwidth usage for upstream traffic.
     #[arg(long)]
     pub bandwidth_limit: Option<usize>,
+
+    /// List of IP:port addresses to refuse connections to/from.
+    #[arg(long, num_args = 0..)]
+    pub blocked_addresses: Option<Vec<SocketAddr>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -545,6 +550,10 @@ pub struct NetworkApiConfig {
 
     /// Hard limit the bandwidth usage for upstream traffic.
     pub bandwidth_limit: Option<usize>,
+
+    /// List of IP:port addresses to refuse connections to/from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_addresses: Option<HashSet<SocketAddr>>,
 }
 
 mod port_allocation;
