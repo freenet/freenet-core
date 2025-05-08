@@ -1,10 +1,12 @@
 use std::{
+    collections::HashMap,
     net::{Ipv4Addr, TcpListener},
     path::PathBuf,
     time::Duration,
 };
 
 use anyhow::anyhow;
+use chrono::{DateTime, Utc};
 use freenet::{
     config::{ConfigArgs, InlineGwConfig, NetworkArgs, SecretArgs, WebsocketApiArgs},
     dev_tool::TransportKeypair,
@@ -13,7 +15,7 @@ use freenet::{
 };
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, WebApi},
+    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
 };
 use futures::FutureExt;
@@ -96,6 +98,40 @@ fn gw_config(port: u16, path: &std::path::Path) -> anyhow::Result<InlineGwConfig
 
 const PACKAGE_DIR: &str = env!("CARGO_MANIFEST_DIR");
 const PATH_TO_CONTRACT: &str = "../contracts/ping/build/freenet/freenet_ping_contract";
+
+// Process an update notification for the ping contract - test helper function
+fn process_ping_update(
+    local_state: &mut Ping,
+    ttl: Duration,
+    update: UpdateData,
+) -> Result<HashMap<String, DateTime<Utc>>, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let mut handle_update = |state: &[u8]| {
+        let new_ping = if state.is_empty() {
+            Ping::default()
+        } else {
+            match serde_json::from_slice::<Ping>(state) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync + 'static>)
+                }
+            }
+        };
+
+        let updates = local_state.merge(new_ping, ttl);
+        Ok(updates)
+    };
+
+    match update {
+        UpdateData::State(state) => handle_update(state.as_ref()),
+        UpdateData::Delta(delta) => handle_update(&delta),
+        UpdateData::StateAndDelta { state, delta } => {
+            let mut updates = handle_update(&state)?;
+            updates.extend(handle_update(&delta)?);
+            Ok(updates)
+        }
+        _ => Err("unknown state".into()),
+    }
+}
 
 const APP_TAG: &str = "ping-app";
 
@@ -335,9 +371,9 @@ async fn test_ping_multi_node() -> TestResult {
         // Step 5: All nodes send updates and verify they receive updates from others
 
         // Setup local state trackers for each node
-        let mut _gw_local_state = Ping::default();
-        let mut _node1_local_state = Ping::default();
-        let mut _node2_local_state = Ping::default();
+        let mut gw_local_state = Ping::default();
+        let mut node1_local_state = Ping::default();
+        let mut node2_local_state = Ping::default();
 
         // Create different tags for each node
         let gw_tag = "ping-from-gw".to_string();
@@ -345,12 +381,12 @@ async fn test_ping_multi_node() -> TestResult {
         let node2_tag = "ping-from-node2".to_string();
 
         // Track which nodes have seen updates from each other
-        let mut _gw_seen_node1 = false;
-        let mut _gw_seen_node2 = false;
-        let mut _node1_seen_gw = false;
-        let mut _node1_seen_node2 = false;
-        let mut _node2_seen_gw = false;
-        let mut _node2_seen_node1 = false;
+        let mut gw_seen_node1 = false;
+        let mut gw_seen_node2 = false;
+        let mut node1_seen_gw = false;
+        let mut node1_seen_node2 = false;
+        let mut node2_seen_gw = false;
+        let mut node2_seen_node1 = false;
 
         // Gateway sends update with its tag
         let mut gw_ping = Ping::default();
