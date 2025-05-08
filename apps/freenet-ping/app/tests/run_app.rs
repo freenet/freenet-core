@@ -99,40 +99,6 @@ fn gw_config(port: u16, path: &std::path::Path) -> anyhow::Result<InlineGwConfig
 const PACKAGE_DIR: &str = env!("CARGO_MANIFEST_DIR");
 const PATH_TO_CONTRACT: &str = "../contracts/ping/build/freenet/freenet_ping_contract";
 
-// Process an update notification for the ping contract - test helper function
-fn process_ping_update(
-    local_state: &mut Ping,
-    ttl: Duration,
-    update: UpdateData,
-) -> Result<HashMap<String, DateTime<Utc>>, Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let mut handle_update = |state: &[u8]| {
-        let new_ping = if state.is_empty() {
-            Ping::default()
-        } else {
-            match serde_json::from_slice::<Ping>(state) {
-                Ok(p) => p,
-                Err(e) => {
-                    return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync + 'static>)
-                }
-            }
-        };
-
-        let updates = local_state.merge(new_ping, ttl);
-        Ok(updates)
-    };
-
-    match update {
-        UpdateData::State(state) => handle_update(state.as_ref()),
-        UpdateData::Delta(delta) => handle_update(&delta),
-        UpdateData::StateAndDelta { state, delta } => {
-            let mut updates = handle_update(&state)?;
-            updates.extend(handle_update(&delta)?);
-            Ok(updates)
-        }
-        _ => Err("unknown state".into()),
-    }
-}
-
 const APP_TAG: &str = "ping-app";
 
 #[tokio::test(flavor = "multi_thread")]
