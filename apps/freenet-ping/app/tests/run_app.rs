@@ -46,6 +46,8 @@ async fn base_node_test_config(
     gateways: Vec<String>,
     public_port: Option<u16>,
     ws_api_port: u16,
+    // New parameter to specify addresses this node should block
+    blocked_addresses_for_this_node: Option<Vec<std::net::SocketAddr>>,
 ) -> anyhow::Result<(ConfigArgs, PresetConfig)> {
     if is_gateway {
         assert!(public_port.is_some());
