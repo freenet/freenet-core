@@ -97,6 +97,7 @@ impl Default for ConfigArgs {
                 gateways: None,
                 location: None,
                 bandwidth_limit: None,
+                blocked_addresses: None,
             },
             ws_api: WebsocketApiArgs {
                 address: Some(default_listening_address()),
@@ -523,7 +524,7 @@ impl NetworkArgs {
     }
 }
 
-#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkApiConfig {
     /// Address to listen to locally
     #[serde(default = "default_listening_address", rename = "network-address")]

@@ -171,7 +171,7 @@ impl NodeConfig {
             network_listener_ip: config.network_api.address,
             network_listener_port: config.network_api.port,
             location: config.location.map(Location::new),
-            config: Arc::new(config),
+            config: Arc::new(config.clone()),
             max_hops_to_live: None,
             rnd_if_htl_above: None,
             max_number_conn: None,
