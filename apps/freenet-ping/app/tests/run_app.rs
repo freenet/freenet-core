@@ -72,6 +72,9 @@ async fn base_node_test_config(
             address: Some(Ipv4Addr::LOCALHOST.into()),
             network_port: public_port,
             bandwidth_limit: None,
+            // Assuming the new field 'blocked_addresses' is added to NetworkArgs
+            // and it takes Option<Vec<SocketAddr>>
+            blocked_addresses: blocked_addresses_for_this_node,
         },
         config_paths: {
             freenet::config::ConfigPathsArgs {
