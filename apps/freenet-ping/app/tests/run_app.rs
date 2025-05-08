@@ -1,12 +1,10 @@
 use std::{
-    collections::HashMap,
     net::{Ipv4Addr, TcpListener},
     path::PathBuf,
     time::Duration,
 };
 
 use anyhow::anyhow;
-use chrono::{DateTime, Utc};
 use freenet::{
     config::{ConfigArgs, InlineGwConfig, NetworkArgs, SecretArgs, WebsocketApiArgs},
     dev_tool::TransportKeypair,
