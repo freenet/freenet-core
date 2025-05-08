@@ -178,7 +178,8 @@ impl NodeConfig {
             min_number_conn: None,
             max_upstream_bandwidth: None,
             max_downstream_bandwidth: None,
-            blocked_addresses: config.network_api.blocked_addresses.clone(),
+            // Assuming 'network_args' is the correct field in 'config' that holds NetworkArgs
+            blocked_addresses: config.network_args.blocked_addresses.clone(),
         })
     }
 

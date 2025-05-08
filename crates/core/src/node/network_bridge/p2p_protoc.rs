@@ -468,7 +468,7 @@ impl P2pConnManager {
     async fn handle_connect_peer(
         &mut self,
         peer: PeerId,
-        callback: Box<dyn ConnectResultSender>,
+        mut callback: Box<dyn ConnectResultSender>,
         tx: Transaction,
         handshake_handler_msg: &HanshakeHandlerMsg,
         state: &mut EventListenerState,

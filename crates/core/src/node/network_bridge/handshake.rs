@@ -160,14 +160,6 @@ impl HanshakeHandlerMsg {
             .map_err(|_| HandshakeError::ChannelClosed)?;
         Ok(())
     }
-
-    pub async fn drop_connection_by_addr(&self, remote_addr: SocketAddr) -> Result<()> {
-        self.0
-            .send(ExternConnection::DropConnectionByAddr(remote_addr))
-            .await
-            .map_err(|_| HandshakeError::ChannelClosed)?;
-        Ok(())
-    }
 }
 
 type OutboundMessageSender = mpsc::Sender<NetMessage>;
