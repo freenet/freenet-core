@@ -21,7 +21,7 @@ ctrlc = { version = "3" }
 dashmap = "^6.1"
 either = "1"
 futures = "0.3"
-rand = { version = "0.8" }
+rand = { version = "0.9" }
 semver = { version = "1",  features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
