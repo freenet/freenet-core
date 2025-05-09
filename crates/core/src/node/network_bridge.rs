@@ -48,6 +48,8 @@ pub(crate) enum ConnectionError {
     FailedConnectOp,
     #[error("unwanted connection")]
     UnwantedConnection,
+    #[error("connection to/from address {0} blocked by local policy")]
+    AddressBlocked(std::net::SocketAddr),
 
     // errors produced while handling the connection:
     #[error("IO error: {0}")]
@@ -80,6 +82,7 @@ impl Clone for ConnectionError {
             Self::TransportError(err) => Self::TransportError(err.clone()),
             Self::FailedConnectOp => Self::FailedConnectOp,
             Self::UnwantedConnection => Self::UnwantedConnection,
+            Self::AddressBlocked(addr) => Self::AddressBlocked(*addr),
         }
     }
 }

@@ -125,6 +125,7 @@ pub struct NodeConfig {
     pub(crate) min_number_conn: Option<usize>,
     pub(crate) max_upstream_bandwidth: Option<Rate>,
     pub(crate) max_downstream_bandwidth: Option<Rate>,
+    pub(crate) blocked_addresses: Option<HashSet<SocketAddr>>,
 }
 
 impl NodeConfig {
@@ -170,13 +171,14 @@ impl NodeConfig {
             network_listener_ip: config.network_api.address,
             network_listener_port: config.network_api.port,
             location: config.location.map(Location::new),
-            config: Arc::new(config),
+            config: Arc::new(config.clone()),
             max_hops_to_live: None,
             rnd_if_htl_above: None,
             max_number_conn: None,
             min_number_conn: None,
             max_upstream_bandwidth: None,
             max_downstream_bandwidth: None,
+            blocked_addresses: config.network_api.blocked_addresses.clone(),
         })
     }
 

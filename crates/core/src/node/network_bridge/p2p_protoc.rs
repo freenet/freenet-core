@@ -125,6 +125,7 @@ pub(in crate::node) struct P2pConnManager {
     this_location: Option<Location>,
     check_version: bool,
     bandwidth_limit: Option<usize>,
+    blocked_addresses: Option<HashSet<SocketAddr>>,
 }
 
 impl P2pConnManager {
@@ -154,6 +155,7 @@ impl P2pConnManager {
             this_location: config.location,
             check_version: !config.config.network_api.ignore_protocol_version,
             bandwidth_limit: config.config.network_api.bandwidth_limit,
+            blocked_addresses: config.blocked_addresses.clone(),
         })
     }
 
@@ -245,10 +247,6 @@ impl P2pConnManager {
                                 }
                             }
                         }
-
-                        ConnEvent::HandshakeAction(action) => {
-                            self.handle_handshake_action(action, &mut state).await?;
-                        }
                         ConnEvent::ClosedChannel => {
                             tracing::info!("Notification channel closed");
                             break;
@@ -334,7 +332,7 @@ impl P2pConnManager {
         &mut self,
         state: &mut EventListenerState,
         handshake_handler: &mut HandshakeHandler,
-        handshake_handler_msg: &HanshakeHandlerMsg,
+        handshake_handler_msg: &HanshakeHandlerMsg, // already passed here
         notification_channel: &mut EventLoopNotificationsReceiver,
         node_controller: &mut Receiver<NodeEvent>,
         client_wait_for_transaction: &mut ContractHandlerChannel<WaitingResolution>,
@@ -353,8 +351,18 @@ impl P2pConnManager {
             msg = self.conn_bridge_rx.recv() => {
                 Ok(self.handle_bridge_msg(msg))
             }
-            msg = handshake_handler.wait_for_events() => {
-                Ok(self.handle_handshake_msg(msg))
+            handshake_event_res = handshake_handler.wait_for_events() => {
+                match handshake_event_res {
+                    Ok(event) => {
+                        self.handle_handshake_action(event, state, handshake_handler_msg).await?;
+                        Ok(EventResult::Continue)
+                    }
+                    Err(HandshakeError::ChannelClosed) => Ok(EventResult::Event(ConnEvent::ClosedChannel)),
+                    Err(e) => {
+                        tracing::warn!("Handshake error: {:?}", e);
+                        Ok(EventResult::Continue)
+                    }
+                }
             }
             msg = node_controller.recv() => {
                 Ok(self.handle_node_controller_msg(msg))
@@ -460,13 +468,25 @@ impl P2pConnManager {
     async fn handle_connect_peer(
         &mut self,
         peer: PeerId,
-        callback: Box<dyn ConnectResultSender>,
+        mut callback: Box<dyn ConnectResultSender>,
         tx: Transaction,
         handshake_handler_msg: &HanshakeHandlerMsg,
         state: &mut EventListenerState,
         is_gw: bool,
     ) -> anyhow::Result<()> {
         tracing::info!(tx = %tx, remote = %peer, "Connecting to peer");
+        if let Some(blocked_addrs) = &self.blocked_addresses {
+            if blocked_addrs.contains(&peer.addr) {
+                tracing::info!(tx = %tx, remote = %peer.addr, "Outgoing connection to peer blocked by local policy");
+                // Ensure ConnectionError is correctly namespaced if HandshakeError::ConnectionError expects it directly
+                callback
+                    .send_result(Err(HandshakeError::ConnectionError(
+                        crate::node::network_bridge::ConnectionError::AddressBlocked(peer.addr),
+                    )))
+                    .await?;
+                return Ok(());
+            }
+        }
         state.awaiting_connection.insert(peer.addr, callback);
         let res = timeout(
             Duration::from_secs(10),
@@ -492,6 +512,7 @@ impl P2pConnManager {
         &mut self,
         event: HandshakeEvent,
         state: &mut EventListenerState,
+        handshake_handler_msg: &HanshakeHandlerMsg, // Parameter added
     ) -> anyhow::Result<()> {
         match event {
             HandshakeEvent::InboundConnection {
@@ -502,6 +523,16 @@ impl P2pConnManager {
                 op,
                 forward_info,
             } => {
+                if let Some(blocked_addrs) = &self.blocked_addresses {
+                    if blocked_addrs.contains(&joiner.addr) {
+                        tracing::info!(%id, remote = %joiner.addr, "Inbound connection from peer blocked by local policy");
+                        // Not proceeding with adding connection or processing the operation.
+                        handshake_handler_msg
+                            .drop_connection_by_addr(joiner.addr)
+                            .await?;
+                        return Ok(());
+                    }
+                }
                 let (tx, rx) = mpsc::channel(1);
                 self.connections.insert(joiner.clone(), tx);
                 let was_reserved = {
@@ -733,20 +764,14 @@ impl P2pConnManager {
         }
     }
 
-    fn handle_handshake_msg(&self, msg: Result<HandshakeEvent, HandshakeError>) -> EventResult {
-        match msg {
-            Ok(event) => EventResult::Event(ConnEvent::HandshakeAction(event)),
-            Err(HandshakeError::ChannelClosed) => EventResult::Event(ConnEvent::ClosedChannel),
-            _ => EventResult::Continue,
-        }
-    }
-
     fn handle_node_controller_msg(&self, msg: Option<NodeEvent>) -> EventResult {
         match msg {
             Some(msg) => EventResult::Event(ConnEvent::NodeAction(msg)),
             None => EventResult::Event(ConnEvent::ClosedChannel),
         }
     }
+
+    // Removed handle_handshake_msg as it's integrated into wait_for_event
 
     fn handle_client_transaction_subscription(
         &self,
@@ -875,7 +900,6 @@ enum EventResult {
 enum ConnEvent {
     InboundMessage(NetMessage),
     OutboundMessage(NetMessage),
-    HandshakeAction(HandshakeEvent),
     NodeAction(NodeEvent),
     ClosedChannel,
 }

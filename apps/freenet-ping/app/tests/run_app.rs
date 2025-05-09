@@ -46,6 +46,8 @@ async fn base_node_test_config(
     gateways: Vec<String>,
     public_port: Option<u16>,
     ws_api_port: u16,
+    // New parameter to specify addresses this node should block
+    blocked_addresses: Option<Vec<std::net::SocketAddr>>,
 ) -> anyhow::Result<(ConfigArgs, PresetConfig)> {
     if is_gateway {
         assert!(public_port.is_some());
@@ -72,6 +74,9 @@ async fn base_node_test_config(
             address: Some(Ipv4Addr::LOCALHOST.into()),
             network_port: public_port,
             bandwidth_limit: None,
+            // Assuming the new field 'blocked_addresses' is added to NetworkArgs
+            // and it takes Option<Vec<SocketAddr>>
+            blocked_addresses,
         },
         config_paths: {
             freenet::config::ConfigPathsArgs {
@@ -154,6 +159,7 @@ async fn test_ping_multi_node() -> TestResult {
             vec![],
             Some(network_socket_gw.local_addr()?.port()),
             ws_api_port_socket_gw.local_addr()?.port(),
+            None, // blocked_addresses
         )
         .await?;
         let public_port = cfg.network_api.public_port.unwrap();
@@ -168,6 +174,7 @@ async fn test_ping_multi_node() -> TestResult {
         vec![serde_json::to_string(&config_gw_info)?],
         None,
         ws_api_port_socket_node1.local_addr()?.port(),
+        None, // blocked_addresses
     )
     .await?;
     let ws_api_port_node1 = config_node1.ws_api.ws_api_port.unwrap();
@@ -178,6 +185,7 @@ async fn test_ping_multi_node() -> TestResult {
         vec![serde_json::to_string(&config_gw_info)?],
         None,
         ws_api_port_socket_node2.local_addr()?.port(),
+        None, // blocked_addresses
     )
     .await?;
     let ws_api_port_node2 = config_node2.ws_api.ws_api_port.unwrap();
@@ -667,6 +675,7 @@ async fn test_ping_application_loop() -> TestResult {
             vec![],
             Some(network_socket_gw.local_addr()?.port()),
             ws_api_port_socket_gw.local_addr()?.port(),
+            None, // blocked_addresses
         )
         .await?;
         let public_port = cfg.network_api.public_port.unwrap();
@@ -681,6 +690,7 @@ async fn test_ping_application_loop() -> TestResult {
         vec![serde_json::to_string(&config_gw_info)?],
         None,
         ws_api_port_socket_node1.local_addr()?.port(),
+        None, // blocked_addresses
     )
     .await?;
     let ws_api_port_node1 = config_node1.ws_api.ws_api_port.unwrap();
@@ -691,6 +701,7 @@ async fn test_ping_application_loop() -> TestResult {
         vec![serde_json::to_string(&config_gw_info)?],
         None,
         ws_api_port_socket_node2.local_addr()?.port(),
+        None, // blocked_addresses
     )
     .await?;
     let ws_api_port_node2 = config_node2.ws_api.ws_api_port.unwrap();
