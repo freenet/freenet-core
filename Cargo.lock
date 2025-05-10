@@ -1443,7 +1443,7 @@ dependencies = [
  "clap",
  "dashmap",
  "either",
- "freenet 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "freenet",
  "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures 0.3.31",
  "glob",
@@ -1626,79 +1626,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "freenet"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b52c6d0d8dcccd52aebaddbe83bb54ad9edde0d9c01ec4b429b70373c221e31"
-dependencies = [
- "aes-gcm",
- "ahash",
- "anyhow",
- "arc-swap",
- "asynchronous-codec",
- "axum",
- "bincode",
- "blake3",
- "bs58",
- "byteorder",
- "bytes 1.10.1",
- "cache-padded",
- "chacha20poly1305",
- "chrono",
- "clap",
- "cookie",
- "crossbeam",
- "ctrlc",
- "dashmap",
- "delegate",
- "directories",
- "either",
- "flatbuffers",
- "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
- "futures 0.3.31",
- "headers",
- "hickory-resolver",
- "itertools 0.14.0",
- "notify",
- "once_cell",
- "opentelemetry 0.29.1",
- "opentelemetry-jaeger",
- "opentelemetry-otlp",
- "ordered-float 5.0.0",
- "parking_lot",
- "pav_regression",
- "pkcs8",
- "rand 0.8.5",
- "redb",
- "reqwest",
- "rsa",
- "semver",
- "serde",
- "serde_derive",
- "serde_json",
- "serde_with",
- "stretto",
- "tar",
- "thiserror 2.0.12",
- "time",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "toml",
- "tower-http",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "ulid",
- "unsigned-varint",
- "wasmer",
- "wasmer-compiler-singlepass",
- "wasmer-middlewares",
- "winapi",
- "wmi",
- "xz2",
-]
-
-[[package]]
 name = "freenet-macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1725,7 +1652,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
- "freenet 0.1.3",
+ "freenet",
  "freenet-ping-types",
  "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures 0.3.31",
@@ -1991,9 +1918,9 @@ dependencies = [
 
 [[package]]
 name = "getrandom"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73fea8450eea4bac3940448fb7ae50d91f034f941199fcd9d909a5a07aa455f0"
+checksum = "26145e563e54f2cadc477553f1ec5ee650b00862f0a58bcd12cbdc5f0ea2d2f4"
 dependencies = [
  "cfg-if",
  "libc",
@@ -3958,7 +3885,7 @@ version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "99d9a13982dcf210057a8a78572b2217b667c3beacbf3a0d8b454f6f82837d38"
 dependencies = [
- "getrandom 0.3.2",
+ "getrandom 0.3.3",
 ]
 
 [[package]]
@@ -5081,7 +5008,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7437ac7763b9b123ccf33c338a5cc1bac6f69b45a136c19bdd8a65e3916435bf"
 dependencies = [
  "fastrand 2.3.0",
- "getrandom 0.3.2",
+ "getrandom 0.3.3",
  "once_cell",
  "rustix 1.0.7",
  "windows-sys 0.59.0",
