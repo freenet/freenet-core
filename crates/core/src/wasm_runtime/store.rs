@@ -111,7 +111,7 @@ impl From<DelegateKey> for StoreKey {
 impl From<StoreKey> for DelegateKey {
     fn from(value: StoreKey) -> Self {
         let StoreKey::DelegateKey { key, code_hash } = value else {
-            unreachable!()
+            unreachable!("StoreKey should be DelegateKey variant")
         };
         DelegateKey::new(key, CodeHash::new(code_hash))
     }
@@ -126,7 +126,7 @@ impl From<ContractInstanceId> for StoreKey {
 impl From<StoreKey> for ContractInstanceId {
     fn from(value: StoreKey) -> Self {
         let StoreKey::ContractKey(value) = value else {
-            unreachable!()
+            unreachable!("StoreKey should be ContractKey variant")
         };
         ContractInstanceId::new(value)
     }
@@ -240,7 +240,7 @@ where
     let key_type = match key_part[1] {
         0 => KeyType::Contract,
         1 => KeyType::Delegate,
-        _ => unreachable!(),
+        _ => unreachable!("Invalid KeyType byte"),
     };
 
     if !deleted {

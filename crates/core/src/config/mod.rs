@@ -669,7 +669,7 @@ impl ConfigPathsArgs {
             .unwrap_or_else(|| {
                 let default_dirs = Self::default_dirs(id)?;
                 let Either::Left(defaults) = default_dirs else {
-                    unreachable!()
+                    unreachable!("default_dirs should return Left if data_dir is None and id is not set for temp dir")
                 };
                 Ok(defaults.data_dir().to_path_buf())
             })?;
@@ -712,7 +712,7 @@ impl ConfigPathsArgs {
             .unwrap_or_else(|| {
                 let default_dirs = Self::default_dirs(id)?;
                 let Either::Left(defaults) = default_dirs else {
-                    unreachable!()
+                    unreachable!("default_dirs should return Left if config_dir is None and id is not set for temp dir")
                 };
                 Ok(defaults.config_dir().to_path_buf())
             })?;
@@ -968,7 +968,7 @@ impl GlobalExecutor {
         } else if let Some(rt) = &*ASYNC_RT {
             rt.spawn(f)
         } else {
-            unreachable!("the executor must have been initialized")
+            unreachable!("ASYNC_RT should be initialized if Handle::try_current fails")
         }
     }
 }

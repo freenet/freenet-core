@@ -602,7 +602,7 @@ impl HandshakeHandler {
                     .into_inner()
                     .expect("target was successfully set");
                 let ConnectState::AwaitingConnectivity(info) = conn_state else {
-                    unreachable!()
+                    unreachable!("forward_conn should return AwaitingConnectivity if successful")
                 };
                 Ok(ForwardResult::Forward(forward_target, msg, info))
             }
@@ -792,7 +792,7 @@ impl NetworkBridge for ForwardPeerMessage {
 
     async fn drop_connection(&mut self, _: &PeerId) -> super::ConnResult<()> {
         if cfg!(debug_assertions) {
-            unreachable!()
+            unreachable!("drop_connection should not be called on ForwardPeerMessage")
         }
         Ok(())
     }
@@ -1114,16 +1114,17 @@ async fn gw_transient_peer_conn(
                                 },
                             }));
                             conn.send(msg).await?;
-                            if info.decrement_check() {
+                            if info.decrement_check() { // this means all checks have been performed
                                 break Ok((InternalEvent::DropInboundConnection(conn.remote_addr()), outbound));
-                            } else {
+                            } else { // still waiting for more checks
                                 continue;
                             }
                         }
+                        // other messages are just forwarded
                         conn.send(msg).await?;
                     }
                     Ok(None) => {
-                        tracing::debug!("Outbound channel closed");
+                        tracing::debug!("Outbound channel closed for transient connection");
                         break Ok((InternalEvent::DropInboundConnection(conn.remote_addr()), outbound));
                     }
                     Err(_) => {

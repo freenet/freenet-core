@@ -76,9 +76,7 @@ impl RequestDensityTracker {
                             .or_insert(0) += sample_count;
                     }
                 }
-                _ => unreachable!(
-                    "This shouldn't be possible given that we verify neighbors is not empty"
-                ),
+                _ => unreachable!("previous_neighbor and next_neighbor should always be Some if neighbor_locations is not empty"),
             }
         }
 
@@ -127,9 +125,7 @@ impl DensityMap {
                     + previous_neighbor_prop * *next_neighbor_count as f64
             }
             // The None cases have been removed as they should not occur given the new logic
-            _ => unreachable!(
-                "This shouldn't be possible given that we verify neighbors is not empty"
-            ),
+            _ => unreachable!("previous_neighbor and next_neighbor should always be Some if neighbor_request_counts is not empty"),
         };
 
         Ok(count_estimate)
