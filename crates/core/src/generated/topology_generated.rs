@@ -1703,6 +1703,8 @@ pub mod topology {
         pub const VT_KEY: flatbuffers::VOffsetT = 6;
         pub const VT_REQUESTER: flatbuffers::VOffsetT = 8;
         pub const VT_TARGET: flatbuffers::VOffsetT = 10;
+        pub const VT_TIMESTAMP: flatbuffers::VOffsetT = 12;
+        pub const VT_CONTRACT_LOCATION: flatbuffers::VOffsetT = 14;
 
         #[inline]
         pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -1719,6 +1721,8 @@ pub mod topology {
             args: &'args UpdateRequestArgs<'args>,
         ) -> flatbuffers::WIPOffset<UpdateRequest<'bldr>> {
             let mut builder = UpdateRequestBuilder::new(_fbb);
+            builder.add_contract_location(args.contract_location);
+            builder.add_timestamp(args.timestamp);
             if let Some(x) = args.target {
                 builder.add_target(x);
             }
@@ -1778,6 +1782,28 @@ pub mod topology {
                     .unwrap()
             }
         }
+        #[inline]
+        pub fn timestamp(&self) -> u64 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<u64>(UpdateRequest::VT_TIMESTAMP, Some(0))
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn contract_location(&self) -> f64 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<f64>(UpdateRequest::VT_CONTRACT_LOCATION, Some(0.0))
+                    .unwrap()
+            }
+        }
     }
 
     impl flatbuffers::Verifiable for UpdateRequest<'_> {
@@ -1800,6 +1826,8 @@ pub mod topology {
                     true,
                 )?
                 .visit_field::<flatbuffers::ForwardsUOffset<&str>>("target", Self::VT_TARGET, true)?
+                .visit_field::<u64>("timestamp", Self::VT_TIMESTAMP, false)?
+                .visit_field::<f64>("contract_location", Self::VT_CONTRACT_LOCATION, false)?
                 .finish();
             Ok(())
         }
@@ -1809,6 +1837,8 @@ pub mod topology {
         pub key: Option<flatbuffers::WIPOffset<&'a str>>,
         pub requester: Option<flatbuffers::WIPOffset<&'a str>>,
         pub target: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub timestamp: u64,
+        pub contract_location: f64,
     }
     impl<'a> Default for UpdateRequestArgs<'a> {
         #[inline]
@@ -1818,6 +1848,8 @@ pub mod topology {
                 key: None,         // required field
                 requester: None,   // required field
                 target: None,      // required field
+                timestamp: 0,
+                contract_location: 0.0,
             }
         }
     }
@@ -1852,6 +1884,16 @@ pub mod topology {
                 .push_slot_always::<flatbuffers::WIPOffset<_>>(UpdateRequest::VT_TARGET, target);
         }
         #[inline]
+        pub fn add_timestamp(&mut self, timestamp: u64) {
+            self.fbb_
+                .push_slot::<u64>(UpdateRequest::VT_TIMESTAMP, timestamp, 0);
+        }
+        #[inline]
+        pub fn add_contract_location(&mut self, contract_location: f64) {
+            self.fbb_
+                .push_slot::<f64>(UpdateRequest::VT_CONTRACT_LOCATION, contract_location, 0.0);
+        }
+        #[inline]
         pub fn new(
             _fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>,
         ) -> UpdateRequestBuilder<'a, 'b, A> {
@@ -1881,6 +1923,8 @@ pub mod topology {
             ds.field("key", &self.key());
             ds.field("requester", &self.requester());
             ds.field("target", &self.target());
+            ds.field("timestamp", &self.timestamp());
+            ds.field("contract_location", &self.contract_location());
             ds.finish()
         }
     }
@@ -2373,6 +2417,7 @@ pub mod topology {
         pub const VT_TARGET: flatbuffers::VOffsetT = 8;
         pub const VT_KEY: flatbuffers::VOffsetT = 10;
         pub const VT_TIMESTAMP: flatbuffers::VOffsetT = 12;
+        pub const VT_CONTRACT_LOCATION: flatbuffers::VOffsetT = 14;
 
         #[inline]
         pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -2389,6 +2434,7 @@ pub mod topology {
             args: &'args UpdateSuccessArgs<'args>,
         ) -> flatbuffers::WIPOffset<UpdateSuccess<'bldr>> {
             let mut builder = UpdateSuccessBuilder::new(_fbb);
+            builder.add_contract_location(args.contract_location);
             builder.add_timestamp(args.timestamp);
             if let Some(x) = args.key {
                 builder.add_key(x);
@@ -2460,6 +2506,17 @@ pub mod topology {
                     .unwrap()
             }
         }
+        #[inline]
+        pub fn contract_location(&self) -> f64 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<f64>(UpdateSuccess::VT_CONTRACT_LOCATION, Some(0.0))
+                    .unwrap()
+            }
+        }
     }
 
     impl flatbuffers::Verifiable for UpdateSuccess<'_> {
@@ -2483,6 +2540,7 @@ pub mod topology {
                 .visit_field::<flatbuffers::ForwardsUOffset<&str>>("target", Self::VT_TARGET, true)?
                 .visit_field::<flatbuffers::ForwardsUOffset<&str>>("key", Self::VT_KEY, true)?
                 .visit_field::<u64>("timestamp", Self::VT_TIMESTAMP, false)?
+                .visit_field::<f64>("contract_location", Self::VT_CONTRACT_LOCATION, false)?
                 .finish();
             Ok(())
         }
@@ -2493,6 +2551,7 @@ pub mod topology {
         pub target: Option<flatbuffers::WIPOffset<&'a str>>,
         pub key: Option<flatbuffers::WIPOffset<&'a str>>,
         pub timestamp: u64,
+        pub contract_location: f64,
     }
     impl<'a> Default for UpdateSuccessArgs<'a> {
         #[inline]
@@ -2503,6 +2562,7 @@ pub mod topology {
                 target: None,      // required field
                 key: None,         // required field
                 timestamp: 0,
+                contract_location: 0.0,
             }
         }
     }
@@ -2542,6 +2602,11 @@ pub mod topology {
                 .push_slot::<u64>(UpdateSuccess::VT_TIMESTAMP, timestamp, 0);
         }
         #[inline]
+        pub fn add_contract_location(&mut self, contract_location: f64) {
+            self.fbb_
+                .push_slot::<f64>(UpdateSuccess::VT_CONTRACT_LOCATION, contract_location, 0.0);
+        }
+        #[inline]
         pub fn new(
             _fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>,
         ) -> UpdateSuccessBuilder<'a, 'b, A> {
@@ -2572,6 +2637,7 @@ pub mod topology {
             ds.field("target", &self.target());
             ds.field("key", &self.key());
             ds.field("timestamp", &self.timestamp());
+            ds.field("contract_location", &self.contract_location());
             ds.finish()
         }
     }
@@ -2598,6 +2664,7 @@ pub mod topology {
         pub const VT_TARGET: flatbuffers::VOffsetT = 8;
         pub const VT_KEY: flatbuffers::VOffsetT = 10;
         pub const VT_TIMESTAMP: flatbuffers::VOffsetT = 12;
+        pub const VT_CONTRACT_LOCATION: flatbuffers::VOffsetT = 14;
 
         #[inline]
         pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -2614,6 +2681,7 @@ pub mod topology {
             args: &'args UpdateFailureArgs<'args>,
         ) -> flatbuffers::WIPOffset<UpdateFailure<'bldr>> {
             let mut builder = UpdateFailureBuilder::new(_fbb);
+            builder.add_contract_location(args.contract_location);
             builder.add_timestamp(args.timestamp);
             if let Some(x) = args.key {
                 builder.add_key(x);
@@ -2685,6 +2753,17 @@ pub mod topology {
                     .unwrap()
             }
         }
+        #[inline]
+        pub fn contract_location(&self) -> f64 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<f64>(UpdateFailure::VT_CONTRACT_LOCATION, Some(0.0))
+                    .unwrap()
+            }
+        }
     }
 
     impl flatbuffers::Verifiable for UpdateFailure<'_> {
@@ -2708,6 +2787,7 @@ pub mod topology {
                 .visit_field::<flatbuffers::ForwardsUOffset<&str>>("target", Self::VT_TARGET, true)?
                 .visit_field::<flatbuffers::ForwardsUOffset<&str>>("key", Self::VT_KEY, true)?
                 .visit_field::<u64>("timestamp", Self::VT_TIMESTAMP, false)?
+                .visit_field::<f64>("contract_location", Self::VT_CONTRACT_LOCATION, false)?
                 .finish();
             Ok(())
         }
@@ -2718,6 +2798,7 @@ pub mod topology {
         pub target: Option<flatbuffers::WIPOffset<&'a str>>,
         pub key: Option<flatbuffers::WIPOffset<&'a str>>,
         pub timestamp: u64,
+        pub contract_location: f64,
     }
     impl<'a> Default for UpdateFailureArgs<'a> {
         #[inline]
@@ -2728,6 +2809,7 @@ pub mod topology {
                 target: None,      // required field
                 key: None,         // required field
                 timestamp: 0,
+                contract_location: 0.0,
             }
         }
     }
@@ -2767,6 +2849,11 @@ pub mod topology {
                 .push_slot::<u64>(UpdateFailure::VT_TIMESTAMP, timestamp, 0);
         }
         #[inline]
+        pub fn add_contract_location(&mut self, contract_location: f64) {
+            self.fbb_
+                .push_slot::<f64>(UpdateFailure::VT_CONTRACT_LOCATION, contract_location, 0.0);
+        }
+        #[inline]
         pub fn new(
             _fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>,
         ) -> UpdateFailureBuilder<'a, 'b, A> {
@@ -2797,6 +2884,7 @@ pub mod topology {
             ds.field("target", &self.target());
             ds.field("key", &self.key());
             ds.field("timestamp", &self.timestamp());
+            ds.field("contract_location", &self.contract_location());
             ds.finish()
         }
     }

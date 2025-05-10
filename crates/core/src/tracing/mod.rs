@@ -14,7 +14,7 @@ use crate::{
     generated::ContractChange,
     message::{MessageStats, NetMessage, NetMessageV1, Transaction},
     node::PeerId,
-    operations::{connect, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg},
+    operations::{connect, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg, update::UpdateMsg},
     ring::{Location, PeerKeyLocation, Ring},
     router::RouteEvent,
 };
@@ -300,6 +300,65 @@ impl<'a> NetEventLog<'a> {
                 timestamp: chrono::Utc::now().timestamp() as u64,
                 requester: target.clone(),
             },
+            NetMessageV1::Update(UpdateMsg::RequestUpdate {
+                key, target, id, ..
+            }) => {
+                let this_peer = &op_manager.ring.connection_manager.own_location();
+                EventKind::Update(UpdateEvent::Request {
+                    requester: this_peer.clone(),
+                    target: target.clone(),
+                    key: *key,
+                    id: *id,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                })
+            }
+            NetMessageV1::Update(UpdateMsg::SuccessfulUpdate {
+                id,
+                target,
+                sender,
+                key,
+                ..
+            }) => EventKind::Update(UpdateEvent::UpdateSuccess {
+                id: *id,
+                requester: sender.clone(),
+                target: target.clone(),
+                key: *key,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+            NetMessageV1::Update(UpdateMsg::Broadcasting {
+                new_value,
+                broadcast_to,
+                broadcasted_to, // broadcasted_to n peers
+                key,
+                id,
+                upstream,
+                sender,
+                ..
+            }) => EventKind::Update(UpdateEvent::BroadcastEmitted {
+                id: *id,
+                upstream: upstream.clone(),
+                broadcast_to: broadcast_to.clone(),
+                broadcasted_to: *broadcasted_to,
+                key: *key,
+                value: new_value.clone(),
+                sender: sender.clone(),
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+            NetMessageV1::Update(UpdateMsg::BroadcastTo {
+                sender,
+                new_value,
+                key,
+                target,
+                id,
+                ..
+            }) => EventKind::Update(UpdateEvent::BroadcastReceived {
+                id: *id,
+                requester: target.clone(),
+                key: *key,
+                value: new_value.clone(),
+                target: sender.clone(),
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
             _ => EventKind::Ignored,
         };
         Either::Left(NetEventLog {
@@ -667,7 +726,85 @@ async fn send_to_metrics_server(
                 at.location.unwrap().as_f64(),
                 *timestamp,
             );
+            ws_stream.send(Message::Binary(msg.into())).await
+        }
 
+        EventKind::Update(UpdateEvent::Request {
+            id,
+            requester,
+            key,
+            target,
+            timestamp,
+        }) => {
+            let contract_location = Location::from_contract_key(key.as_bytes());
+            let msg = ContractChange::update_request_msg(
+                id.to_string(),
+                key.to_string(),
+                requester.to_string(),
+                target.peer.to_string(),
+                *timestamp,
+                contract_location.as_f64(),
+            );
+            ws_stream.send(Message::Binary(msg.into())).await
+        }
+        EventKind::Update(UpdateEvent::UpdateSuccess {
+            id,
+            requester,
+            target,
+            key,
+            timestamp,
+        }) => {
+            let contract_location = Location::from_contract_key(key.as_bytes());
+            let msg = ContractChange::update_success_msg(
+                id.to_string(),
+                key.to_string(),
+                requester.to_string(),
+                target.peer.to_string(),
+                *timestamp,
+                contract_location.as_f64(),
+            );
+            ws_stream.send(Message::Binary(msg.into())).await
+        }
+        EventKind::Update(UpdateEvent::BroadcastEmitted {
+            id,
+            upstream,
+            broadcast_to, // broadcast_to n peers
+            broadcasted_to,
+            key,
+            sender,
+            timestamp,
+            ..
+        }) => {
+            let contract_location = Location::from_contract_key(key.as_bytes());
+            let msg = ContractChange::broadcast_emitted_msg(
+                id.to_string(),
+                upstream.to_string(),
+                broadcast_to.iter().map(|p| p.to_string()).collect(),
+                *broadcasted_to,
+                key.to_string(),
+                sender.to_string(),
+                *timestamp,
+                contract_location.as_f64(),
+            );
+            ws_stream.send(Message::Binary(msg.into())).await
+        }
+        EventKind::Update(UpdateEvent::BroadcastReceived {
+            id,
+            target,
+            requester,
+            key,
+            timestamp,
+            ..
+        }) => {
+            let contract_location = Location::from_contract_key(key.as_bytes());
+            let msg = ContractChange::broadcast_received_msg(
+                id.to_string(),
+                target.to_string(),
+                requester.to_string(),
+                key.to_string(),
+                *timestamp,
+                contract_location.as_f64(),
+            );
             ws_stream.send(Message::Binary(msg.into())).await
         }
         _ => Ok(()),
@@ -793,14 +930,14 @@ mod opentelemetry_tracer {
         ) where
             T: Into<std::borrow::Cow<'static, str>>,
         {
-            unreachable!("not explicitly called")
+            unreachable!("add_event_with_timestamp is not explicitly called on OTSpan")
         }
 
         fn update_name<T>(&mut self, _: T)
         where
             T: Into<std::borrow::Cow<'static, str>>,
         {
-            unreachable!("shouldn't change span name")
+            unreachable!("update_name shouldn't be called on OTSpan as span name is fixed")
         }
 
         fn add_link(&mut self, span_context: trace::SpanContext, attributes: Vec<KeyValue>) {
@@ -981,7 +1118,7 @@ enum EventKind {
         target: PeerKeyLocation,
     },
     Route(RouteEvent),
-    // todo: add update sequences too
+    Update(UpdateEvent),
     Subscribed {
         id: Transaction,
         key: ContractKey,
@@ -1003,6 +1140,7 @@ impl EventKind {
     const SUBSCRIBED: u8 = 4;
     const IGNORED: u8 = 5;
     const DISCONNECTED: u8 = 6;
+    const UPDATE: u8 = 7;
 
     const fn varint_id(&self) -> u8 {
         match self {
@@ -1013,6 +1151,7 @@ impl EventKind {
             EventKind::Subscribed { .. } => Self::SUBSCRIBED,
             EventKind::Ignored => Self::IGNORED,
             EventKind::Disconnected { .. } => Self::DISCONNECTED,
+            EventKind::Update(_) => Self::UPDATE,
         }
     }
 }
@@ -1070,6 +1209,50 @@ enum PutEvent {
         /// key of the contract which value was being updated
         key: ContractKey,
         /// value that was put
+        value: WrappedState,
+        /// target peer
+        target: PeerKeyLocation,
+        timestamp: u64,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+enum UpdateEvent {
+    Request {
+        id: Transaction,
+        requester: PeerKeyLocation,
+        key: ContractKey,
+        target: PeerKeyLocation,
+        timestamp: u64,
+    },
+    UpdateSuccess {
+        id: Transaction,
+        requester: PeerKeyLocation,
+        target: PeerKeyLocation,
+        key: ContractKey,
+        timestamp: u64,
+    },
+    BroadcastEmitted {
+        id: Transaction,
+        upstream: PeerKeyLocation,
+        /// subscribed peers
+        broadcast_to: Vec<PeerKeyLocation>,
+        broadcasted_to: usize,
+        /// key of the contract which value was being updated
+        key: ContractKey,
+        /// value that was updated
+        value: WrappedState,
+        sender: PeerKeyLocation,
+        timestamp: u64,
+    },
+    BroadcastReceived {
+        id: Transaction,
+        /// peer who started the broadcast op
+        requester: PeerKeyLocation,
+        /// key of the contract which value was being updated
+        key: ContractKey,
+        /// value that was updated
         value: WrappedState,
         /// target peer
         target: PeerKeyLocation,

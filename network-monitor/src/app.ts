@@ -1,6 +1,6 @@
 import * as flatbuffers from "flatbuffers";
 import * as fbTopology from "./generated/topology";
-import { handleChange } from "./topology";
+import {handleChange} from "./topology";
 import {
     handleBroadcastEmitted,
     handleBroadcastReceived,
@@ -8,6 +8,7 @@ import {
     handlePutRequest,
     handlePutSuccess,
     handleSubscribedToContract,
+    handleUpdate,
 } from "./transactions-data";
 import {
     get_change_type,
@@ -17,9 +18,13 @@ import {
     parse_put_request_msg_data,
     parse_put_success_msg_data,
     parse_subscribed_to_contract_msg_data,
+    parse_update_failure_msg_data,
+    parse_update_request_msg_data,
+    parse_update_success_msg_data,
 } from "./utils";
-import { ChangeType } from "./type_definitions";
-import { unionToContractChangeType } from "./generated/topology/contract-change-type";
+import {ChangeType} from "./type_definitions";
+import {unionToContractChangeType} from "./generated/topology/contract-change-type";
+import {now} from "d3";
 
 let connection_established = false;
 
@@ -78,7 +83,6 @@ function handleChanges(event: MessageEvent) {
                         contractChange,
                         contractChange.changeType()
                     );
-
                     handleGetContract(
                         transaction,
                         requester,
@@ -87,6 +91,33 @@ function handleChanges(event: MessageEvent) {
                         change_type,
                         timestamp,
                         target
+                    );
+
+                    return;
+                }
+
+                if (now_change_type == ChangeType.UPDATE_REQUEST) {
+                    let {
+                        transaction,
+                        contract_id,
+                        target,
+                        requester,
+                        change_type,
+                        timestamp,
+                        contract_location,
+                    } = parse_update_request_msg_data(
+                        contractChange,
+                        contractChange.changeType()
+                    );
+
+                    handleUpdate(
+                        transaction,
+                        target,
+                        requester,
+                        contract_id,
+                        change_type,
+                        timestamp,
+                        contract_location
                     );
 
                     return;
@@ -116,6 +147,60 @@ function handleChanges(event: MessageEvent) {
                         at_peer,
                         at_peer_location,
                         timestamp
+                    );
+
+                    return;
+                }
+
+                if (now_change_type == ChangeType.UPDATE_SUCCESS) {
+                    let {
+                        transaction,
+                        contract_id,
+                        target,
+                        requester,
+                        change_type,
+                        timestamp,
+                        contract_location,
+                    } = parse_update_success_msg_data(
+                        contractChange,
+                        contractChange.changeType()
+                    );
+
+                    handleUpdate(
+                        transaction,
+                        target,
+                        requester,
+                        contract_id,
+                        change_type,
+                        timestamp,
+                        contract_location
+                    );
+
+                    return;
+                }
+
+                if (now_change_type == ChangeType.UPDATE_FAILURE) {
+                    let {
+                        transaction,
+                        contract_id,
+                        target,
+                        requester,
+                        change_type,
+                        timestamp,
+                        contract_location,
+                    } = parse_update_failure_msg_data(
+                        contractChange,
+                        contractChange.changeType()
+                    );
+
+                    handleUpdate(
+                        transaction,
+                        target,
+                        requester,
+                        contract_id,
+                        change_type,
+                        timestamp,
+                        contract_location
                     );
 
                     return;

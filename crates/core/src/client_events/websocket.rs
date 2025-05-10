@@ -407,7 +407,7 @@ async fn new_client_connection(
     match response_recv.recv().await {
         Some(HostCallbackResult::NewId { id: client_id, .. }) => Ok((response_recv, client_id)),
         None => Err(ErrorKind::NodeUnavailable.into()),
-        other => unreachable!("received unexpected message: {other:?}"),
+        other => unreachable!("received unexpected message after NewConnection: {other:?}"),
     }
 }
 

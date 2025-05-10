@@ -9,6 +9,9 @@ export enum ChangeType {
     BROADCAST_RECEIVED = "Broadcast Received",
     GET_CONTRACT = "Get Contract",
     SUBSCRIBED_TO_CONTRACT = "Subscribed to Contract",
+    UPDATE_REQUEST = "Update Request",
+    UPDATE_SUCCESS = "Update Success",
+    UPDATE_FAILURE = "Update Failure",
 }
 
 export type TransactionData = {
@@ -141,7 +144,7 @@ export interface Peer {
     connectionTimestamp: number;
     connections: Connection[];
     history: ChangeInfo[];
-    locationHistory: { location: number; timestamp: number }[];
+    locationHistory: {location: number; timestamp: number}[];
 }
 
 export interface Connection {

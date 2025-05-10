@@ -25,6 +25,9 @@ pub enum ContractChange<'a> {
     BroadcastReceived(topology::BroadcastReceived<'a>),
     GetContract(topology::GetContract<'a>),
     SubscribedToContract(topology::SubscribedToContract<'a>),
+    UpdateRequest(topology::UpdateRequest<'a>),
+    UpdateSuccess(topology::UpdateSuccess<'a>),
+    UpdateFailure(topology::UpdateFailure<'a>),
 }
 
 // TODO: Change this to EventWrapper
@@ -300,6 +303,126 @@ impl ContractChange<'_> {
         buf.finish_minimal(msg);
         buf.finished_data().to_vec()
     }
+
+    pub fn update_request_msg<'a>(
+        transaction: impl AsRef<str>,
+        contract: impl AsRef<str>,
+        requester: impl AsRef<str>,
+        target: impl AsRef<str>,
+        timestamp: u64,
+        contract_location: f64,
+    ) -> Vec<u8> {
+        let mut buf = flatbuffers::FlatBufferBuilder::new();
+
+        let transaction = buf.create_string(transaction.as_ref());
+        let contract = buf.create_string(contract.as_ref());
+        let requester = buf.create_string(requester.as_ref());
+        let target = buf.create_string(target.as_ref());
+
+        let update_req = topology::UpdateRequest::create(
+            &mut buf,
+            &topology::UpdateRequestArgs {
+                transaction: Some(transaction),
+                key: Some(contract),
+                requester: Some(requester),
+                target: Some(target),
+                timestamp,
+                contract_location,
+            },
+        );
+
+        let msg = topology::ContractChange::create(
+            &mut buf,
+            &topology::ContractChangeArgs {
+                contract_id: Some(contract),
+                change_type: topology::ContractChangeType::UpdateRequest,
+                change: Some(update_req.as_union_value()),
+            },
+        );
+
+        buf.finish_minimal(msg);
+        buf.finished_data().to_vec()
+    }
+
+    pub fn update_success_msg<'a>(
+        transaction: impl AsRef<str>,
+        contract: impl AsRef<str>,
+        requester: impl AsRef<str>,
+        target: impl AsRef<str>,
+        timestamp: u64,
+        contract_location: f64,
+    ) -> Vec<u8> {
+        let mut buf = flatbuffers::FlatBufferBuilder::new();
+
+        let transaction = buf.create_string(transaction.as_ref());
+        let contract = buf.create_string(contract.as_ref());
+        let requester = buf.create_string(requester.as_ref());
+        let target = buf.create_string(target.as_ref());
+
+        let update_success = topology::UpdateSuccess::create(
+            &mut buf,
+            &topology::UpdateSuccessArgs {
+                transaction: Some(transaction),
+                key: Some(contract),
+                requester: Some(requester),
+                target: Some(target),
+                timestamp,
+                contract_location,
+            },
+        );
+
+        let msg = topology::ContractChange::create(
+            &mut buf,
+            &topology::ContractChangeArgs {
+                contract_id: Some(contract),
+                change_type: topology::ContractChangeType::UpdateSuccess,
+                change: Some(update_success.as_union_value()),
+            },
+        );
+
+        buf.finish_minimal(msg);
+        buf.finished_data().to_vec()
+    }
+
+    pub fn update_failure_msg<'a>(
+        transaction: impl AsRef<str>,
+        contract: impl AsRef<str>,
+        requester: impl AsRef<str>,
+        target: impl AsRef<str>,
+        timestamp: u64,
+        contract_location: f64,
+    ) -> Vec<u8> {
+        let mut buf = flatbuffers::FlatBufferBuilder::new();
+
+        let transaction = buf.create_string(transaction.as_ref());
+        let contract = buf.create_string(contract.as_ref());
+        let requester = buf.create_string(requester.as_ref());
+        let target = buf.create_string(target.as_ref());
+
+        let update_failure = topology::UpdateFailure::create(
+            &mut buf,
+            &topology::UpdateFailureArgs {
+                transaction: Some(transaction),
+                key: Some(contract),
+                requester: Some(requester),
+                target: Some(target),
+                timestamp,
+                contract_location,
+            },
+        );
+
+        let msg = topology::ContractChange::create(
+            &mut buf,
+            &topology::ContractChangeArgs {
+                contract_id: Some(contract),
+                change_type: topology::ContractChangeType::UpdateFailure,
+                change: Some(update_failure.as_union_value()),
+            },
+        );
+
+        buf.finish_minimal(msg);
+        buf.finished_data().to_vec()
+    }
 }
 
 impl PeerChange<'_> {
@@ -427,7 +550,7 @@ impl<'a> TryFromFbs<'a> for PeerChange<'a> {
                 })?;
                 Ok(Self::Error(req))
             }
-            _ => unreachable!(),
+            _ => unreachable!("PeerChangeType enum should be exhaustive"),
         }
     }
 }
@@ -534,7 +657,39 @@ impl<'a> TryFromFbs<'a> for ContractChange<'a> {
                 })?;
                 Ok(Self::SubscribedToContract(req))
             }
-            _ => unreachable!("Invalid contract change type"),
+            topology::ContractChangeType::UpdateRequest => {
+                let req = req.change_as_update_request().ok_or_else(|| {
+                    flatbuffers::InvalidFlatbuffer::InconsistentUnion {
+                        field: "change_type",
+                        field_type: "ContractChangeType",
+                        error_trace: Default::default(),
+                    }
+                })?;
+                Ok(Self::UpdateRequest(req))
+            }
+            topology::ContractChangeType::UpdateSuccess => {
+                let req = req.change_as_update_success().ok_or_else(|| {
+                    flatbuffers::InvalidFlatbuffer::InconsistentUnion {
+                        field: "change_type",
+                        field_type: "ContractChangeType",
+                        error_trace: Default::default(),
+                    }
+                })?;
+                Ok(Self::UpdateSuccess(req))
+            }
+
+            topology::ContractChangeType::UpdateFailure => {
+                let req = req.change_as_update_failure().ok_or_else(|| {
+                    flatbuffers::InvalidFlatbuffer::InconsistentUnion {
+                        field: "change_type",
+                        field_type: "ContractChangeType",
+                        error_trace: Default::default(),
+                    }
+                })?;
+                Ok(Self::UpdateFailure(req))
+            }
+
+            _ => unreachable!("ContractChangeType enum should be exhaustive"),
         }
     }
 }
