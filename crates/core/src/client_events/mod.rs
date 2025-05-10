@@ -592,7 +592,7 @@ async fn process_open_request(
                 })));
             }
             ClientRequest::Disconnect { .. } => {
-                unreachable!("ClientRequest::Disconnect should be handled by client_event_handling loop");
+                tracing::debug!("Received disconnect from user event");
             }
             ClientRequest::NodeQueries(_) => {
                 tracing::debug!("Received node queries from user event");
