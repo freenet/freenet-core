@@ -550,7 +550,7 @@ impl<'a> TryFromFbs<'a> for PeerChange<'a> {
                 })?;
                 Ok(Self::Error(req))
             }
-            _ => unreachable!(),
+            _ => unreachable!("PeerChangeType enum should be exhaustive"),
         }
     }
 }
@@ -689,7 +689,7 @@ impl<'a> TryFromFbs<'a> for ContractChange<'a> {
                 Ok(Self::UpdateFailure(req))
             }
 
-            _ => unreachable!("Invalid contract change type"),
+            _ => unreachable!("ContractChangeType enum should be exhaustive"),
         }
     }
 }

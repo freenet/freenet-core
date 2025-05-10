@@ -469,7 +469,7 @@ impl DelegateRuntimeInterface for Runtime {
                         self.secret_store.remove_secret(delegate_key, &key)?;
                     }
                 }
-                _ => unreachable!(),
+                _ => unreachable!("All OutboundDelegateMsg variants should be handled"),
             }
         }
         tracing::debug!(

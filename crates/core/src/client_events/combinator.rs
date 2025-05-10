@@ -68,7 +68,7 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
     fn recv(&mut self) -> BoxFuture<'_, Result<OpenRequest<'static>, ClientError>> {
         async {
             let Some((idx, mut rx, res)) = self.pending_futs.next().await else {
-                unreachable!();
+                unreachable!("pending_futs should always have a future unless the combinator is dropped");
             };
 
             let res = res

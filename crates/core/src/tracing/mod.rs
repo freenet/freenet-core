@@ -930,14 +930,14 @@ mod opentelemetry_tracer {
         ) where
             T: Into<std::borrow::Cow<'static, str>>,
         {
-            unreachable!("not explicitly called")
+            unreachable!("add_event_with_timestamp is not explicitly called on OTSpan")
         }
 
         fn update_name<T>(&mut self, _: T)
         where
             T: Into<std::borrow::Cow<'static, str>>,
         {
-            unreachable!("shouldn't change span name")
+            unreachable!("update_name shouldn't be called on OTSpan as span name is fixed")
         }
 
         fn add_link(&mut self, span_context: trace::SpanContext, attributes: Vec<KeyValue>) {

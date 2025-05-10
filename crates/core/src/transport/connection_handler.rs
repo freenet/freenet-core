@@ -383,7 +383,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 },
                 gw_connection_handshake = gw_connection_tasks.next(), if !gw_connection_tasks.is_empty() => {
                     let Some(res): GwOngoingConnectionResult = gw_connection_handshake else {
-                        unreachable!();
+                        unreachable!("gw_connection_tasks.next() should only return None if empty, which is guarded");
                     };
                     match res.expect("task shouldn't panic") {
                         Ok((outbound_remote_conn, inbound_remote_connection, outbound_ack_packet)) => {
@@ -424,7 +424,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 }
                 connection_handshake = connection_tasks.next(), if !connection_tasks.is_empty() => {
                     let Some(res): OngoingConnectionResult = connection_handshake else {
-                        unreachable!();
+                        unreachable!("connection_tasks.next() should only return None if empty, which is guarded");
                     };
                     match res.expect("task shouldn't panic") {
                         Ok((outbound_remote_conn, inbound_remote_connection)) => {
