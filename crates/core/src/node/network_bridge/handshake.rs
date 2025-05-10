@@ -1099,7 +1099,7 @@ async fn gw_transient_peer_conn(
                                 msg: ConnectResponse::AcceptedBy { accepted, acceptor, joiner },
                                 ..
                             })) = msg else {
-                                unreachable!()
+                                unreachable!("Expected ConnectResponse::AcceptedBy after matches! guard")
                             };
                             // in this case it may be a reply of a third party we forwarded to,
                             // and need to send that back to the joiner and count the reply
