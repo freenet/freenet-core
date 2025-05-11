@@ -1,7 +1,7 @@
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::prelude::*;
 
-struct Contract;
+pub struct Contract;
 
 #[contract]
 impl ContractInterface for Contract {
