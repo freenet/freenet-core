@@ -695,8 +695,12 @@ pub(crate) async fn initial_join_procedure(
             return;
         }
 
+        let mut connected = false;
+        const WAIT_TIME: u64 = 1;
+        const CHECK_AGAIN_TIME: u64 = 15;
         loop {
             if op_manager.ring.open_connections() == 0 {
+                connected = false;
                 tracing::info!(
                     "Attempting to connect to {} gateways in parallel",
                     number_of_parallel_connections
@@ -725,11 +729,15 @@ pub(crate) async fn initial_join_procedure(
                     }
                 }).await;
             }
-            #[cfg(debug_assertions)]
-            const WAIT_TIME: u64 = 15;
-            #[cfg(not(debug_assertions))]
-            const WAIT_TIME: u64 = 3;
-            tokio::time::sleep(Duration::from_secs(WAIT_TIME)).await;
+
+            if !connected {
+                tokio::time::sleep(Duration::from_secs(WAIT_TIME)).await;
+            } else {
+                // tipically we won't need to ever again connect to a gw once connected
+                // to the network, but this task will check time to time in case the peer
+                // becomes completely disconnected for some reason
+                tokio::time::sleep(Duration::from_secs(CHECK_AGAIN_TIME)).await;
+            }
         }
     });
     Ok(())
