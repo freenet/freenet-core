@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use freenet_stdlib::client_api::HostResponse;
-use futures::Future;
+use futures::{Future, StreamExt};
 
 pub(crate) use self::messages::{ConnectMsg, ConnectRequest, ConnectResponse};
 use super::{connect, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
@@ -685,7 +685,8 @@ pub(crate) async fn initial_join_procedure(
         // e.g. 10 gateways and htl 5 -> only need 2 connections in parallel
         let needed_to_cover_max =
             op_manager.ring.connection_manager.max_connections / max_potential_conns_per_gw;
-        gateways.iter().take(needed_to_cover_max).count().max(1)
+        // if we have 2 gws, we will at least attempt 2 parallel connections
+        gateways.iter().take(needed_to_cover_max).count().max(2)
     };
     let gateways = gateways.to_vec();
     tokio::task::spawn(async move {
@@ -693,12 +694,18 @@ pub(crate) async fn initial_join_procedure(
             tracing::warn!("No gateways available, aborting join procedure");
             return;
         }
+
+        let mut connected = false;
+        const WAIT_TIME: u64 = 1;
+        const CHECK_AGAIN_TIME: u64 = 15;
         loop {
             if op_manager.ring.open_connections() == 0 {
+                connected = false;
                 tracing::info!(
                     "Attempting to connect to {} gateways in parallel",
                     number_of_parallel_connections
                 );
+                let select_all = futures::stream::FuturesUnordered::new();
                 for gateway in op_manager
                     .ring
                     .is_not_connected(gateways.iter())
@@ -706,21 +713,31 @@ pub(crate) async fn initial_join_procedure(
                     .take(number_of_parallel_connections)
                 {
                     tracing::info!(%gateway, "Attempting connection to gateway");
-                    if let Err(error) = join_ring_request(None, gateway, &op_manager).await {
+                    let op_manager = op_manager.clone();
+                    select_all.push(async move {
+                        (join_ring_request(None, gateway, &op_manager).await, gateway)
+                    });
+                }
+                select_all.for_each(|(res, gateway)| async move {
+                    if let Err(error) = res {
                         if !matches!(
                             error,
                             OpError::ConnError(crate::node::ConnectionError::UnwantedConnection)
                         ) {
-                            tracing::error!(%error, "Failed while attempting connection to gateway");
+                            tracing::error!(%gateway, %error, "Failed while attempting connection to gateway");
                         }
                     }
-                }
+                }).await;
             }
-            #[cfg(debug_assertions)]
-            const WAIT_TIME: u64 = 15;
-            #[cfg(not(debug_assertions))]
-            const WAIT_TIME: u64 = 3;
-            tokio::time::sleep(Duration::from_secs(WAIT_TIME)).await;
+
+            if !connected {
+                tokio::time::sleep(Duration::from_secs(WAIT_TIME)).await;
+            } else {
+                // tipically we won't need to ever again connect to a gw once connected
+                // to the network, but this task will check time to time in case the peer
+                // becomes completely disconnected for some reason
+                tokio::time::sleep(Duration::from_secs(CHECK_AGAIN_TIME)).await;
+            }
         }
     });
     Ok(())
