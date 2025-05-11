@@ -896,18 +896,18 @@ fn handle_ack_connection_error(err: Cow<'static, str>) -> TransportError {
 
 fn key_from_addr(addr: &SocketAddr) -> [u8; 16] {
     let current_time = chrono::Utc::now();
-    let mut hasher = blake3::Hasher::new(); 
+    let mut blake_hasher = blake3::Hasher::new();
     match addr {
         SocketAddr::V4(v4) => {
-            hasher.update(&v4.ip().octets());
-            hasher.update(&v4.port().to_le_bytes());
+            blake_hasher.update(&v4.ip().octets());
+            blake_hasher.update(&v4.port().to_le_bytes());
         }
         SocketAddr::V6(v6) => {
-            hasher.update(&v6.ip().octets());
-            hasher.update(&v6.port().to_le_bytes());
+            blake_hasher.update(&v6.ip().octets());
+            blake_hasher.update(&v6.port().to_le_bytes());
         }
     }
-    hasher.update(
+    blake_hasher.update(
         current_time
             .date_naive()
             .and_hms_opt(0, 0, 0)
@@ -923,13 +923,13 @@ fn key_from_addr(addr: &SocketAddr) -> [u8; 16] {
     use std::collections::hash_map::DefaultHasher;
     
     let pid = std::process::id().to_le_bytes();
-    let mut hasher = DefaultHasher::new();
-    std::thread::current().id().hash(&mut hasher);
-    let tid_hash = hasher.finish().to_le_bytes();
+    let mut thread_hasher = DefaultHasher::new();
+    std::thread::current().id().hash(&mut thread_hasher);
+    let tid_hash = thread_hasher.finish().to_le_bytes();
     
-    hasher.update(&pid);
-    hasher.update(&tid_hash);
-    hasher.finalize().as_bytes()[..16].try_into().unwrap()
+    blake_hasher.update(&pid);
+    blake_hasher.update(&tid_hash);
+    blake_hasher.finalize().as_bytes()[..16].try_into().unwrap()
 }
 
 pub(crate) enum ConnectionEvent {
