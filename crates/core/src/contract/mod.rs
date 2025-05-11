@@ -113,8 +113,7 @@ where
                         ContractHandlerEvent::PutResponse {
                             new_value: Err(err),
                         }
-                    }
-                    // UpsertResult::NotAvailable is not used in this path
+                    } // UpsertResult::NotAvailable is not used in this path
                 };
 
                 contract_handler

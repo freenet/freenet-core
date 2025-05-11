@@ -1041,7 +1041,9 @@ pub(crate) mod test {
                         };
                         return Some(request.into());
                     }
-                    _ => unreachable!("gen_range(0..100) should always fall into one of the defined ranges"),
+                    _ => unreachable!(
+                        "gen_range(0..100) should always fall into one of the defined ranges"
+                    ),
                 }
             }
             None

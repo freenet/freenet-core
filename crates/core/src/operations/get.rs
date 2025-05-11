@@ -820,7 +820,9 @@ impl Operation for GetOp {
                                     return Err(OpError::StatePushed);
                                 }
                             }
-                            _ => unreachable!("PutQuery from Get operation should always return PutResponse"),
+                            _ => unreachable!(
+                                "PutQuery from Get operation should always return PutResponse"
+                            ),
                         }
                     }
 
