@@ -679,7 +679,6 @@ pub(crate) async fn initial_join_procedure(
     op_manager: Arc<OpManager>,
     gateways: &[PeerKeyLocation],
 ) -> Result<(), OpError> {
-    use crate::util::IterExt;
     let number_of_parallel_connections = {
         let max_potential_conns_per_gw = op_manager.ring.max_hops_to_live;
         // e.g. 10 gateways and htl 5 -> only need 2 connections in parallel
@@ -696,7 +695,7 @@ pub(crate) async fn initial_join_procedure(
         loop {
             if op_manager.ring.open_connections() == 0 {
                 tracing::info!(
-                    "Attempting to connect to gateways with failover support",
+                    "Attempting to connect to {} gateways with failover support",
                     number_of_parallel_connections
                 );
                 
@@ -712,9 +711,17 @@ pub(crate) async fn initial_join_procedure(
                 }
                 
                 let mut shuffled_gateways: Vec<_> = available_gateways.into_iter().collect();
-                use rand::seq::SliceRandom;
-                let mut rng = rand::thread_rng();
-                shuffled_gateways.shuffle(&mut rng);
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                
+                if !shuffled_gateways.is_empty() {
+                    for i in (1..shuffled_gateways.len()).rev() {
+                        let j = ((seed + i as u64) % (i + 1) as u64) as usize;
+                        shuffled_gateways.swap(i, j);
+                    }
+                }
                 
                 let mut connected = false;
                 for gateway in &shuffled_gateways {
