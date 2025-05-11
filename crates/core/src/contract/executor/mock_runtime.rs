@@ -41,7 +41,7 @@ impl Executor<MockRuntime> {
         _req: ClientRequest<'_>,
         _updates: Option<mpsc::UnboundedSender<Result<HostResponse, WsClientError>>>,
     ) -> Response {
-        unreachable!()
+        unreachable!("MockRuntime does not handle client requests directly")
     }
 }
 
@@ -105,7 +105,7 @@ impl ContractExecutor for Executor<MockRuntime> {
                     .map_err(ExecutorError::other)?;
                 Ok(UpsertResult::Updated(incoming_state))
             }
-            (update, contract) => unreachable!("{update:?}, {contract:?}"),
+            (update, contract) => unreachable!("Invalid combination of state/delta and contract presence: {update:?}, {contract:?}"),
         }
     }
 

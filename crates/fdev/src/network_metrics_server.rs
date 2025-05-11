@@ -255,6 +255,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                         *contract_location,
                     )
                 }
+
                 Change::GetContract {
                     requester,
                     transaction,
@@ -291,6 +292,61 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                         at_peer,
                         *at_peer_location,
                         *timestamp,
+                    )
+                }
+
+                Change::UpdateRequest {
+                    tx_id,
+                    key,
+                    requester,
+                    target,
+                    timestamp,
+                    contract_location,
+                } => {
+                    tracing::info!("sending update request");
+                    ContractChange::update_request_msg(
+                        tx_id.clone(),
+                        key,
+                        requester,
+                        target,
+                        *timestamp,
+                        *contract_location,
+                    )
+                }
+                Change::UpdateSuccess {
+                    tx_id,
+                    key,
+                    requester,
+                    target,
+                    timestamp,
+                    contract_location,
+                } => {
+                    tracing::info!("sending update success");
+                    ContractChange::update_success_msg(
+                        tx_id.clone(),
+                        key,
+                        requester,
+                        target,
+                        *timestamp,
+                        *contract_location,
+                    )
+                }
+                Change::UpdateFailure {
+                    tx_id,
+                    key,
+                    requester,
+                    target,
+                    timestamp,
+                    contract_location,
+                } => {
+                    tracing::info!("sending update failure");
+                    ContractChange::update_failure_msg(
+                        tx_id.clone(),
+                        key,
+                        requester,
+                        target,
+                        *timestamp,
+                        *contract_location,
                     )
                 }
 
@@ -435,6 +491,60 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                 );
                 tx.send(Message::Binary(msg)).await?;
             }
+            Change::UpdateRequest {
+                tx_id,
+                key,
+                requester,
+                target,
+                timestamp,
+                contract_location,
+            } => {
+                let msg = ContractChange::update_request_msg(
+                    tx_id,
+                    key,
+                    requester,
+                    target,
+                    timestamp,
+                    contract_location,
+                );
+                tx.send(Message::Binary(msg)).await?;
+            }
+            Change::UpdateSuccess {
+                tx_id,
+                key,
+                requester,
+                target,
+                timestamp,
+                contract_location,
+            } => {
+                let msg = ContractChange::update_success_msg(
+                    tx_id,
+                    key,
+                    requester,
+                    target,
+                    timestamp,
+                    contract_location,
+                );
+                tx.send(Message::Binary(msg)).await?;
+            }
+            Change::UpdateFailure {
+                tx_id,
+                key,
+                requester,
+                target,
+                timestamp,
+                contract_location,
+            } => {
+                let msg = ContractChange::update_failure_msg(
+                    tx_id,
+                    key,
+                    requester,
+                    target,
+                    timestamp,
+                    contract_location,
+                );
+                tx.send(Message::Binary(msg)).await?;
+            }
         }
     }
     Ok(())
@@ -522,6 +632,30 @@ pub(crate) enum Change {
         at_peer: String,
         at_peer_location: f64,
         timestamp: u64,
+    },
+    UpdateRequest {
+        tx_id: String,
+        key: String,
+        requester: String,
+        target: String,
+        timestamp: u64,
+        contract_location: f64,
+    },
+    UpdateSuccess {
+        tx_id: String,
+        key: String,
+        requester: String,
+        target: String,
+        timestamp: u64,
+        contract_location: f64,
+    },
+    UpdateFailure {
+        tx_id: String,
+        key: String,
+        requester: String,
+        target: String,
+        timestamp: u64,
+        contract_location: f64,
     },
 }
 
@@ -631,8 +765,6 @@ impl ServerState {
 
                 if let Some(_entry) = self.transactions_data.get_mut(&tx_id) {
                     tracing::error!("this tx should not be included on transactions_data");
-
-                    unreachable!();
                 } else {
                     self.transactions_data.insert(
                         tx_id.clone(),
@@ -696,7 +828,6 @@ impl ServerState {
                     dashmap::mapref::entry::Entry::Vacant(_vac) => {
                         // this should not happen
                         tracing::error!("this tx should be included on transactions_data. It should exists a PutRequest before the PutSuccess.");
-                        unreachable!();
                     }
                 }
 
@@ -834,17 +965,8 @@ impl ServerState {
                         //connections.dedup();
                     }
                     dashmap::mapref::entry::Entry::Vacant(_vac) => {
-                        self.transactions_data.insert(
-                            tx_id.clone(),
-                            vec![Change::BroadcastReceived {
-                                tx_id: tx_id.clone(),
-                                key: key.clone(),
-                                requester: requester.clone(),
-                                target: target.clone(),
-                                timestamp,
-                                contract_location,
-                            }],
-                        );
+                        // this should not happen
+                        tracing::error!("this tx should be included on transactions_data. It should exists a PutRequest before BroadcastReceived.");
                     }
                 }
 
@@ -859,6 +981,7 @@ impl ServerState {
                     contract_location,
                 });
             }
+
             ChangesWrapper::ContractChange(ContractChange::GetContract(get_contract_data)) => {
                 let requester = get_contract_data.requester().to_string();
                 let transaction = get_contract_data.transaction().to_string();
@@ -995,6 +1118,181 @@ impl ServerState {
                     at_peer,
                     at_peer_location,
                     timestamp,
+                });
+            }
+
+            ChangesWrapper::ContractChange(ContractChange::UpdateRequest(update_request)) => {
+                let tx_id = update_request.transaction().to_string();
+                let key = update_request.key().to_string();
+                let requester = update_request.requester().to_string();
+                let target = update_request.target().to_string();
+                let timestamp = update_request.timestamp();
+                let contract_location = update_request.contract_location();
+
+                if tx_id.is_empty() {
+                    return Err(anyhow::anyhow!("tx_id is empty"));
+                }
+
+                if key.is_empty() {
+                    return Err(anyhow::anyhow!("key is empty"));
+                }
+
+                if requester.is_empty() {
+                    return Err(anyhow::anyhow!("requester is empty"));
+                }
+
+                if target.is_empty() {
+                    return Err(anyhow::anyhow!("target is empty"));
+                }
+
+                if let Some(mut transactions) = self.transactions_data.get_mut(&tx_id) {
+                    transactions.push(Change::UpdateRequest {
+                        tx_id: tx_id.clone(),
+                        requester: requester.clone(),
+                        key: key.clone(),
+                        contract_location,
+                        timestamp,
+                        target: target.clone(),
+                    });
+                } else {
+                    self.transactions_data.insert(
+                        tx_id.clone(),
+                        vec![Change::UpdateRequest {
+                            tx_id: tx_id.clone(),
+                            requester: requester.clone(),
+                            key: key.clone(),
+                            contract_location,
+                            timestamp,
+                            target: target.clone(),
+                        }],
+                    );
+                }
+
+                tracing::debug!(%tx_id, %key, %requester, %target, "checking values from save_record -- updaterequest");
+
+                let _ = self.changes.send(Change::UpdateRequest {
+                    tx_id,
+                    key,
+                    requester,
+                    target,
+                    timestamp,
+                    contract_location,
+                });
+            }
+            ChangesWrapper::ContractChange(ContractChange::UpdateSuccess(update_success)) => {
+                let tx_id = update_success.transaction().to_string();
+                let key = update_success.key().to_string();
+                let requester = update_success.requester().to_string();
+                let target = update_success.target().to_string();
+                let timestamp = update_success.timestamp();
+                let contract_location = update_success.contract_location();
+
+                if tx_id.is_empty() {
+                    return Err(anyhow::anyhow!("tx_id is empty"));
+                }
+
+                if key.is_empty() {
+                    return Err(anyhow::anyhow!("key is empty"));
+                }
+
+                if requester.is_empty() {
+                    return Err(anyhow::anyhow!("requester is empty"));
+                }
+
+                if target.is_empty() {
+                    return Err(anyhow::anyhow!("target is empty"));
+                }
+
+                if let Some(mut transactions) = self.transactions_data.get_mut(&tx_id) {
+                    transactions.push(Change::UpdateSuccess {
+                        tx_id: tx_id.clone(),
+                        requester: requester.clone(),
+                        key: key.clone(),
+                        contract_location,
+                        timestamp,
+                        target: target.clone(),
+                    });
+                } else {
+                    self.transactions_data.insert(
+                        tx_id.clone(),
+                        vec![Change::UpdateSuccess {
+                            tx_id: tx_id.clone(),
+                            requester: requester.clone(),
+                            key: key.clone(),
+                            contract_location,
+                            timestamp,
+                            target: target.clone(),
+                        }],
+                    );
+                }
+
+                tracing::debug!(%tx_id, %key, %requester, %target, "checking values from save_record -- updatesuccess");
+
+                let _ = self.changes.send(Change::UpdateSuccess {
+                    tx_id,
+                    key,
+                    requester,
+                    target,
+                    timestamp,
+                    contract_location,
+                });
+            }
+            ChangesWrapper::ContractChange(ContractChange::UpdateFailure(update_failure)) => {
+                let tx_id = update_failure.transaction().to_string();
+                let key = update_failure.key().to_string();
+                let requester = update_failure.requester().to_string();
+                let target = update_failure.target().to_string();
+                let timestamp = update_failure.timestamp();
+                let contract_location = update_failure.contract_location();
+
+                if tx_id.is_empty() {
+                    return Err(anyhow::anyhow!("tx_id is empty"));
+                }
+
+                if key.is_empty() {
+                    return Err(anyhow::anyhow!("key is empty"));
+                }
+
+                if requester.is_empty() {
+                    return Err(anyhow::anyhow!("requester is empty"));
+                }
+
+                if target.is_empty() {
+                    return Err(anyhow::anyhow!("target is empty"));
+                }
+
+                if let Some(mut transactions) = self.transactions_data.get_mut(&tx_id) {
+                    transactions.push(Change::UpdateFailure {
+                        tx_id: tx_id.clone(),
+                        requester: requester.clone(),
+                        key: key.clone(),
+                        contract_location,
+                        timestamp,
+                        target: target.clone(),
+                    });
+                } else {
+                    self.transactions_data.insert(
+                        tx_id.clone(),
+                        vec![Change::UpdateFailure {
+                            tx_id: tx_id.clone(),
+                            requester: requester.clone(),
+                            key: key.clone(),
+                            contract_location,
+                            timestamp,
+                            target: target.clone(),
+                        }],
+                    );
+                }
+
+                tracing::debug!(%tx_id, %key, %requester, %target, "checking values from save_record -- updatefailure");
+
+                let _ = self.changes.send(Change::UpdateFailure {
+                    tx_id,
+                    key,
+                    requester,
+                    target,
+                    timestamp,
+                    contract_location,
                 });
             }
 

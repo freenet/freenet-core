@@ -941,7 +941,7 @@ async fn peer_connection_listener(
                                 break Err(TransportError::ConnectionClosed(conn.remote_addr()));
                             }
                             other => {
-                                unreachable!("Unexpected action: {:?}", other);
+                                unreachable!("Unexpected action from peer_connection_listener channel: {:?}", other);
                             }
                         }
                     }

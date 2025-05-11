@@ -233,7 +233,7 @@ where
             }
             res = results.next(), if !results.is_empty() => {
                 let Some(f_res) = res else {
-                    unreachable!();
+                    unreachable!("results.next() should only return None if results is empty, which is guarded against");
                 };
                 match f_res {
                     (cli_id, Ok(Some(res))) => {
@@ -592,14 +592,14 @@ async fn process_open_request(
                 })));
             }
             ClientRequest::Disconnect { .. } => {
-                unreachable!();
+                tracing::debug!("Received disconnect from user event");
             }
             ClientRequest::NodeQueries(_) => {
                 tracing::debug!("Received node queries from user event");
 
                 let Some(tx) = callback_tx else {
                     tracing::error!("callback_tx not available for NodeQueries");
-                    unreachable!();
+                    unreachable!("callback_tx should always be Some for NodeQueries based on initialization logic");
                 };
 
                 if let Err(err) = op_manager
@@ -1041,7 +1041,9 @@ pub(crate) mod test {
                         };
                         return Some(request.into());
                     }
-                    _ => unreachable!(),
+                    _ => unreachable!(
+                        "gen_range(0..100) should always fall into one of the defined ranges"
+                    ),
                 }
             }
             None

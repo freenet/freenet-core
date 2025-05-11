@@ -113,7 +113,7 @@ where
                         ContractHandlerEvent::PutResponse {
                             new_value: Err(err),
                         }
-                    }
+                    } // UpsertResult::NotAvailable is not used in this path
                 };
 
                 contract_handler
@@ -228,7 +228,7 @@ where
                         tracing::debug!(%error, "shutting down contract handler");
                     })?;
             }
-            _ => unreachable!(),
+            _ => unreachable!("ContractHandlerEvent enum should be exhaustive here"),
         }
     }
 }
