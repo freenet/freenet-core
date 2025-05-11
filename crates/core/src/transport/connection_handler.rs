@@ -16,8 +16,7 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
     Future, FutureExt, TryFutureExt,
 };
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use std::hash::{Hash, Hasher};
 use tokio::{
     net::UdpSocket,
     sync::{mpsc, oneshot},
@@ -921,10 +920,15 @@ fn key_from_addr(addr: &SocketAddr) -> [u8; 16] {
     
     // Use a deterministic value based on the current process ID and thread ID
     // This ensures thread safety while still providing sufficient entropy
+    use std::collections::hash_map::DefaultHasher;
+    
     let pid = std::process::id().to_le_bytes();
-    let tid = std::thread::current().id().as_u64().unwrap_or(0).to_le_bytes();
+    let mut hasher = DefaultHasher::new();
+    std::thread::current().id().hash(&mut hasher);
+    let tid_hash = hasher.finish().to_le_bytes();
+    
     hasher.update(&pid);
-    hasher.update(&tid);
+    hasher.update(&tid_hash);
     hasher.finalize().as_bytes()[..16].try_into().unwrap()
 }
 
