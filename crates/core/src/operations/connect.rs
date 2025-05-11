@@ -711,17 +711,9 @@ pub(crate) async fn initial_join_procedure(
                 }
                 
                 let mut shuffled_gateways: Vec<_> = available_gateways.into_iter().collect();
-                let seed = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                
-                if !shuffled_gateways.is_empty() {
-                    for i in (1..shuffled_gateways.len()).rev() {
-                        let j = ((seed + i as u64) % (i + 1) as u64) as usize;
-                        shuffled_gateways.swap(i, j);
-                    }
-                }
+                use rand::seq::SliceRandom;
+                let mut rng = rand::thread_rng();
+                shuffled_gateways.shuffle(&mut rng);
                 
                 let mut connected = false;
                 for gateway in &shuffled_gateways {
