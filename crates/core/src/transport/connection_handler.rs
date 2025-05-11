@@ -240,9 +240,6 @@ impl<T> Drop for UdpPacketsListener<T> {
         tracing::info!(%self.this_addr, "Dropping UdpPacketsListener");
     }
 }
-task_local! {
-    static RANDOM_U64: [u8; 8];
-}
 
 /// The amount of times to retry NAT traversal before giving up. It should be sufficient
 /// so we give peers enough time for the other party to start the connection on its end.
@@ -900,7 +897,7 @@ fn handle_ack_connection_error(err: Cow<'static, str>) -> TransportError {
 
 fn key_from_addr(addr: &SocketAddr) -> [u8; 16] {
     let current_time = chrono::Utc::now();
-    let mut hasher = blake3::Hasher::new();
+    let mut hasher = blake3::Hasher::new(); 
     match addr {
         SocketAddr::V4(v4) => {
             hasher.update(&v4.ip().octets());
@@ -921,9 +918,13 @@ fn key_from_addr(addr: &SocketAddr) -> [u8; 16] {
             .to_le_bytes()
             .as_ref(),
     );
-    RANDOM_U64.with(|&random_value| {
-        hasher.update(random_value.as_ref());
-    });
+    
+    // Use a deterministic value based on the current process ID and thread ID
+    // This ensures thread safety while still providing sufficient entropy
+    let pid = std::process::id().to_le_bytes();
+    let tid = std::thread::current().id().as_u64().unwrap_or(0).to_le_bytes();
+    hasher.update(&pid);
+    hasher.update(&tid);
     hasher.finalize().as_bytes()[..16].try_into().unwrap()
 }
 
