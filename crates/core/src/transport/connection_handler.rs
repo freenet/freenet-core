@@ -21,7 +21,7 @@ use rand::{Rng, SeedableRng};
 use tokio::{
     net::UdpSocket,
     sync::{mpsc, oneshot},
-    task, task_local,
+    task,
 };
 use tracing::{span, Instrument};
 use version_cmp::PROTOC_VERSION;
@@ -149,7 +149,7 @@ impl OutboundConnectionHandler {
         };
 
         task::spawn(bw_tracker.rate_limiter(bandwith_limit, socket));
-        task::spawn(RANDOM_U64.scope(StdRng::from_entropy().gen(), transport.listen()));
+        task::spawn(transport.listen());
 
         Ok((connection_handler, new_connection_notifier))
     }
