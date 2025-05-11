@@ -38,6 +38,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: success() || steps.test.conclusion == 'failure'
         with:
+          shared-key: "rust-cache"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install stdlib packages
@@ -80,6 +81,9 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "rust-cache"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build
         run: |
