@@ -696,26 +696,54 @@ pub(crate) async fn initial_join_procedure(
         loop {
             if op_manager.ring.open_connections() == 0 {
                 tracing::info!(
-                    "Attempting to connect to {} gateways in parallel",
+                    "Attempting to connect to gateways with failover support",
                     number_of_parallel_connections
                 );
-                for gateway in op_manager
+                
+                let available_gateways: Vec<_> = op_manager
                     .ring
                     .is_not_connected(gateways.iter())
-                    .shuffle()
-                    .take(number_of_parallel_connections)
-                {
+                    .collect();
+                
+                if available_gateways.is_empty() {
+                    tracing::warn!("No available gateways to connect to");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+                
+                let mut shuffled_gateways: Vec<_> = available_gateways.into_iter().collect();
+                use rand::seq::SliceRandom;
+                let mut rng = rand::thread_rng();
+                shuffled_gateways.shuffle(&mut rng);
+                
+                let mut connected = false;
+                for gateway in &shuffled_gateways {
                     tracing::info!(%gateway, "Attempting connection to gateway");
-                    if let Err(error) = join_ring_request(None, gateway, &op_manager).await {
-                        if !matches!(
-                            error,
-                            OpError::ConnError(crate::node::ConnectionError::UnwantedConnection)
-                        ) {
-                            tracing::error!(%error, "Failed while attempting connection to gateway");
+                    match join_ring_request(None, gateway.clone(), &op_manager).await {
+                        Ok(_) => {
+                            tracing::info!(%gateway, "Successfully connected to gateway");
+                            connected = true;
+                            break;
+                        }
+                        Err(error) => {
+                            if matches!(
+                                error,
+                                OpError::ConnError(crate::node::ConnectionError::UnwantedConnection)
+                            ) {
+                                tracing::info!(%gateway, "Gateway connection not wanted, trying next gateway");
+                            } else {
+                                tracing::error!(%error, %gateway, "Failed to connect to gateway, trying next gateway");
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                     }
                 }
+                
+                if !connected && !shuffled_gateways.is_empty() {
+                    tracing::warn!("Failed to connect to any gateway, will retry after delay");
+                }
             }
+            
             #[cfg(debug_assertions)]
             const WAIT_TIME: u64 = 15;
             #[cfg(not(debug_assertions))]
