@@ -33,9 +33,12 @@ impl PingStats {
         self.sent_count += 1;
     }
 
-    pub fn record_received(&mut self, peer: String, time: DateTime<Utc>) {
+    pub fn record_received(&mut self, peer: String, time: Vec<DateTime<Utc>>) {
         *self.received_counts.entry(peer.clone()).or_insert(0) += 1;
-        self.last_updates.insert(peer, time);
+        // Use the most recent timestamp (first element since they're sorted newest first)
+        if let Some(latest) = time.first() {
+            self.last_updates.insert(peer, *latest);
+        }
     }
 }
 
@@ -218,9 +221,14 @@ pub async fn run_ping_client(
 
                                         let updates = local_state.merge(new_ping, parameters.ttl);
 
-                                        for (name, update_time) in updates.into_iter() {
-                                            tracing::info!("{} last updated at {}", name, update_time);
-                                            stats.record_received(name, update_time);
+                                        for (name, timestamps) in updates.into_iter() {
+                                            if !timestamps.is_empty() {
+                                                // Use the newest timestamp for logging
+                                                if let Some(last) = timestamps.first() {
+                                                    tracing::info!("{} last updated at {}", name, last);
+                                                }
+                                                stats.record_received(name, timestamps);
+                                            }
                                         }
                                         Ok(())
                                     };
