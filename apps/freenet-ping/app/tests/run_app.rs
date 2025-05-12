@@ -346,7 +346,6 @@ async fn test_ping_multi_node() -> TestResult {
             .map_err(anyhow::Error::msg)?;
         tracing::info!("Node 2: subscribed successfully!");
 
-
         let mut gw_local_state = Ping::default();
         let mut node1_local_state = Ping::default();
         let mut node2_local_state = Ping::default();
@@ -409,7 +408,8 @@ async fn test_ping_multi_node() -> TestResult {
         let get_all_states = |client_gw: &mut WebApi,
                               client_node1: &mut WebApi,
                               client_node2: &mut WebApi,
-                              key: ContractKey| -> BoxFuture<'_, anyhow::Result<(Ping, Ping, Ping)>> {
+                              key: ContractKey|
+         -> BoxFuture<'_, anyhow::Result<(Ping, Ping, Ping)>> {
             Box::pin(async move {
                 tracing::info!("Querying all nodes for current state...");
 
@@ -467,9 +467,13 @@ async fn test_ping_multi_node() -> TestResult {
             })
         };
 
-        let (final_state_gw, final_state_node1, final_state_node2) =
-            get_all_states(&mut client_gw, &mut client_node1, &mut client_node2, contract_key)
-                .await?;
+        let (final_state_gw, final_state_node1, final_state_node2) = get_all_states(
+            &mut client_gw,
+            &mut client_node1,
+            &mut client_node2,
+            contract_key,
+        )
+        .await?;
 
         let tags = vec![gw_tag.clone(), node1_tag.clone(), node2_tag.clone()];
         let all_tags_present = verify_all_tags_present(
