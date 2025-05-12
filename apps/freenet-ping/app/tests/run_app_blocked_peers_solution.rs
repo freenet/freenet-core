@@ -1,24 +1,38 @@
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    net::{Ipv4Addr, SocketAddr, TcpListener},
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
+use anyhow::{anyhow, Result};
+use freenet::{
+    config::{ConfigArgs, InlineGwConfig, NetworkArgs, SecretArgs, WebsocketApiArgs},
+    dev_tool::TransportKeypair,
+    local_node::NodeConfig,
+    server::serve_gateway,
+};
+use freenet_ping_types::Ping;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{
+        ClientRequest, ContractRequest, ContractResponse, HostResponse, UpdateData, WebApi,
+    },
     prelude::*,
 };
 use futures::future::BoxFuture;
-use rand::{Rng, SeedableRng};
+use rand::{random, Rng, SeedableRng};
 use testresult::TestResult;
 use tokio::{
     select,
     sync::{mpsc, Mutex},
     time::sleep,
 };
-use tracing::{info, span, warn, Instrument, Level};
+use tokio_tungstenite::connect_async;
+use tracing::{span, Instrument, Level};
 use tracing_subscriber::EnvFilter;
 
-use freenet_ping_app::{
-    ping_client::{wait_for_put_response, wait_for_subscribe_response},
-    ping_contract::Ping,
+use freenet_ping_app::ping_client::{
+    wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
 };
 
 const MAX_UPDATE_RETRIES: usize = 5;
@@ -28,13 +42,88 @@ const BASE_DELAY_MS: u64 = 500;
 const MAX_TEST_DURATION_SECS: u64 = 180;
 
 #[derive(Debug, Clone)]
+struct PresetConfig {
+    temp_dir: tempfile::TempDir,
+}
+
+async fn base_node_test_config(
+    is_gateway: bool,
+    gateways: Vec<String>,
+    public_port: Option<u16>,
+    ws_api_port: u16,
+    blocked_addresses: Option<Vec<SocketAddr>>,
+) -> anyhow::Result<(ConfigArgs, PresetConfig)> {
+    if is_gateway {
+        assert!(public_port.is_some());
+    }
+
+    let temp_dir = tempfile::tempdir()?;
+    let key = TransportKeypair::new_with_rng(&mut *RNG.lock().unwrap());
+    let transport_keypair = temp_dir.path().join("private.pem");
+    key.save(&transport_keypair)?;
+    key.public().save(temp_dir.path().join("public.pem"))?;
+    let config = ConfigArgs {
+        ws_api: WebsocketApiArgs {
+            address: Some(Ipv4Addr::LOCALHOST.into()),
+            ws_api_port: Some(ws_api_port),
+        },
+        network_api: NetworkArgs {
+            public_address: Some(Ipv4Addr::LOCALHOST.into()),
+            public_port,
+            is_gateway,
+            skip_load_from_network: true,
+            gateways: Some(gateways),
+            location: Some(RNG.lock().unwrap().gen()),
+            ignore_protocol_checking: true,
+            address: Some(Ipv4Addr::LOCALHOST.into()),
+            network_port: public_port,
+            bandwidth_limit: None,
+            blocked_addresses,
+        },
+        config_paths: {
+            freenet::config::ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+            }
+        },
+        secrets: SecretArgs {
+            transport_keypair: Some(transport_keypair),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    Ok((config, PresetConfig { temp_dir }))
+}
+
+fn gw_config(port: u16, path: &std::path::Path) -> anyhow::Result<InlineGwConfig> {
+    Ok(InlineGwConfig {
+        address: (Ipv4Addr::LOCALHOST, port).into(),
+        location: Some(random()),
+        public_key_path: path.join("public.pem"),
+    })
+}
+
+static RNG: once_cell::sync::Lazy<std::sync::Mutex<rand::rngs::StdRng>> =
+    once_cell::sync::Lazy::new(|| {
+        std::sync::Mutex::new(rand::rngs::StdRng::from_seed(
+            *b"0102030405060708090a0b0c0d0e0f10",
+        ))
+    });
+
+const PACKAGE_DIR: &str = env!("CARGO_MANIFEST_DIR");
+const PATH_TO_CONTRACT: &str = "../contracts/ping/build/freenet/freenet_ping_contract";
+const APP_TAG: &str = "ping-app";
+const MAX_UPDATE_RETRIES: u32 = 5;
+const BASE_DELAY_MS: u64 = 500;
+const MAX_TEST_DURATION_SECS: u64 = 300;
+
 struct LogEntry {
     timestamp: std::time::SystemTime,
     source: String,
     message: String,
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_ping_blocked_peers_solution() -> TestResult {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new("debug,freenet::operations::subscribe=trace,freenet::contract=trace,freenet::operations::update=trace")
@@ -94,58 +183,99 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
         let node1_dir = tempfile::tempdir_in(temp_dir.path())?;
         let node2_dir = tempfile::tempdir_in(temp_dir.path())?;
 
-        log_gateway("Starting gateway node".to_string());
-        let gateway_node = freenet::start_with_config(
-            freenet::Config::default()
-                .with_ws_api_port(ws_port_gw)
-                .with_network_port(network_port_gw)
-                .with_data_dir(gw_dir.path())
-                .with_bootstrap_peers(vec![])
-                .with_gateway_peers(vec![]),
+        let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
+        let gw_network_port = network_socket_gw.local_addr()?.port();
+        let gw_network_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), gw_network_port);
+
+        let ws_api_port_socket_gw = TcpListener::bind("127.0.0.1:0")?;
+        let ws_api_port_socket_node1 = TcpListener::bind("127.0.0.1:0")?;
+        let ws_api_port_socket_node2 = TcpListener::bind("127.0.0.1:0")?;
+
+        let network_socket_node1 = TcpListener::bind("127.0.0.1:0")?;
+        let node1_network_port = network_socket_node1.local_addr()?.port();
+        let node1_network_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), node1_network_port);
+
+        let network_socket_node2 = TcpListener::bind("127.0.0.1:0")?;
+        let node2_network_port = network_socket_node2.local_addr()?.port();
+        let node2_network_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), node2_network_port);
+
+        log_gateway(format!("Gateway node port: {}", gw_network_port));
+        log_node1(format!("Node 1 port: {}", node1_network_port));
+        log_node2(format!("Node 2 port: {}", node2_network_port));
+        log_node1(format!("Node 1 blocks: {:?}", node2_network_addr));
+        log_node2(format!("Node 2 blocks: {:?}", node1_network_addr));
+
+        let (config_gw, preset_cfg_gw, config_gw_info) = {
+            let (cfg, preset) = base_node_test_config(
+                true,
+                vec![],
+                Some(gw_network_port),
+                ws_api_port_socket_gw.local_addr()?.port(),
+                None, // Gateway doesn't block any peers
+            )
+            .await?;
+            let public_port = cfg.network_api.public_port.unwrap();
+            let path = preset.temp_dir.path().to_path_buf();
+            (cfg, preset, gw_config(public_port, &path)?)
+        };
+        let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
+
+        let (config_node1, preset_cfg_node1) = base_node_test_config(
+            false,
+            vec![serde_json::to_string(&config_gw_info)?],
+            Some(node1_network_port),
+            ws_api_port_socket_node1.local_addr()?.port(),
+            Some(vec![node2_network_addr]), // Node1 blocks Node2
         )
         .await?;
+        let ws_api_port_node1 = config_node1.ws_api.ws_api_port.unwrap();
 
-        let gateway_peer_id = gateway_node.peer_id().await?;
-        log_gateway(format!(
-            "Gateway node started with peer ID: {}",
-            gateway_peer_id
-        ));
-
-        log_node1("Starting node1".to_string());
-        let node1 = freenet::start_with_config(
-            freenet::Config::default()
-                .with_ws_api_port(ws_port_node1)
-                .with_network_port(network_port_node1)
-                .with_data_dir(node1_dir.path())
-                .with_bootstrap_peers(vec![])
-                .with_gateway_peers(vec![format!(
-                    "127.0.0.1:{}:{}",
-                    network_port_gw, gateway_peer_id
-                )])
-                .with_blocked_peers(vec![]),
+        let (config_node2, preset_cfg_node2) = base_node_test_config(
+            false,
+            vec![serde_json::to_string(&config_gw_info)?],
+            Some(node2_network_port),
+            ws_api_port_socket_node2.local_addr()?.port(),
+            Some(vec![node1_network_addr]), // Node2 blocks Node1
         )
         .await?;
+        let ws_api_port_node2 = config_node2.ws_api.ws_api_port.unwrap();
 
-        let node1_peer_id = node1.peer_id().await?;
-        log_node1(format!("Node1 started with peer ID: {}", node1_peer_id));
+        std::mem::drop(network_socket_gw);
+        std::mem::drop(network_socket_node1);
+        std::mem::drop(network_socket_node2);
+        std::mem::drop(ws_api_port_socket_gw);
+        std::mem::drop(ws_api_port_socket_node1);
+        std::mem::drop(ws_api_port_socket_node2);
 
-        log_node2("Starting node2".to_string());
-        let node2 = freenet::start_with_config(
-            freenet::Config::default()
-                .with_ws_api_port(ws_port_node2)
-                .with_network_port(network_port_node2)
-                .with_data_dir(node2_dir.path())
-                .with_bootstrap_peers(vec![])
-                .with_gateway_peers(vec![format!(
-                    "127.0.0.1:{}:{}",
-                    network_port_gw, gateway_peer_id
-                )])
-                .with_blocked_peers(vec![node1_peer_id.clone()]),
-        )
-        .await?;
+        let gateway_node = async {
+            let config = config_gw.build().await?;
+            let node = NodeConfig::new(config.clone())
+                .await?
+                .build(serve_gateway(config.ws_api).await)
+                .await?;
+            node.run().await
+        }
+        .boxed_local();
 
-        let node2_peer_id = node2.peer_id().await?;
-        log_node2(format!("Node2 started with peer ID: {}", node2_peer_id));
+        let node1 = async move {
+            let config = config_node1.build().await?;
+            let node = NodeConfig::new(config.clone())
+                .await?
+                .build(serve_gateway(config.ws_api).await)
+                .await?;
+            node.run().await
+        }
+        .boxed_local();
+
+        let node2 = async {
+            let config = config_node2.build().await?;
+            let node = NodeConfig::new(config.clone())
+                .await?
+                .build(serve_gateway(config.ws_api).await)
+                .await?;
+            node.run().await
+        }
+        .boxed_local();
 
         log_node1(format!("Updating node1 to block node2: {}", node2_peer_id));
         node1
@@ -155,9 +285,30 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
         log_gateway("Waiting for nodes to connect to the gateway".to_string());
         sleep(Duration::from_secs(5)).await;
 
-        let client_gw = WebApi::connect(format!("ws://127.0.0.1:{}", ws_port_gw)).await?;
-        let client_node1 = WebApi::connect(format!("ws://127.0.0.1:{}", ws_port_node1)).await?;
-        let client_node2 = WebApi::connect(format!("ws://127.0.0.1:{}", ws_port_node2)).await?;
+        let uri_gw = format!(
+            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+            ws_api_port_gw
+        );
+        let uri_node1 = format!(
+            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+            ws_api_port_node1
+        );
+        let uri_node2 = format!(
+            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+            ws_api_port_node2
+        );
+
+        log_gateway(format!("Connecting to Gateway at {}", uri_gw));
+        let (stream_gw, _) = connect_async(&uri_gw).await?;
+        let mut client_gw = WebApi::start(stream_gw);
+
+        log_node1(format!("Connecting to Node1 at {}", uri_node1));
+        let (stream_node1, _) = connect_async(&uri_node1).await?;
+        let mut client_node1 = WebApi::start(stream_node1);
+
+        log_node2(format!("Connecting to Node2 at {}", uri_node2));
+        let (stream_node2, _) = connect_async(&uri_node2).await?;
+        let mut client_node2 = WebApi::start(stream_node2);
 
         let client_gw = Arc::new(Mutex::new(client_gw));
         let client_node1 = Arc::new(Mutex::new(client_node1));
@@ -169,25 +320,41 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
         let ping = Ping::default();
         let state = serde_json::to_vec(&ping)?;
 
+        let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
+        log_gateway(format!(
+            "Loading contract code from {}",
+            path_to_code.display()
+        ));
+        let code = std::fs::read(path_to_code)
+            .ok()
+            .ok_or_else(|| anyhow!("Failed to read contract code"))?;
+        let code_hash = CodeHash::from_code(&code);
+        log_gateway(format!("Loaded contract code with hash: {}", code_hash));
+
+        let ping = Ping::default();
+        let serialized = serde_json::to_vec(&ping)?;
+        let wrapped_state = WrappedState::new(serialized);
+        let params = Parameters::default();
+        let container = ContractContainer::try_from((code, &params))?;
+        let contract_key = container.key();
+
+        log_gateway(format!(
+            "Deploying ping contract with key: {}",
+            contract_key
+        ));
+
         client_gw_lock
-            .send(ClientRequest::ContractOp {
-                key: None,
-                request: ContractRequest {
-                    return_contract_code: false,
-                    subscribe: true,
-                    op: Some(state),
-                },
-            })
+            .send(ClientRequest::ContractOp(ContractRequest::Put {
+                contract: container.clone(),
+                state: wrapped_state.clone(),
+                related_contracts: RelatedContracts::new(),
+                subscribe: false,
+            }))
             .await?;
 
-        let response = client_gw_lock.recv().await?;
-        let key = if let HostResponse::ContractResponse(ContractResponse::PutResponse { key }) =
-            response
-        {
-            key
-        } else {
-            return Err("Failed to deploy ping contract".into());
-        };
+        let key = wait_for_put_response(&mut client_gw_lock, &contract_key)
+            .await
+            .map_err(anyhow::Error::msg)?;
 
         log_gateway(format!("Ping contract deployed with key: {}", key));
         drop(client_gw_lock);
@@ -195,32 +362,24 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
         log_node1(format!("Subscribing node1 to the contract: {}", key));
         let mut client_node1_lock = client_node1.lock().await;
         client_node1_lock
-            .send(ClientRequest::ContractOp {
-                key: Some(key),
-                request: ContractRequest {
-                    return_contract_code: false,
-                    subscribe: true,
-                    op: None,
-                },
-            })
+            .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
+                key: contract_key,
+                summary: None,
+            }))
             .await?;
-        let response = wait_for_subscribe_response(&mut client_node1_lock, &key).await?;
+        let response = wait_for_subscribe_response(&mut client_node1_lock, &contract_key).await?;
         log_node1(format!("Node1 subscription response: {:?}", response));
         drop(client_node1_lock);
 
         log_node2(format!("Subscribing node2 to the contract: {}", key));
         let mut client_node2_lock = client_node2.lock().await;
         client_node2_lock
-            .send(ClientRequest::ContractOp {
-                key: Some(key),
-                request: ContractRequest {
-                    return_contract_code: false,
-                    subscribe: true,
-                    op: None,
-                },
-            })
+            .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
+                key: contract_key,
+                summary: None,
+            }))
             .await?;
-        let response = wait_for_subscribe_response(&mut client_node2_lock, &key).await?;
+        let response = wait_for_subscribe_response(&mut client_node2_lock, &contract_key).await?;
         log_node2(format!("Node2 subscription response: {:?}", response));
         drop(client_node2_lock);
 
@@ -245,14 +404,11 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                 let gw_state_future = tokio::spawn(async move {
                     let mut client = client_gw_clone.lock().await;
                     let response = client
-                        .send(ClientRequest::ContractOp {
-                            key: Some(key),
-                            request: ContractRequest {
-                                return_contract_code: false,
-                                subscribe: false,
-                                op: None,
-                            },
-                        })
+                        .send(ClientRequest::ContractOp(ContractRequest::Get {
+                            key,
+                            return_contract_code: false,
+                            subscribe: false,
+                        }))
                         .await?;
 
                     if let HostResponse::ContractResponse(ContractResponse::GetResponse {
@@ -270,14 +426,11 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                 let node1_state_future = tokio::spawn(async move {
                     let mut client = client_node1_clone.lock().await;
                     let response = client
-                        .send(ClientRequest::ContractOp {
-                            key: Some(key),
-                            request: ContractRequest {
-                                return_contract_code: false,
-                                subscribe: false,
-                                op: None,
-                            },
-                        })
+                        .send(ClientRequest::ContractOp(ContractRequest::Get {
+                            key,
+                            return_contract_code: false,
+                            subscribe: false,
+                        }))
                         .await?;
 
                     if let HostResponse::ContractResponse(ContractResponse::GetResponse {
@@ -295,14 +448,11 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                 let node2_state_future = tokio::spawn(async move {
                     let mut client = client_node2_clone.lock().await;
                     let response = client
-                        .send(ClientRequest::ContractOp {
-                            key: Some(key),
-                            request: ContractRequest {
-                                return_contract_code: false,
-                                subscribe: false,
-                                op: None,
-                            },
-                        })
+                        .send(ClientRequest::ContractOp(ContractRequest::Get {
+                            key,
+                            return_contract_code: false,
+                            subscribe: false,
+                        }))
                         .await?;
 
                     if let HostResponse::ContractResponse(ContractResponse::GetResponse {
@@ -362,14 +512,10 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                     let state = serde_json::to_vec(&ping)?;
 
                     client_lock
-                        .send(ClientRequest::ContractOp {
-                            key: Some(key),
-                            request: ContractRequest {
-                                return_contract_code: false,
-                                subscribe: false,
-                                op: Some(state),
-                            },
-                        })
+                        .send(ClientRequest::ContractOp(ContractRequest::Update {
+                            key,
+                            data: UpdateData::Full(state),
+                        }))
                         .await?;
 
                     let response = wait_for_put_response(&mut client_lock, &key).await?;
