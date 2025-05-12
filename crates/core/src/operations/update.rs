@@ -543,7 +543,10 @@ async fn try_to_broadcast(
                         sender: sender.clone(),
                         target: peer.clone(),
                     };
-                    let f = conn_manager.send(&peer.peer, msg.into());
+                    let f = op_manager
+                        .ring
+                        .connection_manager
+                        .send(&peer.peer, msg.into());
                     broadcasting.push(f);
                 }
 
