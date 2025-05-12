@@ -23,6 +23,7 @@ use testresult::TestResult;
 use tokio::{
     select,
     sync::{mpsc, Mutex},
+    task::LocalSet,
     time::sleep,
 };
 use tokio_tungstenite::connect_async;
@@ -116,8 +117,9 @@ struct LogEntry {
     message: String,
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_ping_blocked_peers_solution() -> TestResult {
+    let local = LocalSet::new();
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new("debug,freenet::operations::subscribe=trace,freenet::contract=trace,freenet::operations::update=trace")
     });
@@ -243,7 +245,7 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
         std::mem::drop(ws_api_port_socket_node1);
         std::mem::drop(ws_api_port_socket_node2);
 
-        let gateway_node_handle = tokio::spawn(async move {
+        let gateway_node_handle = tokio::task::spawn_local(async move {
             let config = config_gw.build().await?;
             let node = NodeConfig::new(config.clone())
                 .await?
@@ -252,7 +254,7 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
             node.run().await
         });
 
-        let node1_handle = tokio::spawn(async move {
+        let node1_handle = tokio::task::spawn_local(async move {
             let config = config_node1.build().await?;
             let node = NodeConfig::new(config.clone())
                 .await?
@@ -261,7 +263,7 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
             node.run().await
         });
 
-        let node2_handle = tokio::spawn(async move {
+        let node2_handle = tokio::task::spawn_local(async move {
             let config = config_node2.build().await?;
             let node = NodeConfig::new(config.clone())
                 .await?
@@ -688,12 +690,16 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
 
     let instrumented_test = test.instrument(span!(Level::INFO, "test_ping_blocked_peers_solution"));
 
-    let result = select! {
-        result = instrumented_test => result.map_err(|e| e.into()),
-        _ = sleep(Duration::from_secs(MAX_TEST_DURATION_SECS)) => {
-            Err("Test timed out".into())
-        }
-    };
+    let result = local
+        .run_until(async move {
+            select! {
+                result = instrumented_test => result.map_err(|e| e.into()),
+                _ = sleep(Duration::from_secs(MAX_TEST_DURATION_SECS)) => {
+                    Err("Test timed out".into())
+                }
+            }
+        })
+        .await;
 
     let _ = log_task.await;
 
