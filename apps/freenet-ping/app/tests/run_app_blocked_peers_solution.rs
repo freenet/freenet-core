@@ -243,37 +243,37 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
         std::mem::drop(ws_api_port_socket_node1);
         std::mem::drop(ws_api_port_socket_node2);
 
-        let gateway_node = async {
+        let gateway_node_handle = tokio::spawn(async move {
             let config = config_gw.build().await?;
             let node = NodeConfig::new(config.clone())
                 .await?
                 .build(serve_gateway(config.ws_api).await)
                 .await?;
             node.run().await
-        }
-        .boxed_local();
+        });
 
-        let node1 = async move {
+        let node1_handle = tokio::spawn(async move {
             let config = config_node1.build().await?;
             let node = NodeConfig::new(config.clone())
                 .await?
                 .build(serve_gateway(config.ws_api).await)
                 .await?;
             node.run().await
-        }
-        .boxed_local();
+        });
 
-        let node2 = async {
+        let node2_handle = tokio::spawn(async move {
             let config = config_node2.build().await?;
             let node = NodeConfig::new(config.clone())
                 .await?
                 .build(serve_gateway(config.ws_api).await)
                 .await?;
             node.run().await
-        }
-        .boxed_local();
+        });
 
         log_node1(format!("Updating node1 to block node2: {}", node2_peer_id));
+
+        log_gateway("Starting nodes and waiting for them to initialize".to_string());
+        sleep(Duration::from_secs(10)).await;
 
         log_gateway("Waiting for nodes to connect to the gateway".to_string());
         sleep(Duration::from_secs(5)).await;
@@ -675,6 +675,11 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
             node2_update_result.is_ok(),
             "Node2 update failed to propagate"
         );
+
+        log_gateway("Test completed, cleaning up node handles".to_string());
+        gateway_node_handle.abort();
+        node1_handle.abort();
+        node2_handle.abort();
 
         drop(log_tx);
 
