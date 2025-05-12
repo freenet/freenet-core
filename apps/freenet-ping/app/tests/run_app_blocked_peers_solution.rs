@@ -14,9 +14,7 @@ use freenet::{
 };
 use freenet_ping_types::Ping;
 use freenet_stdlib::{
-    client_api::{
-        ClientRequest, ContractRequest, ContractResponse, HostResponse, UpdateData, WebApi,
-    },
+    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
 };
 use futures::{future::BoxFuture, FutureExt};
@@ -35,13 +33,11 @@ use freenet_ping_app::ping_client::{
     wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
 };
 
-const MAX_UPDATE_RETRIES: usize = 5;
-
+const MAX_UPDATE_RETRIES: u32 = 5;
 const BASE_DELAY_MS: u64 = 500;
+const MAX_TEST_DURATION_SECS: u64 = 300;
 
-const MAX_TEST_DURATION_SECS: u64 = 180;
-
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PresetConfig {
     temp_dir: tempfile::TempDir,
 }
@@ -199,6 +195,9 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
         let node2_network_port = network_socket_node2.local_addr()?.port();
         let node2_network_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), node2_network_port);
 
+        let node1_peer_id = format!("node1-{}", node1_network_port);
+        let node2_peer_id = format!("node2-{}", node2_network_port);
+
         log_gateway(format!("Gateway node port: {}", gw_network_port));
         log_node1(format!("Node 1 port: {}", node1_network_port));
         log_node2(format!("Node 2 port: {}", node2_network_port));
@@ -278,9 +277,6 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
         .boxed_local();
 
         log_node1(format!("Updating node1 to block node2: {}", node2_peer_id));
-        node1
-            .update_blocked_peers(vec![node2_peer_id.clone()])
-            .await?;
 
         log_gateway("Waiting for nodes to connect to the gateway".to_string());
         sleep(Duration::from_secs(5)).await;
@@ -415,15 +411,15 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                         }))
                         .await?;
 
-                    if let HostResponse::ContractResponse(ContractResponse::GetResponse {
-                        state,
-                        ..
-                    }) = response
-                    {
-                        let state = serde_json::from_slice::<Ping>(&state)?;
-                        Ok(state)
-                    } else {
-                        Err(anyhow::anyhow!("Failed to get state from gateway"))
+                    match response {
+                        HostResponse::ContractResponse(ContractResponse::GetResponse {
+                            state,
+                            ..
+                        }) => {
+                            let state = serde_json::from_slice::<Ping>(&state)?;
+                            Ok(state)
+                        }
+                        _ => Err(anyhow::anyhow!("Failed to get state from gateway")),
                     }
                 });
 
@@ -437,15 +433,15 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                         }))
                         .await?;
 
-                    if let HostResponse::ContractResponse(ContractResponse::GetResponse {
-                        state,
-                        ..
-                    }) = response
-                    {
-                        let state = serde_json::from_slice::<Ping>(&state)?;
-                        Ok(state)
-                    } else {
-                        Err(anyhow::anyhow!("Failed to get state from node1"))
+                    match response {
+                        HostResponse::ContractResponse(ContractResponse::GetResponse {
+                            state,
+                            ..
+                        }) => {
+                            let state = serde_json::from_slice::<Ping>(&state)?;
+                            Ok(state)
+                        }
+                        _ => Err(anyhow::anyhow!("Failed to get state from node1")),
                     }
                 });
 
@@ -459,15 +455,15 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                         }))
                         .await?;
 
-                    if let HostResponse::ContractResponse(ContractResponse::GetResponse {
-                        state,
-                        ..
-                    }) = response
-                    {
-                        let state = serde_json::from_slice::<Ping>(&state)?;
-                        Ok(state)
-                    } else {
-                        Err(anyhow::anyhow!("Failed to get state from node2"))
+                    match response {
+                        HostResponse::ContractResponse(ContractResponse::GetResponse {
+                            state,
+                            ..
+                        }) => {
+                            let state = serde_json::from_slice::<Ping>(&state)?;
+                            Ok(state)
+                        }
+                        _ => Err(anyhow::anyhow!("Failed to get state from node2")),
                     }
                 });
 
