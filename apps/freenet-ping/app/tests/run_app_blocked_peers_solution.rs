@@ -134,7 +134,7 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
             logs.push(log);
             logs.sort_by_key(|log| log.timestamp);
 
-            if logs.len() > 10 {
+            if logs.len() % 10 == 0 {
                 println!("--- CHRONOLOGICAL LOGS (LAST 10) ---");
                 for log in logs.iter().rev().take(10).rev() {
                     println!(
@@ -147,6 +147,32 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                 println!("----------------------------------");
             }
         }
+
+        println!("\n\n=== COMPLETE CHRONOLOGICAL LOG TRACE ===");
+        println!("Total log entries: {}", logs.len());
+
+        let update_logs: Vec<_> = logs
+            .iter()
+            .filter(|log| {
+                log.message.contains("Update")
+                    || log.message.contains("update")
+                    || log.message.contains("state")
+                    || log.message.contains("propagation")
+                    || log.message.contains("missing")
+            })
+            .collect();
+
+        println!("Update-related log entries: {}", update_logs.len());
+
+        for log in update_logs {
+            println!(
+                "[{}] {}: {}",
+                humantime::format_rfc3339(log.timestamp),
+                log.source,
+                log.message
+            );
+        }
+        println!("=== END OF LOG TRACE ===\n");
     });
 
     let create_logger = |source: String, log_tx: mpsc::Sender<LogEntry>| {
