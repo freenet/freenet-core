@@ -2,7 +2,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr, TcpListener},
     path::PathBuf,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use anyhow::{anyhow, Result};
@@ -147,14 +147,14 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
     });
 
     let create_logger = |source: String, log_tx: mpsc::Sender<LogEntry>| {
-        move |message: String| {
+        Arc::new(move |message: String| {
             let log_entry = LogEntry {
                 timestamp: std::time::SystemTime::now(),
                 source: source.clone(),
                 message,
             };
             let _ = log_tx.try_send(log_entry);
-        }
+        }) as Arc<dyn Fn(String) + Send + Sync>
     };
 
     let test = async {
@@ -387,9 +387,9 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                               client_node1: &Arc<Mutex<WebApi>>,
                               client_node2: &Arc<Mutex<WebApi>>,
                               key: ContractKey,
-                              log_gateway: &dyn Fn(String),
-                              log_node1: &dyn Fn(String),
-                              log_node2: &dyn Fn(String)|
+                              log_gateway: Arc<dyn Fn(String) + Send + Sync>,
+                              log_node1: Arc<dyn Fn(String) + Send + Sync>,
+                              log_node2: Arc<dyn Fn(String) + Send + Sync>|
          -> BoxFuture<'_, anyhow::Result<(Ping, Ping, Ping)>> {
             Box::pin(async move {
                 log_gateway("Querying all nodes for current state...".to_string());
@@ -487,9 +487,9 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                                  key: ContractKey,
                                  name: String,
                                  timestamp: u64,
-                                 log_gateway: &dyn Fn(String),
-                                 log_node1: &dyn Fn(String),
-                                 log_node2: &dyn Fn(String)|
+                                 log_gateway: Arc<dyn Fn(String) + Send + Sync>,
+                                 log_node1: Arc<dyn Fn(String) + Send + Sync>,
+                                 log_node2: Arc<dyn Fn(String) + Send + Sync>|
          -> BoxFuture<'_, anyhow::Result<()>> {
             Box::pin(async move {
                 let logger = match node_name {
@@ -534,9 +534,9 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                         &client_node1,
                         &client_node2,
                         key,
-                        log_gateway,
-                        log_node1,
-                        log_node2,
+                        log_gateway.clone(),
+                        log_node1.clone(),
+                        log_node2.clone(),
                     )
                     .await?;
 
@@ -588,9 +588,9 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
             key,
             "Gateway Update".to_string(),
             42,
-            &log_gateway,
-            &log_node1,
-            &log_node2,
+            log_gateway.clone(),
+            log_node1.clone(),
+            log_node2.clone(),
         )
         .await;
 
@@ -601,9 +601,9 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
             key,
             "Node1 Update".to_string(),
             43,
-            &log_gateway,
-            &log_node1,
-            &log_node2,
+            log_gateway.clone(),
+            log_node1.clone(),
+            log_node2.clone(),
         )
         .await;
 
@@ -614,9 +614,9 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
             key,
             "Node2 Update".to_string(),
             44,
-            &log_gateway,
-            &log_node1,
-            &log_node2,
+            log_gateway.clone(),
+            log_node1.clone(),
+            log_node2.clone(),
         )
         .await;
 
