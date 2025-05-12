@@ -19,7 +19,7 @@ use freenet_stdlib::{
     },
     prelude::*,
 };
-use futures::future::BoxFuture;
+use futures::{future::BoxFuture, FutureExt};
 use rand::{random, Rng, SeedableRng};
 use testresult::TestResult;
 use tokio::{
@@ -334,7 +334,7 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
         let ping = Ping::default();
         let serialized = serde_json::to_vec(&ping)?;
         let wrapped_state = WrappedState::new(serialized);
-        let params = Parameters::default();
+        let params = Parameters::empty();
         let container = ContractContainer::try_from((code, &params))?;
         let contract_key = container.key();
 
@@ -412,11 +412,12 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                         .await?;
 
                     if let HostResponse::ContractResponse(ContractResponse::GetResponse {
-                        value: Some(value),
-                        ..
+                        key: _,
+                        contract: _,
+                        state,
                     }) = response
                     {
-                        let state = serde_json::from_slice::<Ping>(&value)?;
+                        let state = serde_json::from_slice::<Ping>(&state)?;
                         Ok(state)
                     } else {
                         Err(anyhow::anyhow!("Failed to get state from gateway"))
@@ -434,11 +435,12 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                         .await?;
 
                     if let HostResponse::ContractResponse(ContractResponse::GetResponse {
-                        value: Some(value),
-                        ..
+                        key: _,
+                        contract: _,
+                        state,
                     }) = response
                     {
-                        let state = serde_json::from_slice::<Ping>(&value)?;
+                        let state = serde_json::from_slice::<Ping>(&state)?;
                         Ok(state)
                     } else {
                         Err(anyhow::anyhow!("Failed to get state from node1"))
@@ -456,11 +458,12 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                         .await?;
 
                     if let HostResponse::ContractResponse(ContractResponse::GetResponse {
-                        value: Some(value),
-                        ..
+                        key: _,
+                        contract: _,
+                        state,
                     }) = response
                     {
-                        let state = serde_json::from_slice::<Ping>(&value)?;
+                        let state = serde_json::from_slice::<Ping>(&state)?;
                         Ok(state)
                     } else {
                         Err(anyhow::anyhow!("Failed to get state from node2"))
@@ -508,13 +511,13 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                     let mut client_lock = client.lock().await;
 
                     let mut ping = Ping::default();
-                    ping.insert(name.clone(), timestamp);
+                    ping.insert(format!("{}:{}", name.clone(), timestamp));
                     let state = serde_json::to_vec(&ping)?;
 
                     client_lock
                         .send(ClientRequest::ContractOp(ContractRequest::Update {
                             key,
-                            data: UpdateData::Full(state),
+                            data: UpdateData::State(state),
                         }))
                         .await?;
 
