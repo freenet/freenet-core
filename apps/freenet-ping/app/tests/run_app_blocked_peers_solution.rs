@@ -383,14 +383,14 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
         log_gateway("Waiting for subscriptions to propagate".to_string());
         sleep(Duration::from_secs(5)).await;
 
-        let get_all_states = |client_gw: &Arc<Mutex<WebApi>>,
-                              client_node1: &Arc<Mutex<WebApi>>,
-                              client_node2: &Arc<Mutex<WebApi>>,
-                              key: ContractKey,
-                              log_gateway: Arc<dyn Fn(String) + Send + Sync>,
-                              log_node1: Arc<dyn Fn(String) + Send + Sync>,
-                              log_node2: Arc<dyn Fn(String) + Send + Sync>|
-         -> BoxFuture<'_, anyhow::Result<(Ping, Ping, Ping)>> {
+        let get_all_states_fn = |client_gw: Arc<Mutex<WebApi>>,
+                                 client_node1: Arc<Mutex<WebApi>>,
+                                 client_node2: Arc<Mutex<WebApi>>,
+                                 key: ContractKey,
+                                 log_gateway: Arc<dyn Fn(String) + Send + Sync>,
+                                 log_node1: Arc<dyn Fn(String) + Send + Sync>,
+                                 log_node2: Arc<dyn Fn(String) + Send + Sync>|
+         -> BoxFuture<'static, anyhow::Result<(Ping, Ping, Ping)>> {
             Box::pin(async move {
                 log_gateway("Querying all nodes for current state...".to_string());
 
@@ -482,141 +482,166 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
             })
         };
 
-        let update_with_retry = |client: &Arc<Mutex<WebApi>>,
-                                 node_name: &str,
-                                 key: ContractKey,
-                                 name: String,
-                                 timestamp: u64,
-                                 log_gateway: Arc<dyn Fn(String) + Send + Sync>,
-                                 log_node1: Arc<dyn Fn(String) + Send + Sync>,
-                                 log_node2: Arc<dyn Fn(String) + Send + Sync>|
-         -> BoxFuture<'_, anyhow::Result<()>> {
-            Box::pin(async move {
-                let logger = match node_name {
-                    "Gateway" => log_gateway,
-                    "Node1" => log_node1,
-                    "Node2" => log_node2,
-                    _ => log_gateway,
-                };
+        async fn perform_update(
+            client: Arc<Mutex<WebApi>>,
+            client_gw: Arc<Mutex<WebApi>>,
+            client_node1: Arc<Mutex<WebApi>>,
+            client_node2: Arc<Mutex<WebApi>>,
+            node_name: String,
+            key: ContractKey,
+            name: String,
+            timestamp: u64,
+            log_gateway: Arc<dyn Fn(String) + Send + Sync>,
+            log_node1: Arc<dyn Fn(String) + Send + Sync>,
+            log_node2: Arc<dyn Fn(String) + Send + Sync>,
+            get_all_states_fn: impl Fn(
+                    Arc<Mutex<WebApi>>,
+                    Arc<Mutex<WebApi>>,
+                    Arc<Mutex<WebApi>>,
+                    ContractKey,
+                    Arc<dyn Fn(String) + Send + Sync>,
+                    Arc<dyn Fn(String) + Send + Sync>,
+                    Arc<dyn Fn(String) + Send + Sync>,
+                ) -> BoxFuture<'static, anyhow::Result<(Ping, Ping, Ping)>>
+                + Send
+                + Sync,
+        ) -> anyhow::Result<()> {
+            let logger = match node_name.as_str() {
+                "Gateway" => log_gateway.clone(),
+                "Node1" => log_node1.clone(),
+                "Node2" => log_node2.clone(),
+                _ => log_gateway.clone(),
+            };
 
-                for retry in 0..MAX_UPDATE_RETRIES {
-                    logger(format!(
-                        "Updating contract on {} (attempt {})",
-                        node_name,
-                        retry + 1
-                    ));
+            for retry in 0..MAX_UPDATE_RETRIES {
+                logger(format!(
+                    "Updating contract on {} (attempt {})",
+                    node_name,
+                    retry + 1
+                ));
 
-                    let delay = BASE_DELAY_MS * (2_u64.pow(retry as u32));
+                let delay = BASE_DELAY_MS * (2_u64.pow(retry as u32));
 
-                    let mut client_lock = client.lock().await;
+                let mut client_lock = client.lock().await;
 
-                    let mut ping = Ping::default();
-                    ping.insert(format!("{}:{}", name.clone(), timestamp));
-                    let state = serde_json::to_vec(&ping)?;
+                let mut ping = Ping::default();
+                ping.insert(format!("{}:{}", name.clone(), timestamp));
+                let state = serde_json::to_vec(&ping)?;
 
-                    client_lock
-                        .send(ClientRequest::ContractOp(ContractRequest::Update {
-                            key,
-                            data: UpdateData::State(state.into()),
-                        }))
-                        .await?;
-
-                    let response = wait_for_put_response(&mut client_lock, &key)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))?;
-                    logger(format!("{} update response: {:?}", node_name, response));
-                    drop(client_lock);
-
-                    sleep(Duration::from_millis(delay)).await;
-
-                    let (gw_state, node1_state, node2_state) = get_all_states(
-                        &client_gw,
-                        &client_node1,
-                        &client_node2,
+                client_lock
+                    .send(ClientRequest::ContractOp(ContractRequest::Update {
                         key,
-                        log_gateway.clone(),
-                        log_node1.clone(),
-                        log_node2.clone(),
-                    )
+                        data: UpdateData::State(state.into()),
+                    }))
                     .await?;
 
-                    let update_propagated = match node_name {
-                        "Gateway" => {
-                            gw_state.contains_key(&name)
-                                && node1_state.contains_key(&name)
-                                && node2_state.contains_key(&name)
-                        }
-                        "Node1" => {
-                            gw_state.contains_key(&name)
-                                && node1_state.contains_key(&name)
-                                && node2_state.contains_key(&name)
-                        }
-                        "Node2" => {
-                            gw_state.contains_key(&name)
-                                && node1_state.contains_key(&name)
-                                && node2_state.contains_key(&name)
-                        }
-                        _ => false,
-                    };
+                let response = wait_for_put_response(&mut client_lock, &key)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                logger(format!("{} update response: {:?}", node_name, response));
+                drop(client_lock);
 
-                    if update_propagated {
-                        logger(format!(
-                            "Update from {} successfully propagated to all nodes",
-                            node_name
-                        ));
-                        return Ok(());
+                sleep(Duration::from_millis(delay)).await;
+
+                let (gw_state, node1_state, node2_state) = get_all_states_fn(
+                    client_gw.clone(),
+                    client_node1.clone(),
+                    client_node2.clone(),
+                    key,
+                    log_gateway.clone(),
+                    log_node1.clone(),
+                    log_node2.clone(),
+                )
+                .await?;
+
+                let update_propagated = match node_name.as_str() {
+                    "Gateway" => {
+                        gw_state.contains_key(&name)
+                            && node1_state.contains_key(&name)
+                            && node2_state.contains_key(&name)
                     }
+                    "Node1" => {
+                        gw_state.contains_key(&name)
+                            && node1_state.contains_key(&name)
+                            && node2_state.contains_key(&name)
+                    }
+                    "Node2" => {
+                        gw_state.contains_key(&name)
+                            && node1_state.contains_key(&name)
+                            && node2_state.contains_key(&name)
+                    }
+                    _ => false,
+                };
 
+                if update_propagated {
                     logger(format!(
-                        "Update from {} not fully propagated, retrying...",
+                        "Update from {} successfully propagated to all nodes",
                         node_name
                     ));
+                    return Ok(());
                 }
 
-                Err(anyhow::anyhow!(
-                    "Failed to propagate update from {} after {} retries",
-                    node_name,
-                    MAX_UPDATE_RETRIES
-                ))
-            })
+                logger(format!(
+                    "Update from {} not fully propagated, retrying...",
+                    node_name
+                ));
+            }
+
+            Err(anyhow::anyhow!(
+                "Failed to propagate update from {} after {} retries",
+                node_name,
+                MAX_UPDATE_RETRIES
+            ))
         };
 
         log_gateway("Testing update propagation from Gateway to Node1 and Node2".to_string());
-        let gateway_update_result = update_with_retry(
-            &client_gw,
-            "Gateway",
+        let gateway_update_result = perform_update(
+            client_gw.clone(),
+            client_gw.clone(),
+            client_node1.clone(),
+            client_node2.clone(),
+            "Gateway".to_string(),
             key,
             "Gateway Update".to_string(),
             42,
             log_gateway.clone(),
             log_node1.clone(),
             log_node2.clone(),
+            get_all_states_fn,
         )
         .await;
 
         log_node1("Testing update propagation from Node1 to Gateway and Node2".to_string());
-        let node1_update_result = update_with_retry(
-            &client_node1,
-            "Node1",
+        let node1_update_result = perform_update(
+            client_node1.clone(),
+            client_gw.clone(),
+            client_node1.clone(),
+            client_node2.clone(),
+            "Node1".to_string(),
             key,
             "Node1 Update".to_string(),
             43,
             log_gateway.clone(),
             log_node1.clone(),
             log_node2.clone(),
+            get_all_states_fn,
         )
         .await;
 
         log_node2("Testing update propagation from Node2 to Gateway and Node1".to_string());
-        let node2_update_result = update_with_retry(
-            &client_node2,
-            "Node2",
+        let node2_update_result = perform_update(
+            client_node2.clone(),
+            client_gw.clone(),
+            client_node1.clone(),
+            client_node2.clone(),
+            "Node2".to_string(),
             key,
             "Node2 Update".to_string(),
             44,
             log_gateway.clone(),
             log_node1.clone(),
             log_node2.clone(),
+            get_all_states_fn,
         )
         .await;
 
