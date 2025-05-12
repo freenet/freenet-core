@@ -334,7 +334,7 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
         let ping = Ping::default();
         let serialized = serde_json::to_vec(&ping)?;
         let wrapped_state = WrappedState::new(serialized);
-        let params = Parameters::empty();
+        let params = Parameters::from(vec![]);
         let container = ContractContainer::try_from((code, &params))?;
         let contract_key = container.key();
 
@@ -354,7 +354,7 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
 
         let key = wait_for_put_response(&mut client_gw_lock, &contract_key)
             .await
-            .map_err(anyhow::Error::msg)?;
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         log_gateway(format!("Ping contract deployed with key: {}", key));
         drop(client_gw_lock);
@@ -367,7 +367,9 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                 summary: None,
             }))
             .await?;
-        let response = wait_for_subscribe_response(&mut client_node1_lock, &contract_key).await?;
+        let response = wait_for_subscribe_response(&mut client_node1_lock, &contract_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
         log_node1(format!("Node1 subscription response: {:?}", response));
         drop(client_node1_lock);
 
@@ -379,7 +381,9 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                 summary: None,
             }))
             .await?;
-        let response = wait_for_subscribe_response(&mut client_node2_lock, &contract_key).await?;
+        let response = wait_for_subscribe_response(&mut client_node2_lock, &contract_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
         log_node2(format!("Node2 subscription response: {:?}", response));
         drop(client_node2_lock);
 
@@ -412,9 +416,8 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                         .await?;
 
                     if let HostResponse::ContractResponse(ContractResponse::GetResponse {
-                        key: _,
-                        contract: _,
                         state,
+                        ..
                     }) = response
                     {
                         let state = serde_json::from_slice::<Ping>(&state)?;
@@ -435,9 +438,8 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                         .await?;
 
                     if let HostResponse::ContractResponse(ContractResponse::GetResponse {
-                        key: _,
-                        contract: _,
                         state,
+                        ..
                     }) = response
                     {
                         let state = serde_json::from_slice::<Ping>(&state)?;
@@ -458,9 +460,8 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                         .await?;
 
                     if let HostResponse::ContractResponse(ContractResponse::GetResponse {
-                        key: _,
-                        contract: _,
                         state,
+                        ..
                     }) = response
                     {
                         let state = serde_json::from_slice::<Ping>(&state)?;
@@ -517,11 +518,13 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                     client_lock
                         .send(ClientRequest::ContractOp(ContractRequest::Update {
                             key,
-                            data: UpdateData::State(state),
+                            data: UpdateData::State(state.into()),
                         }))
                         .await?;
 
-                    let response = wait_for_put_response(&mut client_lock, &key).await?;
+                    let response = wait_for_put_response(&mut client_lock, &key)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
                     logger(format!("{} update response: {:?}", node_name, response));
                     drop(client_lock);
 
