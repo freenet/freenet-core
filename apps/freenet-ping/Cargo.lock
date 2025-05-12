@@ -1344,6 +1344,7 @@ dependencies = [
  "freenet-ping-types",
  "freenet-stdlib 0.1.5",
  "futures",
+ "humantime",
  "once_cell",
  "rand 0.8.5",
  "serde",
