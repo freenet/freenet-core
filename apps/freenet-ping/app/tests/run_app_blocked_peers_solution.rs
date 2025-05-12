@@ -109,9 +109,6 @@ static RNG: once_cell::sync::Lazy<std::sync::Mutex<rand::rngs::StdRng>> =
 const PACKAGE_DIR: &str = env!("CARGO_MANIFEST_DIR");
 const PATH_TO_CONTRACT: &str = "../contracts/ping/build/freenet/freenet_ping_contract";
 const APP_TAG: &str = "ping-app";
-const MAX_UPDATE_RETRIES: u32 = 5;
-const BASE_DELAY_MS: u64 = 500;
-const MAX_TEST_DURATION_SECS: u64 = 300;
 
 struct LogEntry {
     timestamp: std::time::SystemTime,
@@ -403,7 +400,7 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
 
                 let gw_state_future = tokio::spawn(async move {
                     let mut client = client_gw_clone.lock().await;
-                    let response = client
+                    client
                         .send(ClientRequest::ContractOp(ContractRequest::Get {
                             key,
                             return_contract_code: false,
@@ -411,21 +408,23 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                         }))
                         .await?;
 
-                    match response {
-                        HostResponse::ContractResponse(ContractResponse::GetResponse {
-                            state,
-                            ..
-                        }) => {
-                            let state = serde_json::from_slice::<Ping>(&state)?;
-                            Ok(state)
-                        }
-                        _ => Err(anyhow::anyhow!("Failed to get state from gateway")),
+                    let response = client.recv().await?;
+
+                    if let HostResponse::ContractResponse(ContractResponse::GetResponse {
+                        state,
+                        ..
+                    }) = response
+                    {
+                        let state = serde_json::from_slice::<Ping>(&state)?;
+                        Ok(state)
+                    } else {
+                        Err(anyhow::anyhow!("Failed to get state from gateway"))
                     }
                 });
 
                 let node1_state_future = tokio::spawn(async move {
                     let mut client = client_node1_clone.lock().await;
-                    let response = client
+                    client
                         .send(ClientRequest::ContractOp(ContractRequest::Get {
                             key,
                             return_contract_code: false,
@@ -433,21 +432,23 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                         }))
                         .await?;
 
-                    match response {
-                        HostResponse::ContractResponse(ContractResponse::GetResponse {
-                            state,
-                            ..
-                        }) => {
-                            let state = serde_json::from_slice::<Ping>(&state)?;
-                            Ok(state)
-                        }
-                        _ => Err(anyhow::anyhow!("Failed to get state from node1")),
+                    let response = client.recv().await?;
+
+                    if let HostResponse::ContractResponse(ContractResponse::GetResponse {
+                        state,
+                        ..
+                    }) = response
+                    {
+                        let state = serde_json::from_slice::<Ping>(&state)?;
+                        Ok(state)
+                    } else {
+                        Err(anyhow::anyhow!("Failed to get state from node1"))
                     }
                 });
 
                 let node2_state_future = tokio::spawn(async move {
                     let mut client = client_node2_clone.lock().await;
-                    let response = client
+                    client
                         .send(ClientRequest::ContractOp(ContractRequest::Get {
                             key,
                             return_contract_code: false,
@@ -455,15 +456,17 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                         }))
                         .await?;
 
-                    match response {
-                        HostResponse::ContractResponse(ContractResponse::GetResponse {
-                            state,
-                            ..
-                        }) => {
-                            let state = serde_json::from_slice::<Ping>(&state)?;
-                            Ok(state)
-                        }
-                        _ => Err(anyhow::anyhow!("Failed to get state from node2")),
+                    let response = client.recv().await?;
+
+                    if let HostResponse::ContractResponse(ContractResponse::GetResponse {
+                        state,
+                        ..
+                    }) = response
+                    {
+                        let state = serde_json::from_slice::<Ping>(&state)?;
+                        Ok(state)
+                    } else {
+                        Err(anyhow::anyhow!("Failed to get state from node2"))
                     }
                 });
 
