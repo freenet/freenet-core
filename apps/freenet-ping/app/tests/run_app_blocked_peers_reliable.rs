@@ -99,13 +99,13 @@ fn ping_states_equal(a: &Ping, b: &Ping) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    
+
     for key in a.keys() {
         if !b.contains_key(key) {
             return false;
         }
     }
-    
+
     true
 }
 
@@ -273,12 +273,12 @@ async fn test_ping_blocked_peers_reliable() -> TestResult {
 
         let key = tokio::time::timeout(
             Duration::from_secs(15),
-            wait_for_put_response(&mut client_gw, &contract_key)
+            wait_for_put_response(&mut client_gw, &contract_key),
         )
         .await
         .map_err(|_| anyhow!("Gateway put request timed out"))?
         .map_err(anyhow::Error::msg)?;
-        
+
         tracing::info!(key=%key, "Gateway: put ping contract successfully!");
 
         tracing::info!("Node 1 getting contract and subscribing...");
@@ -292,12 +292,12 @@ async fn test_ping_blocked_peers_reliable() -> TestResult {
 
         let node1_state = tokio::time::timeout(
             Duration::from_secs(15),
-            wait_for_get_response(&mut client_node1, &contract_key)
+            wait_for_get_response(&mut client_node1, &contract_key),
         )
         .await
         .map_err(|_| anyhow!("Node1 get request timed out"))?
         .map_err(anyhow::Error::msg)?;
-        
+
         tracing::info!("Node 1: got contract with {} entries", node1_state.len());
 
         tracing::info!("Node 2 getting contract and subscribing...");
@@ -311,12 +311,12 @@ async fn test_ping_blocked_peers_reliable() -> TestResult {
 
         let node2_state = tokio::time::timeout(
             Duration::from_secs(15),
-            wait_for_get_response(&mut client_node2, &contract_key)
+            wait_for_get_response(&mut client_node2, &contract_key),
         )
         .await
         .map_err(|_| anyhow!("Node2 get request timed out"))?
         .map_err(anyhow::Error::msg)?;
-        
+
         tracing::info!("Node 2: got contract with {} entries", node2_state.len());
 
         tracing::info!("Waiting for subscriptions to be fully established...");
@@ -326,7 +326,7 @@ async fn test_ping_blocked_peers_reliable() -> TestResult {
             client_gw: &mut WebApi,
             client_node1: &mut WebApi,
             client_node2: &mut WebApi,
-            key: ContractKey
+            key: ContractKey,
         ) -> anyhow::Result<(Ping, Ping, Ping)> {
             tracing::info!("Querying all nodes for current state...");
 
@@ -337,7 +337,7 @@ async fn test_ping_blocked_peers_reliable() -> TestResult {
                     subscribe: false,
                 }))
                 .await?;
-            
+
             client_node1
                 .send(ClientRequest::ContractOp(ContractRequest::Get {
                     key,
@@ -345,7 +345,7 @@ async fn test_ping_blocked_peers_reliable() -> TestResult {
                     subscribe: false,
                 }))
                 .await?;
-            
+
             client_node2
                 .send(ClientRequest::ContractOp(ContractRequest::Get {
                     key,
@@ -353,32 +353,34 @@ async fn test_ping_blocked_peers_reliable() -> TestResult {
                     subscribe: false,
                 }))
                 .await?;
-            
+
             let state_gw = tokio::time::timeout(
                 Duration::from_secs(10),
-                wait_for_get_response(client_gw, &key)
+                wait_for_get_response(client_gw, &key),
             )
             .await
             .map_err(|_| anyhow!("Gateway get request timed out"))?;
-                
+
             let state_node1 = tokio::time::timeout(
                 Duration::from_secs(10),
-                wait_for_get_response(client_node1, &key)
+                wait_for_get_response(client_node1, &key),
             )
             .await
             .map_err(|_| anyhow!("Node1 get request timed out"))?;
-                
+
             let state_node2 = tokio::time::timeout(
                 Duration::from_secs(10),
-                wait_for_get_response(client_node2, &key)
+                wait_for_get_response(client_node2, &key),
             )
             .await
             .map_err(|_| anyhow!("Node2 get request timed out"))?;
 
             let ping_gw = state_gw.map_err(|e| anyhow!("Failed to get gateway state: {}", e))?;
-            let ping_node1 = state_node1.map_err(|e| anyhow!("Failed to get node1 state: {}", e))?;
-            let ping_node2 = state_node2.map_err(|e| anyhow!("Failed to get node2 state: {}", e))?;
-            
+            let ping_node1 =
+                state_node1.map_err(|e| anyhow!("Failed to get node1 state: {}", e))?;
+            let ping_node2 =
+                state_node2.map_err(|e| anyhow!("Failed to get node2 state: {}", e))?;
+
             Ok((ping_gw, ping_node1, ping_node2))
         }
 
@@ -388,7 +390,7 @@ async fn test_ping_blocked_peers_reliable() -> TestResult {
 
         for round in 1..=3 {
             tracing::info!("Starting update round {}/3...", round);
-            
+
             let mut gw_ping = Ping::default();
             let gw_round_tag = format!("{}-round{}", gw_tag, round);
             gw_ping.insert(gw_round_tag.clone());
@@ -396,12 +398,14 @@ async fn test_ping_blocked_peers_reliable() -> TestResult {
             client_gw
                 .send(ClientRequest::ContractOp(ContractRequest::Update {
                     key: contract_key,
-                    data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&gw_ping).unwrap())),
+                    data: UpdateData::Delta(StateDelta::from(
+                        serde_json::to_vec(&gw_ping).unwrap(),
+                    )),
                 }))
                 .await?;
-            
+
             sleep(Duration::from_secs(2)).await;
-            
+
             let mut node1_ping = Ping::default();
             let node1_round_tag = format!("{}-round{}", node1_tag, round);
             node1_ping.insert(node1_round_tag.clone());
@@ -409,12 +413,14 @@ async fn test_ping_blocked_peers_reliable() -> TestResult {
             client_node1
                 .send(ClientRequest::ContractOp(ContractRequest::Update {
                     key: contract_key,
-                    data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&node1_ping).unwrap())),
+                    data: UpdateData::Delta(StateDelta::from(
+                        serde_json::to_vec(&node1_ping).unwrap(),
+                    )),
                 }))
                 .await?;
-            
+
             sleep(Duration::from_secs(2)).await;
-            
+
             let mut node2_ping = Ping::default();
             let node2_round_tag = format!("{}-round{}", node2_tag, round);
             node2_ping.insert(node2_round_tag.clone());
@@ -422,14 +428,20 @@ async fn test_ping_blocked_peers_reliable() -> TestResult {
             client_node2
                 .send(ClientRequest::ContractOp(ContractRequest::Update {
                     key: contract_key,
-                    data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&node2_ping).unwrap())),
+                    data: UpdateData::Delta(StateDelta::from(
+                        serde_json::to_vec(&node2_ping).unwrap(),
+                    )),
                 }))
                 .await?;
-            
+
             let wait_time = 3 + (round * 2);
-            tracing::info!("Waiting {}s for round {} updates to propagate...", wait_time, round);
+            tracing::info!(
+                "Waiting {}s for round {} updates to propagate...",
+                wait_time,
+                round
+            );
             sleep(Duration::from_secs(wait_time)).await;
-            
+
             let (state_gw, state_node1, state_node2) = get_all_states(
                 &mut client_gw,
                 &mut client_node1,
@@ -437,37 +449,46 @@ async fn test_ping_blocked_peers_reliable() -> TestResult {
                 contract_key,
             )
             .await?;
-            
+
             tracing::info!("Round {} update propagation status:", round);
             tracing::info!("Gateway state: {:?}", state_gw);
             tracing::info!("Node 1 state: {:?}", state_node1);
             tracing::info!("Node 2 state: {:?}", state_node2);
-            
+
             let gw_seen_node1 = state_gw.contains_key(&node1_round_tag);
             let gw_seen_node2 = state_gw.contains_key(&node2_round_tag);
             let node1_seen_gw = state_node1.contains_key(&gw_round_tag);
             let node1_seen_node2 = state_node1.contains_key(&node2_round_tag);
             let node2_seen_gw = state_node2.contains_key(&gw_round_tag);
             let node2_seen_node1 = state_node2.contains_key(&node1_round_tag);
-            
+
             tracing::info!("Gateway seen Node1 round {}: {}", round, gw_seen_node1);
             tracing::info!("Gateway seen Node2 round {}: {}", round, gw_seen_node2);
             tracing::info!("Node1 seen Gateway round {}: {}", round, node1_seen_gw);
             tracing::info!("Node1 seen Node2 round {}: {}", round, node1_seen_node2);
             tracing::info!("Node2 seen Gateway round {}: {}", round, node2_seen_gw);
             tracing::info!("Node2 seen Node1 round {}: {}", round, node2_seen_node1);
-            
-            if gw_seen_node1 && gw_seen_node2 && node1_seen_gw && node1_seen_node2 && node2_seen_gw && node2_seen_node1 {
+
+            if gw_seen_node1
+                && gw_seen_node2
+                && node1_seen_gw
+                && node1_seen_node2
+                && node2_seen_gw
+                && node2_seen_node1
+            {
                 tracing::info!("All round {} updates have propagated successfully!", round);
                 if round == 3 {
                     tracing::info!("All rounds completed successfully!");
                     break;
                 }
             } else {
-                tracing::info!("Some round {} updates did not propagate, continuing to next round...", round);
+                tracing::info!(
+                    "Some round {} updates did not propagate, continuing to next round...",
+                    round
+                );
             }
         }
-        
+
         let (state_gw, state_node1, state_node2) = get_all_states(
             &mut client_gw,
             &mut client_node1,
@@ -475,14 +496,14 @@ async fn test_ping_blocked_peers_reliable() -> TestResult {
             contract_key,
         )
         .await?;
-        
+
         let gw_seen_node1 = state_gw.keys().any(|k| k.starts_with(&node1_tag));
         let gw_seen_node2 = state_gw.keys().any(|k| k.starts_with(&node2_tag));
         let node1_seen_gw = state_node1.keys().any(|k| k.starts_with(&gw_tag));
         let node1_seen_node2 = state_node1.keys().any(|k| k.starts_with(&node2_tag));
         let node2_seen_gw = state_node2.keys().any(|k| k.starts_with(&gw_tag));
         let node2_seen_node1 = state_node2.keys().any(|k| k.starts_with(&node1_tag));
-        
+
         tracing::info!("Final update propagation status:");
         tracing::info!("Gateway state: {:?}", state_gw);
         tracing::info!("Node 1 state: {:?}", state_node1);
@@ -493,13 +514,19 @@ async fn test_ping_blocked_peers_reliable() -> TestResult {
         tracing::info!("Node1 seen Node2: {}", node1_seen_node2);
         tracing::info!("Node2 seen Gateway: {}", node2_seen_gw);
         tracing::info!("Node2 seen Node1: {}", node2_seen_node1);
-        
+
         assert!(gw_seen_node1, "Gateway did not see Node1's update");
         assert!(gw_seen_node2, "Gateway did not see Node2's update");
         assert!(node1_seen_gw, "Node1 did not see Gateway's update");
-        assert!(node1_seen_node2, "Node1 did not see Node2's update through Gateway");
+        assert!(
+            node1_seen_node2,
+            "Node1 did not see Node2's update through Gateway"
+        );
         assert!(node2_seen_gw, "Node2 did not see Gateway's update");
-        assert!(node2_seen_node1, "Node2 did not see Node1's update through Gateway");
+        assert!(
+            node2_seen_node1,
+            "Node2 did not see Node1's update through Gateway"
+        );
 
         assert!(
             ping_states_equal(&state_gw, &state_node1),
@@ -515,10 +542,13 @@ async fn test_ping_blocked_peers_reliable() -> TestResult {
         );
 
         tracing::info!("All nodes have successfully received updates through the gateway!");
-        tracing::info!("Test passed: updates propagated correctly despite blocked direct connections");
+        tracing::info!(
+            "Test passed: updates propagated correctly despite blocked direct connections"
+        );
 
         Ok::<_, anyhow::Error>(())
-    }).instrument(span!(Level::INFO, "test_ping_blocked_peers_reliable"));
+    })
+    .instrument(span!(Level::INFO, "test_ping_blocked_peers_reliable"));
 
     select! {
         gw = gateway_node => {
