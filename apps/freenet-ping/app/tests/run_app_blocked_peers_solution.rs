@@ -533,7 +533,7 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                 client_lock
                     .send(ClientRequest::ContractOp(ContractRequest::Update {
                         key,
-                        data: UpdateData::State(state.into()),
+                        data: UpdateData::Delta(StateDelta::from(state)),
                     }))
                     .await?;
 
