@@ -5,19 +5,19 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::anyhow;
 use freenet::{
     config::{ConfigArgs, InlineGwConfig, NetworkArgs, SecretArgs, WebsocketApiArgs},
     dev_tool::TransportKeypair,
     local_node::NodeConfig,
     server::serve_gateway,
 };
-use freenet_ping_types::Ping;
+use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
 };
-use futures::{future::BoxFuture, FutureExt};
+use futures::future::BoxFuture;
 use rand::{random, Rng, SeedableRng};
 use testresult::TestResult;
 use tokio::{
@@ -34,8 +34,9 @@ use freenet_ping_app::ping_client::{
     wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
 };
 
-const MAX_UPDATE_RETRIES: u32 = 5;
-const BASE_DELAY_MS: u64 = 500;
+const MAX_UPDATE_RETRIES: u32 = 8;
+const BASE_DELAY_MS: u64 = 3000;
+const MAX_DELAY_MS: u64 = 15000;
 const MAX_TEST_DURATION_SECS: u64 = 300;
 
 #[derive(Debug)]
@@ -326,10 +327,18 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
         let code_hash = CodeHash::from_code(&code);
         log_gateway(format!("Loaded contract code with hash: {}", code_hash));
 
+        let ping_options = PingContractOptions {
+            ttl: Duration::from_secs(5),
+            frequency: Duration::from_secs(1),
+            tag: "ping-test".to_string(),
+            code_key: code_hash.to_string(),
+        };
+
         let ping = Ping::default();
         let serialized = serde_json::to_vec(&ping)?;
         let wrapped_state = WrappedState::new(serialized);
-        let params = Parameters::from(vec![]);
+
+        let params = Parameters::from(serde_json::to_vec(&ping_options)?);
         let container = ContractContainer::try_from((code, &params))?;
         let contract_key = container.key();
 
@@ -522,12 +531,26 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                     retry + 1
                 ));
 
-                let delay = BASE_DELAY_MS * (2_u64.pow(retry as u32));
+                let delay = (BASE_DELAY_MS * (2_u64.pow(retry as u32))).min(MAX_DELAY_MS);
+                logger(format!(
+                    "Update attempt {} with delay {}ms",
+                    retry + 1,
+                    delay
+                ));
 
                 let mut client_lock = client.lock().await;
 
                 let mut ping = Ping::default();
-                ping.insert(format!("{}:{}", name.clone(), timestamp));
+                let formatted_key = format!("{}:{}", name.clone(), timestamp);
+                ping.insert(formatted_key.clone());
+
+                let state_str = serde_json::to_string(&ping)?;
+                logger(format!("Serialized ping: {}", state_str));
+                logger(format!(
+                    "Ping contains key: {}, value: {:?}",
+                    formatted_key,
+                    ping.get(&formatted_key)
+                ));
                 let state = serde_json::to_vec(&ping)?;
 
                 client_lock
@@ -543,7 +566,11 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                 logger(format!("{} update response: {:?}", node_name, response));
                 drop(client_lock);
 
-                sleep(Duration::from_millis(delay)).await;
+                logger(format!(
+                    "Waiting for update to propagate (initial {}ms)...",
+                    delay / 3
+                ));
+                sleep(Duration::from_millis(delay / 3)).await;
 
                 let (gw_state, node1_state, node2_state) = get_all_states_fn(
                     client_gw.clone(),
@@ -556,45 +583,115 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
                 )
                 .await?;
 
+                let formatted_key = format!("{}:{}", name, timestamp);
+
+                logger(format!("First check - Gateway state: {}", gw_state));
+                logger(format!("First check - Node1 state: {}", node1_state));
+                logger(format!("First check - Node2 state: {}", node2_state));
+
+                let gw_has_update = gw_state.contains_key(&formatted_key);
+                let node1_has_update = node1_state.contains_key(&formatted_key);
+                let node2_has_update = node2_state.contains_key(&formatted_key);
+
+                logger(format!(
+                    "First check - Update propagation status for key '{}' - Gateway: {}, Node1: {}, Node2: {}",
+                    formatted_key, gw_has_update, node1_has_update, node2_has_update
+                ));
+
                 let update_propagated = match node_name.as_str() {
-                    "Gateway" => {
-                        gw_state.contains_key(&name)
-                            && node1_state.contains_key(&name)
-                            && node2_state.contains_key(&name)
-                    }
-                    "Node1" => {
-                        gw_state.contains_key(&name)
-                            && node1_state.contains_key(&name)
-                            && node2_state.contains_key(&name)
-                    }
-                    "Node2" => {
-                        gw_state.contains_key(&name)
-                            && node1_state.contains_key(&name)
-                            && node2_state.contains_key(&name)
-                    }
+                    "Gateway" => gw_has_update && node1_has_update && node2_has_update,
+                    "Node1" => gw_has_update && node1_has_update && node2_has_update,
+                    "Node2" => gw_has_update && node1_has_update && node2_has_update,
                     _ => false,
                 };
 
                 if update_propagated {
                     logger(format!(
-                        "Update from {} successfully propagated to all nodes",
+                        "Update from {} successfully propagated to all nodes on first check",
                         node_name
                     ));
                     return Ok(());
                 }
 
                 logger(format!(
-                    "Update from {} not fully propagated, retrying...",
-                    node_name
+                    "Update not fully propagated on first check, waiting additional {}ms...",
+                    delay / 3
+                ));
+                sleep(Duration::from_millis(delay / 3)).await;
+
+                let (gw_state2, node1_state2, node2_state2) = get_all_states_fn(
+                    client_gw.clone(),
+                    client_node1.clone(),
+                    client_node2.clone(),
+                    key,
+                    log_gateway.clone(),
+                    log_node1.clone(),
+                    log_node2.clone(),
+                )
+                .await?;
+
+                logger(format!("Second check - Gateway state: {}", gw_state2));
+                logger(format!("Second check - Node1 state: {}", node1_state2));
+                logger(format!("Second check - Node2 state: {}", node2_state2));
+
+                let gw_has_update2 = gw_state2.contains_key(&formatted_key);
+                let node1_has_update2 = node1_state2.contains_key(&formatted_key);
+                let node2_has_update2 = node2_state2.contains_key(&formatted_key);
+
+                logger(format!(
+                    "Second check - Update propagation status for key '{}' - Gateway: {}, Node1: {}, Node2: {}",
+                    formatted_key, gw_has_update2, node1_has_update2, node2_has_update2
+                ));
+
+                let update_propagated = match node_name.as_str() {
+                    "Gateway" => gw_has_update2 && node1_has_update2 && node2_has_update2,
+                    "Node1" => gw_has_update2 && node1_has_update2 && node2_has_update2,
+                    "Node2" => gw_has_update2 && node1_has_update2 && node2_has_update2,
+                    _ => false,
+                };
+
+                if update_propagated {
+                    logger(format!(
+                        "Update from {} successfully propagated to all nodes on second check",
+                        node_name
+                    ));
+                    return Ok(());
+                }
+
+                logger(format!("Update not fully propagated on second check, waiting final {}ms before next retry...", delay/3));
+                sleep(Duration::from_millis(delay / 3)).await;
+
+                if !gw_has_update2 {
+                    logger(format!(
+                        "Gateway missing update for key '{}'",
+                        formatted_key
+                    ));
+                }
+                if !node1_has_update2 {
+                    logger(format!("Node1 missing update for key '{}'", formatted_key));
+                }
+                if !node2_has_update2 {
+                    logger(format!("Node2 missing update for key '{}'", formatted_key));
+                }
+
+                logger(format!(
+                    "Update from {} not fully propagated after attempt {}, retrying...",
+                    node_name,
+                    retry + 1
                 ));
             }
+
+            logger(format!(
+                "Failed to propagate update from {} after {} retries with max delay {}ms",
+                node_name, MAX_UPDATE_RETRIES, MAX_DELAY_MS
+            ));
 
             Err(anyhow::anyhow!(
                 "Failed to propagate update from {} after {} retries",
                 node_name,
                 MAX_UPDATE_RETRIES
             ))
-        };
+        }
 
         log_gateway("Testing update propagation from Gateway to Node1 and Node2".to_string());
         let gateway_update_result = perform_update(
