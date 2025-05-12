@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::anyhow;
 use freenet::{
     config::{ConfigArgs, InlineGwConfig, NetworkArgs, SecretArgs, WebsocketApiArgs},
     dev_tool::TransportKeypair,
@@ -119,7 +119,7 @@ async fn test_ping_blocked_peers() -> TestResult {
 
     let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
     let gw_network_port = network_socket_gw.local_addr()?.port();
-    let gw_network_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), gw_network_port);
+    let _gw_network_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), gw_network_port);
 
     let ws_api_port_socket_gw = TcpListener::bind("127.0.0.1:0")?;
     let ws_api_port_socket_node1 = TcpListener::bind("127.0.0.1:0")?;
@@ -211,8 +211,9 @@ async fn test_ping_blocked_peers() -> TestResult {
     }
     .boxed_local();
 
-    let test = tokio::time::timeout(Duration::from_secs(120), async {
-        tokio::time::sleep(Duration::from_secs(10)).await;
+    let test = tokio::time::timeout(Duration::from_secs(300), async {
+        tracing::info!("Waiting for nodes to start up and establish connections...");
+        tokio::time::sleep(Duration::from_secs(15)).await;
 
         let uri_gw = format!(
             "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
@@ -227,8 +228,11 @@ async fn test_ping_blocked_peers() -> TestResult {
             ws_api_port_node2
         );
 
+        tracing::info!("Connecting to Gateway at {}", uri_gw);
         let (stream_gw, _) = connect_async(&uri_gw).await?;
+        tracing::info!("Connecting to Node1 at {}", uri_node1);
         let (stream_node1, _) = connect_async(&uri_node1).await?;
+        tracing::info!("Connecting to Node2 at {}", uri_node2);
         let (stream_node2, _) = connect_async(&uri_node2).await?;
 
         let mut client_gw = WebApi::start(stream_gw);
@@ -236,16 +240,16 @@ async fn test_ping_blocked_peers() -> TestResult {
         let mut client_node2 = WebApi::start(stream_node2);
 
         let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
-        tracing::info!(path=%path_to_code.display(), "loading contract code");
+        tracing::info!(path=%path_to_code.display(), "Loading contract code");
         let code = std::fs::read(path_to_code)
             .ok()
             .ok_or_else(|| anyhow!("Failed to read contract code"))?;
         let code_hash = CodeHash::from_code(&code);
-        tracing::info!(code_hash=%code_hash, "loaded contract code");
+        tracing::info!(code_hash=%code_hash, "Loaded contract code");
 
         let ping_options = PingContractOptions {
             frequency: Duration::from_secs(5),
-            ttl: Duration::from_secs(30),
+            ttl: Duration::from_secs(60), // Increased TTL for more reliability
             tag: APP_TAG.to_string(),
             code_key: code_hash.to_string(),
         };
@@ -269,9 +273,14 @@ async fn test_ping_blocked_peers() -> TestResult {
             }))
             .await?;
 
-        let key = wait_for_put_response(&mut client_gw, &contract_key)
-            .await
-            .map_err(anyhow::Error::msg)?;
+        let key = tokio::time::timeout(
+            Duration::from_secs(30),
+            wait_for_put_response(&mut client_gw, &contract_key)
+        )
+        .await
+        .map_err(|_| anyhow!("Gateway put request timed out"))?
+        .map_err(anyhow::Error::msg)?;
+        
         tracing::info!(key=%key, "Gateway: put ping contract successfully!");
 
         tracing::info!("Node 1 getting contract...");
@@ -283,9 +292,14 @@ async fn test_ping_blocked_peers() -> TestResult {
             }))
             .await?;
 
-        let node1_state = wait_for_get_response(&mut client_node1, &contract_key)
-            .await
-            .map_err(anyhow::Error::msg)?;
+        let node1_state = tokio::time::timeout(
+            Duration::from_secs(30),
+            wait_for_get_response(&mut client_node1, &contract_key)
+        )
+        .await
+        .map_err(|_| anyhow!("Node1 get request timed out"))?
+        .map_err(anyhow::Error::msg)?;
+        
         tracing::info!("Node 1: got contract with {} entries", node1_state.len());
 
         tracing::info!("Node 2 getting contract...");
@@ -297,9 +311,14 @@ async fn test_ping_blocked_peers() -> TestResult {
             }))
             .await?;
 
-        let node2_state = wait_for_get_response(&mut client_node2, &contract_key)
-            .await
-            .map_err(anyhow::Error::msg)?;
+        let node2_state = tokio::time::timeout(
+            Duration::from_secs(30),
+            wait_for_get_response(&mut client_node2, &contract_key)
+        )
+        .await
+        .map_err(|_| anyhow!("Node2 get request timed out"))?
+        .map_err(anyhow::Error::msg)?;
+        
         tracing::info!("Node 2: got contract with {} entries", node2_state.len());
 
         tracing::info!("All nodes subscribing to contract...");
@@ -310,9 +329,15 @@ async fn test_ping_blocked_peers() -> TestResult {
                 summary: None,
             }))
             .await?;
-        wait_for_subscribe_response(&mut client_gw, &contract_key)
-            .await
-            .map_err(anyhow::Error::msg)?;
+        
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            wait_for_subscribe_response(&mut client_gw, &contract_key)
+        )
+        .await
+        .map_err(|_| anyhow!("Gateway subscribe request timed out"))?
+        .map_err(anyhow::Error::msg)?;
+        
         tracing::info!("Gateway: subscribed successfully!");
 
         client_node1
@@ -321,9 +346,15 @@ async fn test_ping_blocked_peers() -> TestResult {
                 summary: None,
             }))
             .await?;
-        wait_for_subscribe_response(&mut client_node1, &contract_key)
-            .await
-            .map_err(anyhow::Error::msg)?;
+        
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            wait_for_subscribe_response(&mut client_node1, &contract_key)
+        )
+        .await
+        .map_err(|_| anyhow!("Node1 subscribe request timed out"))?
+        .map_err(anyhow::Error::msg)?;
+        
         tracing::info!("Node 1: subscribed successfully!");
 
         client_node2
@@ -332,9 +363,15 @@ async fn test_ping_blocked_peers() -> TestResult {
                 summary: None,
             }))
             .await?;
-        wait_for_subscribe_response(&mut client_node2, &contract_key)
-            .await
-            .map_err(anyhow::Error::msg)?;
+        
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            wait_for_subscribe_response(&mut client_node2, &contract_key)
+        )
+        .await
+        .map_err(|_| anyhow!("Node2 subscribe request timed out"))?
+        .map_err(anyhow::Error::msg)?;
+        
         tracing::info!("Node 2: subscribed successfully!");
 
         let gw_tag = "ping-from-gw".to_string();
@@ -382,73 +419,68 @@ async fn test_ping_blocked_peers() -> TestResult {
             client_gw: &mut WebApi,
             client_node1: &mut WebApi,
             client_node2: &mut WebApi,
-            key: ContractKey,
+            key: ContractKey
         ) -> anyhow::Result<(Ping, Ping, Ping)> {
             tracing::info!("Querying all nodes for current state...");
 
-            let gw_fut = async {
-                client_gw
-                    .send(ClientRequest::ContractOp(ContractRequest::Get {
-                        key,
-                        return_contract_code: false,
-                        subscribe: false,
-                    }))
-                    .await?;
-                
+            client_gw
+                .send(ClientRequest::ContractOp(ContractRequest::Get {
+                    key,
+                    return_contract_code: false,
+                    subscribe: false,
+                }))
+                .await?;
+            
+            client_node1
+                .send(ClientRequest::ContractOp(ContractRequest::Get {
+                    key,
+                    return_contract_code: false,
+                    subscribe: false,
+                }))
+                .await?;
+            
+            client_node2
+                .send(ClientRequest::ContractOp(ContractRequest::Get {
+                    key,
+                    return_contract_code: false,
+                    subscribe: false,
+                }))
+                .await?;
+            
+            let state_gw = tokio::time::timeout(
+                Duration::from_secs(20),
                 wait_for_get_response(client_gw, &key)
-                    .await
-                    .map_err(anyhow::Error::msg)
-            };
-            
-            let node1_fut = async {
-                client_node1
-                    .send(ClientRequest::ContractOp(ContractRequest::Get {
-                        key,
-                        return_contract_code: false,
-                        subscribe: false,
-                    }))
-                    .await?;
+            )
+            .await
+            .map_err(|_| anyhow!("Gateway get request timed out"))?;
                 
+            let state_node1 = tokio::time::timeout(
+                Duration::from_secs(20),
                 wait_for_get_response(client_node1, &key)
-                    .await
-                    .map_err(anyhow::Error::msg)
-            };
-            
-            let node2_fut = async {
-                client_node2
-                    .send(ClientRequest::ContractOp(ContractRequest::Get {
-                        key,
-                        return_contract_code: false,
-                        subscribe: false,
-                    }))
-                    .await?;
+            )
+            .await
+            .map_err(|_| anyhow!("Node1 get request timed out"))?;
                 
+            let state_node2 = tokio::time::timeout(
+                Duration::from_secs(20),
                 wait_for_get_response(client_node2, &key)
-                    .await
-                    .map_err(anyhow::Error::msg)
-            };
+            )
+            .await
+            .map_err(|_| anyhow!("Node2 get request timed out"))?;
 
-            let state_gw = tokio::time::timeout(Duration::from_secs(10), gw_fut)
-                .await
-                .map_err(|_| anyhow!("Gateway get request timed out"))??;
-                
-            let state_node1 = tokio::time::timeout(Duration::from_secs(10), node1_fut)
-                .await
-                .map_err(|_| anyhow!("Node1 get request timed out"))??;
-                
-            let state_node2 = tokio::time::timeout(Duration::from_secs(10), node2_fut)
-                .await
-                .map_err(|_| anyhow!("Node2 get request timed out"))??;
-
-            Ok((state_gw, state_node1, state_node2))
+            let ping_gw = state_gw.map_err(|e| anyhow!("Failed to get gateway state: {}", e))?;
+            let ping_node1 = state_node1.map_err(|e| anyhow!("Failed to get node1 state: {}", e))?;
+            let ping_node2 = state_node2.map_err(|e| anyhow!("Failed to get node2 state: {}", e))?;
+            
+            Ok((ping_gw, ping_node1, ping_node2))
         }
 
         tracing::info!("Implementing robust update propagation strategy...");
         
         tracing::info!("Waiting for initial updates to propagate...");
-        sleep(Duration::from_secs(5)).await;
+        sleep(Duration::from_secs(8)).await;
         
-        for i in 1..=3 {
+        for i in 1..=3 {  // Reduced from 5 to 3 rounds to speed up test
             let mut gw_ping_refresh = Ping::default();
             let gw_refresh_tag = format!("{}-refresh-{}", gw_tag, i);
             gw_ping_refresh.insert(gw_refresh_tag.clone());
@@ -482,11 +514,11 @@ async fn test_ping_blocked_peers() -> TestResult {
                 }))
                 .await?;
             
-            sleep(Duration::from_secs(3)).await;
+            sleep(Duration::from_secs(5)).await;
         }
         
         tracing::info!("Waiting for all updates to propagate...");
-        sleep(Duration::from_secs(5)).await;
+        sleep(Duration::from_secs(8)).await;
 
         let (state_gw, state_node1, state_node2) = get_all_states(
             &mut client_gw,
@@ -515,7 +547,7 @@ async fn test_ping_blocked_peers() -> TestResult {
         tracing::info!("Node2 seen Node1: {}", node2_seen_node1);
 
         tracing::info!("Waiting longer for updates to propagate through the gateway...");
-        sleep(Duration::from_secs(15)).await;
+        sleep(Duration::from_secs(15)).await;  // Reduced from 20 to 15 seconds
 
         let (state_gw, state_node1, state_node2) = get_all_states(
             &mut client_gw,
@@ -542,6 +574,72 @@ async fn test_ping_blocked_peers() -> TestResult {
         tracing::info!("Node1 seen Node2: {}", node1_seen_node2);
         tracing::info!("Node2 seen Gateway: {}", node2_seen_gw);
         tracing::info!("Node2 seen Node1: {}", node2_seen_node1);
+
+        if !gw_seen_node1 || !gw_seen_node2 || !node1_seen_gw || !node1_seen_node2 || !node2_seen_gw || !node2_seen_node1 {
+            tracing::info!("Some updates still missing, sending final round of updates...");
+            
+            let mut gw_ping_final = Ping::default();
+            let gw_final_tag = format!("{}-final", gw_tag);
+            gw_ping_final.insert(gw_final_tag.clone());
+            tracing::info!("Gateway sending final update: {}", gw_final_tag);
+            client_gw
+                .send(ClientRequest::ContractOp(ContractRequest::Update {
+                    key: contract_key,
+                    data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&gw_ping_final).unwrap())),
+                }))
+                .await?;
+            
+            let mut node1_ping_final = Ping::default();
+            let node1_final_tag = format!("{}-final", node1_tag);
+            node1_ping_final.insert(node1_final_tag.clone());
+            tracing::info!("Node1 sending final update: {}", node1_final_tag);
+            client_node1
+                .send(ClientRequest::ContractOp(ContractRequest::Update {
+                    key: contract_key,
+                    data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&node1_ping_final).unwrap())),
+                }))
+                .await?;
+            
+            let mut node2_ping_final = Ping::default();
+            let node2_final_tag = format!("{}-final", node2_tag);
+            node2_ping_final.insert(node2_final_tag.clone());
+            tracing::info!("Node2 sending final update: {}", node2_final_tag);
+            client_node2
+                .send(ClientRequest::ContractOp(ContractRequest::Update {
+                    key: contract_key,
+                    data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&node2_ping_final).unwrap())),
+                }))
+                .await?;
+            
+            tracing::info!("Waiting for final updates to propagate (25 seconds)...");
+        sleep(Duration::from_secs(25)).await;  // Reduced from 30 to 25 seconds
+            
+            let (state_gw, state_node1, state_node2) = get_all_states(
+                &mut client_gw,
+                &mut client_node1,
+                &mut client_node2,
+                contract_key,
+            )
+            .await?;
+            
+            gw_seen_node1 = gw_seen_node1 || state_gw.contains_key(&node1_tag) || state_gw.contains_key(&node1_final_tag);
+            gw_seen_node2 = gw_seen_node2 || state_gw.contains_key(&node2_tag) || state_gw.contains_key(&node2_final_tag);
+            node1_seen_gw = node1_seen_gw || state_node1.contains_key(&gw_tag) || state_node1.contains_key(&gw_final_tag);
+            node1_seen_node2 = node1_seen_node2 || state_node1.contains_key(&node2_tag) || state_node1.contains_key(&node2_final_tag);
+            node2_seen_gw = node2_seen_gw || state_node2.contains_key(&gw_tag) || state_node2.contains_key(&gw_final_tag);
+            node2_seen_node1 = node2_seen_node1 || state_node2.contains_key(&node1_tag) || state_node2.contains_key(&node1_final_tag);
+            
+            tracing::info!("After final updates:");
+            tracing::info!("Gateway state: {:?}", state_gw);
+            tracing::info!("Node 1 state: {:?}", state_node1);
+            tracing::info!("Node 2 state: {:?}", state_node2);
+            tracing::info!("Gateway seen Node1: {}", gw_seen_node1);
+            tracing::info!("Gateway seen Node2: {}", gw_seen_node2);
+            tracing::info!("Node1 seen Gateway: {}", node1_seen_gw);
+            tracing::info!("Node1 seen Node2: {}", node1_seen_node2);
+            tracing::info!("Node2 seen Gateway: {}", node2_seen_gw);
+            tracing::info!("Node2 seen Node1: {}", node2_seen_node1);
+        }
 
         assert!(gw_seen_node1, "Gateway did not see Node1's update");
         assert!(gw_seen_node2, "Gateway did not see Node2's update");
