@@ -1,6 +1,7 @@
 // TODO: complete update logic in the network
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
+use std::time::Duration;
 
 pub(crate) use self::messages::UpdateMsg;
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
@@ -12,6 +13,10 @@ use crate::{
     client_events::HostResult,
     node::{NetworkBridge, OpManager, PeerId},
 };
+
+const MAX_RETRIES: usize = 10;
+const BASE_DELAY_MS: u64 = 100;
+const MAX_DELAY_MS: u64 = 5000;
 
 pub(crate) struct UpdateOp {
     pub id: Transaction,
@@ -93,7 +98,7 @@ impl Operation for UpdateOp {
                 tracing::debug!(tx = %tx, sender = ?sender, "initializing new op");
                 Ok(OpInitialization {
                     op: Self {
-                        state: Some(UpdateState::ReceivedRequest),
+                        state: Some(UpdateState::ReceivedRequest { retry_count: 0 }),
                         id: tx,
                         stats: None, // don't care about stats in target peers
                     },
@@ -292,17 +297,46 @@ impl Operation for UpdateOp {
                         });
 
                     let mut incorrect_results = 0;
+                    let mut failed_peers = Vec::new();
+                    
                     for (peer_num, err) in error_futures {
-                        // remove the failed peers in reverse order
                         let peer = broadcast_to.get(peer_num).unwrap();
                         tracing::warn!(
-                            "failed broadcasting update change to {} with error {}; dropping connection",
+                            "failed broadcasting update change to {} with error {}; will retry",
                             peer.peer,
                             err
                         );
-                        // TODO: review this, maybe we should just dropping this subscription
-                        conn_manager.drop_connection(&peer.peer).await?;
+                        
+                        failed_peers.push(peer.clone());
                         incorrect_results += 1;
+                    }
+                    
+                    if !failed_peers.is_empty() && incorrect_results > 0 {
+                        tracing::debug!(
+                            "Setting up retry for {} failed peers out of {}",
+                            incorrect_results,
+                            broadcast_to.len()
+                        );
+                        
+                        new_state = Some(UpdateState::RetryingBroadcast {
+                            key: *key,
+                            retry_count: 0,
+                            failed_peers,
+                            upstream: upstream.clone(),
+                            new_value: new_value.clone(),
+                        });
+                        
+                        let op = UpdateOp {
+                            id: *id,
+                            state: new_state.clone(),
+                            stats: None,
+                        };
+                        
+                        op_manager
+                            .notify_op_change(NetMessage::from(UpdateMsg::AwaitUpdate { id: *id }), OpEnum::Update(op))
+                            .await?;
+                            
+                        return Err(OpError::StatePushed);
                     }
 
                     broadcasted_to += broadcast_to.len() - incorrect_results;
@@ -385,7 +419,7 @@ async fn try_to_broadcast(
     let return_msg;
 
     match state {
-        Some(UpdateState::ReceivedRequest | UpdateState::BroadcastOngoing) => {
+        Some(UpdateState::ReceivedRequest { retry_count } | UpdateState::BroadcastOngoing { retry_count }) => {
             if broadcast_to.is_empty() && !last_hop {
                 // broadcast complete
                 tracing::debug!(
@@ -404,13 +438,14 @@ async fn try_to_broadcast(
                 new_state = Some(UpdateState::AwaitingResponse {
                     key,
                     upstream: Some(upstream),
+                    retry_count: 0,
                 });
             } else if !broadcast_to.is_empty() {
                 tracing::debug!(
                     "Callback to start broadcasting to other nodes. List size {}",
                     broadcast_to.len()
                 );
-                new_state = Some(UpdateState::BroadcastOngoing);
+                new_state = Some(UpdateState::BroadcastOngoing { retry_count });
 
                 return_msg = Some(UpdateMsg::Broadcasting {
                     id,
@@ -444,6 +479,129 @@ async fn try_to_broadcast(
                     key,
                     sender: op_manager.ring.connection_manager.own_location(),
                 });
+            }
+        }
+        Some(UpdateState::RetryingBroadcast { key, retry_count, failed_peers, upstream: retry_upstream, new_value: retry_value }) => {
+            if retry_count >= MAX_RETRIES {
+                tracing::warn!(
+                    "Maximum retries ({}) reached for broadcasting update to contract {}",
+                    MAX_RETRIES,
+                    key
+                );
+                
+                let raw_state = State::from(retry_value);
+                let summary = StateSummary::from(raw_state.into_bytes());
+                
+                new_state = None;
+                return_msg = Some(UpdateMsg::SuccessfulUpdate {
+                    id,
+                    target: retry_upstream,
+                    summary,
+                    key,
+                    sender: op_manager.ring.connection_manager.own_location(),
+                });
+            } else {
+                let delay_ms = std::cmp::min(
+                    BASE_DELAY_MS * (1 << retry_count), // Exponential backoff: BASE_DELAY_MS * 2^retry_count
+                    MAX_DELAY_MS
+                );
+                
+                tracing::debug!(
+                    "Retrying broadcast for contract {} (retry {}/{}), delaying for {}ms",
+                    key,
+                    retry_count + 1,
+                    MAX_RETRIES,
+                    delay_ms
+                );
+                
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                
+                let mut broadcasting = Vec::with_capacity(failed_peers.len());
+                let sender = op_manager.ring.connection_manager.own_location();
+                
+                for peer in failed_peers.iter() {
+                    let msg = UpdateMsg::BroadcastTo {
+                        id,
+                        key,
+                        new_value: retry_value.clone(),
+                        sender: sender.clone(),
+                        target: peer.clone(),
+                    };
+                    let f = op_manager.ring.connection_manager.send(&peer.peer, msg.into());
+                    broadcasting.push(f);
+                }
+                
+                let error_futures = futures::future::join_all(broadcasting)
+                    .await
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(p, err)| {
+                        if let Err(err) = err {
+                            Some((p, err))
+                        } else {
+                            None
+                        }
+                    });
+                
+                let mut still_failed_peers = Vec::new();
+                let mut incorrect_results = 0;
+                
+                for (peer_num, err) in error_futures {
+                    let peer = failed_peers.get(peer_num).unwrap();
+                    tracing::warn!(
+                        "Failed broadcasting update change to {} with error {} (retry {}/{})",
+                        peer.peer,
+                        err,
+                        retry_count + 1,
+                        MAX_RETRIES
+                    );
+                    
+                    still_failed_peers.push(peer.clone());
+                    incorrect_results += 1;
+                }
+                
+                let successful_broadcasts = failed_peers.len() - incorrect_results;
+                tracing::debug!(
+                    "Successfully broadcasted update contract {key} to {successful_broadcasts} peers on retry {}/{}",
+                    retry_count + 1,
+                    MAX_RETRIES
+                );
+                
+                if still_failed_peers.is_empty() {
+                    let raw_state = State::from(retry_value);
+                    let summary = StateSummary::from(raw_state.into_bytes());
+                    
+                    new_state = None;
+                    return_msg = Some(UpdateMsg::SuccessfulUpdate {
+                        id,
+                        target: retry_upstream,
+                        summary,
+                        key,
+                        sender: op_manager.ring.connection_manager.own_location(),
+                    });
+                } else {
+                    new_state = Some(UpdateState::RetryingBroadcast {
+                        key,
+                        retry_count: retry_count + 1,
+                        failed_peers: still_failed_peers,
+                        upstream: retry_upstream,
+                        new_value: retry_value,
+                    });
+                    
+                    return_msg = None;
+                    
+                    let op = UpdateOp {
+                        id,
+                        state: new_state.clone(),
+                        stats: None,
+                    };
+                    
+                    op_manager
+                        .notify_op_change(NetMessage::from(UpdateMsg::AwaitUpdate { id }), OpEnum::Update(op))
+                        .await?;
+                    
+                    return Err(OpError::StatePushed);
+                }
             }
         }
         _ => return Err(OpError::invalid_transition(id)),
@@ -499,6 +657,7 @@ async fn update_contract(
     related_contracts: RelatedContracts<'static>,
 ) -> Result<WrappedState, OpError> {
     let update_data = UpdateData::State(State::from(state));
+    
     match op_manager
         .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
             key,
@@ -597,6 +756,7 @@ pub(crate) async fn request_update(
             let new_state = Some(UpdateState::AwaitingResponse {
                 key,
                 upstream: None,
+                retry_count: 0,
             });
             let msg = UpdateMsg::RequestUpdate {
                 id,
@@ -750,10 +910,13 @@ mod messages {
 
 #[derive(Debug)]
 pub enum UpdateState {
-    ReceivedRequest,
+    ReceivedRequest {
+        retry_count: usize,
+    },
     AwaitingResponse {
         key: ContractKey,
         upstream: Option<PeerKeyLocation>,
+        retry_count: usize,
     },
     Finished {
         key: ContractKey,
@@ -764,5 +927,14 @@ pub enum UpdateState {
         related_contracts: RelatedContracts<'static>,
         value: WrappedState,
     },
-    BroadcastOngoing,
+    BroadcastOngoing {
+        retry_count: usize,
+    },
+    RetryingBroadcast {
+        key: ContractKey,
+        retry_count: usize,
+        failed_peers: Vec<PeerKeyLocation>,
+        upstream: PeerKeyLocation,
+        new_value: WrappedState,
+    },
 }
