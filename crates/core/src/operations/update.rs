@@ -298,7 +298,7 @@ impl Operation for UpdateOp {
 
                     let mut incorrect_results = 0;
                     let mut failed_peers = Vec::new();
-                    
+
                     for (peer_num, err) in error_futures {
                         let peer = broadcast_to.get(peer_num).unwrap();
                         tracing::warn!(
@@ -306,18 +306,18 @@ impl Operation for UpdateOp {
                             peer.peer,
                             err
                         );
-                        
+
                         failed_peers.push(peer.clone());
                         incorrect_results += 1;
                     }
-                    
+
                     if !failed_peers.is_empty() && incorrect_results > 0 {
                         tracing::debug!(
                             "Setting up retry for {} failed peers out of {}",
                             incorrect_results,
                             broadcast_to.len()
                         );
-                        
+
                         new_state = Some(UpdateState::RetryingBroadcast {
                             key: *key,
                             retry_count: 0,
@@ -325,17 +325,20 @@ impl Operation for UpdateOp {
                             upstream: upstream.clone(),
                             new_value: new_value.clone(),
                         });
-                        
+
                         let op = UpdateOp {
                             id: *id,
                             state: new_state.clone(),
                             stats: None,
                         };
-                        
+
                         op_manager
-                            .notify_op_change(NetMessage::from(UpdateMsg::AwaitUpdate { id: *id }), OpEnum::Update(op))
+                            .notify_op_change(
+                                NetMessage::from(UpdateMsg::AwaitUpdate { id: *id }),
+                                OpEnum::Update(op),
+                            )
                             .await?;
-                            
+
                         return Err(OpError::StatePushed);
                     }
 
@@ -361,7 +364,11 @@ impl Operation for UpdateOp {
                 }
                 UpdateMsg::SuccessfulUpdate { id, summary, .. } => {
                     match self.state {
-                        Some(UpdateState::AwaitingResponse { key, upstream }) => {
+                        Some(UpdateState::AwaitingResponse {
+                            key,
+                            upstream,
+                            retry_count: _,
+                        }) => {
                             tracing::debug!(
                                 tx = %id,
                                 %key,
@@ -419,7 +426,10 @@ async fn try_to_broadcast(
     let return_msg;
 
     match state {
-        Some(UpdateState::ReceivedRequest { retry_count } | UpdateState::BroadcastOngoing { retry_count }) => {
+        Some(
+            UpdateState::ReceivedRequest { retry_count }
+            | UpdateState::BroadcastOngoing { retry_count },
+        ) => {
             if broadcast_to.is_empty() && !last_hop {
                 // broadcast complete
                 tracing::debug!(
@@ -481,17 +491,23 @@ async fn try_to_broadcast(
                 });
             }
         }
-        Some(UpdateState::RetryingBroadcast { key, retry_count, failed_peers, upstream: retry_upstream, new_value: retry_value }) => {
+        Some(UpdateState::RetryingBroadcast {
+            key,
+            retry_count,
+            failed_peers,
+            upstream: retry_upstream,
+            new_value: retry_value,
+        }) => {
             if retry_count >= MAX_RETRIES {
                 tracing::warn!(
                     "Maximum retries ({}) reached for broadcasting update to contract {}",
                     MAX_RETRIES,
                     key
                 );
-                
+
                 let raw_state = State::from(retry_value);
                 let summary = StateSummary::from(raw_state.into_bytes());
-                
+
                 new_state = None;
                 return_msg = Some(UpdateMsg::SuccessfulUpdate {
                     id,
@@ -503,9 +519,9 @@ async fn try_to_broadcast(
             } else {
                 let delay_ms = std::cmp::min(
                     BASE_DELAY_MS * (1 << retry_count), // Exponential backoff: BASE_DELAY_MS * 2^retry_count
-                    MAX_DELAY_MS
+                    MAX_DELAY_MS,
                 );
-                
+
                 tracing::debug!(
                     "Retrying broadcast for contract {} (retry {}/{}), delaying for {}ms",
                     key,
@@ -513,12 +529,12 @@ async fn try_to_broadcast(
                     MAX_RETRIES,
                     delay_ms
                 );
-                
+
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                
+
                 let mut broadcasting = Vec::with_capacity(failed_peers.len());
                 let sender = op_manager.ring.connection_manager.own_location();
-                
+
                 for peer in failed_peers.iter() {
                     let msg = UpdateMsg::BroadcastTo {
                         id,
@@ -527,10 +543,10 @@ async fn try_to_broadcast(
                         sender: sender.clone(),
                         target: peer.clone(),
                     };
-                    let f = op_manager.ring.connection_manager.send(&peer.peer, msg.into());
+                    let f = conn_manager.send(&peer.peer, msg.into());
                     broadcasting.push(f);
                 }
-                
+
                 let error_futures = futures::future::join_all(broadcasting)
                     .await
                     .into_iter()
@@ -542,10 +558,10 @@ async fn try_to_broadcast(
                             None
                         }
                     });
-                
+
                 let mut still_failed_peers = Vec::new();
                 let mut incorrect_results = 0;
-                
+
                 for (peer_num, err) in error_futures {
                     let peer = failed_peers.get(peer_num).unwrap();
                     tracing::warn!(
@@ -555,22 +571,22 @@ async fn try_to_broadcast(
                         retry_count + 1,
                         MAX_RETRIES
                     );
-                    
+
                     still_failed_peers.push(peer.clone());
                     incorrect_results += 1;
                 }
-                
+
                 let successful_broadcasts = failed_peers.len() - incorrect_results;
                 tracing::debug!(
                     "Successfully broadcasted update contract {key} to {successful_broadcasts} peers on retry {}/{}",
                     retry_count + 1,
                     MAX_RETRIES
                 );
-                
+
                 if still_failed_peers.is_empty() {
                     let raw_state = State::from(retry_value);
                     let summary = StateSummary::from(raw_state.into_bytes());
-                    
+
                     new_state = None;
                     return_msg = Some(UpdateMsg::SuccessfulUpdate {
                         id,
@@ -587,19 +603,22 @@ async fn try_to_broadcast(
                         upstream: retry_upstream,
                         new_value: retry_value,
                     });
-                    
+
                     return_msg = None;
-                    
+
                     let op = UpdateOp {
                         id,
                         state: new_state.clone(),
                         stats: None,
                     };
-                    
+
                     op_manager
-                        .notify_op_change(NetMessage::from(UpdateMsg::AwaitUpdate { id }), OpEnum::Update(op))
+                        .notify_op_change(
+                            NetMessage::from(UpdateMsg::AwaitUpdate { id }),
+                            OpEnum::Update(op),
+                        )
                         .await?;
-                    
+
                     return Err(OpError::StatePushed);
                 }
             }
@@ -657,7 +676,7 @@ async fn update_contract(
     related_contracts: RelatedContracts<'static>,
 ) -> Result<WrappedState, OpError> {
     let update_data = UpdateData::State(State::from(state));
-    
+
     match op_manager
         .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
             key,
@@ -908,7 +927,7 @@ mod messages {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum UpdateState {
     ReceivedRequest {
         retry_count: usize,
