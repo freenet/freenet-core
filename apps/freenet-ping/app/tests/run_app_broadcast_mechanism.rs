@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     fmt::Debug,
     net::{Ipv4Addr, SocketAddr, TcpListener},
     path::PathBuf,
@@ -7,7 +6,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::anyhow;
 use freenet::{
     config::{ConfigArgs, InlineGwConfig, NetworkArgs, SecretArgs, WebsocketApiArgs},
     dev_tool::TransportKeypair,
@@ -22,14 +21,13 @@ use freenet_stdlib::{
 use futures::{future::BoxFuture, FutureExt};
 use rand::{random, Rng, SeedableRng};
 use testresult::TestResult;
-use tokio::{select, time::sleep};
+use tokio::{task::LocalSet, time::sleep};
 use tokio_tungstenite::connect_async;
-use tracing::{info, span, warn, Instrument, Level};
+use tracing::info;
 
 use freenet_ping_app::ping_client::{
     wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
 };
-use freenet_ping_types::Ping;
 
 const MAX_UPDATE_RETRIES: usize = 8;
 const INITIAL_DELAY_MS: u64 = 500;
@@ -161,7 +159,7 @@ impl ChronologicalLogger {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_ping_broadcast_mechanism() -> TestResult {
     freenet::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG), None);
 
@@ -272,9 +270,12 @@ async fn test_ping_broadcast_mechanism() -> TestResult {
     }
     .boxed_local();
 
-    tokio::spawn(gateway_node);
-    tokio::spawn(node1);
-    tokio::spawn(node2);
+    let local = LocalSet::new();
+    local.spawn_local(gateway_node);
+    local.spawn_local(node1);
+    local.spawn_local(node2);
+
+    tokio::task::spawn(local);
 
     sleep(Duration::from_secs(10)).await;
 
