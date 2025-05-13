@@ -691,7 +691,27 @@ async fn update_contract(
     state: WrappedState,
     related_contracts: RelatedContracts<'static>,
 ) -> Result<WrappedState, OpError> {
-    let update_data = UpdateData::State(State::from(state));
+    let current_state = match op_manager
+        .notify_contract_handler(ContractHandlerEvent::GetQuery {
+            key,
+            return_contract_code: false,
+        })
+        .await
+    {
+        Ok(ContractHandlerEvent::GetResponse {
+            value: Ok(Some(current)),
+            ..
+        }) => Some(current),
+        _ => None,
+    };
+
+    let update_data = if let Some(current) = current_state {
+        tracing::debug!("Using Delta update for contract {}", key);
+        UpdateData::Delta(StateDelta::from(state.as_ref().to_vec()))
+    } else {
+        tracing::debug!("Using State update for contract {}", key);
+        UpdateData::State(State::from(state))
+    };
 
     match op_manager
         .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
