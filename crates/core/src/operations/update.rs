@@ -273,7 +273,9 @@ impl Operation for UpdateOp {
                                     .pop()
                                     .ok_or(OpError::RingError(RingError::NoLocation))?
                             } else {
-                                let closest = op_manager
+                                
+
+                                op_manager
                                     .ring
                                     .closest_potentially_caching(
                                         key,
@@ -281,9 +283,7 @@ impl Operation for UpdateOp {
                                     )
                                     .into_iter()
                                     .next()
-                                    .ok_or_else(|| RingError::EmptyRing)?;
-
-                                closest
+                                    .ok_or_else(|| RingError::EmptyRing)?
                             };
 
                             let msg = UpdateMsg::SeekNode {
