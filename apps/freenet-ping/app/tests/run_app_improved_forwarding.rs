@@ -106,32 +106,61 @@ fn process_ping_update(
     ttl: Duration,
     update: UpdateData,
 ) -> Result<HashMap<String, DateTime<Utc>>, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    tracing::debug!("Processing ping update with TTL: {:?}", ttl);
+    
     let mut handle_update = |state: &[u8]| {
-        let new_ping = if state.is_empty() {
-            Ping::default()
-        } else {
-            match serde_json::from_slice::<Ping>(state) {
-                Ok(p) => p,
-                Err(e) => {
-                    return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync + 'static>)
-                }
+        if state.is_empty() {
+            tracing::warn!("Received empty state in update");
+            return Ok(HashMap::new());
+        }
+        
+        let new_ping = match serde_json::from_slice::<Ping>(state) {
+            Ok(p) => {
+                tracing::debug!("Successfully deserialized ping update: {}", p);
+                p
+            },
+            Err(e) => {
+                tracing::error!("Failed to deserialize ping update: {}", e);
+                return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync + 'static>);
             }
         };
 
+        tracing::debug!("Local state before merge: {}", local_state);
         let updates = local_state.merge(new_ping, ttl);
+        tracing::debug!("Local state after merge: {}", local_state);
+        tracing::debug!("Updates from merge: {:?}", updates);
         Ok(updates)
     };
 
-    match update {
-        UpdateData::State(state) => handle_update(state.as_ref()),
-        UpdateData::Delta(delta) => handle_update(&delta),
+    let result = match update {
+        UpdateData::State(state) => {
+            tracing::debug!("Processing State update, size: {}", state.as_ref().len());
+            handle_update(state.as_ref())
+        },
+        UpdateData::Delta(delta) => {
+            tracing::debug!("Processing Delta update, size: {}", delta.len());
+            handle_update(&delta)
+        },
         UpdateData::StateAndDelta { state, delta } => {
+            tracing::debug!("Processing StateAndDelta update, state size: {}, delta size: {}", 
+                state.as_ref().len(), delta.len());
             let mut updates = handle_update(&state)?;
             updates.extend(handle_update(&delta)?);
             Ok(updates)
-        }
-        _ => Err("unknown state".into()),
+        },
+        _ => {
+            tracing::error!("Unknown update type");
+            Err("unknown state".into())
+        },
+    };
+    
+    if let Ok(ref updates) = result {
+        tracing::debug!("Processed ping update successfully with {} updates", updates.len());
+    } else if let Err(ref e) = result {
+        tracing::error!("Failed to process ping update: {}", e);
     }
+    
+    result
 }
 
 const APP_TAG: &str = "ping-app-improved-forwarding";
@@ -373,10 +402,13 @@ async fn test_ping_improved_forwarding() -> TestResult {
             
         let mut node1_ping = current_node1_state;
         node1_ping.insert("Update1".to_string());
+        let serialized_ping = serde_json::to_vec(&node1_ping).unwrap();
+        tracing::info!("Node1 sending update with size: {} bytes", serialized_ping.len());
+        
         client_node1_update
             .send(ClientRequest::ContractOp(ContractRequest::Update {
                 key: contract_key.clone(),
-                data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&node1_ping).unwrap())),
+                data: UpdateData::State(State::from(serialized_ping)),
             }))
             .await?;
 
@@ -421,10 +453,13 @@ async fn test_ping_improved_forwarding() -> TestResult {
             
         let mut node2_ping = current_node2_state;
         node2_ping.insert("Update2".to_string());
+        let serialized_ping = serde_json::to_vec(&node2_ping).unwrap();
+        tracing::info!("Node2 sending update with size: {} bytes", serialized_ping.len());
+        
         client_node2_update
             .send(ClientRequest::ContractOp(ContractRequest::Update {
                 key: contract_key.clone(),
-                data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&node2_ping).unwrap())),
+                data: UpdateData::State(State::from(serialized_ping)),
             }))
             .await?;
 
