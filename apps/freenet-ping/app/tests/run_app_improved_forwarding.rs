@@ -18,6 +18,7 @@ use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
+    storage::StateDelta,
 };
 use futures::{future::BoxFuture, FutureExt};
 use rand::{random, Rng, SeedableRng};
@@ -495,10 +496,11 @@ async fn test_ping_improved_forwarding() -> TestResult {
         let serialized_ping = serde_json::to_vec(&node1_ping).unwrap();
         tracing::info!("Node1 sending update with size: {} bytes", serialized_ping.len());
         
+        tracing::info!("Using Delta update for Node1 update");
         client_node1_update
             .send(ClientRequest::ContractOp(ContractRequest::Update {
                 key: contract_key.clone(),
-                data: UpdateData::State(State::from(serialized_ping)),
+                data: UpdateData::Delta(StateDelta::from(serialized_ping)),
             }))
             .await?;
 
@@ -546,10 +548,11 @@ async fn test_ping_improved_forwarding() -> TestResult {
         let serialized_ping = serde_json::to_vec(&node2_ping).unwrap();
         tracing::info!("Node2 sending update with size: {} bytes", serialized_ping.len());
         
+        tracing::info!("Using Delta update for Node2 update");
         client_node2_update
             .send(ClientRequest::ContractOp(ContractRequest::Update {
                 key: contract_key.clone(),
-                data: UpdateData::State(State::from(serialized_ping)),
+                data: UpdateData::Delta(StateDelta::from(serialized_ping)),
             }))
             .await?;
 
