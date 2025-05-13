@@ -1,4 +1,3 @@
-
 use std::{
     collections::HashSet,
     net::{Ipv4Addr, SocketAddr, TcpListener},
@@ -126,10 +125,12 @@ pub async fn setup_test_network(
     let gw_config = gw_config(gw_dir.clone(), gw_ws_port, gw_network_port);
     let gateway_peer_id = gw_config.identity.peer_id();
 
-    let node1_config = base_node_test_config(node1_dir.clone(), node1_ws_port, node1_network_port, vec![]);
+    let node1_config =
+        base_node_test_config(node1_dir.clone(), node1_ws_port, node1_network_port, vec![]);
     let node1_peer_id = node1_config.identity.peer_id();
 
-    let node2_config = base_node_test_config(node2_dir.clone(), node2_ws_port, node2_network_port, vec![]);
+    let node2_config =
+        base_node_test_config(node2_dir.clone(), node2_ws_port, node2_network_port, vec![]);
     let node2_peer_id = node2_config.identity.peer_id();
 
     let gateway_node = {
