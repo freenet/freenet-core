@@ -18,7 +18,6 @@ use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
-    storage::StateDelta,
 };
 use futures::{future::BoxFuture, FutureExt};
 use rand::{random, Rng, SeedableRng};
