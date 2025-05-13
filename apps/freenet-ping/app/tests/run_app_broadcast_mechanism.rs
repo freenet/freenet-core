@@ -170,7 +170,7 @@ async fn test_ping_broadcast_mechanism() -> TestResult {
 
     let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
     let gw_network_port = network_socket_gw.local_addr()?.port();
-    let gw_network_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), gw_network_port);
+    let _gw_network_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), gw_network_port);
 
     let ws_api_port_socket_gw = TcpListener::bind("127.0.0.1:0")?;
     let ws_api_port_socket_node1 = TcpListener::bind("127.0.0.1:0")?;
@@ -184,7 +184,7 @@ async fn test_ping_broadcast_mechanism() -> TestResult {
     let node2_network_port = network_socket_node2.local_addr()?.port();
     let node2_network_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), node2_network_port);
 
-    let (config_gw, preset_cfg_gw, config_gw_info) = {
+    let (config_gw, _preset_cfg_gw, config_gw_info) = {
         let (cfg, preset) = base_node_test_config(
             true,
             vec![],
@@ -203,7 +203,7 @@ async fn test_ping_broadcast_mechanism() -> TestResult {
         &format!("Gateway WS API port: {}", ws_api_port_gw),
     );
 
-    let (config_node1, preset_cfg_node1) = base_node_test_config(
+    let (config_node1, _preset_cfg_node1) = base_node_test_config(
         false,
         vec![serde_json::to_string(&config_gw_info)?],
         Some(node1_network_port),
@@ -218,7 +218,7 @@ async fn test_ping_broadcast_mechanism() -> TestResult {
     );
     node1_logger.log("Node1", &format!("Node1 blocks: {:?}", node2_network_addr));
 
-    let (config_node2, preset_cfg_node2) = base_node_test_config(
+    let (config_node2, _preset_cfg_node2) = base_node_test_config(
         false,
         vec![serde_json::to_string(&config_gw_info)?],
         Some(node2_network_port),
@@ -271,11 +271,14 @@ async fn test_ping_broadcast_mechanism() -> TestResult {
     .boxed_local();
 
     let local = LocalSet::new();
+
     local.spawn_local(gateway_node);
     local.spawn_local(node1);
     local.spawn_local(node2);
 
-    tokio::task::spawn(local);
+    tokio::task::spawn_local(async {
+        local.await;
+    });
 
     sleep(Duration::from_secs(10)).await;
 
@@ -296,9 +299,9 @@ async fn test_ping_broadcast_mechanism() -> TestResult {
     let (stream_node1, _) = connect_async(&uri_node1).await?;
     let (stream_node2, _) = connect_async(&uri_node2).await?;
 
-    let mut client_gw = WebApi::start(stream_gw);
-    let mut client_node1 = WebApi::start(stream_node1);
-    let mut client_node2 = WebApi::start(stream_node2);
+    let client_gw = WebApi::start(stream_gw);
+    let client_node1 = WebApi::start(stream_node1);
+    let client_node2 = WebApi::start(stream_node2);
 
     let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
     tracing::info!(path=%path_to_code.display(), "loading contract code");
@@ -377,62 +380,93 @@ async fn test_ping_broadcast_mechanism() -> TestResult {
 
     sleep(Duration::from_secs(5)).await;
 
-    let get_all_states = |client_gw: &mut WebApi,
-                          client_node1: &mut WebApi,
-                          client_node2: &mut WebApi,
-                          key: ContractKey|
-     -> BoxFuture<'_, anyhow::Result<(Ping, Ping, Ping)>> {
-        Box::pin(async move {
-            info!("Querying all nodes for current state...");
+    let ws_api_port_gw_copy = ws_api_port_gw;
+    let ws_api_port_node1_copy = ws_api_port_node1;
+    let ws_api_port_node2_copy = ws_api_port_node2;
 
-            client_gw
-                .send(ClientRequest::ContractOp(ContractRequest::Get {
-                    key,
-                    return_contract_code: false,
-                    subscribe: false,
-                }))
-                .await?;
+    let get_all_states =
+        move |key: ContractKey| -> BoxFuture<'static, anyhow::Result<(Ping, Ping, Ping)>> {
+            let key = key.clone();
+            let ws_api_port_gw = ws_api_port_gw_copy;
+            let ws_api_port_node1 = ws_api_port_node1_copy;
+            let ws_api_port_node2 = ws_api_port_node2_copy;
 
-            client_node1
-                .send(ClientRequest::ContractOp(ContractRequest::Get {
-                    key,
-                    return_contract_code: false,
-                    subscribe: false,
-                }))
-                .await?;
+            Box::pin(async move {
+                info!("Querying all nodes for current state...");
 
-            client_node2
-                .send(ClientRequest::ContractOp(ContractRequest::Get {
-                    key,
-                    return_contract_code: false,
-                    subscribe: false,
-                }))
-                .await?;
+                let uri_gw = format!(
+                    "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+                    ws_api_port_gw
+                );
+                let uri_node1 = format!(
+                    "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+                    ws_api_port_node1
+                );
+                let uri_node2 = format!(
+                    "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+                    ws_api_port_node2
+                );
 
-            let state_gw = wait_for_get_response(client_gw, &key)
-                .await
-                .map_err(anyhow::Error::msg)?;
+                let (stream_gw, _) = connect_async(&uri_gw).await?;
+                let (stream_node1, _) = connect_async(&uri_node1).await?;
+                let (stream_node2, _) = connect_async(&uri_node2).await?;
 
-            let state_node1 = wait_for_get_response(client_node1, &key)
-                .await
-                .map_err(anyhow::Error::msg)?;
+                let mut client_gw = WebApi::start(stream_gw);
+                let mut client_node1 = WebApi::start(stream_node1);
+                let mut client_node2 = WebApi::start(stream_node2);
 
-            let state_node2 = wait_for_get_response(client_node2, &key)
-                .await
-                .map_err(anyhow::Error::msg)?;
+                client_gw
+                    .send(ClientRequest::ContractOp(ContractRequest::Get {
+                        key,
+                        return_contract_code: false,
+                        subscribe: false,
+                    }))
+                    .await?;
 
-            Ok((state_gw, state_node1, state_node2))
-        })
-    };
+                client_node1
+                    .send(ClientRequest::ContractOp(ContractRequest::Get {
+                        key,
+                        return_contract_code: false,
+                        subscribe: false,
+                    }))
+                    .await?;
+
+                client_node2
+                    .send(ClientRequest::ContractOp(ContractRequest::Get {
+                        key,
+                        return_contract_code: false,
+                        subscribe: false,
+                    }))
+                    .await?;
+
+                let state_gw = wait_for_get_response(&mut client_gw, &key)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+
+                let state_node1 = wait_for_get_response(&mut client_node1, &key)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+
+                let state_node2 = wait_for_get_response(&mut client_node2, &key)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+
+                Ok((state_gw, state_node1, state_node2))
+            })
+        };
 
     let send_update_and_check_propagation = |source_node: &str,
-                                             source_client: &mut WebApi,
                                              key: &ContractKey,
+                                             ws_api_port: u16,
                                              logger: Arc<ChronologicalLogger>|
-     -> BoxFuture<'_, anyhow::Result<bool>> {
+     -> BoxFuture<'static, anyhow::Result<bool>> {
         let key = *key;
         let source_node = source_node.to_string();
         let logger = logger.clone();
+        let source_uri = format!(
+            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+            ws_api_port
+        );
 
         Box::pin(async move {
             let timestamp = SystemTime::now()
@@ -446,6 +480,9 @@ async fn test_ping_broadcast_mechanism() -> TestResult {
                 &source_node,
                 &format!("Sending update with ID: {}", update_id),
             );
+
+            let (stream_source, _) = connect_async(&source_uri).await?;
+            let mut source_client = WebApi::start(stream_source);
 
             let mut delay_ms = INITIAL_DELAY_MS;
             let mut success = false;
@@ -477,6 +514,23 @@ async fn test_ping_broadcast_mechanism() -> TestResult {
                             &format!("Update attempt {} failed: {}", attempt, e),
                         );
 
+                        if e.to_string().contains("connection") {
+                            let (new_stream, _) = match connect_async(&source_uri).await {
+                                Ok(s) => {
+                                    logger.log(&source_node, "Reconnected successfully");
+                                    s
+                                }
+                                Err(e) => {
+                                    logger
+                                        .log(&source_node, &format!("Reconnection failed: {}", e));
+                                    delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+                                    sleep(Duration::from_millis(delay_ms)).await;
+                                    continue;
+                                }
+                            };
+                            source_client = WebApi::start(new_stream);
+                        }
+
                         delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
                         sleep(Duration::from_millis(delay_ms)).await;
                     }
@@ -491,22 +545,22 @@ async fn test_ping_broadcast_mechanism() -> TestResult {
                 return Ok(false);
             }
 
-            let uri_gw = format!(
+            let gw_uri = format!(
                 "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
                 ws_api_port_gw
             );
-            let uri_node1 = format!(
+            let node1_uri = format!(
                 "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
                 ws_api_port_node1
             );
-            let uri_node2 = format!(
+            let node2_uri = format!(
                 "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
                 ws_api_port_node2
             );
 
-            let (stream_gw, _) = connect_async(&uri_gw).await?;
-            let (stream_node1, _) = connect_async(&uri_node1).await?;
-            let (stream_node2, _) = connect_async(&uri_node2).await?;
+            let (stream_gw, _) = connect_async(&gw_uri).await?;
+            let (stream_node1, _) = connect_async(&node1_uri).await?;
+            let (stream_node2, _) = connect_async(&node2_uri).await?;
 
             let mut client_gw = WebApi::start(stream_gw);
             let mut client_node1 = WebApi::start(stream_node1);
@@ -520,8 +574,7 @@ async fn test_ping_broadcast_mechanism() -> TestResult {
 
                 sleep(Duration::from_millis(PROPAGATION_CHECK_INTERVAL_MS)).await;
 
-                let states_result =
-                    get_all_states(&mut client_gw, &mut client_node1, &mut client_node2, key).await;
+                let states_result = get_all_states(key).await;
 
                 match states_result {
                     Ok((gw_ping, node1_ping, node2_ping)) => {
@@ -568,24 +621,24 @@ async fn test_ping_broadcast_mechanism() -> TestResult {
 
     let node1_to_node2_result = send_update_and_check_propagation(
         "Node1",
-        &mut client_node1,
         &contract_key,
+        ws_api_port_node1,
         node1_logger.clone(),
     )
     .await?;
 
     let node2_to_node1_result = send_update_and_check_propagation(
         "Node2",
-        &mut client_node2,
         &contract_key,
+        ws_api_port_node2,
         node2_logger.clone(),
     )
     .await?;
 
     let gateway_to_nodes_result = send_update_and_check_propagation(
         "Gateway",
-        &mut client_gw,
         &contract_key,
+        ws_api_port_gw,
         gateway_logger.clone(),
     )
     .await?;
