@@ -535,7 +535,9 @@ async fn try_to_broadcast(
                 let mut broadcasting = Vec::with_capacity(failed_peers.len());
                 let sender = op_manager.ring.connection_manager.own_location();
 
-                for peer in failed_peers.iter() {
+                let mut failed_broadcasts = Vec::new();
+
+                for (i, peer) in failed_peers.iter().enumerate() {
                     let msg = UpdateMsg::BroadcastTo {
                         id,
                         key,
@@ -543,29 +545,42 @@ async fn try_to_broadcast(
                         sender: sender.clone(),
                         target: peer.clone(),
                     };
-                    let f = op_manager
-                        .ring
-                        .connection_manager
-                        .send(&peer.peer, msg.into());
-                    broadcasting.push(f);
+
+                    match op_manager
+                        .notify_op_change(
+                            NetMessage::from(msg),
+                            OpEnum::Update(UpdateOp {
+                                id,
+                                state: Some(UpdateState::RetryingBroadcast {
+                                    key,
+                                    retry_count,
+                                    failed_peers: failed_peers.clone(),
+                                    upstream: retry_upstream.clone(),
+                                    new_value: retry_value.clone(),
+                                }),
+                                stats: None,
+                            }),
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            tracing::debug!("Successfully sent retry broadcast to {}", peer.peer);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                "Failed to send retry broadcast to {}: {}",
+                                peer.peer,
+                                err
+                            );
+                            failed_broadcasts.push((i, err));
+                        }
+                    }
                 }
 
-                let error_futures = futures::future::join_all(broadcasting)
-                    .await
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(p, err)| {
-                        if let Err(err) = err {
-                            Some((p, err))
-                        } else {
-                            None
-                        }
-                    });
-
                 let mut still_failed_peers = Vec::new();
-                let mut incorrect_results = 0;
+                let incorrect_results = failed_broadcasts.len();
 
-                for (peer_num, err) in error_futures {
+                for (peer_num, err) in failed_broadcasts {
                     let peer = failed_peers.get(peer_num).unwrap();
                     tracing::warn!(
                         "Failed broadcasting update change to {} with error {} (retry {}/{})",
@@ -576,7 +591,6 @@ async fn try_to_broadcast(
                     );
 
                     still_failed_peers.push(peer.clone());
-                    incorrect_results += 1;
                 }
 
                 let successful_broadcasts = failed_peers.len() - incorrect_results;
