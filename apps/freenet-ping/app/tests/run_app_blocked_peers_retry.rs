@@ -104,7 +104,8 @@ fn process_ping_update(
     local_state: &mut Ping,
     ttl: Duration,
     update: UpdateData,
-) -> Result<HashMap<String, Vec<DateTime<Utc>>>, Box<dyn std::error::Error + Send + Sync + 'static>> {
+) -> Result<HashMap<String, Vec<DateTime<Utc>>>, Box<dyn std::error::Error + Send + Sync + 'static>>
+{
     let mut handle_update = |state: &[u8]| {
         let new_ping = if state.is_empty() {
             Ping::default()
@@ -496,7 +497,7 @@ async fn test_ping_blocked_peers_retry() -> TestResult {
         let current_node2_state = wait_for_get_response(&mut client_node2, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-            
+
         let mut node2_ping = current_node2_state;
         node2_ping.insert(node2_tag.clone());
         tracing::info!(%node2_ping, "Node 2 sending update with tag: {}", node2_tag);

@@ -92,7 +92,7 @@ pub async fn wait_for_get_response(
                     Ok(ping) => {
                         tracing::info!(num_entries = %ping.len(), "old state fetched successfully!");
                         return Ok(ping);
-                    },
+                    }
                     Err(e) => {
                         tracing::error!("Failed to deserialize Ping: {}", e);
                         tracing::error!("Raw state data: {:?}", String::from_utf8_lossy(&state));

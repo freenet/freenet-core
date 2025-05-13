@@ -23,7 +23,9 @@ use futures::{future::BoxFuture, FutureExt};
 use rand::{random, Rng, SeedableRng};
 use testresult::TestResult;
 use tokio::{net::TcpStream, sync::Mutex, time::sleep};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, WebSocketStream, MaybeTlsStream};
+use tokio_tungstenite::{
+    connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
+};
 use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 
 use freenet_ping_app::ping_client::{
@@ -105,20 +107,21 @@ fn process_ping_update(
     local_state: &mut Ping,
     ttl: Duration,
     update: UpdateData,
-) -> Result<HashMap<String, Vec<DateTime<Utc>>>, Box<dyn std::error::Error + Send + Sync + 'static>> {
+) -> Result<HashMap<String, Vec<DateTime<Utc>>>, Box<dyn std::error::Error + Send + Sync + 'static>>
+{
     tracing::debug!("Processing ping update with TTL: {:?}", ttl);
-    
+
     let mut handle_update = |state: &[u8]| {
         if state.is_empty() {
             tracing::warn!("Received empty state in update");
             return Ok(HashMap::new());
         }
-        
+
         let new_ping = match serde_json::from_slice::<Ping>(state) {
             Ok(p) => {
                 tracing::debug!("Successfully deserialized ping update: {}", p);
                 p
-            },
+            }
             Err(e) => {
                 tracing::error!("Failed to deserialize ping update: {}", e);
                 return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync + 'static>);
@@ -136,30 +139,36 @@ fn process_ping_update(
         UpdateData::State(state) => {
             tracing::debug!("Processing State update, size: {}", state.as_ref().len());
             handle_update(state.as_ref())
-        },
+        }
         UpdateData::Delta(delta) => {
             tracing::debug!("Processing Delta update, size: {}", delta.len());
             handle_update(&delta)
-        },
+        }
         UpdateData::StateAndDelta { state, delta } => {
-            tracing::debug!("Processing StateAndDelta update, state size: {}, delta size: {}", 
-                state.as_ref().len(), delta.len());
+            tracing::debug!(
+                "Processing StateAndDelta update, state size: {}, delta size: {}",
+                state.as_ref().len(),
+                delta.len()
+            );
             let mut updates = handle_update(&state)?;
             updates.extend(handle_update(&delta)?);
             Ok(updates)
-        },
+        }
         _ => {
             tracing::error!("Unknown update type");
             Err("unknown state".into())
-        },
+        }
     };
-    
+
     if let Ok(ref updates) = result {
-        tracing::debug!("Processed ping update successfully with {} updates", updates.len());
+        tracing::debug!(
+            "Processed ping update successfully with {} updates",
+            updates.len()
+        );
     } else if let Err(ref e) = result {
         tracing::error!("Failed to process ping update: {}", e);
     }
-    
+
     result
 }
 
@@ -169,7 +178,10 @@ const APP_TAG: &str = "ping-app-improved-forwarding";
 async fn test_ping_improved_forwarding() -> TestResult {
     freenet::config::set_logger(
         Some(LevelFilter::DEBUG),
-        Some("debug,freenet::operations::update=trace,freenet::operations::subscribe=trace".to_string()),
+        Some(
+            "debug,freenet::operations::update=trace,freenet::operations::subscribe=trace"
+                .to_string(),
+        ),
     );
 
     let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
@@ -191,7 +203,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
         let path = preset.temp_dir.path().to_path_buf();
         (cfg, preset, gw_config(public_port, &path)?)
     };
-    
+
     let node2_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0); // Will be updated later
     let (config_node1, preset_cfg_node1) = base_node_test_config(
         false,
@@ -213,22 +225,31 @@ async fn test_ping_improved_forwarding() -> TestResult {
     )
     .await?;
     let ws_api_port_node2 = config_node2.ws_api.ws_api_port.unwrap();
-    
+
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
-    
-    let uri_gw = format!("ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native", ws_api_port_gw);
-    let uri_node1 = format!("ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native", ws_api_port_node1);
-    let uri_node2 = format!("ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native", ws_api_port_node2);
-    
+
+    let uri_gw = format!(
+        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+        ws_api_port_gw
+    );
+    let uri_node1 = format!(
+        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+        ws_api_port_node1
+    );
+    let uri_node2 = format!(
+        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+        ws_api_port_node2
+    );
+
     tracing::info!("Gateway node data dir: {:?}", preset_cfg_gw.temp_dir.path());
     tracing::info!("Node 1 data dir: {:?}", preset_cfg_node1.temp_dir.path());
     tracing::info!("Node 2 data dir: {:?}", preset_cfg_node2.temp_dir.path());
-    
+
     std::mem::drop(network_socket_gw);
     std::mem::drop(ws_api_port_socket_gw);
     std::mem::drop(ws_api_port_socket_node1);
     std::mem::drop(ws_api_port_socket_node2);
-    
+
     let gateway_node = async {
         let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -258,12 +279,15 @@ async fn test_ping_improved_forwarding() -> TestResult {
         node.run().await
     }
     .boxed_local();
-    
+
     tracing::info!("Waiting for nodes to initialize...");
     sleep(Duration::from_secs(30)).await;
     tracing::info!("Attempting to connect to nodes with retry mechanism...");
-    
-    async fn connect_with_retries(uri: &str, max_attempts: usize) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, anyhow::Error> {
+
+    async fn connect_with_retries(
+        uri: &str,
+        max_attempts: usize,
+    ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, anyhow::Error> {
         let mut attempt = 1;
         loop {
             match connect_async(uri).await {
@@ -273,34 +297,43 @@ async fn test_ping_improved_forwarding() -> TestResult {
                 }
                 Err(e) => {
                     if attempt >= max_attempts {
-                        return Err(anyhow::anyhow!("Failed to connect after {} attempts: {}", max_attempts, e));
+                        return Err(anyhow::anyhow!(
+                            "Failed to connect after {} attempts: {}",
+                            max_attempts,
+                            e
+                        ));
                     }
-                    tracing::warn!("Connection attempt {} failed for {}: {}. Retrying in 5 seconds...", attempt, uri, e);
+                    tracing::warn!(
+                        "Connection attempt {} failed for {}: {}. Retrying in 5 seconds...",
+                        attempt,
+                        uri,
+                        e
+                    );
                     attempt += 1;
                     sleep(Duration::from_secs(5)).await;
                 }
             }
         }
     }
-    
+
     let test = async {
         tracing::info!("Connecting to Gateway node...");
         let stream_gw = connect_with_retries(&uri_gw, 10).await?;
-        
+
         tracing::info!("Connecting to Node 1...");
         let stream_node1 = connect_with_retries(&uri_node1, 10).await?;
-        
+
         tracing::info!("Connecting to Node 2...");
         let stream_node2 = connect_with_retries(&uri_node2, 10).await?;
-        
+
         let mut client_gw = WebApi::start(stream_gw);
         let mut client_node1 = WebApi::start(stream_node1);
         let mut client_node2 = WebApi::start(stream_node2);
-        
+
         let (stream_gw_update, _) = connect_async(&uri_gw).await?;
         let (stream_node1_update, _) = connect_async(&uri_node1).await?;
         let (stream_node2_update, _) = connect_async(&uri_node2).await?;
-        
+
         let mut client_gw_update = WebApi::start(stream_gw_update);
         let mut client_node1_update = WebApi::start(stream_node1_update);
         let mut client_node2_update = WebApi::start(stream_node2_update);
@@ -336,7 +369,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
         tracing::info!("Deployed ping contract with key: {}", contract_key);
 
         client_node1
-            .send(ClientRequest::ContractOp(ContractRequest::Subscribe { 
+            .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
                 key: contract_key.clone(),
                 summary: None,
             }))
@@ -345,7 +378,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
         tracing::info!("Node1 subscribed to contract: {}", contract_key);
 
         client_node2
-            .send(ClientRequest::ContractOp(ContractRequest::Subscribe { 
+            .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
                 key: contract_key.clone(),
                 summary: None,
             }))
@@ -354,7 +387,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
         tracing::info!("Node2 subscribed to contract: {}", contract_key);
 
         client_gw
-            .send(ClientRequest::ContractOp(ContractRequest::Subscribe { 
+            .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
                 key: contract_key.clone(),
                 summary: None,
             }))
@@ -379,15 +412,24 @@ async fn test_ping_improved_forwarding() -> TestResult {
             async move {
                 loop {
                     match client.recv().await {
-                        Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
-                            key: update_key,
-                            update,
-                        })) => {
+                        Ok(HostResponse::ContractResponse(
+                            ContractResponse::UpdateNotification {
+                                key: update_key,
+                                update,
+                            },
+                        )) => {
                             if update_key == contract_key {
-                                match process_ping_update(&mut gateway_state, Duration::from_secs(120), update) {
+                                match process_ping_update(
+                                    &mut gateway_state,
+                                    Duration::from_secs(120),
+                                    update,
+                                ) {
                                     Ok(updates) => {
                                         for (name, _) in updates {
-                                            tracing::info!("Gateway received update from: {}", name);
+                                            tracing::info!(
+                                                "Gateway received update from: {}",
+                                                name
+                                            );
                                             let mut counter = counter.lock().await;
                                             counter.insert(format!("Gateway-{}", name));
                                         }
@@ -414,12 +456,18 @@ async fn test_ping_improved_forwarding() -> TestResult {
             async move {
                 loop {
                     match client.recv().await {
-                        Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
-                            key: update_key,
-                            update,
-                        })) => {
+                        Ok(HostResponse::ContractResponse(
+                            ContractResponse::UpdateNotification {
+                                key: update_key,
+                                update,
+                            },
+                        )) => {
                             if update_key == contract_key {
-                                match process_ping_update(&mut node1_state, Duration::from_secs(120), update) {
+                                match process_ping_update(
+                                    &mut node1_state,
+                                    Duration::from_secs(120),
+                                    update,
+                                ) {
                                     Ok(updates) => {
                                         for (name, _) in updates {
                                             tracing::info!("Node1 received update from: {}", name);
@@ -449,12 +497,18 @@ async fn test_ping_improved_forwarding() -> TestResult {
             async move {
                 loop {
                     match client.recv().await {
-                        Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
-                            key: update_key,
-                            update,
-                        })) => {
+                        Ok(HostResponse::ContractResponse(
+                            ContractResponse::UpdateNotification {
+                                key: update_key,
+                                update,
+                            },
+                        )) => {
                             if update_key == contract_key {
-                                match process_ping_update(&mut node2_state, Duration::from_secs(120), update) {
+                                match process_ping_update(
+                                    &mut node2_state,
+                                    Duration::from_secs(120),
+                                    update,
+                                ) {
                                     Ok(updates) => {
                                         for (name, _) in updates {
                                             tracing::info!("Node2 received update from: {}", name);
@@ -489,12 +543,15 @@ async fn test_ping_improved_forwarding() -> TestResult {
         let current_node1_state = wait_for_get_response(&mut client_node1_update, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-            
+
         let mut node1_ping = current_node1_state;
         node1_ping.insert("Update1".to_string());
         let serialized_ping = serde_json::to_vec(&node1_ping).unwrap();
-        tracing::info!("Node1 sending update with size: {} bytes", serialized_ping.len());
-        
+        tracing::info!(
+            "Node1 sending update with size: {} bytes",
+            serialized_ping.len()
+        );
+
         tracing::info!("Using Delta update for Node1 update");
         client_node1_update
             .send(ClientRequest::ContractOp(ContractRequest::Update {
@@ -506,20 +563,21 @@ async fn test_ping_improved_forwarding() -> TestResult {
         let mut update1_propagated = false;
         for i in 1..=15 {
             sleep(Duration::from_secs(2)).await;
-            
+
             let counter = update_counter.lock().await;
-            tracing::info!("Update1 propagation check {}/15: Gateway={}, Node2={}", 
-                i, 
-                counter.contains("Gateway-Update1"), 
+            tracing::info!(
+                "Update1 propagation check {}/15: Gateway={}, Node2={}",
+                i,
+                counter.contains("Gateway-Update1"),
                 counter.contains("Node2-Update1")
             );
-            
+
             if counter.contains("Gateway-Update1") && counter.contains("Node2-Update1") {
                 tracing::info!("Update1 propagated to all nodes successfully");
                 update1_propagated = true;
                 break;
             }
-            
+
             if i == 15 {
                 tracing::warn!("Update1 failed to propagate to all nodes after maximum retries");
             }
@@ -541,12 +599,15 @@ async fn test_ping_improved_forwarding() -> TestResult {
         let current_node2_state = wait_for_get_response(&mut client_node2_update, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-            
+
         let mut node2_ping = current_node2_state;
         node2_ping.insert("Update2".to_string());
         let serialized_ping = serde_json::to_vec(&node2_ping).unwrap();
-        tracing::info!("Node2 sending update with size: {} bytes", serialized_ping.len());
-        
+        tracing::info!(
+            "Node2 sending update with size: {} bytes",
+            serialized_ping.len()
+        );
+
         tracing::info!("Using Delta update for Node2 update");
         client_node2_update
             .send(ClientRequest::ContractOp(ContractRequest::Update {
@@ -558,17 +619,18 @@ async fn test_ping_improved_forwarding() -> TestResult {
         let mut update2_propagated = false;
         for i in 1..=15 {
             sleep(Duration::from_secs(2)).await;
-            
+
             let counter = update_counter.lock().await;
-            tracing::info!("Update2 propagation check {}/15: Gateway={}, Node1={}", 
-                i, 
-                counter.contains("Gateway-Update2"), 
+            tracing::info!(
+                "Update2 propagation check {}/15: Gateway={}, Node1={}",
+                i,
+                counter.contains("Gateway-Update2"),
                 counter.contains("Node1-Update2")
             );
-            
+
             if counter.contains("Gateway-Update2") {
                 tracing::info!("Update2 propagated to Gateway successfully");
-                
+
                 if counter.contains("Node1-Update2") {
                     tracing::info!("Update2 propagated to Node1 successfully");
                     update2_propagated = true;
@@ -577,7 +639,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
                     tracing::warn!("Update2 failed to propagate from Gateway to Node1");
                 }
             }
-            
+
             if i == 15 {
                 tracing::warn!("Update2 failed to propagate to all nodes after maximum retries");
                 if counter.contains("Gateway-Update2") {
@@ -590,7 +652,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
         gateway_handle.abort();
         node1_handle.abort();
         node2_handle.abort();
-        
+
         if update1_propagated && update2_propagated {
             tracing::info!("All updates propagated successfully!");
         } else {
