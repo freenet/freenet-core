@@ -273,8 +273,6 @@ impl Operation for UpdateOp {
                                     .pop()
                                     .ok_or(OpError::RingError(RingError::NoLocation))?
                             } else {
-                                
-
                                 op_manager
                                     .ring
                                     .closest_potentially_caching(
