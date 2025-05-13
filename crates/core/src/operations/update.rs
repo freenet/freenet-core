@@ -878,7 +878,39 @@ impl OpManager {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-
+        
+        if subscribers.is_empty() {
+            let mut closest_peers = Vec::new();
+            let key_location = Location::from(key);
+            let skip_list = std::collections::HashSet::from([sender.clone()]);
+            
+            if let Some(closest) = self.ring.closest_potentially_caching(key, &skip_list) {
+                closest_peers.push(closest);
+                tracing::debug!("Found closest potentially caching peer for contract {}", key);
+            }
+            
+            if let Some(closest) = self.ring.closest_to_location(key_location, skip_list.clone()) {
+                if !closest_peers.iter().any(|p| p.peer == closest.peer) {
+                    closest_peers.push(closest);
+                    tracing::debug!("Found closest peer by location for contract {}", key);
+                }
+            }
+            
+            tracing::debug!(
+                "No direct subscribers for contract {}, forwarding to {} closest peers",
+                key,
+                closest_peers.len()
+            );
+            
+            return closest_peers;
+        }
+        
+        tracing::debug!(
+            "Forwarding update for contract {} to {} subscribers",
+            key,
+            subscribers.len()
+        );
+        
         subscribers
     }
 }
