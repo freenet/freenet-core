@@ -21,9 +21,9 @@ use freenet_stdlib::{
 use futures::FutureExt;
 use rand::{random, Rng, SeedableRng};
 use testresult::TestResult;
-use tokio::{select, time::sleep};
+use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
-use tracing::{level_filters::LevelFilter, span, Instrument, Level};
+use tracing::level_filters::LevelFilter;
 
 use freenet_ping_app::ping_client::{
     wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,

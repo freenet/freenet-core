@@ -26,7 +26,7 @@ use tokio::{net::TcpStream, sync::Mutex, time::sleep};
 use tokio_tungstenite::{
     connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
 };
-use tracing::{level_filters::LevelFilter, span, Instrument, Level};
+use tracing::level_filters::LevelFilter;
 
 use freenet_ping_app::ping_client::{
     wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
