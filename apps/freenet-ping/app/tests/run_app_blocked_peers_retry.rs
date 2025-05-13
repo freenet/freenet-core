@@ -18,7 +18,7 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, WebApi},
     prelude::*,
 };
-use futures::{future::BoxFuture, FutureExt};
+use futures::FutureExt;
 use rand::{random, Rng, SeedableRng};
 use testresult::TestResult;
 use tokio::{select, time::sleep};
@@ -104,7 +104,7 @@ fn process_ping_update(
     local_state: &mut Ping,
     ttl: Duration,
     update: UpdateData,
-) -> Result<HashMap<String, DateTime<Utc>>, Box<dyn std::error::Error + Send + Sync + 'static>> {
+) -> Result<HashMap<String, Vec<DateTime<Utc>>>, Box<dyn std::error::Error + Send + Sync + 'static>> {
     let mut handle_update = |state: &[u8]| {
         let new_ping = if state.is_empty() {
             Ping::default()
@@ -405,7 +405,7 @@ async fn test_ping_blocked_peers_retry() -> TestResult {
                 .map_err(anyhow::Error::msg)?;
 
             Ok((state_gw, state_node1, state_node2))
-        };
+        }
 
         let verify_all_tags_present =
             |gw: &Ping, node1: &Ping, node2: &Ping, tags: &[String]| -> bool {
