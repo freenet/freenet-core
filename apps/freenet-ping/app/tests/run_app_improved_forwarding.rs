@@ -295,7 +295,8 @@ async fn test_ping_improved_forwarding() -> TestResult {
         let container = ContractContainer::try_from((code.clone(), &params))?;
         let contract_key = container.key();
 
-        client_node1
+        tracing::info!("Deploying ping contract to Gateway node instead of Node1");
+        client_gw
             .send(ClientRequest::ContractOp(ContractRequest::Put {
                 contract: container.clone(),
                 state: wrapped_state.clone(),
@@ -304,7 +305,8 @@ async fn test_ping_improved_forwarding() -> TestResult {
             }))
             .await?;
 
-        wait_for_put_response(&mut client_node1, &contract_key).await?;
+        tracing::info!("Waiting for put response from Gateway node...");
+        wait_for_put_response(&mut client_gw, &contract_key).await?;
 
         tracing::info!("Deployed ping contract with key: {}", contract_key);
 
