@@ -15,7 +15,7 @@ use freenet::{
 };
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractRequest, WebApi},
     prelude::*,
 };
 use futures::{future::BoxFuture, FutureExt};
@@ -26,8 +26,7 @@ use tokio_tungstenite::connect_async;
 use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 
 use freenet_ping_app::ping_client::{
-    run_ping_client, wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
-    PingStats,
+    wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
 };
 
 static RNG: once_cell::sync::Lazy<std::sync::Mutex<rand::rngs::StdRng>> =
@@ -140,7 +139,7 @@ const APP_TAG: &str = "ping-app";
 async fn test_ping_blocked_peers_retry() -> TestResult {
     freenet::config::set_logger(
         Some(LevelFilter::DEBUG),
-        Some("debug,freenet::operations::update=trace,freenet::contract=trace"),
+        Some("debug,freenet::operations::update=trace,freenet::contract=trace".to_string()),
     );
 
     let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
