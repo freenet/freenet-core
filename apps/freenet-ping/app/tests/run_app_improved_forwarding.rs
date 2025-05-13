@@ -192,22 +192,74 @@ async fn test_ping_improved_forwarding() -> TestResult {
         (cfg, preset, gw_config(public_port, &path)?)
     };
     
-    let network_port_node1 = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
-    let network_port_node2 = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
-    let node1_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), network_port_node1);
-    let node2_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), network_port_node2);
+    let node2_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0); // Will be updated later
+    let (config_node1, preset_cfg_node1) = base_node_test_config(
+        false,
+        vec![serde_json::to_string(&config_gw_info)?],
+        None,
+        ws_api_port_socket_node1.local_addr()?.port(),
+        Some(vec![node2_addr]), // Block node 2
+    )
+    .await?;
+    let ws_api_port_node1 = config_node1.ws_api.ws_api_port.unwrap();
 
+    let node1_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0); // Will be updated later
+    let (config_node2, preset_cfg_node2) = base_node_test_config(
+        false,
+        vec![serde_json::to_string(&config_gw_info)?],
+        None,
+        ws_api_port_socket_node2.local_addr()?.port(),
+        Some(vec![node1_addr]), // Block node 1
+    )
+    .await?;
+    let ws_api_port_node2 = config_node2.ws_api.ws_api_port.unwrap();
+    
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
-    let ws_api_port_node1 = ws_api_port_socket_node1.local_addr()?.port();
-    let ws_api_port_node2 = ws_api_port_socket_node2.local_addr()?.port();
     
     let uri_gw = format!("ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native", ws_api_port_gw);
     let uri_node1 = format!("ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native", ws_api_port_node1);
     let uri_node2 = format!("ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native", ws_api_port_node2);
     
-    tracing::info!("Setting up blocked peers: Node1 will block Node2 and vice versa");
-    tracing::info!("Node1 address: {:?}", node1_addr);
-    tracing::info!("Node2 address: {:?}", node2_addr);
+    tracing::info!("Gateway node data dir: {:?}", preset_cfg_gw.temp_dir.path());
+    tracing::info!("Node 1 data dir: {:?}", preset_cfg_node1.temp_dir.path());
+    tracing::info!("Node 2 data dir: {:?}", preset_cfg_node2.temp_dir.path());
+    
+    std::mem::drop(network_socket_gw);
+    std::mem::drop(ws_api_port_socket_gw);
+    std::mem::drop(ws_api_port_socket_node1);
+    std::mem::drop(ws_api_port_socket_node2);
+    
+    let gateway_node = async {
+        let config = config_gw.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    let node1 = async move {
+        let config = config_node1.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    let node2 = async {
+        let config = config_node2.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+    
+    sleep(Duration::from_secs(10)).await;
     
     let test = async {
         let (stream_gw, _) = connect_async(&uri_gw).await?;
@@ -523,6 +575,15 @@ async fn test_ping_improved_forwarding() -> TestResult {
         Ok(()) as TestResult
     };
 
-    let result = test.await;
-    result
+    tokio::select! {
+        res = test => {
+            match res {
+                Ok(()) => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        }
+        res = gateway_node => Err(anyhow!("Gateway node failed: {:?}", res).into()),
+        res = node1 => Err(anyhow!("Node 1 failed: {:?}", res).into()),
+        res = node2 => Err(anyhow!("Node 2 failed: {:?}", res).into()),
+    }
 }
