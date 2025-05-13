@@ -360,7 +360,21 @@ async fn test_ping_improved_forwarding() -> TestResult {
         });
 
         tracing::info!("Node1 sending update 1");
-        let mut node1_ping = Ping::default();
+        client_node1_update
+            .send(ClientRequest::ContractOp(ContractRequest::Get {
+                key: contract_key.clone(),
+                return_contract_code: false,
+                subscribe: false,
+            }))
+            .await?;
+        let current_node1_state = wait_for_get_response(&mut client_node1_update, &contract_key)
+            .await
+            .map_err(anyhow::Error::msg)?;
+            
+        let mut node1_ping = match current_node1_state {
+            Some(state) => serde_json::from_slice::<Ping>(&state).unwrap_or_default(),
+            None => Ping::default(),
+        };
         node1_ping.insert("Update1".to_string());
         client_node1_update
             .send(ClientRequest::ContractOp(ContractRequest::Update {
@@ -391,7 +405,21 @@ async fn test_ping_improved_forwarding() -> TestResult {
         }
 
         tracing::info!("Node2 sending update 2");
-        let mut node2_ping = Ping::default();
+        client_node2_update
+            .send(ClientRequest::ContractOp(ContractRequest::Get {
+                key: contract_key.clone(),
+                return_contract_code: false,
+                subscribe: false,
+            }))
+            .await?;
+        let current_node2_state = wait_for_get_response(&mut client_node2_update, &contract_key)
+            .await
+            .map_err(anyhow::Error::msg)?;
+            
+        let mut node2_ping = match current_node2_state {
+            Some(state) => serde_json::from_slice::<Ping>(&state).unwrap_or_default(),
+            None => Ping::default(),
+        };
         node2_ping.insert("Update2".to_string());
         client_node2_update
             .send(ClientRequest::ContractOp(ContractRequest::Update {
