@@ -259,7 +259,9 @@ async fn test_ping_improved_forwarding() -> TestResult {
     }
     .boxed_local();
     
-    sleep(Duration::from_secs(10)).await;
+    tracing::info!("Waiting for nodes to initialize...");
+    sleep(Duration::from_secs(30)).await;
+    tracing::info!("Attempting to connect to nodes...");
     
     let test = async {
         let (stream_gw, _) = connect_async(&uri_gw).await?;
