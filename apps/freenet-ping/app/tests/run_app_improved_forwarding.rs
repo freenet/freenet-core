@@ -164,8 +164,8 @@ async fn test_ping_improved_forwarding() -> TestResult {
     };
 
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
-    let ws_api_port_node1 = config_node1.ws_api.ws_api_port.unwrap();
-    let ws_api_port_node2 = config_node2.ws_api.ws_api_port.unwrap();
+    let ws_api_port_node1 = ws_api_port_socket_node1.local_addr()?.port();
+    let ws_api_port_node2 = ws_api_port_socket_node2.local_addr()?.port();
     
     let uri_gw = format!("ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native", ws_api_port_gw);
     let uri_node1 = format!("ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native", ws_api_port_node1);
@@ -191,47 +191,49 @@ async fn test_ping_improved_forwarding() -> TestResult {
 
         let wrapped_state = WrappedState::from(serde_json::to_vec(&Ping::default())?);
 
+        let params = Parameters::from(serde_json::to_vec(&ping_options)?);
+        let container = ContractContainer::try_from((code.clone(), &params))?;
+        let contract_key = container.key();
+
         client_node1
             .send(ClientRequest::ContractOp(ContractRequest::Put {
-                code: ContractCode::from(code.clone()),
+                contract: container.clone(),
                 state: wrapped_state.clone(),
-                parameters: Parameters::from(serde_json::to_vec(&ping_options)?),
+                related_contracts: RelatedContracts::new(),
+                subscribe: false,
             }))
             .await?;
 
-        let key = wait_for_put_response(&mut client_node1, &ContractKey::from_params_and_code(
-            Parameters::from(serde_json::to_vec(&ping_options)?),
-            ContractCode::from(code.clone()),
-        )).await?;
+        wait_for_put_response(&mut client_node1, &contract_key).await?;
 
-        tracing::info!("Deployed ping contract with key: {}", key);
+        tracing::info!("Deployed ping contract with key: {}", contract_key);
 
         client_node1
             .send(ClientRequest::ContractOp(ContractRequest::Subscribe { 
-                key: key.clone(),
-                summary: true,
+                key: contract_key.clone(),
+                summary: None,
             }))
             .await?;
-        wait_for_subscribe_response(&mut client_node1, &key).await?;
-        tracing::info!("Node1 subscribed to contract: {}", key);
+        wait_for_subscribe_response(&mut client_node1, &contract_key).await?;
+        tracing::info!("Node1 subscribed to contract: {}", contract_key);
 
         client_node2
             .send(ClientRequest::ContractOp(ContractRequest::Subscribe { 
-                key: key.clone(),
-                summary: true,
+                key: contract_key.clone(),
+                summary: None,
             }))
             .await?;
-        wait_for_subscribe_response(&mut client_node2, &key).await?;
-        tracing::info!("Node2 subscribed to contract: {}", key);
+        wait_for_subscribe_response(&mut client_node2, &contract_key).await?;
+        tracing::info!("Node2 subscribed to contract: {}", contract_key);
 
         client_gw
             .send(ClientRequest::ContractOp(ContractRequest::Subscribe { 
-                key: key.clone(),
-                summary: true,
+                key: contract_key.clone(),
+                summary: None,
             }))
             .await?;
-        wait_for_subscribe_response(&mut client_gw, &key).await?;
-        tracing::info!("Gateway subscribed to contract: {}", key);
+        wait_for_subscribe_response(&mut client_gw, &contract_key).await?;
+        tracing::info!("Gateway subscribed to contract: {}", contract_key);
 
         sleep(Duration::from_secs(2)).await;
 
@@ -254,7 +256,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
                             key: update_key,
                             update,
                         })) => {
-                            if update_key == key {
+                            if update_key == contract_key {
                                 match process_ping_update(&mut gateway_state, Duration::from_secs(5), update) {
                                     Ok(updates) => {
                                         for (name, _) in updates {
@@ -289,7 +291,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
                             key: update_key,
                             update,
                         })) => {
-                            if update_key == key {
+                            if update_key == contract_key {
                                 match process_ping_update(&mut node1_state, Duration::from_secs(5), update) {
                                     Ok(updates) => {
                                         for (name, _) in updates {
@@ -324,7 +326,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
                             key: update_key,
                             update,
                         })) => {
-                            if update_key == key {
+                            if update_key == contract_key {
                                 match process_ping_update(&mut node2_state, Duration::from_secs(5), update) {
                                     Ok(updates) => {
                                         for (name, _) in updates {
@@ -354,7 +356,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
         node1_ping.insert("Update1".to_string());
         client_node1
             .send(ClientRequest::ContractOp(ContractRequest::Update {
-                key: key.clone(),
+                key: contract_key.clone(),
                 data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&node1_ping).unwrap())),
             }))
             .await?;
@@ -385,7 +387,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
         node2_ping.insert("Update2".to_string());
         client_node2
             .send(ClientRequest::ContractOp(ContractRequest::Update {
-                key: key.clone(),
+                key: contract_key.clone(),
                 data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&node2_ping).unwrap())),
             }))
             .await?;
