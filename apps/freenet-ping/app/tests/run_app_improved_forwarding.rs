@@ -261,12 +261,37 @@ async fn test_ping_improved_forwarding() -> TestResult {
     
     tracing::info!("Waiting for nodes to initialize...");
     sleep(Duration::from_secs(30)).await;
-    tracing::info!("Attempting to connect to nodes...");
+    tracing::info!("Attempting to connect to nodes with retry mechanism...");
+    
+    async fn connect_with_retries(uri: &str, max_attempts: usize) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, anyhow::Error> {
+        let mut attempt = 1;
+        loop {
+            match connect_async(uri).await {
+                Ok((stream, _)) => {
+                    tracing::info!("Successfully connected to {}", uri);
+                    return Ok(stream);
+                }
+                Err(e) => {
+                    if attempt >= max_attempts {
+                        return Err(anyhow::anyhow!("Failed to connect after {} attempts: {}", max_attempts, e));
+                    }
+                    tracing::warn!("Connection attempt {} failed for {}: {}. Retrying in 5 seconds...", attempt, uri, e);
+                    attempt += 1;
+                    sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
     
     let test = async {
-        let (stream_gw, _) = connect_async(&uri_gw).await?;
-        let (stream_node1, _) = connect_async(&uri_node1).await?;
-        let (stream_node2, _) = connect_async(&uri_node2).await?;
+        tracing::info!("Connecting to Gateway node...");
+        let stream_gw = connect_with_retries(&uri_gw, 10).await?;
+        
+        tracing::info!("Connecting to Node 1...");
+        let stream_node1 = connect_with_retries(&uri_node1, 10).await?;
+        
+        tracing::info!("Connecting to Node 2...");
+        let stream_node2 = connect_with_retries(&uri_node2, 10).await?;
         
         let mut client_gw = WebApi::start(stream_gw);
         let mut client_node1 = WebApi::start(stream_node1);
