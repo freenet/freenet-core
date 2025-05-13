@@ -5,7 +5,7 @@ use std::time::Duration;
 
 pub(crate) use self::messages::UpdateMsg;
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
-use crate::contract::ContractHandlerEvent;
+use crate::contract::{ContractHandlerEvent, ExecutorError, handler::StoreResponse};
 use crate::message::{InnerMessage, NetMessage, Transaction};
 use crate::node::IsOperationCompleted;
 use crate::ring::{Location, PeerKeyLocation, RingError};
@@ -699,7 +699,7 @@ async fn update_contract(
         .await
     {
         Ok(ContractHandlerEvent::GetResponse {
-            value: Ok(Some(current)),
+            response: Ok(StoreResponse { state: Some(current), .. }),
             ..
         }) => Some(current),
         _ => None,
