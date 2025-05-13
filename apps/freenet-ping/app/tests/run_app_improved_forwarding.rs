@@ -22,8 +22,8 @@ use freenet_stdlib::{
 use futures::{future::BoxFuture, FutureExt};
 use rand::{random, Rng, SeedableRng};
 use testresult::TestResult;
-use tokio::{sync::Mutex, time::sleep};
-use tokio_tungstenite::connect_async;
+use tokio::{net::TcpStream, sync::Mutex, time::sleep};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, WebSocketStream, MaybeTlsStream};
 use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 
 use freenet_ping_app::ping_client::{
