@@ -175,10 +175,18 @@ async fn test_ping_improved_forwarding() -> TestResult {
         let (stream_gw, _) = connect_async(&uri_gw).await?;
         let (stream_node1, _) = connect_async(&uri_node1).await?;
         let (stream_node2, _) = connect_async(&uri_node2).await?;
-
+        
         let mut client_gw = WebApi::start(stream_gw);
         let mut client_node1 = WebApi::start(stream_node1);
         let mut client_node2 = WebApi::start(stream_node2);
+        
+        let (stream_gw_update, _) = connect_async(&uri_gw).await?;
+        let (stream_node1_update, _) = connect_async(&uri_node1).await?;
+        let (stream_node2_update, _) = connect_async(&uri_node2).await?;
+        
+        let mut client_gw_update = WebApi::start(stream_gw_update);
+        let mut client_node1_update = WebApi::start(stream_node1_update);
+        let mut client_node2_update = WebApi::start(stream_node2_update);
 
         let code = std::fs::read(format!("{}/{}", PACKAGE_DIR, PATH_TO_CONTRACT))?;
 
@@ -354,7 +362,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
         tracing::info!("Node1 sending update 1");
         let mut node1_ping = Ping::default();
         node1_ping.insert("Update1".to_string());
-        client_node1
+        client_node1_update
             .send(ClientRequest::ContractOp(ContractRequest::Update {
                 key: contract_key.clone(),
                 data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&node1_ping).unwrap())),
@@ -385,7 +393,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
         tracing::info!("Node2 sending update 2");
         let mut node2_ping = Ping::default();
         node2_ping.insert("Update2".to_string());
-        client_node2
+        client_node2_update
             .send(ClientRequest::ContractOp(ContractRequest::Update {
                 key: contract_key.clone(),
                 data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&node2_ping).unwrap())),
