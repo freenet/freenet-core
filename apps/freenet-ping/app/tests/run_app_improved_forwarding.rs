@@ -105,7 +105,7 @@ fn process_ping_update(
     local_state: &mut Ping,
     ttl: Duration,
     update: UpdateData,
-) -> Result<HashMap<String, DateTime<Utc>>, Box<dyn std::error::Error + Send + Sync + 'static>> {
+) -> Result<HashMap<String, Vec<DateTime<Utc>>>, Box<dyn std::error::Error + Send + Sync + 'static>> {
     tracing::debug!("Processing ping update with TTL: {:?}", ttl);
     
     let mut handle_update = |state: &[u8]| {
