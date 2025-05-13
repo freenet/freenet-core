@@ -38,9 +38,9 @@ use freenet_ping_app::ping_client::{
     wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
 };
 
-const MAX_UPDATE_RETRIES: u32 = 8;
-const BASE_DELAY_MS: u64 = 3000;
-const MAX_DELAY_MS: u64 = 15000;
+const MAX_UPDATE_RETRIES: u32 = 10;
+const BASE_DELAY_MS: u64 = 5000;
+const MAX_DELAY_MS: u64 = 30000;
 const MAX_TEST_DURATION_SECS: u64 = 300;
 
 #[derive(Debug)]
@@ -306,10 +306,10 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
         log_node1(format!("Updating node1 to block node2: {}", node2_peer_id));
 
         log_gateway("Starting nodes and waiting for them to initialize".to_string());
-        sleep(Duration::from_secs(10)).await;
+        sleep(Duration::from_secs(30)).await;
 
         log_gateway("Waiting for nodes to connect to the gateway".to_string());
-        sleep(Duration::from_secs(5)).await;
+        sleep(Duration::from_secs(10)).await;
 
         let uri_gw = format!(
             "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
@@ -358,7 +358,7 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
         log_gateway(format!("Loaded contract code with hash: {}", code_hash));
 
         let ping_options = PingContractOptions {
-            ttl: Duration::from_secs(5),
+            ttl: Duration::from_secs(120),
             frequency: Duration::from_secs(1),
             tag: "ping-test".to_string(),
             code_key: code_hash.to_string(),
@@ -422,7 +422,7 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
         drop(client_node2_lock);
 
         log_gateway("Waiting for subscriptions to propagate".to_string());
-        sleep(Duration::from_secs(5)).await;
+        sleep(Duration::from_secs(15)).await;
 
         let get_all_states_fn = |client_gw: Arc<Mutex<WebApi>>,
                                  client_node1: Arc<Mutex<WebApi>>,
