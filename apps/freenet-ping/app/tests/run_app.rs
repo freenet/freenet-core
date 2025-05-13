@@ -428,6 +428,7 @@ async fn test_ping_multi_node() -> TestResult {
         let final_state_node1 = wait_for_get_response(&mut client_node1, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
+
         let final_state_node2 = wait_for_get_response(&mut client_node2, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
@@ -445,6 +446,7 @@ async fn test_ping_multi_node() -> TestResult {
 
         for tag in &tags {
             tracing::info!("Checking history for tag '{}':", tag);
+
             // Get the vector of timestamps for this tag from each node
             let gw_history = final_state_gw.get(tag).cloned().unwrap_or_default();
             let node1_history = final_state_node1.get(tag).cloned().unwrap_or_default();
@@ -455,16 +457,19 @@ async fn test_ping_multi_node() -> TestResult {
                 all_histories_match = false;
                 continue;
             }
+
             // Log the number of entries in each history
             tracing::info!("  - Gateway: {} entries", gw_history.len());
             tracing::info!("  - Node 1:  {} entries", node1_history.len());
             tracing::info!("  - Node 2:  {} entries", node2_history.len());
+
             // Check if the histories have the same length
             if gw_history.len() != node1_history.len() || gw_history.len() != node2_history.len() {
                 tracing::warn!("⚠️ Different number of history entries for tag '{}'!", tag);
                 all_histories_match = false;
                 continue;
             }
+
             // Compare the actual timestamp vectors element by element
             let mut timestamps_match = true;
             for i in 0..gw_history.len() {
@@ -476,6 +481,7 @@ async fn test_ping_multi_node() -> TestResult {
                     );
                 }
             }
+
             if timestamps_match {
                 tracing::info!("  ✅ History for tag '{}' is identical across all nodes!", tag);
             } else {
@@ -491,6 +497,7 @@ async fn test_ping_multi_node() -> TestResult {
             all_histories_match,
             "Eventual consistency test failed: Ping histories are not identical across all nodes"
         );
+
         tracing::info!("✅ Eventual consistency test PASSED - all nodes have identical ping histories!");
 
         Ok::<_, anyhow::Error>(())
