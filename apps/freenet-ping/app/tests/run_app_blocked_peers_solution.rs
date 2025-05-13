@@ -570,7 +570,21 @@ async fn test_ping_blocked_peers_solution() -> TestResult {
 
                 let mut client_lock = client.lock().await;
 
-                let mut ping = Ping::default();
+                client_lock
+                    .send(ClientRequest::ContractOp(ContractRequest::Get {
+                        key,
+                        return_contract_code: false,
+                        subscribe: false,
+                    }))
+                    .await?;
+
+                let current_state = wait_for_get_response(&mut client_lock, &key)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+                logger(format!("Retrieved current state: {}", current_state));
+
+                let mut ping = current_state;
                 let formatted_key = format!("{}:{}", name.clone(), timestamp);
                 ping.insert(formatted_key.clone());
 
