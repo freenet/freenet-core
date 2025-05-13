@@ -5,7 +5,7 @@ use std::time::Duration;
 
 pub(crate) use self::messages::UpdateMsg;
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
-use crate::contract::{ContractHandlerEvent, ExecutorError};
+use crate::contract::ContractHandlerEvent;
 use crate::message::{InnerMessage, NetMessage, Transaction};
 use crate::node::IsOperationCompleted;
 use crate::ring::{Location, PeerKeyLocation, RingError};
@@ -50,6 +50,7 @@ impl UpdateOp {
     }
 }
 
+#[derive(Clone)]
 struct UpdateStats {
     target: Option<PeerKeyLocation>,
 }
@@ -188,7 +189,7 @@ impl Operation for UpdateOp {
                                 id: self.id,
                                 sender: sender.clone(),
                                 target: target.clone(),
-                                value: WrappedState::default(), // We don't have the original value, but the target should have it
+                                value: WrappedState::new(Vec::new()), // We don't have the original value, but the target should have it
                                 key: *key,
                                 related_contracts: RelatedContracts::default(),
                             };
@@ -208,7 +209,6 @@ impl Operation for UpdateOp {
                                         retry_count: retry_count + 1,
                                     });
                                     
-                                    return_msg = None;
                                     
                                     return Ok(OperationResult {
                                         return_msg: None,
@@ -272,7 +272,7 @@ impl Operation for UpdateOp {
                                 id: self.id,
                                 sender: sender.clone(),
                                 target: target.clone(),
-                                value: WrappedState::default(), // We don't have the original value, but the target should have it
+                                value: WrappedState::new(Vec::new()), // We don't have the original value, but the target should have it
                                 key: *key,
                                 related_contracts: RelatedContracts::default(),
                             };
@@ -292,7 +292,6 @@ impl Operation for UpdateOp {
                                         retry_count: retry_count + 1,
                                     });
                                     
-                                    return_msg = None;
                                     
                                     return Ok(OperationResult {
                                         return_msg: None,
@@ -838,7 +837,6 @@ async fn try_to_broadcast(
                         new_value: retry_value,
                     });
 
-                    return_msg = None;
 
                     let op = UpdateOp {
                         id,
@@ -964,7 +962,7 @@ pub(crate) async fn request_update(
     op_manager: &OpManager,
     mut update_op: UpdateOp,
 ) -> Result<(), OpError> {
-    let (key, state_type) = match &update_op.state {
+    let (key, _state_type) = match &update_op.state {
         Some(UpdateState::PrepareRequest { key, .. }) => (key, "PrepareRequest"),
         Some(UpdateState::RetryingRequest { key, retry_count, .. }) => {
             if *retry_count >= MAX_RETRIES {
@@ -1025,7 +1023,7 @@ pub(crate) async fn request_update(
             let msg = UpdateMsg::RequestUpdate {
                 id,
                 key,
-                related_contracts,
+                related_contracts: related_contracts.clone(),
                 target: target.clone(),
                 value: value.clone(),
             };
@@ -1033,7 +1031,7 @@ pub(crate) async fn request_update(
             let op = UpdateOp {
                 state: new_state,
                 id,
-                stats: update_op.stats,
+                stats: update_op.stats.clone(),
             };
 
             match op_manager
@@ -1061,7 +1059,7 @@ pub(crate) async fn request_update(
                     let retry_op = UpdateOp {
                         state: retry_state,
                         id,
-                        stats: update_op.stats,
+                        stats: update_op.stats.clone(),
                     };
                     
                     op_manager
@@ -1104,15 +1102,15 @@ pub(crate) async fn request_update(
             let msg = UpdateMsg::RequestUpdate {
                 id,
                 key,
-                related_contracts,
-                target: retry_target,
-                value,
+                related_contracts: related_contracts.clone(),
+                target: retry_target.clone(),
+                value: value.clone(),
             };
             
             let op = UpdateOp {
                 state: new_state,
                 id,
-                stats: update_op.stats,
+                stats: update_op.stats.clone(),
             };
             
             match op_manager
@@ -1138,16 +1136,16 @@ pub(crate) async fn request_update(
                     
                     let retry_state = Some(UpdateState::RetryingRequest {
                         key,
-                        target: retry_target,
-                        related_contracts,
-                        value,
+                        target: retry_target.clone(),
+                        related_contracts: related_contracts.clone(),
+                        value: value.clone(),
                         retry_count: retry_count + 1,
                     });
                     
                     let retry_op = UpdateOp {
                         state: retry_state,
                         id,
-                        stats: update_op.stats,
+                        stats: update_op.stats.clone(),
                     };
                     
                     op_manager
