@@ -56,9 +56,16 @@ pub async fn wait_for_put_response(
                     return Err("unexpected key".into());
                 }
             }
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, summary }))) => {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                key,
+                summary,
+            }))) => {
                 if &key == expected_key {
-                    tracing::info!("Received update response for key: {}, summary: {:?}", key, summary);
+                    tracing::info!(
+                        "Received update response for key: {}, summary: {:?}",
+                        key,
+                        summary
+                    );
                     return Ok(key);
                 } else {
                     return Err("unexpected key".into());
