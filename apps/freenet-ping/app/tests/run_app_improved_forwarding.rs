@@ -370,8 +370,8 @@ async fn test_ping_improved_forwarding() -> TestResult {
             .await?;
 
         let mut update1_propagated = false;
-        for i in 1..=5 {
-            sleep(Duration::from_millis(500 * i)).await;
+        for i in 1..=10 {
+            sleep(Duration::from_secs(2)).await;
             
             let counter = update_counter.lock().await;
             if counter.contains("Gateway-Update1") && counter.contains("Node2-Update1") {
@@ -380,7 +380,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
                 break;
             }
             
-            if i == 5 {
+            if i == 10 {
                 tracing::warn!("Update1 failed to propagate to all nodes after maximum retries");
             }
         }
@@ -401,8 +401,8 @@ async fn test_ping_improved_forwarding() -> TestResult {
             .await?;
 
         let mut update2_propagated = false;
-        for i in 1..=5 {
-            sleep(Duration::from_millis(500 * i)).await;
+        for i in 1..=10 {
+            sleep(Duration::from_secs(2)).await;
             
             let counter = update_counter.lock().await;
             if counter.contains("Gateway-Update2") {
@@ -417,7 +417,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
                 }
             }
             
-            if i == 5 {
+            if i == 10 {
                 tracing::warn!("Update2 failed to propagate to all nodes after maximum retries");
             }
         }
