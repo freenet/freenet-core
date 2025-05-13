@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     fmt::Debug,
     net::{Ipv4Addr, SocketAddr, TcpListener},
