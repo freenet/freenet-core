@@ -371,10 +371,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
             .await
             .map_err(anyhow::Error::msg)?;
             
-        let mut node1_ping = match current_node1_state {
-            Some(state) => serde_json::from_slice::<Ping>(&state).unwrap_or_default(),
-            None => Ping::default(),
-        };
+        let mut node1_ping = current_node1_state;
         node1_ping.insert("Update1".to_string());
         client_node1_update
             .send(ClientRequest::ContractOp(ContractRequest::Update {
@@ -416,10 +413,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
             .await
             .map_err(anyhow::Error::msg)?;
             
-        let mut node2_ping = match current_node2_state {
-            Some(state) => serde_json::from_slice::<Ping>(&state).unwrap_or_default(),
-            None => Ping::default(),
-        };
+        let mut node2_ping = current_node2_state;
         node2_ping.insert("Update2".to_string());
         client_node2_update
             .send(ClientRequest::ContractOp(ContractRequest::Update {
