@@ -83,6 +83,42 @@ impl Operation for UpdateOp {
         let tx = *msg.id();
         match op_manager.pop(msg.id()) {
             Ok(Some(OpEnum::Update(update_op))) => {
+                // Check if we need to retry an AwaitingResponse state
+                if let Some(UpdateState::AwaitingResponse { key, upstream, retry_count }) = &update_op.state {
+                    if let UpdateMsg::AwaitUpdate { .. } = msg {
+                        if *retry_count < MAX_RETRIES {
+                            // This is a retry for an AwaitingResponse state
+                            tracing::debug!(
+                                "Processing retry for AwaitingResponse state for contract {} (retry {}/{})",
+                                key,
+                                retry_count + 1,
+                                MAX_RETRIES
+                            );
+                            
+                            let new_op = Self {
+                                state: Some(UpdateState::AwaitingResponse {
+                                    key: *key,
+                                    upstream: upstream.clone(),
+                                    retry_count: retry_count + 1,
+                                }),
+                                id: tx,
+                                stats: update_op.stats.clone(),
+                            };
+                            
+                            return Ok(OpInitialization {
+                                op: new_op,
+                                sender,
+                            });
+                        } else {
+                            tracing::warn!(
+                                "Maximum retries ({}) reached for AwaitingResponse state for contract {}",
+                                MAX_RETRIES,
+                                key
+                            );
+                        }
+                    }
+                }
+                
                 Ok(OpInitialization {
                     op: update_op,
                     sender,
@@ -126,6 +162,188 @@ impl Operation for UpdateOp {
             let return_msg;
             let new_state;
             let stats = self.stats;
+
+            if let Some(UpdateState::AwaitingResponse { key, upstream, retry_count }) = &self.state {
+                if let UpdateMsg::AwaitUpdate { .. } = input {
+                    if *retry_count < MAX_RETRIES {
+                        let delay_ms = std::cmp::min(
+                            BASE_DELAY_MS * (1 << retry_count), // Exponential backoff: BASE_DELAY_MS * 2^retry_count
+                            MAX_DELAY_MS,
+                        );
+                        
+                        tracing::debug!(
+                            "Retrying update request for contract {} due to timeout (retry {}/{}), delaying for {}ms",
+                            key,
+                            retry_count + 1,
+                            MAX_RETRIES,
+                            delay_ms
+                        );
+                        
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        
+                        if let Some(target) = upstream {
+                            let sender = op_manager.ring.connection_manager.own_location();
+                            
+                            let msg = UpdateMsg::SeekNode {
+                                id: self.id,
+                                sender: sender.clone(),
+                                target: target.clone(),
+                                value: WrappedState::default(), // We don't have the original value, but the target should have it
+                                key: *key,
+                                related_contracts: RelatedContracts::default(),
+                            };
+                            
+                            match conn_manager.send(&target.peer, msg.into()).await {
+                                Ok(_) => {
+                                    tracing::debug!(
+                                        "Successfully sent retry update request for contract {} (retry {}/{})",
+                                        key,
+                                        retry_count + 1,
+                                        MAX_RETRIES
+                                    );
+                                    
+                                    new_state = Some(UpdateState::AwaitingResponse {
+                                        key: *key,
+                                        upstream: Some(target.clone()),
+                                        retry_count: retry_count + 1,
+                                    });
+                                    
+                                    return_msg = None;
+                                    
+                                    return Ok(OperationResult {
+                                        return_msg: None,
+                                        state: Some(OpEnum::Update(UpdateOp {
+                                            id: self.id,
+                                            state: new_state,
+                                            stats,
+                                        })),
+                                    });
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "Failed to send retry update request for contract {}: {} (retry {}/{})",
+                                        key,
+                                        err,
+                                        retry_count + 1,
+                                        MAX_RETRIES
+                                    );
+                                    
+                                    let retry_op = UpdateOp {
+                                        id: self.id,
+                                        state: Some(UpdateState::AwaitingResponse {
+                                            key: *key,
+                                            upstream: upstream.clone(),
+                                            retry_count: retry_count + 1,
+                                        }),
+                                        stats,
+                                    };
+                                    
+                                    op_manager
+                                        .notify_op_change(
+                                            NetMessage::from(UpdateMsg::AwaitUpdate { id: self.id }),
+                                            OpEnum::Update(retry_op),
+                                        )
+                                        .await?;
+                                    
+                                    return Err(OpError::StatePushed);
+                                }
+                            }
+                        } else {
+                            // This is a client-initiated update, we need to find a new target
+                            let sender = op_manager.ring.connection_manager.own_location();
+                            
+                            let target = if let Some(location) = op_manager.ring.subscribers_of(key) {
+                                location
+                                    .clone()
+                                    .pop()
+                                    .ok_or(OpError::RingError(RingError::NoLocation))?
+                            } else {
+                                let closest = op_manager
+                                    .ring
+                                    .closest_potentially_caching(key, [sender.peer.clone()].as_slice())
+                                    .into_iter()
+                                    .next()
+                                    .ok_or_else(|| RingError::EmptyRing)?;
+                                
+                                closest
+                            };
+                            
+                            let msg = UpdateMsg::SeekNode {
+                                id: self.id,
+                                sender: sender.clone(),
+                                target: target.clone(),
+                                value: WrappedState::default(), // We don't have the original value, but the target should have it
+                                key: *key,
+                                related_contracts: RelatedContracts::default(),
+                            };
+                            
+                            match conn_manager.send(&target.peer, msg.into()).await {
+                                Ok(_) => {
+                                    tracing::debug!(
+                                        "Successfully sent retry update request to new target for contract {} (retry {}/{})",
+                                        key,
+                                        retry_count + 1,
+                                        MAX_RETRIES
+                                    );
+                                    
+                                    new_state = Some(UpdateState::AwaitingResponse {
+                                        key: *key,
+                                        upstream: None,
+                                        retry_count: retry_count + 1,
+                                    });
+                                    
+                                    return_msg = None;
+                                    
+                                    return Ok(OperationResult {
+                                        return_msg: None,
+                                        state: Some(OpEnum::Update(UpdateOp {
+                                            id: self.id,
+                                            state: new_state,
+                                            stats,
+                                        })),
+                                    });
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "Failed to send retry update request to new target for contract {}: {} (retry {}/{})",
+                                        key,
+                                        err,
+                                        retry_count + 1,
+                                        MAX_RETRIES
+                                    );
+                                    
+                                    let retry_op = UpdateOp {
+                                        id: self.id,
+                                        state: Some(UpdateState::AwaitingResponse {
+                                            key: *key,
+                                            upstream: None,
+                                            retry_count: retry_count + 1,
+                                        }),
+                                        stats,
+                                    };
+                                    
+                                    op_manager
+                                        .notify_op_change(
+                                            NetMessage::from(UpdateMsg::AwaitUpdate { id: self.id }),
+                                            OpEnum::Update(retry_op),
+                                        )
+                                        .await?;
+                                    
+                                    return Err(OpError::StatePushed);
+                                }
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            "Maximum retries ({}) reached for AwaitingResponse state for contract {}",
+                            MAX_RETRIES,
+                            key
+                        );
+                        
+                        return Err(OpError::MaxRetriesExceeded(self.id, crate::message::TransactionType::Update));
+                    }
+                }
+            }
 
             match input {
                 UpdateMsg::RequestUpdate {
@@ -746,10 +964,20 @@ pub(crate) async fn request_update(
     op_manager: &OpManager,
     mut update_op: UpdateOp,
 ) -> Result<(), OpError> {
-    let key = if let Some(UpdateState::PrepareRequest { key, .. }) = &update_op.state {
-        key
-    } else {
-        return Err(OpError::UnexpectedOpState);
+    let (key, state_type) = match &update_op.state {
+        Some(UpdateState::PrepareRequest { key, .. }) => (key, "PrepareRequest"),
+        Some(UpdateState::RetryingRequest { key, retry_count, .. }) => {
+            if *retry_count >= MAX_RETRIES {
+                tracing::warn!(
+                    "Maximum retries ({}) reached for initial update request to contract {}",
+                    MAX_RETRIES,
+                    key
+                );
+                return Err(OpError::MaxRetriesExceeded(update_op.id, crate::message::TransactionType::Update));
+            }
+            (key, "RetryingRequest")
+        }
+        _ => return Err(OpError::UnexpectedOpState),
     };
 
     let sender = op_manager.ring.connection_manager.own_location();
@@ -798,8 +1026,8 @@ pub(crate) async fn request_update(
                 id,
                 key,
                 related_contracts,
-                target,
-                value,
+                target: target.clone(),
+                value: value.clone(),
             };
 
             let op = UpdateOp {
@@ -808,9 +1036,128 @@ pub(crate) async fn request_update(
                 stats: update_op.stats,
             };
 
-            op_manager
+            match op_manager
                 .notify_op_change(NetMessage::from(msg), OpEnum::Update(op))
-                .await?;
+                .await
+            {
+                Ok(_) => {
+                    tracing::debug!("Successfully sent initial update request for contract {}", key);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to send initial update request for contract {}: {}. Will retry.",
+                        key,
+                        err
+                    );
+                    
+                    let retry_state = Some(UpdateState::RetryingRequest {
+                        key,
+                        target,
+                        related_contracts,
+                        value,
+                        retry_count: 0,
+                    });
+                    
+                    let retry_op = UpdateOp {
+                        state: retry_state,
+                        id,
+                        stats: update_op.stats,
+                    };
+                    
+                    op_manager
+                        .notify_op_change(
+                            NetMessage::from(UpdateMsg::AwaitUpdate { id }),
+                            OpEnum::Update(retry_op),
+                        )
+                        .await?;
+                }
+            }
+        }
+        Some(UpdateState::RetryingRequest {
+            key,
+            target: retry_target,
+            related_contracts,
+            value,
+            retry_count,
+        }) => {
+            let delay_ms = std::cmp::min(
+                BASE_DELAY_MS * (1 << retry_count), // Exponential backoff: BASE_DELAY_MS * 2^retry_count
+                MAX_DELAY_MS,
+            );
+            
+            tracing::debug!(
+                "Retrying initial update request for contract {} (retry {}/{}), delaying for {}ms",
+                key,
+                retry_count + 1,
+                MAX_RETRIES,
+                delay_ms
+            );
+            
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            
+            let new_state = Some(UpdateState::AwaitingResponse {
+                key,
+                upstream: None,
+                retry_count: 0,
+            });
+            
+            let msg = UpdateMsg::RequestUpdate {
+                id,
+                key,
+                related_contracts,
+                target: retry_target,
+                value,
+            };
+            
+            let op = UpdateOp {
+                state: new_state,
+                id,
+                stats: update_op.stats,
+            };
+            
+            match op_manager
+                .notify_op_change(NetMessage::from(msg), OpEnum::Update(op))
+                .await
+            {
+                Ok(_) => {
+                    tracing::debug!(
+                        "Successfully sent retry update request for contract {} (retry {}/{})",
+                        key,
+                        retry_count + 1,
+                        MAX_RETRIES
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to send retry update request for contract {}: {} (retry {}/{}). Will retry again.",
+                        key,
+                        err,
+                        retry_count + 1,
+                        MAX_RETRIES
+                    );
+                    
+                    let retry_state = Some(UpdateState::RetryingRequest {
+                        key,
+                        target: retry_target,
+                        related_contracts,
+                        value,
+                        retry_count: retry_count + 1,
+                    });
+                    
+                    let retry_op = UpdateOp {
+                        state: retry_state,
+                        id,
+                        stats: update_op.stats,
+                    };
+                    
+                    op_manager
+                        .notify_op_change(
+                            NetMessage::from(UpdateMsg::AwaitUpdate { id }),
+                            OpEnum::Update(retry_op),
+                        )
+                        .await?;
+                }
+            }
         }
         _ => return Err(OpError::invalid_transition(update_op.id)),
     };
@@ -972,5 +1319,12 @@ pub enum UpdateState {
         failed_peers: Vec<PeerKeyLocation>,
         upstream: PeerKeyLocation,
         new_value: WrappedState,
+    },
+    RetryingRequest {
+        key: ContractKey,
+        target: PeerKeyLocation,
+        related_contracts: RelatedContracts<'static>,
+        value: WrappedState,
+        retry_count: usize,
     },
 }
