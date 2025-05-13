@@ -5,7 +5,7 @@ use std::time::Duration;
 
 pub(crate) use self::messages::UpdateMsg;
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
-use crate::contract::{ContractHandlerEvent, ExecutorError, handler::StoreResponse};
+use crate::contract::{ContractHandlerEvent, ExecutorError};
 use crate::message::{InnerMessage, NetMessage, Transaction};
 use crate::node::IsOperationCompleted;
 use crate::ring::{Location, PeerKeyLocation, RingError};
@@ -691,27 +691,8 @@ async fn update_contract(
     state: WrappedState,
     related_contracts: RelatedContracts<'static>,
 ) -> Result<WrappedState, OpError> {
-    let current_state = match op_manager
-        .notify_contract_handler(ContractHandlerEvent::GetQuery {
-            key,
-            return_contract_code: false,
-        })
-        .await
-    {
-        Ok(ContractHandlerEvent::GetResponse {
-            response: Ok(StoreResponse { state: Some(current), .. }),
-            ..
-        }) => Some(current),
-        _ => None,
-    };
-
-    let update_data = if let Some(current) = current_state {
-        tracing::debug!("Using Delta update for contract {}", key);
-        UpdateData::Delta(StateDelta::from(state.as_ref().to_vec()))
-    } else {
-        tracing::debug!("Using State update for contract {}", key);
-        UpdateData::State(State::from(state))
-    };
+    let update_data = UpdateData::Delta(StateDelta::from(state.as_ref().to_vec()));
+    tracing::debug!("Using Delta update for contract {}", key);
 
     match op_manager
         .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
