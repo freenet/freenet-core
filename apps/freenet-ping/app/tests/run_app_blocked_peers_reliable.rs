@@ -1,5 +1,8 @@
-//
-//
+// Reliable blocked peers test
+// This test focuses on reliability aspects of update propagation between blocked peers,
+// implementing additional checks and verification steps to ensure consistent delivery.
+
+mod common;
 
 use std::{
     net::{Ipv4Addr, SocketAddr, TcpListener},

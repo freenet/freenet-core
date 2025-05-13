@@ -1,5 +1,8 @@
-//
-//
+// Simple blocked peers test
+// This test verifies basic update propagation between peers that are blocked from direct communication
+// and must rely on a gateway node for message forwarding.
+
+mod common;
 
 use std::{collections::HashSet, path::PathBuf, time::Duration};
 

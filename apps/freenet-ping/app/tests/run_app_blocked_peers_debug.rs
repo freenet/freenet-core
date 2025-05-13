@@ -1,5 +1,8 @@
-//
-//
+// Enhanced logging test for subscription operations
+// This test adds detailed tracing for the subscription process to diagnose update propagation issues
+// when peers are indirectly connected through gateways but blocked from direct communication.
+
+mod common;
 
 use std::{
     net::{Ipv4Addr, SocketAddr, TcpListener},

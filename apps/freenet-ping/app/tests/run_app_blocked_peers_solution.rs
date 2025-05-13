@@ -1,6 +1,8 @@
-//
-//
-//
+// Solution for blocked peers update propagation
+// This test implements a comprehensive solution for update propagation between blocked peers,
+// combining retry logic, improved forwarding, and enhanced state management.
+
+mod common;
 
 use std::{
     net::{Ipv4Addr, SocketAddr, TcpListener},

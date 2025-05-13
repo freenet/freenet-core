@@ -1,5 +1,8 @@
-//
-//
+// Optimized blocked peers test
+// This test implements an optimized version of the blocked peers test with improved connection handling
+// and more efficient state management for update propagation through gateway nodes.
+
+mod common;
 
 use std::{
     net::{Ipv4Addr, SocketAddr, TcpListener},
