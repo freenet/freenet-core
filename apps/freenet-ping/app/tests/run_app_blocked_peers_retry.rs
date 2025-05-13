@@ -163,7 +163,7 @@ async fn test_ping_blocked_peers_retry() -> TestResult {
     };
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
     let gw_network_port = config_gw.network_api.public_port.unwrap();
-    let gw_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), gw_network_port);
+    let _gw_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), gw_network_port);
 
     let node2_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0); // Will be updated later
     let (config_node1, preset_cfg_node1) = base_node_test_config(
@@ -352,60 +352,59 @@ async fn test_ping_blocked_peers_retry() -> TestResult {
             .map_err(anyhow::Error::msg)?;
         tracing::info!("Node 2: subscribed successfully!");
 
-        let mut gw_local_state = Ping::default();
-        let mut node1_local_state = Ping::default();
-        let mut node2_local_state = Ping::default();
+        let _gw_local_state = Ping::default();
+        let _node1_local_state = Ping::default();
+        let _node2_local_state = Ping::default();
 
-        let gw_tag = "ping-from-gw".to_string();
+        let _gw_tag = "ping-from-gw".to_string();
         let node1_tag = "ping-from-node1".to_string();
         let node2_tag = "ping-from-node2".to_string();
 
-        let get_all_states = |client_gw: &mut WebApi,
-                              client_node1: &mut WebApi,
-                              client_node2: &mut WebApi,
-                              key: ContractKey|
-         -> BoxFuture<'_, anyhow::Result<(Ping, Ping, Ping)>> {
-            Box::pin(async move {
-                tracing::info!("Querying all nodes for current state...");
+        async fn get_all_states(
+            client_gw: &mut WebApi,
+            client_node1: &mut WebApi,
+            client_node2: &mut WebApi,
+            key: ContractKey,
+        ) -> anyhow::Result<(Ping, Ping, Ping)> {
+            tracing::info!("Querying all nodes for current state...");
 
-                client_gw
-                    .send(ClientRequest::ContractOp(ContractRequest::Get {
-                        key,
-                        return_contract_code: false,
-                        subscribe: false,
-                    }))
-                    .await?;
+            client_gw
+                .send(ClientRequest::ContractOp(ContractRequest::Get {
+                    key,
+                    return_contract_code: false,
+                    subscribe: false,
+                }))
+                .await?;
 
-                client_node1
-                    .send(ClientRequest::ContractOp(ContractRequest::Get {
-                        key,
-                        return_contract_code: false,
-                        subscribe: false,
-                    }))
-                    .await?;
+            client_node1
+                .send(ClientRequest::ContractOp(ContractRequest::Get {
+                    key,
+                    return_contract_code: false,
+                    subscribe: false,
+                }))
+                .await?;
 
-                client_node2
-                    .send(ClientRequest::ContractOp(ContractRequest::Get {
-                        key,
-                        return_contract_code: false,
-                        subscribe: false,
-                    }))
-                    .await?;
+            client_node2
+                .send(ClientRequest::ContractOp(ContractRequest::Get {
+                    key,
+                    return_contract_code: false,
+                    subscribe: false,
+                }))
+                .await?;
 
-                let state_gw = wait_for_get_response(client_gw, &key)
-                    .await
-                    .map_err(anyhow::Error::msg)?;
+            let state_gw = wait_for_get_response(client_gw, &key)
+                .await
+                .map_err(anyhow::Error::msg)?;
 
-                let state_node1 = wait_for_get_response(client_node1, &key)
-                    .await
-                    .map_err(anyhow::Error::msg)?;
+            let state_node1 = wait_for_get_response(client_node1, &key)
+                .await
+                .map_err(anyhow::Error::msg)?;
 
-                let state_node2 = wait_for_get_response(client_node2, &key)
-                    .await
-                    .map_err(anyhow::Error::msg)?;
+            let state_node2 = wait_for_get_response(client_node2, &key)
+                .await
+                .map_err(anyhow::Error::msg)?;
 
-                Ok((state_gw, state_node1, state_node2))
-            })
+            Ok((state_gw, state_node1, state_node2))
         };
 
         let verify_all_tags_present =
@@ -434,7 +433,7 @@ async fn test_ping_blocked_peers_retry() -> TestResult {
         tracing::info!("Waiting for initial propagation attempt...");
         sleep(Duration::from_secs(5)).await;
 
-        let (gw_state, node1_state, node2_state) = get_all_states(
+        let (gw_state, _node1_state, node2_state) = get_all_states(
             &mut client_gw,
             &mut client_node1,
             &mut client_node2,
@@ -455,7 +454,7 @@ async fn test_ping_blocked_peers_retry() -> TestResult {
         tracing::info!("Waiting for retry mechanism to complete...");
         sleep(Duration::from_secs(20)).await;
 
-        let (final_gw_state, final_node1_state, final_node2_state) = get_all_states(
+        let (final_gw_state, _final_node1_state, final_node2_state) = get_all_states(
             &mut client_gw,
             &mut client_node1,
             &mut client_node2,
