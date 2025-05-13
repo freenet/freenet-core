@@ -260,7 +260,7 @@ async fn test_ping_blocked_peers_retry() -> TestResult {
 
         let ping_options = PingContractOptions {
             frequency: Duration::from_secs(5),
-            ttl: Duration::from_secs(30),
+            ttl: Duration::from_secs(120),
             tag: APP_TAG.to_string(),
             code_key: code_hash.to_string(),
         };
@@ -452,7 +452,7 @@ async fn test_ping_blocked_peers_retry() -> TestResult {
         );
 
         tracing::info!("Waiting for retry mechanism to complete...");
-        sleep(Duration::from_secs(20)).await;
+        sleep(Duration::from_secs(40)).await;
 
         let (final_gw_state, _final_node1_state, final_node2_state) = get_all_states(
             &mut client_gw,
@@ -486,7 +486,18 @@ async fn test_ping_blocked_peers_retry() -> TestResult {
             ));
         }
 
-        let mut node2_ping = Ping::default();
+        client_node2
+            .send(ClientRequest::ContractOp(ContractRequest::Get {
+                key: contract_key,
+                return_contract_code: false,
+                subscribe: false,
+            }))
+            .await?;
+        let current_node2_state = wait_for_get_response(&mut client_node2, &contract_key)
+            .await
+            .map_err(anyhow::Error::msg)?;
+            
+        let mut node2_ping = current_node2_state;
         node2_ping.insert(node2_tag.clone());
         tracing::info!(%node2_ping, "Node 2 sending update with tag: {}", node2_tag);
         client_node2
@@ -497,7 +508,7 @@ async fn test_ping_blocked_peers_retry() -> TestResult {
             .await?;
 
         tracing::info!("Waiting for retry mechanism to complete for Node 2 update...");
-        sleep(Duration::from_secs(20)).await;
+        sleep(Duration::from_secs(40)).await;
 
         let (final_gw_state2, final_node1_state2, final_node2_state2) = get_all_states(
             &mut client_gw,

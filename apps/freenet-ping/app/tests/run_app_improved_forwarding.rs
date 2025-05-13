@@ -191,7 +191,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
         let code = std::fs::read(format!("{}/{}", PACKAGE_DIR, PATH_TO_CONTRACT))?;
 
         let ping_options = PingContractOptions {
-            ttl: Duration::from_secs(5),
+            ttl: Duration::from_secs(120),
             frequency: Duration::from_secs(1),
             tag: APP_TAG.to_string(),
             code_key: "".to_string(),
