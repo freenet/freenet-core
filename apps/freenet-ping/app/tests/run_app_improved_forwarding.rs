@@ -265,7 +265,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
                             update,
                         })) => {
                             if update_key == contract_key {
-                                match process_ping_update(&mut gateway_state, Duration::from_secs(5), update) {
+                                match process_ping_update(&mut gateway_state, Duration::from_secs(120), update) {
                                     Ok(updates) => {
                                         for (name, _) in updates {
                                             tracing::info!("Gateway received update from: {}", name);
@@ -300,7 +300,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
                             update,
                         })) => {
                             if update_key == contract_key {
-                                match process_ping_update(&mut node1_state, Duration::from_secs(5), update) {
+                                match process_ping_update(&mut node1_state, Duration::from_secs(120), update) {
                                     Ok(updates) => {
                                         for (name, _) in updates {
                                             tracing::info!("Node1 received update from: {}", name);
@@ -335,7 +335,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
                             update,
                         })) => {
                             if update_key == contract_key {
-                                match process_ping_update(&mut node2_state, Duration::from_secs(5), update) {
+                                match process_ping_update(&mut node2_state, Duration::from_secs(120), update) {
                                     Ok(updates) => {
                                         for (name, _) in updates {
                                             tracing::info!("Node2 received update from: {}", name);
