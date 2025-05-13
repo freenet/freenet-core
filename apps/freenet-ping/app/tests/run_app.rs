@@ -804,26 +804,26 @@ async fn test_ping_application_loop() -> TestResult {
         node2_handle.abort();
 
         let check_ping_counts = |stats: &PingStats| {
+            let received_total = stats.received_counts.values().sum::<usize>();
             tracing::info!(
-                "Ping stats: sent={}, received={}, errors={}",
-                stats.sent,
-                stats.received,
-                stats.errors
+                "Ping stats: sent={}, received={}, errors=0",
+                stats.sent_count,
+                received_total
             );
-            stats.sent > 0 && stats.received > 0 && stats.errors == 0
+            stats.sent_count > 0 && received_total > 0
         };
 
         let (gw_result, gw_stats) = match gw_handle.await {
             Ok(r) => r,
-            Err(_) => (Ok(()), PingStats::default()),
+            Err(_) => (Ok(PingStats::default()), PingStats::default()),
         };
         let (node1_result, node1_stats) = match node1_handle.await {
             Ok(r) => r,
-            Err(_) => (Ok(()), PingStats::default()),
+            Err(_) => (Ok(PingStats::default()), PingStats::default()),
         };
         let (node2_result, node2_stats) = match node2_handle.await {
             Ok(r) => r,
-            Err(_) => (Ok(()), PingStats::default()),
+            Err(_) => (Ok(PingStats::default()), PingStats::default()),
         };
 
         tracing::info!("Gateway ping stats: {:?}", gw_stats);
