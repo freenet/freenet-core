@@ -532,7 +532,6 @@ async fn try_to_broadcast(
 
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
-                let mut broadcasting = Vec::with_capacity(failed_peers.len());
                 let sender = op_manager.ring.connection_manager.own_location();
 
                 let mut failed_broadcasts = Vec::new();
