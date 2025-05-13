@@ -716,7 +716,7 @@ async fn test_ping_application_loop() -> TestResult {
                 contract: container.clone(),
                 state: WrappedState::new(serde_json::to_vec(&Ping::default())?),
                 related_contracts: RelatedContracts::new(),
-                subscribe: true,
+                subscribe: false,
             }))
             .await?;
 
@@ -729,7 +729,7 @@ async fn test_ping_application_loop() -> TestResult {
             .send(ClientRequest::ContractOp(ContractRequest::Get {
                 key,
                 return_contract_code: true,
-                subscribe: true,
+                subscribe: false,
             }))
             .await?;
 
@@ -742,7 +742,7 @@ async fn test_ping_application_loop() -> TestResult {
             .send(ClientRequest::ContractOp(ContractRequest::Get {
                 key,
                 return_contract_code: true,
-                subscribe: true,
+                subscribe: false,
             }))
             .await?;
 
@@ -750,6 +750,39 @@ async fn test_ping_application_loop() -> TestResult {
             .await
             .map_err(anyhow::Error::msg)?;
         tracing::info!("Node 2: got contract with {} entries", node2_state.len());
+
+        client_gw
+            .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
+                key,
+                summary: None,
+            }))
+            .await?;
+        wait_for_subscribe_response(&mut client_gw, &key)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        tracing::info!("Gateway: subscribed successfully!");
+
+        client_node1
+            .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
+                key,
+                summary: None,
+            }))
+            .await?;
+        wait_for_subscribe_response(&mut client_node1, &key)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        tracing::info!("Node 1: subscribed successfully!");
+
+        client_node2
+            .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
+                key,
+                summary: None,
+            }))
+            .await?;
+        wait_for_subscribe_response(&mut client_node2, &key)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        tracing::info!("Node 2: subscribed successfully!");
 
         tracing::info!("Starting ping clients...");
 
