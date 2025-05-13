@@ -88,9 +88,17 @@ pub async fn wait_for_get_response(
                     return Err("unexpected key".into());
                 }
 
-                let old_ping = serde_json::from_slice::<Ping>(&state)?;
-                tracing::info!(num_entries = %old_ping.len(), "old state fetched successfully!");
-                return Ok(old_ping);
+                match serde_json::from_slice::<Ping>(&state) {
+                    Ok(ping) => {
+                        tracing::info!(num_entries = %ping.len(), "old state fetched successfully!");
+                        return Ok(ping);
+                    },
+                    Err(e) => {
+                        tracing::error!("Failed to deserialize Ping: {}", e);
+                        tracing::error!("Raw state data: {:?}", String::from_utf8_lossy(&state));
+                        return Err(Box::new(e));
+                    }
+                };
             }
             Ok(Ok(other)) => {
                 tracing::warn!("Unexpected response while waiting for get: {}", other);
