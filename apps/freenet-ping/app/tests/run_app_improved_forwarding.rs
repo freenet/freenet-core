@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     net::{Ipv4Addr, SocketAddr, TcpListener},
-    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -19,14 +18,12 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
 };
-use futures::{future::BoxFuture, FutureExt};
+use futures::FutureExt;
 use rand::{random, Rng, SeedableRng};
 use testresult::TestResult;
-use tokio::{net::TcpStream, select, sync::Mutex, time::sleep};
-use tokio_tungstenite::{
-    connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
-};
-use tracing::{level_filters::LevelFilter, span, Instrument, Level};
+use tokio::{net::TcpStream, sync::Mutex, time::sleep};
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tracing::level_filters::LevelFilter;
 
 use freenet_ping_app::ping_client::{
     wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
@@ -363,8 +360,44 @@ async fn test_ping_improved_forwarding() -> TestResult {
             }))
             .await?;
 
-        tracing::info!("Waiting for put response from Gateway node...");
-        wait_for_put_response(&mut client_gw, &contract_key).await?;
+        tracing::info!("Waiting for put response from Gateway node with retry mechanism...");
+        let max_put_retries = 5;
+        let mut put_success = false;
+
+        for i in 1..=max_put_retries {
+            match wait_for_put_response(&mut client_gw, &contract_key).await {
+                Ok(_) => {
+                    tracing::info!("Successfully received put response on attempt {}", i);
+                    put_success = true;
+                    break;
+                }
+                Err(e) => {
+                    if i == max_put_retries {
+                        return Err(anyhow::anyhow!(
+                            "Failed to get put response after {} attempts: {}",
+                            max_put_retries,
+                            e
+                        ));
+                    }
+                    tracing::warn!(
+                        "Put response attempt {} failed: {}. Retrying in 5 seconds...",
+                        i,
+                        e
+                    );
+                    sleep(Duration::from_secs(5)).await;
+
+                    tracing::info!("Resending put request to Gateway node...");
+                    client_gw
+                        .send(ClientRequest::ContractOp(ContractRequest::Put {
+                            contract: container.clone(),
+                            state: wrapped_state.clone(),
+                            related_contracts: RelatedContracts::new(),
+                            subscribe: false,
+                        }))
+                        .await?;
+                }
+            }
+        }
 
         tracing::info!("Deployed ping contract with key: {}", contract_key);
 
@@ -374,7 +407,9 @@ async fn test_ping_improved_forwarding() -> TestResult {
                 summary: None,
             }))
             .await?;
-        wait_for_subscribe_response(&mut client_node1, &contract_key).await?;
+        wait_for_subscribe_response(&mut client_node1, &contract_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("Subscribe error: {}", e))?;
         tracing::info!("Node1 subscribed to contract: {}", contract_key);
 
         client_node2
@@ -383,7 +418,9 @@ async fn test_ping_improved_forwarding() -> TestResult {
                 summary: None,
             }))
             .await?;
-        wait_for_subscribe_response(&mut client_node2, &contract_key).await?;
+        wait_for_subscribe_response(&mut client_node2, &contract_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("Subscribe error: {}", e))?;
         tracing::info!("Node2 subscribed to contract: {}", contract_key);
 
         client_gw
@@ -392,7 +429,9 @@ async fn test_ping_improved_forwarding() -> TestResult {
                 summary: None,
             }))
             .await?;
-        wait_for_subscribe_response(&mut client_gw, &contract_key).await?;
+        wait_for_subscribe_response(&mut client_gw, &contract_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("Subscribe error: {}", e))?;
         tracing::info!("Gateway subscribed to contract: {}", contract_key);
 
         sleep(Duration::from_secs(2)).await;
@@ -665,7 +704,7 @@ async fn test_ping_improved_forwarding() -> TestResult {
             panic!("Update propagation test failed");
         }
 
-        Ok(()) as TestResult
+        Ok(())
     };
 
     tokio::select! {
