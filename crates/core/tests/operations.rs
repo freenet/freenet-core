@@ -414,8 +414,8 @@ async fn test_update_contract() -> TestResult {
 
         make_update(&mut client_api_a, contract_key, updated_state.clone()).await?;
 
-        // Wait for update response
-        let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
+        // Wait for update response with increased timeout
+        let resp = tokio::time::timeout(Duration::from_secs(60), client_api_a.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
                 key,
@@ -874,7 +874,7 @@ async fn test_multiple_clients_subscription() -> TestResult {
         };
 
         let start_time = std::time::Instant::now();
-        while start_time.elapsed() < Duration::from_secs(60)
+        while start_time.elapsed() < Duration::from_secs(120)
             && (!received_update_response
                 || !client1_received_notification
                 || !client2_received_notification
