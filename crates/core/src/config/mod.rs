@@ -52,7 +52,7 @@ const APPLICATION: &str = "Freenet";
 
 const FREENET_GATEWAYS_INDEX: &str = "https://freenet.org/keys/gateways.toml";
 
-#[derive(clap::Parser, Debug)]
+#[derive(clap::Parser, Debug, Clone)]
 pub struct ConfigArgs {
     /// Node operation mode. Default is network mode.
     #[arg(value_enum, env = "MODE")]
