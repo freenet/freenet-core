@@ -65,7 +65,7 @@ impl SeedingManager {
         let mut old_subscribers = vec![];
         let mut contract_to_drop = None;
 
-        if self.seeding_contract.len() <= Self::MAX_SEEDING_CONTRACTS {
+        if self.seeding_contract.len() >= Self::MAX_SEEDING_CONTRACTS {
             if let Some(dropped_contract) = self
                 .seeding_contract
                 .iter()
