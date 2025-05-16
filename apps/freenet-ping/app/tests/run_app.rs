@@ -22,7 +22,7 @@ use freenet_ping_app::ping_client::{
 };
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "fix me"]
 async fn test_ping_multi_node() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
 
@@ -451,7 +451,7 @@ async fn test_ping_multi_node() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "fix me"]
 async fn test_ping_application_loop() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
 

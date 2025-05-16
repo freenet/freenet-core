@@ -33,7 +33,7 @@ use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 use common::{base_node_test_config, gw_config_from_path, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT};
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "fix me"]
 async fn test_ping_partially_connected_network() -> TestResult {
     /*
      * This test verifies how subscription propagation works in a partially connected network.
