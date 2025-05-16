@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Read, Write},
+    io::{self, BufReader, Read, Write},
     process::Child,
     time::Duration,
 };
@@ -28,18 +28,26 @@ pub(crate) fn pipe_std_streams(mut child: Child) -> anyhow::Result<()> {
 
     let write_child_stderr = move || -> anyhow::Result<()> {
         let mut stderr = io::stderr();
-        for b in c_stderr.bytes() {
-            let b = b?;
-            stderr.write_all(&[b])?;
+        let mut reader = BufReader::new(c_stderr);
+        let mut buffer = [0; 1024];
+        while let Ok(n) = reader.read(&mut buffer) {
+            if n == 0 {
+                break;
+            }
+            stderr.write_all(&buffer[..n])?;
         }
         Ok(())
     };
 
     let write_child_stdout = move || -> anyhow::Result<()> {
         let mut stdout = io::stdout();
-        for b in c_stdout.bytes() {
-            let b = b?;
-            stdout.write_all(&[b])?;
+        let mut reader = BufReader::new(c_stdout);
+        let mut buffer = [0; 1024];
+        while let Ok(n) = reader.read(&mut buffer) {
+            if n == 0 {
+                break;
+            }
+            stdout.write_all(&buffer[..n])?;
         }
         Ok(())
     };

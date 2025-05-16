@@ -208,7 +208,7 @@ impl P2pConnManager {
             match event {
                 EventResult::Continue => continue,
                 EventResult::Event(event) => {
-                    match event {
+                    match *event {
                         ConnEvent::InboundMessage(msg) => {
                             self.handle_inbound_message(
                                 msg,
@@ -357,7 +357,7 @@ impl P2pConnManager {
                         self.handle_handshake_action(event, state, handshake_handler_msg).await?;
                         Ok(EventResult::Continue)
                     }
-                    Err(HandshakeError::ChannelClosed) => Ok(EventResult::Event(ConnEvent::ClosedChannel)),
+                    Err(HandshakeError::ChannelClosed) => Ok(EventResult::Event(ConnEvent::ClosedChannel.into())),
                     Err(e) => {
                         tracing::warn!("Handshake error: {:?}", e);
                         Ok(EventResult::Continue)
@@ -706,7 +706,9 @@ impl P2pConnManager {
             Some(Ok(peer_conn)) => {
                 let task = peer_connection_listener(peer_conn.rx, peer_conn.conn).boxed();
                 state.peer_connections.push(task);
-                Ok(EventResult::Event(ConnEvent::InboundMessage(peer_conn.msg)))
+                Ok(EventResult::Event(
+                    ConnEvent::InboundMessage(peer_conn.msg).into(),
+                ))
             }
             Some(Err(err)) => {
                 if let TransportError::ConnectionClosed(socket_addr) = err {
@@ -736,8 +738,8 @@ impl P2pConnManager {
 
     fn handle_notification_msg(&self, msg: Option<Either<NetMessage, NodeEvent>>) -> EventResult {
         match msg {
-            Some(Left(msg)) => EventResult::Event(ConnEvent::InboundMessage(msg)),
-            Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action)),
+            Some(Left(msg)) => EventResult::Event(ConnEvent::InboundMessage(msg).into()),
+            Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action).into()),
             None => EventResult::Continue,
         }
     }
@@ -750,7 +752,7 @@ impl P2pConnManager {
         match msg {
             Some((callback, msg)) => {
                 state.pending_op_results.insert(*msg.id(), callback);
-                EventResult::Event(ConnEvent::InboundMessage(msg))
+                EventResult::Event(ConnEvent::InboundMessage(msg).into())
             }
             _ => EventResult::Continue,
         }
@@ -758,16 +760,16 @@ impl P2pConnManager {
 
     fn handle_bridge_msg(&self, msg: Option<P2pBridgeEvent>) -> EventResult {
         match msg {
-            Some(Left((_, msg))) => EventResult::Event(ConnEvent::OutboundMessage(*msg)),
-            Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action)),
-            None => EventResult::Event(ConnEvent::ClosedChannel),
+            Some(Left((_, msg))) => EventResult::Event(ConnEvent::OutboundMessage(*msg).into()),
+            Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action).into()),
+            None => EventResult::Event(ConnEvent::ClosedChannel.into()),
         }
     }
 
     fn handle_node_controller_msg(&self, msg: Option<NodeEvent>) -> EventResult {
         match msg {
-            Some(msg) => EventResult::Event(ConnEvent::NodeAction(msg)),
-            None => EventResult::Event(ConnEvent::ClosedChannel),
+            Some(msg) => EventResult::Event(ConnEvent::NodeAction(msg).into()),
+            None => EventResult::Event(ConnEvent::ClosedChannel.into()),
         }
     }
 
@@ -893,7 +895,7 @@ impl EventListenerState {
 
 enum EventResult {
     Continue,
-    Event(ConnEvent),
+    Event(Box<ConnEvent>),
 }
 
 #[derive(Debug)]

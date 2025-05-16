@@ -1,3 +1,4 @@
+#![allow(clippy::unbuffered_bytes)]
 use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},

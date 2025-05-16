@@ -4,31 +4,35 @@ This directory contains integration tests for the Freenet Ping application, focu
 
 ## Test Organization
 
-| Test File                  | Scenario                                                                                                                                           |
-| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `run_app.rs`               | **Multi-node and networking tests.** Contains multiple test functions focusing on basic multi-node functionality and partially connected networks. |
-| `run_app_blocked_peers.rs` | **Parameterized blocked peers tests.** A unified implementation of all blocked peers tests with different configurations.                          |
+| Test File                                | Scenario                                                                                                                    |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `run_app.rs`                             | **Multi-node and client functionality tests.** Contains tests for basic multi-node functionality and client application.    |
+| `run_app_blocked_peers.rs`               | **Parameterized blocked peers tests.** A unified implementation of blocked peers tests with different functional behaviors. |
+| `run_app_partially_connected_network.rs` | **Partial connectivity test.** Large-scale network test with controlled connectivity between nodes.                         |
 
 ## Parameterized "Blocked Peers" Tests
 
-The `run_app_blocked_peers.rs` file contains a parameterized implementation that consolidates all blocked peers testing variants into a single file. The file provides the following test variants:
+The `run_app_blocked_peers.rs` file contains a parameterized implementation that consolidates blocked peers testing into a single file. The file provides the following test variants:
 
-| Test Function                       | Description                                                                      |
-| ----------------------------------- | -------------------------------------------------------------------------------- |
-| `test_ping_blocked_peers`           | **Baseline implementation.** Standard test for indirect propagation via gateway. |
-| `test_ping_blocked_peers_simple`    | **Minimal variant.** One round of updates, simplified verification.              |
-| `test_ping_blocked_peers_optimized` | **Faster timeouts.** Reduced wait times for quicker test execution.              |
-| `test_ping_blocked_peers_improved`  | **Enhanced robustness.** Longer waits and more thorough verification.            |
-| `test_ping_blocked_peers_debug`     | **Debugging support.** Verbose logging and frequent state checks.                |
-| `test_ping_blocked_peers_reliable`  | **Reliability focus.** Multiple update rounds and refresh updates.               |
-| `test_ping_blocked_peers_solution`  | **Reference implementation.** Best practices for indirect propagation.           |
+| Test Function                      | Description                                                                      |
+| ---------------------------------- | -------------------------------------------------------------------------------- |
+| `test_ping_blocked_peers`          | **Baseline implementation.** Standard test for indirect propagation via gateway. |
+| `test_ping_blocked_peers_simple`   | **Minimal variant.** One round of updates, simplified verification.              |
+| `test_ping_blocked_peers_solution` | **Reference implementation.** Best practices for indirect propagation.           |
 
-## Test Structure in `run_app.rs`
+## Test Structure
+
+### In `run_app.rs`
+
+| Test Function                | Description                                                    |
+| ---------------------------- | -------------------------------------------------------------- |
+| `test_ping_multi_node`       | Tests basic contract propagation in a fully-connected network. |
+| `test_ping_application_loop` | Tests the complete client application running over time.       |
+
+### In `run_app_partially_connected_network.rs`
 
 | Test Function                           | Description                                                      |
 | --------------------------------------- | ---------------------------------------------------------------- |
-| `test_ping_multi_node`                  | Tests basic contract propagation in a fully-connected network.   |
-| `test_ping_application_loop`            | Tests the complete client application running over time.         |
 | `test_ping_partially_connected_network` | Tests propagation in a larger network with partial connectivity. |
 
 ### Multi-node vs. Partially Connected Tests
@@ -65,9 +69,9 @@ The unified approach in `run_app_blocked_peers.rs` offers several advantages:
 
 - **Reduced duplication**: Core test logic is defined once and reused
 - **Consistent methodology**: All variants follow the same testing pattern
-- **Parameterized configurations**: Tests differ only in timing, logging, and update strategies
+- **Functional variants**: Tests focus on different functional behaviors (baseline, simple, solution)
 - **Easier maintenance**: Changes to the core test logic only need to be made in one place
-- **Better test coverage**: Different configurations stress the system in different ways
+- **Focused test coverage**: Each variant tests a specific functional aspect of the system
 
 ## Running the Tests
 
@@ -78,16 +82,16 @@ cd apps/freenet-ping
 cargo test
 ```
 
-Run a specific test variant:
+Run a specific blocked peers test variant:
 
 ```bash
 cargo test test_ping_blocked_peers_simple
 ```
 
-Run the large-scale network test:
+Run the large-scale partial connectivity network test:
 
 ```bash
-cargo test test_ping_partially_connected_network
+cargo test -p freenet-ping-app --test run_app_partially_connected_network
 ```
 
 ---
