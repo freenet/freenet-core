@@ -1,7 +1,7 @@
 use std::{
     fmt::Display,
     fs::File,
-    io::{Read, Seek},
+    io::{BufReader, Read, Seek},
     sync::Arc,
     time::Duration,
 };
@@ -250,7 +250,7 @@ impl ClientEventsProxy for StdInput {
             loop {
                 self.buf.clear();
                 let f = async {
-                    let stdin = std::io::stdin();
+                    let stdin = BufReader::new(std::io::stdin());
                     'stdin: for b in stdin.bytes() {
                         let b = b.map_err(|_| {
                             ClientError::from(ErrorKind::TransportProtocolDisconnect)
