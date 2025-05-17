@@ -12,7 +12,7 @@ Options:
  -h --help	    Prints this command
  -p --path  	Directory where to save the output (generated params and/or key).
 		        If not set will use current working directory
- -k --key 	    Key path, if not set one will be generated  
+ -k --key 	    Key path, if not set one will be generated
  -c --code      Compiles the contract and saves the code hash
 "#;
 

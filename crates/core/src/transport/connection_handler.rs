@@ -1342,7 +1342,7 @@ mod test {
                                 _ = to.tick() => {
                                     return Err::<_, anyhow::Error>(
                                         anyhow::anyhow!(
-                                            "timeout waiting for messages, total time: {time:.2}; done iters {iter}", 
+                                            "timeout waiting for messages, total time: {time:.2}; done iters {iter}",
                                             time = start.elapsed().as_secs_f64(),
                                             iter = messages.len()
                                         )

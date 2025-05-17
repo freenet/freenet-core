@@ -951,7 +951,7 @@ mod opentelemetry_tracer {
         finished_tx_notifier: mpsc::Sender<Transaction>,
     }
 
-    /// For tests running in a single process is importart that span tracking is global across threads and simulated peers.  
+    /// For tests running in a single process is important that span tracking is global across threads and simulated peers.
     static UNIQUE_REGISTER: std::sync::OnceLock<DashMap<Transaction, OTSpan>> =
         std::sync::OnceLock::new();
 

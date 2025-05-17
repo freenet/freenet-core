@@ -52,8 +52,8 @@ impl StateStorage for Pool {
 
     async fn store(&mut self, key: ContractKey, state: WrappedState) -> Result<(), Self::Error> {
         sqlx::query(
-            "INSERT INTO states (contract, state) 
-                     VALUES ($1, $2) 
+            "INSERT INTO states (contract, state)
+                     VALUES ($1, $2)
                      ON CONFLICT(contract) DO UPDATE SET state = excluded.state
                      ",
         )
@@ -83,7 +83,7 @@ impl StateStorage for Pool {
         params: Parameters<'static>,
     ) -> Result<(), Self::Error> {
         sqlx::query(
-            "INSERT OR REPLACE INTO states (contract, params) 
+            "INSERT OR REPLACE INTO states (contract, params)
                      VALUES ($1, $2)
                      ON CONFLICT(contract) DO UPDATE SET params = excluded.params
                      ",

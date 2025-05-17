@@ -16,7 +16,7 @@ impl ContractInterface for Contract {
     ) -> Result<ValidateResult, ContractError> {
         let test_conditions: TestConditions = serde_json::from_slice(state.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
-        
+
         let mut _counter = 0;
         for _ in 0..test_conditions.iterations {
             _counter += 1;

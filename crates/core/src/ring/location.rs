@@ -118,7 +118,7 @@ impl PartialEq for Location {
 }
 
 /// Since we don't allow NaN values in the construction of Location
-/// we can safely assume that an equivalence relation holds.  
+/// we can safely assume that an equivalence relation holds.
 impl Eq for Location {}
 
 impl Ord for Location {

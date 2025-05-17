@@ -697,17 +697,17 @@ fn open_message(cx: Scope<Message>) -> Element {
                     onclick: move |_| {
                         menu_selection.write().at_inbox_list();
                     },
-                    i { class: "fa-sharp fa-solid fa-arrow-left", aria_label: "Back to Inbox", style: "color:#4a4a4a" }, 
+                    i { class: "fa-sharp fa-solid fa-arrow-left", aria_label: "Back to Inbox", style: "color:#4a4a4a" },
                 }
             }
             div { class: "column is-four-fifths", h2 { "{email.title}" } }
             div {
-                class: "column", 
+                class: "column",
                 a {
-                    class: "icon is-small", 
+                    class: "icon is-small",
                     // onclick: delete,
                     onclick: move |_| {},
-                    i { class: "fa-sharp fa-solid fa-trash", aria_label: "Delete", style: "color:#4a4a4a" } 
+                    i { class: "fa-sharp fa-solid fa-trash", aria_label: "Delete", style: "color:#4a4a4a" }
                 }
             }
         }

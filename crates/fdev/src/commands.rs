@@ -185,7 +185,7 @@ async fn put_delegate(
 
     let (cipher, nonce) = if delegate_config.cipher.is_empty() && delegate_config.nonce.is_empty() {
         println!(
-"Using default cipher and nonce. 
+"Using default cipher and nonce.
 For additional hardening is recommended to use a different cipher and nonce to encrypt secrets in storage.");
         (
             ::freenet_stdlib::client_api::DelegateRequest::DEFAULT_CIPHER,
