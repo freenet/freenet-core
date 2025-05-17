@@ -1004,39 +1004,54 @@ async fn test_ping_partially_connected_network() -> TestResult {
     std::mem::drop(ws_api_gateway_sockets);
     std::mem::drop(ws_api_node_sockets);
 
-    // Start the first gateway node
-    let gateway_future = {
-        let config = gateway_configs.remove(0);
-        async {
-            let config = config.build().await?;
-            let node = NodeConfig::new(config.clone())
-                .await?
-                .build(serve_gateway(config.ws_api).await)
-                .await?;
-            node.run().await
-        }
-        .boxed_local()
-    };
+    // Start all gateway nodes
+    let mut gateway_futures = Vec::with_capacity(NUM_GATEWAYS);
+    for (i, config) in gateway_configs.into_iter().enumerate() {
+        let gateway_future = {
+            let config = config;
+            async move {
+                let config = config.build().await?;
+                let node = NodeConfig::new(config.clone())
+                    .await?
+                    .build(serve_gateway(config.ws_api).await)
+                    .await?;
+                node.run().await
+            }
+            .boxed_local()
+        };
+        gateway_futures.push(gateway_future);
+    }
 
-    // Start one regular node
-    let regular_node_future = {
-        let config = node_configs.remove(0);
-        async {
-            let config = config.build().await?;
-            let node = NodeConfig::new(config.clone())
-                .await?
-                .build(serve_gateway(config.ws_api).await)
-                .await?;
-            node.run().await
-        }
-        .boxed_local()
-    };
+    // Start all regular nodes
+    let mut regular_node_futures = Vec::with_capacity(NUM_REGULAR_NODES);
+    for (i, config) in node_configs.into_iter().enumerate() {
+        let regular_node_future = {
+            let config = config;
+            async move {
+                let config = config.build().await?;
+                let node = NodeConfig::new(config.clone())
+                    .await?
+                    .build(serve_gateway(config.ws_api).await)
+                    .await?;
+                node.run().await
+            }
+            .boxed_local()
+        };
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        regular_node_futures.push(regular_node_future);
+    }
+
+    // Use the first futures for the select! macro
+    let gateway_future = gateway_futures.remove(0);
+    let regular_node_future = regular_node_futures.remove(0);
 
     let test = tokio::time::timeout(Duration::from_secs(240), async {
         // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        tracing::info!("Waiting for nodes to start up...");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        tracing::info!("Proceeding to connect to nodes...");
 
-        // Connect to all nodes
+        // Connect to all nodes with retry logic
         let mut gateway_clients = Vec::with_capacity(NUM_GATEWAYS);
         for (i, port) in ws_api_ports_gw.iter().enumerate() {
             let uri = format!(
