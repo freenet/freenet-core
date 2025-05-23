@@ -35,6 +35,7 @@ use common::{base_node_test_config, gw_config_from_path, APP_TAG, PACKAGE_DIR, P
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "fix me"]
 async fn test_ping_partially_connected_network() -> TestResult {
+    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
     /*
      * This test verifies how subscription propagation works in a partially connected network.
      *
@@ -60,8 +61,8 @@ async fn test_ping_partially_connected_network() -> TestResult {
      */
 
     // Network configuration parameters
-    const NUM_GATEWAYS: usize = 3;
-    const NUM_REGULAR_NODES: usize = 7;
+    const NUM_GATEWAYS: usize = 1;
+    const NUM_REGULAR_NODES: usize = 5;
     const CONNECTIVITY_RATIO: f64 = 0.5; // Controls connectivity between regular nodes
 
     // Configure logging
@@ -112,7 +113,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
             None,                         // base_tmp_dir
             None,                         // No blocked addresses for gateways
         )
-        .await?;
+            .await?;
 
         let public_port = cfg.network_api.public_port.unwrap();
         let path = preset.temp_dir.path().to_path_buf();
@@ -172,7 +173,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
             None,                            // base_tmp_dir
             Some(blocked_addresses.clone()), // Use blocked_addresses for regular nodes
         )
-        .await?;
+            .await?;
 
         tracing::info!(
             "Node {} data dir: {:?} - Connected to {} other regular nodes (blocked: {})",
@@ -192,10 +193,11 @@ async fn test_ping_partially_connected_network() -> TestResult {
     std::mem::drop(ws_api_gateway_sockets);
     std::mem::drop(ws_api_node_sockets);
 
-    // Start the first gateway node
-    let gateway_future = {
+    // Start all gateway nodes
+    let mut gateway_futures = Vec::with_capacity(NUM_GATEWAYS);
+    for _ in 0..NUM_GATEWAYS {
         let config = gateway_configs.remove(0);
-        async {
+        let gateway_future = async {
             let config = config.build().await?;
             let node = NodeConfig::new(config.clone())
                 .await?
@@ -203,13 +205,17 @@ async fn test_ping_partially_connected_network() -> TestResult {
                 .await?;
             node.run().await
         }
-        .boxed_local()
-    };
+            .boxed_local();
+        gateway_futures.push(gateway_future);
+    }
 
-    // Start one regular node
-    let regular_node_future = {
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Start all regular nodes
+    let mut regular_node_futures = Vec::with_capacity(NUM_REGULAR_NODES);
+    for _ in 0..NUM_REGULAR_NODES {
         let config = node_configs.remove(0);
-        async {
+        let regular_node_future = async {
             let config = config.build().await?;
             let node = NodeConfig::new(config.clone())
                 .await?
@@ -217,7 +223,8 @@ async fn test_ping_partially_connected_network() -> TestResult {
                 .await?;
             node.run().await
         }
-        .boxed_local()
+            .boxed_local();
+        regular_node_futures.push(regular_node_future);
     };
 
     let test = tokio::time::timeout(Duration::from_secs(240), async {
@@ -300,9 +307,9 @@ async fn test_ping_partially_connected_network() -> TestResult {
             Duration::from_secs(30),
             wait_for_put_response(publisher, &contract_key),
         )
-        .await
-        .map_err(|_| anyhow!("Put request timed out"))?
-        .map_err(anyhow::Error::msg)?;
+            .await
+            .map_err(|_| anyhow!("Put request timed out"))?
+            .map_err(anyhow::Error::msg)?;
 
         tracing::info!(key=%key, "Publisher node {} put ping contract successfully!", publisher_idx);
 
@@ -757,20 +764,41 @@ async fn test_ping_partially_connected_network() -> TestResult {
         tracing::info!("Subscription propagation test completed successfully!");
         Ok::<_, anyhow::Error>(())
     })
-    .instrument(span!(Level::INFO, "test_ping_partially_connected_network"));
+        .instrument(span!(Level::INFO, "test_ping_partially_connected_network"));
 
     // Wait for test completion or node failures
-    select! {
-        r = gateway_future => {
-            let Err(err) = r;
-            return Err(anyhow!("Gateway node failed: {}", err).into());
-        }
-        r = regular_node_future => {
-            let Err(err) = r;
-            return Err(anyhow!("Regular node failed: {}", err).into());
-        }
-        r = test => {
-            r??;
+    let mut all_futures = Vec::new();
+    all_futures.extend(gateway_futures);
+    all_futures.extend(regular_node_futures);
+
+    // Use a loop with select_all to handle multiple futures
+    let mut test_future = Box::pin(test);
+
+    loop {
+        let select_all_futures = futures::future::select_all(all_futures);
+
+        select! {
+            (result, _index, remaining) = select_all_futures => {
+                match result {
+                    Err(err) => {
+                        return Err(anyhow!("Node failed: {}", err).into());
+                    }
+                    Ok(_) => {
+                        // A node completed successfully, continue with remaining nodes
+                        all_futures = remaining;
+                        if all_futures.is_empty() {
+                            // All nodes completed successfully, but test should still be running
+                            tracing::warn!("All nodes completed before test finished");
+                            break;
+                        }
+                    }
+                }
+            }
+            r = &mut test_future => {
+                // Test completed
+                r??;
+                break;
+            }
         }
     }
 
