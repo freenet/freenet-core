@@ -238,7 +238,9 @@ async fn test_ping_partially_connected_network() -> TestResult {
                 "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
                 port
             );
-            let (stream, _) = connect_async(&uri).await?;
+            let (stream, _) = connect_async(&uri).await.inspect_err(|err| {
+                tracing::error!("Failed to connect to gateway ws {}: {}", i, err);
+            })?;
             let client = WebApi::start(stream);
             gateway_clients.push(client);
             tracing::info!("Connected to gateway {}", i);
@@ -250,7 +252,9 @@ async fn test_ping_partially_connected_network() -> TestResult {
                 "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
                 port
             );
-            let (stream, _) = connect_async(&uri).await?;
+            let (stream, _) = connect_async(&uri).await.inspect_err(|err| {
+                tracing::error!("Failed to connect to regular node ws {}: {}", i, err);
+            })?;
             let client = WebApi::start(stream);
             node_clients.push(client);
             tracing::info!("Connected to regular node {}", i);
@@ -273,7 +277,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
 
         // Create ping contract options
         let ping_options = PingContractOptions {
-            frequency: Duration::from_secs(3),
+            frequency: Duration::from_secs(2),
             ttl: Duration::from_secs(60),
             tag: APP_TAG.to_string(),
             code_key: code_hash.to_string(),

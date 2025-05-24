@@ -161,6 +161,41 @@ impl Operation for PutOp {
                         target.peer
                     );
 
+                    // Cache the contract locally BEFORE propagating to network
+                    // This ensures the initiating node has immediate access to the contract
+                    // and prevents data loss if the network propagation fails
+                    let should_seed = op_manager.ring.should_seed(&key);
+                    let is_already_seeding = op_manager.ring.is_seeding_contract(&key);
+
+                    if should_seed && !is_already_seeding {
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            peer = %sender.peer,
+                            "Caching contract locally in initiating node before propagation"
+                        );
+
+                        // Put the contract locally first
+                        put_contract(
+                            op_manager,
+                            key,
+                            value.clone(),
+                            related_contracts.clone(),
+                            contract,
+                        )
+                        .await?;
+
+                        // Mark as seeded locally
+                        op_manager.ring.seed_contract(key);
+
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            peer = %sender.peer,
+                            "Successfully cached contract locally before propagation"
+                        );
+                    }
+
                     // Create a SeekNode message to find the target node
                     // fixme: this node should filter out incoming redundant puts since is the one initiating the request
                     return_msg = Some(PutMsg::SeekNode {
@@ -413,28 +448,28 @@ impl Operation for PutOp {
                             state,
                             subscribe,
                         }) => {
-                            // Check if already subscribed before any operations
-                            let is_subscribed_contract = op_manager.ring.is_seeding_contract(&key);
+                            // Check if already sotored before any operations
+                            let is_seeding_contract = op_manager.ring.is_seeding_contract(&key);
 
-                            tracing::debug!(
-                                tx = %id,
-                                %key,
-                                peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
-                                "Storing contract locally after successful put"
-                            );
+                            // Only store the contract locally if not already seeded
+                            if !is_seeding_contract {
+                                tracing::debug!(
+                                    tx = %id,
+                                    %key,
+                                    peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
+                                    "Storing contract locally after successful put"
+                                );
 
-                            // Store the contract locally
-                            put_contract(
-                                op_manager,
-                                key,
-                                state.clone(),
-                                RelatedContracts::default(),
-                                &contract.clone(),
-                            )
-                            .await?;
+                                // Store the contract locally
+                                put_contract(
+                                    op_manager,
+                                    key,
+                                    state.clone(),
+                                    RelatedContracts::default(),
+                                    &contract.clone(),
+                                )
+                                .await?;
 
-                            // Handle seeding and subscription in one block
-                            if !is_subscribed_contract {
                                 // Always seed the contract locally after a successful put
                                 tracing::debug!(
                                     tx = %id,
@@ -443,26 +478,33 @@ impl Operation for PutOp {
                                     "Adding contract to local seed list"
                                 );
                                 op_manager.ring.seed_contract(key);
+                            } else {
+                                tracing::debug!(
+                                    tx = %id,
+                                    %key,
+                                    peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
+                                    "Contract already seeded locally, skipping duplicate caching"
+                                );
+                            }
 
-                                // Start subscription if requested
-                                if subscribe {
-                                    tracing::debug!(
-                                        tx = %id,
-                                        %key,
-                                        peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
-                                        "Starting subscription request"
-                                    );
-                                    // TODO: Make put operation atomic by linking it to the completion of this subscription request.
-                                    // Currently we can't link one transaction to another transaction's result, which would be needed
-                                    // to make this fully atomic. This should be addressed in a future refactoring.
-                                    super::start_subscription_request(
-                                        op_manager,
-                                        key,
-                                        false,
-                                        HashSet::new(),
-                                    )
-                                    .await;
-                                }
+                            // Start subscription if the contract is already seeded and the user requested it
+                            if subscribe && is_seeding_contract {
+                                tracing::debug!(
+                                    tx = %id,
+                                    %key,
+                                    peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
+                                    "Starting subscription request"
+                                );
+                                // TODO: Make put operation atomic by linking it to the completion of this subscription request.
+                                // Currently we can't link one transaction to another transaction's result, which would be needed
+                                // to make this fully atomic. This should be addressed in a future refactoring.
+                                super::start_subscription_request(
+                                    op_manager,
+                                    key,
+                                    false,
+                                    HashSet::new(),
+                                )
+                                .await;
                             }
 
                             tracing::info!(
