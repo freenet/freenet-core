@@ -135,7 +135,8 @@ pub fn ping_states_equal(a: &Ping, b: &Ping) -> bool {
 }
 
 pub const PACKAGE_DIR: &str = env!("CARGO_MANIFEST_DIR");
-pub const PATH_TO_CONTRACT: &str = "../contracts/ping/build/freenet/freenet_ping_contract";
+pub const PATH_TO_CONTRACT: &str = "../contracts/ping";
+const WASM_FILE_NAME: &str = "freenet-ping-contract";
 pub const APP_TAG: &str = "ping-app";
 
 pub async fn connect_ws_client(ws_port: u16) -> Result<WebApi> {

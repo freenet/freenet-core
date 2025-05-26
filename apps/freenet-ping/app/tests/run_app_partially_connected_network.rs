@@ -67,7 +67,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
 
     // Configure logging
     freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
-    tracing::info!(
+    println!(
         "Starting test with {} gateways and {} regular nodes (connectivity ratio: {})",
         NUM_GATEWAYS,
         NUM_REGULAR_NODES,
@@ -119,7 +119,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         let path = preset.temp_dir.path().to_path_buf();
         let config_info = gw_config_from_path(public_port, &path)?;
 
-        tracing::info!("Gateway {} data dir: {:?}", i, preset.temp_dir.path());
+        println!("Gateway {} data dir: {:?}", i, preset.temp_dir.path());
         ws_api_ports_gw.push(cfg.ws_api.ws_api_port.unwrap());
         gateway_info.push(config_info);
         gateway_configs.push(cfg);
@@ -175,7 +175,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         )
             .await?;
 
-        tracing::info!(
+        println!(
             "Node {} data dir: {:?} - Connected to {} other regular nodes (blocked: {})",
             i,
             preset.temp_dir.path(),
@@ -239,11 +239,11 @@ async fn test_ping_partially_connected_network() -> TestResult {
                 port
             );
             let (stream, _) = connect_async(&uri).await.inspect_err(|err| {
-                tracing::error!("Failed to connect to gateway ws {}: {}", i, err);
+                println!("Failed to connect to gateway ws {}: {}", i, err);
             })?;
             let client = WebApi::start(stream);
             gateway_clients.push(client);
-            tracing::info!("Connected to gateway {}", i);
+            println!("Connected to gateway {}", i);
         }
 
         let mut node_clients = Vec::with_capacity(NUM_REGULAR_NODES);
@@ -253,43 +253,39 @@ async fn test_ping_partially_connected_network() -> TestResult {
                 port
             );
             let (stream, _) = connect_async(&uri).await.inspect_err(|err| {
-                tracing::error!("Failed to connect to regular node ws {}: {}", i, err);
+                println!("Failed to connect to regular node ws {}: {}", i, err);
             })?;
             let client = WebApi::start(stream);
             node_clients.push(client);
-            tracing::info!("Connected to regular node {}", i);
+            println!("Connected to regular node {}", i);
         }
 
         // Log the node connectivity
-        tracing::info!("Node connectivity setup:");
+        println!("Node connectivity setup:");
         for (i, num_connections) in node_connections.iter().enumerate() {
-            tracing::info!("Node {} is connected to all {} gateways and {} other regular nodes",
+            println!("Node {} is connected to all {} gateways and {} other regular nodes",
                           i, NUM_GATEWAYS, num_connections);
         }
 
-        // Load the ping contract
+        // Load the ping contract using load_contract which compiles it at test execution time
         let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
-        tracing::info!(path=%path_to_code.display(), "loading contract code");
-        let code = std::fs::read(path_to_code)
-            .ok()
-            .ok_or_else(|| anyhow!("Failed to read contract code"))?;
-        let code_hash = CodeHash::from_code(&code);
+        println!("loading contract code from {}", path_to_code.display());
 
         // Create ping contract options
         let ping_options = PingContractOptions {
             frequency: Duration::from_secs(2),
             ttl: Duration::from_secs(60),
             tag: APP_TAG.to_string(),
-            code_key: code_hash.to_string(),
+            code_key: "".to_string(), // Will be set by load_contract
         };
 
         let params = Parameters::from(serde_json::to_vec(&ping_options).unwrap());
-        let container = ContractContainer::try_from((code, &params))?;
+        let container = common::load_contract(&path_to_code, params)?;
         let contract_key = container.key();
 
         // Choose a node to publish the contract
         let publisher_idx = 0;
-        tracing::info!("Node {} will publish the contract", publisher_idx);
+        println!("Node {} will publish the contract", publisher_idx);
 
         // Publisher node puts the contract
         let ping = Ping::default();
@@ -315,7 +311,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
             .map_err(|_| anyhow!("Put request timed out"))?
             .map_err(anyhow::Error::msg)?;
 
-        tracing::info!(key=%key, "Publisher node {} put ping contract successfully!", publisher_idx);
+        println!("Publisher node {} put ping contract successfully!", publisher_idx);
 
         // All nodes try to get the contract to see which have access
         let mut nodes_with_contract = [false; NUM_REGULAR_NODES];
@@ -353,7 +349,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
 
         while !get_requests.is_empty() || !gw_get_requests.is_empty() {
             if start.elapsed() > total_timeout {
-                tracing::warn!("Timeout waiting for get responses, continuing with test");
+                println!("Timeout waiting for get responses, continuing with test");
                 break;
             }
 
@@ -366,7 +362,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                 match timeout(Duration::from_millis(500), client.recv()).await {
                     Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, .. }))) => {
                         if key == contract_key {
-                            tracing::info!("Node {} successfully got the contract", node_idx);
+                            println!("Node {} successfully got the contract", node_idx);
                             nodes_with_contract[node_idx] = true;
                             get_requests.remove(i);
                             continue;
@@ -374,7 +370,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     }
                     Ok(Ok(_)) => {},
                     Ok(Err(e)) => {
-                        tracing::warn!("Error receiving from node {}: {}", node_idx, e);
+                        println!("Error receiving from node {}: {}", node_idx, e);
                         get_requests.remove(i);
                         continue;
                     }
@@ -392,7 +388,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                 match timeout(Duration::from_millis(500), client.recv()).await {
                     Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, .. }))) => {
                         if key == contract_key {
-                            tracing::info!("Gateway {} successfully got the contract", gw_idx);
+                            println!("Gateway {} successfully got the contract", gw_idx);
                             gateways_with_contract[gw_idx] = true;
                             gw_get_requests.remove(i);
                             continue;
@@ -400,7 +396,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     }
                     Ok(Ok(_)) => {},
                     Ok(Err(e)) => {
-                        tracing::warn!("Error receiving from gateway {}: {}", gw_idx, e);
+                        println!("Error receiving from gateway {}: {}", gw_idx, e);
                         gw_get_requests.remove(i);
                         continue;
                     }
@@ -413,11 +409,11 @@ async fn test_ping_partially_connected_network() -> TestResult {
         }
 
         // Log initial contract distribution
-        tracing::info!("Initial contract distribution:");
-        tracing::info!("Gateways with contract: {}/{}",
+        println!("Initial contract distribution:");
+        println!("Gateways with contract: {}/{}",
                       gateways_with_contract.iter().filter(|&&x| x).count(),
                       NUM_GATEWAYS);
-        tracing::info!("Regular nodes with contract: {}/{}",
+        println!("Regular nodes with contract: {}/{}",
                       nodes_with_contract.iter().filter(|&&x| x).count(),
                       NUM_REGULAR_NODES);
 
@@ -459,7 +455,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
 
         while !subscription_requests.is_empty() || !gw_subscription_requests.is_empty() {
             if start.elapsed() > total_timeout {
-                tracing::warn!("Timeout waiting for subscription responses, continuing with test");
+                println!("Timeout waiting for subscription responses, continuing with test");
                 break;
             }
 
@@ -472,7 +468,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                 match timeout(Duration::from_millis(500), client.recv()).await {
                     Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse { key, subscribed, .. }))) => {
                         if key == contract_key {
-                            tracing::info!("Node {} subscription result: {}", node_idx, subscribed);
+                            println!("Node {} subscription result: {}", node_idx, subscribed);
                             subscribed_nodes[node_idx] = subscribed;
                             subscription_requests.remove(i);
                             continue;
@@ -480,7 +476,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     }
                     Ok(Ok(_)) => {},
                     Ok(Err(e)) => {
-                        tracing::warn!("Error receiving from node {}: {}", node_idx, e);
+                        println!("Error receiving from node {}: {}", node_idx, e);
                         subscription_requests.remove(i);
                         continue;
                     }
@@ -498,7 +494,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                 match timeout(Duration::from_millis(500), client.recv()).await {
                     Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse { key, subscribed, .. }))) => {
                         if key == contract_key {
-                            tracing::info!("Gateway {} subscription result: {}", gw_idx, subscribed);
+                            println!("Gateway {} subscription result: {}", gw_idx, subscribed);
                             subscribed_gateways[gw_idx] = subscribed;
                             gw_subscription_requests.remove(i);
                             continue;
@@ -506,7 +502,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     }
                     Ok(Ok(_)) => {},
                     Ok(Err(e)) => {
-                        tracing::warn!("Error receiving from gateway {}: {}", gw_idx, e);
+                        println!("Error receiving from gateway {}: {}", gw_idx, e);
                         gw_subscription_requests.remove(i);
                         continue;
                     }
@@ -519,12 +515,12 @@ async fn test_ping_partially_connected_network() -> TestResult {
         }
 
         // Log subscription results
-        tracing::info!("Initial subscription results:");
-        tracing::info!("Subscribed gateways: {}/{} (with contract: {})",
+        println!("Initial subscription results:");
+        println!("Subscribed gateways: {}/{} (with contract: {})",
                       subscribed_gateways.iter().filter(|&&x| x).count(),
                       NUM_GATEWAYS,
                       gateways_with_contract.iter().filter(|&&x| x).count());
-        tracing::info!("Subscribed regular nodes: {}/{} (with contract: {})",
+        println!("Subscribed regular nodes: {}/{} (with contract: {})",
                       subscribed_nodes.iter().filter(|&&x| x).count(),
                       NUM_REGULAR_NODES,
                       nodes_with_contract.iter().filter(|&&x| x).count());
@@ -540,7 +536,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         }
 
         let updater_idx = updater_indices[0];
-        tracing::info!("Node {} will send an update", updater_idx);
+        println!("Node {} will send an update", updater_idx);
 
         // Create a unique tag for the updater
         let update_tag = format!("ping-from-node-{}", updater_idx);
@@ -549,7 +545,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         let mut update_ping = Ping::default();
         update_ping.insert(update_tag.clone());
 
-        tracing::info!("Node {} sending update with tag: {}", updater_idx, update_tag);
+        println!("Node {} sending update with tag: {}", updater_idx, update_tag);
         node_clients[updater_idx]
             .send(ClientRequest::ContractOp(ContractRequest::Update {
                 key: contract_key,
@@ -558,7 +554,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
             .await?;
 
         // Wait for the update to propagate through the network
-        tracing::info!("Waiting for update to propagate...");
+        println!("Waiting for update to propagate...");
         tokio::time::sleep(Duration::from_secs(20)).await;
 
         // Check which nodes received the update
@@ -601,7 +597,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
 
         while !get_state_requests.is_empty() || !gw_get_state_requests.is_empty() {
             if start.elapsed() > total_timeout {
-                tracing::warn!("Timeout waiting for get state responses, finalizing test");
+                println!("Timeout waiting for get state responses, finalizing test");
                 break;
             }
 
@@ -618,11 +614,11 @@ async fn test_ping_partially_connected_network() -> TestResult {
                             match serde_json::from_slice::<Ping>(&state) {
                                 Ok(ping_state) => {
                                     let has_update = ping_state.get(&update_tag).is_some();
-                                    tracing::info!("Node {} has update: {}", node_idx, has_update);
+                                    println!("Node {} has update: {}", node_idx, has_update);
 
                                     if has_update {
                                         let timestamps = ping_state.get(&update_tag).unwrap();
-                                        tracing::info!("Node {} has {} timestamps for tag {}",
+                                        println!("Node {} has {} timestamps for tag {}",
                                                       node_idx,
                                                       timestamps.len(),
                                                       update_tag);
@@ -631,7 +627,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                                     nodes_received_update[node_idx] = has_update;
                                 }
                                 Err(e) => {
-                                    tracing::warn!("Failed to deserialize state from node {}: {}", node_idx, e);
+                                    println!("Failed to deserialize state from node {}: {}", node_idx, e);
                                 }
                             }
                             get_state_requests.remove(i);
@@ -640,7 +636,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     }
                     Ok(Ok(_)) => {},
                     Ok(Err(e)) => {
-                        tracing::warn!("Error receiving from node {}: {}", node_idx, e);
+                        println!("Error receiving from node {}: {}", node_idx, e);
                         get_state_requests.remove(i);
                         continue;
                     }
@@ -662,11 +658,11 @@ async fn test_ping_partially_connected_network() -> TestResult {
                             match serde_json::from_slice::<Ping>(&state) {
                                 Ok(ping_state) => {
                                     let has_update = ping_state.get(&update_tag).is_some();
-                                    tracing::info!("Gateway {} has update: {}", gw_idx, has_update);
+                                    println!("Gateway {} has update: {}", gw_idx, has_update);
 
                                     if has_update {
                                         let timestamps = ping_state.get(&update_tag).unwrap();
-                                        tracing::info!("Gateway {} has {} timestamps for tag {}",
+                                        println!("Gateway {} has {} timestamps for tag {}",
                                                       gw_idx,
                                                       timestamps.len(),
                                                       update_tag);
@@ -675,7 +671,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                                     gateways_received_update[gw_idx] = has_update;
                                 }
                                 Err(e) => {
-                                    tracing::warn!("Failed to deserialize state from gateway {}: {}", gw_idx, e);
+                                    println!("Failed to deserialize state from gateway {}: {}", gw_idx, e);
                                 }
                             }
                             gw_get_state_requests.remove(i);
@@ -684,7 +680,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     }
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
-                        tracing::warn!("Error receiving from gateway {}: {}", gw_idx, e);
+                        println!("Error receiving from gateway {}: {}", gw_idx, e);
                         gw_get_state_requests.remove(i);
                         continue;
                     }
@@ -697,13 +693,13 @@ async fn test_ping_partially_connected_network() -> TestResult {
         }
 
         // Analyze update propagation results
-        tracing::info!("Final update propagation results:");
+        println!("Final update propagation results:");
 
         // Summary for gateways
         let subscribed_gw_count = subscribed_gateways.iter().filter(|&&x| x).count();
         let updated_gw_count = gateways_received_update.iter().filter(|&&x| x).count();
 
-        tracing::info!("Gateways: {}/{} subscribed received the update ({:.1}%)",
+        println!("Gateways: {}/{} subscribed received the update ({:.1}%)",
                       updated_gw_count,
                       subscribed_gw_count,
                       if subscribed_gw_count > 0 {
@@ -716,7 +712,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         let subscribed_node_count = subscribed_nodes.iter().filter(|&&x| x).count();
         let updated_node_count = nodes_received_update.iter().filter(|&&x| x).count();
 
-        tracing::info!("Regular nodes: {}/{} subscribed received the update ({:.1}%)",
+        println!("Regular nodes: {}/{} subscribed received the update ({:.1}%)",
                       updated_node_count,
                       subscribed_node_count,
                       if subscribed_node_count > 0 {
@@ -728,11 +724,11 @@ async fn test_ping_partially_connected_network() -> TestResult {
         // Check nodes that didn't receive updates
         for (node_idx, (subscribed, updated)) in subscribed_nodes.iter().zip(nodes_received_update.iter()).enumerate() {
             if *subscribed && !updated {
-                tracing::warn!("Node {} was subscribed but did not receive the update!", node_idx);
+                println!("Node {} was subscribed but did not receive the update!", node_idx);
 
                 // Get the node connectivity info
                 let connections = node_connections[node_idx];
-                tracing::warn!("Node {} is connected to {} other regular nodes", node_idx, connections);
+                println!("Node {} is connected to {} other regular nodes", node_idx, connections);
             }
         }
 
@@ -765,7 +761,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
             actual_rate * 100.0,
             min_expected_rate * 100.0
         );
-        tracing::info!("Subscription propagation test completed successfully!");
+        println!("Subscription propagation test completed successfully!");
         Ok::<_, anyhow::Error>(())
     })
         .instrument(span!(Level::INFO, "test_ping_partially_connected_network"));
@@ -792,7 +788,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                         all_futures = remaining;
                         if all_futures.is_empty() {
                             // All nodes completed successfully, but test should still be running
-                            tracing::warn!("All nodes completed before test finished");
+                            println!("All nodes completed before test finished");
                             break;
                         }
                     }
@@ -807,7 +803,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
     }
 
     // Keep presets alive until here
-    tracing::debug!(
+    println!(
         "Test complete, dropping {} gateway presets and {} node presets",
         gateway_presets.len(),
         node_presets.len()
