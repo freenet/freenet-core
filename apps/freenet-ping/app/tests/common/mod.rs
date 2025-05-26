@@ -245,16 +245,10 @@ fn compile_contract(contract_path: &PathBuf) -> anyhow::Result<Vec<u8>> {
         &contract_path,
     )?;
 
-    let name = contract_path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get file name"))?
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Failed to convert OsStr to str"))?;
-
     let output_file = Path::new(&target)
         .join(WASM_TARGET)
         .join("debug")
-        .join(name.replace('-', "_"))
+        .join(WASM_FILE_NAME.replace('-', "_"))
         .with_extension("wasm");
     println!("output file: {output_file:?}");
     Ok(std::fs::read(output_file)?)

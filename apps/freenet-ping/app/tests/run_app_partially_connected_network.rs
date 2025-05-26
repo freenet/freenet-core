@@ -312,6 +312,8 @@ async fn test_ping_partially_connected_network() -> TestResult {
             .map_err(anyhow::Error::msg)?;
 
         println!("Publisher node {} put ping contract successfully!", publisher_idx);
+        // wait for put propagation
+        tokio::time::sleep(Duration::from_secs(5)).await;
 
         // All nodes try to get the contract to see which have access
         let mut nodes_with_contract = [false; NUM_REGULAR_NODES];
