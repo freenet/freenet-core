@@ -242,7 +242,7 @@ fn compile_contract(contract_path: &PathBuf) -> anyhow::Result<Vec<u8>> {
             package_type: PackageType::Contract,
             debug: true,
         },
-        &contract_path,
+        contract_path,
     )?;
 
     let output_file = Path::new(&target)

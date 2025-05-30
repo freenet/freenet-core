@@ -818,7 +818,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     continue;
                                 }
                                 // if is not an intro packet, the connection is successful and we can proceed
-                                let (inbound_sender, inbound_recv) = mpsc::channel(1);
+                                let (inbound_sender, inbound_recv) = mpsc::channel(100);
                                 return Ok((
                                     RemoteConnection {
                                         outbound_packets: outbound_packets.clone(),

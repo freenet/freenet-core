@@ -33,7 +33,6 @@ use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 use common::{base_node_test_config, gw_config_from_path, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT};
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "fix me"]
 async fn test_ping_partially_connected_network() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
     /*
@@ -305,7 +304,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
             .await?;
 
         // Wait for put response on publisher
-        let key = timeout(
+        let _key = timeout(
             Duration::from_secs(30),
             wait_for_put_response(publisher, &contract_key),
         )

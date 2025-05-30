@@ -533,7 +533,7 @@ impl P2pConnManager {
                         return Ok(());
                     }
                 }
-                let (tx, rx) = mpsc::channel(1);
+                let (tx, rx) = mpsc::channel(100);
                 self.connections.insert(joiner.clone(), tx);
                 let was_reserved = {
                     // this is an unexpected inbound request at a gateway so it didn't have a reserved spot

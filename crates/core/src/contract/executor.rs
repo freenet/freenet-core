@@ -216,8 +216,8 @@ pub(crate) fn executor_channel(
 ) {
     // todo: use sensible values for channel buf sizes based on number concurrent tasks running
     // when we are able to suspend execution of a request while waiting for a callback
-    let (waiting_for_op_tx, waiting_for_op_rx) = mpsc::channel(1);
-    let (response_for_tx, response_for_rx) = mpsc::channel(1);
+    let (waiting_for_op_tx, waiting_for_op_rx) = mpsc::channel(10);
+    let (response_for_tx, response_for_rx) = mpsc::channel(10);
 
     let listener_halve = ExecutorToEventLoopChannel {
         op_manager: op_manager.clone(),
