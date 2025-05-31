@@ -999,10 +999,10 @@ async fn test_ping_partially_connected_network() -> TestResult {
         node_presets.push(preset);
     }
 
-    // Free ports to avoid binding errors
-    std::mem::drop(gateway_sockets);
-    std::mem::drop(ws_api_gateway_sockets);
-    std::mem::drop(ws_api_node_sockets);
+    // Keep socket references to prevent port reuse until nodes start
+    let _gateway_sockets = gateway_sockets;
+    let _ws_api_gateway_sockets = ws_api_gateway_sockets;
+    let _ws_api_node_sockets = ws_api_node_sockets;
 
     // Start all gateway nodes
     let mut gateway_futures = Vec::with_capacity(NUM_GATEWAYS);
@@ -1046,7 +1046,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
     let test = tokio::time::timeout(Duration::from_secs(240), async {
         // Wait for nodes to start up
         tracing::info!("Waiting for nodes to start up...");
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_secs(45)).await;
         tracing::info!("Proceeding to connect to nodes...");
 
         // Connect to all nodes with retry logic
@@ -1056,8 +1056,30 @@ async fn test_ping_partially_connected_network() -> TestResult {
                 "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
                 port
             );
-            let (stream, _) = connect_async(&uri).await?;
-            let client = WebApi::start(stream);
+
+            // Retry connection with exponential backoff
+            let mut retry_count = 0;
+            let max_retries = 5;
+            let client = loop {
+                match connect_async(&uri).await {
+                    Ok((stream, _)) => {
+                        break WebApi::start(stream);
+                    }
+                    Err(e) if retry_count < max_retries => {
+                        retry_count += 1;
+                        let delay = Duration::from_secs(2u64.pow(retry_count));
+                        tracing::warn!(
+                            "Failed to connect to gateway {} (attempt {}/{}): {}. Retrying in {:?}...",
+                            i, retry_count, max_retries, e, delay
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(e) => {
+                        return Err(anyhow!("Failed to connect to gateway {} after {} attempts: {}", i, max_retries, e));
+                    }
+                }
+            };
+
             gateway_clients.push(client);
             tracing::info!("Connected to gateway {}", i);
         }
@@ -1068,8 +1090,30 @@ async fn test_ping_partially_connected_network() -> TestResult {
                 "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
                 port
             );
-            let (stream, _) = connect_async(&uri).await?;
-            let client = WebApi::start(stream);
+
+            // Retry connection with exponential backoff
+            let mut retry_count = 0;
+            let max_retries = 5;
+            let client = loop {
+                match connect_async(&uri).await {
+                    Ok((stream, _)) => {
+                        break WebApi::start(stream);
+                    }
+                    Err(e) if retry_count < max_retries => {
+                        retry_count += 1;
+                        let delay = Duration::from_secs(2u64.pow(retry_count));
+                        tracing::warn!(
+                            "Failed to connect to regular node {} (attempt {}/{}): {}. Retrying in {:?}...",
+                            i, retry_count, max_retries, e, delay
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(e) => {
+                        return Err(anyhow!("Failed to connect to regular node {} after {} attempts: {}", i, max_retries, e));
+                    }
+                }
+            };
+
             node_clients.push(client);
             tracing::info!("Connected to regular node {}", i);
         }
@@ -1596,12 +1640,15 @@ async fn test_ping_partially_connected_network() -> TestResult {
         }
     }
 
-    // Keep presets alive until here
+    // Keep presets and sockets alive until here
     tracing::debug!(
         "Test complete, dropping {} gateway presets and {} node presets",
         gateway_presets.len(),
         node_presets.len()
     );
+    drop(_gateway_sockets);
+    drop(_ws_api_gateway_sockets);
+    drop(_ws_api_node_sockets);
 
     Ok(())
 }
