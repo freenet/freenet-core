@@ -110,7 +110,10 @@ fn compile_contract(name: &str) -> anyhow::Result<Vec<u8>> {
 
     println!("module path: {contract_path:?}");
     let target = get_workspace_target_dir();
-    println!("trying to compile the test contract, target: {}", target.display());
+    println!(
+        "trying to compile the test contract, target: {}",
+        target.display()
+    );
 
     compile_rust_wasm_lib(
         &BuildToolConfig {
@@ -147,7 +150,10 @@ fn compile_delegate(name: &str) -> anyhow::Result<Vec<u8>> {
     }
 
     let target = get_workspace_target_dir();
-    println!("trying to compile the test delegate, target: {}", target.display());
+    println!(
+        "trying to compile the test delegate, target: {}",
+        target.display()
+    );
 
     compile_rust_wasm_lib(
         &BuildToolConfig {

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 /// environment variable or by finding the workspace root and using its target directory.
 pub fn get_workspace_target_dir() -> PathBuf {
     const TARGET_DIR_VAR: &str = "CARGO_TARGET_DIR";
-    
+
     std::env::var(TARGET_DIR_VAR)
         .map(PathBuf::from)
         .unwrap_or_else(|_| {

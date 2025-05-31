@@ -26,7 +26,10 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
         path.join("tests").join(name.replace('_', "-"))
     };
     let target = get_workspace_target_dir();
-    println!("trying to compile the test contract, target: {}", target.display());
+    println!(
+        "trying to compile the test contract, target: {}",
+        target.display()
+    );
     // attempt to compile it
     const RUST_TARGET_ARGS: &[&str] = &["build", "--target"];
     const WASM_TARGET: &str = "wasm32-unknown-unknown";
