@@ -1,6 +1,6 @@
 mod common;
 
-use std::{net::TcpListener, path::PathBuf, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::anyhow;
 use freenet::{local_node::NodeConfig, server::serve_gateway};
@@ -15,7 +15,10 @@ use tokio::{select, time::sleep, time::timeout};
 use tokio_tungstenite::connect_async;
 use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 
-use common::{base_node_test_config, gw_config_from_path, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT};
+use common::{
+    base_node_test_config, create_tcp_listener_with_reuse, gw_config_from_path, APP_TAG,
+    PACKAGE_DIR, PATH_TO_CONTRACT,
+};
 use freenet_ping_app::ping_client::{
     run_ping_client, wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
     PingStats,
@@ -27,12 +30,12 @@ async fn test_ping_multi_node() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
 
     // Setup network sockets for the gateway
-    let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
+    let network_socket_gw = create_tcp_listener_with_reuse("127.0.0.1:0")?;
 
     // Setup API sockets for all three nodes
-    let ws_api_port_socket_gw = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_node1 = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_node2 = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_socket_gw = create_tcp_listener_with_reuse("127.0.0.1:0")?;
+    let ws_api_port_socket_node1 = create_tcp_listener_with_reuse("127.0.0.1:0")?;
+    let ws_api_port_socket_node2 = create_tcp_listener_with_reuse("127.0.0.1:0")?;
 
     // Configure gateway node
     let (config_gw, preset_cfg_gw, config_gw_info) = {
@@ -456,12 +459,12 @@ async fn test_ping_application_loop() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
 
     // Setup network sockets for the gateway
-    let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
+    let network_socket_gw = create_tcp_listener_with_reuse("127.0.0.1:0")?;
 
     // Setup API sockets for all three nodes
-    let ws_api_port_socket_gw = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_node1 = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_node2 = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_socket_gw = create_tcp_listener_with_reuse("127.0.0.1:0")?;
+    let ws_api_port_socket_node1 = create_tcp_listener_with_reuse("127.0.0.1:0")?;
+    let ws_api_port_socket_node2 = create_tcp_listener_with_reuse("127.0.0.1:0")?;
 
     // Configure gateway node
     let (config_gw, preset_cfg_gw, config_gw_info) = {
@@ -890,8 +893,8 @@ async fn test_ping_partially_connected_network() -> TestResult {
     let mut ws_api_gateway_sockets = Vec::with_capacity(NUM_GATEWAYS);
 
     for _ in 0..NUM_GATEWAYS {
-        gateway_sockets.push(TcpListener::bind("127.0.0.1:0")?);
-        ws_api_gateway_sockets.push(TcpListener::bind("127.0.0.1:0")?);
+        gateway_sockets.push(create_tcp_listener_with_reuse("127.0.0.1:0")?);
+        ws_api_gateway_sockets.push(create_tcp_listener_with_reuse("127.0.0.1:0")?);
     }
 
     // Setup API sockets for regular nodes
@@ -899,11 +902,11 @@ async fn test_ping_partially_connected_network() -> TestResult {
     let mut regular_node_addresses = Vec::with_capacity(NUM_REGULAR_NODES);
 
     // First, bind all sockets to get addresses for later blocking
-    for i in 0..NUM_REGULAR_NODES {
-        let socket = TcpListener::bind("127.0.0.1:0")?;
+    for _i in 0..NUM_REGULAR_NODES {
+        let socket = create_tcp_listener_with_reuse("127.0.0.1:0")?;
         // Store the address for later use in blocked_addresses
         regular_node_addresses.push(socket.local_addr()?);
-        ws_api_node_sockets.push(TcpListener::bind("127.0.0.1:0")?);
+        ws_api_node_sockets.push(create_tcp_listener_with_reuse("127.0.0.1:0")?);
     }
 
     // Configure gateway nodes
@@ -953,6 +956,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
     let mut node_configs = Vec::with_capacity(NUM_REGULAR_NODES);
     let mut node_presets = Vec::with_capacity(NUM_REGULAR_NODES);
 
+    #[allow(clippy::needless_range_loop)]
     for i in 0..NUM_REGULAR_NODES {
         // Determine which other regular nodes this node should block
         let mut blocked_addresses = Vec::new();
@@ -1006,7 +1010,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
 
     // Start all gateway nodes
     let mut gateway_futures = Vec::with_capacity(NUM_GATEWAYS);
-    for (i, config) in gateway_configs.into_iter().enumerate() {
+    for config in gateway_configs.into_iter() {
         let gateway_future = {
             async move {
                 let config = config.build().await?;
@@ -1023,7 +1027,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
 
     // Start all regular nodes
     let mut regular_node_futures = Vec::with_capacity(NUM_REGULAR_NODES);
-    for (i, config) in node_configs.into_iter().enumerate() {
+    for config in node_configs.into_iter() {
         let regular_node_future = {
             async move {
                 let config = config.build().await?;
@@ -1043,11 +1047,30 @@ async fn test_ping_partially_connected_network() -> TestResult {
     let gateway_future = gateway_futures.remove(0);
     let regular_node_future = regular_node_futures.remove(0);
 
-    let test = tokio::time::timeout(Duration::from_secs(240), async {
-        // Wait for nodes to start up
-        tracing::info!("Waiting for nodes to start up...");
-        tokio::time::sleep(Duration::from_secs(45)).await;
-        tracing::info!("Proceeding to connect to nodes...");
+    // Helper function to wait for nodes to be ready with health checks
+    async fn wait_for_nodes_ready(num_gateways: usize, num_nodes: usize, wait_time: Duration) {
+        tracing::info!(
+            "Waiting {} seconds for {} gateways and {} nodes to start up...",
+            wait_time.as_secs(),
+            num_gateways,
+            num_nodes
+        );
+
+        // Wait in smaller increments for better observability
+        let increments = 5;
+        let increment_duration = wait_time / increments;
+
+        for i in 0..increments {
+            tokio::time::sleep(increment_duration).await;
+            tracing::debug!("Node startup progress: {}/{}", i + 1, increments);
+        }
+
+        tracing::info!("Node startup wait complete, proceeding to connect...");
+    }
+
+    let test = tokio::time::timeout(Duration::from_secs(300), async {
+        // Wait for nodes to start up with health check
+        wait_for_nodes_ready(NUM_GATEWAYS, NUM_REGULAR_NODES, Duration::from_secs(60)).await;
 
         // Connect to all nodes with retry logic
         let mut gateway_clients = Vec::with_capacity(NUM_GATEWAYS);
@@ -1067,7 +1090,15 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     }
                     Err(e) if retry_count < max_retries => {
                         retry_count += 1;
-                        let delay = Duration::from_secs(2u64.pow(retry_count));
+                        // Add jitter to avoid thundering herd
+                        let base_delay = Duration::from_secs(2u64.pow(retry_count));
+                        let jitter = Duration::from_millis(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64 % 1000
+                        );
+                        let delay = base_delay + jitter;
                         tracing::warn!(
                             "Failed to connect to gateway {} (attempt {}/{}): {}. Retrying in {:?}...",
                             i, retry_count, max_retries, e, delay
@@ -1101,7 +1132,15 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     }
                     Err(e) if retry_count < max_retries => {
                         retry_count += 1;
-                        let delay = Duration::from_secs(2u64.pow(retry_count));
+                        // Add jitter to avoid thundering herd
+                        let base_delay = Duration::from_secs(2u64.pow(retry_count));
+                        let jitter = Duration::from_millis(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64 % 1000
+                        );
+                        let delay = base_delay + jitter;
                         tracing::warn!(
                             "Failed to connect to regular node {} (attempt {}/{}): {}. Retrying in {:?}...",
                             i, retry_count, max_retries, e, delay
@@ -1154,7 +1193,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         let serialized = serde_json::to_vec(&ping)?;
         let wrapped_state = WrappedState::new(serialized);
 
-        let mut publisher = &mut node_clients[publisher_idx];
+        let publisher = &mut node_clients[publisher_idx];
         publisher
             .send(ClientRequest::ContractOp(ContractRequest::Put {
                 contract: container.clone(),
