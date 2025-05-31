@@ -268,7 +268,7 @@ impl Ring {
     ) -> Vec<PeerKeyLocation> {
         let router = self.router.read();
         let target_location = Location::from(contract_key);
-        
+
         // Get all connected peers through the connection manager
         let connections = self.connection_manager.get_connections_by_location();
         let peers = connections.values().filter_map(|conns| {
@@ -276,8 +276,9 @@ impl Ring {
             let conn = conns.choose(&mut rand::thread_rng())?;
             (!skip_list.has_element(conn.location.peer.clone())).then_some(&conn.location)
         });
-        
-        router.select_k_best_peers(peers, target_location, k)
+
+        router
+            .select_k_best_peers(peers, target_location, k)
             .into_iter()
             .cloned()
             .collect()

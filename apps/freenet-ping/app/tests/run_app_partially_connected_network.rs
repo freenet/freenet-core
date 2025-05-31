@@ -440,7 +440,10 @@ async fn test_ping_partially_connected_network() -> TestResult {
         let mut final_get_requests = Vec::new();
         for (i, has_contract) in nodes_with_contract.iter().enumerate() {
             if !has_contract {
-                println!("Node {} still doesn't have contract, making final attempt to get it", i);
+                println!(
+                    "Node {} still doesn't have contract, making final attempt to get it",
+                    i
+                );
                 node_clients[i]
                     .send(ClientRequest::ContractOp(ContractRequest::Get {
                         key: contract_key,
@@ -473,7 +476,10 @@ async fn test_ping_partially_connected_network() -> TestResult {
                         ..
                     }))) => {
                         if key == contract_key {
-                            println!("Node {} successfully got the contract on final attempt", node_idx);
+                            println!(
+                                "Node {} successfully got the contract on final attempt",
+                                node_idx
+                            );
                             nodes_with_contract[node_idx] = true;
                             final_get_requests.remove(i);
                             continue;
@@ -481,7 +487,10 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     }
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
-                        println!("Error receiving from node {} on final get attempt: {}", node_idx, e);
+                        println!(
+                            "Error receiving from node {} on final get attempt: {}",
+                            node_idx, e
+                        );
                         final_get_requests.remove(i);
                         continue;
                     }
