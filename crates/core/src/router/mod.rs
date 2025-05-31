@@ -211,13 +211,14 @@ impl Router {
                         .map(|loc| (peer, target_location.distance(loc)))
                 })
                 .collect();
-            
+
             peer_distances.sort_by_key(|&(_, distance)| distance);
             peer_distances.truncate(k);
             peer_distances.into_iter().map(|(peer, _)| peer).collect()
         } else {
             // Get closest peers and rank by predicted routing outcome time
-            let mut candidates: Vec<_> = self.select_closest_peers(peers, &target_location)
+            let mut candidates: Vec<_> = self
+                .select_closest_peers(peers, &target_location)
                 .into_iter()
                 .filter_map(|peer| {
                     self.predict_routing_outcome(peer, target_location)
@@ -225,14 +226,14 @@ impl Router {
                         .map(|t| (peer, t.time_to_response_start))
                 })
                 .collect();
-            
+
             // Sort by predicted response time
             candidates.sort_by(|&(_, time1), &(_, time2)| {
                 time1
                     .partial_cmp(&time2)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            
+
             candidates.truncate(k);
             candidates.into_iter().map(|(peer, _)| peer).collect()
         }

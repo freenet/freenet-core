@@ -1,8 +1,4 @@
-use std::{
-    path::{Path, PathBuf},
-    process::Command,
-    sync::Arc,
-};
+use std::{path::PathBuf, process::Command, sync::Arc};
 
 use freenet_stdlib::prelude::{
     ContractCode, ContractContainer, ContractKey, ContractWasmAPIVersion, WrappedContract,
