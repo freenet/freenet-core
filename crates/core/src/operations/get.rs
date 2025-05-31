@@ -331,7 +331,9 @@ impl Operation for GetOp {
         input: &'a Self::Message,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
+            #[allow(unused_assignments)]
             let mut return_msg = None;
+            #[allow(unused_assignments)]
             let mut new_state = None;
             let mut result = None;
             let mut stats = self.stats;
