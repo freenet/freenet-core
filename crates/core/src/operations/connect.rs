@@ -297,7 +297,7 @@ impl Operation for ConnectOp {
                         .should_accept(joiner_loc, &joiner.peer)
                     {
                         tracing::debug!(tx = %id, %joiner, "Accepting connection from");
-                        let (callback, mut result) = tokio::sync::mpsc::channel(1);
+                        let (callback, mut result) = tokio::sync::mpsc::channel(10);
                         // Attempt to connect to the joiner
                         op_manager
                             .notify_node_event(NodeEvent::ConnectPeer {
@@ -833,7 +833,7 @@ async fn connect_request(
         "Connecting to gateway",
     );
 
-    let (callback, mut result) = tokio::sync::mpsc::channel(1);
+    let (callback, mut result) = tokio::sync::mpsc::channel(10);
     op_manager
         .notify_node_event(NodeEvent::ConnectPeer {
             peer: gateway.peer.clone(),

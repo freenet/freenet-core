@@ -33,7 +33,6 @@ use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 use common::{base_node_test_config, gw_config_from_path, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT};
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "fix me"]
 async fn test_ping_partially_connected_network() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
     /*
@@ -62,8 +61,8 @@ async fn test_ping_partially_connected_network() -> TestResult {
 
     // Network configuration parameters
     const NUM_GATEWAYS: usize = 1;
-    const NUM_REGULAR_NODES: usize = 5;
-    const CONNECTIVITY_RATIO: f64 = 0.5; // Controls connectivity between regular nodes
+    const NUM_REGULAR_NODES: usize = 7;
+    const CONNECTIVITY_RATIO: f64 = 0.3; // Controls connectivity between regular nodes
 
     // Configure logging
     freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
@@ -150,9 +149,11 @@ async fn test_ping_partially_connected_network() -> TestResult {
                 continue; // Skip self
             }
 
-            // Use a deterministic approach based on node indices
-            // If the result is >= than CONNECTIVITY_RATIO, block the connection
-            let should_block = (i * j) % 100 >= (CONNECTIVITY_RATIO * 100.0) as usize;
+            // Use a deterministic hash-based approach to achieve target connectivity ratio
+            // Create a deterministic value from the ordered pair (min(i,j), max(i,j))
+            let (a, b) = if i < j { (i, j) } else { (j, i) };
+            let hash_value = (a * 17 + b * 31 + a * b * 7) % 100;
+            let should_block = hash_value >= (CONNECTIVITY_RATIO * 100.0) as usize;
             if should_block {
                 blocked_addresses.push(addr);
             }
@@ -227,7 +228,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
 
     let test = tokio::time::timeout(Duration::from_secs(240), async {
         // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
 
         // Connect to all nodes
         let mut gateway_clients = Vec::with_capacity(NUM_GATEWAYS);
@@ -303,7 +304,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
             .await?;
 
         // Wait for put response on publisher
-        let key = timeout(
+        let _key = timeout(
             Duration::from_secs(30),
             wait_for_put_response(publisher, &contract_key),
         )

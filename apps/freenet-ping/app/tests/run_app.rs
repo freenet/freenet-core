@@ -1008,7 +1008,6 @@ async fn test_ping_partially_connected_network() -> TestResult {
     let mut gateway_futures = Vec::with_capacity(NUM_GATEWAYS);
     for (i, config) in gateway_configs.into_iter().enumerate() {
         let gateway_future = {
-            let config = config;
             async move {
                 let config = config.build().await?;
                 let node = NodeConfig::new(config.clone())
@@ -1026,7 +1025,6 @@ async fn test_ping_partially_connected_network() -> TestResult {
     let mut regular_node_futures = Vec::with_capacity(NUM_REGULAR_NODES);
     for (i, config) in node_configs.into_iter().enumerate() {
         let regular_node_future = {
-            let config = config;
             async move {
                 let config = config.build().await?;
                 let node = NodeConfig::new(config.clone())
@@ -1123,13 +1121,13 @@ async fn test_ping_partially_connected_network() -> TestResult {
             .await?;
 
         // Wait for put response on publisher
-        let key = wait_for_put_response(&mut publisher, &contract_key)
+        let key = wait_for_put_response(publisher, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
         tracing::info!(key=%key, "Publisher node {} put ping contract successfully!", publisher_idx);
 
         // All nodes try to get the contract to see which have access
-        let mut nodes_with_contract = vec![false; NUM_REGULAR_NODES];
+        let mut nodes_with_contract = [false; NUM_REGULAR_NODES];
         let mut get_requests = Vec::with_capacity(NUM_REGULAR_NODES);
 
         for (i, client) in node_clients.iter_mut().enumerate() {
@@ -1144,7 +1142,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         }
 
         // Track gateways with the contract
-        let mut gateways_with_contract = vec![false; NUM_GATEWAYS];
+        let mut gateways_with_contract = [false; NUM_GATEWAYS];
         let mut gw_get_requests = Vec::with_capacity(NUM_GATEWAYS);
 
         for (i, client) in gateway_clients.iter_mut().enumerate() {
@@ -1233,7 +1231,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                       NUM_REGULAR_NODES);
 
         // All nodes with the contract subscribe to it
-        let mut subscribed_nodes = vec![false; NUM_REGULAR_NODES];
+        let mut subscribed_nodes = [false; NUM_REGULAR_NODES];
         let mut subscription_requests = Vec::new();
 
         for (i, has_contract) in nodes_with_contract.iter().enumerate() {
@@ -1249,7 +1247,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         }
 
         // Also subscribe gateways
-        let mut subscribed_gateways = vec![false; NUM_GATEWAYS];
+        let mut subscribed_gateways = [false; NUM_GATEWAYS];
         let mut gw_subscription_requests = Vec::new();
 
         for (i, has_contract) in gateways_with_contract.iter().enumerate() {
@@ -1373,7 +1371,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         tokio::time::sleep(Duration::from_secs(20)).await;
 
         // Check which nodes received the update
-        let mut nodes_received_update = vec![false; NUM_REGULAR_NODES];
+        let mut nodes_received_update = [false; NUM_REGULAR_NODES];
         let mut get_state_requests = Vec::new();
 
         for (i, subscribed) in subscribed_nodes.iter().enumerate() {
@@ -1390,7 +1388,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         }
 
         // Also check gateways
-        let mut gateways_received_update = vec![false; NUM_GATEWAYS];
+        let mut gateways_received_update = [false; NUM_GATEWAYS];
         let mut gw_get_state_requests = Vec::new();
 
         for (i, subscribed) in subscribed_gateways.iter().enumerate() {
