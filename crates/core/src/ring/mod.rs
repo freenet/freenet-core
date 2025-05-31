@@ -259,6 +259,30 @@ impl Ring {
             .routing(Location::from(contract_key), None, skip_list, &router)
     }
 
+    /// Get k best peers for caching a contract, ranked by routing predictions
+    pub fn k_closest_potentially_caching(
+        &self,
+        contract_key: &ContractKey,
+        skip_list: impl Contains<PeerId> + Clone,
+        k: usize,
+    ) -> Vec<PeerKeyLocation> {
+        let router = self.router.read();
+        let target_location = Location::from(contract_key);
+        
+        // Get all connected peers through the connection manager
+        let connections = self.connection_manager.get_connections_by_location();
+        let peers = connections.values().filter_map(|conns| {
+            use rand::seq::SliceRandom;
+            let conn = conns.choose(&mut rand::thread_rng())?;
+            (!skip_list.has_element(conn.location.peer.clone())).then_some(&conn.location)
+        });
+        
+        router.select_k_best_peers(peers, target_location, k)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
     pub fn routing_finished(&self, event: crate::router::RouteEvent) {
         self.connection_manager
             .topology_manager
