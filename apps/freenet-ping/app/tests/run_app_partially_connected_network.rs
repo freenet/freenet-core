@@ -39,7 +39,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
      * This test verifies how subscription propagation works in a partially connected network.
      *
      * Parameters:
-     * - NUM_GATEWAYS: Number of gateway nodes to create (default: 3)
+     * - NUM_GATEWAYS: Number of gateway nodes to create (default: 1)
      * - NUM_REGULAR_NODES: Number of regular nodes to create (default: 7)
      * - CONNECTIVITY_RATIO: Percentage of connectivity between regular nodes (0.0-1.0)
      *
@@ -52,11 +52,14 @@ async fn test_ping_partially_connected_network() -> TestResult {
      * Test procedure:
      * 1. Configures and starts all nodes with the specified topology
      * 2. One node publishes the ping contract
-     * 3. Tracks which nodes successfully access the contract
-     * 4. Subscribes available nodes to the contract
-     * 5. Sends an update from one node
-     * 6. Verifies update propagation across the network
-     * 7. Analyzes results to detect potential subscription propagation issues
+     * 3. All nodes (gateways and regular nodes) attempt to get the contract initially
+     * 4. Tracks which nodes successfully access the contract in the first attempt
+     * 5. Nodes that don't have the contract make additional get attempts
+     * 6. ALL nodes that successfully obtain the contract (in any attempt) subscribe to it
+     * 7. Sends an update from one subscribed node
+     * 8. Verifies update propagation across all subscribed nodes in the network
+     * 9. Analyzes results to detect potential subscription propagation issues
+     * 10. Validates that a minimum percentage of subscribed nodes receive updates
      */
 
     // Network configuration parameters
@@ -433,12 +436,78 @@ async fn test_ping_partially_connected_network() -> TestResult {
             NUM_REGULAR_NODES
         );
 
-        // All nodes with the contract subscribe to it
+        // For nodes that still don't have the contract, make additional attempts
+        let mut final_get_requests = Vec::new();
+        for (i, has_contract) in nodes_with_contract.iter().enumerate() {
+            if !has_contract {
+                println!("Node {} still doesn't have contract, making final attempt to get it", i);
+                node_clients[i]
+                    .send(ClientRequest::ContractOp(ContractRequest::Get {
+                        key: contract_key,
+                        return_contract_code: true,
+                        subscribe: false,
+                    }))
+                    .await?;
+                final_get_requests.push(i);
+            }
+        }
+
+        // Process final get responses with a timeout
+        let start = std::time::Instant::now();
+        let total_timeout = Duration::from_secs(30);
+
+        while !final_get_requests.is_empty() {
+            if start.elapsed() > total_timeout {
+                println!("Timeout waiting for final get responses, continuing with subscriptions");
+                break;
+            }
+
+            let mut i = 0;
+            while i < final_get_requests.len() {
+                let node_idx = final_get_requests[i];
+                let client = &mut node_clients[node_idx];
+
+                match timeout(Duration::from_millis(500), client.recv()).await {
+                    Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                        key,
+                        ..
+                    }))) => {
+                        if key == contract_key {
+                            println!("Node {} successfully got the contract on final attempt", node_idx);
+                            nodes_with_contract[node_idx] = true;
+                            final_get_requests.remove(i);
+                            continue;
+                        }
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        println!("Error receiving from node {} on final get attempt: {}", node_idx, e);
+                        final_get_requests.remove(i);
+                        continue;
+                    }
+                    Err(_) => {}
+                }
+                i += 1;
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Log final contract distribution
+        println!("Final contract distribution after all get attempts:");
+        println!(
+            "Regular nodes with contract: {}/{}",
+            nodes_with_contract.iter().filter(|&&x| x).count(),
+            NUM_REGULAR_NODES
+        );
+
+        // ALL nodes with the contract subscribe to it (including those that got it in any attempt)
         let mut subscribed_nodes = [false; NUM_REGULAR_NODES];
         let mut subscription_requests = Vec::new();
 
         for (i, has_contract) in nodes_with_contract.iter().enumerate() {
             if *has_contract {
+                println!("Node {} has contract, subscribing to it", i);
                 node_clients[i]
                     .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
                         key: contract_key,
@@ -446,15 +515,18 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     }))
                     .await?;
                 subscription_requests.push(i);
+            } else {
+                println!("Node {} does not have contract, cannot subscribe", i);
             }
         }
 
-        // Also subscribe gateways
+        // Also subscribe gateways that have the contract
         let mut subscribed_gateways = [false; NUM_GATEWAYS];
         let mut gw_subscription_requests = Vec::new();
 
         for (i, has_contract) in gateways_with_contract.iter().enumerate() {
             if *has_contract {
+                println!("Gateway {} has contract, subscribing to it", i);
                 gateway_clients[i]
                     .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
                         key: contract_key,
@@ -462,6 +534,8 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     }))
                     .await?;
                 gw_subscription_requests.push(i);
+            } else {
+                println!("Gateway {} does not have contract, cannot subscribe", i);
             }
         }
 
