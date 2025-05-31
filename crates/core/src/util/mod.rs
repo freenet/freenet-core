@@ -1,4 +1,5 @@
 pub(crate) mod time_source;
+pub(crate) mod workspace;
 
 use std::{
     borrow::Borrow,

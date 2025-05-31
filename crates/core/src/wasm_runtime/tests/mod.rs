@@ -9,6 +9,7 @@ use freenet_stdlib::prelude::{
 };
 
 use crate::util::tests::get_temp_dir;
+use crate::util::workspace::get_workspace_target_dir;
 
 use super::{ContractStore, DelegateStore, SecretsStore};
 
@@ -24,23 +25,8 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
         let path = dirs.nth(2).unwrap();
         path.join("tests").join(name.replace('_', "-"))
     };
-    const TARGET_DIR_VAR: &str = "CARGO_TARGET_DIR";
-    let target = std::env::var(TARGET_DIR_VAR).unwrap_or_else(|_| {
-        // Use the workspace target directory if CARGO_TARGET_DIR is not set
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let workspace_root = PathBuf::from(manifest_dir)
-            .ancestors()
-            .find(|p| {
-                p.join("Cargo.toml").exists() && {
-                    let content = std::fs::read_to_string(p.join("Cargo.toml")).unwrap_or_default();
-                    content.contains("[workspace]")
-                }
-            })
-            .expect("Could not find workspace root")
-            .to_path_buf();
-        workspace_root.join("target").to_string_lossy().to_string()
-    });
-    println!("trying to compile the test contract, target: {target}");
+    let target = get_workspace_target_dir();
+    println!("trying to compile the test contract, target: {}", target.display());
     // attempt to compile it
     const RUST_TARGET_ARGS: &[&str] = &["build", "--target"];
     const WASM_TARGET: &str = "wasm32-unknown-unknown";
@@ -54,7 +40,7 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
         .current_dir(&module_path)
         .spawn()?;
     child.wait()?;
-    let output_file = Path::new(&target)
+    let output_file = target
         .join(WASM_TARGET)
         .join("debug")
         .join(name)
