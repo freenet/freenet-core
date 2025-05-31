@@ -846,6 +846,7 @@ async fn test_ping_application_loop() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "Flaky test - fails with 'Connection refused' errors. See PR #1612"]
 async fn test_ping_partially_connected_network() -> TestResult {
     /*
      * This test verifies how subscription propagation works in a partially connected network.
