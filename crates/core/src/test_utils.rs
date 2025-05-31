@@ -110,7 +110,19 @@ fn compile_contract(name: &str) -> anyhow::Result<Vec<u8>> {
 
     println!("module path: {contract_path:?}");
     let target = std::env::var(TARGET_DIR_VAR)
-        .map_err(|_| anyhow::anyhow!("CARGO_TARGET_DIR should be set"))?;
+        .unwrap_or_else(|_| {
+            // Use the workspace target directory if CARGO_TARGET_DIR is not set
+            let manifest_dir = env!("CARGO_MANIFEST_DIR");
+            let workspace_root = PathBuf::from(manifest_dir)
+                .ancestors()
+                .find(|p| p.join("Cargo.toml").exists() && {
+                    let content = std::fs::read_to_string(p.join("Cargo.toml")).unwrap_or_default();
+                    content.contains("[workspace]")
+                })
+                .expect("Could not find workspace root")
+                .to_path_buf();
+            workspace_root.join("target").to_string_lossy().to_string()
+        });
     println!("trying to compile the test contract, target: {target}");
 
     compile_rust_wasm_lib(
@@ -148,7 +160,19 @@ fn compile_delegate(name: &str) -> anyhow::Result<Vec<u8>> {
     }
 
     let target = std::env::var(TARGET_DIR_VAR)
-        .map_err(|_| anyhow::anyhow!("CARGO_TARGET_DIR should be set"))?;
+        .unwrap_or_else(|_| {
+            // Use the workspace target directory if CARGO_TARGET_DIR is not set
+            let manifest_dir = env!("CARGO_MANIFEST_DIR");
+            let workspace_root = PathBuf::from(manifest_dir)
+                .ancestors()
+                .find(|p| p.join("Cargo.toml").exists() && {
+                    let content = std::fs::read_to_string(p.join("Cargo.toml")).unwrap_or_default();
+                    content.contains("[workspace]")
+                })
+                .expect("Could not find workspace root")
+                .to_path_buf();
+            workspace_root.join("target").to_string_lossy().to_string()
+        });
     println!("trying to compile the test delegate, target: {target}");
 
     compile_rust_wasm_lib(
@@ -228,7 +252,24 @@ fn compile_rust_wasm_lib(cli_config: &BuildToolConfig, work_dir: &Path) -> anyho
 
     let package_type = cli_config.package_type;
     println!("Compiling {package_type} with rust");
-    let child = Command::new("cargo")
+    
+    // Set CARGO_TARGET_DIR if not already set to ensure consistent output location
+    let mut command = Command::new("cargo");
+    if std::env::var(TARGET_DIR_VAR).is_err() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let workspace_root = PathBuf::from(manifest_dir)
+            .ancestors()
+            .find(|p| p.join("Cargo.toml").exists() && {
+                let content = std::fs::read_to_string(p.join("Cargo.toml")).unwrap_or_default();
+                content.contains("[workspace]")
+            })
+            .expect("Could not find workspace root")
+            .to_path_buf();
+        let target_dir = workspace_root.join("target");
+        command.env(TARGET_DIR_VAR, target_dir);
+    }
+    
+    let child = command
         .args(&cmd_args)
         .current_dir(work_dir)
         .stdout(Stdio::piped())
