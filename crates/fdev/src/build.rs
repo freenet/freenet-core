@@ -13,7 +13,7 @@ use tar::Builder;
 
 use crate::{
     config::{BuildToolConfig, PackageType},
-    util::pipe_std_streams,
+    util::{get_workspace_target_dir, pipe_std_streams},
     Error,
 };
 pub(crate) use contract::*;
@@ -107,19 +107,7 @@ fn compile_rust_wasm_lib(cli_config: &BuildToolConfig, work_dir: &Path) -> anyho
     // Set CARGO_TARGET_DIR if not already set to ensure consistent output location
     let mut command = Command::new("cargo");
     if env::var("CARGO_TARGET_DIR").is_err() {
-        let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-        let workspace_root = PathBuf::from(manifest_dir)
-            .ancestors()
-            .find(|p| {
-                p.join("Cargo.toml").exists() && {
-                    let content = std::fs::read_to_string(p.join("Cargo.toml")).unwrap_or_default();
-                    content.contains("[workspace]")
-                }
-            })
-            .expect("Could not find workspace root")
-            .to_path_buf();
-        let target_dir = workspace_root.join("target");
-        command.env("CARGO_TARGET_DIR", target_dir);
+        command.env("CARGO_TARGET_DIR", get_workspace_target_dir());
     }
 
     let child = command
@@ -162,23 +150,8 @@ fn get_out_lib(work_dir: &Path, cli_config: &BuildToolConfig) -> anyhow::Result<
         "debug"
     };
     let output_lib = env::var("CARGO_TARGET_DIR")
-        .unwrap_or_else(|_| {
-            // Use the workspace target directory if CARGO_TARGET_DIR is not set
-            let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-            let workspace_root = PathBuf::from(manifest_dir)
-                .ancestors()
-                .find(|p| {
-                    p.join("Cargo.toml").exists() && {
-                        let content =
-                            std::fs::read_to_string(p.join("Cargo.toml")).unwrap_or_default();
-                        content.contains("[workspace]")
-                    }
-                })
-                .expect("Could not find workspace root")
-                .to_path_buf();
-            workspace_root.join("target").to_string_lossy().to_string()
-        })
-        .parse::<PathBuf>()?
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| get_workspace_target_dir())
         .join(target)
         .join(opt_dir)
         .join(&package_name)
