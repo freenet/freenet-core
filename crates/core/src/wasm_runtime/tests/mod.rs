@@ -30,9 +30,11 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let workspace_root = PathBuf::from(manifest_dir)
             .ancestors()
-            .find(|p| p.join("Cargo.toml").exists() && {
-                let content = std::fs::read_to_string(p.join("Cargo.toml")).unwrap_or_default();
-                content.contains("[workspace]")
+            .find(|p| {
+                p.join("Cargo.toml").exists() && {
+                    let content = std::fs::read_to_string(p.join("Cargo.toml")).unwrap_or_default();
+                    content.contains("[workspace]")
+                }
             })
             .expect("Could not find workspace root")
             .to_path_buf();
