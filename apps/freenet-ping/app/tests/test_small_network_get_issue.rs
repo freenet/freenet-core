@@ -29,7 +29,7 @@ async fn test_small_network_get_failure() -> TestResult {
      * 2. Poor connectivity between peers
      * 3. One peer publishes a contract
      * 4. Other peers try to GET the contract
-     * 
+     *
      * Without backtracking, the GET would fail.
      * With backtracking, it should succeed.
      */
@@ -180,7 +180,7 @@ async fn test_small_network_get_failure() -> TestResult {
 
         // Node1 publishes the contract
         println!("📤 Node1 publishing ping contract...");
-        
+
         let ping = Ping::default();
         let serialized = serde_json::to_vec(&ping)?;
         let wrapped_state = WrappedState::new(serialized);
@@ -197,9 +197,9 @@ async fn test_small_network_get_failure() -> TestResult {
         // Wait for put response
         println!("Waiting for put response...");
         match timeout(Duration::from_secs(30), client_node1.recv()).await {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse {
-                key,
-            }))) if key == contract_key => {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key })))
+                if key == contract_key =>
+            {
                 println!("✅ Node1 successfully published contract");
             }
             Ok(Ok(resp)) => {
@@ -238,9 +238,7 @@ async fn test_small_network_get_failure() -> TestResult {
             Ok(Ok(HostResponse::ContractResponse(response))) => {
                 println!("Get response after {:?}: {:?}", start.elapsed(), response);
                 match response {
-                    ContractResponse::GetResponse { key, state, .. }
-                        if key == contract_key =>
-                    {
+                    ContractResponse::GetResponse { key, state, .. } if key == contract_key => {
                         if !state.is_empty() {
                             println!("✅ Node2 successfully retrieved the contract!");
                             println!("   The backtracking implementation is working!");
