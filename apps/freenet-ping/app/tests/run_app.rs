@@ -999,10 +999,10 @@ async fn test_ping_partially_connected_network() -> TestResult {
         node_presets.push(preset);
     }
 
-    // Keep socket references to prevent port reuse until nodes start
-    let _gateway_sockets = gateway_sockets;
-    let _ws_api_gateway_sockets = ws_api_gateway_sockets;
-    let _ws_api_node_sockets = ws_api_node_sockets;
+    // Free ports to avoid binding errors
+    std::mem::drop(gateway_sockets);
+    std::mem::drop(ws_api_gateway_sockets);
+    std::mem::drop(ws_api_node_sockets);
 
     // Start all gateway nodes
     let mut gateway_futures = Vec::with_capacity(NUM_GATEWAYS);
@@ -1640,15 +1640,12 @@ async fn test_ping_partially_connected_network() -> TestResult {
         }
     }
 
-    // Keep presets and sockets alive until here
+    // Keep presets alive until here
     tracing::debug!(
         "Test complete, dropping {} gateway presets and {} node presets",
         gateway_presets.len(),
         node_presets.len()
     );
-    drop(_gateway_sockets);
-    drop(_ws_api_gateway_sockets);
-    drop(_ws_api_node_sockets);
 
     Ok(())
 }
