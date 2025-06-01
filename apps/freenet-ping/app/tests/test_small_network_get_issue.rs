@@ -115,7 +115,9 @@ async fn test_small_network_get_failure() -> TestResult {
         // Set reasonable connection limits for small test network
         node_config.min_number_of_connections(2);
         node_config.max_number_of_connections(10);
-        let node = node_config.build(serve_gateway(config.ws_api).await).await?;
+        let node = node_config
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
         node.run().await
     }
     .instrument(span!(Level::INFO, "gateway"))
@@ -127,7 +129,9 @@ async fn test_small_network_get_failure() -> TestResult {
         // Set reasonable connection limits for small test network
         node_config.min_number_of_connections(2);
         node_config.max_number_of_connections(10);
-        let node = node_config.build(serve_gateway(config.ws_api).await).await?;
+        let node = node_config
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
         node.run().await
     }
     .instrument(span!(Level::INFO, "node1"))
@@ -139,7 +143,9 @@ async fn test_small_network_get_failure() -> TestResult {
         // Set reasonable connection limits for small test network
         node_config.min_number_of_connections(2);
         node_config.max_number_of_connections(10);
-        let node = node_config.build(serve_gateway(config.ws_api).await).await?;
+        let node = node_config
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
         node.run().await
     }
     .instrument(span!(Level::INFO, "node2"))
@@ -150,11 +156,11 @@ async fn test_small_network_get_failure() -> TestResult {
         println!("Waiting for nodes to start up...");
         tokio::time::sleep(Duration::from_secs(15)).await;
         println!("✓ Nodes should be up and have basic connectivity");
-        
+
         // TODO: The connection maintenance task runs every 60 seconds by default,
         // which is too slow for tests. This causes the first GET operation to take
-        // 11+ seconds as connections are established on-demand. 
-        // 
+        // 11+ seconds as connections are established on-demand.
+        //
         // Proper fix: Make connection acquisition more aggressive during startup,
         // or make the maintenance interval configurable for tests.
 
@@ -339,7 +345,7 @@ async fn test_small_network_get_failure() -> TestResult {
         // Test second GET after connections are established
         println!("\n🔍 Testing second GET from Node2 after connections are established...");
         tokio::time::sleep(Duration::from_secs(5)).await;
-        
+
         let get2_start = std::time::Instant::now();
         client_node2
             .send(ClientRequest::ContractOp(ContractRequest::Get {
@@ -351,8 +357,11 @@ async fn test_small_network_get_failure() -> TestResult {
         println!("   Second GET request sent");
 
         match timeout(Duration::from_secs(10), client_node2.recv()).await {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, state, .. }))) 
-                if key == contract_key => {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key,
+                state,
+                ..
+            }))) if key == contract_key => {
                 println!(
                     "✅ Second GET completed in {}ms (vs 13s for first GET!)",
                     get2_start.elapsed().as_millis()

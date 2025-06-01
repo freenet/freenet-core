@@ -1,0 +1,109 @@
+warning: unused variable: `i`
+   --> apps/freenet-ping/app/tests/run_app.rs:903:9
+    |
+903 |     for i in 0..NUM_REGULAR_NODES {
+    |         ^ help: if this is intentional, prefix it with an underscore: `_i`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `i`
+    --> apps/freenet-ping/app/tests/run_app.rs:1010:10
+     |
+1010 |     for (i, config) in gateway_configs.into_iter().enumerate() {
+     |          ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `i`
+    --> apps/freenet-ping/app/tests/run_app.rs:1027:10
+     |
+1027 |     for (i, config) in node_configs.into_iter().enumerate() {
+     |          ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: variable does not need to be mutable
+    --> apps/freenet-ping/app/tests/run_app.rs:1114:13
+     |
+1114 |         let mut publisher = &mut node_clients[publisher_idx];
+     |             ----^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: `freenet-ping-app` (test "run_app") generated 4 warnings (run `cargo fix --test "run_app"` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.37s
+     Running unittests src/lib.rs (target/debug/deps/freenet_ping_app-0e4598d1cfbeff9f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/freenet_ping-715dcaf68c5b5c53)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/large_network_simulation.rs (target/debug/deps/large_network_simulation-7e4b01f2bdb435ba)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/run_app.rs (target/debug/deps/run_app-6beffa69a33ddc5e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/run_app_blocked_peers.rs (target/debug/deps/run_app_blocked_peers-4f35d7ff7e324d88)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/run_app_partially_connected_network.rs (target/debug/deps/run_app_partially_connected_network-e5722d1221aa2db3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/test_50_node_operations.rs (target/debug/deps/test_50_node_operations-e861fde33d76ea5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/test_connection_timing.rs (target/debug/deps/test_connection_timing-b6fde2bc8b664227)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/test_small_network_get_issue.rs (target/debug/deps/test_small_network_get_issue-74008835fe45f3d9)
+
+running 1 test
+🔧 Testing get operation in small, poorly connected network
+   Simulating production conditions with 4 total peers
+Network topology:
+  Gateway
+    ├── Node1
+    └── Node2
+
+Note: Nodes are only connected through the gateway
+Waiting for nodes to start up...
+✓ Nodes should be up and have discovered each other
+Loading contract code from /home/ian/code/freenet/freenet-core/debug-update-issues/apps/freenet-ping/app/../contracts/ping
+module path: "/home/ian/code/freenet/freenet-core/debug-update-issues/apps/freenet-ping/app/../contracts/ping"
+trying to compile the test contract, target: /home/ian/code/freenet/freenet-core/debug-update-issues/target
+Compiling contract with rust
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.18s
+output file: "/home/ian/code/freenet/freenet-core/debug-update-issues/target/wasm32-unknown-unknown/debug/freenet_ping_contract.wasm"
+📤 Node1 publishing ping contract...
+Waiting for put response...
+Timeout waiting for put response
+🔍 Checking which nodes have the contract cached...
+   ✓ Gateway has the contract cached
+🔍 Testing second GET from Gateway (should be fast if WASM is the issue)...
+   ✓ Gateway second GET took 116ms
+📥 Node2 attempting to GET the contract...
+   Contract key: 7h99HJYhaMNQchCZtTDThc4pfeNx8BPPhrGqhN84NrPV
+   GET request sent (0ms after start)

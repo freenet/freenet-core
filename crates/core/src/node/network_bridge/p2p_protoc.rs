@@ -30,6 +30,7 @@ use crate::node::network_bridge::handshake::{
     OutboundMessage,
 };
 use crate::node::PeerId;
+use crate::operations::{connect::ConnectMsg, get::GetMsg, put::PutMsg, update::UpdateMsg};
 use crate::transport::{
     create_connection_handler, PeerConnection, TransportError, TransportKeypair,
 };
@@ -239,11 +240,55 @@ impl P2pConnManager {
                                     }
                                 }
                                 None => {
-                                    tracing::error!(
+                                    tracing::warn!(
                                         id = %msg.id(),
                                         target = %target_peer.peer,
-                                        "No existing outbound connection to forward the message"
+                                        "No existing outbound connection, establishing connection first"
                                     );
+
+                                    // Queue the message for sending after connection is established
+                                    let tx = *msg.id();
+                                    let (callback, mut result) = tokio::sync::mpsc::channel(10);
+
+                                    // Initiate connection to the peer
+                                    self.bridge
+                                        .ev_listener_tx
+                                        .send(Right(NodeEvent::ConnectPeer {
+                                            peer: target_peer.peer.clone(),
+                                            tx,
+                                            callback,
+                                            is_gw: false,
+                                        }))
+                                        .await?;
+
+                                    // Wait for connection to be established (with timeout)
+                                    match timeout(Duration::from_secs(5), result.recv()).await {
+                                        Ok(Some(Ok(_))) => {
+                                            // Connection established, try sending again
+                                            if let Some(peer_connection) =
+                                                self.connections.get(&target_peer.peer)
+                                            {
+                                                if let Err(e) =
+                                                    peer_connection.send(Left(msg)).await
+                                                {
+                                                    tracing::error!("Failed to send message to peer after establishing connection: {}", e);
+                                                }
+                                            }
+                                        }
+                                        Ok(Some(Err(e))) => {
+                                            tracing::error!(
+                                                "Failed to establish connection to {}: {:?}",
+                                                target_peer.peer,
+                                                e
+                                            );
+                                        }
+                                        Ok(None) | Err(_) => {
+                                            tracing::error!(
+                                                "Timeout or error establishing connection to {}",
+                                                target_peer.peer
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -699,11 +744,43 @@ impl P2pConnManager {
     async fn handle_peer_connection_msg(
         &mut self,
         msg: Option<Result<PeerConnectionInbound, TransportError>>,
-        state: &EventListenerState,
+        state: &mut EventListenerState,
         handshake_handler_msg: &HanshakeHandlerMsg,
     ) -> anyhow::Result<EventResult> {
         match msg {
             Some(Ok(peer_conn)) => {
+                // Get the remote address from the connection
+                let remote_addr = peer_conn.conn.remote_addr();
+
+                // Check if we need to establish a connection back to the sender
+                let should_connect = !self.connections.keys().any(|peer| peer.addr == remote_addr)
+                    && !state.awaiting_connection.contains_key(&remote_addr);
+
+                if should_connect {
+                    // Try to extract sender information from the message to establish connection
+                    if let Some(sender_peer) = extract_sender_from_message(&peer_conn.msg) {
+                        tracing::info!(
+                            "Received message from unconnected peer {}, establishing connection proactively",
+                            sender_peer.peer
+                        );
+
+                        let tx = Transaction::new::<crate::operations::connect::ConnectMsg>();
+                        let (callback, _rx) = tokio::sync::mpsc::channel(10);
+
+                        // Don't await - let it happen in the background
+                        let _ = self
+                            .handle_connect_peer(
+                                sender_peer.peer.clone(),
+                                Box::new(callback),
+                                tx,
+                                handshake_handler_msg,
+                                state,
+                                false, // not a gateway connection
+                            )
+                            .await;
+                    }
+                }
+
                 let task = peer_connection_listener(peer_conn.rx, peer_conn.conn).boxed();
                 state.peer_connections.push(task);
                 Ok(EventResult::Event(
@@ -968,6 +1045,49 @@ async fn peer_connection_listener(
 #[inline(always)]
 fn decode_msg(data: &[u8]) -> Result<NetMessage, ConnectionError> {
     bincode::deserialize(data).map_err(|err| ConnectionError::Serialization(Some(err)))
+}
+
+/// Extract sender information from various message types
+fn extract_sender_from_message(msg: &NetMessage) -> Option<PeerKeyLocation> {
+    match msg {
+        NetMessage::V1(msg_v1) => match msg_v1 {
+            // Connect messages often have sender information
+            NetMessageV1::Connect(connect_msg) => match connect_msg {
+                ConnectMsg::Response { sender, .. } => Some(sender.clone()),
+                ConnectMsg::Request { target, .. } => Some(target.clone()),
+                _ => None,
+            },
+            // Get messages have sender in some variants
+            NetMessageV1::Get(get_msg) => match get_msg {
+                GetMsg::SeekNode { sender, .. } => Some(sender.clone()),
+                GetMsg::ReturnGet { sender, .. } => Some(sender.clone()),
+                _ => None,
+            },
+            // Put messages have sender in some variants
+            NetMessageV1::Put(put_msg) => match put_msg {
+                PutMsg::SeekNode { sender, .. } => Some(sender.clone()),
+                PutMsg::SuccessfulPut { sender, .. } => Some(sender.clone()),
+                PutMsg::PutForward { sender, .. } => Some(sender.clone()),
+                _ => None,
+            },
+            // Update messages have sender in some variants
+            NetMessageV1::Update(update_msg) => match update_msg {
+                UpdateMsg::SeekNode { sender, .. } => Some(sender.clone()),
+                UpdateMsg::SuccessfulUpdate { sender, .. } => Some(sender.clone()),
+                UpdateMsg::Broadcasting { sender, .. } => Some(sender.clone()),
+                UpdateMsg::BroadcastTo { sender, .. } => Some(sender.clone()),
+                _ => None,
+            },
+            // Subscribe messages
+            NetMessageV1::Subscribe(subscribe_msg) => match subscribe_msg {
+                SubscribeMsg::SeekNode { subscriber, .. } => Some(subscriber.clone()),
+                SubscribeMsg::ReturnSub { sender, .. } => Some(sender.clone()),
+                _ => None,
+            },
+            // Other message types don't have sender info
+            _ => None,
+        },
+    }
 }
 
 // TODO: add testing for the network loop, now it should be possible to do since we don't depend upon having real connections

@@ -1,0 +1,83 @@
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+
+running 1 test
+🔧 Testing get operation in small, poorly connected network
+   Simulating production conditions with 4 total peers
+Network topology:
+  Gateway
+    ├── Node1
+    └── Node2
+
+Note: Nodes are only connected through the gateway
+Waiting for nodes to start up...
+  [2m2025-05-31T23:46:19.996909Z[0m [33m WARN[0m [1;33mfreenet::transport::connection_handler[0m[33m: [33mfailed to receive UDP response in time, retrying, [1;33mthis_addr[0m[33m: 127.0.0.1:40648, [1;33mremote_addr[0m[33m: 127.0.0.1:52665, [1;33mfailures[0m[33m: 1, [1;33mtimeout_ms[0m[33m: 600[0m
+    [2;3mat[0m crates/core/src/transport/connection_handler.rs:851
+
+  [2m2025-05-31T23:46:20.719919Z[0m [33m WARN[0m [1;33mfreenet::transport::connection_handler[0m[33m: [33mfailed to receive UDP response in time, retrying, [1;33mthis_addr[0m[33m: 127.0.0.1:40648, [1;33mremote_addr[0m[33m: 127.0.0.1:52665, [1;33mfailures[0m[33m: 2, [1;33mtimeout_ms[0m[33m: 720[0m
+    [2;3mat[0m crates/core/src/transport/connection_handler.rs:851
+
+✓ Nodes should be up and have discovered each other
+Loading contract code from /home/ian/code/freenet/freenet-core/debug-update-issues/apps/freenet-ping/app/../contracts/ping
+module path: "/home/ian/code/freenet/freenet-core/debug-update-issues/apps/freenet-ping/app/../contracts/ping"
+trying to compile the test contract, target: /home/ian/code/freenet/freenet-core/debug-update-issues/target
+Compiling contract with rust
+output file: "/home/ian/code/freenet/freenet-core/debug-update-issues/target/wasm32-unknown-unknown/debug/freenet_ping_contract.wasm"
+📤 Node1 publishing ping contract...
+Waiting for put response...
+  [2m2025-05-31T23:46:53.339641Z[0m [33m WARN[0m [1;33mfreenet::transport::peer_connection[0m[33m: [33mconnection timed out, [1;33mremote[0m[33m: 127.0.0.1:39367[0m
+    [2;3mat[0m crates/core/src/transport/peer_connection.rs:346
+
+  [2m2025-05-31T23:46:54.108889Z[0m [33m WARN[0m [1;33mfreenet::transport::peer_connection[0m[33m: [33mconnection timed out, [1;33mremote[0m[33m: 127.0.0.1:39367[0m
+    [2;3mat[0m crates/core/src/transport/peer_connection.rs:346
+
+Timeout waiting for put response
+🔍 Checking which nodes have the contract cached...
+   ✓ Gateway has the contract cached
+🔍 Testing second GET from Gateway (should be fast if WASM is the issue)...
+   ✓ Gateway second GET took 112ms
+📥 Node2 attempting to GET the contract...
+   Contract key: 7h99HJYhaMNQchCZtTDThc4pfeNx8BPPhrGqhN84NrPV
+   GET request sent (0ms after start)
+test test_small_network_get_failure has been running for over 60 seconds
+Get response after 11.283692187s: GetResponse { key: ContractKey { instance: ContractInstanceId("7h99HJYhaMNQchCZtTDThc4pfeNx8BPPhrGqhN84NrPV"), code: Some(CodeHash("aatgnh5cpc5hpravn7ediuubhsmlykiubfqpl2fm7kmk")) }, contract: Some(Wasm(V1(WrappedContract { data: ContractCode { hash: CodeHash("aatgnh5cpc5hpravn7ediuubhsmlykiubfqpl2fm7kmk"), params: Parameters([123, 34, 116, 116, 108, 34, 58, 34, 49, 109, 34, 44, 34, 102, 114, 101, 113, 117, 101, 110, 99, 121, 34, 58, 34, 50, 115, 34, 44, 34, 116, 97, 103, 34, 58, 34, 112, 105, 110, 103, 45, 97, 112, 112, 34, 44, 34, 99, 111, 100, 101, 95, 107, 101, 121, 34, 58, 34, 34, 125]), key: ContractKey { instance: ContractInstanceId("7h99HJYhaMNQchCZtTDThc4pfeNx8BPPhrGqhN84NrPV"), code: Some(CodeHash("aatgnh5cpc5hpravn7ediuubhsmlykiubfqpl2fm7kmk")) } }))), state: ContractState(data: [0x7b2266726f6d223a...]) }
+✅ Node2 successfully retrieved the contract!
+   The backtracking implementation is working!
+Test completed successfully!
+test test_small_network_get_failure ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 62.75s
+
