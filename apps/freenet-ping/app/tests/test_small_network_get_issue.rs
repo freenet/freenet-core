@@ -336,6 +336,45 @@ async fn test_small_network_get_failure() -> TestResult {
             }
         }
 
+        // Test second GET after connections are established
+        println!("\n🔍 Testing second GET from Node2 after connections are established...");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        
+        let get2_start = std::time::Instant::now();
+        client_node2
+            .send(ClientRequest::ContractOp(ContractRequest::Get {
+                key: contract_key,
+                return_contract_code: false,
+                subscribe: false,
+            }))
+            .await?;
+        println!("   Second GET request sent");
+
+        match timeout(Duration::from_secs(10), client_node2.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, state, .. }))) 
+                if key == contract_key => {
+                println!(
+                    "✅ Second GET completed in {}ms (vs 13s for first GET!)",
+                    get2_start.elapsed().as_millis()
+                );
+                if state.is_empty() {
+                    return Err(anyhow!("Second GET returned empty state"));
+                }
+            }
+            Ok(Ok(resp)) => {
+                println!("Got unexpected response: {:?}", resp);
+                return Err(anyhow!("Unexpected response type"));
+            }
+            Ok(Err(e)) => {
+                println!("❌ Error during second get: {}", e);
+                return Err(anyhow!("Second GET operation failed: {}", e));
+            }
+            Err(_) => {
+                println!("❌ Timeout waiting for second get response after 10s");
+                return Err(anyhow!("Second GET operation timed out"));
+            }
+        }
+
         Ok::<_, anyhow::Error>(())
     })
     .instrument(span!(Level::INFO, "test_small_network_get_failure"));
