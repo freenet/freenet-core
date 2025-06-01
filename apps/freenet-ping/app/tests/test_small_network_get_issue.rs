@@ -111,10 +111,11 @@ async fn test_small_network_get_failure() -> TestResult {
     // Start all nodes
     let gateway_future = async {
         let config = config_gw.build().await?;
-        let node = NodeConfig::new(config.clone())
-            .await?
-            .build(serve_gateway(config.ws_api).await)
-            .await?;
+        let mut node_config = NodeConfig::new(config.clone()).await?;
+        // Set reasonable connection limits for small test network
+        node_config.min_number_of_connections(2);
+        node_config.max_number_of_connections(10);
+        let node = node_config.build(serve_gateway(config.ws_api).await).await?;
         node.run().await
     }
     .instrument(span!(Level::INFO, "gateway"))
@@ -122,10 +123,11 @@ async fn test_small_network_get_failure() -> TestResult {
 
     let node1_future = async {
         let config = config_node1.build().await?;
-        let node = NodeConfig::new(config.clone())
-            .await?
-            .build(serve_gateway(config.ws_api).await)
-            .await?;
+        let mut node_config = NodeConfig::new(config.clone()).await?;
+        // Set reasonable connection limits for small test network
+        node_config.min_number_of_connections(2);
+        node_config.max_number_of_connections(10);
+        let node = node_config.build(serve_gateway(config.ws_api).await).await?;
         node.run().await
     }
     .instrument(span!(Level::INFO, "node1"))
@@ -133,10 +135,11 @@ async fn test_small_network_get_failure() -> TestResult {
 
     let node2_future = async {
         let config = config_node2.build().await?;
-        let node = NodeConfig::new(config.clone())
-            .await?
-            .build(serve_gateway(config.ws_api).await)
-            .await?;
+        let mut node_config = NodeConfig::new(config.clone()).await?;
+        // Set reasonable connection limits for small test network
+        node_config.min_number_of_connections(2);
+        node_config.max_number_of_connections(10);
+        let node = node_config.build(serve_gateway(config.ws_api).await).await?;
         node.run().await
     }
     .instrument(span!(Level::INFO, "node2"))
@@ -146,7 +149,14 @@ async fn test_small_network_get_failure() -> TestResult {
         // Wait for nodes to start up
         println!("Waiting for nodes to start up...");
         tokio::time::sleep(Duration::from_secs(15)).await;
-        println!("✓ Nodes should be up and have discovered each other");
+        println!("✓ Nodes should be up and have basic connectivity");
+        
+        // TODO: The connection maintenance task runs every 60 seconds by default,
+        // which is too slow for tests. This causes the first GET operation to take
+        // 11+ seconds as connections are established on-demand. 
+        // 
+        // Proper fix: Make connection acquisition more aggressive during startup,
+        // or make the maintenance interval configurable for tests.
 
         // Connect to gateway first
         let uri_gw = format!(
