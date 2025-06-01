@@ -1,4 +1,4 @@
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{collections::HashSet, convert::Infallible, sync::Arc, time::Duration};
 
 use futures::{future::BoxFuture, FutureExt};
 use tracing::Instrument;
@@ -20,9 +20,9 @@ use crate::{
         self, ClientResponsesSender, ContractHandler, ContractHandlerChannel,
         ExecutorToEventLoopChannel, NetworkEventListenerHalve, WaitingResolution,
     },
-    message::NodeEvent,
+    message::{NetMessage, NodeEvent, Transaction},
     node::NodeConfig,
-    operations::connect,
+    operations::{connect, OpEnum},
 };
 
 use super::OpManager;
@@ -57,13 +57,17 @@ impl NodeP2P {
             min_connections
         );
         
-        // Try for up to 10 seconds to establish minimum connections
+        // For small networks, we want to ensure all nodes discover each other quickly
+        // to avoid the 10+ second delays on first GET operations
         let start = std::time::Instant::now();
         let max_duration = Duration::from_secs(10);
+        let mut last_connection_count = 0;
+        let mut stable_rounds = 0;
         
         while start.elapsed() < max_duration {
             let current_connections = self.op_manager.ring.open_connections();
             
+            // If we've reached our target, we're done
             if current_connections >= min_connections {
                 tracing::info!(
                     "Reached minimum connections target: {}/{}",
@@ -73,23 +77,95 @@ impl NodeP2P {
                 break;
             }
             
+            // If connection count is stable for 3 rounds, actively trigger more connections
+            if current_connections == last_connection_count {
+                stable_rounds += 1;
+                if stable_rounds >= 3 && current_connections > 0 {
+                    tracing::info!(
+                        "Connection count stable at {}, triggering active peer discovery",
+                        current_connections
+                    );
+                    
+                    // Trigger the connection maintenance task to actively look for more peers
+                    // In small networks, we want to be more aggressive
+                    for _ in 0..3 {
+                        if let Err(e) = self.trigger_connection_maintenance().await {
+                            tracing::warn!("Failed to trigger connection maintenance: {}", e);
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    stable_rounds = 0;
+                }
+            } else {
+                stable_rounds = 0;
+                last_connection_count = current_connections;
+            }
+            
             tracing::debug!(
-                "Current connections: {}/{}, waiting for connection maintenance to acquire more",
+                "Current connections: {}/{}, waiting for more peers (elapsed: {}s)",
                 current_connections,
-                min_connections
+                min_connections,
+                start.elapsed().as_secs()
             );
             
-            // The connection maintenance task will handle establishing connections
-            // We just wait and monitor progress
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Check more frequently at the beginning
+            let sleep_duration = if start.elapsed() < Duration::from_secs(3) {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(1)
+            };
+            tokio::time::sleep(sleep_duration).await;
         }
         
         let final_connections = self.op_manager.ring.open_connections();
         tracing::info!(
-            "Aggressive connection phase complete. Final connections: {}/{}",
+            "Aggressive connection phase complete. Final connections: {}/{} (took {}s)",
             final_connections,
-            min_connections
+            min_connections,
+            start.elapsed().as_secs()
         );
+    }
+    
+    /// Trigger the connection maintenance task to actively look for more peers
+    async fn trigger_connection_maintenance(&self) -> anyhow::Result<()> {
+        // Send a connect request to find more peers
+        use crate::operations::connect;
+        let ideal_location = Location::random();
+        let tx = Transaction::new::<connect::ConnectMsg>();
+        
+        // Find a connected peer to query
+        let query_target = {
+            let router = self.op_manager.ring.router.read();
+            self.op_manager.ring.connection_manager.routing(
+                ideal_location,
+                None,
+                &HashSet::new(),
+                &router,
+            )
+        };
+        
+        if let Some(query_target) = query_target {
+            let joiner = self.op_manager.ring.connection_manager.own_location();
+            let msg = connect::ConnectMsg::Request {
+                id: tx,
+                target: query_target.clone(),
+                msg: connect::ConnectRequest::FindOptimalPeer {
+                    query_target,
+                    ideal_location,
+                    joiner,
+                    max_hops_to_live: self.op_manager.ring.max_hops_to_live,
+                    skip_connections: HashSet::new(),
+                    skip_forwards: HashSet::new(),
+                },
+            };
+            
+            self.op_manager.notify_op_change(
+                NetMessage::from(msg),
+                OpEnum::Connect(Box::new(connect::ConnectOp::new(tx, None, None, None)))
+            ).await?;
+        }
+        
+        Ok(())
     }
     pub(super) async fn run_node(self) -> anyhow::Result<Infallible> {
         if self.should_try_connect {

@@ -614,7 +614,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         //
         const INITIAL_TIMEOUT: Duration = Duration::from_millis(50); // Check for response frequently
         const TIMEOUT_MULTIPLIER: f64 = 1.0; // Don't increase timeout - keep checking frequently
-        const MAX_TIMEOUT: Duration = Duration::from_secs(10); // 10 seconds is enough for NAT traversal
+        const MAX_TIMEOUT: Duration = Duration::from_secs(2); // Reduced for faster failure detection
 
         #[allow(clippy::large_enum_variant)]
         enum ConnectionState {
