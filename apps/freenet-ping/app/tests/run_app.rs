@@ -9,7 +9,7 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
 };
-use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use testresult::TestResult;
 use tokio::{select, time::sleep, time::timeout};
 use tokio_tungstenite::connect_async;
