@@ -140,8 +140,6 @@ async fn test_connection_timing() -> TestResult {
         }
         r = test => {
             r??;
-            // Keep nodes alive for pending operations to complete
-            tokio::time::sleep(Duration::from_secs(3)).await;
             Ok(())
         }
     }

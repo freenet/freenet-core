@@ -531,6 +531,7 @@ impl P2pConnManager {
                     .await?;
                 return Ok(());
             }
+            tracing::debug!(tx = %tx, "Blocked addresses: {:?}, peer addr: {}", blocked_addrs, peer.addr);
         }
         state.awaiting_connection.insert(peer.addr, callback);
         let res = timeout(
@@ -572,9 +573,8 @@ impl P2pConnManager {
                     if blocked_addrs.contains(&joiner.addr) {
                         tracing::info!(%id, remote = %joiner.addr, "Inbound connection from peer blocked by local policy");
                         // Not proceeding with adding connection or processing the operation.
-                        handshake_handler_msg
-                            .drop_connection_by_addr(joiner.addr)
-                            .await?;
+                        // Don't call drop_connection_by_addr as it can cause channels to close abruptly
+                        // Just ignore the connection and let it timeout naturally
                         return Ok(());
                     }
                 }
