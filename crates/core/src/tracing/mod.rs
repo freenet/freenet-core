@@ -855,16 +855,9 @@ mod opentelemetry_tracer {
 
     impl OTSpan {
         fn new(transaction: Transaction) -> Self {
-            use trace::{Tracer, TracerProvider};
+            use trace::Tracer;
 
-            let tracer = {
-                let tracer_provider = global::tracer_provider();
-                tracer_provider
-                    .tracer_builder("freenet")
-                    .with_version(env!("CARGO_PKG_VERSION"))
-                    .with_schema_url("https://opentelemetry.io/schemas/1.21.0")
-                    .build()
-            };
+            let tracer = global::tracer("freenet");
             let tx_bytes = transaction.as_bytes();
             let mut span_id = [0; 8];
             span_id.copy_from_slice(&tx_bytes[8..]);
@@ -1265,7 +1258,7 @@ pub(crate) mod tracer {
     use tracing::level_filters::LevelFilter;
     use tracing_subscriber::{Layer, Registry};
 
-    pub fn init_tracer(level: Option<LevelFilter>, endpoint: Option<String>) -> anyhow::Result<()> {
+    pub fn init_tracer(level: Option<LevelFilter>, _endpoint: Option<String>) -> anyhow::Result<()> {
         let default_filter = if cfg!(any(test, debug_assertions)) {
             LevelFilter::DEBUG
         } else {
@@ -1302,37 +1295,27 @@ pub(crate) mod tracer {
 
             #[cfg(feature = "trace-ot")]
             {
-                let disabled_ot_traces = std::env::var("FREENET_DISABLE_TRACES").is_ok();
+                let _disabled_ot_traces = std::env::var("FREENET_DISABLE_TRACES").is_ok();
                 let identifier = if let Ok(peer) = std::env::var("FREENET_PEER_ID") {
                     format!("freenet-core-{peer}")
                 } else {
                     "freenet-core".to_string()
                 };
                 println!("setting OT collector with identifier: {identifier}");
+                // TODO: Fix OpenTelemetry version conflicts and API changes
+                // The code below needs to be updated to work with the new OpenTelemetry API
+                // For now, we'll just use the fmt_layer without OpenTelemetry tracing
+                /*
                 let tracing_ot_layer = {
-                    // Connect the Jaeger OT tracer with the tracing middleware
-                    let ot_jaeger_tracer = opentelemetry_otlp::new_pipeline()
-                        .tracing()
-                        .with_exporter(
-                            opentelemetry_otlp::new_exporter()
-                                .tonic()
-                                .with_endpoint(endpoint.unwrap_or_default()),
-                        )
-                        .with_trace_config(
-                            opentelemetry_sdk::trace::Config::default().with_resource(
-                                opentelemetry_sdk::Resource::new(vec![
-                                    opentelemetry::KeyValue::new(identifier, "tracing-jaeger"),
-                                ]),
-                            ),
-                        )
-                        .install_simple()?;
+                    // For now, just use the global tracer until we fix version conflicts
+                    let ot_jaeger_tracer = opentelemetry::global::tracer("freenet");
                     // Get a tracer which will route OT spans to a Jaeger agent
                     tracing_opentelemetry::layer().with_tracer(ot_jaeger_tracer)
                 };
-                if !disabled_logs && !disabled_ot_traces {
-                    fmt_layer.and_then(tracing_ot_layer).boxed()
-                } else if !disabled_ot_traces {
-                    tracing_ot_layer.boxed()
+                */
+                // Temporarily disable OpenTelemetry tracing until version conflicts are resolved
+                if !disabled_logs {
+                    fmt_layer.boxed()
                 } else {
                     return Ok(());
                 }

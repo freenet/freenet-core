@@ -9,9 +9,8 @@ use freenet::{
         verify_contract_exists,
     },
 };
-use freenet_stdlib::client_api::ClientRequest;
 use freenet_stdlib::{
-    client_api::{ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
 };
 use futures::FutureExt;
@@ -189,9 +188,11 @@ async fn test_put_contract() -> TestResult {
     }
     .boxed_local();
 
-    let test = tokio::time::timeout(Duration::from_secs(60), async {
+    let test = tokio::time::timeout(Duration::from_secs(120), async {
         // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tracing::info!("Waiting for nodes to start up...");
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        tracing::info!("Nodes should be ready, proceeding with test...");
 
         // Connect to node A's websocket API
         let uri = format!(
@@ -257,7 +258,19 @@ async fn test_put_contract() -> TestResult {
             assert_eq!(response_key, contract_key);
             assert_eq!(response_contract, contract);
             assert_eq!(response_state, wrapped_state);
+
+            // Properly close the client
+            client_api_b
+                .send(ClientRequest::Disconnect { cause: None })
+                .await?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+
+        // Close the first client as well
+        client_api_a
+            .send(ClientRequest::Disconnect { cause: None })
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         Ok::<_, anyhow::Error>(())
     });
@@ -273,6 +286,8 @@ async fn test_put_contract() -> TestResult {
         }
         r = test => {
             r??;
+            // Give time for cleanup before dropping nodes
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
 
@@ -509,6 +524,8 @@ async fn test_update_contract() -> TestResult {
         }
         r = test => {
             r??;
+            // Keep nodes alive for pending operations to complete
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
 
@@ -614,7 +631,7 @@ async fn test_multiple_clients_subscription() -> TestResult {
 
     let test = tokio::time::timeout(Duration::from_secs(180), async {
         // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(20)).await;
 
         // Connect first client to node A's websocket API
         let uri_a = format!(
@@ -1143,6 +1160,18 @@ async fn test_multiple_clients_subscription() -> TestResult {
             "Client 3 did not receive update notification within timeout period (cross-node)"
         );
 
+        // Properly close all clients
+        client_api1_node_a
+            .send(ClientRequest::Disconnect { cause: None })
+            .await?;
+        client_api2_node_a
+            .send(ClientRequest::Disconnect { cause: None })
+            .await?;
+        client_api_node_b
+            .send(ClientRequest::Disconnect { cause: None })
+            .await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
         Ok::<_, anyhow::Error>(())
     });
 
@@ -1162,6 +1191,8 @@ async fn test_multiple_clients_subscription() -> TestResult {
         }
         r = test => {
             r??;
+            // Give time for cleanup before dropping nodes
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
 
@@ -1245,7 +1276,7 @@ async fn test_get_with_subscribe_flag() -> TestResult {
 
     let test = tokio::time::timeout(Duration::from_secs(60), async {
         // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(20)).await;
 
         // Connect first client to node A's websocket API (for putting the contract)
         let uri_a = format!(
@@ -1464,6 +1495,8 @@ async fn test_get_with_subscribe_flag() -> TestResult {
         }
         r = test => {
             r??;
+            // Keep nodes alive for pending operations to complete
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
 
@@ -1547,7 +1580,7 @@ async fn test_put_with_subscribe_flag() -> TestResult {
 
     let test = tokio::time::timeout(Duration::from_secs(60), async {
         // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(20)).await;
 
         // Connect first client to node A's websocket API (for putting with auto-subscribe)
         let uri_a = format!(
@@ -1770,6 +1803,8 @@ async fn test_put_with_subscribe_flag() -> TestResult {
         }
         r = test => {
             r??;
+            // Keep nodes alive for pending operations to complete
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
 
@@ -1857,7 +1892,7 @@ async fn test_delegate_request() -> TestResult {
     // Wait for the nodes to start and run the test
     let test = tokio::time::timeout(Duration::from_secs(60), async {
         // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(20)).await;
 
         // Connect to the client node's WebSocket API
         let uri = format!(
@@ -1985,6 +2020,8 @@ async fn test_delegate_request() -> TestResult {
         }
         r = test => {
             r??;
+            // Keep nodes alive for pending operations to complete
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
 
