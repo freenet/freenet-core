@@ -27,8 +27,8 @@ async fn test_small_network_get_failure() -> TestResult {
      * This test simulates the real network issue where:
      * 1. A small number of peers (matching production)
      * 2. Poor connectivity between peers
-     * 3. One peer publishes a contract
-     * 4. Other peers try to GET the contract
+     * 3. Gateway publishes a contract (central topology position)
+     * 4. Node2 tries to GET the contract through the gateway
      *
      * Without backtracking, the GET would fail.
      * With backtracking, it should succeed.
@@ -146,6 +146,15 @@ async fn test_small_network_get_failure() -> TestResult {
         // Wait for nodes to start up
         println!("Waiting for nodes to start up...");
         tokio::time::sleep(Duration::from_secs(15)).await;
+        println!("✓ Nodes should be up and have discovered each other");
+
+        // Connect to gateway first
+        let uri_gw = format!(
+            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+            _ws_api_port_gw
+        );
+        let (stream_gw, _) = connect_async(&uri_gw).await?;
+        let mut client_gw = WebApi::start(stream_gw);
 
         // Connect to nodes
         let uri_node1 = format!(
@@ -178,7 +187,7 @@ async fn test_small_network_get_failure() -> TestResult {
         let container = common::load_contract(&path_to_code, params)?;
         let contract_key = container.key();
 
-        // Node1 publishes the contract
+        // Node1 publishes the contract (more typical scenario)
         println!("📤 Node1 publishing ping contract...");
 
         let ping = Ping::default();
@@ -219,10 +228,54 @@ async fn test_small_network_get_failure() -> TestResult {
         // Give time for any propagation
         tokio::time::sleep(Duration::from_secs(5)).await;
 
+        // Debug: Check if contract is cached on each node
+        println!("🔍 Checking which nodes have the contract cached...");
+
+        // Try GET from Gateway
+        client_gw
+            .send(ClientRequest::ContractOp(ContractRequest::Get {
+                key: contract_key,
+                return_contract_code: false,
+                subscribe: false,
+            }))
+            .await?;
+
+        match timeout(Duration::from_secs(2), client_gw.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { .. }))) => {
+                println!("   ✓ Gateway has the contract cached");
+            }
+            _ => {
+                println!("   ✗ Gateway does NOT have the contract cached");
+            }
+        }
+
+        // First, let's do a second GET from Gateway to see if it's faster
+        println!("🔍 Testing second GET from Gateway (should be fast if WASM is the issue)...");
+        let gw_get2_start = std::time::Instant::now();
+        client_gw
+            .send(ClientRequest::ContractOp(ContractRequest::Get {
+                key: contract_key,
+                return_contract_code: true,
+                subscribe: false,
+            }))
+            .await?;
+
+        match timeout(Duration::from_secs(5), client_gw.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { .. }))) => {
+                println!(
+                    "   ✓ Gateway second GET took {}ms",
+                    gw_get2_start.elapsed().as_millis()
+                );
+            }
+            _ => {
+                println!("   ✗ Gateway second GET failed/timed out");
+            }
+        }
+
         // Now Node2 tries to GET the contract
+        let get_start = std::time::Instant::now();
         println!("📥 Node2 attempting to GET the contract...");
-        println!("   (Node2 is connected through the gateway)");
-        println!("   This tests the backtracking implementation");
+        println!("   Contract key: {}", contract_key);
 
         client_node2
             .send(ClientRequest::ContractOp(ContractRequest::Get {
@@ -231,6 +284,10 @@ async fn test_small_network_get_failure() -> TestResult {
                 subscribe: false,
             }))
             .await?;
+        println!(
+            "   GET request sent ({}ms after start)",
+            get_start.elapsed().as_millis()
+        );
 
         // Wait for get response with longer timeout
         let start = std::time::Instant::now();

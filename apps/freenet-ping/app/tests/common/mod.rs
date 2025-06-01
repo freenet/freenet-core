@@ -295,19 +295,23 @@ pub(crate) fn pipe_std_streams(mut child: Child) -> anyhow::Result<()> {
     let c_stderr = child.stderr.take().expect("Failed to open command stderr");
 
     let write_child_stderr = move || -> anyhow::Result<()> {
+        use std::io::BufRead;
         let mut stderr = io::stderr();
-        for b in c_stderr.bytes() {
-            let b = b?;
-            stderr.write_all(&[b])?;
+        let reader = std::io::BufReader::new(c_stderr);
+        for line in reader.lines() {
+            let line = line?;
+            writeln!(stderr, "{}", line)?;
         }
         Ok(())
     };
 
     let write_child_stdout = move || -> anyhow::Result<()> {
+        use std::io::BufRead;
         let mut stdout = io::stdout();
-        for b in c_stdout.bytes() {
-            let b = b?;
-            stdout.write_all(&[b])?;
+        let reader = std::io::BufReader::new(c_stdout);
+        for line in reader.lines() {
+            let line = line?;
+            writeln!(stdout, "{}", line)?;
         }
         Ok(())
     };
