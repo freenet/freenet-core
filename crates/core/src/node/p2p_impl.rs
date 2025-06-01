@@ -1,4 +1,4 @@
-use std::{convert::Infallible, sync::Arc};
+use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use futures::{future::BoxFuture, FutureExt};
 use tracing::Instrument;
@@ -45,10 +45,60 @@ pub(crate) struct NodeP2P {
 }
 
 impl NodeP2P {
+    /// Aggressively establish connections during startup to avoid on-demand delays
+    async fn aggressive_initial_connections(&self) {
+        let min_connections = self.op_manager
+            .ring
+            .connection_manager
+            .min_connections;
+            
+        tracing::info!(
+            "Starting aggressive connection acquisition phase (target: {} connections)",
+            min_connections
+        );
+        
+        // Try for up to 10 seconds to establish minimum connections
+        let start = std::time::Instant::now();
+        let max_duration = Duration::from_secs(10);
+        
+        while start.elapsed() < max_duration {
+            let current_connections = self.op_manager.ring.open_connections();
+            
+            if current_connections >= min_connections {
+                tracing::info!(
+                    "Reached minimum connections target: {}/{}",
+                    current_connections,
+                    min_connections
+                );
+                break;
+            }
+            
+            tracing::debug!(
+                "Current connections: {}/{}, waiting for connection maintenance to acquire more",
+                current_connections,
+                min_connections
+            );
+            
+            // The connection maintenance task will handle establishing connections
+            // We just wait and monitor progress
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        
+        let final_connections = self.op_manager.ring.open_connections();
+        tracing::info!(
+            "Aggressive connection phase complete. Final connections: {}/{}",
+            final_connections,
+            min_connections
+        );
+    }
     pub(super) async fn run_node(self) -> anyhow::Result<Infallible> {
         if self.should_try_connect {
             connect::initial_join_procedure(self.op_manager.clone(), &self.conn_manager.gateways)
                 .await?;
+            
+            // After connecting to gateways, aggressively try to reach min_connections
+            // This is important for fast startup and avoiding on-demand connection delays
+            self.aggressive_initial_connections().await;
         }
 
         let f = self.conn_manager.run_event_listener(
