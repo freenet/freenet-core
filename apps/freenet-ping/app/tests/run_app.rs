@@ -9,7 +9,7 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
 };
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use testresult::TestResult;
 use tokio::{select, time::sleep, time::timeout};
 use tokio_tungstenite::connect_async;
@@ -846,7 +846,6 @@ async fn test_ping_application_loop() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Flaky test - fails with 'Connection refused' errors. See PR #1612"]
 async fn test_ping_partially_connected_network() -> TestResult {
     /*
      * This test verifies how subscription propagation works in a partially connected network.
@@ -1006,43 +1005,39 @@ async fn test_ping_partially_connected_network() -> TestResult {
     std::mem::drop(ws_api_node_sockets);
 
     // Start all gateway nodes
-    let mut gateway_futures = Vec::with_capacity(NUM_GATEWAYS);
-    for (i, config) in gateway_configs.into_iter().enumerate() {
-        let gateway_future = {
-            async move {
-                let config = config.build().await?;
-                let node = NodeConfig::new(config.clone())
-                    .await?
-                    .build(serve_gateway(config.ws_api).await)
-                    .await?;
-                node.run().await
-            }
-            .boxed_local()
-        };
+    let mut gateway_futures = FuturesUnordered::new();
+    for (_i, config) in gateway_configs.into_iter().enumerate() {
+        let gateway_future = async move {
+            let config = config.build().await?;
+            let node = NodeConfig::new(config.clone())
+                .await?
+                .build(serve_gateway(config.ws_api).await)
+                .await?;
+            node.run().await
+        }
+        .boxed_local();
         gateway_futures.push(gateway_future);
     }
 
     // Start all regular nodes
-    let mut regular_node_futures = Vec::with_capacity(NUM_REGULAR_NODES);
-    for (i, config) in node_configs.into_iter().enumerate() {
-        let regular_node_future = {
-            async move {
-                let config = config.build().await?;
-                let node = NodeConfig::new(config.clone())
-                    .await?
-                    .build(serve_gateway(config.ws_api).await)
-                    .await?;
-                node.run().await
-            }
-            .boxed_local()
-        };
+    let mut regular_node_futures = FuturesUnordered::new();
+    for (_i, config) in node_configs.into_iter().enumerate() {
+        let regular_node_future = async move {
+            let config = config.build().await?;
+            let node = NodeConfig::new(config.clone())
+                .await?
+                .build(serve_gateway(config.ws_api).await)
+                .await?;
+            node.run().await
+        }
+        .boxed_local();
         tokio::time::sleep(Duration::from_secs(2)).await;
         regular_node_futures.push(regular_node_future);
     }
 
-    // Use the first futures for the select! macro
-    let gateway_future = gateway_futures.remove(0);
-    let regular_node_future = regular_node_futures.remove(0);
+    // Create a future that will complete if any gateway fails
+    let mut gateway_monitor = gateway_futures.into_future();
+    let mut regular_node_monitor = regular_node_futures.into_future();
 
     let test = tokio::time::timeout(Duration::from_secs(240), async {
         // Wait for nodes to start up
@@ -1584,13 +1579,21 @@ async fn test_ping_partially_connected_network() -> TestResult {
 
     // Wait for test completion or node failures
     select! {
-        r = gateway_future => {
-            let Err(err) = r;
-            return Err(anyhow!("Gateway node failed: {}", err).into());
+        (r, _remaining) = &mut gateway_monitor => {
+            if let Some(r) = r {
+                match r {
+                    Err(err) => return Err(anyhow!("Gateway node failed: {}", err).into()),
+                    Ok(_) => panic!("Gateway node unexpectedly terminated successfully"),
+                }
+            }
         }
-        r = regular_node_future => {
-            let Err(err) = r;
-            return Err(anyhow!("Regular node failed: {}", err).into());
+        (r, _remaining) = &mut regular_node_monitor => {
+            if let Some(r) = r {
+                match r {
+                    Err(err) => return Err(anyhow!("Regular node failed: {}", err).into()),
+                    Ok(_) => panic!("Regular node unexpectedly terminated successfully"),
+                }
+            }
         }
         r = test => {
             r??;
