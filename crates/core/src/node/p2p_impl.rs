@@ -139,7 +139,7 @@ impl NodeP2P {
             self.op_manager.ring.connection_manager.routing(
                 ideal_location,
                 None,
-                &HashSet::new(),
+                &HashSet::<PeerId>::new(),
                 &router,
             )
         };
