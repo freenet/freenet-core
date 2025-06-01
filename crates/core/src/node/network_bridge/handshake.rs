@@ -126,6 +126,7 @@ pub(super) enum ExternConnection {
     Dropped {
         peer: PeerId,
     },
+    #[allow(dead_code)]
     DropConnectionByAddr(SocketAddr),
 }
 
@@ -153,6 +154,7 @@ impl HanshakeHandlerMsg {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn drop_connection_by_addr(&self, remote_addr: SocketAddr) -> Result<()> {
         self.0
             .send(ExternConnection::DropConnectionByAddr(remote_addr))

@@ -558,7 +558,7 @@ impl P2pConnManager {
         &mut self,
         event: HandshakeEvent,
         state: &mut EventListenerState,
-        handshake_handler_msg: &HanshakeHandlerMsg, // Parameter added
+        _handshake_handler_msg: &HanshakeHandlerMsg, // Parameter added
     ) -> anyhow::Result<()> {
         match event {
             HandshakeEvent::InboundConnection {
