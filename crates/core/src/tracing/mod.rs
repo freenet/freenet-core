@@ -1258,7 +1258,10 @@ pub(crate) mod tracer {
     use tracing::level_filters::LevelFilter;
     use tracing_subscriber::{Layer, Registry};
 
-    pub fn init_tracer(level: Option<LevelFilter>, _endpoint: Option<String>) -> anyhow::Result<()> {
+    pub fn init_tracer(
+        level: Option<LevelFilter>,
+        _endpoint: Option<String>,
+    ) -> anyhow::Result<()> {
         let default_filter = if cfg!(any(test, debug_assertions)) {
             LevelFilter::DEBUG
         } else {
@@ -1290,7 +1293,7 @@ pub(crate) mod tracer {
             };
             #[cfg(not(feature = "trace-ot"))]
             {
-                let _ = endpoint;
+                // OpenTelemetry endpoint is temporarily unused due to disabled OT tracing
             }
 
             #[cfg(feature = "trace-ot")]
