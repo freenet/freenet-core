@@ -598,23 +598,13 @@ impl<S: Socket> UdpPacketsListener<S> {
             %remote_addr,
             "Starting NAT traversal"
         );
-        // Constants for NAT traversal packet timing
-        //
-        // Current implementation uses timeout mechanism to trigger packet sends every 50ms.
-        // This is a minimal solution that works but could be improved:
-        //
-        // TODO: Future improvements:
-        // 1. Use a proper timer (tokio::select! with interval) for packet sending instead of
-        //    relying on timeouts. This would separate concerns of "when to send" from "when to give up".
-        // 2. Add jitter to packet timing to avoid synchronized flooding if many peers connect
-        //    simultaneously.
-        // 3. Implement adaptive timing based on network conditions (e.g., increase interval
-        //    after initial burst).
-        // 4. Add packet deduplication on the receiving side to handle reordered packets.
-        //
-        const INITIAL_TIMEOUT: Duration = Duration::from_millis(50); // Check for response frequently
-        const TIMEOUT_MULTIPLIER: f64 = 1.0; // Don't increase timeout - keep checking frequently
-        const MAX_TIMEOUT: Duration = Duration::from_secs(2); // Reduced for faster failure detection
+        // Constants for exponential backoff
+        const INITIAL_TIMEOUT: Duration = Duration::from_millis(600);
+        const TIMEOUT_MULTIPLIER: f64 = 1.2;
+        #[cfg(not(test))]
+        const MAX_TIMEOUT: Duration = Duration::from_secs(60); // Maximum timeout limit
+        #[cfg(test)]
+        const MAX_TIMEOUT: Duration = Duration::from_secs(10); // Maximum timeout limit
 
         #[allow(clippy::large_enum_variant)]
         enum ConnectionState {
@@ -682,9 +672,8 @@ impl<S: Socket> UdpPacketsListener<S> {
             };
 
             let mut sent_tracker = SentPacketTracker::new();
-            let start_time = std::time::Instant::now();
 
-            while failures < NAT_TRAVERSAL_MAX_ATTEMPTS && start_time.elapsed() < MAX_TIMEOUT {
+            while failures < NAT_TRAVERSAL_MAX_ATTEMPTS {
                 match state {
                     ConnectionState::StartOutbound => {
                         tracing::debug!(%remote_addr, "sending protocol version and inbound key");
@@ -823,18 +812,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 // next packet should be an acknowledgement packet, but might also be a repeated
                                 // intro packet so we need to handle that
                                 if packet.is_intro_packet(intro_packet) {
-                                    tracing::debug!(%remote_addr, "received repeated intro packet, re-sending ACK");
-                                    // The remote peer may not have received our ACK, so re-send it
-                                    let our_inbound = SymmetricMessage::ack_ok(
-                                        outbound_sym_key.as_ref().expect("should be set"),
-                                        inbound_sym_key_bytes,
-                                        remote_addr,
-                                    )?;
-                                    outbound_packets
-                                        .send((remote_addr, our_inbound.data().into()))
-                                        .await
-                                        .map_err(|_| TransportError::ChannelClosed)?;
-                                    // Don't count as failure - this is expected behavior
+                                    tracing::debug!(%remote_addr, "received intro packet");
+                                    // we add to the number of failures so we are not stuck in a loop retrying
+                                    failures += 1;
                                     continue;
                                 }
                                 // if is not an intro packet, the connection is successful and we can proceed
@@ -866,13 +846,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                         return Err(TransportError::ConnectionClosed(remote_addr));
                     }
                     Err(_) => {
-                        // Timeout is expected - we're using it to trigger periodic sends
-                        // Don't count as failure, just continue the loop
-                        //
-                        // NOTE: This is a hack - we're abusing the timeout mechanism to get
-                        // periodic packet sends. A proper implementation would use tokio::select!
-                        // with both a timer and the receive future.
-                        tracing::trace!(%this_addr, %remote_addr, "timeout expired, sending next packet");
+                        failures += 1;
+                        tracing::debug!(%this_addr, %remote_addr, "failed to receive UDP response in time, retrying");
                     }
                 }
 
