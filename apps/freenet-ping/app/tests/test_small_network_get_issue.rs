@@ -411,7 +411,11 @@ async fn test_small_network_get_failure() -> TestResult {
         r = test => {
             match r {
                 Err(e) => return Err(anyhow!("Test timed out: {}", e).into()),
-                Ok(Ok(_)) => println!("Test completed successfully!"),
+                Ok(Ok(_)) => {
+                    println!("Test completed successfully!");
+                    // Give nodes time to process remaining operations before shutdown
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                },
                 Ok(Err(e)) => return Err(anyhow!("Test failed: {}", e).into()),
             }
         }
