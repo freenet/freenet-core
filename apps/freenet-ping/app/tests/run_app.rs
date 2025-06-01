@@ -444,6 +444,8 @@ async fn test_ping_multi_node() -> TestResult {
         }
         r = test => {
             r??;
+            // Keep nodes alive for pending operations to complete
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
 
@@ -839,6 +841,8 @@ async fn test_ping_application_loop() -> TestResult {
         }
         r = test => {
             r??;
+            // Keep nodes alive for pending operations to complete
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
 
@@ -1597,6 +1601,8 @@ async fn test_ping_partially_connected_network() -> TestResult {
         }
         r = test => {
             r??;
+            // Keep nodes alive for pending operations to complete
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
 
