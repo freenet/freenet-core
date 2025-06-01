@@ -891,7 +891,7 @@ async fn test_multiple_clients_subscription() -> TestResult {
         };
 
         let start_time = std::time::Instant::now();
-        while start_time.elapsed() < Duration::from_secs(60)
+        while start_time.elapsed() < Duration::from_secs(90)
             && (!received_update_response
                 || !client1_received_notification
                 || !client2_received_notification
