@@ -533,7 +533,7 @@ async fn test_update_contract() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "Flaky test - times out on CI. See issue #1629"]
+#[ignore = "Flaky test - times out on CI. See issue #1623"]
 async fn test_multiple_clients_subscription() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::INFO), None);
 
