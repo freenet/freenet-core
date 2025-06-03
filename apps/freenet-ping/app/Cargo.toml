@@ -23,6 +23,7 @@ humantime = "2.2.0"
 
 [dev-dependencies]
 freenet = { path = "../../../crates/core" }
+socket2 = { version = "0.5", features = ["all"] }
 testresult = { workspace = true }
 
 [lib]

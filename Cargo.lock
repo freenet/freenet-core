@@ -1650,6 +1650,7 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde_json",
+ "socket2",
  "tempfile",
  "testresult",
  "tokio",

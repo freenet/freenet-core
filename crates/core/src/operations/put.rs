@@ -448,7 +448,7 @@ impl Operation for PutOp {
                             state,
                             subscribe,
                         }) => {
-                            // Check if already sotored before any operations
+                            // Check if already stored before any operations
                             let is_seeding_contract = op_manager.ring.is_seeding_contract(&key);
 
                             // Only store the contract locally if not already seeded

@@ -17,7 +17,7 @@ use freenet_stdlib::{
 };
 use futures::{future::BoxFuture, FutureExt};
 use rand::{random, Rng, SeedableRng};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::{
@@ -49,13 +49,46 @@ pub struct PresetConfig {
 }
 
 pub fn get_free_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let listener = create_tcp_listener_with_reuse("127.0.0.1:0")?;
     Ok(listener.local_addr()?.port())
 }
 
 pub fn get_free_socket_addr() -> Result<SocketAddr> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let listener = create_tcp_listener_with_reuse("127.0.0.1:0")?;
     Ok(listener.local_addr()?)
+}
+
+/// Create a TCP listener with SO_REUSEADDR enabled to avoid 'Address already in use' errors
+pub fn create_tcp_listener_with_reuse(addr: &str) -> Result<TcpListener> {
+    use std::net::ToSocketAddrs;
+
+    let addr = addr
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow!("Invalid socket address"))?;
+
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+
+    // Set SO_REUSEADDR to allow immediate reuse of the port
+    socket.set_reuse_address(true)?;
+
+    // On Unix systems, also set SO_REUSEPORT if available
+    #[cfg(unix)]
+    {
+        if let Err(e) = socket.set_reuse_port(true) {
+            // Not all systems support SO_REUSEPORT, so just log the error
+            tracing::debug!("Could not set SO_REUSEPORT: {}", e);
+        }
+    }
+
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+
+    Ok(socket.into())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -297,7 +330,7 @@ pub(crate) fn pipe_std_streams(mut child: Child) -> anyhow::Result<()> {
     let write_child_stderr = move || -> anyhow::Result<()> {
         use std::io::BufRead;
         let mut stderr = io::stderr();
-        let reader = std::io::BufReader::new(c_stderr);
+        let reader = BufReader::new(c_stderr);
         for line in reader.lines() {
             let line = line?;
             writeln!(stderr, "{}", line)?;
@@ -308,7 +341,7 @@ pub(crate) fn pipe_std_streams(mut child: Child) -> anyhow::Result<()> {
     let write_child_stdout = move || -> anyhow::Result<()> {
         use std::io::BufRead;
         let mut stdout = io::stdout();
-        let reader = std::io::BufReader::new(c_stdout);
+        let reader = BufReader::new(c_stdout);
         for line in reader.lines() {
             let line = line?;
             writeln!(stdout, "{}", line)?;
