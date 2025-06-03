@@ -850,7 +850,7 @@ async fn test_ping_application_loop() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "Fails to connect to gateway nodes on CI. See issue #1624"]
-async fn test_ping_partially_connected_network() -> TestResult {
+async fn test_ping_partially_connected_network_multi_gateway() -> TestResult {
     /*
      * This test verifies how subscription propagation works in a partially connected network.
      *
@@ -1663,7 +1663,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
 
         Ok::<_, anyhow::Error>(())
     })
-    .instrument(span!(Level::INFO, "test_ping_partially_connected_network"));
+    .instrument(span!(Level::INFO, "test_ping_partially_connected_network_multi_gateway"));
 
     // Wait for test completion or node failures
     select! {
