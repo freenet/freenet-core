@@ -784,7 +784,7 @@ impl P2pConnManager {
                                 false, // not a gateway connection
                             )
                             .await;
-                        
+
                         if let Err(e) = handle_result {
                             tracing::debug!(
                                 "Failed to initiate proactive connection to {}: {:?}",

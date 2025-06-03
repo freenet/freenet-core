@@ -439,12 +439,14 @@ async fn report_result(
             {
                 use std::io::Write;
                 #[cfg(debug_assertions)]
-                let OpError::InvalidStateTransition { tx, state, trace } = err else {
+                let OpError::InvalidStateTransition { tx, state, trace } = err
+                else {
                     tracing::error!("Finished transaction with error: {err}");
                     return;
                 };
                 #[cfg(not(debug_assertions))]
-                let OpError::InvalidStateTransition { tx } = err else {
+                let OpError::InvalidStateTransition { tx } = err
+                else {
                     tracing::error!("Finished transaction with error: {err}");
                     return;
                 };
@@ -454,13 +456,13 @@ async fn report_result(
                     let trace = format!("{trace}");
                     let mut tr_lines = trace.lines();
                     let trace = tr_lines
-                    .nth(2)
-                    .map(|second_trace| {
-                        let second_trace_lines =
-                            [second_trace, tr_lines.next().unwrap_or_default()];
-                        second_trace_lines.join("\n")
-                    })
-                    .unwrap_or_default();
+                        .nth(2)
+                        .map(|second_trace| {
+                            let second_trace_lines =
+                                [second_trace, tr_lines.next().unwrap_or_default()];
+                            second_trace_lines.join("\n")
+                        })
+                        .unwrap_or_default();
                     let peer = &op_manager
                         .ring
                         .connection_manager
@@ -478,9 +480,7 @@ async fn report_result(
                         .connection_manager
                         .get_peer_key()
                         .expect("Peer key not found");
-                    let log = format!(
-                        "Transaction ({tx} @ {peer}) error\n"
-                    );
+                    let log = format!("Transaction ({tx} @ {peer}) error\n");
                     std::io::stderr().write_all(log.as_bytes()).unwrap();
                 }
             }
