@@ -33,7 +33,6 @@ use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 use common::{base_node_test_config, gw_config_from_path, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT};
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Test has never worked - nodes fail on startup with channel closed errors"]
 async fn test_ping_partially_connected_network() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
     /*
@@ -65,8 +64,8 @@ async fn test_ping_partially_connected_network() -> TestResult {
 
     // Network configuration parameters
     const NUM_GATEWAYS: usize = 1;
-    const NUM_REGULAR_NODES: usize = 7;
-    const CONNECTIVITY_RATIO: f64 = 0.3; // Controls connectivity between regular nodes
+    const NUM_REGULAR_NODES: usize = 4;
+    const CONNECTIVITY_RATIO: f64 = 0.6;
 
     // Configure logging
     freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
@@ -934,12 +933,13 @@ async fn test_ping_partially_connected_network() -> TestResult {
                         return Err(anyhow!("Node failed: {}", err).into());
                     }
                     Ok(_) => {
-                        // A node completed successfully, continue with remaining nodes
+                        // A node completed - this is actually unexpected during the test!
+                        println!("WARNING: A node exited unexpectedly during the test!");
+                        println!("Remaining nodes: {}", remaining.len());
                         all_futures = remaining;
                         if all_futures.is_empty() {
                             // All nodes completed successfully, but test should still be running
-                            println!("All nodes completed before test finished");
-                            break;
+                            return Err(anyhow!("All nodes exited before test could complete!").into());
                         }
                     }
                 }

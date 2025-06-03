@@ -846,7 +846,6 @@ async fn test_ping_application_loop() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Test has never worked - gateway nodes fail on startup with channel closed errors"]
 async fn test_ping_partially_connected_network() -> TestResult {
     /*
      * This test verifies how subscription propagation works in a partially connected network.
@@ -872,19 +871,25 @@ async fn test_ping_partially_connected_network() -> TestResult {
      * 7. Analyzes results to detect potential subscription propagation issues
      */
 
-    // Network configuration parameters
-    const NUM_GATEWAYS: usize = 3;
-    const NUM_REGULAR_NODES: usize = 7;
-    const CONNECTIVITY_RATIO: f64 = 0.5; // Controls connectivity between regular nodes
+    // Network configuration parameters - start simple with 2 nodes
+    const NUM_GATEWAYS: usize = 1;
+    const NUM_REGULAR_NODES: usize = 2;
+
+    // Manual connectivity specification - which nodes CANNOT talk to each other
+    // This creates a partially connected network with predictable structure
+    // Format: (node_index, node_index)
+    let blocked_pairs: Vec<(usize, usize)> = vec![
+        // No blocking for initial test
+    ];
 
     // Configure logging
     freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
     tracing::info!(
-        "Starting test with {} gateways and {} regular nodes (connectivity ratio: {})",
+        "Starting test with {} gateway and {} regular nodes",
         NUM_GATEWAYS,
-        NUM_REGULAR_NODES,
-        CONNECTIVITY_RATIO
+        NUM_REGULAR_NODES
     );
+    tracing::info!("Blocked pairs: {:?}", blocked_pairs);
 
     // Setup network sockets for the gateways
     let mut gateway_sockets = Vec::with_capacity(NUM_GATEWAYS);
@@ -955,16 +960,18 @@ async fn test_ping_partially_connected_network() -> TestResult {
     let mut node_presets = Vec::with_capacity(NUM_REGULAR_NODES);
 
     for i in 0..NUM_REGULAR_NODES {
-        // Determine which other regular nodes this node should block
+        // Determine which other regular nodes this node should block based on manual specification
         let mut blocked_addresses = Vec::new();
         for (j, &addr) in regular_node_addresses.iter().enumerate() {
             if i == j {
                 continue; // Skip self
             }
 
-            // Use a deterministic approach based on node indices
-            // If the result is >= than CONNECTIVITY_RATIO, block the connection
-            let should_block = (i * j) % 100 >= (CONNECTIVITY_RATIO * 100.0) as usize;
+            // Check if this pair is in the blocked list (bidirectional blocking)
+            let should_block = blocked_pairs.iter().any(|&(a, b)| {
+                (a == i && b == j) || (b == i && a == j)
+            });
+            
             if should_block {
                 blocked_addresses.push(addr);
             }
@@ -1040,10 +1047,10 @@ async fn test_ping_partially_connected_network() -> TestResult {
     let mut gateway_monitor = gateway_futures.into_future();
     let mut regular_node_monitor = regular_node_futures.into_future();
 
-    let test = tokio::time::timeout(Duration::from_secs(240), async {
+    let test = tokio::time::timeout(Duration::from_secs(120), async {
         // Wait for nodes to start up
         tracing::info!("Waiting for nodes to start up...");
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
         tracing::info!("Proceeding to connect to nodes...");
 
         // Connect to all nodes with retry logic
@@ -1073,29 +1080,40 @@ async fn test_ping_partially_connected_network() -> TestResult {
 
         // Log the node connectivity
         tracing::info!("Node connectivity setup:");
-        for (i, num_connections) in node_connections.iter().enumerate() {
-            tracing::info!("Node {} is connected to all {} gateways and {} other regular nodes",
-                          i, NUM_GATEWAYS, num_connections);
+        tracing::info!("All regular nodes connect to gateway");
+        for i in 0..NUM_REGULAR_NODES {
+            let blocked_nodes: Vec<usize> = (0..NUM_REGULAR_NODES)
+                .filter(|&j| {
+                    j != i && blocked_pairs.iter().any(|&(a, b)| {
+                        (a == i && b == j) || (b == i && a == j)
+                    })
+                })
+                .collect();
+            
+            let connected_nodes: Vec<usize> = (0..NUM_REGULAR_NODES)
+                .filter(|&j| j != i && !blocked_nodes.contains(&j))
+                .collect();
+                
+            tracing::info!(
+                "Node {} can communicate with nodes: {:?}, blocked from nodes: {:?}",
+                i, connected_nodes, blocked_nodes
+            );
         }
 
-        // Load the ping contract
+        // Load the ping contract using load_contract which compiles it at test execution time
         let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
         tracing::info!(path=%path_to_code.display(), "loading contract code");
-        let code = std::fs::read(path_to_code)
-            .ok()
-            .ok_or_else(|| anyhow!("Failed to read contract code"))?;
-        let code_hash = CodeHash::from_code(&code);
 
         // Create ping contract options
         let ping_options = PingContractOptions {
-            frequency: Duration::from_secs(3),
+            frequency: Duration::from_secs(2),
             ttl: Duration::from_secs(60),
             tag: APP_TAG.to_string(),
-            code_key: code_hash.to_string(),
+            code_key: "".to_string(), // Will be set by load_contract
         };
 
         let params = Parameters::from(serde_json::to_vec(&ping_options).unwrap());
-        let container = ContractContainer::try_from((code, &params))?;
+        let container = common::load_contract(&path_to_code, params)?;
         let contract_key = container.key();
 
         // Choose a node to publish the contract

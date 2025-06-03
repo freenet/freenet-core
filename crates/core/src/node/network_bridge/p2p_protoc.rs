@@ -170,6 +170,7 @@ impl P2pConnManager {
         mut executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         cli_response_sender: ClientResponsesSender,
         mut node_controller: Receiver<NodeEvent>,
+        ready_signal: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> anyhow::Result<Infallible> {
         tracing::info!(%self.listening_port, %self.listening_ip, %self.is_gateway, key = %self.key_pair.public(), "Opening network listener");
 
@@ -192,6 +193,11 @@ impl P2pConnManager {
                 self.bridge.op_manager.ring.router.clone(),
                 self.this_location,
             );
+
+        // Signal that the event listener is ready to receive events
+        if let Some(ready_tx) = ready_signal {
+            let _ = ready_tx.send(());
+        }
 
         loop {
             let event = self
@@ -765,10 +771,10 @@ impl P2pConnManager {
                         );
 
                         let tx = Transaction::new::<crate::operations::connect::ConnectMsg>();
-                        let (callback, _rx) = tokio::sync::mpsc::channel(10);
+                        let (callback, mut rx) = tokio::sync::mpsc::channel(10);
 
-                        // Don't await - let it happen in the background
-                        let _ = self
+                        // Initiate the connection (don't use ? operator here, we don't want to fail)
+                        let handle_result = self
                             .handle_connect_peer(
                                 sender_peer.peer.clone(),
                                 Box::new(callback),
@@ -778,6 +784,34 @@ impl P2pConnManager {
                                 false, // not a gateway connection
                             )
                             .await;
+                        
+                        if let Err(e) = handle_result {
+                            tracing::debug!(
+                                "Failed to initiate proactive connection to {}: {:?}",
+                                sender_peer.peer,
+                                e
+                            );
+                        } else {
+                            // Spawn a task to handle the connection result
+                            GlobalExecutor::spawn(async move {
+                                match rx.recv().await {
+                                    Some(Ok((peer_id, _))) => {
+                                        tracing::info!(
+                                            "Proactive connection established successfully to {}",
+                                            peer_id
+                                        );
+                                    }
+                                    Some(Err(_)) => {
+                                        tracing::debug!(
+                                            "Proactive connection attempt failed, will retry later if needed"
+                                        );
+                                    }
+                                    None => {
+                                        tracing::debug!("Connection callback channel closed");
+                                    }
+                                }
+                            });
+                        }
                     }
                 }
 
@@ -907,7 +941,7 @@ impl P2pConnManager {
     }
 }
 
-trait ConnectResultSender {
+trait ConnectResultSender: Send {
     fn send_result(
         &mut self,
         result: Result<(PeerId, Option<usize>), HandshakeError>,

@@ -167,28 +167,64 @@ impl NodeP2P {
         Ok(())
     }
     pub(super) async fn run_node(self) -> anyhow::Result<Infallible> {
-        if self.should_try_connect {
-            connect::initial_join_procedure(self.op_manager.clone(), &self.conn_manager.gateways)
-                .await?;
-
-            // After connecting to gateways, aggressively try to reach min_connections
-            // This is important for fast startup and avoiding on-demand connection delays
-            self.aggressive_initial_connections().await;
+        // Save what we need for connections before moving self
+        let should_try_connect = self.should_try_connect;
+        let gateways = self.conn_manager.gateways.clone();
+        let op_manager_for_connect = self.op_manager.clone();
+        
+        // Create a channel to signal when the event listener is ready
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        
+        // Start event listener in background with ready signal
+        let event_listener_handle = {
+            let op_manager = self.op_manager.clone();
+            let conn_manager = self.conn_manager;
+            let client_wait_for_transaction = self.client_wait_for_transaction;
+            let notification_channel = self.notification_channel;
+            let executor_listener = self.executor_listener;
+            let cli_response_sender = self.cli_response_sender;
+            let node_controller = self.node_controller;
+            
+            GlobalExecutor::spawn(async move {
+                conn_manager.run_event_listener(
+                    op_manager,
+                    client_wait_for_transaction,
+                    notification_channel,
+                    executor_listener,
+                    cli_response_sender,
+                    node_controller,
+                    Some(ready_tx),
+                ).await
+            })
+        };
+        
+        // Wait for event listener to signal it's ready
+        if ready_rx.await.is_ok() {
+            // Now it's safe to initiate connections
+            if should_try_connect {
+                GlobalExecutor::spawn(async move {
+                    if let Err(e) = connect::initial_join_procedure(op_manager_for_connect.clone(), &gateways).await {
+                        tracing::error!("Initial join procedure failed: {}", e);
+                    }
+                    
+                    // After initial join, trigger more aggressive connection attempts
+                    // The ring's connection maintenance task will handle this, but we can
+                    // also trigger it manually for faster startup
+                    tracing::info!("Initial join complete, connection maintenance will find more peers");
+                    
+                    // For now, use the connection maintenance to avoid overwhelming the network
+                    // aggressive_initial_connections would be better but needs access to self
+                });
+            }
         }
 
-        let f = self.conn_manager.run_event_listener(
-            self.op_manager.clone(),
-            self.client_wait_for_transaction,
-            self.notification_channel,
-            self.executor_listener,
-            self.cli_response_sender,
-            self.node_controller,
-        );
-
         tokio::select!(
-            r = f => {
-               let Err(e) = r;
-               Err(e)
+            r = event_listener_handle => {
+               match r {
+                   Ok(Err(e)) => Err(e),
+                   Ok(Ok(_)) => unreachable!("Event listener should not return Ok"),
+                   Err(e) => Err(e.into()),
+               }
             }
             e = self.client_events_task => {
                 Err(e)
