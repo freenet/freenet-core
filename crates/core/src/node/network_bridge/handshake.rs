@@ -707,10 +707,7 @@ impl HandshakeHandler {
         is_gw: bool,
     ) {
         if self.connected.contains(&remote.addr) {
-            tracing::warn!(
-                "Already connected to {}, notifying failure",
-                remote.addr
-            );
+            tracing::warn!("Already connected to {}, notifying failure", remote.addr);
             // Push a failure event so p2p_protoc can clean up the callback
             let f = async move {
                 Err((
@@ -722,7 +719,7 @@ impl HandshakeHandler {
             self.ongoing_outbound_connections.push(f);
             return;
         }
-        
+
         if let Some(&existing_tx) = self.connecting.get(&remote.addr) {
             if existing_tx != transaction {
                 tracing::warn!(
@@ -733,7 +730,9 @@ impl HandshakeHandler {
                 let f = async move {
                     Err((
                         remote,
-                        HandshakeError::ConnectionError(super::ConnectionError::ConnectionInProgress),
+                        HandshakeError::ConnectionError(
+                            super::ConnectionError::ConnectionInProgress,
+                        ),
                     ))
                 }
                 .boxed();
@@ -741,7 +740,7 @@ impl HandshakeHandler {
                 return;
             }
         }
-        
+
         self.connecting.insert(remote.addr, transaction);
         tracing::debug!("Starting outbound connection to {addr}", addr = remote.addr);
         let f = self

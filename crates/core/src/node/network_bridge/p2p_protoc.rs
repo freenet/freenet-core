@@ -309,9 +309,10 @@ impl P2pConnManager {
                                 let _ = Self::cleanup_awaiting_connection(
                                     peer.addr,
                                     &mut state,
-                                    HandshakeError::ConnectionClosed(peer.addr)
-                                ).await;
-                                
+                                    HandshakeError::ConnectionClosed(peer.addr),
+                                )
+                                .await;
+
                                 if let Some(conn) = self.connections.remove(&peer) {
                                     // TODO: review: this could potentially leave garbage tasks in the background with peer listener
                                     timeout(
@@ -367,7 +368,7 @@ impl P2pConnManager {
                                     cli_response_sender
                                         .send((client, Err(ErrorKind::FailedOperation.into())))?;
                                 }
-                                
+
                                 // Also check for connection attempts with this transaction
                                 let mut addr_to_cleanup = None;
                                 for (addr, conn_tx) in &state.connection_tx {
@@ -376,14 +377,19 @@ impl P2pConnManager {
                                         break;
                                     }
                                 }
-                                
+
                                 if let Some(addr) = addr_to_cleanup {
-                                    tracing::debug!("Transaction {} timed out for connection to {}", tx, addr);
+                                    tracing::debug!(
+                                        "Transaction {} timed out for connection to {}",
+                                        tx,
+                                        addr
+                                    );
                                     let _ = Self::cleanup_awaiting_connection(
                                         addr,
                                         &mut state,
-                                        HandshakeError::ConnectionClosed(addr)
-                                    ).await;
+                                        HandshakeError::ConnectionClosed(addr),
+                                    )
+                                    .await;
                                 }
                             }
                             NodeEvent::Disconnect { cause } => {
@@ -549,7 +555,7 @@ impl P2pConnManager {
     ) -> Result<(), HandshakeError> {
         // Remove the transaction tracking
         state.connection_tx.remove(&addr);
-        
+
         if let Some(mut callback) = state.awaiting_connection.remove(&addr) {
             callback.send_result(Err(error)).await?;
         }
@@ -579,7 +585,7 @@ impl P2pConnManager {
             }
             tracing::debug!(tx = %tx, "Blocked addresses: {:?}, peer addr: {}", blocked_addrs, peer.addr);
         }
-        
+
         // Check if already connected
         if self.connections.contains_key(&peer) {
             tracing::info!(tx = %tx, remote = %peer, "Already connected to peer");
@@ -590,7 +596,7 @@ impl P2pConnManager {
                 .await?;
             return Ok(());
         }
-        
+
         // Check if connection attempt already in progress
         if state.awaiting_connection.contains_key(&peer.addr) {
             tracing::info!(tx = %tx, remote = %peer, "Connection attempt already in progress");
@@ -601,7 +607,7 @@ impl P2pConnManager {
                 .await?;
             return Ok(());
         }
-        
+
         state.awaiting_connection.insert(peer.addr, callback);
         state.connection_tx.insert(peer.addr, tx);
         let res = timeout(
@@ -609,7 +615,7 @@ impl P2pConnManager {
             handshake_handler_msg.establish_conn(peer.clone(), tx, is_gw),
         )
         .await;
-        
+
         match res {
             Ok(Ok(())) => {
                 tracing::debug!(tx = %tx,
@@ -621,11 +627,8 @@ impl P2pConnManager {
             Ok(Err(e)) => {
                 tracing::error!(tx = %tx, "Failed to establish connection: {:?}", e);
                 // Cleanup the callback on error
-                Self::cleanup_awaiting_connection(
-                    peer.addr,
-                    state,
-                    HandshakeError::ChannelClosed
-                ).await?;
+                Self::cleanup_awaiting_connection(peer.addr, state, HandshakeError::ChannelClosed)
+                    .await?;
                 Err(anyhow::Error::msg(e))
             }
             Err(_timeout) => {
@@ -634,8 +637,9 @@ impl P2pConnManager {
                 Self::cleanup_awaiting_connection(
                     peer.addr,
                     state,
-                    HandshakeError::ConnectionClosed(peer.addr)
-                ).await?;
+                    HandshakeError::ConnectionClosed(peer.addr),
+                )
+                .await?;
                 Err(anyhow::Error::msg("Timeout establishing connection"))
             }
         }
@@ -796,7 +800,7 @@ impl P2pConnManager {
     ) -> anyhow::Result<()> {
         // Clean up the transaction tracking
         state.connection_tx.remove(&peer_id.addr);
-        
+
         if let Some(mut cb) = state.awaiting_connection.remove(&peer_id.addr) {
             let peer_id = if let Some(peer_id) = self
                 .bridge
@@ -911,9 +915,10 @@ impl P2pConnManager {
                     let _ = Self::cleanup_awaiting_connection(
                         socket_addr,
                         state,
-                        HandshakeError::ConnectionClosed(socket_addr)
-                    ).await;
-                    
+                        HandshakeError::ConnectionClosed(socket_addr),
+                    )
+                    .await;
+
                     if let Some(peer) = self
                         .connections
                         .keys()
