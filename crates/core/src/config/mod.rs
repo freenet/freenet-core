@@ -225,6 +225,9 @@ impl ConfigArgs {
 
         let should_persist = cfg.is_none();
 
+        let mut min_connections = None;
+        let mut max_connections = None;
+
         // merge the configuration from the file with the command line arguments
         if let Some(cfg) = cfg {
             self.secrets.merge(cfg.secrets);
@@ -233,6 +236,8 @@ impl ConfigArgs {
             self.ws_api.ws_api_port.get_or_insert(cfg.ws_api.port);
             self.log_level.get_or_insert(cfg.log_level);
             self.config_paths.merge(cfg.config_paths.as_ref().clone());
+            min_connections = cfg.min_connections;
+            max_connections = cfg.max_connections;
         }
 
         let mode = self.mode.unwrap_or(OperationMode::Network);
@@ -340,6 +345,8 @@ impl ConfigArgs {
             gateways: gateways.gateways.clone(),
             is_gateway: self.network_api.is_gateway,
             location: self.network_api.location,
+            min_connections,
+            max_connections,
         };
 
         fs::create_dir_all(this.config_dir())?;
@@ -423,6 +430,12 @@ pub struct Config {
     pub(crate) gateways: Vec<GatewayConfig>,
     pub(crate) is_gateway: bool,
     pub(crate) location: Option<f64>,
+    /// Minimum number of connections to maintain. Defaults to 25 for production.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) min_connections: Option<usize>,
+    /// Maximum number of connections allowed. Defaults to 200.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) max_connections: Option<usize>,
 }
 
 impl Config {

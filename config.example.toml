@@ -1,0 +1,34 @@
+# Example Freenet Node Configuration File
+#
+# This file demonstrates how to configure a Freenet node for different scenarios.
+# Copy this file to your config directory and modify as needed.
+
+# Node operation mode: "network" or "local"
+mode = "network"
+
+# Network API configuration
+network-address = "0.0.0.0"
+network-port = 31337
+
+# WebSocket API configuration  
+ws-api-address = "127.0.0.1"
+ws-api-port = 50509
+
+# Logging level: "off", "error", "warn", "info", "debug", or "trace"
+log_level = "info"
+
+# Whether this node is a gateway
+is_gateway = false
+
+# Connection limits
+# For production networks, the defaults are:
+# - min_connections = 25
+# - max_connections = 200
+#
+# For smaller test networks, you may want to reduce these:
+# min_connections = 2
+# max_connections = 10
+
+# Transport keypair path (relative to config directory)
+# If not specified, a new keypair will be generated
+# transport_keypair = "transport.pem"
