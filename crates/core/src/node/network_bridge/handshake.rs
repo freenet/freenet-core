@@ -126,6 +126,7 @@ pub(super) enum ExternConnection {
     Dropped {
         peer: PeerId,
     },
+    #[allow(dead_code)]
     DropConnectionByAddr(SocketAddr),
 }
 
@@ -153,6 +154,7 @@ impl HanshakeHandlerMsg {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn drop_connection_by_addr(&self, remote_addr: SocketAddr) -> Result<()> {
         self.0
             .send(ExternConnection::DropConnectionByAddr(remote_addr))
@@ -705,12 +707,40 @@ impl HandshakeHandler {
         is_gw: bool,
     ) {
         if self.connected.contains(&remote.addr) {
-            tracing::warn!(
-                "Already connected to {}, ignore connection attempt",
-                remote.addr
-            );
+            tracing::warn!("Already connected to {}, notifying failure", remote.addr);
+            // Push a failure event so p2p_protoc can clean up the callback
+            let f = async move {
+                Err((
+                    remote,
+                    HandshakeError::ConnectionError(super::ConnectionError::AlreadyConnected),
+                ))
+            }
+            .boxed();
+            self.ongoing_outbound_connections.push(f);
             return;
         }
+
+        if let Some(&existing_tx) = self.connecting.get(&remote.addr) {
+            if existing_tx != transaction {
+                tracing::warn!(
+                    "Connection attempt already in progress to {}, notifying failure",
+                    remote.addr
+                );
+                // Push a failure event for duplicate connection attempt
+                let f = async move {
+                    Err((
+                        remote,
+                        HandshakeError::ConnectionError(
+                            super::ConnectionError::ConnectionInProgress,
+                        ),
+                    ))
+                }
+                .boxed();
+                self.ongoing_outbound_connections.push(f);
+                return;
+            }
+        }
+
         self.connecting.insert(remote.addr, transaction);
         tracing::debug!("Starting outbound connection to {addr}", addr = remote.addr);
         let f = self

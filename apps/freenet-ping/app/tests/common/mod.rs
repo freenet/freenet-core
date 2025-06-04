@@ -328,6 +328,7 @@ pub(crate) fn pipe_std_streams(mut child: Child) -> anyhow::Result<()> {
     let c_stderr = child.stderr.take().expect("Failed to open command stderr");
 
     let write_child_stderr = move || -> anyhow::Result<()> {
+        use std::io::BufRead;
         let mut stderr = io::stderr();
         let reader = BufReader::new(c_stderr);
         for line in reader.lines() {
@@ -338,6 +339,7 @@ pub(crate) fn pipe_std_streams(mut child: Child) -> anyhow::Result<()> {
     };
 
     let write_child_stdout = move || -> anyhow::Result<()> {
+        use std::io::BufRead;
         let mut stdout = io::stdout();
         let reader = BufReader::new(c_stdout);
         for line in reader.lines() {

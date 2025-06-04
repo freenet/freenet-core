@@ -30,6 +30,7 @@ use crate::node::network_bridge::handshake::{
     OutboundMessage,
 };
 use crate::node::PeerId;
+use crate::operations::{connect::ConnectMsg, get::GetMsg, put::PutMsg, update::UpdateMsg};
 use crate::transport::{
     create_connection_handler, PeerConnection, TransportError, TransportKeypair,
 };
@@ -169,6 +170,7 @@ impl P2pConnManager {
         mut executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         cli_response_sender: ClientResponsesSender,
         mut node_controller: Receiver<NodeEvent>,
+        ready_signal: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> anyhow::Result<Infallible> {
         tracing::info!(%self.listening_port, %self.listening_ip, %self.is_gateway, key = %self.key_pair.public(), "Opening network listener");
 
@@ -191,6 +193,11 @@ impl P2pConnManager {
                 self.bridge.op_manager.ring.router.clone(),
                 self.this_location,
             );
+
+        // Signal that the event listener is ready to receive events
+        if let Some(ready_tx) = ready_signal {
+            let _ = ready_tx.send(());
+        }
 
         loop {
             let event = self
@@ -239,11 +246,55 @@ impl P2pConnManager {
                                     }
                                 }
                                 None => {
-                                    tracing::error!(
+                                    tracing::warn!(
                                         id = %msg.id(),
                                         target = %target_peer.peer,
-                                        "No existing outbound connection to forward the message"
+                                        "No existing outbound connection, establishing connection first"
                                     );
+
+                                    // Queue the message for sending after connection is established
+                                    let tx = *msg.id();
+                                    let (callback, mut result) = tokio::sync::mpsc::channel(10);
+
+                                    // Initiate connection to the peer
+                                    self.bridge
+                                        .ev_listener_tx
+                                        .send(Right(NodeEvent::ConnectPeer {
+                                            peer: target_peer.peer.clone(),
+                                            tx,
+                                            callback,
+                                            is_gw: false,
+                                        }))
+                                        .await?;
+
+                                    // Wait for connection to be established (with timeout)
+                                    match timeout(Duration::from_secs(5), result.recv()).await {
+                                        Ok(Some(Ok(_))) => {
+                                            // Connection established, try sending again
+                                            if let Some(peer_connection) =
+                                                self.connections.get(&target_peer.peer)
+                                            {
+                                                if let Err(e) =
+                                                    peer_connection.send(Left(msg)).await
+                                                {
+                                                    tracing::error!("Failed to send message to peer after establishing connection: {}", e);
+                                                }
+                                            }
+                                        }
+                                        Ok(Some(Err(e))) => {
+                                            tracing::error!(
+                                                "Failed to establish connection to {}: {:?}",
+                                                target_peer.peer,
+                                                e
+                                            );
+                                        }
+                                        Ok(None) | Err(_) => {
+                                            tracing::error!(
+                                                "Timeout or error establishing connection to {}",
+                                                target_peer.peer
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -254,6 +305,14 @@ impl P2pConnManager {
                         ConnEvent::NodeAction(action) => match action {
                             NodeEvent::DropConnection(peer) => {
                                 tracing::debug!(%peer, "Dropping connection");
+                                // Cleanup any pending connection attempts for this peer
+                                let _ = Self::cleanup_awaiting_connection(
+                                    peer.addr,
+                                    &mut state,
+                                    HandshakeError::ConnectionClosed(peer.addr),
+                                )
+                                .await;
+
                                 if let Some(conn) = self.connections.remove(&peer) {
                                     // TODO: review: this could potentially leave garbage tasks in the background with peer listener
                                     timeout(
@@ -304,11 +363,34 @@ impl P2pConnManager {
                                 })??;
                             }
                             NodeEvent::TransactionTimedOut(tx) => {
-                                let Some(client) = state.tx_to_client.remove(&tx) else {
-                                    continue;
-                                };
-                                cli_response_sender
-                                    .send((client, Err(ErrorKind::FailedOperation.into())))?;
+                                // Handle client transactions
+                                if let Some(client) = state.tx_to_client.remove(&tx) {
+                                    cli_response_sender
+                                        .send((client, Err(ErrorKind::FailedOperation.into())))?;
+                                }
+
+                                // Also check for connection attempts with this transaction
+                                let mut addr_to_cleanup = None;
+                                for (addr, conn_tx) in &state.connection_tx {
+                                    if conn_tx == &tx {
+                                        addr_to_cleanup = Some(*addr);
+                                        break;
+                                    }
+                                }
+
+                                if let Some(addr) = addr_to_cleanup {
+                                    tracing::debug!(
+                                        "Transaction {} timed out for connection to {}",
+                                        tx,
+                                        addr
+                                    );
+                                    let _ = Self::cleanup_awaiting_connection(
+                                        addr,
+                                        &mut state,
+                                        HandshakeError::ConnectionClosed(addr),
+                                    )
+                                    .await;
+                                }
                             }
                             NodeEvent::Disconnect { cause } => {
                                 tracing::info!(
@@ -465,6 +547,21 @@ impl P2pConnManager {
         );
     }
 
+    /// Helper to cleanup and notify a pending connection callback
+    async fn cleanup_awaiting_connection(
+        addr: SocketAddr,
+        state: &mut EventListenerState,
+        error: HandshakeError,
+    ) -> Result<(), HandshakeError> {
+        // Remove the transaction tracking
+        state.connection_tx.remove(&addr);
+
+        if let Some(mut callback) = state.awaiting_connection.remove(&addr) {
+            callback.send_result(Err(error)).await?;
+        }
+        Ok(())
+    }
+
     async fn handle_connect_peer(
         &mut self,
         peer: PeerId,
@@ -486,25 +583,65 @@ impl P2pConnManager {
                     .await?;
                 return Ok(());
             }
+            tracing::debug!(tx = %tx, "Blocked addresses: {:?}, peer addr: {}", blocked_addrs, peer.addr);
         }
+
+        // Check if already connected
+        if self.connections.contains_key(&peer) {
+            tracing::info!(tx = %tx, remote = %peer, "Already connected to peer");
+            callback
+                .send_result(Err(HandshakeError::ConnectionError(
+                    crate::node::network_bridge::ConnectionError::AlreadyConnected,
+                )))
+                .await?;
+            return Ok(());
+        }
+
+        // Check if connection attempt already in progress
+        if state.awaiting_connection.contains_key(&peer.addr) {
+            tracing::info!(tx = %tx, remote = %peer, "Connection attempt already in progress");
+            callback
+                .send_result(Err(HandshakeError::ConnectionError(
+                    crate::node::network_bridge::ConnectionError::ConnectionInProgress,
+                )))
+                .await?;
+            return Ok(());
+        }
+
         state.awaiting_connection.insert(peer.addr, callback);
+        state.connection_tx.insert(peer.addr, tx);
         let res = timeout(
             Duration::from_secs(10),
             handshake_handler_msg.establish_conn(peer.clone(), tx, is_gw),
         )
-        .await
-        .inspect_err(|error| {
-            tracing::error!(tx = %tx, "Failed to establish connection: {:?}", error);
-        })?;
+        .await;
+
         match res {
-            Ok(()) => {
+            Ok(Ok(())) => {
                 tracing::debug!(tx = %tx,
                     "Successfully initiated connection process for peer: {:?}",
                     peer
                 );
                 Ok(())
             }
-            Err(e) => Err(anyhow::Error::msg(e)),
+            Ok(Err(e)) => {
+                tracing::error!(tx = %tx, "Failed to establish connection: {:?}", e);
+                // Cleanup the callback on error
+                Self::cleanup_awaiting_connection(peer.addr, state, HandshakeError::ChannelClosed)
+                    .await?;
+                Err(anyhow::Error::msg(e))
+            }
+            Err(_timeout) => {
+                tracing::error!(tx = %tx, "Timeout establishing connection to {:?}", peer);
+                // Cleanup the callback on timeout
+                Self::cleanup_awaiting_connection(
+                    peer.addr,
+                    state,
+                    HandshakeError::ConnectionClosed(peer.addr),
+                )
+                .await?;
+                Err(anyhow::Error::msg("Timeout establishing connection"))
+            }
         }
     }
 
@@ -512,7 +649,7 @@ impl P2pConnManager {
         &mut self,
         event: HandshakeEvent,
         state: &mut EventListenerState,
-        handshake_handler_msg: &HanshakeHandlerMsg, // Parameter added
+        _handshake_handler_msg: &HanshakeHandlerMsg, // Parameter added
     ) -> anyhow::Result<()> {
         match event {
             HandshakeEvent::InboundConnection {
@@ -527,9 +664,8 @@ impl P2pConnManager {
                     if blocked_addrs.contains(&joiner.addr) {
                         tracing::info!(%id, remote = %joiner.addr, "Inbound connection from peer blocked by local policy");
                         // Not proceeding with adding connection or processing the operation.
-                        handshake_handler_msg
-                            .drop_connection_by_addr(joiner.addr)
-                            .await?;
+                        // Don't call drop_connection_by_addr as it can cause channels to close abruptly
+                        // Just ignore the connection and let it timeout naturally
                         return Ok(());
                     }
                 }
@@ -662,6 +798,9 @@ impl P2pConnManager {
         state: &mut EventListenerState,
         remaining_checks: Option<usize>,
     ) -> anyhow::Result<()> {
+        // Clean up the transaction tracking
+        state.connection_tx.remove(&peer_id.addr);
+
         if let Some(mut cb) = state.awaiting_connection.remove(&peer_id.addr) {
             let peer_id = if let Some(peer_id) = self
                 .bridge
@@ -699,11 +838,71 @@ impl P2pConnManager {
     async fn handle_peer_connection_msg(
         &mut self,
         msg: Option<Result<PeerConnectionInbound, TransportError>>,
-        state: &EventListenerState,
+        state: &mut EventListenerState,
         handshake_handler_msg: &HanshakeHandlerMsg,
     ) -> anyhow::Result<EventResult> {
         match msg {
             Some(Ok(peer_conn)) => {
+                // Get the remote address from the connection
+                let remote_addr = peer_conn.conn.remote_addr();
+
+                // Check if we need to establish a connection back to the sender
+                let should_connect = !self.connections.keys().any(|peer| peer.addr == remote_addr)
+                    && !state.awaiting_connection.contains_key(&remote_addr);
+
+                if should_connect {
+                    // Try to extract sender information from the message to establish connection
+                    if let Some(sender_peer) = extract_sender_from_message(&peer_conn.msg) {
+                        tracing::info!(
+                            "Received message from unconnected peer {}, establishing connection proactively",
+                            sender_peer.peer
+                        );
+
+                        let tx = Transaction::new::<crate::operations::connect::ConnectMsg>();
+                        let (callback, mut rx) = tokio::sync::mpsc::channel(10);
+
+                        // Initiate the connection (don't use ? operator here, we don't want to fail)
+                        let handle_result = self
+                            .handle_connect_peer(
+                                sender_peer.peer.clone(),
+                                Box::new(callback),
+                                tx,
+                                handshake_handler_msg,
+                                state,
+                                false, // not a gateway connection
+                            )
+                            .await;
+
+                        if let Err(e) = handle_result {
+                            tracing::debug!(
+                                "Failed to initiate proactive connection to {}: {:?}",
+                                sender_peer.peer,
+                                e
+                            );
+                        } else {
+                            // Spawn a task to handle the connection result
+                            GlobalExecutor::spawn(async move {
+                                match rx.recv().await {
+                                    Some(Ok((peer_id, _))) => {
+                                        tracing::info!(
+                                            "Proactive connection established successfully to {}",
+                                            peer_id
+                                        );
+                                    }
+                                    Some(Err(_)) => {
+                                        tracing::debug!(
+                                            "Proactive connection attempt failed, will retry later if needed"
+                                        );
+                                    }
+                                    None => {
+                                        tracing::debug!("Connection callback channel closed");
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+
                 let task = peer_connection_listener(peer_conn.rx, peer_conn.conn).boxed();
                 state.peer_connections.push(task);
                 Ok(EventResult::Event(
@@ -712,6 +911,14 @@ impl P2pConnManager {
             }
             Some(Err(err)) => {
                 if let TransportError::ConnectionClosed(socket_addr) = err {
+                    // First cleanup any pending connection attempts for this address
+                    let _ = Self::cleanup_awaiting_connection(
+                        socket_addr,
+                        state,
+                        HandshakeError::ConnectionClosed(socket_addr),
+                    )
+                    .await;
+
                     if let Some(peer) = self
                         .connections
                         .keys()
@@ -830,7 +1037,7 @@ impl P2pConnManager {
     }
 }
 
-trait ConnectResultSender {
+trait ConnectResultSender: Send {
     fn send_result(
         &mut self,
         result: Result<(PeerId, Option<usize>), HandshakeError>,
@@ -876,6 +1083,8 @@ struct EventListenerState {
     client_waiting_transaction: Vec<(WaitingTransaction, HashSet<ClientId>)>,
     transient_conn: HashMap<Transaction, SocketAddr>,
     awaiting_connection: HashMap<SocketAddr, Box<dyn ConnectResultSender>>,
+    // Track transaction ID for each connection attempt
+    connection_tx: HashMap<SocketAddr, Transaction>,
     pending_op_results: HashMap<Transaction, Sender<NetMessage>>,
 }
 
@@ -888,6 +1097,7 @@ impl EventListenerState {
             client_waiting_transaction: Vec::new(),
             transient_conn: HashMap::new(),
             awaiting_connection: HashMap::new(),
+            connection_tx: HashMap::new(),
             pending_op_results: HashMap::new(),
         }
     }
@@ -968,6 +1178,49 @@ async fn peer_connection_listener(
 #[inline(always)]
 fn decode_msg(data: &[u8]) -> Result<NetMessage, ConnectionError> {
     bincode::deserialize(data).map_err(|err| ConnectionError::Serialization(Some(err)))
+}
+
+/// Extract sender information from various message types
+fn extract_sender_from_message(msg: &NetMessage) -> Option<PeerKeyLocation> {
+    match msg {
+        NetMessage::V1(msg_v1) => match msg_v1 {
+            // Connect messages often have sender information
+            NetMessageV1::Connect(connect_msg) => match connect_msg {
+                ConnectMsg::Response { sender, .. } => Some(sender.clone()),
+                ConnectMsg::Request { target, .. } => Some(target.clone()),
+                _ => None,
+            },
+            // Get messages have sender in some variants
+            NetMessageV1::Get(get_msg) => match get_msg {
+                GetMsg::SeekNode { sender, .. } => Some(sender.clone()),
+                GetMsg::ReturnGet { sender, .. } => Some(sender.clone()),
+                _ => None,
+            },
+            // Put messages have sender in some variants
+            NetMessageV1::Put(put_msg) => match put_msg {
+                PutMsg::SeekNode { sender, .. } => Some(sender.clone()),
+                PutMsg::SuccessfulPut { sender, .. } => Some(sender.clone()),
+                PutMsg::PutForward { sender, .. } => Some(sender.clone()),
+                _ => None,
+            },
+            // Update messages have sender in some variants
+            NetMessageV1::Update(update_msg) => match update_msg {
+                UpdateMsg::SeekNode { sender, .. } => Some(sender.clone()),
+                UpdateMsg::SuccessfulUpdate { sender, .. } => Some(sender.clone()),
+                UpdateMsg::Broadcasting { sender, .. } => Some(sender.clone()),
+                UpdateMsg::BroadcastTo { sender, .. } => Some(sender.clone()),
+                _ => None,
+            },
+            // Subscribe messages
+            NetMessageV1::Subscribe(subscribe_msg) => match subscribe_msg {
+                SubscribeMsg::SeekNode { subscriber, .. } => Some(subscriber.clone()),
+                SubscribeMsg::ReturnSub { sender, .. } => Some(sender.clone()),
+                _ => None,
+            },
+            // Other message types don't have sender info
+            _ => None,
+        },
+    }
 }
 
 // TODO: add testing for the network loop, now it should be possible to do since we don't depend upon having real connections

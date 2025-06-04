@@ -28,3 +28,15 @@ config.toml
 rustc-ice*.txt
 .aider*
 aider.conf.yaml
+
+# Claude-specific files
+CLAUDE.md
+**/CLAUDE.md
+CI_STATUS.md
+
+# Temporary test outputs and logs
+*.log
+test_*.sh
+PR_*.md
+GET_OPERATION_OPTIMIZATION_SUMMARY.md
+INTEGRATION_TEST_FIX_STATUS.md

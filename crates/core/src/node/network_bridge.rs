@@ -56,6 +56,10 @@ pub(crate) enum ConnectionError {
     IOError(String),
     #[error("timeout error while waiting for a message")]
     Timeout,
+    #[error("already connected to peer")]
+    AlreadyConnected,
+    #[error("connection attempt already in progress")]
+    ConnectionInProgress,
 }
 
 impl From<std::io::Error> for ConnectionError {
@@ -83,6 +87,8 @@ impl Clone for ConnectionError {
             Self::FailedConnectOp => Self::FailedConnectOp,
             Self::UnwantedConnection => Self::UnwantedConnection,
             Self::AddressBlocked(addr) => Self::AddressBlocked(*addr),
+            Self::AlreadyConnected => Self::AlreadyConnected,
+            Self::ConnectionInProgress => Self::ConnectionInProgress,
         }
     }
 }

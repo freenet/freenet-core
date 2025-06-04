@@ -698,17 +698,35 @@ pub(crate) async fn initial_join_procedure(
         let mut connected = false;
         const WAIT_TIME: u64 = 1;
         const CHECK_AGAIN_TIME: u64 = 15;
+
+        tracing::info!(
+            "Starting initial join procedure with {} gateways",
+            gateways.len()
+        );
+
         loop {
-            if op_manager.ring.open_connections() == 0 {
+            let open_conns = op_manager.ring.open_connections();
+            let unconnected_gateways: Vec<_> =
+                op_manager.ring.is_not_connected(gateways.iter()).collect();
+
+            tracing::debug!(
+                "Connection status: open_connections = {}, unconnected_gateways = {}",
+                open_conns,
+                unconnected_gateways.len()
+            );
+
+            // Connect to gateways if we're not connected to all of them
+            let unconnected_count = unconnected_gateways.len();
+            if unconnected_count > 0 {
                 connected = false;
                 tracing::info!(
-                    "Attempting to connect to {} gateways in parallel",
-                    number_of_parallel_connections
+                    "Need to connect to {} gateways. Attempting to connect to {} in parallel",
+                    unconnected_count,
+                    number_of_parallel_connections.min(unconnected_count)
                 );
                 let select_all = futures::stream::FuturesUnordered::new();
-                for gateway in op_manager
-                    .ring
-                    .is_not_connected(gateways.iter())
+                for gateway in unconnected_gateways
+                    .into_iter()
                     .shuffle()
                     .take(number_of_parallel_connections)
                 {
@@ -730,13 +748,40 @@ pub(crate) async fn initial_join_procedure(
                 }).await;
             }
 
+            // Check if we're connected to at least one gateway
+            let connected_to_gateway = unconnected_count < gateways.len();
+
+            if !connected && connected_to_gateway {
+                connected = true;
+                let connected_gw_count = gateways.len() - unconnected_count;
+                tracing::info!(
+                    "Successfully connected to {}/{} gateways! Total connections: {}",
+                    connected_gw_count,
+                    gateways.len(),
+                    open_conns
+                );
+            }
+
             if !connected {
+                tracing::debug!(
+                    "Not connected to any gateway yet, waiting {}s before retry",
+                    WAIT_TIME
+                );
                 tokio::time::sleep(Duration::from_secs(WAIT_TIME)).await;
-            } else {
-                // tipically we won't need to ever again connect to a gw once connected
-                // to the network, but this task will check time to time in case the peer
-                // becomes completely disconnected for some reason
+            } else if unconnected_count == 0 {
+                // Connected to all gateways, can wait longer
+                tracing::trace!(
+                    "Connected to all gateways, waiting {}s before next check",
+                    CHECK_AGAIN_TIME
+                );
                 tokio::time::sleep(Duration::from_secs(CHECK_AGAIN_TIME)).await;
+            } else {
+                // Connected to some but not all gateways, check more frequently
+                tracing::debug!(
+                    "Connected to some gateways but not all, waiting {}s before retry",
+                    WAIT_TIME * 3
+                );
+                tokio::time::sleep(Duration::from_secs(WAIT_TIME * 3)).await;
             }
         }
     });
@@ -864,8 +909,8 @@ async fn connect_request(
                 joiner = %joiner,
                 "Sending connection request to gateway",
             );
-            // at this point the gateway has accepted the connection so already
-            // sent StartJoinReq to the gateway and are waiting for new upstream connections
+
+            // Update state to indicate we're waiting for new connections
             op_manager
                 .push(
                     tx,
@@ -874,9 +919,64 @@ async fn connect_request(
                         state: Some(ConnectState::AwaitingNewConnection(NewConnectionInfo {
                             remaining_connections,
                         })),
-                        gateway: Some(Box::new(gateway)),
+                        gateway: Some(Box::new(gateway.clone())),
                         backoff,
                     })),
+                )
+                .await?;
+
+            // After connecting to gateway, immediately request to find more peers
+            // We'll create a new transaction for this follow-up request
+            let new_tx_id = Transaction::new::<ConnectMsg>();
+            let ideal_location = Location::random();
+            let joiner_location = op_manager.ring.connection_manager.own_location();
+
+            // Track this transaction so connection maintenance knows about it
+            op_manager
+                .ring
+                .live_tx_tracker
+                .add_transaction(gateway.peer.clone(), new_tx_id);
+
+            let msg = ConnectMsg::Request {
+                id: new_tx_id,
+                target: gateway.clone(),
+                msg: ConnectRequest::FindOptimalPeer {
+                    query_target: gateway.clone(),
+                    ideal_location,
+                    joiner: joiner_location,
+                    max_hops_to_live: op_manager.ring.max_hops_to_live,
+                    skip_connections: HashSet::from([joiner.clone()]),
+                    skip_forwards: HashSet::new(),
+                },
+            };
+
+            tracing::info!(
+                tx = %new_tx_id,
+                gateway = %gateway.peer,
+                ideal_location = %ideal_location,
+                "Immediately requesting more peer connections from gateway"
+            );
+
+            // Send the message through the op_manager's notification system
+            // We need to create a new ConnectOp for this new transaction
+            let new_op = ConnectOp::new(
+                new_tx_id,
+                Some(ConnectState::AwaitingNewConnection(NewConnectionInfo {
+                    remaining_connections: op_manager.ring.max_hops_to_live,
+                })),
+                Some(Box::new(gateway.clone())),
+                None,
+            );
+
+            // Push the new operation and send the message
+            op_manager
+                .push(new_tx_id, OpEnum::Connect(Box::new(new_op)))
+                .await?;
+
+            op_manager
+                .notify_op_change(
+                    NetMessage::from(msg),
+                    OpEnum::Connect(Box::new(ConnectOp::new(new_tx_id, None, None, None))),
                 )
                 .await?;
             Ok(())
