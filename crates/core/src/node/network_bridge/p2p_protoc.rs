@@ -305,6 +305,13 @@ impl P2pConnManager {
                         ConnEvent::NodeAction(action) => match action {
                             NodeEvent::DropConnection(peer) => {
                                 tracing::debug!(%peer, "Dropping connection");
+                                // Cleanup any pending connection attempts for this peer
+                                let _ = Self::cleanup_awaiting_connection(
+                                    peer.addr,
+                                    &mut state,
+                                    HandshakeError::ConnectionClosed(peer.addr)
+                                ).await;
+                                
                                 if let Some(conn) = self.connections.remove(&peer) {
                                     // TODO: review: this could potentially leave garbage tasks in the background with peer listener
                                     timeout(
@@ -355,11 +362,29 @@ impl P2pConnManager {
                                 })??;
                             }
                             NodeEvent::TransactionTimedOut(tx) => {
-                                let Some(client) = state.tx_to_client.remove(&tx) else {
-                                    continue;
-                                };
-                                cli_response_sender
-                                    .send((client, Err(ErrorKind::FailedOperation.into())))?;
+                                // Handle client transactions
+                                if let Some(client) = state.tx_to_client.remove(&tx) {
+                                    cli_response_sender
+                                        .send((client, Err(ErrorKind::FailedOperation.into())))?;
+                                }
+                                
+                                // Also check for connection attempts with this transaction
+                                let mut addr_to_cleanup = None;
+                                for (addr, conn_tx) in &state.connection_tx {
+                                    if conn_tx == &tx {
+                                        addr_to_cleanup = Some(*addr);
+                                        break;
+                                    }
+                                }
+                                
+                                if let Some(addr) = addr_to_cleanup {
+                                    tracing::debug!("Transaction {} timed out for connection to {}", tx, addr);
+                                    let _ = Self::cleanup_awaiting_connection(
+                                        addr,
+                                        &mut state,
+                                        HandshakeError::ConnectionClosed(addr)
+                                    ).await;
+                                }
                             }
                             NodeEvent::Disconnect { cause } => {
                                 tracing::info!(
@@ -516,6 +541,21 @@ impl P2pConnManager {
         );
     }
 
+    /// Helper to cleanup and notify a pending connection callback
+    async fn cleanup_awaiting_connection(
+        addr: SocketAddr,
+        state: &mut EventListenerState,
+        error: HandshakeError,
+    ) -> Result<(), HandshakeError> {
+        // Remove the transaction tracking
+        state.connection_tx.remove(&addr);
+        
+        if let Some(mut callback) = state.awaiting_connection.remove(&addr) {
+            callback.send_result(Err(error)).await?;
+        }
+        Ok(())
+    }
+
     async fn handle_connect_peer(
         &mut self,
         peer: PeerId,
@@ -539,24 +579,65 @@ impl P2pConnManager {
             }
             tracing::debug!(tx = %tx, "Blocked addresses: {:?}, peer addr: {}", blocked_addrs, peer.addr);
         }
+        
+        // Check if already connected
+        if self.connections.contains_key(&peer) {
+            tracing::info!(tx = %tx, remote = %peer, "Already connected to peer");
+            callback
+                .send_result(Err(HandshakeError::ConnectionError(
+                    crate::node::network_bridge::ConnectionError::AlreadyConnected,
+                )))
+                .await?;
+            return Ok(());
+        }
+        
+        // Check if connection attempt already in progress
+        if state.awaiting_connection.contains_key(&peer.addr) {
+            tracing::info!(tx = %tx, remote = %peer, "Connection attempt already in progress");
+            callback
+                .send_result(Err(HandshakeError::ConnectionError(
+                    crate::node::network_bridge::ConnectionError::ConnectionInProgress,
+                )))
+                .await?;
+            return Ok(());
+        }
+        
         state.awaiting_connection.insert(peer.addr, callback);
+        state.connection_tx.insert(peer.addr, tx);
         let res = timeout(
             Duration::from_secs(10),
             handshake_handler_msg.establish_conn(peer.clone(), tx, is_gw),
         )
-        .await
-        .inspect_err(|error| {
-            tracing::error!(tx = %tx, "Failed to establish connection: {:?}", error);
-        })?;
+        .await;
+        
         match res {
-            Ok(()) => {
+            Ok(Ok(())) => {
                 tracing::debug!(tx = %tx,
                     "Successfully initiated connection process for peer: {:?}",
                     peer
                 );
                 Ok(())
             }
-            Err(e) => Err(anyhow::Error::msg(e)),
+            Ok(Err(e)) => {
+                tracing::error!(tx = %tx, "Failed to establish connection: {:?}", e);
+                // Cleanup the callback on error
+                Self::cleanup_awaiting_connection(
+                    peer.addr,
+                    state,
+                    HandshakeError::ChannelClosed
+                ).await?;
+                Err(anyhow::Error::msg(e))
+            }
+            Err(_timeout) => {
+                tracing::error!(tx = %tx, "Timeout establishing connection to {:?}", peer);
+                // Cleanup the callback on timeout
+                Self::cleanup_awaiting_connection(
+                    peer.addr,
+                    state,
+                    HandshakeError::ConnectionClosed(peer.addr)
+                ).await?;
+                Err(anyhow::Error::msg("Timeout establishing connection"))
+            }
         }
     }
 
@@ -713,6 +794,9 @@ impl P2pConnManager {
         state: &mut EventListenerState,
         remaining_checks: Option<usize>,
     ) -> anyhow::Result<()> {
+        // Clean up the transaction tracking
+        state.connection_tx.remove(&peer_id.addr);
+        
         if let Some(mut cb) = state.awaiting_connection.remove(&peer_id.addr) {
             let peer_id = if let Some(peer_id) = self
                 .bridge
@@ -823,6 +907,13 @@ impl P2pConnManager {
             }
             Some(Err(err)) => {
                 if let TransportError::ConnectionClosed(socket_addr) = err {
+                    // First cleanup any pending connection attempts for this address
+                    let _ = Self::cleanup_awaiting_connection(
+                        socket_addr,
+                        state,
+                        HandshakeError::ConnectionClosed(socket_addr)
+                    ).await;
+                    
                     if let Some(peer) = self
                         .connections
                         .keys()
@@ -987,6 +1078,8 @@ struct EventListenerState {
     client_waiting_transaction: Vec<(WaitingTransaction, HashSet<ClientId>)>,
     transient_conn: HashMap<Transaction, SocketAddr>,
     awaiting_connection: HashMap<SocketAddr, Box<dyn ConnectResultSender>>,
+    // Track transaction ID for each connection attempt
+    connection_tx: HashMap<SocketAddr, Transaction>,
     pending_op_results: HashMap<Transaction, Sender<NetMessage>>,
 }
 
@@ -999,6 +1092,7 @@ impl EventListenerState {
             client_waiting_transaction: Vec::new(),
             transient_conn: HashMap::new(),
             awaiting_connection: HashMap::new(),
+            connection_tx: HashMap::new(),
             pending_op_results: HashMap::new(),
         }
     }
