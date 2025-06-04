@@ -900,7 +900,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
     let mut regular_node_addresses = Vec::with_capacity(NUM_REGULAR_NODES);
 
     // First, bind all sockets to get addresses for later blocking
-    for i in 0..NUM_REGULAR_NODES {
+    for _i in 0..NUM_REGULAR_NODES {
         let socket = TcpListener::bind("127.0.0.1:0")?;
         // Store the address for later use in blocked_addresses
         regular_node_addresses.push(socket.local_addr()?);
@@ -954,7 +954,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
     let mut node_configs = Vec::with_capacity(NUM_REGULAR_NODES);
     let mut node_presets = Vec::with_capacity(NUM_REGULAR_NODES);
 
-    for i in 0..NUM_REGULAR_NODES {
+    for (i, _) in ws_api_node_sockets.iter().enumerate() {
         // Determine which other regular nodes this node should block
         let mut blocked_addresses = Vec::new();
         for (j, &addr) in regular_node_addresses.iter().enumerate() {
@@ -1006,8 +1006,8 @@ async fn test_ping_partially_connected_network() -> TestResult {
     std::mem::drop(ws_api_node_sockets);
 
     // Start all gateway nodes
-    let mut gateway_futures = FuturesUnordered::new();
-    for (_i, config) in gateway_configs.into_iter().enumerate() {
+    let gateway_futures = FuturesUnordered::new();
+    for config in gateway_configs.into_iter() {
         let gateway_future = async move {
             let config = config.build().await?;
             let node = NodeConfig::new(config.clone())
@@ -1021,8 +1021,8 @@ async fn test_ping_partially_connected_network() -> TestResult {
     }
 
     // Start all regular nodes
-    let mut regular_node_futures = FuturesUnordered::new();
-    for (_i, config) in node_configs.into_iter().enumerate() {
+    let regular_node_futures = FuturesUnordered::new();
+    for config in node_configs.into_iter() {
         let regular_node_future = async move {
             let config = config.build().await?;
             let node = NodeConfig::new(config.clone())
@@ -1107,7 +1107,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         let serialized = serde_json::to_vec(&ping)?;
         let wrapped_state = WrappedState::new(serialized);
 
-        let mut publisher = &mut node_clients[publisher_idx];
+        let publisher = &mut node_clients[publisher_idx];
         publisher
             .send(ClientRequest::ContractOp(ContractRequest::Put {
                 contract: container.clone(),

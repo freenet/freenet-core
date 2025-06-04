@@ -405,6 +405,7 @@ async fn test_concurrent_gets(
     let mut max_time = Duration::from_secs(0);
 
     // Sequential GET requests (simpler than concurrent)
+    #[allow(clippy::needless_range_loop)]
     for i in 0..concurrent_requests {
         let request_start = std::time::Instant::now();
         let get_request = ClientRequest::ContractOp(ContractRequest::Get {
@@ -491,6 +492,7 @@ async fn test_mass_subscription(
     let start_time = std::time::Instant::now();
 
     // Subscribe from multiple nodes
+    #[allow(clippy::needless_range_loop)]
     for i in 0..subscribers {
         let subscribe_request = ClientRequest::ContractOp(ContractRequest::Subscribe {
             key: *contract_key,
@@ -575,7 +577,7 @@ async fn test_update_propagation(
 
     // Send update from node 0
     let update_request = ClientRequest::ContractOp(ContractRequest::Update {
-        key: contract_key.clone(),
+        key: *contract_key,
         data: freenet_stdlib::prelude::UpdateData::State(updated_state.clone().into()),
     });
 
@@ -618,6 +620,7 @@ async fn test_update_propagation(
     // Give some time for update to propagate
     tokio::time::sleep(Duration::from_secs(10)).await;
 
+    #[allow(clippy::needless_range_loop)]
     for i in 1..=verification_nodes {
         let get_request = ClientRequest::ContractOp(ContractRequest::Get {
             key: *contract_key,
