@@ -126,6 +126,7 @@ pub(super) enum ExternConnection {
     Dropped {
         peer: PeerId,
     },
+    #[allow(dead_code)]
     DropConnectionByAddr(SocketAddr),
 }
 
@@ -153,6 +154,7 @@ impl HanshakeHandlerMsg {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn drop_connection_by_addr(&self, remote_addr: SocketAddr) -> Result<()> {
         self.0
             .send(ExternConnection::DropConnectionByAddr(remote_addr))
@@ -227,8 +229,8 @@ impl HandshakeHandler {
         router: Arc<RwLock<Router>>,
         this_location: Option<Location>,
     ) -> (Self, HanshakeHandlerMsg, OutboundMessage) {
-        let (pending_msg_tx, pending_msg_rx) = tokio::sync::mpsc::channel(1);
-        let (establish_connection_tx, establish_connection_rx) = tokio::sync::mpsc::channel(1);
+        let (pending_msg_tx, pending_msg_rx) = tokio::sync::mpsc::channel(100);
+        let (establish_connection_tx, establish_connection_rx) = tokio::sync::mpsc::channel(100);
         let connector = HandshakeHandler {
             connecting: HashMap::new(),
             connected: HashSet::new(),
@@ -629,7 +631,7 @@ impl HandshakeHandler {
 
     /// Tracks a new inbound connection and sets up message handling for it.
     fn track_inbound_connection(&mut self, conn: PeerConnection) {
-        let (outbound_msg_sender, outbound_msg_recv) = mpsc::channel(1);
+        let (outbound_msg_sender, outbound_msg_recv) = mpsc::channel(100);
         let remote = conn.remote_addr();
         let f = gw_peer_connection_listener(conn, PeerOutboundMessage(outbound_msg_recv)).boxed();
         self.unconfirmed_inbound_connections.push(f);

@@ -1,0 +1,1 @@
+- contract states are commutative monoids, they can be "merged" in any order to arrive at the same result. This may reduce some potential race conditions.

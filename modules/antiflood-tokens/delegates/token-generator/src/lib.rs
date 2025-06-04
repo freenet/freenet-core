@@ -221,7 +221,7 @@ impl TryFrom<&Context> for DelegateContext {
 }
 
 /// This is used internally by the delegate to allocate new tokens on behave of the requesting client app.
-///  
+///
 /// Conflicting assignments for the same time slot are not permitted and indicate that the generator is broken or malicious.
 trait TokenAssignmentInternal {
     fn assign(

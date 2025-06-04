@@ -14,7 +14,7 @@ use freenet_stdlib::{
 };
 use serde::{Deserialize, Serialize};
 
-const TARGET_DIR_VAR: &str = "CARGO_TARGET_DIR";
+use crate::util::workspace::get_workspace_target_dir;
 
 pub fn with_tracing<T>(f: impl FnOnce() -> T) -> T {
     let subscriber = tracing_subscriber::fmt()
@@ -109,9 +109,11 @@ fn compile_contract(name: &str) -> anyhow::Result<Vec<u8>> {
     };
 
     println!("module path: {contract_path:?}");
-    let target = std::env::var(TARGET_DIR_VAR)
-        .map_err(|_| anyhow::anyhow!("CARGO_TARGET_DIR should be set"))?;
-    println!("trying to compile the test contract, target: {target}");
+    let target = get_workspace_target_dir();
+    println!(
+        "trying to compile the test contract, target: {}",
+        target.display()
+    );
 
     compile_rust_wasm_lib(
         &BuildToolConfig {
@@ -122,7 +124,7 @@ fn compile_contract(name: &str) -> anyhow::Result<Vec<u8>> {
         &contract_path,
     )?;
 
-    let output_file = Path::new(&target)
+    let output_file = target
         .join(WASM_TARGET)
         .join("debug")
         .join(name.replace('-', "_"))
@@ -147,9 +149,11 @@ fn compile_delegate(name: &str) -> anyhow::Result<Vec<u8>> {
         ));
     }
 
-    let target = std::env::var(TARGET_DIR_VAR)
-        .map_err(|_| anyhow::anyhow!("CARGO_TARGET_DIR should be set"))?;
-    println!("trying to compile the test delegate, target: {target}");
+    let target = get_workspace_target_dir();
+    println!(
+        "trying to compile the test delegate, target: {}",
+        target.display()
+    );
 
     compile_rust_wasm_lib(
         &BuildToolConfig {
@@ -160,7 +164,7 @@ fn compile_delegate(name: &str) -> anyhow::Result<Vec<u8>> {
         &delegate_path,
     )?;
 
-    let output_file = Path::new(&target)
+    let output_file = target
         .join(WASM_TARGET)
         .join("release")
         .join(name.replace('-', "_"))
@@ -228,7 +232,14 @@ fn compile_rust_wasm_lib(cli_config: &BuildToolConfig, work_dir: &Path) -> anyho
 
     let package_type = cli_config.package_type;
     println!("Compiling {package_type} with rust");
-    let child = Command::new("cargo")
+
+    // Set CARGO_TARGET_DIR if not already set to ensure consistent output location
+    let mut command = Command::new("cargo");
+    if std::env::var("CARGO_TARGET_DIR").is_err() {
+        command.env("CARGO_TARGET_DIR", get_workspace_target_dir());
+    }
+
+    let child = command
         .args(&cmd_args)
         .current_dir(work_dir)
         .stdout(Stdio::piped())

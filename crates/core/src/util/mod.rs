@@ -1,4 +1,5 @@
 pub(crate) mod time_source;
+pub(crate) mod workspace;
 
 use std::{
     borrow::Borrow,
@@ -15,7 +16,20 @@ use rand::{
     SeedableRng,
 };
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static CLEANUP_HANDLER_SET: AtomicBool = AtomicBool::new(false);
+
 pub fn set_cleanup_on_exit(config: Arc<ConfigPaths>) -> Result<(), ctrlc::Error> {
+    // Only set the handler once per process
+    if CLEANUP_HANDLER_SET
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        // Handler already set, skip
+        return Ok(());
+    }
+
     ctrlc::set_handler(move || {
         tracing::info!("Received Ctrl+C. Cleaning up...");
 

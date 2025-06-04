@@ -13,7 +13,7 @@ use tar::Builder;
 
 use crate::{
     config::{BuildToolConfig, PackageType},
-    util::pipe_std_streams,
+    util::{get_workspace_target_dir, pipe_std_streams},
     Error,
 };
 pub(crate) use contract::*;
@@ -103,7 +103,14 @@ fn compile_rust_wasm_lib(cli_config: &BuildToolConfig, work_dir: &Path) -> anyho
 
     let package_type = cli_config.package_type;
     println!("Compiling {package_type} with rust");
-    let child = Command::new("cargo")
+
+    // Set CARGO_TARGET_DIR if not already set to ensure consistent output location
+    let mut command = Command::new("cargo");
+    if env::var("CARGO_TARGET_DIR").is_err() {
+        command.env("CARGO_TARGET_DIR", get_workspace_target_dir());
+    }
+
+    let child = command
         .args(&cmd_args)
         .current_dir(work_dir)
         .stdout(Stdio::piped())
@@ -143,18 +150,8 @@ fn get_out_lib(work_dir: &Path, cli_config: &BuildToolConfig) -> anyhow::Result<
         "debug"
     };
     let output_lib = env::var("CARGO_TARGET_DIR")
-        .unwrap_or_else(|_| {
-            // For tests, use a temporary directory if CARGO_TARGET_DIR is not set
-            if cfg!(test) {
-                env::temp_dir()
-                    .join("cargo_target")
-                    .to_string_lossy()
-                    .to_string()
-            } else {
-                panic!("Missing environment variable CARGO_TARGET_DIR")
-            }
-        })
-        .parse::<PathBuf>()?
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| get_workspace_target_dir())
         .join(target)
         .join(opt_dir)
         .join(&package_name)
@@ -656,7 +653,6 @@ mod contract {
 
         #[test]
         fn compile_webapp_contract() -> anyhow::Result<()> {
-            //
             let (config, cwd) = setup_webapp_contract()?;
             compile_contract(&config, &BuildToolConfig::default(), &cwd)?;
             Ok(())

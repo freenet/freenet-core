@@ -1272,7 +1272,7 @@ dependencies = [
  "directories",
  "either",
  "flatbuffers",
- "freenet-stdlib 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "freenet-stdlib",
  "futures",
  "headers",
  "hickory-resolver",
@@ -1315,17 +1315,6 @@ dependencies = [
 
 [[package]]
 name = "freenet-macros"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c21b0e54ae3e7c5c9b9c845bd9eb4df94d24c94c0c5815ce5aa097492b984259"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.101",
-]
-
-[[package]]
-name = "freenet-macros"
 version = "0.1.2"
 dependencies = [
  "proc-macro2",
@@ -1342,13 +1331,14 @@ dependencies = [
  "clap",
  "freenet",
  "freenet-ping-types",
- "freenet-stdlib 0.1.5",
+ "freenet-stdlib",
  "futures",
  "humantime",
  "once_cell",
  "rand 0.8.5",
  "serde",
  "serde_json",
+ "socket2",
  "tempfile",
  "testresult",
  "tokio",
@@ -1362,7 +1352,7 @@ name = "freenet-ping-contract"
 version = "0.1.0"
 dependencies = [
  "freenet-ping-types",
- "freenet-stdlib 0.1.5",
+ "freenet-stdlib",
  "serde_json",
 ]
 
@@ -1372,7 +1362,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
- "freenet-stdlib 0.1.5",
+ "freenet-stdlib",
  "humantime",
  "humantime-serde",
  "serde",
@@ -1388,38 +1378,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "flatbuffers",
- "freenet-macros 0.1.2",
- "futures",
- "js-sys",
- "once_cell",
- "semver",
- "serde",
- "serde-wasm-bindgen 0.6.5",
- "serde_bytes",
- "serde_json",
- "serde_with",
- "thiserror 1.0.69",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "tracing",
- "tracing-subscriber",
- "wasm-bindgen",
- "web-sys",
-]
-
-[[package]]
-name = "freenet-stdlib"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1637f0e80197acbabcc12cf366b6322fbbf9b695de68659af6ba01a1d3dac642"
-dependencies = [
- "bincode",
- "blake3",
- "bs58",
- "byteorder",
- "chrono",
- "flatbuffers",
- "freenet-macros 0.1.1",
+ "freenet-macros",
  "futures",
  "js-sys",
  "once_cell",

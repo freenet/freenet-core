@@ -185,34 +185,57 @@ impl Router {
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
         target_location: Location,
     ) -> Option<&'a PeerKeyLocation> {
+        self.select_k_best_peers(peers, target_location, 1)
+            .into_iter()
+            .next()
+    }
+
+    /// Select up to k best peers for routing, ranked by predicted performance.
+    /// Returns peers ordered from best to worst predicted performance.
+    pub fn select_k_best_peers<'a>(
+        &self,
+        peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
+        target_location: Location,
+        k: usize,
+    ) -> Vec<&'a PeerKeyLocation> {
+        if k == 0 {
+            return Vec::new();
+        }
+
         if !self.has_sufficient_historical_data() {
-            // Find the peer with the minimum distance to the contract location,
-            // ignoring peers with no location
-            peers
+            // Sort peers by distance to the contract location
+            let mut peer_distances: Vec<_> = peers
                 .into_iter()
                 .filter_map(|peer| {
                     peer.location
                         .map(|loc| (peer, target_location.distance(loc)))
                 })
-                .min_by_key(|&(_, distance)| distance)
-                .map(|(peer, _)| peer)
+                .collect();
+
+            peer_distances.sort_by_key(|&(_, distance)| distance);
+            peer_distances.truncate(k);
+            peer_distances.into_iter().map(|(peer, _)| peer).collect()
         } else {
-            // Find the peer with the minimum predicted routing outcome time
-            self.select_closest_peers(peers, &target_location)
+            // Get closest peers and rank by predicted routing outcome time
+            let mut candidates: Vec<_> = self
+                .select_closest_peers(peers, &target_location)
                 .into_iter()
-                .map(|peer: &PeerKeyLocation| {
-                    let t = self.predict_routing_outcome(peer, target_location).expect(
-                        "Should always be Ok when has_sufficient_historical_data() is true",
-                    );
-                    (peer, t.time_to_response_start)
+                .filter_map(|peer| {
+                    self.predict_routing_outcome(peer, target_location)
+                        .ok()
+                        .map(|t| (peer, t.time_to_response_start))
                 })
-                // Required because f64 doesn't implement Ord
-                .min_by(|&(_, time1), &(_, time2)| {
-                    time1
-                        .partial_cmp(&time2)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|(peer, _)| peer)
+                .collect();
+
+            // Sort by predicted response time
+            candidates.sort_by(|&(_, time1), &(_, time2)| {
+                time1
+                    .partial_cmp(&time2)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            candidates.truncate(k);
+            candidates.into_iter().map(|(peer, _)| peer).collect()
         }
     }
 

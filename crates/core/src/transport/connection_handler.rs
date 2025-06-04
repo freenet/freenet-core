@@ -301,7 +301,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     outdated_peer.remove(&remote_addr);
                                 }
                             }
-                            let packet_data = PacketData::from_buf(&buf[..size]);
+                            let mut packet_data = PacketData::from_buf(&buf[..size]);
 
                             tracing::trace!(
                                 %remote_addr,
@@ -313,33 +313,51 @@ impl<S: Socket> UdpPacketsListener<S> {
                             );
 
                             if let Some(remote_conn) = self.remote_connections.remove(&remote_addr) {
-                                if remote_conn.inbound_packet_sender.send(packet_data)
-                                    .await
-                                    .inspect_err(|err| {
+                                match remote_conn.inbound_packet_sender.try_send(packet_data) {
+                                    Ok(_) => {
+                                        self.remote_connections.insert(remote_addr, remote_conn);
+                                        continue;
+                                    }
+                                    Err(mpsc::error::TrySendError::Full(packet)) => {
+                                        // Channel full, reinsert connection and restore packet_data
+                                        self.remote_connections.insert(remote_addr, remote_conn);
+                                        tracing::debug!(%remote_addr, "inbound packet channel full, will try other connections");
+                                        packet_data = packet;
+                                        // Fall through to try other connection types
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        // Channel closed, connection is dead
                                         tracing::warn!(
                                             %remote_addr,
-                                            %err,
-                                            "failed to receive packet from remote, connection closed"
+                                            "connection closed, removing from active connections"
                                         );
-                                    })
-                                    .is_ok()
-                                {
-                                    self.remote_connections.insert(remote_addr, remote_conn);
+                                        // Don't reinsert - connection is truly dead
+                                        continue;
+                                    }
                                 }
-                                continue;
                             }
 
-                            if let Some(inbound_packet_sender) = ongoing_gw_connections.remove(&remote_addr) {
-                                if inbound_packet_sender.send(packet_data).await.inspect_err(|err| {
-                                    tracing::warn!(
-                                        %remote_addr,
-                                        %err,
-                                        "failed to receive packet from remote, connection closed"
-                                    );
-                                }).is_ok() {
-                                    ongoing_gw_connections.insert(remote_addr, inbound_packet_sender);
+                            if let Some(inbound_packet_sender) = ongoing_gw_connections.get(&remote_addr) {
+                                match inbound_packet_sender.try_send(packet_data) {
+                                    Ok(_) => continue,
+                                    Err(mpsc::error::TrySendError::Full(packet)) => {
+                                        // Channel full, restore packet_data for next attempt
+                                        packet_data = packet;
+                                        tracing::debug!(
+                                            %remote_addr,
+                                            "ongoing gateway connection channel full, will try other connections"
+                                        );
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(packet)) => {
+                                        // Channel closed, remove the connection and restore packet_data
+                                        ongoing_gw_connections.remove(&remote_addr);
+                                        packet_data = packet;
+                                        tracing::debug!(
+                                            %remote_addr,
+                                            "ongoing gateway connection channel closed, removing"
+                                        );
+                                    }
                                 }
-                                continue;
                             }
 
                             if let Some((packets_sender, open_connection)) = ongoing_connections.remove(&remote_addr) {
@@ -361,6 +379,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     %size,
                                     "unexpected packet from non-gateway node"
                                 );
+                                continue;
+                            }
+
+                            // Check if we already have a gateway connection in progress
+                            if ongoing_gw_connections.contains_key(&remote_addr) {
+                                tracing::debug!(%remote_addr, "gateway connection already in progress, ignoring duplicate packet");
                                 continue;
                             }
 
@@ -453,10 +477,33 @@ impl<S: Socket> UdpPacketsListener<S> {
                         return Ok(());
                     };
                     tracing::debug!(%remote_addr, "received connection event");
-                    if let Some(_conn) = self.remote_connections.remove(&remote_addr) {
-                        tracing::warn!(%remote_addr, "connection already established, dropping old connection");
-                    }
                     let ConnectionEvent::ConnectionStart { remote_public_key, open_connection } = event;
+
+                    // Check if we already have an active connection
+                    if let Some(existing_conn) = self.remote_connections.get(&remote_addr) {
+                        // Check if the existing connection is still alive
+                        if existing_conn.inbound_packet_sender.is_closed() {
+                            // Connection is dead, remove it
+                            self.remote_connections.remove(&remote_addr);
+                            tracing::warn!(%remote_addr, "removing closed connection");
+                        } else {
+                            // Connection is still alive, reject new connection attempt
+                            tracing::debug!(%remote_addr, "connection already established and healthy, rejecting new attempt");
+                            let _ = open_connection.send(Err(TransportError::ConnectionEstablishmentFailure {
+                                cause: "connection already exists".into(),
+                            }));
+                            continue;
+                        }
+                    }
+
+                    // Also check if a connection attempt is already in progress
+                    if ongoing_connections.contains_key(&remote_addr) {
+                        tracing::debug!(%remote_addr, "connection attempt already in progress, rejecting duplicate");
+                        let _ = open_connection.send(Err(TransportError::ConnectionEstablishmentFailure {
+                            cause: "connection attempt already in progress".into(),
+                        }));
+                        continue;
+                    }
                     tracing::debug!(%remote_addr, "attempting to establish connection");
                     let (ongoing_connection, packets_sender) = self.traverse_nat(
                         remote_addr,  remote_public_key,
@@ -486,7 +533,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         let outbound_packets = self.outbound_packets.clone();
 
         let (inbound_from_remote, mut next_inbound) =
-            mpsc::channel::<PacketData<UnknownEncryption>>(1);
+            mpsc::channel::<PacketData<UnknownEncryption>>(100);
         let f = async move {
             let decrypted_intro_packet =
                 secret.decrypt(remote_intro_packet.data()).map_err(|err| {
@@ -649,7 +696,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         let outbound_packets = self.outbound_packets.clone();
         let transport_secret_key = self.this_peer_keypair.secret.clone();
         let (inbound_from_remote, mut next_inbound) =
-            mpsc::channel::<PacketData<UnknownEncryption>>(1);
+            mpsc::channel::<PacketData<UnknownEncryption>>(100);
         let this_addr = self.this_addr;
         let f = async move {
             let mut state = ConnectionState::StartOutbound {};
@@ -818,7 +865,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     continue;
                                 }
                                 // if is not an intro packet, the connection is successful and we can proceed
-                                let (inbound_sender, inbound_recv) = mpsc::channel(1);
+                                let (inbound_sender, inbound_recv) = mpsc::channel(100);
                                 return Ok((
                                     RemoteConnection {
                                         outbound_packets: outbound_packets.clone(),
@@ -1342,7 +1389,7 @@ mod test {
                                 _ = to.tick() => {
                                     return Err::<_, anyhow::Error>(
                                         anyhow::anyhow!(
-                                            "timeout waiting for messages, total time: {time:.2}; done iters {iter}", 
+                                            "timeout waiting for messages, total time: {time:.2}; done iters {iter}",
                                             time = start.elapsed().as_secs_f64(),
                                             iter = messages.len()
                                         )

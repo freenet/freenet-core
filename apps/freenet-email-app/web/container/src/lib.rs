@@ -13,7 +13,7 @@ impl ContractInterface for Contract {
     ) -> Result<ValidateResult, ContractError> {
         Ok(ValidateResult::Valid)
     }
-    
+
     fn update_state(
         _parameters: Parameters<'static>,
         state: State<'static>,
