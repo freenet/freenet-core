@@ -33,6 +33,7 @@ aider.conf.yaml
 CLAUDE.md
 **/CLAUDE.md
 CI_STATUS.md
+claude_notes/
 
 # Temporary test outputs and logs
 *.log
