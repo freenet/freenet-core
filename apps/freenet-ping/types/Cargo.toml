@@ -18,4 +18,4 @@ serde = { version = "1", features = ["derive"] }
 chrono = { workspace = true, features = ["serde"] }
 clap = { version = "4", features = ["derive"], optional = true }
 
-freenet-stdlib.workspace = true
+freenet-stdlib = { workspace = true }
