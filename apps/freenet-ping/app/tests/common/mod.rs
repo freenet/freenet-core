@@ -68,6 +68,29 @@ pub async fn base_node_test_config(
     base_tmp_dir: Option<&Path>,
     blocked_addresses: Option<Vec<SocketAddr>>,
 ) -> Result<(ConfigArgs, PresetConfig)> {
+    base_node_test_config_with_rng(
+        is_gateway,
+        gateways,
+        public_port,
+        ws_api_port,
+        data_dir_suffix,
+        base_tmp_dir,
+        blocked_addresses,
+        &mut *RNG.lock().unwrap(),
+    ).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn base_node_test_config_with_rng(
+    is_gateway: bool,
+    gateways: Vec<String>,
+    public_port: Option<u16>,
+    ws_api_port: u16,
+    data_dir_suffix: &str,
+    base_tmp_dir: Option<&Path>,
+    blocked_addresses: Option<Vec<SocketAddr>>,
+    rng: &mut rand::rngs::StdRng,
+) -> Result<(ConfigArgs, PresetConfig)> {
     if is_gateway {
         assert!(public_port.is_some());
     }
@@ -78,7 +101,7 @@ pub async fn base_node_test_config(
         tempfile::Builder::new().prefix(data_dir_suffix).tempdir()?
     };
 
-    let key = TransportKeypair::new_with_rng(&mut *RNG.lock().unwrap());
+    let key = TransportKeypair::new_with_rng(rng);
     let transport_keypair = temp_dir.path().join("private.pem");
     key.save(&transport_keypair)?;
     key.public().save(temp_dir.path().join("public.pem"))?;
@@ -94,7 +117,7 @@ pub async fn base_node_test_config(
             is_gateway,
             skip_load_from_network: true,
             gateways: Some(gateways),
-            location: Some(RNG.lock().unwrap().gen()),
+            location: Some(rng.gen()),
             ignore_protocol_checking: true,
             address: Some(Ipv4Addr::LOCALHOST.into()),
             network_port: public_port, // if None, node will pick a free one or use default
@@ -115,9 +138,13 @@ pub async fn base_node_test_config(
 }
 
 pub fn gw_config_from_path(port: u16, path: &Path) -> Result<InlineGwConfig> {
+    gw_config_from_path_with_rng(port, path, &mut *RNG.lock().unwrap())
+}
+
+pub fn gw_config_from_path_with_rng(port: u16, path: &Path, rng: &mut rand::rngs::StdRng) -> Result<InlineGwConfig> {
     Ok(InlineGwConfig {
         address: (Ipv4Addr::LOCALHOST, port).into(),
-        location: Some(RNG.lock().unwrap().gen()),
+        location: Some(rng.gen()),
         public_key_path: path.join("public.pem"),
     })
 }
