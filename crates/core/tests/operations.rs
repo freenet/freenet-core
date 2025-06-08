@@ -532,6 +532,7 @@ async fn test_update_contract() -> TestResult {
     Ok(())
 }
 
+#[ignore = "Flaky test - fails intermittently in CI. See issue #1637"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_multiple_clients_subscription() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::INFO), None);

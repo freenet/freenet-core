@@ -26,8 +26,6 @@ jobs:
           access_token: ${{ github.token }}
 
       - uses: actions/checkout@v4
-        with:
-          submodules: true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -40,9 +38,6 @@ jobs:
           shared-key: "rust-cache"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install stdlib packages
-        working-directory: stdlib/typescript
-        run: npm run dev.package
 
       - name: Build
         run: |
@@ -70,8 +65,6 @@ jobs:
           access_token: ${{ github.token }}
 
       - uses: actions/checkout@v4
-        with:
-          submodules: true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -100,8 +93,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
 
       - uses: dtolnay/rust-toolchain@stable
         with:

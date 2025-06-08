@@ -1,3 +1,0 @@
-[submodule "stdlib"]
-	path = stdlib
-	url = https://github.com/freenet/freenet-stdlib.git
