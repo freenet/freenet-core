@@ -1444,7 +1444,7 @@ dependencies = [
  "dashmap",
  "either",
  "freenet",
- "freenet-stdlib 0.1.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "freenet-stdlib",
  "futures 0.3.31",
  "glob",
  "http 1.3.1",
@@ -1573,7 +1573,7 @@ dependencies = [
  "directories",
  "either",
  "flatbuffers",
- "freenet-stdlib 0.1.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "freenet-stdlib",
  "futures 0.3.31",
  "headers",
  "hickory-resolver",
@@ -1637,15 +1637,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "freenet-macros"
-version = "0.1.2"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.101",
-]
-
-[[package]]
 name = "freenet-ping-app"
 version = "0.1.0"
 dependencies = [
@@ -1654,7 +1645,7 @@ dependencies = [
  "clap",
  "freenet",
  "freenet-ping-types",
- "freenet-stdlib 0.1.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "freenet-stdlib",
  "futures 0.3.31",
  "humantime",
  "once_cell",
@@ -1674,7 +1665,7 @@ name = "freenet-ping-contract"
 version = "0.1.0"
 dependencies = [
  "freenet-ping-types",
- "freenet-stdlib 0.1.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "freenet-stdlib",
  "serde_json",
 ]
 
@@ -1684,42 +1675,10 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
- "freenet-stdlib 0.1.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "freenet-stdlib",
  "humantime",
  "humantime-serde",
  "serde",
-]
-
-[[package]]
-name = "freenet-stdlib"
-version = "0.1.6"
-dependencies = [
- "arbitrary",
- "bincode",
- "blake3",
- "bs58",
- "byteorder",
- "chrono",
- "flatbuffers",
- "freenet-macros 0.1.2",
- "futures 0.3.31",
- "js-sys",
- "once_cell",
- "rand 0.8.5",
- "semver",
- "serde",
- "serde-wasm-bindgen 0.6.5",
- "serde_bytes",
- "serde_json",
- "serde_with",
- "thiserror 1.0.69",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "tracing",
- "tracing-subscriber",
- "wasm-bindgen",
- "wasmer",
- "web-sys",
 ]
 
 [[package]]
@@ -1735,7 +1694,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "flatbuffers",
- "freenet-macros 0.1.1",
+ "freenet-macros",
  "futures 0.3.31",
  "js-sys",
  "once_cell",
@@ -5030,7 +4989,7 @@ dependencies = [
 name = "test-contract-integration"
 version = "0.1.0"
 dependencies = [
- "freenet-stdlib 0.1.6",
+ "freenet-stdlib",
  "serde",
  "serde_json",
 ]
