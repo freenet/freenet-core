@@ -37,6 +37,7 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
     let mut child = Command::new("cargo")
         .args(&cmd_args)
         .current_dir(&module_path)
+        .env("CARGO_TARGET_DIR", &target)
         .spawn()?;
     child.wait()?;
     let output_file = target
