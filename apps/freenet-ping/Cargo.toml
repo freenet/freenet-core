@@ -3,7 +3,7 @@ resolver = "2"
 members = ["contracts/ping", "app", "types"]
 
 [workspace.dependencies]
-freenet-stdlib = { workspace = true, features = ["contract"] }
+freenet-stdlib = { version = "0.1.6", features = ["contract"] }
 freenet-ping-types = { path = "types", default-features = false }
 chrono = { version = "0.4", default-features = false }
 testresult = "0.4"

@@ -7,7 +7,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-freenet-stdlib = { workspace = true, features = ["contract"] }
+freenet-stdlib = { workspace = true }
 freenet-ping-types = { path = "../../types", default-features = false }
 serde_json = "1"
 
