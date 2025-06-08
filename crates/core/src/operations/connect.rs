@@ -695,9 +695,9 @@ pub(crate) async fn initial_join_procedure(
             return;
         }
 
-        let mut connected = false;
         const WAIT_TIME: u64 = 1;
-        const CHECK_AGAIN_TIME: u64 = 15;
+        const LONG_WAIT_TIME: u64 = 30;
+        const BOOTSTRAP_THRESHOLD: usize = 4;
 
         tracing::info!(
             "Starting initial join procedure with {} gateways",
@@ -715,13 +715,15 @@ pub(crate) async fn initial_join_procedure(
                 unconnected_gateways.len()
             );
 
-            // Connect to gateways if we're not connected to all of them
+            // Only try to connect to gateways if we have fewer than BOOTSTRAP_THRESHOLD connections
+            // This prevents overloading gateways once peers have basic connectivity
             let unconnected_count = unconnected_gateways.len();
-            if unconnected_count > 0 {
-                connected = false;
+
+            if open_conns < BOOTSTRAP_THRESHOLD && unconnected_count > 0 {
                 tracing::info!(
-                    "Need to connect to {} gateways. Attempting to connect to {} in parallel",
-                    unconnected_count,
+                    "Below bootstrap threshold ({} < {}), attempting to connect to {} gateways",
+                    open_conns,
+                    BOOTSTRAP_THRESHOLD,
                     number_of_parallel_connections.min(unconnected_count)
                 );
                 let select_all = futures::stream::FuturesUnordered::new();
@@ -746,43 +748,39 @@ pub(crate) async fn initial_join_procedure(
                         }
                     }
                 }).await;
-            }
-
-            // Check if we're connected to at least one gateway
-            let connected_to_gateway = unconnected_count < gateways.len();
-
-            if !connected && connected_to_gateway {
-                connected = true;
-                let connected_gw_count = gateways.len() - unconnected_count;
-                tracing::info!(
-                    "Successfully connected to {}/{} gateways! Total connections: {}",
-                    connected_gw_count,
-                    gateways.len(),
-                    open_conns
-                );
-            }
-
-            if !connected {
-                tracing::debug!(
-                    "Not connected to any gateway yet, waiting {}s before retry",
-                    WAIT_TIME
-                );
-                tokio::time::sleep(Duration::from_secs(WAIT_TIME)).await;
-            } else if unconnected_count == 0 {
-                // Connected to all gateways, can wait longer
+            } else if open_conns >= BOOTSTRAP_THRESHOLD {
                 tracing::trace!(
-                    "Connected to all gateways, waiting {}s before next check",
-                    CHECK_AGAIN_TIME
+                    "Have {} connections (>= threshold of {}), not attempting gateway connections",
+                    open_conns,
+                    BOOTSTRAP_THRESHOLD
                 );
-                tokio::time::sleep(Duration::from_secs(CHECK_AGAIN_TIME)).await;
-            } else {
-                // Connected to some but not all gateways, check more frequently
+            }
+
+            // Determine wait time based on connection state
+            let wait_time = if open_conns == 0 {
+                // No connections at all - retry quickly
+                tracing::debug!("No connections yet, waiting {}s before retry", WAIT_TIME);
+                WAIT_TIME
+            } else if open_conns < BOOTSTRAP_THRESHOLD {
+                // Some connections but below threshold - moderate wait
                 tracing::debug!(
-                    "Connected to some gateways but not all, waiting {}s before retry",
+                    "Have {} connections (below threshold of {}), waiting {}s",
+                    open_conns,
+                    BOOTSTRAP_THRESHOLD,
                     WAIT_TIME * 3
                 );
-                tokio::time::sleep(Duration::from_secs(WAIT_TIME * 3)).await;
-            }
+                WAIT_TIME * 3
+            } else {
+                // Healthy connection pool - long wait
+                tracing::trace!(
+                    "Connection pool healthy ({} connections), waiting {}s",
+                    open_conns,
+                    LONG_WAIT_TIME
+                );
+                LONG_WAIT_TIME
+            };
+
+            tokio::time::sleep(Duration::from_secs(wait_time)).await;
         }
     });
     Ok(())
