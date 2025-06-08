@@ -3,6 +3,7 @@ mod common;
 use std::{net::TcpListener, path::PathBuf, time::Duration};
 
 use anyhow::anyhow;
+use rand::SeedableRng;
 use freenet::{local_node::NodeConfig, server::serve_gateway};
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
@@ -15,14 +16,13 @@ use tokio::{select, time::sleep, time::timeout};
 use tokio_tungstenite::connect_async;
 use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 
-use common::{base_node_test_config, gw_config_from_path, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT};
+use common::{base_node_test_config, base_node_test_config_with_rng, gw_config_from_path, gw_config_from_path_with_rng, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT};
 use freenet_ping_app::ping_client::{
     run_ping_client, wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
     PingStats,
 };
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "fix me"]
 async fn test_ping_multi_node() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
 
@@ -34,9 +34,16 @@ async fn test_ping_multi_node() -> TestResult {
     let ws_api_port_socket_node1 = TcpListener::bind("127.0.0.1:0")?;
     let ws_api_port_socket_node2 = TcpListener::bind("127.0.0.1:0")?;
 
+    // Configure gateway node with fixed seed for deterministic testing
+    let test_seed = *b"app_loop_test_seed_0123456789012";
+    let mut test_rng = rand::rngs::StdRng::from_seed(test_seed);
+    
+    tracing::info!("Using deterministic test seed: {:?}", test_seed);
+    tracing::info!("Test RNG initial state configured for deterministic network topology");
+    
     // Configure gateway node
     let (config_gw, preset_cfg_gw, config_gw_info) = {
-        let (cfg, preset) = base_node_test_config(
+        let (cfg, preset) = base_node_test_config_with_rng(
             true,
             vec![],
             Some(network_socket_gw.local_addr()?.port()),
@@ -44,16 +51,17 @@ async fn test_ping_multi_node() -> TestResult {
             "gw_multi_node", // data_dir_suffix
             None,            // base_tmp_dir
             None,            // blocked_addresses
+            &mut test_rng,
         )
         .await?;
         let public_port = cfg.network_api.public_port.unwrap();
         let path = preset.temp_dir.path().to_path_buf();
-        (cfg, preset, gw_config_from_path(public_port, &path)?)
+        (cfg, preset, gw_config_from_path_with_rng(public_port, &path, &mut test_rng)?)
     };
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
 
     // Configure client node 1
-    let (config_node1, preset_cfg_node1) = base_node_test_config(
+    let (config_node1, preset_cfg_node1) = base_node_test_config_with_rng(
         false,
         vec![serde_json::to_string(&config_gw_info)?],
         None,
@@ -61,12 +69,13 @@ async fn test_ping_multi_node() -> TestResult {
         "node1_multi_node", // data_dir_suffix
         None,               // base_tmp_dir
         None,               // blocked_addresses
+        &mut test_rng,
     )
     .await?;
     let ws_api_port_node1 = config_node1.ws_api.ws_api_port.unwrap();
 
     // Configure client node 2
-    let (config_node2, preset_cfg_node2) = base_node_test_config(
+    let (config_node2, preset_cfg_node2) = base_node_test_config_with_rng(
         false,
         vec![serde_json::to_string(&config_gw_info)?],
         None,
@@ -74,14 +83,53 @@ async fn test_ping_multi_node() -> TestResult {
         "node2_multi_node", // data_dir_suffix
         None,               // base_tmp_dir
         None,               // blocked_addresses
+        &mut test_rng,
     )
     .await?;
     let ws_api_port_node2 = config_node2.ws_api.ws_api_port.unwrap();
 
-    // Log data directories for debugging
+    // Log data directories and ring locations for debugging
     tracing::info!("Gateway node data dir: {:?}", preset_cfg_gw.temp_dir.path());
     tracing::info!("Node 1 data dir: {:?}", preset_cfg_node1.temp_dir.path());
     tracing::info!("Node 2 data dir: {:?}", preset_cfg_node2.temp_dir.path());
+    
+    // Log ring locations for network topology analysis
+    tracing::info!("=== RING TOPOLOGY ANALYSIS ===");
+    tracing::info!("Gateway location: {:?}", config_gw.network_api.location);
+    tracing::info!("Node 1 location: {:?}", config_node1.network_api.location);
+    tracing::info!("Node 2 location: {:?}", config_node2.network_api.location);
+    
+    // Calculate distances in the ring
+    if let (Some(gw_loc), Some(n1_loc), Some(n2_loc)) = (
+        config_gw.network_api.location,
+        config_node1.network_api.location,
+        config_node2.network_api.location,
+    ) {
+        let gw_to_n1_dist = (gw_loc - n1_loc).abs().min(1.0 - (gw_loc - n1_loc).abs());
+        let gw_to_n2_dist = (gw_loc - n2_loc).abs().min(1.0 - (gw_loc - n2_loc).abs());
+        let n1_to_n2_dist = (n1_loc - n2_loc).abs().min(1.0 - (n1_loc - n2_loc).abs());
+        
+        tracing::info!("Ring distances:");
+        tracing::info!("  Gateway ↔ Node1: {:.6}", gw_to_n1_dist);
+        tracing::info!("  Gateway ↔ Node2: {:.6}", gw_to_n2_dist);
+        tracing::info!("  Node1 ↔ Node2: {:.6}", n1_to_n2_dist);
+        
+        // Warn about potentially problematic distances
+        let max_distance_threshold = 0.4; // Arbitrary threshold for "far" nodes
+        if n1_to_n2_dist > max_distance_threshold {
+            tracing::warn!("Node1 and Node2 are far apart in the ring (distance: {:.6})", n1_to_n2_dist);
+            tracing::warn!("This may cause update propagation issues!");
+        }
+        
+        if gw_to_n1_dist > max_distance_threshold {
+            tracing::warn!("Gateway and Node1 are far apart (distance: {:.6})", gw_to_n1_dist);
+        }
+        
+        if gw_to_n2_dist > max_distance_threshold {
+            tracing::warn!("Gateway and Node2 are far apart (distance: {:.6})", gw_to_n2_dist);
+        }
+    }
+    tracing::info!("==============================");
 
     // Free ports so they don't fail on initialization
     std::mem::drop(network_socket_gw);
@@ -149,17 +197,22 @@ async fn test_ping_multi_node() -> TestResult {
         let mut client_node1 = WebApi::start(stream_node1);
         let mut client_node2 = WebApi::start(stream_node2);
 
-        // FIXME: this is error prone, rebuild the contract each time there are changes in the code
-        // (add a build.rs script to the contracts/ping crate)
+        // Load the ping contract
         let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
         tracing::info!(path=%path_to_code.display(), "loading contract code");
-        let code = std::fs::read(path_to_code)
-            .ok()
-            .ok_or_else(|| anyhow!("Failed to read contract code"))?;
-        let code_hash = CodeHash::from_code(&code);
-        tracing::info!(code_hash=%code_hash, "loaded contract code");
 
-        // Load the ping contrac
+        // First compile to get the code hash, then create proper options
+        let temp_options = PingContractOptions {
+            frequency: Duration::from_secs(5),
+            ttl: Duration::from_secs(30),
+            tag: APP_TAG.to_string(),
+            code_key: "".to_string(),
+        };
+        let temp_params = Parameters::from(serde_json::to_vec(&temp_options).unwrap());
+        let container = common::load_contract(&path_to_code, temp_params)?;
+        
+        // Now get the actual code hash and create proper options
+        let code_hash = CodeHash::from_code(container.data());
         let ping_options = PingContractOptions {
             frequency: Duration::from_secs(5),
             ttl: Duration::from_secs(30),
@@ -167,7 +220,7 @@ async fn test_ping_multi_node() -> TestResult {
             code_key: code_hash.to_string(),
         };
         let params = Parameters::from(serde_json::to_vec(&ping_options).unwrap());
-        let container = ContractContainer::try_from((code, &params))?;
+        let container = common::load_contract(&path_to_code, params)?;
         let contract_key = container.key();
 
         // Step 1: Gateway node puts the contrac
@@ -225,44 +278,55 @@ async fn test_ping_multi_node() -> TestResult {
             .map_err(anyhow::Error::msg)?;
         tracing::info!("Node 2: got contract with {} entries", node2_state.len());
 
-        // Step 4: All nodes subscribe to the contrac
-        tracing::info!("All nodes subscribing to contract...");
+        // Step 4: All nodes subscribe to the contract
+        tracing::info!("=== SUBSCRIPTION PHASE ===");
+        tracing::info!("All nodes subscribing to contract: {}", contract_key);
 
         // Gateway subscribes
+        tracing::info!("Gateway attempting subscription...");
         client_gw
             .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
                 key: contract_key,
                 summary: None,
             }))
             .await?;
-        wait_for_subscribe_response(&mut client_gw, &contract_key)
+        let gw_sub_result = wait_for_subscribe_response(&mut client_gw, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-        tracing::info!("Gateway: subscribed successfully!");
+        tracing::info!("Gateway: subscribed successfully! Response: {:?}", gw_sub_result);
 
         // Node 1 subscribes
+        tracing::info!("Node 1 attempting subscription...");
         client_node1
             .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
                 key: contract_key,
                 summary: None,
             }))
             .await?;
-        wait_for_subscribe_response(&mut client_node1, &contract_key)
+        let node1_sub_result = wait_for_subscribe_response(&mut client_node1, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-        tracing::info!("Node 1: subscribed successfully!");
+        tracing::info!("Node 1: subscribed successfully! Response: {:?}", node1_sub_result);
 
         // Node 2 subscribes
+        tracing::info!("Node 2 attempting subscription...");
         client_node2
             .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
                 key: contract_key,
                 summary: None,
             }))
             .await?;
-        wait_for_subscribe_response(&mut client_node2, &contract_key)
+        let node2_sub_result = wait_for_subscribe_response(&mut client_node2, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-        tracing::info!("Node 2: subscribed successfully!");
+        tracing::info!("Node 2: subscribed successfully! Response: {:?}", node2_sub_result);
+        
+        tracing::info!("=== ALL SUBSCRIPTIONS COMPLETED ===");
+        tracing::info!("All nodes are now subscribed and should receive all updates regardless of ring location");
+        
+        // Add a delay to ensure subscription system is fully active
+        tracing::info!("Waiting 5 seconds for subscription system to stabilize...");
+        sleep(Duration::from_secs(5)).await;
 
         // Step 5: All nodes send multiple updates to build history for eventual consistency testing
 
@@ -276,10 +340,14 @@ async fn test_ping_multi_node() -> TestResult {
         tracing::info!("Each node will send {} pings to build history", ping_rounds);
 
         for round in 1..=ping_rounds {
+            tracing::info!("=== ROUND {} UPDATE CYCLE ===", round);
+            
             // Gateway sends update with its tag
             let mut gw_ping = Ping::default();
             gw_ping.insert(gw_tag.clone());
-            tracing::info!("Gateway sending update with tag: {} (round {})", gw_tag, round);
+            let gw_timestamp = gw_ping.get(&gw_tag).and_then(|v| v.first()).unwrap();
+            tracing::info!("Gateway sending update: tag='{}', timestamp={} (round {})", 
+                         gw_tag, gw_timestamp, round);
             client_gw
                 .send(ClientRequest::ContractOp(ContractRequest::Update {
                     key: contract_key,
@@ -290,7 +358,9 @@ async fn test_ping_multi_node() -> TestResult {
             // Node 1 sends update with its tag
             let mut node1_ping = Ping::default();
             node1_ping.insert(node1_tag.clone());
-            tracing::info!("Node 1 sending update with tag: {} (round {})", node1_tag, round);
+            let node1_timestamp = node1_ping.get(&node1_tag).and_then(|v| v.first()).unwrap();
+            tracing::info!("Node 1 sending update: tag='{}', timestamp={} (round {})", 
+                         node1_tag, node1_timestamp, round);
             client_node1
                 .send(ClientRequest::ContractOp(ContractRequest::Update {
                     key: contract_key,
@@ -301,7 +371,9 @@ async fn test_ping_multi_node() -> TestResult {
             // Node 2 sends update with its tag
             let mut node2_ping = Ping::default();
             node2_ping.insert(node2_tag.clone());
-            tracing::info!("Node 2 sending update with tag: {} (round {})", node2_tag, round);
+            let node2_timestamp = node2_ping.get(&node2_tag).and_then(|v| v.first()).unwrap();
+            tracing::info!("Node 2 sending update: tag='{}', timestamp={} (round {})", 
+                         node2_tag, node2_timestamp, round);
             client_node2
                 .send(ClientRequest::ContractOp(ContractRequest::Update {
                     key: contract_key,
@@ -310,8 +382,11 @@ async fn test_ping_multi_node() -> TestResult {
                 .await?;
 
             // Small delay between rounds to ensure distinct timestamps
+            tracing::info!("Waiting 200ms before next round...");
             sleep(Duration::from_millis(200)).await;
         }
+        
+        tracing::info!("=== ALL UPDATES SENT, WAITING FOR PROPAGATION ===");
 
         // Wait for updates to propagate across the network - longer wait to ensure eventual consistency
         tracing::info!("Waiting for updates to propagate across the network...");
@@ -362,22 +437,76 @@ async fn test_ping_multi_node() -> TestResult {
         tracing::info!("Node 2 final state: {}", final_state_node2);
 
         // Show detailed comparison of ping history per tag
-        tracing::info!("===== Detailed comparison of ping history =====");
+        tracing::info!("===== DETAILED PROPAGATION ANALYSIS =====");
 
         let tags = vec![gw_tag.clone(), node1_tag.clone(), node2_tag.clone()];
         let mut all_histories_match = true;
+        let mut propagation_matrix = std::collections::HashMap::new();
+
+        // First, analyze what each node received
+        tracing::info!("=== PROPAGATION MATRIX ===");
+        let nodes = [("Gateway", &final_state_gw), ("Node1", &final_state_node1), ("Node2", &final_state_node2)];
+        
+        for (node_name, state) in &nodes {
+            tracing::info!("{} received tags: {:?}", node_name, state.keys().collect::<Vec<_>>());
+            for tag in &tags {
+                let has_tag = state.contains_key(tag);
+                let count = state.get(tag).map(|v| v.len()).unwrap_or(0);
+                tracing::info!("  {} has '{}': {} (count: {})", node_name, tag, has_tag, count);
+                propagation_matrix.insert((node_name.to_string(), tag.clone()), (has_tag, count));
+            }
+        }
+
+        // Analyze cross-propagation success
+        tracing::info!("=== CROSS-PROPAGATION ANALYSIS ===");
+        
+        // Gateway should have all tags
+        let gw_has_node1 = final_state_gw.contains_key(&node1_tag);
+        let gw_has_node2 = final_state_gw.contains_key(&node2_tag);
+        
+        // Node1 should have gateway and node2 tags  
+        let node1_has_gw = final_state_node1.contains_key(&gw_tag);
+        let node1_has_node2 = final_state_node1.contains_key(&node2_tag);
+        
+        // Node2 should have gateway and node1 tags
+        let node2_has_gw = final_state_node2.contains_key(&gw_tag);
+        let node2_has_node1 = final_state_node2.contains_key(&node1_tag);
+        
+        tracing::info!("Cross-propagation success rates:");
+        tracing::info!("  Gateway ← Node1: {} | Gateway ← Node2: {}", gw_has_node1, gw_has_node2);
+        tracing::info!("  Node1 ← Gateway: {} | Node1 ← Node2: {}", node1_has_gw, node1_has_node2);
+        tracing::info!("  Node2 ← Gateway: {} | Node2 ← Node1: {}", node2_has_gw, node2_has_node1);
+        
+        // Calculate overall propagation success
+        let total_propagation_attempts = 6; // 3 nodes × 2 cross-propagations each
+        let successful_propagations = [gw_has_node1, gw_has_node2, node1_has_gw, 
+                                     node1_has_node2, node2_has_gw, node2_has_node1]
+                                     .iter().filter(|&&x| x).count();
+        let propagation_rate = successful_propagations as f64 / total_propagation_attempts as f64;
+        
+        tracing::info!("Overall propagation success: {}/{} ({:.1}%)", 
+                      successful_propagations, total_propagation_attempts, propagation_rate * 100.0);
 
         for tag in &tags {
-            tracing::info!("Checking history for tag '{}':", tag);
+            tracing::info!("=== DETAILED ANALYSIS FOR TAG '{}' ===", tag);
 
             // Get the vector of timestamps for this tag from each node
             let gw_history = final_state_gw.get(tag).cloned().unwrap_or_default();
             let node1_history = final_state_node1.get(tag).cloned().unwrap_or_default();
             let node2_history = final_state_node2.get(tag).cloned().unwrap_or_default();
 
+            // Log which nodes have this tag
+            tracing::info!("Tag '{}' presence:", tag);
+            tracing::info!("  Gateway: {} (count: {})", !gw_history.is_empty(), gw_history.len());
+            tracing::info!("  Node1: {} (count: {})", !node1_history.is_empty(), node1_history.len());
+            tracing::info!("  Node2: {} (count: {})", !node2_history.is_empty(), node2_history.len());
+
             // Histories should be non-empty if eventual consistency worked
             if gw_history.is_empty() || node1_history.is_empty() || node2_history.is_empty() {
-                tracing::warn!("⚠️ Tag '{}' missing from one or more nodes!", tag);
+                tracing::warn!("Tag '{}' missing from one or more nodes!", tag);
+                if gw_history.is_empty() { tracing::warn!("Gateway missing '{}'", tag); }
+                if node1_history.is_empty() { tracing::warn!("Node1 missing '{}'", tag); }
+                if node2_history.is_empty() { tracing::warn!("Node2 missing '{}'", tag); }
                 all_histories_match = false;
                 continue;
             }
@@ -389,7 +518,7 @@ async fn test_ping_multi_node() -> TestResult {
 
             // Check if the histories have the same length
             if gw_history.len() != node1_history.len() || gw_history.len() != node2_history.len() {
-                tracing::warn!("⚠️ Different number of history entries for tag '{}'!", tag);
+                tracing::warn!("Different number of history entries for tag '{}'!", tag);
                 all_histories_match = false;
                 continue;
             }
@@ -400,29 +529,71 @@ async fn test_ping_multi_node() -> TestResult {
                 if gw_history[i] != node1_history[i] || gw_history[i] != node2_history[i] {
                     timestamps_match = false;
                     tracing::warn!(
-                        "⚠️ Timestamp mismatch at position {}:\n  - Gateway: {}\n  - Node 1:  {}\n  - Node 2:  {}",
+                        "Timestamp mismatch at position {}:\n  - Gateway: {}\n  - Node 1:  {}\n  - Node 2:  {}",
                         i, gw_history[i], node1_history[i], node2_history[i]
                     );
                 }
             }
 
             if timestamps_match {
-                tracing::info!("  ✅ History for tag '{}' is identical across all nodes!", tag);
+                tracing::info!("History for tag '{}' is identical across all nodes!", tag);
             } else {
-                tracing::warn!("  ⚠️ History timestamps for tag '{}' differ between nodes!", tag);
+                tracing::warn!("History timestamps for tag '{}' differ between nodes!", tag);
                 all_histories_match = false;
             }
         }
 
         tracing::info!("=================================================");
 
+        // Final diagnosis before assertion
+        if !all_histories_match {
+            tracing::error!("PROPAGATION FAILURE DIAGNOSIS:");
+            tracing::error!("Overall propagation rate: {:.1}%", propagation_rate * 100.0);
+            
+            if propagation_rate < 0.5 {
+                tracing::error!("SEVERE: Less than 50% of updates propagated");
+                tracing::error!("This is a BUG - all subscribed nodes MUST receive updates!");
+                tracing::error!("Possible causes:");
+                tracing::error!("1. Bug in subscription notification system");
+                tracing::error!("2. Network connectivity failure");
+                tracing::error!("3. Updates sent before subscriptions fully active");
+                tracing::error!("4. Configuration issues (skip_load_from_network, etc.)");
+            } else if propagation_rate < 0.8 {
+                tracing::error!("MODERATE: 50-80% of updates propagated");
+                tracing::error!("Still problematic - subscribed nodes should receive ALL updates");
+                tracing::error!("This suggests partial failure in notification system");
+            } else {
+                tracing::error!("PARTIAL: >80% propagated but timestamp mismatches");
+                tracing::error!("Updates reached nodes but content differs - timing or merge issues");
+            }
+            
+            // More detailed failure analysis
+            if !gw_has_node1 && !gw_has_node2 {
+                tracing::error!("Gateway received NO updates from client nodes!");
+                tracing::error!("This suggests client→gateway propagation failure");
+            }
+            
+            if !node1_has_node2 && !node2_has_node1 {
+                tracing::error!("No peer-to-peer propagation between client nodes!");
+                tracing::error!("This is expected if they only connect through gateway");
+            }
+            
+            if gw_has_node1 && gw_has_node2 && (!node1_has_gw || !node2_has_gw) {
+                tracing::error!("Gateway received updates but failed to propagate them!");
+                tracing::error!("This suggests gateway→client propagation failure");
+            }
+        }
+
         // Final assertion for eventual consistency
         assert!(
             all_histories_match,
-            "Eventual consistency test failed: Ping histories are not identical across all nodes"
+            "Eventual consistency test failed: Ping histories are not identical across all nodes\n\
+             Propagation success rate: {:.1}% ({}/{})\n\
+             Check logs above for detailed diagnosis of the failure",
+            propagation_rate * 100.0, successful_propagations, total_propagation_attempts
         );
 
-        tracing::info!("✅ Eventual consistency test PASSED - all nodes have identical ping histories!");
+        tracing::info!("Eventual consistency test PASSED - all nodes have identical ping histories!");
 
         Ok::<_, anyhow::Error>(())
     })
@@ -451,7 +622,6 @@ async fn test_ping_multi_node() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "fix me"]
 async fn test_ping_application_loop() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
 
@@ -463,9 +633,16 @@ async fn test_ping_application_loop() -> TestResult {
     let ws_api_port_socket_node1 = TcpListener::bind("127.0.0.1:0")?;
     let ws_api_port_socket_node2 = TcpListener::bind("127.0.0.1:0")?;
 
+    // Configure nodes with fixed seed for deterministic testing
+    let test_seed = *b"app_loop_test_seed_0123456789012";
+    let mut test_rng = rand::rngs::StdRng::from_seed(test_seed);
+    
+    tracing::info!("Using deterministic test seed for app loop: {:?}", test_seed);
+    tracing::info!("Test RNG initial state configured for deterministic network topology");
+
     // Configure gateway node
     let (config_gw, preset_cfg_gw, config_gw_info) = {
-        let (cfg, preset) = base_node_test_config(
+        let (cfg, preset) = base_node_test_config_with_rng(
             true,
             vec![],
             Some(network_socket_gw.local_addr()?.port()),
@@ -473,16 +650,17 @@ async fn test_ping_application_loop() -> TestResult {
             "gw_app_loop", // data_dir_suffix
             None,          // base_tmp_dir
             None,          // blocked_addresses
+            &mut test_rng,
         )
         .await?;
         let public_port = cfg.network_api.public_port.unwrap();
         let path = preset.temp_dir.path().to_path_buf();
-        (cfg, preset, gw_config_from_path(public_port, &path)?)
+        (cfg, preset, gw_config_from_path_with_rng(public_port, &path, &mut test_rng)?)
     };
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
 
     // Configure client node 1
-    let (config_node1, preset_cfg_node1) = base_node_test_config(
+    let (config_node1, preset_cfg_node1) = base_node_test_config_with_rng(
         false,
         vec![serde_json::to_string(&config_gw_info)?],
         None,
@@ -490,12 +668,13 @@ async fn test_ping_application_loop() -> TestResult {
         "node1_app_loop", // data_dir_suffix
         None,             // base_tmp_dir
         None,             // blocked_addresses
+        &mut test_rng,
     )
     .await?;
     let ws_api_port_node1 = config_node1.ws_api.ws_api_port.unwrap();
 
     // Configure client node 2
-    let (config_node2, preset_cfg_node2) = base_node_test_config(
+    let (config_node2, preset_cfg_node2) = base_node_test_config_with_rng(
         false,
         vec![serde_json::to_string(&config_gw_info)?],
         None,
@@ -503,14 +682,18 @@ async fn test_ping_application_loop() -> TestResult {
         "node2_app_loop", // data_dir_suffix
         None,             // base_tmp_dir
         None,             // blocked_addresses
+        &mut test_rng,
     )
     .await?;
     let ws_api_port_node2 = config_node2.ws_api.ws_api_port.unwrap();
 
-    // Log data directories for debugging
+    // Log data directories and locations for debugging
     tracing::info!("Gateway node data dir: {:?}", preset_cfg_gw.temp_dir.path());
     tracing::info!("Node 1 data dir: {:?}", preset_cfg_node1.temp_dir.path());
     tracing::info!("Node 2 data dir: {:?}", preset_cfg_node2.temp_dir.path());
+    tracing::info!("App loop - Gateway location: {:?}", config_gw.network_api.location);
+    tracing::info!("App loop - Node 1 location: {:?}", config_node1.network_api.location);
+    tracing::info!("App loop - Node 2 location: {:?}", config_node2.network_api.location);
 
     // Free ports so they don't fail on initialization
     std::mem::drop(network_socket_gw);
@@ -578,15 +761,23 @@ async fn test_ping_application_loop() -> TestResult {
         let mut client_node1 = WebApi::start(stream_node1);
         let mut client_node2 = WebApi::start(stream_node2);
 
-        // Load the ping contrac
+        // Load the ping contract
         let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
         tracing::info!(path=%path_to_code.display(), "loading contract code");
-        let code = std::fs::read(path_to_code)
-            .ok()
-            .ok_or_else(|| anyhow!("Failed to read contract code"))?;
-        let code_hash = CodeHash::from_code(&code);
 
-        // Create ping contract options for each node with different tags
+        // First compile to get the code hash, then create proper options
+        let temp_options = PingContractOptions {
+            frequency: Duration::from_secs(3),
+            ttl: Duration::from_secs(30),
+            tag: APP_TAG.to_string(),
+            code_key: "".to_string(),
+        };
+        let temp_params = Parameters::from(serde_json::to_vec(&temp_options).unwrap());
+        let container = common::load_contract(&path_to_code, temp_params)?;
+        
+        // Now get the actual code hash and create proper options for all nodes
+        let code_hash = CodeHash::from_code(container.data());
+        
         let gw_options = PingContractOptions {
             frequency: Duration::from_secs(3),
             ttl: Duration::from_secs(30),
@@ -609,7 +800,7 @@ async fn test_ping_application_loop() -> TestResult {
         };
 
         let params = Parameters::from(serde_json::to_vec(&gw_options).unwrap());
-        let container = ContractContainer::try_from((code, &params))?;
+        let container = common::load_contract(&path_to_code, params)?;
         let contract_key = container.key();
 
         // Step 1: Gateway node puts the contrac
