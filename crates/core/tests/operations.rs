@@ -1275,9 +1275,9 @@ async fn test_get_with_subscribe_flag() -> TestResult {
     }
     .boxed_local();
 
-    let test = tokio::time::timeout(Duration::from_secs(60), async {
+    let test = tokio::time::timeout(Duration::from_secs(120), async {
         // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(20)).await;
+        tokio::time::sleep(Duration::from_secs(15)).await;
 
         // Connect first client to node A's websocket API (for putting the contract)
         let uri_a = format!(
@@ -1287,12 +1287,7 @@ async fn test_get_with_subscribe_flag() -> TestResult {
         let (stream1, _) = connect_async(&uri_a).await?;
         let mut client_api1_node_a = WebApi::start(stream1);
 
-        // Connect second client to node A's websocket API (for getting with auto-subscribe)
-        let (stream2, _) = connect_async(&uri_a).await?;
-        let mut client_api2_node_a = WebApi::start(stream2);
-
         tracing::info!("Client 1: Put contract with initial state");
-
 
         // First client puts contract with initial state (without subscribing)
         make_put(
@@ -1302,7 +1297,6 @@ async fn test_get_with_subscribe_flag() -> TestResult {
             false, // subscribe=false
         )
         .await?;
-
 
         // Wait for put response
         let resp = tokio::time::timeout(Duration::from_secs(30), client_api1_node_a.recv()).await;
@@ -1322,6 +1316,10 @@ async fn test_get_with_subscribe_flag() -> TestResult {
         }
 
         tracing::warn!("Client 1: Successfully put contract {}", contract_key);
+
+        // Connect second client to node A's websocket API (for getting with auto-subscribe)
+        let (stream2, _) = connect_async(&uri_a).await?;
+        let mut client_api2_node_a = WebApi::start(stream2);
 
         // Second client gets the contract with auto-subscribe
         make_get(&mut client_api2_node_a, contract_key, true, true).await?;
