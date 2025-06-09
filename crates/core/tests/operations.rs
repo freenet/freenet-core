@@ -69,7 +69,7 @@ async fn base_node_test_config(
             ignore_protocol_checking: true,
             address: Some(Ipv4Addr::LOCALHOST.into()),
             network_port: public_port,
-            bandwidth_limit: None,
+            bandwidth_limit: Some(12_500_000), // 10 Mbps = 1.25 MB/s * 10s window
             blocked_addresses: None,
         },
         config_paths: {
@@ -532,7 +532,6 @@ async fn test_update_contract() -> TestResult {
     Ok(())
 }
 
-#[ignore = "Flaky test - fails intermittently in CI. See issue #1637"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_multiple_clients_subscription() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::INFO), None);

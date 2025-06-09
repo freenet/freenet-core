@@ -64,7 +64,7 @@ pub(crate) async fn create_connection_handler<S: Socket>(
     listen_host: IpAddr,
     listen_port: u16,
     is_gateway: bool,
-    bandwith_limit: Option<usize>,
+    bandwidth_limit: Option<usize>,
 ) -> Result<(OutboundConnectionHandler, InboundConnectionHandler), TransportError> {
     // Bind the UDP socket to the specified port
     let socket = S::bind((listen_host, listen_port).into()).await?;
@@ -73,7 +73,7 @@ pub(crate) async fn create_connection_handler<S: Socket>(
         keypair,
         is_gateway,
         (listen_host, listen_port).into(),
-        bandwith_limit,
+        bandwidth_limit,
     )?;
     Ok((
         och,
@@ -122,11 +122,11 @@ impl OutboundConnectionHandler {
         keypair: TransportKeypair,
         is_gateway: bool,
         socket_addr: SocketAddr,
-        bandwith_limit: Option<usize>,
+        bandwidth_limit: Option<usize>,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection>), TransportError> {
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
-        let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
-        let (new_connection_sender, new_connection_notifier) = mpsc::channel(100);
+        let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(1000);
+        let (new_connection_sender, new_connection_notifier) = mpsc::channel(1000);
 
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (outbound_sender, outbound_recv) = mpsc::channel(10000);
@@ -139,6 +139,8 @@ impl OutboundConnectionHandler {
             new_connection_notifier: new_connection_sender,
             outbound_packets: outbound_sender,
             this_addr: socket_addr,
+            dropped_packets: HashMap::new(),
+            last_drop_warning: Instant::now(),
         };
         let bw_tracker = super::rate_limiter::PacketRateLimiter::new(
             DEFAULT_BW_TRACKER_WINDOW_SIZE,
@@ -148,7 +150,7 @@ impl OutboundConnectionHandler {
             send_queue: conn_handler_sender,
         };
 
-        task::spawn(bw_tracker.rate_limiter(bandwith_limit, socket));
+        task::spawn(bw_tracker.rate_limiter(bandwidth_limit, socket));
         task::spawn(RANDOM_U64.scope(StdRng::from_entropy().gen(), transport.listen()));
 
         Ok((connection_handler, new_connection_notifier))
@@ -206,6 +208,8 @@ struct UdpPacketsListener<S = UdpSocket> {
     new_connection_notifier: mpsc::Sender<PeerConnection>,
     outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
     this_addr: SocketAddr,
+    dropped_packets: HashMap<SocketAddr, u64>,
+    last_drop_warning: Instant,
 }
 
 type OngoingConnection = (
@@ -321,7 +325,28 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     Err(mpsc::error::TrySendError::Full(_)) => {
                                         // Channel full, reinsert connection
                                         self.remote_connections.insert(remote_addr, remote_conn);
-                                        tracing::debug!(%remote_addr, "inbound packet channel full, dropping packet to prevent misrouting");
+
+                                        // Track dropped packets and log warnings periodically
+                                        let dropped_count = self.dropped_packets.entry(remote_addr).or_insert(0);
+                                        *dropped_count += 1;
+
+                                        // Log warning every 10 seconds if packets are being dropped
+                                        let now = Instant::now();
+                                        if now.duration_since(self.last_drop_warning) > Duration::from_secs(10) {
+                                            let total_dropped: u64 = self.dropped_packets.values().sum();
+                                            tracing::warn!(
+                                                "Channel overflow: dropped {} packets in last 10s (bandwidth limit may be too high or receiver too slow)",
+                                                total_dropped
+                                            );
+                                            for (addr, count) in &self.dropped_packets {
+                                                if *count > 100 {
+                                                    tracing::warn!("  {} dropped from {}", count, addr);
+                                                }
+                                            }
+                                            self.dropped_packets.clear();
+                                            self.last_drop_warning = now;
+                                        }
+
                                         // Drop the packet instead of falling through - prevents symmetric packets
                                         // from being sent to RSA decryption handlers
                                         continue;
@@ -610,7 +635,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
             let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
 
-            let (inbound_packet_tx, inbound_packet_rx) = mpsc::channel(100);
+            let (inbound_packet_tx, inbound_packet_rx) = mpsc::channel(1000);
             let remote_conn = RemoteConnection {
                 outbound_packets,
                 outbound_symmetric_key: outbound_key,
@@ -800,7 +825,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 ))
                                                 .await
                                                 .map_err(|_| TransportError::ChannelClosed)?;
-                                            let (inbound_sender, inbound_recv) = mpsc::channel(100);
+                                            let (inbound_sender, inbound_recv) =
+                                                mpsc::channel(1000);
                                             tracing::debug!(%remote_addr, "connection established");
                                             return Ok((
                                                 RemoteConnection {
@@ -866,7 +892,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     continue;
                                 }
                                 // if is not an intro packet, the connection is successful and we can proceed
-                                let (inbound_sender, inbound_recv) = mpsc::channel(100);
+                                let (inbound_sender, inbound_recv) = mpsc::channel(1000);
                                 return Ok((
                                     RemoteConnection {
                                         outbound_packets: outbound_packets.clone(),
