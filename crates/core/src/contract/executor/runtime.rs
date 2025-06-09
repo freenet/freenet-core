@@ -331,6 +331,10 @@ impl ContractExecutor for Executor<Runtime> {
             _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
         }
     }
+
+    fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
+        self.get_subscription_info()
+    }
 }
 
 impl Executor<Runtime> {

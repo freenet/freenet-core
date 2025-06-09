@@ -912,6 +912,9 @@ where
                 NodeEvent::TransactionTimedOut(_) => {
                     unimplemented!()
                 }
+                NodeEvent::QuerySubscriptions { .. } => {
+                    unimplemented!()
+                }
             },
             Err(err) => {
                 super::report_result(

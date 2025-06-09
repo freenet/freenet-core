@@ -1,4 +1,4 @@
-use freenet_stdlib::client_api::{ConnectedPeers, HostResponse, QueryResponse};
+use freenet_stdlib::client_api::{HostResponse, NodeQuery, QueryResponse};
 use prettytable::{Cell, Row, Table};
 
 use crate::{
@@ -10,7 +10,7 @@ pub async fn query(base_cfg: BaseConfig) -> anyhow::Result<()> {
     let mut client = start_api_client(base_cfg).await?;
     tracing::info!("Querying for connected peers");
     execute_command(
-        freenet_stdlib::client_api::ClientRequest::NodeQueries(ConnectedPeers {}),
+        freenet_stdlib::client_api::ClientRequest::NodeQueries(NodeQuery::ConnectedPeers),
         &mut client,
     )
     .await?;

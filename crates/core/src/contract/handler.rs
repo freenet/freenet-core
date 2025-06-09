@@ -26,7 +26,7 @@ use super::{
 };
 use crate::client_events::HostResult;
 use crate::config::Config;
-use crate::message::Transaction;
+use crate::message::{QueryResult, Transaction};
 use crate::{client_events::ClientId, wasm_runtime::Runtime};
 
 pub(crate) struct ClientResponsesReceiver(UnboundedReceiver<(ClientId, HostResult)>);
@@ -359,6 +359,12 @@ pub(crate) enum ContractHandlerEvent {
         subscriber_listener: UnboundedSender<HostResult>,
     },
     RegisterSubscriberListenerResponse,
+    #[allow(dead_code)]
+    QuerySubscriptions {
+        callback: tokio::sync::mpsc::Sender<QueryResult>,
+    },
+    #[allow(dead_code)]
+    QuerySubscriptionsResponse,
 }
 
 impl std::fmt::Display for ContractHandlerEvent {
@@ -440,6 +446,12 @@ impl std::fmt::Display for ContractHandlerEvent {
             }
             ContractHandlerEvent::RegisterSubscriberListenerResponse => {
                 write!(f, "register subscriber listener response")
+            }
+            ContractHandlerEvent::QuerySubscriptions { .. } => {
+                write!(f, "query subscriptions")
+            }
+            ContractHandlerEvent::QuerySubscriptionsResponse => {
+                write!(f, "query subscriptions response")
             }
         }
     }
