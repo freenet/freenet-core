@@ -228,6 +228,26 @@ where
                         tracing::debug!(%error, "shutting down contract handler");
                     })?;
             }
+            ContractHandlerEvent::QuerySubscriptions { callback } => {
+                // Get subscription information from the executor and send it through the callback
+                let subscriptions = contract_handler.executor().get_subscription_info();
+                let connections = vec![]; // For now, we'll populate this from the calling context
+                let network_debug = crate::message::NetworkDebugInfo {
+                    subscriptions,
+                    connected_peers: connections,
+                };
+                let _ = callback
+                    .send(crate::message::QueryResult::NetworkDebug(network_debug))
+                    .await;
+
+                contract_handler
+                    .channel()
+                    .send_to_sender(id, ContractHandlerEvent::QuerySubscriptionsResponse)
+                    .await
+                    .inspect_err(|error| {
+                        tracing::debug!(%error, "shutting down contract handler");
+                    })?;
+            }
             _ => unreachable!("ContractHandlerEvent enum should be exhaustive here"),
         }
     }

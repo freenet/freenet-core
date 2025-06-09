@@ -479,6 +479,8 @@ pub(crate) trait ContractExecutor: Send + 'static {
         req: DelegateRequest<'_>,
         attested_contract: Option<&ContractInstanceId>,
     ) -> Response;
+
+    fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo>;
 }
 
 /// A WASM executor which will run any contracts, delegates, etc. registered.
@@ -588,5 +590,19 @@ impl<R> Executor<R> {
             ExecutorError::other(err)
         })?;
         Ok(result)
+    }
+
+    pub fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
+        let mut subscriptions = Vec::new();
+        for (contract_key, client_list) in &self.update_notifications {
+            for (client_id, _channel) in client_list {
+                subscriptions.push(crate::message::SubscriptionInfo {
+                    contract_key: *contract_key,
+                    client_id: *client_id,
+                    last_update: None,
+                });
+            }
+        }
+        subscriptions
     }
 }

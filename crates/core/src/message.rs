@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::{
-    client_events::HostResult,
+    client_events::{ClientId, HostResult},
     node::PeerId,
     operations::{
         connect::ConnectMsg, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg, update::UpdateMsg,
@@ -318,7 +318,23 @@ pub(crate) enum NodeEvent {
     QueryConnections {
         callback: tokio::sync::mpsc::Sender<QueryResult>,
     },
+    QuerySubscriptions {
+        callback: tokio::sync::mpsc::Sender<QueryResult>,
+    },
     TransactionTimedOut(Transaction),
+}
+
+#[derive(Debug, Clone)]
+pub struct SubscriptionInfo {
+    pub contract_key: ContractKey,
+    pub client_id: ClientId,
+    pub last_update: Option<std::time::SystemTime>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkDebugInfo {
+    pub subscriptions: Vec<SubscriptionInfo>,
+    pub connected_peers: Vec<PeerId>,
 }
 
 pub(crate) enum QueryResult {
@@ -333,6 +349,7 @@ pub(crate) enum QueryResult {
         key: DelegateKey,
         response: HostResult,
     },
+    NetworkDebug(NetworkDebugInfo),
 }
 
 impl Display for NodeEvent {
@@ -352,6 +369,9 @@ impl Display for NodeEvent {
             }
             NodeEvent::QueryConnections { .. } => {
                 write!(f, "QueryConnections")
+            }
+            NodeEvent::QuerySubscriptions { .. } => {
+                write!(f, "QuerySubscriptions")
             }
             NodeEvent::TransactionTimedOut(transaction) => {
                 write!(f, "Transaction timed out ({})", transaction)

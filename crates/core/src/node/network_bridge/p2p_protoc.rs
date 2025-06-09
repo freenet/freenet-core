@@ -348,12 +348,34 @@ impl P2pConnManager {
                                     );
                                 })??;
                             }
+                            NodeEvent::QuerySubscriptions { callback } => {
+                                // For now, return connection info until we integrate with contract handler
+                                // TODO: Query contract handler for actual subscription info
+                                let connections = self.connections.keys().cloned().collect();
+                                let debug_info = crate::message::NetworkDebugInfo {
+                                    subscriptions: Vec::new(), // TODO: Get from contract handler
+                                    connected_peers: connections,
+                                };
+                                timeout(
+                                    Duration::from_secs(1),
+                                    callback.send(QueryResult::NetworkDebug(debug_info)),
+                                )
+                                .await
+                                .inspect_err(|error| {
+                                    tracing::error!(
+                                        "Failed to send subscriptions query result: {:?}",
+                                        error
+                                    );
+                                })??;
+                            }
                             NodeEvent::TransactionTimedOut(tx) => {
-                                let Some(client) = state.tx_to_client.remove(&tx) else {
+                                let Some(clients) = state.tx_to_client.remove(&tx) else {
                                     continue;
                                 };
-                                cli_response_sender
-                                    .send((client, Err(ErrorKind::FailedOperation.into())))?;
+                                for client in clients {
+                                    cli_response_sender
+                                        .send((client, Err(ErrorKind::FailedOperation.into())))?;
+                                }
                             }
                             NodeEvent::Disconnect { cause } => {
                                 tracing::info!(
@@ -468,8 +490,8 @@ impl P2pConnManager {
         let pending_client_req = state
             .tx_to_client
             .get(msg.id())
-            .copied()
-            .map(|c| vec![c])
+            .cloned()
+            .map(|clients| clients.into_iter().collect::<Vec<_>>())
             .or(state
                 .client_waiting_transaction
                 .iter_mut()
@@ -865,7 +887,7 @@ impl P2pConnManager {
         match transaction {
             WaitingTransaction::Transaction(tx) => {
                 tracing::debug!(%tx, %client_id, "Subscribing client to transaction results");
-                state.tx_to_client.insert(tx, client_id);
+                state.tx_to_client.entry(tx).or_default().insert(client_id);
             }
             WaitingTransaction::Subscription { contract_key } => {
                 tracing::debug!(%client_id, %contract_key, "Client waiting for subscription");
@@ -949,7 +971,7 @@ struct EventListenerState {
         FuturesUnordered<BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>>,
     pending_from_executor: HashSet<Transaction>,
     // FIXME: we are potentially leaving trash here when transacrions are completed
-    tx_to_client: HashMap<Transaction, ClientId>,
+    tx_to_client: HashMap<Transaction, HashSet<ClientId>>,
     client_waiting_transaction: Vec<(WaitingTransaction, HashSet<ClientId>)>,
     transient_conn: HashMap<Transaction, SocketAddr>,
     awaiting_connection: HashMap<SocketAddr, Box<dyn ConnectResultSender>>,
