@@ -128,6 +128,10 @@ impl ContractExecutor for Executor<MockRuntime> {
             "not supported in mock runtime"
         )))
     }
+
+    fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
+        vec![] // Mock implementation returns empty list
+    }
 }
 
 #[cfg(test)]

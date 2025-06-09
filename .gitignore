@@ -41,3 +41,6 @@ test_*.sh
 PR_*.md
 GET_OPERATION_OPTIMIZATION_SUMMARY.md
 INTEGRATION_TEST_FIX_STATUS.md
+
+# Temporary work directories
+crates/core/tmp_work/

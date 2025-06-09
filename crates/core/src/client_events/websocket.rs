@@ -123,6 +123,54 @@ impl WebSocketProxy {
                             return Err(ErrorKind::UnknownClient(client_id.into()).into());
                         }
                     }
+                    ClientRequest::ContractOp(ContractRequest::Get {
+                        key,
+                        subscribe: true,
+                        ..
+                    }) => {
+                        tracing::debug!(%client_id, contract = %key, "get with auto-subscribe");
+                        // intercept GET with subscribe=true because they also require a callback subscription channel
+                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                        if let Some(ch) = self.response_channels.get(&client_id) {
+                            ch.send(HostCallbackResult::SubscriptionChannel {
+                                key: *key,
+                                id: client_id,
+                                callback: rx,
+                            })
+                            .map_err(|_| ErrorKind::ChannelClosed)?;
+                            OpenRequest::new(client_id, req)
+                                .with_notification(tx)
+                                .with_token(auth_token)
+                                .with_attested_contract(attested_contract)
+                        } else {
+                            tracing::warn!("client: {client_id} not found");
+                            return Err(ErrorKind::UnknownClient(client_id.into()).into());
+                        }
+                    }
+                    ClientRequest::ContractOp(ContractRequest::Put {
+                        contract,
+                        subscribe: true,
+                        ..
+                    }) => {
+                        tracing::debug!(%client_id, contract = %contract.key(), "put with auto-subscribe");
+                        // intercept PUT with subscribe=true because they also require a callback subscription channel
+                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                        if let Some(ch) = self.response_channels.get(&client_id) {
+                            ch.send(HostCallbackResult::SubscriptionChannel {
+                                key: contract.key(),
+                                id: client_id,
+                                callback: rx,
+                            })
+                            .map_err(|_| ErrorKind::ChannelClosed)?;
+                            OpenRequest::new(client_id, req)
+                                .with_notification(tx)
+                                .with_token(auth_token)
+                                .with_attested_contract(attested_contract)
+                        } else {
+                            tracing::warn!("client: {client_id} not found");
+                            return Err(ErrorKind::UnknownClient(client_id.into()).into());
+                        }
+                    }
                     _ => {
                         // just forward the request to the node
                         OpenRequest::new(client_id, req)

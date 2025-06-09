@@ -253,6 +253,27 @@ where
                             QueryResult::DelegateResult { response, .. } => {
                                 response
                             }
+                            QueryResult::NetworkDebug(debug_info) => {
+                                // Convert internal types to stdlib types
+                                let subscriptions = debug_info.subscriptions.into_iter().map(|sub| {
+                                    freenet_stdlib::client_api::SubscriptionInfo {
+                                        contract_key: sub.contract_key,
+                                        client_id: sub.client_id.into(),
+                                        last_update: sub.last_update,
+                                    }
+                                }).collect();
+
+                                let connected_peers = debug_info.connected_peers.into_iter().map(|peer| {
+                                    (peer.to_string(), peer.addr)
+                                }).collect();
+
+                                Ok(HostResponse::QueryResponse(QueryResponse::NetworkDebug(
+                                    freenet_stdlib::client_api::NetworkDebugInfo {
+                                        subscriptions,
+                                        connected_peers,
+                                    }
+                                )))
+                            }
                         };
                         if let Ok(result) = &res {
                             tracing::debug!(%result, "sending client operation response");
@@ -329,6 +350,7 @@ async fn process_open_request(
                             "Received put from user event",
                         );
 
+                        let contract_key = contract.key();
                         let op = put::start_op(
                             contract,
                             related_contracts,
@@ -348,6 +370,47 @@ async fn process_open_request(
 
                         if let Err(err) = put::request_put(&op_manager, op).await {
                             tracing::error!("Put request error: {}", err);
+                        }
+
+                        // Register subscription listener if subscribe=true
+                        if subscribe {
+                            if let Some(subscription_listener) = subscription_listener {
+                                tracing::debug!(%client_id, %contract_key, "Registering subscription for PUT with auto-subscribe");
+                                let register_listener = op_manager
+                                    .notify_contract_handler(
+                                        ContractHandlerEvent::RegisterSubscriberListener {
+                                            key: contract_key,
+                                            client_id,
+                                            summary: None, // No summary for PUT-based subscriptions
+                                            subscriber_listener: subscription_listener,
+                                        },
+                                    )
+                                    .await
+                                    .inspect_err(|err| {
+                                        tracing::error!(
+                                            %client_id, %contract_key,
+                                            "Register subscriber listener error for PUT: {}", err
+                                        );
+                                    });
+                                match register_listener {
+                                    Ok(
+                                        ContractHandlerEvent::RegisterSubscriberListenerResponse,
+                                    ) => {
+                                        tracing::debug!(
+                                            %client_id, %contract_key,
+                                            "Subscriber listener registered successfully for PUT"
+                                        );
+                                    }
+                                    _ => {
+                                        tracing::error!(
+                                            %client_id, %contract_key,
+                                            "Subscriber listener registration failed for PUT"
+                                        );
+                                    }
+                                }
+                            } else {
+                                tracing::warn!(%client_id, %contract_key, "PUT with subscribe=true but no subscription_listener");
+                            }
                         }
                     }
                     ContractRequest::Update { key, data } => {
@@ -457,6 +520,46 @@ async fn process_open_request(
                                     this_peer = %peer_id,
                                     "Contract found, returning get result",
                                 );
+
+                                // Handle subscription for locally found contracts
+                                if subscribe {
+                                    if let Some(subscription_listener) = subscription_listener {
+                                        tracing::debug!(%client_id, %key, "Subscribing to locally found contract");
+                                        let register_listener = op_manager
+                                            .notify_contract_handler(
+                                                ContractHandlerEvent::RegisterSubscriberListener {
+                                                    key,
+                                                    client_id,
+                                                    summary: None, // No summary for GET-based subscriptions
+                                                    subscriber_listener: subscription_listener,
+                                                },
+                                            )
+                                            .await
+                                            .inspect_err(|err| {
+                                                tracing::error!(
+                                                    %client_id, %key,
+                                                    "Register subscriber listener error for local GET: {}", err
+                                                );
+                                            });
+                                        match register_listener {
+                                            Ok(ContractHandlerEvent::RegisterSubscriberListenerResponse) => {
+                                                tracing::debug!(
+                                                    %client_id, %key,
+                                                    "Subscriber listener registered successfully for local GET"
+                                                );
+                                            }
+                                            _ => {
+                                                tracing::error!(
+                                                    %client_id, %key,
+                                                    "Subscriber listener registration failed for local GET"
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        tracing::warn!(%client_id, %key, "GET with subscribe=true but no subscription_listener");
+                                    }
+                                }
+
                                 return Ok(Some(Either::Left(QueryResult::GetResult {
                                     key,
                                     state,
@@ -594,19 +697,25 @@ async fn process_open_request(
             ClientRequest::Disconnect { .. } => {
                 tracing::debug!("Received disconnect from user event");
             }
-            ClientRequest::NodeQueries(_) => {
-                tracing::debug!("Received node queries from user event");
+            ClientRequest::NodeQueries(query) => {
+                tracing::debug!("Received node queries from user event: {:?}", query);
 
                 let Some(tx) = callback_tx else {
                     tracing::error!("callback_tx not available for NodeQueries");
                     unreachable!("callback_tx should always be Some for NodeQueries based on initialization logic");
                 };
 
-                if let Err(err) = op_manager
-                    .notify_node_event(NodeEvent::QueryConnections { callback: tx })
-                    .await
-                {
-                    tracing::error!("notify_node_event(QueryConnections) error: {}", err);
+                let node_event = match query {
+                    freenet_stdlib::client_api::NodeQuery::ConnectedPeers => {
+                        NodeEvent::QueryConnections { callback: tx }
+                    }
+                    freenet_stdlib::client_api::NodeQuery::SubscriptionInfo => {
+                        NodeEvent::QuerySubscriptions { callback: tx }
+                    }
+                };
+
+                if let Err(err) = op_manager.notify_node_event(node_event).await {
+                    tracing::error!("notify_node_event error: {}", err);
                     return Err(Error::from(err));
                 }
 
