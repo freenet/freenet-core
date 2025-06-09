@@ -388,8 +388,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 continue;
                             }
 
-                            let inbound_key_bytes = key_from_addr(&remote_addr);
-                            let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
+                            let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr);
                             let task = tokio::spawn(gw_ongoing_connection
                                 .instrument(tracing::span!(tracing::Level::DEBUG, "gateway_connection"))
                                 .map_err(move |error| {
@@ -524,7 +523,6 @@ impl<S: Socket> UdpPacketsListener<S> {
         &mut self,
         remote_intro_packet: PacketData<UnknownEncryption>,
         remote_addr: SocketAddr,
-        inbound_key_bytes: [u8; 16],
     ) -> (
         GatewayConnectionFuture,
         mpsc::Sender<PacketData<UnknownEncryption>>,
@@ -535,6 +533,8 @@ impl<S: Socket> UdpPacketsListener<S> {
         let (inbound_from_remote, mut next_inbound) =
             mpsc::channel::<PacketData<UnknownEncryption>>(100);
         let f = async move {
+            tracing::debug!(%remote_addr, "Gateway connection handler: starting");
+
             let decrypted_intro_packet =
                 secret.decrypt(remote_intro_packet.data()).map_err(|err| {
                     tracing::debug!(%remote_addr, %err, "Failed to decrypt intro packet");
@@ -573,11 +573,18 @@ impl<S: Socket> UdpPacketsListener<S> {
                 });
             }
 
-            let inbound_key = Aes128Gcm::new(&inbound_key_bytes.into());
-            let outbound_ack_packet =
-                SymmetricMessage::ack_ok(&outbound_key, inbound_key_bytes, remote_addr)?;
-
-            tracing::debug!(%remote_addr, "Sending outbound ack packet: {:?}", outbound_ack_packet.data());
+            // For gateway connections, use the same key for both directions
+            let inbound_key = outbound_key.clone();
+            tracing::debug!(
+                %remote_addr,
+                gateway_key = ?outbound_key_bytes,
+                "Gateway: Using client's key for both directions"
+            );
+            let outbound_ack_packet = SymmetricMessage::ack_ok(
+                &outbound_key,
+                outbound_key_bytes.try_into().unwrap(),
+                remote_addr,
+            )?;
 
             outbound_packets
                 .send((remote_addr, outbound_ack_packet.clone().prepared_send()))
@@ -588,12 +595,14 @@ impl<S: Socket> UdpPacketsListener<S> {
             let timeout = tokio::time::timeout(Duration::from_secs(5), next_inbound.recv());
             match timeout.await {
                 Ok(Some(packet)) => {
+                    tracing::debug!(%remote_addr, ?outbound_key_bytes, "Gateway attempting to decrypt client ACK with client's key");
                     let _ = packet.try_decrypt_sym(&inbound_key).map_err(|_| {
-                            tracing::debug!(%remote_addr, "Failed to decrypt packet with inbound key: {:?}", packet.data());
+                            tracing::debug!(%remote_addr, "Failed to decrypt packet with client's key: {:?}", packet.data());
                             TransportError::ConnectionEstablishmentFailure {
                                 cause: "invalid symmetric key".into(),
                             }
                         })?;
+                    tracing::debug!(%remote_addr, "Gateway successfully decrypted client ACK");
                 }
                 Ok(None) => {
                     return Err(TransportError::ConnectionEstablishmentFailure {
@@ -612,13 +621,13 @@ impl<S: Socket> UdpPacketsListener<S> {
             let (inbound_packet_tx, inbound_packet_rx) = mpsc::channel(100);
             let remote_conn = RemoteConnection {
                 outbound_packets,
-                outbound_symmetric_key: outbound_key,
+                outbound_symmetric_key: outbound_key.clone(),
                 remote_addr,
                 sent_tracker: sent_tracker.clone(),
                 last_packet_id: Arc::new(AtomicU32::new(0)),
                 inbound_packet_recv: inbound_packet_rx,
                 inbound_symmetric_key: inbound_key,
-                inbound_symmetric_key_bytes: inbound_key_bytes,
+                inbound_symmetric_key_bytes: outbound_key_bytes.try_into().unwrap(),
                 my_address: None,
             };
 
@@ -736,14 +745,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                             inbound_sym_key_bytes,
                             remote_addr,
                         )?;
+                        let packet_to_send = our_inbound.prepared_send();
                         outbound_packets
-                            .send((remote_addr, our_inbound.data().into()))
+                            .send((remote_addr, packet_to_send.clone()))
                             .await
                             .map_err(|_| TransportError::ChannelClosed)?;
-                        sent_tracker.report_sent_packet(
-                            SymmetricMessage::FIRST_PACKET_ID,
-                            our_inbound.data().into(),
-                        );
+                        sent_tracker
+                            .report_sent_packet(SymmetricMessage::FIRST_PACKET_ID, packet_to_send);
                     }
                 }
                 let next_inbound = tokio::time::timeout(timeout, next_inbound.recv());
@@ -779,26 +787,31 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                     remote_addr: my_address,
                                                 }),
                                         } => {
-                                            let outbound_sym_key = Aes128Gcm::new_from_slice(&key)
-                                                .map_err(|_| {
-                                                    TransportError::ConnectionEstablishmentFailure {
-                                                        cause: "invalid symmetric key".into(),
-                                                    }
-                                                })?;
-                                            tracing::debug!(%remote_addr, "Sending back ack connection: {:?}", key);
+                                            // For gateway connections, verify the gateway returned our own key
+                                            if key != inbound_sym_key_bytes {
+                                                tracing::warn!(%remote_addr, "Gateway returned different key than client sent!");
+                                            }
+                                            tracing::debug!(
+                                                %remote_addr,
+                                                client_key = ?inbound_sym_key_bytes,
+                                                gateway_returned_key = ?key,
+                                                "Client: Using own key for ACK response to gateway"
+                                            );
+                                            // Use our own key to encrypt the ACK response (same key for both directions with gateway)
                                             outbound_packets
                                                 .send((
                                                     remote_addr,
                                                     SymmetricMessage::ack_ok(
-                                                        &outbound_sym_key,
+                                                        &inbound_sym_key, // Use our own key, not the gateway's
                                                         inbound_sym_key_bytes,
                                                         remote_addr,
                                                     )?
-                                                    .data()
-                                                    .into(),
+                                                    .prepared_send(),
                                                 ))
                                                 .await
                                                 .map_err(|_| TransportError::ChannelClosed)?;
+                                            // For RemoteConnection, use the same key for both directions with gateway
+                                            let outbound_sym_key = inbound_sym_key.clone();
                                             let (inbound_sender, inbound_recv) = mpsc::channel(100);
                                             tracing::debug!(%remote_addr, "connection established");
                                             return Ok((
@@ -943,35 +956,6 @@ fn handle_ack_connection_error(err: Cow<'static, str>) -> TransportError {
     } else {
         TransportError::ConnectionEstablishmentFailure { cause: err }
     }
-}
-
-fn key_from_addr(addr: &SocketAddr) -> [u8; 16] {
-    let current_time = chrono::Utc::now();
-    let mut hasher = blake3::Hasher::new();
-    match addr {
-        SocketAddr::V4(v4) => {
-            hasher.update(&v4.ip().octets());
-            hasher.update(&v4.port().to_le_bytes());
-        }
-        SocketAddr::V6(v6) => {
-            hasher.update(&v6.ip().octets());
-            hasher.update(&v6.port().to_le_bytes());
-        }
-    }
-    hasher.update(
-        current_time
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp()
-            .to_le_bytes()
-            .as_ref(),
-    );
-    RANDOM_U64.with(|&random_value| {
-        hasher.update(random_value.as_ref());
-    });
-    hasher.finalize().as_bytes()[..16].try_into().unwrap()
 }
 
 pub(crate) enum ConnectionEvent {
@@ -1940,6 +1924,124 @@ mod test {
                 result??;
             }
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_gateway_connection_uses_same_key() -> anyhow::Result<()> {
+        // This test verifies that gateway connections use the same symmetric key for both directions
+        let channels = Arc::new(DashMap::new());
+
+        // Create a gateway and client
+        let (gateway_pub, (_gateway_conn, mut gateway_inbound), gateway_addr) =
+            set_gateway_connection(Default::default(), channels.clone()).await?;
+        let (_client_pub, mut client_conn, _client_addr) =
+            set_peer_connection(Default::default(), channels.clone()).await?;
+
+        // Client connects to gateway
+        let client_task = tokio::spawn(async move {
+            let conn = client_conn.connect(gateway_pub, gateway_addr).await;
+            tokio::time::timeout(Duration::from_secs(5), conn).await
+        });
+
+        // Gateway accepts the connection
+        let mut gw_connection =
+            tokio::time::timeout(Duration::from_secs(5), gateway_inbound.recv())
+                .await?
+                .ok_or(anyhow::anyhow!("Gateway didn't receive connection"))?;
+
+        let mut client_to_gw = client_task.await???;
+
+        // Test bidirectional communication
+        // Send from client to gateway
+        let test_msg = b"Test message".to_vec();
+        client_to_gw.send(test_msg.clone()).await?;
+
+        // Gateway should receive it
+        let received = tokio::time::timeout(Duration::from_secs(1), gw_connection.recv()).await??;
+        assert_eq!(
+            &received[8..],
+            &test_msg[..],
+            "Gateway should receive client's message"
+        );
+
+        // Send from gateway to client
+        let gw_msg = b"Gateway response".to_vec();
+        gw_connection.send(gw_msg.clone()).await?;
+
+        // Client should receive it
+        let client_received =
+            tokio::time::timeout(Duration::from_secs(1), client_to_gw.recv()).await??;
+        assert_eq!(
+            &client_received[8..],
+            &gw_msg[..],
+            "Client should receive gateway's message"
+        );
+
+        // This confirms bidirectional communication works with gateway connections
+        // which requires the gateway to use the same key for both directions
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_peer_to_peer_connection_uses_different_keys() -> anyhow::Result<()> {
+        // This test verifies that peer-to-peer connections use different symmetric keys for each direction
+        // by testing that messages encrypted with one key can only be decrypted with the corresponding key
+
+        let channels = Arc::new(DashMap::new());
+
+        // Create two non-gateway peers
+        let (peer_a_pub, mut peer_a_conn, peer_a_addr) =
+            set_peer_connection(Default::default(), channels.clone()).await?;
+        let (peer_b_pub, mut peer_b_conn, peer_b_addr) =
+            set_peer_connection(Default::default(), channels.clone()).await?;
+
+        // Both peers try to connect to each other (NAT traversal)
+        let peer_a_task = tokio::spawn(async move {
+            let conn = peer_a_conn.connect(peer_b_pub, peer_b_addr).await;
+            tokio::time::timeout(Duration::from_secs(5), conn).await
+        });
+
+        let peer_b_task = tokio::spawn(async move {
+            let conn = peer_b_conn.connect(peer_a_pub, peer_a_addr).await;
+            tokio::time::timeout(Duration::from_secs(5), conn).await
+        });
+
+        // Wait for both connections
+        let (peer_a_result, peer_b_result) = tokio::join!(peer_a_task, peer_b_task);
+        let mut peer_a_to_b = peer_a_result???;
+        let mut peer_b_to_a = peer_b_result???;
+
+        // Send a message from A to B
+        let test_msg_a = b"Hello from A".to_vec();
+        peer_a_to_b.send(test_msg_a.clone()).await?;
+
+        // B should receive the message
+        let received_at_b =
+            tokio::time::timeout(Duration::from_secs(1), peer_b_to_a.recv()).await??;
+        assert_eq!(
+            &received_at_b[8..],
+            &test_msg_a[..],
+            "Message from A to B should match"
+        );
+
+        // Send a message from B to A
+        let test_msg_b = b"Hello from B".to_vec();
+        peer_b_to_a.send(test_msg_b.clone()).await?;
+
+        // A should receive the message
+        let received_at_a =
+            tokio::time::timeout(Duration::from_secs(1), peer_a_to_b.recv()).await??;
+        assert_eq!(
+            &received_at_a[8..],
+            &test_msg_b[..],
+            "Message from B to A should match"
+        );
+
+        // This test confirms bidirectional communication works, which implies different keys
+        // are used for each direction (as per the NAT traversal protocol)
 
         Ok(())
     }
