@@ -301,7 +301,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     outdated_peer.remove(&remote_addr);
                                 }
                             }
-                            let mut packet_data = PacketData::from_buf(&buf[..size]);
+                            let packet_data = PacketData::from_buf(&buf[..size]);
 
                             tracing::trace!(
                                 %remote_addr,
@@ -318,12 +318,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         self.remote_connections.insert(remote_addr, remote_conn);
                                         continue;
                                     }
-                                    Err(mpsc::error::TrySendError::Full(packet)) => {
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
                                         // Channel full, reinsert connection and restore packet_data
                                         self.remote_connections.insert(remote_addr, remote_conn);
-                                        tracing::debug!(%remote_addr, "inbound packet channel full, will try other connections");
-                                        packet_data = packet;
-                                        // Fall through to try other connection types
+                                        tracing::debug!(%remote_addr, "inbound packet channel full, dropping packet to prevent misrouting");
+                                        // Drop the packet instead of falling through - prevents symmetric packets
+                                        // from being sent to RSA decryption handlers
+                                        continue;
                                     }
                                     Err(mpsc::error::TrySendError::Closed(_)) => {
                                         // Channel closed, connection is dead
@@ -340,22 +341,22 @@ impl<S: Socket> UdpPacketsListener<S> {
                             if let Some(inbound_packet_sender) = ongoing_gw_connections.get(&remote_addr) {
                                 match inbound_packet_sender.try_send(packet_data) {
                                     Ok(_) => continue,
-                                    Err(mpsc::error::TrySendError::Full(packet)) => {
-                                        // Channel full, restore packet_data for next attempt
-                                        packet_data = packet;
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        // Channel full, drop packet to prevent misrouting
                                         tracing::debug!(
                                             %remote_addr,
-                                            "ongoing gateway connection channel full, will try other connections"
+                                            "ongoing gateway connection channel full, dropping packet"
                                         );
+                                        continue;
                                     }
-                                    Err(mpsc::error::TrySendError::Closed(packet)) => {
-                                        // Channel closed, remove the connection and restore packet_data
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        // Channel closed, remove the connection
                                         ongoing_gw_connections.remove(&remote_addr);
-                                        packet_data = packet;
                                         tracing::debug!(
                                             %remote_addr,
                                             "ongoing gateway connection channel closed, removing"
                                         );
+                                        continue;
                                     }
                                 }
                             }
