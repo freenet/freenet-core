@@ -2250,6 +2250,7 @@ async fn test_gateway_packet_size_change_after_60s() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Long-running test (75s) - run with --ignored flag"]
 async fn test_production_decryption_error_scenario() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
 
