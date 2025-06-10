@@ -96,7 +96,7 @@ impl Default for ConfigArgs {
                 ignore_protocol_checking: false,
                 gateways: None,
                 location: None,
-                bandwidth_limit: Some(12_500_000), // 10 Mbps = 1.25 MB/s * 10s window
+                bandwidth_limit: None,
                 blocked_addresses: None,
             },
             ws_api: WebsocketApiArgs {
