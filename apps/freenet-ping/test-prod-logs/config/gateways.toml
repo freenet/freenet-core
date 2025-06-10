@@ -1,0 +1,11 @@
+[[gateways]]
+public_key = "/home/ian/code/freenet/freenet-core/main/apps/freenet-ping/test-prod-logs/data/secrets/public.vega.gw.pem"
+
+[gateways.address]
+hostname = "vega.locut.us:31337"
+
+[[gateways]]
+public_key = "/home/ian/code/freenet/freenet-core/main/apps/freenet-ping/test-prod-logs/data/secrets/public.ziggy.gw.pem"
+
+[gateways.address]
+hostname = "technic.locut.us:31337"
