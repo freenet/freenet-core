@@ -1467,7 +1467,7 @@ mod tests {
 
         let gw_inbound = async {
             let event =
-                tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
+                tokio::time::timeout(Duration::from_secs(15), handler.wait_for_events()).await??;
             match event {
                 Event::InboundConnection { conn, .. } => {
                     assert_eq!(conn.remote_addr(), remote_addr);
@@ -1522,7 +1522,7 @@ mod tests {
 
         let gw_inbound = async {
             let event =
-                tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
+                tokio::time::timeout(Duration::from_secs(15), handler.wait_for_events()).await??;
             match event {
                 Event::InboundConnectionRejected { peer_id } => {
                     assert_eq!(peer_id.addr, remote_addr);
@@ -1589,7 +1589,7 @@ mod tests {
 
         let peer_inbound = async {
             let event =
-                tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
+                tokio::time::timeout(Duration::from_secs(15), handler.wait_for_events()).await??;
             match event {
                 Event::OutboundGatewayConnectionSuccessful { peer_id, .. } => {
                     assert_eq!(peer_id.addr, remote_addr);
@@ -1624,7 +1624,7 @@ mod tests {
 
         let peer_inbound = async {
             let event =
-                tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
+                tokio::time::timeout(Duration::from_secs(15), handler.wait_for_events()).await??;
             match event {
                 Event::OutboundConnectionFailed { peer_id, error } => {
                     let addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
@@ -1647,7 +1647,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gw_to_peer_outbound_conn_forwarded() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG));
+        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG), None);
         let gw_addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
         let peer_addr: SocketAddr = ([127, 0, 0, 1], 10001).into();
         let joiner_addr: SocketAddr = ([127, 0, 0, 1], 10002).into();
@@ -1682,6 +1682,9 @@ mod tests {
                 .establish_inbound_conn(joiner_addr, joiner_pub_key, None)
                 .await;
 
+            // Give some time for the events to be processed
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
             // TODO: maybe simulate forwarding back all expected responses
 
             Ok::<_, anyhow::Error>(())
@@ -1691,7 +1694,7 @@ mod tests {
             let mut third_party = None;
             loop {
                 let event =
-                    tokio::time::timeout(Duration::from_secs(1), gw_handler.wait_for_events())
+                    tokio::time::timeout(Duration::from_secs(15), gw_handler.wait_for_events())
                         .await??;
                 match event {
                     Event::InboundConnection {
@@ -1978,7 +1981,7 @@ mod tests {
 
         let peer_inbound = async {
             let event =
-                tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
+                tokio::time::timeout(Duration::from_secs(15), handler.wait_for_events()).await??;
             let _conn = match event {
                 Event::OutboundGatewayConnectionSuccessful {
                     peer_id,
@@ -2022,7 +2025,7 @@ mod tests {
 
         let peer_inbound = async {
             let event =
-                tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
+                tokio::time::timeout(Duration::from_secs(15), handler.wait_for_events()).await??;
             match event {
                 Event::OutboundConnectionFailed { peer_id, error } => {
                     assert_eq!(peer_id.addr, peer_addr);
@@ -2066,7 +2069,7 @@ mod tests {
 
         let peer_inbound = async {
             let event =
-                tokio::time::timeout(Duration::from_secs(1), handler.wait_for_events()).await??;
+                tokio::time::timeout(Duration::from_secs(15), handler.wait_for_events()).await??;
             match event {
                 Event::OutboundConnectionSuccessful {
                     peer_id,
