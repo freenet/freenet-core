@@ -69,7 +69,7 @@ async fn base_node_test_config(
             ignore_protocol_checking: true,
             address: Some(Ipv4Addr::LOCALHOST.into()),
             network_port: public_port,
-            bandwidth_limit: Some(12_500_000), // 10 Mbps = 1.25 MB/s * 10s window
+            bandwidth_limit: None,
             blocked_addresses: None,
         },
         config_paths: {
