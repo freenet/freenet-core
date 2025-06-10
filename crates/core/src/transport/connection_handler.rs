@@ -646,6 +646,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 inbound_symmetric_key: inbound_key,
                 inbound_symmetric_key_bytes: inbound_key_bytes,
                 my_address: None,
+                transport_secret_key: secret,
             };
 
             let inbound_conn = InboundRemoteConnection {
@@ -842,6 +843,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                     inbound_symmetric_key_bytes:
                                                         inbound_sym_key_bytes,
                                                     my_address: Some(my_address),
+                                                    transport_secret_key: transport_secret_key
+                                                        .clone(),
                                                 },
                                                 InboundRemoteConnection {
                                                     inbound_packet_sender: inbound_sender,
@@ -907,6 +910,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         inbound_symmetric_key: inbound_sym_key,
                                         inbound_symmetric_key_bytes: inbound_sym_key_bytes,
                                         my_address: None,
+                                        transport_secret_key: transport_secret_key.clone(),
                                     },
                                     InboundRemoteConnection {
                                         inbound_packet_sender: inbound_sender,

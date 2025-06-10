@@ -5,6 +5,7 @@ use std::time::Duration;
 use std::{collections::HashMap, time::Instant};
 
 use crate::transport::connection_handler::NAT_TRAVERSAL_MAX_ATTEMPTS;
+use crate::transport::crypto::TransportSecretKey;
 use crate::transport::packet_data::UnknownEncryption;
 use crate::transport::sent_packet_tracker::MESSAGE_CONFIRMATION_TIMEOUT;
 use aes_gcm::Aes128Gcm;
@@ -47,6 +48,7 @@ pub(crate) struct RemoteConnection {
     pub(super) inbound_symmetric_key: Aes128Gcm,
     pub(super) inbound_symmetric_key_bytes: [u8; 16],
     pub(super) my_address: Option<SocketAddr>,
+    pub(super) transport_secret_key: TransportSecretKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -157,6 +159,7 @@ impl PeerConnection {
             inbound_symmetric_key,
             inbound_symmetric_key_bytes: [1; 16],
             my_address: Some(my_address),
+            transport_secret_key: super::crypto::TransportKeypair::new().secret,
         };
         (
             Self::new(remote),
@@ -186,6 +189,7 @@ impl PeerConnection {
                 inbound_symmetric_key,
                 inbound_symmetric_key_bytes: [1; 16],
                 my_address: Some(my_address),
+                transport_secret_key: super::crypto::TransportKeypair::new().secret,
             },
             inbound_packet_sender,
             outbound_packets_recv,
@@ -215,14 +219,8 @@ impl PeerConnection {
         // listen for incoming messages or receipts or wait until is time to do anything else again
         let mut resend_check = Some(tokio::time::sleep(tokio::time::Duration::from_millis(10)));
 
-        #[cfg(debug_assertions)]
-        const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(2);
-        #[cfg(not(debug_assertions))]
-        const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(20);
-        #[cfg(debug_assertions)]
-        const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(6);
-        #[cfg(not(debug_assertions))]
-        const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(60);
+        const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+        const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(30);
 
         let mut keep_alive = tokio::time::interval(KEEP_ALIVE_INTERVAL);
         keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -236,14 +234,85 @@ impl PeerConnection {
                 inbound = self.remote_conn.inbound_packet_recv.recv() => {
                     let packet_data = inbound.ok_or(TransportError::ConnectionClosed(self.remote_addr()))?;
                     last_received = std::time::Instant::now();
+
+                    // Debug logging for 256-byte packets
+                    if packet_data.data().len() == 256 {
+                        tracing::warn!(
+                            remote = ?self.remote_conn.remote_addr,
+                            packet_bytes = ?&packet_data.data()[..32], // First 32 bytes
+                            packet_len = packet_data.data().len(),
+                            "Received 256-byte packet"
+                        );
+                    }
+
                     let Ok(decrypted) = packet_data.try_decrypt_sym(&self.remote_conn.inbound_symmetric_key).inspect_err(|error| {
                         tracing::warn!(
                             %error,
                             remote = ?self.remote_conn.remote_addr,
                             inbound_key = ?self.remote_conn.inbound_symmetric_key_bytes,
+                            packet_len = packet_data.data().len(),
+                            packet_first_bytes = ?&packet_data.data()[..std::cmp::min(32, packet_data.data().len())],
                             "Failed to decrypt packet, might be an intro packet or a partial packet"
                         );
                     }) else {
+                        // Check if this is a 256-byte RSA intro packet
+                        if packet_data.data().len() == 256 {
+                            tracing::info!(
+                                remote = ?self.remote_conn.remote_addr,
+                                "Attempting to decrypt potential RSA intro packet"
+                            );
+
+                            // Try to decrypt as RSA intro packet
+                            match self.remote_conn.transport_secret_key.decrypt(packet_data.data()) {
+                                Ok(_decrypted_intro) => {
+                                    tracing::info!(
+                                        remote = ?self.remote_conn.remote_addr,
+                                        "Successfully decrypted RSA intro packet, sending ACK"
+                                    );
+
+                                    // Send ACK response for intro packet
+                                    let ack_packet = SymmetricMessage::ack_ok(
+                                        &self.remote_conn.outbound_symmetric_key,
+                                        self.remote_conn.inbound_symmetric_key_bytes,
+                                        self.remote_conn.remote_addr,
+                                    );
+
+                                    if let Ok(ack) = ack_packet {
+                                        if let Err(send_err) = self.remote_conn
+                                            .outbound_packets
+                                            .send((self.remote_conn.remote_addr, ack.data().into()))
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                remote = ?self.remote_conn.remote_addr,
+                                                error = ?send_err,
+                                                "Failed to send ACK for intro packet"
+                                            );
+                                        } else {
+                                            tracing::info!(
+                                                remote = ?self.remote_conn.remote_addr,
+                                                "Successfully sent ACK for intro packet"
+                                            );
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            remote = ?self.remote_conn.remote_addr,
+                                            "Failed to create ACK packet for intro"
+                                        );
+                                    }
+
+                                    // Continue to next packet
+                                    continue;
+                                }
+                                Err(rsa_err) => {
+                                    tracing::debug!(
+                                        remote = ?self.remote_conn.remote_addr,
+                                        error = ?rsa_err,
+                                        "256-byte packet is not a valid RSA intro packet"
+                                    );
+                                }
+                            }
+                        }
                         let now = Instant::now();
                         if let Some(first_failure_time) = self.first_failure_time {
                             if now.duration_since(first_failure_time) <= FAILURE_TIME_WINDOW {

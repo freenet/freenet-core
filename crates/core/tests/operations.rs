@@ -2022,3 +2022,419 @@ async fn test_delegate_request() -> TestResult {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_gateway_packet_size_change_after_60s() -> TestResult {
+    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
+
+    // Load test contract
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+
+    // Create initial state
+    let initial_state = test_utils::create_empty_todo_list();
+    let wrapped_state = WrappedState::from(initial_state);
+
+    // Create network sockets
+    let network_socket_gw1 = TcpListener::bind("127.0.0.1:0")?;
+    let network_socket_gw2 = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_socket_client = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_socket_gw1 = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_socket_gw2 = TcpListener::bind("127.0.0.1:0")?;
+
+    // Configure first gateway node
+    let (config_gw1, preset_cfg_gw1, config_gw1_info) = {
+        let (cfg, preset) = base_node_test_config(
+            true,
+            vec![],
+            Some(network_socket_gw1.local_addr()?.port()),
+            ws_api_port_socket_gw1.local_addr()?.port(),
+        )
+        .await?;
+        let public_port = cfg.network_api.public_port.unwrap();
+        let path = preset.temp_dir.path().to_path_buf();
+        (cfg, preset, gw_config(public_port, &path)?)
+    };
+
+    // Configure second gateway node (connects to first gateway)
+    let (config_gw2, preset_cfg_gw2, config_gw2_info) = {
+        let (cfg, preset) = base_node_test_config(
+            true,
+            vec![serde_json::to_string(&config_gw1_info)?], // Connect to gateway 1
+            Some(network_socket_gw2.local_addr()?.port()),
+            ws_api_port_socket_gw2.local_addr()?.port(),
+        )
+        .await?;
+        let public_port = cfg.network_api.public_port.unwrap();
+        let path = preset.temp_dir.path().to_path_buf();
+        (cfg, preset, gw_config(public_port, &path)?)
+    };
+
+    // Configure client node (connects via gateway 2)
+    let (config_client, preset_cfg_client) = base_node_test_config(
+        false,
+        vec![serde_json::to_string(&config_gw2_info)?],
+        None,
+        ws_api_port_socket_client.local_addr()?.port(),
+    )
+    .await?;
+    let ws_api_port_client = config_client.ws_api.ws_api_port.unwrap();
+
+    // Log data directories
+    tracing::info!(
+        "Client node data dir: {:?}",
+        preset_cfg_client.temp_dir.path()
+    );
+    tracing::info!(
+        "Gateway 1 node data dir: {:?}",
+        preset_cfg_gw1.temp_dir.path()
+    );
+    tracing::info!(
+        "Gateway 2 node data dir: {:?}",
+        preset_cfg_gw2.temp_dir.path()
+    );
+
+    // Free ports
+    std::mem::drop(ws_api_port_socket_client);
+    std::mem::drop(network_socket_gw1);
+    std::mem::drop(network_socket_gw2);
+    std::mem::drop(ws_api_port_socket_gw1);
+    std::mem::drop(ws_api_port_socket_gw2);
+
+    // Start gateway 1 node
+    let node_gw1 = async {
+        let config = config_gw1.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    // Start gateway 2 node (connects to gateway 1)
+    let node_gw2 = async {
+        let config = config_gw2.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    // Start client node
+    let node_client = async move {
+        let config = config_client.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    let test = tokio::time::timeout(Duration::from_secs(180), async {
+        // Wait for nodes to start (gateways need to connect to each other)
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        // Connect to client node
+        let uri = format!(
+            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+            ws_api_port_client
+        );
+        let (stream, _) = connect_async(&uri).await?;
+        let mut client = WebApi::start(stream);
+
+        // Put contract
+        make_put(&mut client, wrapped_state.clone(), contract.clone(), false).await?;
+
+        // Wait for put response
+        let resp = tokio::time::timeout(Duration::from_secs(30), client.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                assert_eq!(key, contract_key);
+                tracing::info!("Successfully put contract");
+            }
+            _ => {
+                bail!("Failed to put contract");
+            }
+        }
+
+        // Now keep the connection alive for 90 seconds, sending periodic GET requests
+        tracing::info!("Starting packet size change test - monitoring for 75 seconds");
+        let start_time = std::time::Instant::now();
+        let mut get_count = 0;
+        let mut error_count = 0;
+
+        while start_time.elapsed() < Duration::from_secs(75) {
+            // Send a GET request every 5 seconds for more frequent monitoring
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            get_count += 1;
+
+            let elapsed = start_time.elapsed();
+            tracing::info!("Sending GET request #{} at {:?}", get_count, elapsed);
+
+            // Log if we're past the 60-second mark where errors typically start
+            if elapsed > Duration::from_secs(60) {
+                tracing::warn!("Past 60-second mark - monitoring for packet size changes");
+            }
+
+            make_get(&mut client, contract_key, false, false).await?;
+
+            // Try to receive response with a shorter timeout
+            match tokio::time::timeout(Duration::from_secs(10), client.recv()).await {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                    key,
+                    ..
+                }))) => {
+                    assert_eq!(key, contract_key);
+                    tracing::info!("GET request #{} succeeded", get_count);
+                }
+                Ok(Ok(other)) => {
+                    tracing::warn!(
+                        "GET request #{} unexpected response: {:?}",
+                        get_count,
+                        other
+                    );
+                    error_count += 1;
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("GET request #{} error: {}", get_count, e);
+                    error_count += 1;
+                }
+                Err(_) => {
+                    tracing::error!("GET request #{} timed out", get_count);
+                    error_count += 1;
+                }
+            }
+        }
+
+        tracing::info!(
+            "Long-running test completed: {} GET requests, {} errors",
+            get_count,
+            error_count
+        );
+
+        // The test passes if we don't crash with decryption errors
+        // In production, decryption errors would cause the connection to fail
+        if error_count > get_count / 2 {
+            bail!("Too many errors during long-running connection test");
+        }
+
+        Ok::<_, anyhow::Error>(())
+    });
+
+    // Wait for test completion or node failures
+    select! {
+        gw1 = node_gw1 => {
+            let Err(e) = gw1;
+            return Err(anyhow!("Gateway 1 node failed: {}", e).into())
+        }
+        gw2 = node_gw2 => {
+            let Err(e) = gw2;
+            return Err(anyhow!("Gateway 2 node failed: {}", e).into())
+        }
+        client = node_client => {
+            let Err(e) = client;
+            return Err(anyhow!("Client node failed: {}", e).into())
+        }
+        r = test => {
+            r??;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Long-running test (75s) - run with --ignored flag"]
+async fn test_production_decryption_error_scenario() -> TestResult {
+    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
+
+    // This test attempts to reproduce the exact production scenario:
+    // 1. Client connects to gateway (vega)
+    // 2. Connection works fine for ~60 seconds with 48-byte packets
+    // 3. After 60 seconds, 256-byte packets arrive that fail to decrypt
+
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+
+    let initial_state = test_utils::create_empty_todo_list();
+    let wrapped_state = WrappedState::from(initial_state);
+
+    // Create sockets
+    let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_socket_client = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_socket_gw = TcpListener::bind("127.0.0.1:0")?;
+
+    // Configure gateway (simulating vega)
+    let (config_gw, preset_cfg_gw, config_gw_info) = {
+        let (cfg, preset) = base_node_test_config(
+            true,
+            vec![],
+            Some(network_socket_gw.local_addr()?.port()),
+            ws_api_port_socket_gw.local_addr()?.port(),
+        )
+        .await?;
+        let public_port = cfg.network_api.public_port.unwrap();
+        let path = preset.temp_dir.path().to_path_buf();
+        (cfg, preset, gw_config(public_port, &path)?)
+    };
+
+    // Configure client node
+    let (config_client, preset_cfg_client) = base_node_test_config(
+        false,
+        vec![serde_json::to_string(&config_gw_info)?],
+        None,
+        ws_api_port_socket_client.local_addr()?.port(),
+    )
+    .await?;
+    let ws_api_port_client = config_client.ws_api.ws_api_port.unwrap();
+
+    tracing::info!(
+        "Client node data dir: {:?}",
+        preset_cfg_client.temp_dir.path()
+    );
+    tracing::info!("Gateway node data dir: {:?}", preset_cfg_gw.temp_dir.path());
+
+    // Free ports
+    std::mem::drop(ws_api_port_socket_client);
+    std::mem::drop(network_socket_gw);
+    std::mem::drop(ws_api_port_socket_gw);
+
+    // Start nodes
+    let node_gw = async {
+        let config = config_gw.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    let node_client = async move {
+        let config = config_client.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    let test = tokio::time::timeout(Duration::from_secs(90), async {
+        // Wait for nodes to start
+        tokio::time::sleep(Duration::from_secs(15)).await;
+
+        // Connect to client node
+        let uri = format!(
+            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+            ws_api_port_client
+        );
+        let (stream, _) = connect_async(&uri).await?;
+        let mut client = WebApi::start(stream);
+
+        // Put contract
+        make_put(&mut client, wrapped_state.clone(), contract.clone(), false).await?;
+
+        // Wait for put response
+        let resp = tokio::time::timeout(Duration::from_secs(30), client.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                assert_eq!(key, contract_key);
+                tracing::info!("Successfully put contract");
+            }
+            _ => {
+                bail!("Failed to put contract");
+            }
+        }
+
+        // Monitor connection for 75 seconds
+        tracing::info!("Starting production scenario simulation - monitoring for 75 seconds");
+        let start_time = std::time::Instant::now();
+        let mut last_success_time = start_time;
+        let mut error_count = 0;
+        let mut success_count = 0;
+
+        while start_time.elapsed() < Duration::from_secs(75) {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            let elapsed = start_time.elapsed();
+
+            // Try a GET request
+            make_get(&mut client, contract_key, false, false).await?;
+
+            match tokio::time::timeout(Duration::from_secs(5), client.recv()).await {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                    key,
+                    ..
+                }))) => {
+                    assert_eq!(key, contract_key);
+                    success_count += 1;
+                    last_success_time = std::time::Instant::now();
+                    tracing::info!(
+                        "GET succeeded at {:?} (success #{})",
+                        elapsed,
+                        success_count
+                    );
+                }
+                Ok(Ok(other)) => {
+                    error_count += 1;
+                    tracing::error!("GET unexpected response at {:?}: {:?}", elapsed, other);
+                }
+                Ok(Err(e)) => {
+                    error_count += 1;
+                    tracing::error!("GET error at {:?}: {}", elapsed, e);
+                }
+                Err(_) => {
+                    error_count += 1;
+                    tracing::error!("GET timeout at {:?}", elapsed);
+                }
+            }
+
+            // Log status around the critical 60-second mark
+            if elapsed > Duration::from_secs(58) && elapsed < Duration::from_secs(65) {
+                tracing::warn!(
+                    "Critical period - elapsed: {:?}, errors: {}, last success: {:?} ago",
+                    elapsed,
+                    error_count,
+                    std::time::Instant::now().duration_since(last_success_time)
+                );
+            }
+        }
+
+        tracing::info!(
+            "Test completed: {} successes, {} errors",
+            success_count,
+            error_count
+        );
+
+        // In production, all requests fail after ~60 seconds
+        // For now, we just log the results to see if we can reproduce the pattern
+
+        Ok::<_, anyhow::Error>(())
+    });
+
+    // Wait for test completion or node failures
+    select! {
+        gw = node_gw => {
+            let Err(e) = gw;
+            return Err(anyhow!("Gateway node failed: {}", e).into())
+        }
+        client = node_client => {
+            let Err(e) = client;
+            return Err(anyhow!("Client node failed: {}", e).into())
+        }
+        r = test => {
+            r??;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    Ok(())
+}
