@@ -139,4 +139,12 @@ impl SeedingManager {
             subs
         });
     }
+
+    /// Get all subscriptions across all contracts
+    pub fn all_subscriptions(&self) -> Vec<(ContractKey, Vec<PeerKeyLocation>)> {
+        self.subscribers
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect()
+    }
 }

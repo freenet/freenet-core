@@ -308,6 +308,11 @@ impl Ring {
         self.seeding_manager.subscribers_of(contract)
     }
 
+    /// Get all network subscriptions across all contracts
+    pub fn all_network_subscriptions(&self) -> Vec<(ContractKey, Vec<PeerKeyLocation>)> {
+        self.seeding_manager.all_subscriptions()
+    }
+
     pub async fn prune_connection(&self, peer: PeerId) {
         tracing::debug!(%peer, "Removing connection");
         self.live_tx_tracker.prune_transactions_from_peer(&peer);

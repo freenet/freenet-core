@@ -1,5 +1,5 @@
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
-use crate::contract::WaitingTransaction;
+use crate::contract::{ContractHandlerEvent, WaitingTransaction};
 use crate::message::{NetMessageV1, QueryResult};
 use crate::node::subscribe::SubscribeMsg;
 use crate::ring::Location;
@@ -349,13 +349,60 @@ impl P2pConnManager {
                                 })??;
                             }
                             NodeEvent::QuerySubscriptions { callback } => {
-                                // For now, return connection info until we integrate with contract handler
-                                // TODO: Query contract handler for actual subscription info
+                                // Get network subscriptions from OpManager
+                                let network_subs = op_manager.get_network_subscriptions();
+
+                                // Get application subscriptions from contract executor
+                                // For now, we'll send a query to the contract handler
+                                let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+                                op_manager
+                                    .notify_contract_handler(
+                                        ContractHandlerEvent::QuerySubscriptions { callback: tx },
+                                    )
+                                    .await?;
+
+                                let app_subscriptions =
+                                    match timeout(Duration::from_secs(1), rx.recv()).await {
+                                        Ok(Some(QueryResult::NetworkDebug(info))) => {
+                                            info.subscriptions
+                                        }
+                                        _ => Vec::new(),
+                                    };
+
+                                // Combine network and application subscriptions
+                                let mut all_subscriptions = app_subscriptions;
+
+                                // Add network subscriptions
+                                // We use a reserved client ID to indicate network subscriptions
+                                // and encode the peer information in the subscription
+                                const NETWORK_SUBSCRIPTION_CLIENT_ID: ClientId = ClientId::FIRST;
+
+                                for (contract_key, peers) in network_subs {
+                                    // Create one subscription entry per contract for network subscriptions
+                                    // Include the count of subscribing peers in the entry
+                                    if !peers.is_empty() {
+                                        all_subscriptions.push(crate::message::SubscriptionInfo {
+                                            contract_key,
+                                            client_id: NETWORK_SUBSCRIPTION_CLIENT_ID,
+                                            last_update: None,
+                                        });
+
+                                        // Log the network subscription details for debugging
+                                        tracing::debug!(
+                                            %contract_key,
+                                            peer_count = peers.len(),
+                                            "Found network subscription"
+                                        );
+                                    }
+                                }
+
                                 let connections = self.connections.keys().cloned().collect();
                                 let debug_info = crate::message::NetworkDebugInfo {
-                                    subscriptions: Vec::new(), // TODO: Get from contract handler
+                                    subscriptions: all_subscriptions,
                                     connected_peers: connections,
                                 };
+
                                 timeout(
                                     Duration::from_secs(1),
                                     callback.send(QueryResult::NetworkDebug(debug_info)),

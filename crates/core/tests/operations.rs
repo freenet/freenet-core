@@ -10,7 +10,7 @@ use freenet::{
     },
 };
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractResponse, HostResponse, QueryResponse, WebApi},
     prelude::*,
 };
 use futures::FutureExt;
@@ -23,6 +23,7 @@ use std::{
 };
 use testresult::TestResult;
 use tokio::select;
+use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 
@@ -2434,6 +2435,201 @@ async fn test_production_decryption_error_scenario() -> TestResult {
         r = test => {
             r??;
             tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    Ok(())
+}
+
+// Helper functions for future full subscription testing
+#[allow(dead_code)]
+async fn wait_for_put_response(
+    client: &mut WebApi,
+    expected_key: &ContractKey,
+) -> Result<ContractKey, anyhow::Error> {
+    let resp = timeout(Duration::from_secs(30), client.recv()).await??;
+    match resp {
+        HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
+            if &key != expected_key {
+                bail!(
+                    "Put response key mismatch: expected {}, got {}",
+                    expected_key,
+                    key
+                );
+            }
+            Ok(key)
+        }
+        other => {
+            bail!("Unexpected response while waiting for put: {:?}", other);
+        }
+    }
+}
+
+#[allow(dead_code)]
+async fn wait_for_subscribe_response(
+    client: &mut WebApi,
+    expected_key: &ContractKey,
+) -> Result<(), anyhow::Error> {
+    let resp = timeout(Duration::from_secs(10), client.recv()).await??;
+    match resp {
+        HostResponse::ContractResponse(ContractResponse::SubscribeResponse { key, .. }) => {
+            if &key != expected_key {
+                bail!(
+                    "Subscribe response key mismatch: expected {}, got {}",
+                    expected_key,
+                    key
+                );
+            }
+            Ok(())
+        }
+        other => {
+            bail!(
+                "Unexpected response while waiting for subscribe: {:?}",
+                other
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_subscription_introspection() -> TestResult {
+    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
+
+    // Load test contract - not used in this simplified test
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let _contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+
+    // Create initial state - not used in this simplified test
+    let _initial_state = test_utils::create_empty_todo_list();
+
+    // Setup network sockets
+    let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
+    let network_socket_node = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_socket_gw = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_socket_node = TcpListener::bind("127.0.0.1:0")?;
+
+    // Configure gateway node
+    let (config_gw, preset_cfg_gw, config_gw_info) = {
+        let (cfg, preset) = base_node_test_config(
+            true,
+            vec![],
+            Some(network_socket_gw.local_addr()?.port()),
+            ws_api_port_socket_gw.local_addr()?.port(),
+        )
+        .await?;
+        let public_port = cfg.network_api.public_port.unwrap();
+        let path = preset.temp_dir.path().to_path_buf();
+        (cfg, preset, gw_config(public_port, &path)?)
+    };
+    let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
+
+    // Configure regular node
+    let (config_node, preset_cfg_node) = base_node_test_config(
+        false,
+        vec![serde_json::to_string(&config_gw_info)?],
+        Some(network_socket_node.local_addr()?.port()),
+        ws_api_port_socket_node.local_addr()?.port(),
+    )
+    .await?;
+    let ws_api_port_node = config_node.ws_api.ws_api_port.unwrap();
+
+    tracing::info!("Gateway data dir: {:?}", preset_cfg_gw.temp_dir.path());
+    tracing::info!("Node data dir: {:?}", preset_cfg_node.temp_dir.path());
+
+    // Free ports
+    std::mem::drop(network_socket_gw);
+    std::mem::drop(network_socket_node);
+    std::mem::drop(ws_api_port_socket_gw);
+    std::mem::drop(ws_api_port_socket_node);
+
+    // Start nodes
+    let node_gw = async {
+        let config = config_gw.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    let node_regular = async {
+        let config = config_node.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    let test = tokio::time::timeout(Duration::from_secs(60), async {
+        // Wait for nodes to start and connect
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        // Connect to gateway websocket API
+        let uri_gw = format!(
+            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+            ws_api_port_gw
+        );
+        let (stream_gw, _) = connect_async(&uri_gw).await?;
+        let mut client_gw = WebApi::start(stream_gw);
+
+        // Connect to node websocket API
+        let uri_node = format!(
+            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+            ws_api_port_node
+        );
+        let (stream_node, _) = connect_async(&uri_node).await?;
+        let _client_node = WebApi::start(stream_node);
+
+        // First just test that we can query subscription info
+        tracing::info!("Testing basic subscription query without any subscriptions");
+
+        // Query subscription info from gateway
+        tracing::info!("Querying subscription info from gateway");
+        client_gw
+            .send(ClientRequest::NodeQueries(
+                freenet_stdlib::client_api::NodeQuery::SubscriptionInfo,
+            ))
+            .await?;
+
+        // Wait for subscription info response
+        let resp = timeout(Duration::from_secs(5), client_gw.recv()).await??;
+
+        match resp {
+            HostResponse::QueryResponse(QueryResponse::NetworkDebug(info)) => {
+                tracing::info!("Gateway subscription info:");
+                tracing::info!("  Connected peers: {:?}", info.connected_peers);
+                tracing::info!("  Total subscriptions: {}", info.subscriptions.len());
+
+                // Should be empty since we haven't subscribed to anything
+                assert!(
+                    info.subscriptions.is_empty(),
+                    "Expected no subscriptions initially"
+                );
+                tracing::info!("Test passed - query subscription info works");
+            }
+            other => {
+                bail!("Unexpected response: {:?}", other);
+            }
+        }
+
+        Ok::<_, anyhow::Error>(())
+    });
+
+    // Run test with timeout
+    select! {
+        gw = node_gw => {
+            let Err(e) = gw;
+            return Err(anyhow!("Gateway node failed: {}", e).into())
+        }
+        node = node_regular => {
+            let Err(e) = node;
+            return Err(anyhow!("Regular node failed: {}", e).into())
+        }
+        r = test => {
+            r??
         }
     }
 

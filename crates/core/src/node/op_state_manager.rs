@@ -10,12 +10,14 @@ use std::{cmp::Reverse, collections::BTreeSet, sync::Arc, time::Duration};
 
 use dashmap::{DashMap, DashSet};
 use either::Either;
+use freenet_stdlib::prelude::ContractKey;
 use tracing::Instrument;
 
 use crate::{
     config::GlobalExecutor,
     contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent, SenderHalve},
     message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
+    node::PeerId,
     operations::{
         connect::ConnectOp, get::GetOp, put::PutOp, subscribe::SubscribeOp, update::UpdateOp,
         OpEnum, OpError,
@@ -23,7 +25,7 @@ use crate::{
     ring::{ConnectionManager, LiveTransactionTracker, Ring},
 };
 
-use super::{network_bridge::EventLoopNotificationsSender, NetEventRegister, NodeConfig, PeerId};
+use super::{network_bridge::EventLoopNotificationsSender, NetEventRegister, NodeConfig};
 
 #[cfg(debug_assertions)]
 macro_rules! check_id_op {
@@ -133,6 +135,19 @@ impl OpManager {
             .send(Either::Right(msg))
             .await
             .map_err(Into::into)
+    }
+
+    /// Get all network subscription information
+    /// Returns a map of contract keys to lists of subscribing peers
+    pub fn get_network_subscriptions(&self) -> Vec<(ContractKey, Vec<PeerId>)> {
+        self.ring
+            .all_network_subscriptions()
+            .into_iter()
+            .map(|(contract_key, subscribers)| {
+                let peer_ids: Vec<PeerId> = subscribers.into_iter().map(|sub| sub.peer).collect();
+                (contract_key, peer_ids)
+            })
+            .collect()
     }
 
     #[allow(dead_code)] // FIXME: enable async sub-transactions
