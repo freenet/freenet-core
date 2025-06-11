@@ -255,7 +255,7 @@ where
                             }
                             QueryResult::NetworkDebug(debug_info) => {
                                 // Convert internal types to stdlib types
-                                let subscriptions = debug_info.subscriptions.into_iter().map(|sub| {
+                                let subscriptions = debug_info.application_subscriptions.into_iter().map(|sub| {
                                     freenet_stdlib::client_api::SubscriptionInfo {
                                         contract_key: sub.contract_key,
                                         client_id: sub.client_id.into(),

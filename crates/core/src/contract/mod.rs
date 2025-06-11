@@ -233,7 +233,8 @@ where
                 let subscriptions = contract_handler.executor().get_subscription_info();
                 let connections = vec![]; // For now, we'll populate this from the calling context
                 let network_debug = crate::message::NetworkDebugInfo {
-                    subscriptions,
+                    application_subscriptions: subscriptions,
+                    network_subscriptions: vec![], // Contract handler only tracks application subscriptions
                     connected_peers: connections,
                 };
                 let _ = callback

@@ -365,33 +365,18 @@ impl P2pConnManager {
                                 let app_subscriptions =
                                     match timeout(Duration::from_secs(1), rx.recv()).await {
                                         Ok(Some(QueryResult::NetworkDebug(info))) => {
-                                            info.subscriptions
+                                            info.application_subscriptions
                                         }
                                         _ => Vec::new(),
                                     };
 
-                                // Combine network and application subscriptions
-                                let mut all_subscriptions = app_subscriptions;
-
-                                // Add network subscriptions
-                                // We use a reserved client ID to indicate network subscriptions
-                                // and encode the peer information in the subscription
-                                const NETWORK_SUBSCRIPTION_CLIENT_ID: ClientId = ClientId::FIRST;
-
-                                for (contract_key, peers) in network_subs {
-                                    // Create one subscription entry per contract for network subscriptions
-                                    // Include the count of subscribing peers in the entry
+                                // Log network subscription details for debugging
+                                for (contract_key, peers) in &network_subs {
                                     if !peers.is_empty() {
-                                        all_subscriptions.push(crate::message::SubscriptionInfo {
-                                            contract_key,
-                                            client_id: NETWORK_SUBSCRIPTION_CLIENT_ID,
-                                            last_update: None,
-                                        });
-
-                                        // Log the network subscription details for debugging
                                         tracing::debug!(
                                             %contract_key,
                                             peer_count = peers.len(),
+                                            peers = ?peers,
                                             "Found network subscription"
                                         );
                                     }
@@ -399,7 +384,8 @@ impl P2pConnManager {
 
                                 let connections = self.connections.keys().cloned().collect();
                                 let debug_info = crate::message::NetworkDebugInfo {
-                                    subscriptions: all_subscriptions,
+                                    application_subscriptions: app_subscriptions,
+                                    network_subscriptions: network_subs,
                                     connected_peers: connections,
                                 };
 
