@@ -1687,6 +1687,9 @@ mod tests {
                 .await;
             tracing::info!("TEST: Peer connection established");
 
+            // Wait longer to ensure the peer connection is fully processed
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
             // the joiner attempts to connect to the gw, but since it's out of connections
             // it will just be a transient connection
             tracing::info!("TEST: Establishing joiner connection");
