@@ -151,7 +151,13 @@ impl OutboundConnectionHandler {
             send_queue: conn_handler_sender,
         };
 
-        task::spawn(bw_tracker.rate_limiter(bandwidth_limit, socket));
+        // IMPORTANT: The general packet rate limiter is disabled (passing None) due to reliability issues.
+        // It was serializing all packets and grinding transfers to a halt.
+        //
+        // Bandwidth limiting is now only applied to large streaming transfers via send_stream()
+        // in RemoteConnection. The bandwidth_limit parameter is still passed to RemoteConnection
+        // for this purpose (default: 3 MB/s).
+        task::spawn(bw_tracker.rate_limiter(None, socket));
         task::spawn(RANDOM_U64.scope(StdRng::from_entropy().gen(), transport.listen()));
 
         Ok((connection_handler, new_connection_notifier))

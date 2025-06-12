@@ -96,7 +96,7 @@ impl Default for ConfigArgs {
                 ignore_protocol_checking: false,
                 gateways: None,
                 location: None,
-                bandwidth_limit: None,
+                bandwidth_limit: Some(3_000_000), // 3 MB/s default for streaming transfers only
                 blocked_addresses: None,
             },
             ws_api: WebsocketApiArgs {
@@ -488,7 +488,10 @@ pub struct NetworkArgs {
     #[arg(long)]
     pub ignore_protocol_checking: bool,
 
-    /// Hard limit the bandwidth usage for upstream traffic.
+    /// Bandwidth limit for large streaming data transfers (in bytes per second).
+    /// NOTE: This only applies to the send_stream mechanism for large data transfers.
+    /// The general packet rate limiter is currently disabled due to reliability issues.
+    /// Default: 3 MB/s (3,000,000 bytes/second)
     #[arg(long)]
     pub bandwidth_limit: Option<usize>,
 
@@ -552,7 +555,10 @@ pub struct NetworkApiConfig {
     #[serde(skip)]
     pub ignore_protocol_version: bool,
 
-    /// Hard limit the bandwidth usage for upstream traffic.
+    /// Bandwidth limit for large streaming data transfers (in bytes per second).
+    /// NOTE: This only applies to the send_stream mechanism for large data transfers.
+    /// The general packet rate limiter is currently disabled due to reliability issues.
+    /// Default: 3 MB/s (3,000,000 bytes/second)
     pub bandwidth_limit: Option<usize>,
 
     /// List of IP:port addresses to refuse connections to/from.
