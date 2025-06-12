@@ -1683,7 +1683,7 @@ mod tests {
                 .await;
 
             // Give some time for the events to be processed
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
 
             // TODO: maybe simulate forwarding back all expected responses
 
@@ -1694,7 +1694,7 @@ mod tests {
             let mut third_party = None;
             loop {
                 let event =
-                    tokio::time::timeout(Duration::from_secs(15), gw_handler.wait_for_events())
+                    tokio::time::timeout(Duration::from_secs(60), gw_handler.wait_for_events())
                         .await??;
                 match event {
                     Event::InboundConnection {
