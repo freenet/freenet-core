@@ -257,6 +257,11 @@ impl HandshakeHandler {
     #[instrument(skip(self))]
     pub async fn wait_for_events(&mut self) -> Result<Event, HandshakeError> {
         loop {
+            tracing::trace!(
+                "wait_for_events loop iteration - unconfirmed: {}, ongoing_outbound: {}",
+                self.unconfirmed_inbound_connections.len(),
+                self.ongoing_outbound_connections.len()
+            );
             tokio::select! {
                 // Handle new inbound connections
                 new_conn = self.inbound_conn_handler.next_connection() => {
@@ -348,10 +353,12 @@ impl HandshakeHandler {
                 }
                 // Handle unconfirmed inbound connections (only applies in gateways)
                 unconfirmed_inbound_conn = self.unconfirmed_inbound_connections.next(), if !self.unconfirmed_inbound_connections.is_empty() => {
+                    tracing::debug!("Processing unconfirmed inbound connection");
                     let Some(res) = unconfirmed_inbound_conn else {
                         return Err(HandshakeError::ChannelClosed);
                     };
                     let (event, outbound_sender) = res?;
+                    tracing::debug!("Unconfirmed connection event: {:?}", event);
                     match event {
                         InternalEvent::InboundGwJoinRequest(mut req) => {
                             let location = if let Some((_, other)) = self.this_location.zip(req.location) {
@@ -633,9 +640,11 @@ impl HandshakeHandler {
     fn track_inbound_connection(&mut self, conn: PeerConnection) {
         let (outbound_msg_sender, outbound_msg_recv) = mpsc::channel(100);
         let remote = conn.remote_addr();
+        tracing::debug!(%remote, "Tracking inbound connection - spawning gw_peer_connection_listener");
         let f = gw_peer_connection_listener(conn, PeerOutboundMessage(outbound_msg_recv)).boxed();
         self.unconfirmed_inbound_connections.push(f);
         self.outbound_messages.insert(remote, outbound_msg_sender);
+        tracing::debug!(%remote, "Inbound connection tracked - unconfirmed count: {}", self.unconfirmed_inbound_connections.len());
     }
 
     /// Handles outbound messages to peers.
@@ -985,6 +994,7 @@ async fn gw_peer_connection_listener(
     mut conn: PeerConnection,
     mut outbound: PeerOutboundMessage,
 ) -> Result<(InternalEvent, PeerOutboundMessage), HandshakeError> {
+    tracing::debug!(from=%conn.remote_addr(), "Starting gw_peer_connection_listener");
     loop {
         tokio::select! {
             msg = outbound.0.recv() => {
@@ -1647,7 +1657,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_gw_to_peer_outbound_conn_forwarded() -> anyhow::Result<()> {
-        // crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG), None);
+        // Enable debug logging for CI debugging
+        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG), None);
         let gw_addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
         let peer_addr: SocketAddr = ([127, 0, 0, 1], 10001).into();
         let joiner_addr: SocketAddr = ([127, 0, 0, 1], 10002).into();
@@ -1668,34 +1679,42 @@ mod tests {
 
         let gw_test_controller = async {
             // the connection to the gw with the third-party peer is established first
+            tracing::info!("TEST: Establishing peer connection");
             gw_test.transport.new_conn(peer_addr).await;
             gw_test
                 .transport
                 .establish_inbound_conn(peer_addr, peer_pub_key.clone(), None)
                 .await;
+            tracing::info!("TEST: Peer connection established");
 
             // the joiner attempts to connect to the gw, but since it's out of connections
             // it will just be a transient connection
+            tracing::info!("TEST: Establishing joiner connection");
             gw_test.transport.new_conn(joiner_addr).await;
             gw_test
                 .transport
                 .establish_inbound_conn(joiner_addr, joiner_pub_key, None)
                 .await;
+            tracing::info!("TEST: Joiner connection established");
 
             // Give some time for the events to be processed
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
 
             // TODO: maybe simulate forwarding back all expected responses
-
+            tracing::info!("TEST: Controller completed");
             Ok::<_, anyhow::Error>(())
         };
 
         let peer_and_gw = async {
             let mut third_party = None;
+            let mut event_count = 0;
             loop {
+                event_count += 1;
+                tracing::info!("TEST: Waiting for event #{}", event_count);
                 let event =
-                    tokio::time::timeout(Duration::from_secs(60), gw_handler.wait_for_events())
+                    tokio::time::timeout(Duration::from_secs(15), gw_handler.wait_for_events())
                         .await??;
+                tracing::info!("TEST: Received event #{}: {:?}", event_count, event);
                 match event {
                     Event::InboundConnection {
                         conn: first_peer_conn,
@@ -1740,7 +1759,10 @@ mod tests {
             Ok(())
         };
 
-        futures::try_join!(gw_test_controller, peer_and_gw)?;
+        tracing::info!("TEST: Running both tasks");
+        let result = futures::try_join!(gw_test_controller, peer_and_gw);
+        tracing::info!("TEST: Both tasks completed with result: {:?}", result);
+        result?;
         Ok(())
     }
 
