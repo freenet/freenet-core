@@ -1,5 +1,5 @@
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
-use crate::contract::WaitingTransaction;
+use crate::contract::{ContractHandlerEvent, WaitingTransaction};
 use crate::message::{NetMessageV1, QueryResult};
 use crate::node::subscribe::SubscribeMsg;
 use crate::ring::Location;
@@ -349,13 +349,46 @@ impl P2pConnManager {
                                 })??;
                             }
                             NodeEvent::QuerySubscriptions { callback } => {
-                                // For now, return connection info until we integrate with contract handler
-                                // TODO: Query contract handler for actual subscription info
+                                // Get network subscriptions from OpManager
+                                let network_subs = op_manager.get_network_subscriptions();
+
+                                // Get application subscriptions from contract executor
+                                // For now, we'll send a query to the contract handler
+                                let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+                                op_manager
+                                    .notify_contract_handler(
+                                        ContractHandlerEvent::QuerySubscriptions { callback: tx },
+                                    )
+                                    .await?;
+
+                                let app_subscriptions =
+                                    match timeout(Duration::from_secs(1), rx.recv()).await {
+                                        Ok(Some(QueryResult::NetworkDebug(info))) => {
+                                            info.application_subscriptions
+                                        }
+                                        _ => Vec::new(),
+                                    };
+
+                                // Log network subscription details for debugging
+                                for (contract_key, peers) in &network_subs {
+                                    if !peers.is_empty() {
+                                        tracing::debug!(
+                                            %contract_key,
+                                            peer_count = peers.len(),
+                                            peers = ?peers,
+                                            "Found network subscription"
+                                        );
+                                    }
+                                }
+
                                 let connections = self.connections.keys().cloned().collect();
                                 let debug_info = crate::message::NetworkDebugInfo {
-                                    subscriptions: Vec::new(), // TODO: Get from contract handler
+                                    application_subscriptions: app_subscriptions,
+                                    network_subscriptions: network_subs,
                                     connected_peers: connections,
                                 };
+
                                 timeout(
                                     Duration::from_secs(1),
                                     callback.send(QueryResult::NetworkDebug(debug_info)),

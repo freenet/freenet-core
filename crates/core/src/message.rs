@@ -333,7 +333,11 @@ pub struct SubscriptionInfo {
 
 #[derive(Debug, Clone)]
 pub struct NetworkDebugInfo {
-    pub subscriptions: Vec<SubscriptionInfo>,
+    /// Application-level subscriptions (WebSocket clients subscribed to contracts)
+    pub application_subscriptions: Vec<SubscriptionInfo>,
+    /// Network-level subscriptions (nodes subscribing to contracts for routing)
+    #[allow(dead_code)] // Used for debugging purposes, not exposed via stdlib API yet
+    pub network_subscriptions: Vec<(ContractKey, Vec<PeerId>)>,
     pub connected_peers: Vec<PeerId>,
 }
 

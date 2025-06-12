@@ -125,11 +125,11 @@ impl OutboundConnectionHandler {
         bandwidth_limit: Option<usize>,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection>), TransportError> {
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
-        let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(1000);
-        let (new_connection_sender, new_connection_notifier) = mpsc::channel(1000);
+        let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
+        let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
 
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
-        let (outbound_sender, outbound_recv) = mpsc::channel(10000);
+        let (outbound_sender, outbound_recv) = mpsc::channel(100);
         let transport = UdpPacketsListener {
             is_gateway,
             socket_listener: socket.clone(),
@@ -267,33 +267,9 @@ impl<S: Socket> UdpPacketsListener<S> {
         > = BTreeMap::new();
         let mut connection_tasks = FuturesUnordered::new();
         let mut gw_connection_tasks = FuturesUnordered::new();
-        let mut pending_connections = vec![];
         let mut outdated_peer: HashMap<SocketAddr, Instant> = HashMap::new();
 
         'outer: loop {
-            'inner: loop {
-                if pending_connections.len() > 10 {
-                    tracing::error!(%self.this_addr, "too many pending connections");
-                    break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
-                }
-                if let Some(pending) = pending_connections.pop() {
-                    match self.new_connection_notifier.try_send(pending) {
-                        Ok(_) => {}
-                        Err(mpsc::error::TrySendError::Full(pending)) => {
-                            tracing::error!(%self.this_addr, "channel is full");
-                            pending_connections.push(pending);
-                            break 'inner;
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            tracing::error!(%self.this_addr, "failed to notify new connection");
-                            break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
-                        }
-                    }
-                } else {
-                    break 'inner;
-                }
-            }
-
             tokio::select! {
                 recv_result = self.socket_listener.recv_from(&mut buf) => {
                     match recv_result {
@@ -443,17 +419,12 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                             self.remote_connections.insert(remote_addr, inbound_remote_connection);
 
-                            match self.new_connection_notifier
-                            .try_send(PeerConnection::new(outbound_remote_conn)) {
-                                Ok(_) => {}
-                                Err(mpsc::error::TrySendError::Full(pending_conn)) => {
-                                    tracing::error!(%remote_addr, "gateway connection established but channel is full");
-                                    pending_connections.push(pending_conn);
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    tracing::error!(%remote_addr, "gateway connection established but failed to notify new connection");
-                                    break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
-                                }
+                            if self.new_connection_notifier
+                                .send(PeerConnection::new(outbound_remote_conn))
+                                .await
+                                .is_err() {
+                                tracing::error!(%remote_addr, "gateway connection established but failed to notify new connection");
+                                break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
                             }
 
                             sent_tracker.lock().report_sent_packet(
@@ -635,7 +606,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
             let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
 
-            let (inbound_packet_tx, inbound_packet_rx) = mpsc::channel(1000);
+            let (inbound_packet_tx, inbound_packet_rx) = mpsc::channel(100);
             let remote_conn = RemoteConnection {
                 outbound_packets,
                 outbound_symmetric_key: outbound_key,
@@ -826,8 +797,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 ))
                                                 .await
                                                 .map_err(|_| TransportError::ChannelClosed)?;
-                                            let (inbound_sender, inbound_recv) =
-                                                mpsc::channel(1000);
+                                            let (inbound_sender, inbound_recv) = mpsc::channel(100);
                                             tracing::debug!(%remote_addr, "connection established");
                                             return Ok((
                                                 RemoteConnection {
@@ -895,7 +865,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     continue;
                                 }
                                 // if is not an intro packet, the connection is successful and we can proceed
-                                let (inbound_sender, inbound_recv) = mpsc::channel(1000);
+                                let (inbound_sender, inbound_recv) = mpsc::channel(100);
                                 return Ok((
                                     RemoteConnection {
                                         outbound_packets: outbound_packets.clone(),

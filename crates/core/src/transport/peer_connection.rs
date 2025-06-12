@@ -146,9 +146,11 @@ impl PeerConnection {
         outbound_symmetric_key: Aes128Gcm,
         inbound_symmetric_key: Aes128Gcm,
     ) -> PeerConnectionMock {
+        use crate::transport::crypto::TransportKeypair;
         use parking_lot::Mutex;
         let (outbound_packets, outbound_packets_recv) = mpsc::channel(1);
         let (inbound_packet_sender, inbound_packet_recv) = mpsc::channel(1);
+        let keypair = TransportKeypair::new();
         let remote = RemoteConnection {
             outbound_packets,
             outbound_symmetric_key,
@@ -159,7 +161,7 @@ impl PeerConnection {
             inbound_symmetric_key,
             inbound_symmetric_key_bytes: [1; 16],
             my_address: Some(my_address),
-            transport_secret_key: super::crypto::TransportKeypair::new().secret,
+            transport_secret_key: keypair.secret,
         };
         (
             Self::new(remote),
@@ -175,9 +177,11 @@ impl PeerConnection {
         outbound_symmetric_key: Aes128Gcm,
         inbound_symmetric_key: Aes128Gcm,
     ) -> RemoteConnectionMock {
+        use crate::transport::crypto::TransportKeypair;
         use parking_lot::Mutex;
         let (outbound_packets, outbound_packets_recv) = mpsc::channel(1);
         let (inbound_packet_sender, inbound_packet_recv) = mpsc::channel(1);
+        let keypair = TransportKeypair::new();
         (
             RemoteConnection {
                 outbound_packets,
@@ -189,7 +193,7 @@ impl PeerConnection {
                 inbound_symmetric_key,
                 inbound_symmetric_key_bytes: [1; 16],
                 my_address: Some(my_address),
-                transport_secret_key: super::crypto::TransportKeypair::new().secret,
+                transport_secret_key: keypair.secret,
             },
             inbound_packet_sender,
             outbound_packets_recv,
