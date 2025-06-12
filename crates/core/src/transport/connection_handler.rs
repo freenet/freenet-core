@@ -141,6 +141,7 @@ impl OutboundConnectionHandler {
             this_addr: socket_addr,
             dropped_packets: HashMap::new(),
             last_drop_warning: Instant::now(),
+            bandwidth_limit,
         };
         let bw_tracker = super::rate_limiter::PacketRateLimiter::new(
             DEFAULT_BW_TRACKER_WINDOW_SIZE,
@@ -150,7 +151,13 @@ impl OutboundConnectionHandler {
             send_queue: conn_handler_sender,
         };
 
-        task::spawn(bw_tracker.rate_limiter(bandwidth_limit, socket));
+        // IMPORTANT: The general packet rate limiter is disabled (passing None) due to reliability issues.
+        // It was serializing all packets and grinding transfers to a halt.
+        //
+        // Bandwidth limiting is now only applied to large streaming transfers via send_stream()
+        // in RemoteConnection. The bandwidth_limit parameter is still passed to RemoteConnection
+        // for this purpose (default: 3 MB/s).
+        task::spawn(bw_tracker.rate_limiter(None, socket));
         task::spawn(RANDOM_U64.scope(StdRng::from_entropy().gen(), transport.listen()));
 
         Ok((connection_handler, new_connection_notifier))
@@ -210,6 +217,7 @@ struct UdpPacketsListener<S = UdpSocket> {
     this_addr: SocketAddr,
     dropped_packets: HashMap<SocketAddr, u64>,
     last_drop_warning: Instant,
+    bandwidth_limit: Option<usize>,
 }
 
 type OngoingConnection = (
@@ -528,6 +536,7 @@ impl<S: Socket> UdpPacketsListener<S> {
     ) {
         let secret = self.this_peer_keypair.secret.clone();
         let outbound_packets = self.outbound_packets.clone();
+        let bandwidth_limit = self.bandwidth_limit;
 
         let (inbound_from_remote, mut next_inbound) =
             mpsc::channel::<PacketData<UnknownEncryption>>(100);
@@ -618,6 +627,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 inbound_symmetric_key_bytes: inbound_key_bytes,
                 my_address: None,
                 transport_secret_key: secret,
+                bandwidth_limit,
             };
 
             let inbound_conn = InboundRemoteConnection {
@@ -693,6 +703,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
         let outbound_packets = self.outbound_packets.clone();
         let transport_secret_key = self.this_peer_keypair.secret.clone();
+        let bandwidth_limit = self.bandwidth_limit;
         let (inbound_from_remote, mut next_inbound) =
             mpsc::channel::<PacketData<UnknownEncryption>>(100);
         let this_addr = self.this_addr;
@@ -815,6 +826,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                     my_address: Some(my_address),
                                                     transport_secret_key: transport_secret_key
                                                         .clone(),
+                                                    bandwidth_limit,
                                                 },
                                                 InboundRemoteConnection {
                                                     inbound_packet_sender: inbound_sender,
@@ -881,6 +893,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         inbound_symmetric_key_bytes: inbound_sym_key_bytes,
                                         my_address: None,
                                         transport_secret_key: transport_secret_key.clone(),
+                                        bandwidth_limit,
                                     },
                                     InboundRemoteConnection {
                                         inbound_packet_sender: inbound_sender,
