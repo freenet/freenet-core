@@ -1657,8 +1657,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_gw_to_peer_outbound_conn_forwarded() -> anyhow::Result<()> {
-        // Enable debug logging for CI debugging
-        crate::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG), None);
         let gw_addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
         let peer_addr: SocketAddr = ([127, 0, 0, 1], 10001).into();
         let joiner_addr: SocketAddr = ([127, 0, 0, 1], 10002).into();
@@ -1679,52 +1677,42 @@ mod tests {
 
         let gw_test_controller = async {
             // the connection to the gw with the third-party peer is established first
-            tracing::info!("TEST: Establishing peer connection");
             gw_test.transport.new_conn(peer_addr).await;
             gw_test
                 .transport
                 .establish_inbound_conn(peer_addr, peer_pub_key.clone(), None)
                 .await;
-            tracing::info!("TEST: Peer connection established");
 
             // Wait longer to ensure the peer connection is fully processed
             tokio::time::sleep(Duration::from_millis(500)).await;
 
             // the joiner attempts to connect to the gw, but since it's out of connections
             // it will just be a transient connection
-            tracing::info!("TEST: Establishing joiner connection");
             gw_test.transport.new_conn(joiner_addr).await;
             gw_test
                 .transport
                 .establish_inbound_conn(joiner_addr, joiner_pub_key, None)
                 .await;
-            tracing::info!("TEST: Joiner connection established");
 
             // Give some time for the events to be processed
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             // TODO: maybe simulate forwarding back all expected responses
-            tracing::info!("TEST: Controller completed");
             Ok::<_, anyhow::Error>(())
         };
 
         let peer_and_gw = async {
             let mut third_party = None;
-            let mut event_count = 0;
             loop {
-                event_count += 1;
-                tracing::info!("TEST: Waiting for event #{}", event_count);
                 let event =
                     tokio::time::timeout(Duration::from_secs(15), gw_handler.wait_for_events())
                         .await??;
-                tracing::info!("TEST: Received event #{}: {:?}", event_count, event);
                 match event {
                     Event::InboundConnection {
                         conn: first_peer_conn,
                         joiner: third_party_peer,
                         ..
                     } => {
-                        tracing::info!("Received join request from joiner");
                         assert_eq!(third_party_peer.pub_key, peer_pub_key);
                         assert_eq!(first_peer_conn.remote_addr(), peer_addr);
                         third_party = Some(third_party_peer);
@@ -1740,7 +1728,6 @@ mod tests {
                         msg,
                         ..
                     } => {
-                        tracing::info!("Forward join request from joiner to third-party");
                         // transient connection created, and forwarded a request to join to the third-party peer
                         assert_eq!(target, joiner_addr);
                         assert_eq!(forward_to.pub_key, peer_pub_key);
@@ -1762,9 +1749,7 @@ mod tests {
             Ok(())
         };
 
-        tracing::info!("TEST: Running both tasks");
         let result = futures::try_join!(gw_test_controller, peer_and_gw);
-        tracing::info!("TEST: Both tasks completed with result: {:?}", result);
         result?;
         Ok(())
     }
