@@ -49,6 +49,7 @@ pub(crate) struct RemoteConnection {
     pub(super) inbound_symmetric_key_bytes: [u8; 16],
     pub(super) my_address: Option<SocketAddr>,
     pub(super) transport_secret_key: TransportSecretKey,
+    pub(super) bandwidth_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -162,6 +163,7 @@ impl PeerConnection {
             inbound_symmetric_key_bytes: [1; 16],
             my_address: Some(my_address),
             transport_secret_key: keypair.secret,
+            bandwidth_limit: None,
         };
         (
             Self::new(remote),
@@ -194,6 +196,7 @@ impl PeerConnection {
                 inbound_symmetric_key_bytes: [1; 16],
                 my_address: Some(my_address),
                 transport_secret_key: keypair.secret,
+                bandwidth_limit: None,
             },
             inbound_packet_sender,
             outbound_packets_recv,
@@ -566,6 +569,7 @@ impl PeerConnection {
                 data,
                 self.remote_conn.outbound_symmetric_key.clone(),
                 self.remote_conn.sent_tracker.clone(),
+                self.remote_conn.bandwidth_limit,
             )
             .instrument(span!(tracing::Level::DEBUG, "outbound_stream")),
         );
@@ -718,6 +722,7 @@ mod tests {
             message.clone(),
             cipher.clone(),
             sent_tracker,
+            None, // No bandwidth limit for test
         ))
         .map_err(|e| e.into());
 
