@@ -102,6 +102,7 @@ pub(crate) struct PeerConnection {
     failure_count: usize,
     first_failure_time: Option<std::time::Instant>,
     last_packet_report_time: Instant,
+    keep_alive_handle: Option<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for PeerConnection {
@@ -109,6 +110,15 @@ impl std::fmt::Debug for PeerConnection {
         f.debug_struct("PeerConnection")
             .field("remote_conn", &self.remote_conn.remote_addr)
             .finish()
+    }
+}
+
+impl Drop for PeerConnection {
+    fn drop(&mut self) {
+        if let Some(handle) = self.keep_alive_handle.take() {
+            tracing::debug!(remote = ?self.remote_conn.remote_addr, "Cancelling keep-alive task");
+            handle.abort();
+        }
     }
 }
 
@@ -128,6 +138,57 @@ type RemoteConnectionMock = (
 
 impl PeerConnection {
     pub(super) fn new(remote_conn: RemoteConnection) -> Self {
+        const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+        // Start the keep-alive task before creating Self
+        let remote_addr = remote_conn.remote_addr;
+        let outbound_packets = remote_conn.outbound_packets.clone();
+        let outbound_key = remote_conn.outbound_symmetric_key.clone();
+        let last_packet_id = remote_conn.last_packet_id.clone();
+
+        let keep_alive_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(KEEP_ALIVE_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            // Skip the first immediate tick
+            interval.tick().await;
+
+            loop {
+                interval.tick().await;
+
+                tracing::trace!(remote = ?remote_addr, "Keep-alive timer tick - sending NoOp");
+
+                // Create a NoOp packet
+                let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let noop_packet = match SymmetricMessage::serialize_msg_to_packet_data(
+                    packet_id,
+                    SymmetricMessagePayload::NoOp,
+                    &outbound_key,
+                    vec![], // No receipts for keep-alive
+                ) {
+                    Ok(packet) => packet.prepared_send(),
+                    Err(e) => {
+                        tracing::error!(?e, "Failed to create keep-alive packet");
+                        break;
+                    }
+                };
+
+                // Send the keep-alive packet
+                if outbound_packets
+                    .send((remote_addr, noop_packet))
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!(remote = ?remote_addr, "Keep-alive task stopping - channel closed");
+                    break;
+                }
+            }
+
+            tracing::debug!(remote = ?remote_addr, "Keep-alive task exiting");
+        });
+
+        tracing::info!(remote = ?remote_addr, "PeerConnection created with persistent keep-alive task");
+
         Self {
             remote_conn,
             received_tracker: ReceivedPacketTracker::new(),
@@ -137,6 +198,7 @@ impl PeerConnection {
             failure_count: 0,
             first_failure_time: None,
             last_packet_report_time: Instant::now(),
+            keep_alive_handle: Some(keep_alive_handle),
         }
     }
 
@@ -226,13 +288,12 @@ impl PeerConnection {
         // listen for incoming messages or receipts or wait until is time to do anything else again
         let mut resend_check = Some(tokio::time::sleep(tokio::time::Duration::from_millis(10)));
 
-        const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
         const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(30);
-
-        let mut keep_alive = tokio::time::interval(KEEP_ALIVE_INTERVAL);
-        keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        keep_alive.tick().await;
         let mut last_received = std::time::Instant::now();
+
+        // Check for timeout periodically
+        let mut timeout_check = tokio::time::interval(Duration::from_secs(5));
+        timeout_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         const FAILURE_TIME_WINDOW: Duration = Duration::from_secs(30);
         loop {
@@ -422,13 +483,11 @@ impl PeerConnection {
                     };
                     res.map_err(|e| TransportError::Other(e.into()))??
                 }
-                _ = keep_alive.tick() => {
+                _ = timeout_check.tick() => {
                     if last_received.elapsed() > KILL_CONNECTION_AFTER {
-                        tracing::warn!(remote = ?self.remote_conn.remote_addr, "connection timed out");
+                        tracing::warn!(remote = ?self.remote_conn.remote_addr, "connection timed out - no packets received for {:?}", last_received.elapsed());
                         return Err(TransportError::ConnectionClosed(self.remote_addr()));
                     }
-                    tracing::trace!(remote = ?self.remote_conn.remote_addr, "sending keep-alive");
-                    self.noop(vec![]).await?;
                 }
                 _ = resend_check.take().unwrap_or(tokio::time::sleep(Duration::from_millis(10))) => {
                     loop {
