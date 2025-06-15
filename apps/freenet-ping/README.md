@@ -85,23 +85,28 @@ This project includes two Makefiles to help you set up and run a local Freenet n
 - `run-ping.mk`: Builds and runs the ping application.
 
 ### Start Local Network
+
 1. Navigate to the `freenet-core/scripts` directory:
+
    ```bash
    cd freenet-core/scripts
    ```
 
 2. First, clean any previous setup and create necessary directories:
+
    ```bash
    make -f local-network.mk clean
    make -f local-network.mk setup N_GATEWAYS=1 N_NODES=2
    ```
 
 3. Start the gateway:
+
    ```bash
    make -f local-network.mk start-gateways N_GATEWAYS=1
    ```
 
 4. Start the nodes:
+
    ```bash
    make -f local-network.mk start-nodes N_NODES=2
    ```
@@ -112,6 +117,7 @@ This project includes two Makefiles to help you set up and run a local Freenet n
    ```
 
 The network will be configured with:
+
 - 1 Gateway on port 3101
 - Node 1: WebSocket port 3001, Network port 3102
 - Node 2: WebSocket port 3002, Network port 3103
@@ -135,26 +141,30 @@ make -f local-network.mk clean
 ## Build and Run Ping
 
 1. Navigate to the `freenet-core/apps/freenet-ping` directory:
+
    ```bash
    cd freenet-core/apps/freenet-ping
    ```
 
 1. View available options:
+
    ```bash
    make -f run-ping.mk help
    ```
 
-2. Build the contract and application:
+1. Build the contract and application:
+
    ```bash
    make -f run-ping.mk build
    ```
 
-3. Run ping towards node 1:
+1. Run ping towards node 1:
    ```bash
    make -f run-ping.mk run WS_PORT=3001
    ```
 
 You will see something like this:
+
 ```bash
 2024-05-14T15:33:20.685412Z  INFO freenet_ping: 154: put ping contract successfully! key=Cuj4LbFao6vzZ5VtvZAKZ64Y99qNh7MpTUdaCcEkU4oR
 2024-05-14T15:33:20.729883Z  INFO freenet_ping: 146: Hello, ubiquitous-letters!
@@ -163,6 +173,7 @@ You will see something like this:
 ```
 
 You can customize the ping behavior with these parameters:
+
 ```bash
 make -f run-ping.mk run WS_PORT=3001 FREQUENCY=2000 TTL=7200
 ```
