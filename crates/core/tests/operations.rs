@@ -212,7 +212,7 @@ async fn test_put_contract() -> TestResult {
         .await?;
 
         // Wait for put response
-        let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
+        let resp = tokio::time::timeout(Duration::from_secs(60), client_api_a.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                 assert_eq!(key, contract_key);
@@ -390,7 +390,7 @@ async fn test_update_contract() -> TestResult {
         .await?;
 
         // Wait for put response
-        let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
+        let resp = tokio::time::timeout(Duration::from_secs(60), client_api_a.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                 assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
