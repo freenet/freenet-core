@@ -12,7 +12,7 @@ graph LR
         Server[Server] --> WebSocket
         WebSocket -->|"Messages"| ClientEvents
         Server -->|"ClientConnection"| ClientEvents
-        
+
         %% Central Node Event Loop
         subgraph NodeLoop[Node Event Loop]
             Node[Node]
@@ -52,14 +52,14 @@ graph LR
         ContractHandler -->|"Execute"| Executor
         Executor -->|"WASM"| WasmRuntime
         Executor -->|"State"| StateStore
-        
+
         subgraph ExecutorLoop[Executor Callback Loop]
             ExecutorEvents[Executor Event Handler]
             ExecutorCallback[Callback Channel]
             ExecutorEvents -->|"Tx ID"| ExecutorCallback
             ExecutorCallback -->|"Results"| ExecutorEvents
         end
-        
+
         Executor --> ExecutorEvents
         ExecutorCallback --> OpManager
 
@@ -76,7 +76,7 @@ graph LR
             HandshakeHandler --> ConnManager
             ConnManager --> HandshakeHandler
         end
-        
+
         NetworkBridge --> NetworkLoop
         NetworkLoop --> Ring
         NetworkLoop --> Transport
@@ -89,44 +89,44 @@ graph LR
     %% Client Interface Layer
     classDef clientInterface fill:#c6dcef,stroke:#2874a6,stroke-width:1px,color:#000;
     class Client,WebSocket,Server,ClientEvents clientInterface;
-    
+
     %% Node Core
     classDef nodeCore fill:#d5f5e3,stroke:#1e8449,stroke-width:1px,color:#000;
     class Node,EventChannelIn,EventChannelOut nodeCore;
-    
+
     %% Operations
     classDef operations fill:#fdebd0,stroke:#d35400,stroke-width:1px,color:#000;
     class OpManager,OpMachines,OpChannelIn,OpChannelOut operations;
-    
+
     %% Contracts
     classDef contracts fill:#e8daef,stroke:#8e44ad,stroke-width:1px,color:#000;
     class ContractHandler,Executor,WasmRuntime,StateStore,ExecutorEvents,ExecutorCallback contracts;
-    
+
     %% Network - Changed to a more distinct teal color
     classDef network fill:#d1f2eb,stroke:#16a085,stroke-width:1px,color:#000;
     class NetworkBridge,HandshakeHandler,ConnManager,Ring,Transport,NetMessage,Peers network;
-    
+
     %% Event Loops
     classDef eventLoop fill:#f9e79f,stroke:#f39c12,stroke-width:2px;
     class NodeLoop,OpLoop,ExecutorLoop,NetworkLoop eventLoop;
-    
+
     %% Boundary
     classDef boundary fill:#ebf5fb,stroke:#3498db,stroke-width:2px;
     class Core boundary;
-    
+
     %% Link Styling - Colored by SOURCE component - Fixed version
     %% Client Interface links (blue)
     linkStyle 0,1,2,3,6 stroke:#2874a6,stroke-width:2px;
-    
+
     %% Node Core links (green)
     linkStyle 4,5,10,11,12,13 stroke:#1e8449,stroke-width:2px;
-    
-    %% Operation links (orange) 
+
+    %% Operation links (orange)
     linkStyle 7,14,15,16,17,18 stroke:#d35400,stroke-width:2px;
-    
+
     %% Contract links (purple)
     linkStyle 8,19,20,21,22,23,24 stroke:#8e44ad,stroke-width:2px;
-    
+
     %% Network links - Changed to teal
     linkStyle 9,25,26,27,28 stroke:#16a085,stroke-width:2px;
 ```
@@ -135,7 +135,7 @@ graph LR
 
 - **[Server](src/server/mod.rs):** Handles HTTP and WebSocket endpoints for client connections. The `ClientConnection` enum in [http_gateway.rs](src/server/http_gateway.rs) defines the interface between the server and client events system. The server manages the WebSocket API and passes client requests to the ClientEvents subsystem.
 
-- **[Node](src/node.rs):** Central coordinator with the main event loop implemented in `run_event_loop()`. This function contains the core `tokio::select!` loop that dispatches events to appropriate handlers like `handle_network_message()`, `handle_node_event()`, and `handle_client_request()`. 
+- **[Node](src/node.rs):** Central coordinator with the main event loop implemented in `run_event_loop()`. This function contains the core `tokio::select!` loop that dispatches events to appropriate handlers like `handle_network_message()`, `handle_node_event()`, and `handle_client_request()`.
 
 - **[ClientEvents](src/client_events/mod.rs):** Bridges client connections to the Node system through the `ClientEventsProxy` trait in [mod.rs](src/client_events/mod.rs). The WebSocket implementation in [websocket.rs](src/client_events/websocket.rs) provides key methods like `websocket_interface()` and `process_client_request()` that handle client connections.
 
@@ -174,34 +174,40 @@ graph LR
 A typical client request follows this path through the system:
 
 1. **Client Initiation**
+
    - Client connects to the WebSocket endpoint at `/v1/contract/command`
    - `websocket_commands()` in `client_events/websocket.rs` handles the connection
    - Client sends a `ClientRequest` (e.g., `ContractRequest::Get{key}`)
 
 2. **Request Processing**
+
    - `process_client_request()` deserializes the request and assigns a `ClientId`
    - `WebSocketProxy.recv()` wraps it in an `OpenRequest` and sends to the Node
    - Node receives the request in `handle_client_request()` and determines the type
 
 3. **Operation Creation**
+
    - For GET requests: Node calls `get::start_op()` to create a new `GetOp`
    - `OpManager.push()` stores the operation state in its collections
    - Node initiates the operation with `get::request_get()`
    - A unique `Transaction` ID is assigned to track this operation
 
 4. **Network Traversal**
+
    - `OpManager` determines the target peer based on the contract key's location
    - It constructs a `NetMessage::V1(NetMessageV1::Get(GetMsg::...))`
    - `NetworkBridge.send()` delivers this to the target peer
    - `P2pConnManager` sends the actual network packet via `UdpSocket.send_to()`
 
 5. **Remote Processing**
+
    - The receiving peer's `NetworkBridge` gets the message via `UdpSocket.recv_from()`
    - `P2pConnManager.process_message()` forwards to Node's event loop
    - Remote Node processes the Get request in its contract subsystem
    - If the contract exists, a response message is created and sent back
 
 6. **Response Handling**
+
    - Local `NetworkBridge` receives the response message
    - Node event loop processes it in `handle_network_message()`
    - Message is matched to pending `Transaction` via its ID

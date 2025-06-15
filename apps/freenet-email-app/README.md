@@ -37,7 +37,9 @@ local node, which simulates a node on the network.
   ```bash
   git submodule update --init --recursive
   ```
+
 ### Note about MacOS
+
 Email account creation currently does not work on MacOS
 
 ## Prepare the Freenet email contracts and delegates
@@ -59,6 +61,7 @@ This delegate is located inside the modules folder of freenet-core:
       - ...
 
 Add the target directory for the project. This should be an absolute file path to freenet-core/target.
+
 ```bash
 export CARGO_TARGET_DIR="... freenet-core/target"
 ```

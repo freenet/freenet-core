@@ -16,20 +16,20 @@
   </a>
 </div>
 
-This is the freenet-core repository. To learn more about Freenet please visit our website 
+This is the freenet-core repository. To learn more about Freenet please visit our website
 at [freenet.org](https://freenet.org/).
 
 # Decentralize Everything
 
-Freenet is the internet as it should be—fully decentralized, designed to put you back in control. Imagine a global shared 
-computer where you can communicate and collaborate freely, without reliance on big tech. Freenet lets you regain your 
+Freenet is the internet as it should be—fully decentralized, designed to put you back in control. Imagine a global shared
+computer where you can communicate and collaborate freely, without reliance on big tech. Freenet lets you regain your
 digital independence.
 
-Freenet is a peer-to-peer network that transforms users’ computers into a resilient, distributed platform on which anyone 
-can build decentralized services. Every peer contributes to a fault-tolerant collective, ensuring services are always 
+Freenet is a peer-to-peer network that transforms users’ computers into a resilient, distributed platform on which anyone
+can build decentralized services. Every peer contributes to a fault-tolerant collective, ensuring services are always
 available and robust.
 
-Today’s web is a series of siloed services, but every system built on Freenet is fully interoperable by default. Freenet 
+Today’s web is a series of siloed services, but every system built on Freenet is fully interoperable by default. Freenet
 apps can be built with popular web frameworks, accessed through any browser just like the web.
 
 ## Build Instructions

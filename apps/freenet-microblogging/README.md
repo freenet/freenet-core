@@ -31,23 +31,23 @@ Prepare the microblogging app web and posts contracts.
 The app is located inside the `apps/freenet-microblogging` folder:
 
 - `freenet-core/`
-    - `apps/`
-        - `freenet-microblogging/` <-- this folder contains the microblogging app
-            - `contracts/` <-- this folder contains the contract source code
-                - `posts/` <-- this folder contains the posts contract
-                    - `build/` <-- the generated folder that contains the compiled contract binary with version + wasm
-                      code
-                    - `src/` <-- this folder contains the source code of the contract
-                    - ...
-            - `web/` <-- this folder contains the web app source code, web app built with node and webpack
-                - `build/` <-- the generated folder that contains the compiled web app binary with version + wasm
-                  code
-                - `container/` <-- this folder contains the web contract container, a simple contract associated
-                  with the web app, as the state.
-                - `src/` <-- this folder contains the source code of the web app
-                - ...
-            - `Makefile` <-- this file contains the build instructions for building and running the web app, and
-              the local node.
+  - `apps/`
+    - `freenet-microblogging/` <-- this folder contains the microblogging app
+      - `contracts/` <-- this folder contains the contract source code
+        - `posts/` <-- this folder contains the posts contract
+          - `build/` <-- the generated folder that contains the compiled contract binary with version + wasm
+            code
+          - `src/` <-- this folder contains the source code of the contract
+          - ...
+      - `web/` <-- this folder contains the web app source code, web app built with node and webpack
+        - `build/` <-- the generated folder that contains the compiled web app binary with version + wasm
+          code
+        - `container/` <-- this folder contains the web contract container, a simple contract associated
+          with the web app, as the state.
+        - `src/` <-- this folder contains the source code of the web app
+        - ...
+      - `Makefile` <-- this file contains the build instructions for building and running the web app, and
+        the local node.
 
 To build the microblogging application, go to the `apps/freenet-microblogging` folder and run the following command:
 
