@@ -1,7 +1,4 @@
-use std::{
-    thread::{self, JoinHandle},
-    time::Duration,
-};
+use std::{thread::JoinHandle, time::Duration};
 
 use super::{ContractExecError, RuntimeResult};
 use freenet_stdlib::prelude::{
@@ -308,23 +305,50 @@ fn handle_execution_call(
     r: JoinHandle<(Result<i64, wasmer::RuntimeError>, Store)>,
     rt: &mut super::Runtime,
 ) -> Result<i64, Errors> {
-    // Simple implementation: check every 10ms for up to 5 seconds
-    for _ in 0..500 {
-        if r.is_finished() {
-            break;
+    // Check if we're in a tokio runtime context
+    if tokio::runtime::Handle::try_current().is_ok() {
+        // We're in an async context, use block_in_place to avoid blocking the executor
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                // Check every 10ms for up to 5 seconds using async sleep
+                for _ in 0..500 {
+                    if r.is_finished() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+
+                if !r.is_finished() {
+                    return Err(Errors::MaxComputeTimeExceeded);
+                }
+
+                let (r, s) = r
+                    .join()
+                    .map_err(|_| Errors::Other(anyhow::anyhow!("Failed to join thread")))?;
+                rt.wasm_store = Some(s);
+                r.map_err(Errors::Wasmer)
+            })
+        })
+    } else {
+        // We're not in an async context (e.g., in tests), fall back to thread::sleep
+        // This is still better than the original 1-second sleep
+        for _ in 0..500 {
+            if r.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        thread::sleep(Duration::from_millis(10));
-    }
 
-    if !r.is_finished() {
-        return Err(Errors::MaxComputeTimeExceeded);
-    }
+        if !r.is_finished() {
+            return Err(Errors::MaxComputeTimeExceeded);
+        }
 
-    let (r, s) = r
-        .join()
-        .map_err(|_| Errors::Other(anyhow::anyhow!("Failed to join thread")))?;
-    rt.wasm_store = Some(s);
-    r.map_err(Errors::Wasmer)
+        let (r, s) = r
+            .join()
+            .map_err(|_| Errors::Other(anyhow::anyhow!("Failed to join thread")))?;
+        rt.wasm_store = Some(s);
+        r.map_err(Errors::Wasmer)
+    }
 }
 
 fn match_err(
