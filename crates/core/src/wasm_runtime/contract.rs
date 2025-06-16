@@ -308,15 +308,18 @@ fn handle_execution_call(
     r: JoinHandle<(Result<i64, wasmer::RuntimeError>, Store)>,
     rt: &mut super::Runtime,
 ) -> Result<i64, Errors> {
-    for _ in 0..5 {
+    // Simple implementation: check every 10ms for up to 5 seconds
+    for _ in 0..500 {
         if r.is_finished() {
             break;
         }
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(10));
     }
+
     if !r.is_finished() {
         return Err(Errors::MaxComputeTimeExceeded);
     }
+
     let (r, s) = r
         .join()
         .map_err(|_| Errors::Other(anyhow::anyhow!("Failed to join thread")))?;
