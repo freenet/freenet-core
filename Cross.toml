@@ -1,0 +1,6 @@
+[target.aarch64-unknown-linux-gnu]
+# Use a newer cross image with updated GLIBC
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:edge"
+
+[target.x86_64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:edge"

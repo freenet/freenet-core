@@ -67,7 +67,20 @@ pub(crate) async fn create_connection_handler<S: Socket>(
     bandwidth_limit: Option<usize>,
 ) -> Result<(OutboundConnectionHandler, InboundConnectionHandler), TransportError> {
     // Bind the UDP socket to the specified port
-    let socket = S::bind((listen_host, listen_port).into()).await?;
+    let bind_addr: SocketAddr = (listen_host, listen_port).into();
+    tracing::info!(
+        target: "freenet_core::transport::send_debug",
+        %bind_addr,
+        is_gateway,
+        "Binding UDP socket"
+    );
+    let socket = S::bind(bind_addr).await?;
+    tracing::info!(
+        target: "freenet_core::transport::send_debug",
+        %bind_addr,
+        is_gateway,
+        "UDP socket bound successfully"
+    );
     let (och, new_connection_notifier) = OutboundConnectionHandler::config_listener(
         Arc::new(socket),
         keypair,

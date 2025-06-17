@@ -39,15 +39,55 @@ impl<T: TimeSource> PacketRateLimiter<T> {
         bandwidth_limit: Option<usize>,
         socket: Arc<S>,
     ) {
-        tracing::info!(bandwidth_limit, "Rate limiter task started");
+        tracing::info!(
+            target: "freenet_core::transport::send_debug",
+            bandwidth_limit,
+            bandwidth_limit_mbps = bandwidth_limit.map(|b| b as f64 / 1_000_000.0),
+            "Rate limiter task started"
+        );
         while let Some((socket_addr, packet)) = self.outbound_packets.recv().await {
             // tracing::trace!(%socket_addr, packet_len = %packet.len(), "Sending outbound packet");
             if let Some(bandwidth_limit) = bandwidth_limit {
                 self.rate_limiting(bandwidth_limit, &*socket, packet, socket_addr)
                     .await;
-            } else if let Err(error) = socket.send_to(&packet, socket_addr).await {
-                tracing::error!(%socket_addr, "Error sending packet: {}", error);
-                continue;
+            } else {
+                tracing::info!(
+                    target: "freenet_core::transport::send_debug",
+                    dest_addr = %socket_addr,
+                    packet_len = packet.len(),
+                    first_bytes = ?&packet[..std::cmp::min(32, packet.len())],
+                    "Attempting to send packet (no rate limit)"
+                );
+
+                match socket.send_to(&packet, socket_addr).await {
+                    Ok(bytes_sent) => {
+                        tracing::info!(
+                            target: "freenet_core::transport::send_debug",
+                            dest_addr = %socket_addr,
+                            bytes_sent,
+                            expected_len = packet.len(),
+                            "Socket send_to completed"
+                        );
+                        if bytes_sent != packet.len() {
+                            tracing::warn!(
+                                target: "freenet_core::transport::send_debug",
+                                "Partial send: sent {} bytes but packet was {} bytes",
+                                bytes_sent,
+                                packet.len()
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            target: "freenet_core::transport::send_debug",
+                            dest_addr = %socket_addr,
+                            error = %error,
+                            error_kind = ?error.kind(),
+                            "Socket send_to failed"
+                        );
+                        continue;
+                    }
+                }
             }
         }
         tracing::debug!("Rate limiter task ended unexpectedly");
@@ -64,11 +104,62 @@ impl<T: TimeSource> PacketRateLimiter<T> {
         if let Some(wait_time) = self.can_send_packet(bandwidth_limit, packet.len()) {
             tokio::time::sleep(wait_time).await;
             tracing::debug!(%socket_addr, "Sending outbound packet after waiting {:?}", wait_time);
-            if let Err(error) = socket.send_to(&packet, socket_addr).await {
-                tracing::error!("Error sending packet: {}", error);
+
+            tracing::info!(
+                target: "freenet_core::transport::send_debug",
+                dest_addr = %socket_addr,
+                packet_len = packet.len(),
+                wait_time_ms = wait_time.as_millis(),
+                "Attempting to send packet (after rate limit wait)"
+            );
+
+            match socket.send_to(&packet, socket_addr).await {
+                Ok(bytes_sent) => {
+                    tracing::info!(
+                        target: "freenet_core::transport::send_debug",
+                        dest_addr = %socket_addr,
+                        bytes_sent,
+                        "Socket send_to completed (after wait)"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        target: "freenet_core::transport::send_debug",
+                        dest_addr = %socket_addr,
+                        error = %error,
+                        "Socket send_to failed (after wait)"
+                    );
+                }
             }
-        } else if let Err(error) = socket.send_to(&packet, socket_addr).await {
-            tracing::debug!(%socket_addr, "Error sending packet: {:?}", error);
+        } else {
+            tracing::info!(
+                target: "freenet_core::transport::send_debug",
+                dest_addr = %socket_addr,
+                packet_len = packet.len(),
+                first_bytes = ?&packet[..std::cmp::min(32, packet.len())],
+                "Attempting to send packet (with rate limit)"
+            );
+
+            match socket.send_to(&packet, socket_addr).await {
+                Ok(bytes_sent) => {
+                    tracing::info!(
+                        target: "freenet_core::transport::send_debug",
+                        dest_addr = %socket_addr,
+                        bytes_sent,
+                        expected_len = packet.len(),
+                        "Socket send_to completed (rate limited)"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        target: "freenet_core::transport::send_debug",
+                        dest_addr = %socket_addr,
+                        error = %error,
+                        error_kind = ?error.kind(),
+                        "Socket send_to failed (rate limited)"
+                    );
+                }
+            }
         }
         self.add_packet(packet.len());
     }
