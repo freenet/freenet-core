@@ -1,6 +1,11 @@
 use std::process::Command;
 
 fn main() {
+    // Skip flatbuffers generation for cross-compilation
+    if std::env::var("CARGO_BUILD_TARGET").is_ok() {
+        return;
+    }
+
     let status = Command::new("flatc")
         .arg("--rust")
         .arg("-o")

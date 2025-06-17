@@ -52,7 +52,7 @@ ls -la "$ARTIFACTS_DIR"/binaries-*.zip 2>/dev/null || echo -e "${RED}No binary z
 # Server list with architecture mapping
 SERVERS=(
     "vega.locut.us:x86_64"
-    "technic.locut.us:arm64"
+    "ziggy.locut.us:arm64"
 )
 BINARIES_PATH="${BINARIES_PATH:-${TMPDIR:-/tmp}}"
 
@@ -246,7 +246,7 @@ for server_info in "${SERVERS[@]}"; do
     echo -e "${YELLOW}Deploying to $server (architecture: $arch)...${NC}"
     
     # SSH options
-    if [ "$server" = "technic.locut.us" ]; then
+    if [ "$server" = "ziggy.locut.us" ]; then
         SSH_OPTS="-p 23"
     else
         SSH_OPTS=""
@@ -275,7 +275,7 @@ for server_info in "${SERVERS[@]}"; do
                 echo -e "${YELLOW}Copying $binary to $server (this may take a moment)...${NC}"
                 
                 # Use our custom scp_with_timeout function
-                if [ "$server" = "technic.locut.us" ]; then
+                if [ "$server" = "ziggy.locut.us" ]; then
                     scp_with_timeout "${CURRENT_BINARY_PATH}" "freenet@$server:${binary}.new" "23"
                 else
                     scp_with_timeout "${CURRENT_BINARY_PATH}" "freenet@$server:${binary}.new" ""

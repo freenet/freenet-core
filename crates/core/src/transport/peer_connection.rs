@@ -147,16 +147,37 @@ impl PeerConnection {
         let last_packet_id = remote_conn.last_packet_id.clone();
 
         let keep_alive_handle = tokio::spawn(async move {
+            tracing::info!(
+                target: "freenet_core::transport::keepalive_lifecycle",
+                remote = ?remote_addr,
+                "Keep-alive task STARTED for connection"
+            );
+
             let mut interval = tokio::time::interval(KEEP_ALIVE_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             // Skip the first immediate tick
             interval.tick().await;
 
-            loop {
-                interval.tick().await;
+            let mut tick_count = 0u64;
+            let task_start = std::time::Instant::now();
 
-                tracing::trace!(remote = ?remote_addr, "Keep-alive timer tick - sending NoOp");
+            loop {
+                let tick_start = std::time::Instant::now();
+                interval.tick().await;
+                tick_count += 1;
+
+                let elapsed_since_start = task_start.elapsed();
+                let elapsed_since_last_tick = tick_start.elapsed();
+
+                tracing::info!(
+                    target: "freenet_core::transport::keepalive_lifecycle",
+                    remote = ?remote_addr,
+                    tick_count,
+                    elapsed_since_start_secs = elapsed_since_start.as_secs_f64(),
+                    tick_interval_ms = elapsed_since_last_tick.as_millis(),
+                    "Keep-alive tick - attempting to send NoOp"
+                );
 
                 // Create a NoOp packet
                 let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -174,17 +195,43 @@ impl PeerConnection {
                 };
 
                 // Send the keep-alive packet
-                if outbound_packets
-                    .send((remote_addr, noop_packet))
-                    .await
-                    .is_err()
-                {
-                    tracing::debug!(remote = ?remote_addr, "Keep-alive task stopping - channel closed");
-                    break;
+                tracing::info!(
+                    target: "freenet_core::transport::keepalive_lifecycle",
+                    remote = ?remote_addr,
+                    packet_id,
+                    "Sending keep-alive NoOp packet"
+                );
+
+                match outbound_packets.send((remote_addr, noop_packet)).await {
+                    Ok(_) => {
+                        tracing::info!(
+                            target: "freenet_core::transport::keepalive_lifecycle",
+                            remote = ?remote_addr,
+                            packet_id,
+                            "Keep-alive NoOp packet sent successfully"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "freenet_core::transport::keepalive_lifecycle",
+                            remote = ?remote_addr,
+                            error = ?e,
+                            elapsed_since_start_secs = task_start.elapsed().as_secs_f64(),
+                            total_ticks = tick_count,
+                            "Keep-alive task STOPPING - channel closed"
+                        );
+                        break;
+                    }
                 }
             }
 
-            tracing::debug!(remote = ?remote_addr, "Keep-alive task exiting");
+            tracing::warn!(
+                target: "freenet_core::transport::keepalive_lifecycle",
+                remote = ?remote_addr,
+                total_lifetime_secs = task_start.elapsed().as_secs_f64(),
+                total_ticks = tick_count,
+                "Keep-alive task EXITING"
+            );
         });
 
         tracing::info!(remote = ?remote_addr, "PeerConnection created with persistent keep-alive task");
@@ -211,8 +258,8 @@ impl PeerConnection {
     ) -> PeerConnectionMock {
         use crate::transport::crypto::TransportKeypair;
         use parking_lot::Mutex;
-        let (outbound_packets, outbound_packets_recv) = mpsc::channel(1);
-        let (inbound_packet_sender, inbound_packet_recv) = mpsc::channel(1);
+        let (outbound_packets, outbound_packets_recv) = mpsc::channel(100);
+        let (inbound_packet_sender, inbound_packet_recv) = mpsc::channel(100);
         let keypair = TransportKeypair::new();
         let remote = RemoteConnection {
             outbound_packets,
@@ -243,8 +290,8 @@ impl PeerConnection {
     ) -> RemoteConnectionMock {
         use crate::transport::crypto::TransportKeypair;
         use parking_lot::Mutex;
-        let (outbound_packets, outbound_packets_recv) = mpsc::channel(1);
-        let (inbound_packet_sender, inbound_packet_recv) = mpsc::channel(1);
+        let (outbound_packets, outbound_packets_recv) = mpsc::channel(100);
+        let (inbound_packet_sender, inbound_packet_recv) = mpsc::channel(100);
         let keypair = TransportKeypair::new();
         (
             RemoteConnection {
@@ -411,6 +458,28 @@ impl PeerConnection {
                         confirm_receipt,
                         payload,
                     } = msg;
+
+                    // Log keep-alive packets specifically
+                    if matches!(payload, SymmetricMessagePayload::NoOp) {
+                        if confirm_receipt.is_empty() {
+                            tracing::info!(
+                                target: "freenet_core::transport::keepalive_received",
+                                remote = ?self.remote_conn.remote_addr,
+                                packet_id,
+                                time_since_last_received_ms = last_received.elapsed().as_millis(),
+                                "Received NoOp keep-alive packet (no receipts)"
+                            );
+                        } else {
+                            tracing::debug!(
+                                target: "freenet_core::transport::keepalive_received",
+                                remote = ?self.remote_conn.remote_addr,
+                                packet_id,
+                                receipt_count = confirm_receipt.len(),
+                                "Received NoOp receipt packet"
+                            );
+                        }
+                    }
+
                     {
                         tracing::trace!(
                             remote = %self.remote_conn.remote_addr,
@@ -484,9 +553,43 @@ impl PeerConnection {
                     res.map_err(|e| TransportError::Other(e.into()))??
                 }
                 _ = timeout_check.tick() => {
-                    if last_received.elapsed() > KILL_CONNECTION_AFTER {
-                        tracing::warn!(remote = ?self.remote_conn.remote_addr, "connection timed out - no packets received for {:?}", last_received.elapsed());
+                    let elapsed = last_received.elapsed();
+                    if elapsed > KILL_CONNECTION_AFTER {
+                        tracing::warn!(
+                            target: "freenet_core::transport::keepalive_timeout",
+                            remote = ?self.remote_conn.remote_addr,
+                            elapsed_seconds = elapsed.as_secs_f64(),
+                            timeout_threshold_secs = KILL_CONNECTION_AFTER.as_secs(),
+                            "CONNECTION TIMEOUT - no packets received for {:.8}s",
+                            elapsed.as_secs_f64()
+                        );
+
+                        // Check if keep-alive task is still alive
+                        if let Some(ref handle) = self.keep_alive_handle {
+                            if !handle.is_finished() {
+                                tracing::error!(
+                                    target: "freenet_core::transport::keepalive_timeout",
+                                    remote = ?self.remote_conn.remote_addr,
+                                    "Keep-alive task is STILL RUNNING despite timeout!"
+                                );
+                            } else {
+                                tracing::error!(
+                                    target: "freenet_core::transport::keepalive_timeout",
+                                    remote = ?self.remote_conn.remote_addr,
+                                    "Keep-alive task has ALREADY FINISHED before timeout!"
+                                );
+                            }
+                        }
+
                         return Err(TransportError::ConnectionClosed(self.remote_addr()));
+                    } else {
+                        tracing::trace!(
+                            target: "freenet_core::transport::keepalive_health",
+                            remote = ?self.remote_conn.remote_addr,
+                            elapsed_seconds = elapsed.as_secs_f64(),
+                            remaining_seconds = (KILL_CONNECTION_AFTER - elapsed).as_secs_f64(),
+                            "Connection health check - still alive"
+                        );
                     }
                 }
                 _ = resend_check.take().unwrap_or(tokio::time::sleep(Duration::from_millis(10))) => {
