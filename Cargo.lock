@@ -1587,7 +1587,7 @@ dependencies = [
  "itertools 0.14.0",
  "notify",
  "once_cell",
- "opentelemetry 0.29.1",
+ "opentelemetry 0.30.0",
  "opentelemetry-jaeger",
  "opentelemetry-otlp",
  "opentelemetry_sdk 0.29.0",
@@ -3229,6 +3229,20 @@ name = "opentelemetry"
 version = "0.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e87237e2775f74896f9ad219d26a2081751187eb7c9f5c58dde20a23b95d16c"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "pin-project-lite",
+ "thiserror 2.0.12",
+ "tracing",
+]
+
+[[package]]
+name = "opentelemetry"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aaf416e4cb72756655126f7dd7bb0af49c674f4c1b9903e80c009e0c37e552e6"
 dependencies = [
  "futures-core",
  "futures-sink",
