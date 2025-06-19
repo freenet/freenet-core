@@ -65,7 +65,7 @@ local-node local-node-cli --help
 ```
 
 Once the local node is up, you can run `fdev` or a script to send commands to it.  
-Below is a *legacy* style example (paths/names may differ in current code):
+Below is a _legacy_ style example (paths/names may differ in current code):
 
 ```bash
 # Example: older usage for local node exploration
@@ -88,9 +88,11 @@ In newer code, you will likely use `fdev wasm-runtime`, described in a [later se
 - **`webapp`**: A contract container that also bundles a front-end (TypeScript/webpack by default).
 
 Example:
+
 ```bash
 fdev new contract
 ```
+
 Generates Rust cargo boilerplate (and for web apps, TypeScript/webpack scaffolding too).
 
 ---
@@ -123,6 +125,7 @@ fdev build \
 `fdev publish` uploads a **new** contract or delegate to a node (either local or network mode).
 
 **Example: Publishing a contract**:
+
 ```bash
 fdev publish \
     --code path/to/my_contract.wasm \
@@ -130,11 +133,13 @@ fdev publish \
     contract \
     --state path/to/initial_state
 ```
+
 - **`--code`**: path to your built WASM.
 - **`--parameters`**: optional contract parameters file (typically binary format).
 - **`--state`**: optional initial state file (typically binary format).
 
 **Example: Publishing a webapp contract with pre-compressed archive**:
+
 ```bash
 # First compress your webapp directory
 tar cf - webapp/ | xz > webapp.tar.xz
@@ -147,6 +152,7 @@ fdev publish \
     --webapp-archive webapp.tar.xz \
     --webapp-metadata path/to/metadata.json
 ```
+
 - **`--webapp-archive`**: path to your xz-compressed tar archive containing the webapp files.
   The archive should contain an index.html file at the root level.
 - **`--webapp-metadata`**: optional path to metadata file for the webapp (can be any binary format).
@@ -154,6 +160,7 @@ fdev publish \
 This alternative to the TypeScript/webpack build process allows you to provide your own pre-compressed webapp archive.
 
 **Example: Publishing a delegate**:
+
 ```bash
 fdev publish \
     --code path/to/my_delegate.wasm \
@@ -161,6 +168,7 @@ fdev publish \
     delegate \
     [--nonce ... --cipher ...]
 ```
+
 - If you skip `--nonce` and `--cipher`, a default local-only encryption is used (fine for tests, not recommended for production).
 
 By default, `fdev publish` pushes in **local** mode unless you specify `--mode network` or set `MODE=network`.
@@ -199,13 +207,14 @@ fdev build \
 ```
 
 Similarly, you can specify `--state` for a model-only contract:
+
 ```bash
 fdev build \
     --input-state-path contracts/freenet-microblogging/model/ \
     --output-file contracts/freenet-microblogging-data/freenet_microblogging_model
 ```
 
-*(Adjust paths, actual flags, and config to match your usage.)*
+_(Adjust paths, actual flags, and config to match your usage.)_
 
 ---
 
@@ -238,11 +247,13 @@ fdev wasm-runtime \
     --deserialization-format binary \
     --terminal-output
 ```
+
 - The tool will connect to a local Freenet node by default (see `--mode`, `--address`, `--port` if needed).
 - Commands you type—like `put`, `get`, `update`, or `exit`—are forwarded to the local node.
 - Additional command data is read from the file specified by `--input-file`.
 
 Common subcommands once inside the TUI:
+
 ```
 help      # print instructions
 put       # publish a fresh contract state
@@ -280,6 +291,7 @@ fdev test \
     --events 100 \
     single-process
 ```
+
 - **--gateways**: number of gateway nodes
 - **--nodes**: number of normal nodes
 - **--events**: random events (contract puts, updates, etc.)
@@ -292,10 +304,11 @@ fdev test \
     --nodes 10 \
     network
 ```
+
 - One node acts as a **supervisor** (you run `fdev test ... network --mode supervisor`).
 - Others run as **peers** (`--mode peer`) connecting to the supervisor. This can scale across multiple machines or containers.
 
-*(See internal documentation or run `fdev test --help` for more detail.)*
+_(See internal documentation or run `fdev test --help` for more detail.)_
 
 ---
 
@@ -304,6 +317,7 @@ fdev test \
 ```bash
 fdev network-metrics-server [--log-directory path]
 ```
+
 - Launches an HTTP server (default port `55010`) for collecting or pushing network stats and event logs.
 - You can then visualize or store the data for debugging or simulation metrics analysis.
 
@@ -448,7 +462,7 @@ local-node local-node-cli --help
 ```
 
 Once the local node is up, you can run `fdev` or a script to send commands to it.  
-Below is a *legacy* style example (paths/names may differ in current code):
+Below is a _legacy_ style example (paths/names may differ in current code):
 
 ```bash
 # Example: older usage for local node exploration
@@ -471,9 +485,11 @@ In newer code, you will likely use `fdev wasm-runtime`, described in a [later se
 - **`webapp`**: A contract container that also bundles a front-end (TypeScript/webpack by default).
 
 Example:
+
 ```bash
 fdev new contract
 ```
+
 Generates Rust cargo boilerplate (and for web apps, TypeScript/webpack scaffolding too).
 
 ---
@@ -506,6 +522,7 @@ fdev build \
 `fdev publish` uploads a **new** contract or delegate to a node (either local or network mode).
 
 **Example: Publishing a contract**:
+
 ```bash
 fdev publish \
     --code path/to/my_contract.wasm \
@@ -513,11 +530,13 @@ fdev publish \
     contract \
     --state path/to/initial_state.json
 ```
+
 - **`--code`**: path to your built WASM.
 - **`--parameters`**: optional contract parameters.
 - **`--state`**: optional initial state JSON or binary.
 
 **Example: Publishing a delegate**:
+
 ```bash
 fdev publish \
     --code path/to/my_delegate.wasm \
@@ -525,6 +544,7 @@ fdev publish \
     delegate \
     [--nonce ... --cipher ...]
 ```
+
 - If you skip `--nonce` and `--cipher`, a default local-only encryption is used (fine for tests, not recommended for production).
 
 By default, `fdev publish` pushes in **local** mode unless you specify `--mode network` or set `MODE=network`.
@@ -563,13 +583,14 @@ fdev build \
 ```
 
 Similarly, you can specify `--state` for a model-only contract:
+
 ```bash
 fdev build \
     --input-state-path contracts/freenet-microblogging/model/ \
     --output-file contracts/freenet-microblogging-data/freenet_microblogging_model
 ```
 
-*(Adjust paths, actual flags, and config to match your usage.)*
+_(Adjust paths, actual flags, and config to match your usage.)_
 
 ---
 
@@ -602,11 +623,13 @@ fdev wasm-runtime \
     --deserialization-format json \
     --terminal-output
 ```
+
 - The tool will connect to a local Freenet node by default (see `--mode`, `--address`, `--port` if needed).
 - Commands you type—like `put`, `get`, `update`, or `exit`—are forwarded to the local node.
 - Additional command data is read from the file specified by `--input-file`.
 
 Common subcommands once inside the TUI:
+
 ```
 help      # print instructions
 put       # publish a fresh contract state
@@ -644,6 +667,7 @@ fdev test \
     --events 100 \
     single-process
 ```
+
 - **--gateways**: number of gateway nodes
 - **--nodes**: number of normal nodes
 - **--events**: random events (contract puts, updates, etc.)
@@ -656,10 +680,11 @@ fdev test \
     --nodes 10 \
     network
 ```
+
 - One node acts as a **supervisor** (you run `fdev test ... network --mode supervisor`).
 - Others run as **peers** (`--mode peer`) connecting to the supervisor. This can scale across multiple machines or containers.
 
-*(See internal documentation or run `fdev test --help` for more detail.)*
+_(See internal documentation or run `fdev test --help` for more detail.)_
 
 ---
 
@@ -668,6 +693,7 @@ fdev test \
 ```bash
 fdev network-metrics-server [--log-directory path]
 ```
+
 - Launches an HTTP server (default port `55010`) for collecting or pushing network stats and event logs.
 - You can then visualize or store the data for debugging or simulation metrics analysis.
 
