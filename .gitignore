@@ -2,6 +2,8 @@ aider_stdlib_map.md
 
 # Local tools and notes
 .local-tools/
+*.local/
+*.local
 
 # Release artifacts (downloaded binaries)
 release-artifacts/

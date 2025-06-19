@@ -1247,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.1.8"
+version = "0.1.11"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -1326,7 +1326,7 @@ dependencies = [
 
 [[package]]
 name = "freenet-ping-app"
-version = "0.1.0"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "freenet-ping-contract"
-version = "0.1.0"
+version = "0.1.11"
 dependencies = [
  "freenet-ping-types",
  "freenet-stdlib",
@@ -1359,7 +1359,7 @@ dependencies = [
 
 [[package]]
 name = "freenet-ping-types"
-version = "0.1.0"
+version = "0.1.11"
 dependencies = [
  "chrono",
  "clap",

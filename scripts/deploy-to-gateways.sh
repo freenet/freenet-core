@@ -175,14 +175,14 @@ compile_for_target() {
     # Create cross-compiled directory
     mkdir -p "$CROSS_BINARIES_DIR"
     
-    local compile_output
-    local compile_result
+    local compile_output=""
+    local compile_result=0
     
     # Download from GitHub workflow artifacts for both architectures
     show_progress "Downloading binary from GitHub workflow" "start"
     
-    # Get the latest successful workflow run for main branch with timestamp
-    local run_info=$(gh run list --repo freenet/freenet-core --workflow cross-compile.yml --branch main --status success --limit 1 --json databaseId,createdAt --jq '.[0]')
+    # Get the latest successful workflow run (any branch) with timestamp
+    local run_info=$(gh run list --repo freenet/freenet-core --workflow cross-compile.yml --status success --limit 1 --json databaseId,createdAt,headBranch --jq '.[0]')
     
     if [ -z "$run_info" ]; then
         compile_output="Failed to find successful workflow run"
@@ -190,6 +190,9 @@ compile_for_target() {
     else
         local run_id=$(echo "$run_info" | jq -r '.databaseId')
         local created_at=$(echo "$run_info" | jq -r '.createdAt')
+        local branch=$(echo "$run_info" | jq -r '.headBranch')
+        
+        log_verbose "Using workflow run $run_id from branch $branch"
         
         # Check if artifact is older than 12 hours
         local current_time=$(date +%s)

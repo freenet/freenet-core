@@ -325,7 +325,10 @@ async fn websocket_commands(
         }
     };
 
-    ws.on_upgrade(on_upgrade)
+    // Increase max message size to 100MB to handle contract uploads
+    // Default is ~64KB which is too small for WASM contracts
+    ws.max_message_size(100 * 1024 * 1024)
+        .on_upgrade(on_upgrade)
 }
 
 async fn websocket_interface(
