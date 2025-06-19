@@ -1,95 +1,74 @@
 - contract states are commutative monoids, they can be "merged" in any order to arrive at the same result. This may reduce some potential race conditions.
 
-## Transport Layer Key Management Issues (2025-01-06)
+## Important Testing Notes
 
-### Problem
-Integration test `test_put_contract` was failing with "Failed to decrypt packet" errors after v0.1.5 deployment to production. The same decryption failures were affecting the River app in production.
+### Always Use Network Mode for Testing
+- **NEVER use local mode for testing** - it uses very different code paths
+- Local mode bypasses critical networking components that need to be tested
+- Always test with `freenet network` to ensure realistic behavior
 
-### Root Cause  
-The transport layer was incorrectly handling symmetric key establishment for gateway connections:
+## Quick Reference - Essential Commands
 
-1. **Gateway connection key misuse**: Gateway was using different keys for inbound/outbound when it should use the same client key for both directions
-2. **Client ACK encryption error**: Client was encrypting its final ACK response with the gateway's key instead of its own key
-3. **Packet routing overflow**: When existing connection channels became full, packets were misrouted to new gateway connection handlers instead of waiting
+### River Development
+```bash
+# Publish River (use this, not custom scripts)
+cd ~/code/freenet/river && RUST_MIN_STACK=16777216 cargo make publish-river-debug
 
-### Key Protocol Rules
-- **Gateway connections**: Use the same symmetric key (client's key) for both inbound and outbound communication
-- **Peer-to-peer connections**: Use different symmetric keys for each direction (each peer's own inbound key)
-- **Connection establishment**: Only initial gateway connections and explicit connect operations should create new connections
-- **PUT/GET/SUBSCRIBE/UPDATE operations**: Should only use existing active connections, never create new ones
-
-### Fixes Applied
-
-#### 1. Gateway Connection Key Fix (`crates/core/src/transport/connection_handler.rs:578-584`)
-```rust
-// For gateway connections, use the same key for both directions
-let inbound_key = outbound_key.clone();
-let outbound_ack_packet = SymmetricMessage::ack_ok(
-    &outbound_key,
-    outbound_key_bytes.try_into().unwrap(),
-    remote_addr,
-)?;
+# Verify River build time (CRITICAL - only way to confirm new version is served)
+curl -s http://127.0.0.1:50509/v1/contract/web/BcfxyjCH4snaknrBoCiqhYc9UFvmiJvhsp5d4L5DuvRa/ | grep -o 'Built: [^<]*' | head -1
 ```
 
-#### 2. Client ACK Response Fix (`crates/core/src/transport/connection_handler.rs:798-811`)
-```rust
-// Use our own key to encrypt the ACK response (same key for both directions with gateway)
-outbound_packets
-    .send((
-        remote_addr,
-        SymmetricMessage::ack_ok(
-            &inbound_sym_key,  // Use our own key, not the gateway's
-            inbound_sym_key_bytes,
-            remote_addr,
-        )?
-        .prepared_send(),
-    ))
-    .await
-    .map_err(|_| TransportError::ChannelClosed)?;
+### Freenet Management
+```bash
+# Start Freenet
+./target/release/freenet network > freenet-debug.log 2>&1 &
+
+# Check status
+ps aux | grep freenet | grep -v grep | grep -v tail | grep -v journalctl
+
+# Monitor logs
+tail -f freenet-debug.log
 ```
 
-#### 3. Packet Sending Consistency (`crates/core/src/transport/connection_handler.rs:740-747`)
-```rust
-let packet_to_send = our_inbound.prepared_send();
-outbound_packets
-    .send((remote_addr, packet_to_send.clone()))
-    .await
-    .map_err(|_| TransportError::ChannelClosed)?;
-sent_tracker
-    .report_sent_packet(SymmetricMessage::FIRST_PACKET_ID, packet_to_send);
-```
+## Detailed Documentation Files
 
-### Testing
-- Created specialized transport tests in `crates/core/src/transport/test_gateway_handshake.rs`
-- `test_gateway_handshake_symmetric_key_usage()`: Verifies gateway connections use same key for both directions  
-- `test_peer_to_peer_different_keys()`: Verifies peer-to-peer connections use different keys
-- Both specialized tests pass, confirming the transport layer fixes work correctly
+### Current Active Debugging
+- **Directory**: `freenet-invitation-bug.local/` (consolidated debugging)
+  - `README.md` - Overview and quick commands
+  - `river-notes/` - River-specific debugging documentation
+  - `contract-test/` - Minimal Rust test to reproduce PUT/GET issue
+  
+### River Invitation Bug (2025-01-18)
+- **Status**: CONFIRMED - Contract operations hang on live network, work in integration tests
+- **Root Cause**: Freenet node receives WebSocket requests but never responds
+- **Test Directory**: `freenet-invitation-bug.local/live-network-test/`
+- **Confirmed Findings**:
+  - River correctly sends PUT/GET requests via WebSocket
+  - Raw WebSocket test: Receives binary error response from server
+  - freenet-stdlib test: GET request sent but never receives response (2min timeout)
+  - Integration test `test_put_contract` passes when run in isolation
+  - Issue affects both PUT and GET operations
+- **Current Investigation**: Systematically debugging why Freenet node doesn't respond to contract operations
+- **See**: `freenet-invitation-bug.local/river-notes/invitation-bug-analysis-update.md`
 
-### Root Cause Analysis Complete
+### Historical Analysis (Reference Only)
+- **Transport Layer Issues**: See lines 3-145 in previous version of this file (archived)
+- **River Testing Procedures**: See lines 97-145 in previous version of this file (archived)
 
-#### PUT Operation Connection Creation Issue
-**Location**: `crates/core/src/node/network_bridge/p2p_protoc.rs:242-291`
+### CI Tools
+- **GitHub CI Monitoring**: `~/code/agent.scripts/wait-for-ci.sh [PR_NUMBER]`
 
-**Problem**: PUT/GET/SUBSCRIBE/UPDATE operations create new connections when no existing connection is found, violating the protocol rule that these operations should only use existing active connections.
+### Testing Tools
+- **Puppeteer Testing Guide**: `puppeteer-testing-guide.local.md` - Essential patterns for testing Dioxus apps with MCP Puppeteer tools
 
-**Behavior**: When `NetworkBridge.send()` is called and no existing connection exists:
-1. System logs warning: "No existing outbound connection, establishing connection first"  
-2. Creates new connection via `NodeEvent::ConnectPeer`
-3. Waits up to 5 seconds for connection establishment
-4. Attempts to send message on newly created connection
+## Key Code Locations
+- **River Room Creation**: `/home/ian/code/freenet/river/ui/src/components/room_list/create_room_modal.rs`
+- **River Room Synchronizer**: `/home/ian/code/freenet/river/ui/src/components/app/freenet_api/room_synchronizer.rs`
+- **River Room Data**: `/home/ian/code/freenet/river/ui/src/room_data.rs`
 
-**Channel Overflow Root Cause**: Channels fill up due to throughput mismatch:
-- **Fast UDP ingress**: Socket receives packets quickly
-- **Slow application processing**: `peer_connection_listener` processes one message at a time sequentially
-- **Limited buffering**: 100-packet channel buffer insufficient for high-throughput scenarios
-- **No flow control**: System creates new connections instead of implementing proper backpressure
-
-**Cascade Effect**: Channel overflow → packet misrouting → wrong connection handlers → decryption failures → new connection creation
-
-#### Required Fix
-The network bridge should fail gracefully or retry with existing connections instead of creating new ones for PUT/GET/SUBSCRIBE/UPDATE operations. Only initial gateway connections and explicit CONNECT operations should establish new connections.
-
-### Next Steps
-1. Modify PUT/GET operation handling to use only existing connections
-2. Implement proper backpressure handling for full channels instead of creating new connections
-3. Test that integration test `test_put_contract` passes after the fix
+## Organization Rules
+1. **Check this file first** for command reference and active debugging directories
+2. **Use standard commands** instead of creating custom scripts
+3. **Verify River build timestamps** after publishing
+4. **Create timestamped .local directories** for complex debugging sessions
+5. **Update this index** when adding new debugging directories or tools
