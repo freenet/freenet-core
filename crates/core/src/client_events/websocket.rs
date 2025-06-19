@@ -102,6 +102,18 @@ impl WebSocketProxy {
                 auth_token,
                 attested_contract,
             } => {
+                // Log PUT requests for debugging
+                if let ClientRequest::ContractOp(ContractRequest::Put { contract, .. }) =
+                    req.as_ref()
+                {
+                    let contract_id = contract.key().to_string();
+                    tracing::info!(
+                        "WebSocketProxy: Processing PUT request from client_id={}, contract_key={}",
+                        client_id,
+                        contract_id
+                    );
+                }
+
                 let open_req = match &*req {
                     ClientRequest::ContractOp(ContractRequest::Subscribe { key, .. }) => {
                         tracing::debug!(%client_id, contract = %key, "subscribing to contract");
@@ -325,7 +337,10 @@ async fn websocket_commands(
         }
     };
 
-    ws.on_upgrade(on_upgrade)
+    // Increase max message size to 100MB to handle contract uploads
+    // Default is ~64KB which is too small for WASM contracts
+    ws.max_message_size(100 * 1024 * 1024)
+        .on_upgrade(on_upgrade)
 }
 
 async fn websocket_interface(
@@ -518,17 +533,37 @@ async fn process_client_request(
         *auth_token = Some(AuthToken::from(token.clone()));
     }
 
+    // Add special logging for PUT requests to debug River issue
+    if let ClientRequest::ContractOp(ContractRequest::Put { contract, .. }) = &req {
+        let contract_id = contract.key().to_string();
+        tracing::info!(
+            "WebSocket: Received PUT request from client_id={}, contract_key={}",
+            client_id,
+            contract_id
+        );
+    }
+
     tracing::debug!(req = %req, "received client request");
-    request_sender
+
+    let send_result = request_sender
         .send(ClientConnection::Request {
             client_id,
             req: Box::new(req),
             auth_token: auth_token.clone(),
             attested_contract,
         })
-        .await
-        .map_err(|err| Some(err.into()))?;
-    Ok(None)
+        .await;
+
+    match send_result {
+        Ok(()) => {
+            tracing::debug!("Successfully sent client request to handler");
+            Ok(None)
+        }
+        Err(err) => {
+            tracing::error!("Failed to send client request to handler: {}", err);
+            Err(Some(err.into()))
+        }
+    }
 }
 
 async fn process_host_response(
