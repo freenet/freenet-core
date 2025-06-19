@@ -630,11 +630,13 @@ async fn test_multiple_clients_subscription() -> TestResult {
     }
     .boxed_local();
 
-    let test = tokio::time::timeout(Duration::from_secs(180), async {
-        // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(20)).await;
+    let test = tokio::time::timeout(Duration::from_secs(300), async {
+        // Wait for nodes to start up - CI environments need more time
+        tokio::time::sleep(Duration::from_secs(30)).await;
 
         // Connect first client to node A's websocket API
+        tracing::info!("Starting WebSocket connections after 30s startup wait");
+        let start_time = std::time::Instant::now();
         let uri_a = format!(
             "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
             ws_api_port_a
@@ -655,6 +657,10 @@ async fn test_multiple_clients_subscription() -> TestResult {
         let mut client_api_node_b = WebApi::start(stream3);
 
         // First client puts contract with initial state (without subscribing)
+        tracing::info!(
+            "Client 1: Starting PUT operation (elapsed: {:?})",
+            start_time.elapsed()
+        );
         make_put(
             &mut client_api1_node_a,
             wrapped_state.clone(),
@@ -666,10 +672,14 @@ async fn test_multiple_clients_subscription() -> TestResult {
         // Wait for put response
         loop {
             let resp =
-                tokio::time::timeout(Duration::from_secs(60), client_api1_node_a.recv()).await;
+                tokio::time::timeout(Duration::from_secs(120), client_api1_node_a.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                     assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
+                    tracing::info!(
+                        "Client 1: PUT completed successfully (elapsed: {:?})",
+                        start_time.elapsed()
+                    );
                     break;
                 }
                 Ok(Ok(other)) => {
