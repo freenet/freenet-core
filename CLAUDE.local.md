@@ -60,6 +60,7 @@ tail -f freenet-debug.log
 
 ### Testing Tools
 - **Puppeteer Testing Guide**: `puppeteer-testing-guide.local.md` - Essential patterns for testing Dioxus apps with MCP Puppeteer tools
+- **Playwright Notes**: `playwright-notes.local.md` - Learnings and patterns for testing River with Playwright MCP tools
 
 ## Key Code Locations
 - **River Room Creation**: `/home/ian/code/freenet/river/ui/src/components/room_list/create_room_modal.rs`
