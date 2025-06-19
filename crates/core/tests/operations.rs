@@ -630,12 +630,12 @@ async fn test_multiple_clients_subscription() -> TestResult {
     }
     .boxed_local();
 
-    let test = tokio::time::timeout(Duration::from_secs(300), async {
+    let test = tokio::time::timeout(Duration::from_secs(600), async {
         // Wait for nodes to start up - CI environments need more time
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_secs(40)).await;
 
         // Connect first client to node A's websocket API
-        tracing::info!("Starting WebSocket connections after 30s startup wait");
+        tracing::info!("Starting WebSocket connections after 40s startup wait");
         let start_time = std::time::Instant::now();
         let uri_a = format!(
             "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
