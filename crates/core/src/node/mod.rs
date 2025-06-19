@@ -438,30 +438,52 @@ async fn report_result(
             #[cfg(any(debug_assertions, test))]
             {
                 use std::io::Write;
-                let OpError::InvalidStateTransition { tx, state, trace } = err else {
+                #[cfg(debug_assertions)]
+                let OpError::InvalidStateTransition { tx, state, trace } = err
+                else {
+                    tracing::error!("Finished transaction with error: {err}");
+                    return;
+                };
+                #[cfg(not(debug_assertions))]
+                let OpError::InvalidStateTransition { tx } = err
+                else {
                     tracing::error!("Finished transaction with error: {err}");
                     return;
                 };
                 // todo: this can be improved once std::backtrace::Backtrace::frames is stabilized
+                #[cfg(debug_assertions)]
                 let trace = format!("{trace}");
-                let mut tr_lines = trace.lines();
-                let trace = tr_lines
-                    .nth(2)
-                    .map(|second_trace| {
-                        let second_trace_lines =
-                            [second_trace, tr_lines.next().unwrap_or_default()];
-                        second_trace_lines.join("\n")
-                    })
-                    .unwrap_or_default();
-                let peer = &op_manager
-                    .ring
-                    .connection_manager
-                    .get_peer_key()
-                    .expect("Peer key not found");
-                let log = format!(
-                    "Transaction ({tx} @ {peer}) error trace:\n {trace} \nstate:\n {state:?}\n"
-                );
-                std::io::stderr().write_all(log.as_bytes()).unwrap();
+                #[cfg(debug_assertions)]
+                {
+                    let mut tr_lines = trace.lines();
+                    let trace = tr_lines
+                        .nth(2)
+                        .map(|second_trace| {
+                            let second_trace_lines =
+                                [second_trace, tr_lines.next().unwrap_or_default()];
+                            second_trace_lines.join("\n")
+                        })
+                        .unwrap_or_default();
+                    let peer = &op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_key()
+                        .expect("Peer key not found");
+                    let log = format!(
+                        "Transaction ({tx} @ {peer}) error trace:\n {trace} \nstate:\n {state:?}\n"
+                    );
+                    std::io::stderr().write_all(log.as_bytes()).unwrap();
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    let peer = &op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_key()
+                        .expect("Peer key not found");
+                    let log = format!("Transaction ({tx} @ {peer}) error\n");
+                    std::io::stderr().write_all(log.as_bytes()).unwrap();
+                }
             }
             #[cfg(not(any(debug_assertions, test)))]
             {
