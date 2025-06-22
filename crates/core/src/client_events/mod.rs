@@ -274,6 +274,9 @@ where
                                     }
                                 )))
                             }
+                            QueryResult::NodeDiagnostics(response) => {
+                                Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(response)))
+                            }
                         };
                         if let Ok(result) = &res {
                             tracing::debug!(%result, "sending client operation response");
@@ -711,6 +714,12 @@ async fn process_open_request(
                     }
                     freenet_stdlib::client_api::NodeQuery::SubscriptionInfo => {
                         NodeEvent::QuerySubscriptions { callback: tx }
+                    }
+                    freenet_stdlib::client_api::NodeQuery::NodeDiagnostics { config } => {
+                        NodeEvent::QueryNodeDiagnostics {
+                            config,
+                            callback: tx,
+                        }
                     }
                 };
 

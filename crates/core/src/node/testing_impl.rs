@@ -915,6 +915,9 @@ where
                 NodeEvent::QuerySubscriptions { .. } => {
                     unimplemented!()
                 }
+                NodeEvent::QueryNodeDiagnostics { .. } => {
+                    unimplemented!()
+                }
             },
             Err(err) => {
                 super::report_result(

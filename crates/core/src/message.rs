@@ -321,6 +321,10 @@ pub(crate) enum NodeEvent {
     QuerySubscriptions {
         callback: tokio::sync::mpsc::Sender<QueryResult>,
     },
+    QueryNodeDiagnostics {
+        config: freenet_stdlib::client_api::NodeDiagnosticsConfig,
+        callback: tokio::sync::mpsc::Sender<QueryResult>,
+    },
     TransactionTimedOut(Transaction),
 }
 
@@ -354,6 +358,7 @@ pub(crate) enum QueryResult {
         response: HostResult,
     },
     NetworkDebug(NetworkDebugInfo),
+    NodeDiagnostics(freenet_stdlib::client_api::NodeDiagnosticsResponse),
 }
 
 impl Display for NodeEvent {
@@ -376,6 +381,9 @@ impl Display for NodeEvent {
             }
             NodeEvent::QuerySubscriptions { .. } => {
                 write!(f, "QuerySubscriptions")
+            }
+            NodeEvent::QueryNodeDiagnostics { .. } => {
+                write!(f, "QueryNodeDiagnostics")
             }
             NodeEvent::TransactionTimedOut(transaction) => {
                 write!(f, "Transaction timed out ({})", transaction)

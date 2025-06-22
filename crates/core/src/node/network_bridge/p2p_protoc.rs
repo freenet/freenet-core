@@ -401,6 +401,195 @@ impl P2pConnManager {
                                     );
                                 })??;
                             }
+                            NodeEvent::QueryNodeDiagnostics { config, callback } => {
+                                use freenet_stdlib::client_api::{
+                                    ContractState, NetworkInfo, NodeDiagnosticsResponse, NodeInfo,
+                                    SystemMetrics,
+                                };
+                                use std::collections::HashMap;
+
+                                let mut response = NodeDiagnosticsResponse {
+                                    node_info: None,
+                                    network_info: None,
+                                    subscriptions: Vec::new(),
+                                    contract_states: HashMap::new(),
+                                    recent_operations: Vec::new(),
+                                    system_metrics: None,
+                                    update_propagation_info: HashMap::new(),
+                                    cached_contracts: Vec::new(),
+                                    connected_peers_detailed: Vec::new(),
+                                };
+
+                                // Collect node information
+                                if config.include_node_info {
+                                    response.node_info = Some(NodeInfo {
+                                        peer_id: format!(
+                                            "{}:{}",
+                                            self.listening_ip, self.listening_port
+                                        ),
+                                        is_gateway: self.is_gateway,
+                                        location: format!(
+                                            "{}:{}",
+                                            self.listening_ip, self.listening_port
+                                        ),
+                                        uptime_seconds: 0, // TODO: implement actual uptime tracking
+                                    });
+                                }
+
+                                // Collect network information
+                                if config.include_network_info {
+                                    let connected_peers: Vec<_> = self
+                                        .connections
+                                        .keys()
+                                        .map(|p| (p.to_string(), p.addr.to_string()))
+                                        .collect();
+
+                                    response.network_info = Some(NetworkInfo {
+                                        connected_peers,
+                                        active_connections: self.connections.len(),
+                                        peer_connections: self
+                                            .connections
+                                            .iter()
+                                            .map(|(peer, _)| {
+                                                (peer.to_string(), peer.addr.to_string())
+                                            })
+                                            .collect(),
+                                    });
+                                }
+
+                                // Collect subscription information
+                                if config.include_subscriptions {
+                                    // Get network subscriptions from OpManager
+                                    let _network_subs = op_manager.get_network_subscriptions();
+
+                                    // Get application subscriptions from contract executor
+                                    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                                    if let Ok(_) = op_manager
+                                        .notify_contract_handler(
+                                            ContractHandlerEvent::QuerySubscriptions {
+                                                callback: tx,
+                                            },
+                                        )
+                                        .await
+                                    {
+                                        let app_subscriptions = match timeout(
+                                            Duration::from_secs(1),
+                                            rx.recv(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Some(QueryResult::NetworkDebug(info))) => {
+                                                info.application_subscriptions
+                                            }
+                                            _ => Vec::new(),
+                                        };
+
+                                        response.subscriptions = app_subscriptions
+                                            .into_iter()
+                                            .map(|sub| {
+                                                freenet_stdlib::client_api::SubscriptionInfo {
+                                                    contract_key: sub.contract_key,
+                                                    client_id: sub.client_id.into(),
+                                                    last_update: sub.last_update,
+                                                }
+                                            })
+                                            .collect();
+                                    }
+                                }
+
+                                // Collect contract states for specified contracts
+                                if !config.contract_keys.is_empty() {
+                                    for contract_key in &config.contract_keys {
+                                        // For now, just create a basic entry
+                                        // TODO: implement contract state querying when methods are available
+                                        response.contract_states.insert(
+                                            *contract_key,
+                                            ContractState {
+                                                last_update: chrono::Utc::now(),
+                                                size_bytes: 0, // TODO: implement when contract store methods are available
+                                                has_state: true, // TODO: implement when contract store methods are available
+                                                subscribers: 0, // TODO: implement when subscriber tracking is available
+                                                subscriber_peer_ids: Vec::new(), // TODO: implement when subscriber tracking is available
+                                                subscription_details: Vec::new(), // TODO: implement when subscription details are available
+                                            },
+                                        );
+                                    }
+                                }
+
+                                // Collect recent operations
+                                if config.include_recent_operations {
+                                    // TODO: implement recent operations tracking when methods are available
+                                    response.recent_operations = Vec::new();
+                                }
+
+                                // Collect system metrics
+                                if config.include_system_metrics {
+                                    response.system_metrics = Some(SystemMetrics {
+                                        memory_usage_bytes: 0,  // Would need system info crate
+                                        cpu_usage_percent: 0.0, // Would need system info crate
+                                        active_connections: self.connections.len() as u32,
+                                        pending_operations: 0, // TODO: implement when pending operations count is available
+                                    });
+                                }
+
+                                // Track update propagation if requested
+                                if config.track_update_propagation {
+                                    // TODO: implement update propagation tracking when methods are available
+                                    for contract_key in &config.contract_keys {
+                                        response.update_propagation_info.insert(
+                                            *contract_key,
+                                            std::collections::HashMap::new(),
+                                        );
+                                    }
+                                }
+
+                                // Collect cached contracts information if requested
+                                if config.include_cached_contracts {
+                                    // TODO: implement cached contracts collection when ContractKey import is resolved
+                                    // For now, leaving empty - the field is available in response structure
+                                }
+
+                                // Collect detailed peer information if requested
+                                if config.include_detailed_peer_info {
+                                    use freenet_stdlib::client_api::ConnectedPeerInfo;
+                                    // Populate detailed peer information from actual connections
+                                    for (peer, _connection) in &self.connections {
+                                        response.connected_peers_detailed.push(ConnectedPeerInfo {
+                                            peer_id: peer.to_string(),
+                                            address: peer.addr.to_string(),
+                                            connection_type: "unknown".to_string(), // TODO: determine actual connection type
+                                            connected_since: chrono::Utc::now(), // TODO: track actual connection time
+                                            connection_duration_seconds: 0, // TODO: calculate actual duration
+                                            is_gateway: false, // TODO: determine if peer is gateway
+                                            location: None, // TODO: get actual ring location if available
+                                            last_seen: chrono::Utc::now(),
+                                            bytes_sent: 0, // TODO: get actual traffic stats
+                                            bytes_received: 0, // TODO: get actual traffic stats
+                                            ping_ms: None, // TODO: measure actual latency
+                                            shared_contracts: vec![], // TODO: populate when ContractKey import is resolved
+                                        });
+                                    }
+                                }
+
+                                // Add subscriber peer IDs to contract states if requested
+                                if config.include_subscriber_peer_ids {
+                                    // TODO: implement actual subscriber tracking
+                                    // For now, we don't have access to real subscription data
+                                    // This would need to query the actual contract handler for subscriber info
+                                }
+
+                                timeout(
+                                    Duration::from_secs(2),
+                                    callback.send(QueryResult::NodeDiagnostics(response)),
+                                )
+                                .await
+                                .inspect_err(|error| {
+                                    tracing::error!(
+                                        "Failed to send node diagnostics query result: {:?}",
+                                        error
+                                    );
+                                })??;
+                            }
                             NodeEvent::TransactionTimedOut(tx) => {
                                 let Some(clients) = state.tx_to_client.remove(&tx) else {
                                     continue;
