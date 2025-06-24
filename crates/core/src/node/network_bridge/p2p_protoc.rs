@@ -500,16 +500,38 @@ impl P2pConnManager {
                                 // Collect contract states for specified contracts
                                 if !config.contract_keys.is_empty() {
                                     for contract_key in &config.contract_keys {
-                                        // For now, just create a basic entry
-                                        // TODO: implement contract state querying when methods are available
+                                        // Get actual subscriber information from OpManager
+                                        let subscribers_info =
+                                            op_manager.ring.subscribers_of(contract_key);
+                                        let subscriber_count = subscribers_info
+                                            .as_ref()
+                                            .map(|s| s.value().len())
+                                            .unwrap_or(0);
+                                        let subscriber_peer_ids: Vec<String> = subscribers_info
+                                            .as_ref()
+                                            .map(|s| {
+                                                s.value()
+                                                    .iter()
+                                                    .map(|pk| pk.peer.to_string())
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
+
+                                        tracing::info!(
+                                            "DIAGNOSTICS_COLLECTION: contract: {}, actual_subscribers: {}, peer_ids: {:?}",
+                                            contract_key,
+                                            subscriber_count,
+                                            subscriber_peer_ids
+                                        );
+
                                         response.contract_states.insert(
                                             *contract_key,
                                             ContractState {
                                                 last_update: chrono::Utc::now(),
                                                 size_bytes: 0, // TODO: implement when contract store methods are available
                                                 has_state: true, // TODO: implement when contract store methods are available
-                                                subscribers: 0, // TODO: implement when subscriber tracking is available
-                                                subscriber_peer_ids: Vec::new(), // TODO: implement when subscriber tracking is available
+                                                subscribers: subscriber_count as u32,
+                                                subscriber_peer_ids,
                                                 subscription_details: Vec::new(), // TODO: implement when subscription details are available
                                             },
                                         );
