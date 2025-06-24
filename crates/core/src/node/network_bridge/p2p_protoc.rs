@@ -413,10 +413,7 @@ impl P2pConnManager {
                                     network_info: None,
                                     subscriptions: Vec::new(),
                                     contract_states: HashMap::new(),
-                                    recent_operations: Vec::new(),
                                     system_metrics: None,
-                                    update_propagation_info: HashMap::new(),
-                                    cached_contracts: Vec::new(),
                                     connected_peers_detailed: Vec::new(),
                                 };
 
@@ -447,13 +444,6 @@ impl P2pConnManager {
                                     response.network_info = Some(NetworkInfo {
                                         connected_peers,
                                         active_connections: self.connections.len(),
-                                        peer_connections: self
-                                            .connections
-                                            .iter()
-                                            .map(|(peer, _)| {
-                                                (peer.to_string(), peer.addr.to_string())
-                                            })
-                                            .collect(),
                                     });
                                 }
 
@@ -490,7 +480,6 @@ impl P2pConnManager {
                                                 freenet_stdlib::client_api::SubscriptionInfo {
                                                     contract_key: sub.contract_key,
                                                     client_id: sub.client_id.into(),
-                                                    last_update: sub.last_update,
                                                 }
                                             })
                                             .collect();
@@ -507,68 +496,39 @@ impl P2pConnManager {
                                             .as_ref()
                                             .map(|s| s.value().len())
                                             .unwrap_or(0);
-                                        let subscriber_peer_ids: Vec<String> = subscribers_info
-                                            .as_ref()
-                                            .map(|s| {
-                                                s.value()
-                                                    .iter()
-                                                    .map(|pk| pk.peer.to_string())
-                                                    .collect()
-                                            })
-                                            .unwrap_or_default();
-
-                                        tracing::info!(
-                                            "DIAGNOSTICS_COLLECTION: contract: {}, actual_subscribers: {}, peer_ids: {:?}",
-                                            contract_key,
-                                            subscriber_count,
-                                            subscriber_peer_ids
-                                        );
+                                        let subscriber_peer_ids: Vec<String> =
+                                            if config.include_subscriber_peer_ids {
+                                                subscribers_info
+                                                    .as_ref()
+                                                    .map(|s| {
+                                                        s.value()
+                                                            .iter()
+                                                            .map(|pk| pk.peer.to_string())
+                                                            .collect()
+                                                    })
+                                                    .unwrap_or_default()
+                                            } else {
+                                                Vec::new()
+                                            };
 
                                         response.contract_states.insert(
                                             *contract_key,
                                             ContractState {
-                                                last_update: chrono::Utc::now(),
-                                                size_bytes: 0, // TODO: implement when contract store methods are available
-                                                has_state: true, // TODO: implement when contract store methods are available
                                                 subscribers: subscriber_count as u32,
                                                 subscriber_peer_ids,
-                                                subscription_details: Vec::new(), // TODO: implement when subscription details are available
                                             },
                                         );
                                     }
                                 }
 
-                                // Collect recent operations
-                                if config.include_recent_operations {
-                                    // TODO: implement recent operations tracking when methods are available
-                                    response.recent_operations = Vec::new();
-                                }
-
                                 // Collect system metrics
                                 if config.include_system_metrics {
+                                    let seeding_contracts =
+                                        op_manager.ring.all_network_subscriptions().len() as u32;
                                     response.system_metrics = Some(SystemMetrics {
-                                        memory_usage_bytes: 0,  // Would need system info crate
-                                        cpu_usage_percent: 0.0, // Would need system info crate
                                         active_connections: self.connections.len() as u32,
-                                        pending_operations: 0, // TODO: implement when pending operations count is available
+                                        seeding_contracts,
                                     });
-                                }
-
-                                // Track update propagation if requested
-                                if config.track_update_propagation {
-                                    // TODO: implement update propagation tracking when methods are available
-                                    for contract_key in &config.contract_keys {
-                                        response.update_propagation_info.insert(
-                                            *contract_key,
-                                            std::collections::HashMap::new(),
-                                        );
-                                    }
-                                }
-
-                                // Collect cached contracts information if requested
-                                if config.include_cached_contracts {
-                                    // TODO: implement cached contracts collection when ContractKey import is resolved
-                                    // For now, leaving empty - the field is available in response structure
                                 }
 
                                 // Collect detailed peer information if requested
@@ -579,25 +539,8 @@ impl P2pConnManager {
                                         response.connected_peers_detailed.push(ConnectedPeerInfo {
                                             peer_id: peer.to_string(),
                                             address: peer.addr.to_string(),
-                                            connection_type: "unknown".to_string(), // TODO: determine actual connection type
-                                            connected_since: chrono::Utc::now(), // TODO: track actual connection time
-                                            connection_duration_seconds: 0, // TODO: calculate actual duration
-                                            is_gateway: false, // TODO: determine if peer is gateway
-                                            location: None, // TODO: get actual ring location if available
-                                            last_seen: chrono::Utc::now(),
-                                            bytes_sent: 0, // TODO: get actual traffic stats
-                                            bytes_received: 0, // TODO: get actual traffic stats
-                                            ping_ms: None, // TODO: measure actual latency
-                                            shared_contracts: vec![], // TODO: populate when ContractKey import is resolved
                                         });
                                     }
-                                }
-
-                                // Add subscriber peer IDs to contract states if requested
-                                if config.include_subscriber_peer_ids {
-                                    // TODO: implement actual subscriber tracking
-                                    // For now, we don't have access to real subscription data
-                                    // This would need to query the actual contract handler for subscriber info
                                 }
 
                                 timeout(

@@ -259,7 +259,6 @@ where
                                     freenet_stdlib::client_api::SubscriptionInfo {
                                         contract_key: sub.contract_key,
                                         client_id: sub.client_id.into(),
-                                        last_update: sub.last_update,
                                     }
                                 }).collect();
 

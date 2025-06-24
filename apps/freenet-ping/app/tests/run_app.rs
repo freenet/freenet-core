@@ -3,20 +3,26 @@ mod common;
 use std::{net::TcpListener, path::PathBuf, time::Duration};
 
 use anyhow::anyhow;
-use rand::SeedableRng;
 use freenet::{local_node::NodeConfig, server::serve_gateway};
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi, NodeQuery, QueryResponse, NodeDiagnosticsConfig},
+    client_api::{
+        ClientRequest, ContractRequest, ContractResponse, HostResponse, NodeDiagnosticsConfig,
+        NodeQuery, QueryResponse, WebApi,
+    },
     prelude::*,
 };
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
+use rand::SeedableRng;
 use testresult::TestResult;
 use tokio::{select, time::sleep, time::timeout};
 use tokio_tungstenite::connect_async;
 use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 
-use common::{base_node_test_config, base_node_test_config_with_rng, gw_config_from_path, gw_config_from_path_with_rng, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT};
+use common::{
+    base_node_test_config, base_node_test_config_with_rng, gw_config_from_path,
+    gw_config_from_path_with_rng, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+};
 use freenet_ping_app::ping_client::{
     run_ping_client, wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
     PingStats,
@@ -30,124 +36,114 @@ async fn collect_node_diagnostics(
     phase: &str,
 ) -> anyhow::Result<()> {
     use std::time::Duration;
-    
+
     print!("=== NODE DIAGNOSTICS: {} ===\n", phase);
-    
-    // Create comprehensive diagnostic config with enhanced features enabled
+
+    // Create diagnostic config with features enabled
     let config = NodeDiagnosticsConfig {
         include_node_info: true,
         include_network_info: true,
         include_subscriptions: true,
         contract_keys: vec![contract_key],
-        include_recent_operations: true,
-        max_recent_operations: 100,
         include_system_metrics: true,
-        track_update_propagation: true,
-        include_cached_contracts: true,    // Enhanced: Show cached contracts
-        include_detailed_peer_info: true,  // Enhanced: Detailed peer connections
-        include_subscriber_peer_ids: true, // Enhanced: Show subscriber peer IDs
+        include_detailed_peer_info: true,
+        include_subscriber_peer_ids: true,
     };
-    
+
     for (i, (client, node_name)) in clients.iter_mut().zip(node_names.iter()).enumerate() {
-        print!("Collecting diagnostics from {} (index {})...\n", node_name, i);
-        
+        print!(
+            "Collecting diagnostics from {} (index {})...\n",
+            node_name, i
+        );
+
         // Send diagnostic request
-        match client.send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics { config: config.clone() })).await {
+        match client
+            .send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
+                config: config.clone(),
+            }))
+            .await
+        {
             Ok(_) => {
                 // Keep receiving messages until we get a diagnostic response (ignore everything else)
                 loop {
                     match timeout(Duration::from_secs(5), client.recv()).await {
-                        Ok(Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(response)))) => {
-                        print!("--- {} DIAGNOSTICS ---\n", node_name.to_uppercase());
-                        
-                        // Node info
-                        if let Some(node_info) = &response.node_info {
-                            print!("📍 Node: {} ({})\n", 
-                                node_info.peer_id, 
-                                if node_info.is_gateway { "Gateway" } else { "Client" });
-                        }
-                        
-                        // Enhanced: Detailed peer information (CONEXIONES A OTROS NODOS)
-                        if !response.connected_peers_detailed.is_empty() {
-                            print!("🔗 Connected to {} peer(s):\n", response.connected_peers_detailed.len());
-                            for peer in &response.connected_peers_detailed {
-                                print!("  - Peer: {} ({})\n", peer.peer_id, peer.address);
-                                
-                                // Only show information we actually have (no fake data)
-                                if peer.connection_duration_seconds > 0 {
-                                    print!("    Connected for: {}s\n", peer.connection_duration_seconds);
-                                }
-                                if peer.bytes_sent > 0 || peer.bytes_received > 0 {
-                                    print!("    Traffic: ↑{}KB ↓{}KB\n", 
-                                        peer.bytes_sent / 1024, peer.bytes_received / 1024);
-                                }
-                                if let Some(ping) = peer.ping_ms {
-                                    print!("    Latency: {:.1}ms\n", ping);
-                                }
-                                if let Some(location) = peer.location {
-                                    print!("    Ring location: {:.3}\n", location);
-                                }
-                                if peer.is_gateway {
-                                    print!("    Type: Gateway\n");
-                                }
-                            }
-                        } else if let Some(network_info) = &response.network_info {
-                            print!("🔗 Connected to {} peer(s):\n", network_info.connected_peers.len());
-                            for (peer_id, addr) in &network_info.connected_peers {
-                                print!("  - {} at {}\n", peer_id, addr);
-                            }
-                        }
-                        
-                        // Subscription info
-                        if !response.subscriptions.is_empty() {
-                            print!("Subscriptions:\n");
-                            for sub in &response.subscriptions {
-                                print!("  - Contract: {}\n", sub.contract_key);
-                                print!("    Client ID: {}\n", sub.client_id);
-                                if let Some(last_update) = sub.last_update {
-                                    print!("    Last update: {:?}\n", last_update);
-                                } else {
-                                    print!("    Last update: None\n");
-                                }
-                            }
-                        } else {
-                            print!("No active subscriptions\n");
-                        }
-                        
-                        // Contract states (CONTRATOS Y SUSCRIPCIONES)
-                        if !response.contract_states.is_empty() {
-                            print!("📋 Contract States ({} contract(s)):\n", response.contract_states.len());
-                            for (key, state) in &response.contract_states {
-                                print!("  📄 Contract: {}\n", key);
-                                print!("     Size: {} bytes • {} subscribers\n", state.size_bytes, state.subscribers);
-                                
-                                // Enhanced: Show subscriber peer IDs (NODOS SUSCRITOS)
-                                if !state.subscriber_peer_ids.is_empty() {
-                                    print!("     👥 Subscribed nodes: [{}]\n", state.subscriber_peer_ids.join(", "));
-                                    
-                                    // Enhanced: Show subscription details
-                                    if !state.subscription_details.is_empty() {
-                                        for detail in &state.subscription_details {
-                                            print!("        • {} → {} updates sent (client {})\n", 
-                                                detail.peer_id, detail.updates_sent_count, detail.client_id);
-                                        }
+                        Ok(Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(
+                            response,
+                        )))) => {
+                            print!("--- {} DIAGNOSTICS ---\n", node_name.to_uppercase());
+
+                            // Node info
+                            if let Some(node_info) = &response.node_info {
+                                print!(
+                                    "📍 Node: {} ({})\n",
+                                    node_info.peer_id,
+                                    if node_info.is_gateway {
+                                        "Gateway"
+                                    } else {
+                                        "Client"
                                     }
-                                } else {
-                                    print!("     👥 No subscribers\n");
+                                );
+                            }
+
+                            // Simplified peer information
+                            if !response.connected_peers_detailed.is_empty() {
+                                print!(
+                                    "🔗 Connected to {} peer(s):\n",
+                                    response.connected_peers_detailed.len()
+                                );
+                                for peer in &response.connected_peers_detailed {
+                                    print!("  - Peer: {} ({})\n", peer.peer_id, peer.address);
+                                }
+                            } else if let Some(network_info) = &response.network_info {
+                                print!(
+                                    "🔗 Connected to {} peer(s):\n",
+                                    network_info.connected_peers.len()
+                                );
+                                for (peer_id, addr) in &network_info.connected_peers {
+                                    print!("  - {} at {}\n", peer_id, addr);
                                 }
                             }
-                        }
-                        
-                        // System metrics (only show meaningful info)
-                        if let Some(metrics) = &response.system_metrics {
-                            print!("Network metrics:\n");
-                            print!("  - Active connections: {}\n", metrics.active_connections);
-                            if metrics.pending_operations > 0 {
-                                print!("  - Pending operations: {}\n", metrics.pending_operations);
+
+                            // Subscription info
+                            if !response.subscriptions.is_empty() {
+                                print!("Subscriptions:\n");
+                                for sub in &response.subscriptions {
+                                    print!("  - Contract: {}\n", sub.contract_key);
+                                    print!("    Client ID: {}\n", sub.client_id);
+                                }
+                            } else {
+                                print!("No active subscriptions\n");
                             }
-                        }
-                        
-                        
+
+                            // Contract states
+                            if !response.contract_states.is_empty() {
+                                print!(
+                                    "📋 Contract States ({} contract(s)):\n",
+                                    response.contract_states.len()
+                                );
+                                for (key, state) in &response.contract_states {
+                                    print!("  📄 Contract: {}\n", key);
+                                    print!("     {} subscribers\n", state.subscribers);
+
+                                    // Show subscriber peer IDs (NODOS SUSCRITOS)
+                                    if !state.subscriber_peer_ids.is_empty() {
+                                        print!(
+                                            "     👥 Subscribed nodes: [{}]\n",
+                                            state.subscriber_peer_ids.join(", ")
+                                        );
+                                    } else {
+                                        print!("     👥 No subscribers\n");
+                                    }
+                                }
+                            }
+
+                            // System metrics (only show meaningful info)
+                            if let Some(metrics) = &response.system_metrics {
+                                print!("Network metrics:\n");
+                                print!("  - Active connections: {}\n", metrics.active_connections);
+                                print!("  - Seeding contracts: {}\n", metrics.seeding_contracts);
+                            }
+
                             print!("--- END {} DIAGNOSTICS ---\n", node_name.to_uppercase());
                             break; // Got the diagnostic response, exit the loop
                         }
@@ -167,13 +163,16 @@ async fn collect_node_diagnostics(
                 }
             }
             Err(e) => {
-                print!("ERROR: Failed to send diagnostic request to {}: {}\n", node_name, e);
+                print!(
+                    "ERROR: Failed to send diagnostic request to {}: {}\n",
+                    node_name, e
+                );
             }
         }
-        
+
         print!("\n");
     }
-    
+
     print!("=== END DIAGNOSTICS: {} ===\n\n", phase);
     Ok(())
 }
@@ -190,7 +189,7 @@ async fn test_node_diagnostics_query() -> TestResult {
     // Configure nodes with fixed seed for deterministic testing
     let test_seed = *b"diagnostics_test_seed_1234567890";
     let mut test_rng = rand::rngs::StdRng::from_seed(test_seed);
-    
+
     print!("Testing NodeDiagnostics query functionality\n");
     print!("Using deterministic test seed: {:?}\n", test_seed);
 
@@ -225,10 +224,19 @@ async fn test_node_diagnostics_query() -> TestResult {
     .await?;
     let ws_api_port_node = config_node.ws_api.ws_api_port.unwrap();
 
-    print!("Gateway node data dir: {:?}\n", preset_cfg_gw.temp_dir.path());
-    print!("Client node data dir: {:?}\n", preset_cfg_node.temp_dir.path());
+    print!(
+        "Gateway node data dir: {:?}\n",
+        preset_cfg_gw.temp_dir.path()
+    );
+    print!(
+        "Client node data dir: {:?}\n",
+        preset_cfg_node.temp_dir.path()
+    );
     print!("Gateway location: {:?}\n", config_gw.network_api.location);
-    print!("Client node location: {:?}\n", config_node.network_api.location);
+    print!(
+        "Client node location: {:?}\n",
+        config_node.network_api.location
+    );
 
     // Free ports so they don't fail on initialization
     std::mem::drop(network_socket_gw);
@@ -280,32 +288,27 @@ async fn test_node_diagnostics_query() -> TestResult {
 
         print!("=== TESTING NODE DIAGNOSTICS QUERIES ===\n");
 
-        // Test 1: Enhanced node diagnostics from gateway (with new features)
-        print!("Test 1: Querying enhanced diagnostics from gateway...\n");
+        print!("Test 1: Querying diagnostics from gateway...\n");
         let config_basic = NodeDiagnosticsConfig {
             include_node_info: true,
             include_network_info: true,
             include_subscriptions: false,
             contract_keys: vec![],
-            include_recent_operations: false,
-            max_recent_operations: 0,
             include_system_metrics: true,
-            track_update_propagation: false,
-            include_cached_contracts: true,  // Enable new feature
-            include_detailed_peer_info: true,  // Enable new feature
+            include_detailed_peer_info: true,
             include_subscriber_peer_ids: false,
         };
 
         client_gw
-            .send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics { 
-                config: config_basic.clone() 
+            .send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
+                config: config_basic.clone()
             }))
             .await?;
 
         match timeout(Duration::from_secs(10), client_gw.recv()).await {
             Ok(Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(response)))) => {
                 print!("✓ Gateway diagnostics received successfully!\n");
-                
+
                 // Validate response structure
                 if let Some(node_info) = &response.node_info {
                     print!("  - Node ID: {}\n", node_info.peer_id);
@@ -325,9 +328,8 @@ async fn test_node_diagnostics_query() -> TestResult {
                 }
 
                 if let Some(metrics) = &response.system_metrics {
-                    print!("  - Memory usage: {} bytes\n", metrics.memory_usage_bytes);
-                    print!("  - CPU usage: {:.1}%\n", metrics.cpu_usage_percent);
-                    print!("  - Pending operations: {}\n", metrics.pending_operations);
+                    print!("  - Active connections: {}\n", metrics.active_connections);
+                    print!("  - Seeding contracts: {}\n", metrics.seeding_contracts);
                 } else {
                     return Err(anyhow!("Gateway diagnostics missing system_metrics"));
                 }
@@ -345,17 +347,17 @@ async fn test_node_diagnostics_query() -> TestResult {
 
         // Test 2: Basic node diagnostics from client node
         print!("\nTest 2: Querying basic diagnostics from client node...\n");
-        
+
         client_node
-            .send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics { 
-                config: config_basic.clone() 
+            .send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
+                config: config_basic.clone()
             }))
             .await?;
 
         match timeout(Duration::from_secs(10), client_node.recv()).await {
             Ok(Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(response)))) => {
                 print!("✓ Client node diagnostics received successfully!\n");
-                
+
                 if let Some(node_info) = &response.node_info {
                     print!("  - Node ID: {}\n", node_info.peer_id);
                     print!("  - Is Gateway: {}\n", node_info.is_gateway);
@@ -376,9 +378,8 @@ async fn test_node_diagnostics_query() -> TestResult {
                 }
 
                 if let Some(metrics) = &response.system_metrics {
-                    print!("  - Memory usage: {} bytes\n", metrics.memory_usage_bytes);
-                    print!("  - CPU usage: {:.1}%\n", metrics.cpu_usage_percent);
-                    // Note: Memory usage might be 0 during initial startup, which is acceptable
+                    print!("  - Active connections: {}\n", metrics.active_connections);
+                    print!("  - Seeding contracts: {}\n", metrics.seeding_contracts);
                     print!("  - System metrics collection working\n");
                 }
             }
@@ -400,18 +401,14 @@ async fn test_node_diagnostics_query() -> TestResult {
             include_network_info: true,
             include_subscriptions: true,
             contract_keys: vec![],
-            include_recent_operations: true,
-            max_recent_operations: 50,
             include_system_metrics: true,
-            track_update_propagation: true,
-            include_cached_contracts: true,
             include_detailed_peer_info: true,
             include_subscriber_peer_ids: true,
         };
 
         client_gw
-            .send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics { 
-                config: config_full.clone() 
+            .send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
+                config: config_full.clone()
             }))
             .await?;
 
@@ -420,9 +417,8 @@ async fn test_node_diagnostics_query() -> TestResult {
                 print!("✓ Full diagnostics received successfully!\n");
                 print!("  - Subscriptions: {}\n", response.subscriptions.len());
                 print!("  - Contract states: {}\n", response.contract_states.len());
-                print!("  - Recent operations: {}\n", response.recent_operations.len());
-                print!("  - Update propagation info entries: {}\n", response.update_propagation_info.len());
-                
+                print!("  - Connected peers detailed: {}\n", response.connected_peers_detailed.len());
+
                 // All fields should be present in full diagnostics
                 assert!(response.node_info.is_some(), "Full diagnostics should include node_info");
                 assert!(response.network_info.is_some(), "Full diagnostics should include network_info");
@@ -484,7 +480,7 @@ async fn test_ping_multi_node() -> TestResult {
     // Configure gateway node with fixed seed for deterministic testing
     let test_seed = *b"app_loop_test_seed_0123456789012";
     let mut test_rng = rand::rngs::StdRng::from_seed(test_seed);
-    
+
     print!("Using deterministic test seed: {:?}\n", test_seed);
     print!("Test RNG initial state configured for deterministic network topology\n");
 
@@ -503,7 +499,11 @@ async fn test_ping_multi_node() -> TestResult {
         .await?;
         let public_port = cfg.network_api.public_port.unwrap();
         let path = preset.temp_dir.path().to_path_buf();
-        (cfg, preset, gw_config_from_path_with_rng(public_port, &path, &mut test_rng)?)
+        (
+            cfg,
+            preset,
+            gw_config_from_path_with_rng(public_port, &path, &mut test_rng)?,
+        )
     };
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
 
@@ -536,7 +536,10 @@ async fn test_ping_multi_node() -> TestResult {
     let ws_api_port_node2 = config_node2.ws_api.ws_api_port.unwrap();
 
     // Log data directories and ring locations for debugging
-    print!("Gateway node data dir: {:?}\n", preset_cfg_gw.temp_dir.path());
+    print!(
+        "Gateway node data dir: {:?}\n",
+        preset_cfg_gw.temp_dir.path()
+    );
     print!("Node 1 data dir: {:?}\n", preset_cfg_node1.temp_dir.path());
     print!("Node 2 data dir: {:?}\n", preset_cfg_node2.temp_dir.path());
 
@@ -555,7 +558,7 @@ async fn test_ping_multi_node() -> TestResult {
         let gw_to_n1_dist = (gw_loc - n1_loc).abs().min(1.0 - (gw_loc - n1_loc).abs());
         let gw_to_n2_dist = (gw_loc - n2_loc).abs().min(1.0 - (gw_loc - n2_loc).abs());
         let n1_to_n2_dist = (n1_loc - n2_loc).abs().min(1.0 - (n1_loc - n2_loc).abs());
-        
+
         print!("Ring distances:\n");
         print!("  Gateway ↔ Node1: {:.6}\n", gw_to_n1_dist);
         print!("  Gateway ↔ Node2: {:.6}\n", gw_to_n2_dist);
@@ -564,16 +567,25 @@ async fn test_ping_multi_node() -> TestResult {
         // Warn about potentially problematic distances
         let max_distance_threshold = 0.4; // Arbitrary threshold for "far" nodes
         if n1_to_n2_dist > max_distance_threshold {
-            tracing::warn!("Node1 and Node2 are far apart in the ring (distance: {:.6})", n1_to_n2_dist);
+            tracing::warn!(
+                "Node1 and Node2 are far apart in the ring (distance: {:.6})",
+                n1_to_n2_dist
+            );
             tracing::warn!("This may cause update propagation issues!");
         }
-        
+
         if gw_to_n1_dist > max_distance_threshold {
-            tracing::warn!("Gateway and Node1 are far apart (distance: {:.6})", gw_to_n1_dist);
+            tracing::warn!(
+                "Gateway and Node1 are far apart (distance: {:.6})",
+                gw_to_n1_dist
+            );
         }
-        
+
         if gw_to_n2_dist > max_distance_threshold {
-            tracing::warn!("Gateway and Node2 are far apart (distance: {:.6})", gw_to_n2_dist);
+            tracing::warn!(
+                "Gateway and Node2 are far apart (distance: {:.6})",
+                gw_to_n2_dist
+            );
         }
     }
     print!("==============================\n");
@@ -657,7 +669,7 @@ async fn test_ping_multi_node() -> TestResult {
         };
         let temp_params = Parameters::from(serde_json::to_vec(&temp_options).unwrap());
         let container = common::load_contract(&path_to_code, temp_params)?;
-        
+
         // Now get the actual code hash and create proper options
         let code_hash = CodeHash::from_code(container.data());
         let ping_options = PingContractOptions {
@@ -840,7 +852,7 @@ async fn test_ping_multi_node() -> TestResult {
             print!("Waiting 30ms before next round...\n");
             sleep(Duration::from_millis(30)).await;
         }
-        
+
         print!("=== ALL UPDATES SENT, WAITING FOR PROPAGATION ===\n");
 
         // Wait for updates to propagate across the network - longer wait to ensure eventual consistency
@@ -915,7 +927,7 @@ async fn test_ping_multi_node() -> TestResult {
         // First, analyze what each node received
         print!("=== PROPAGATION MATRIX ===\n");
         let nodes = [("Gateway", &final_state_gw), ("Node1", &final_state_node1), ("Node2", &final_state_node2)];
-        
+
         for (node_name, state) in &nodes {
             print!("{} received tags: {:?}\n", node_name, state.keys().collect::<Vec<_>>());
             for tag in &tags {
@@ -932,15 +944,15 @@ async fn test_ping_multi_node() -> TestResult {
         // Gateway should have all tags
         let gw_has_node1 = final_state_gw.contains_key(&node1_tag);
         let gw_has_node2 = final_state_gw.contains_key(&node2_tag);
-        
-        // Node1 should have gateway and node2 tags  
+
+        // Node1 should have gateway and node2 tags
         let node1_has_gw = final_state_node1.contains_key(&gw_tag);
         let node1_has_node2 = final_state_node1.contains_key(&node2_tag);
-        
+
         // Node2 should have gateway and node1 tags
         let node2_has_gw = final_state_node2.contains_key(&gw_tag);
         let node2_has_node1 = final_state_node2.contains_key(&node1_tag);
-        
+
         print!("Cross-propagation success rates:\n");
         print!("  Gateway ← Node1: {} | Gateway ← Node2: {}\n", gw_has_node1, gw_has_node2);
         print!("  Node1 ← Gateway: {} | Node1 ← Node2: {}\n", node1_has_gw, node1_has_node2);
@@ -948,11 +960,11 @@ async fn test_ping_multi_node() -> TestResult {
 
         // Calculate overall propagation success
         let total_propagation_attempts = 6; // 3 nodes × 2 cross-propagations each
-        let successful_propagations = [gw_has_node1, gw_has_node2, node1_has_gw, 
+        let successful_propagations = [gw_has_node1, gw_has_node2, node1_has_gw,
                                      node1_has_node2, node2_has_gw, node2_has_node1]
                                      .iter().filter(|&&x| x).count();
         let propagation_rate = successful_propagations as f64 / total_propagation_attempts as f64;
-        
+
         print!("Overall propagation success: {}/{} ({:.1}%)\n",
                       successful_propagations, total_propagation_attempts, propagation_rate * 100.0);
 
@@ -1018,7 +1030,7 @@ async fn test_ping_multi_node() -> TestResult {
         if !all_histories_match {
             tracing::error!("PROPAGATION FAILURE DIAGNOSIS:");
             tracing::error!("Overall propagation rate: {:.1}%", propagation_rate * 100.0);
-            
+
             if propagation_rate < 0.5 {
                 tracing::error!("SEVERE: Less than 50% of updates propagated");
                 tracing::error!("This is a BUG - all subscribed nodes MUST receive updates!");
@@ -1035,18 +1047,18 @@ async fn test_ping_multi_node() -> TestResult {
                 tracing::error!("PARTIAL: >80% propagated but timestamp mismatches");
                 tracing::error!("Updates reached nodes but content differs - timing or merge issues");
             }
-            
+
             // More detailed failure analysis
             if !gw_has_node1 && !gw_has_node2 {
                 tracing::error!("Gateway received NO updates from client nodes!");
                 tracing::error!("This suggests client→gateway propagation failure");
             }
-            
+
             if !node1_has_node2 && !node2_has_node1 {
                 tracing::error!("No peer-to-peer propagation between client nodes!");
                 tracing::error!("This is expected if they only connect through gateway");
             }
-            
+
             if gw_has_node1 && gw_has_node2 && (!node1_has_gw || !node2_has_gw) {
                 tracing::error!("Gateway received updates but failed to propagate them!");
                 tracing::error!("This suggests gateway→client propagation failure");
@@ -1105,8 +1117,11 @@ async fn test_ping_application_loop() -> TestResult {
     // Configure nodes with fixed seed for deterministic testing
     let test_seed = *b"app_loop_test_seed_0123456789012";
     let mut test_rng = rand::rngs::StdRng::from_seed(test_seed);
-    
-    tracing::info!("Using deterministic test seed for app loop: {:?}", test_seed);
+
+    tracing::info!(
+        "Using deterministic test seed for app loop: {:?}",
+        test_seed
+    );
     tracing::info!("Test RNG initial state configured for deterministic network topology");
 
     // Configure gateway node
@@ -1124,7 +1139,11 @@ async fn test_ping_application_loop() -> TestResult {
         .await?;
         let public_port = cfg.network_api.public_port.unwrap();
         let path = preset.temp_dir.path().to_path_buf();
-        (cfg, preset, gw_config_from_path_with_rng(public_port, &path, &mut test_rng)?)
+        (
+            cfg,
+            preset,
+            gw_config_from_path_with_rng(public_port, &path, &mut test_rng)?,
+        )
     };
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
 
@@ -1160,9 +1179,18 @@ async fn test_ping_application_loop() -> TestResult {
     tracing::info!("Gateway node data dir: {:?}", preset_cfg_gw.temp_dir.path());
     tracing::info!("Node 1 data dir: {:?}", preset_cfg_node1.temp_dir.path());
     tracing::info!("Node 2 data dir: {:?}", preset_cfg_node2.temp_dir.path());
-    tracing::info!("App loop - Gateway location: {:?}", config_gw.network_api.location);
-    tracing::info!("App loop - Node 1 location: {:?}", config_node1.network_api.location);
-    tracing::info!("App loop - Node 2 location: {:?}", config_node2.network_api.location);
+    tracing::info!(
+        "App loop - Gateway location: {:?}",
+        config_gw.network_api.location
+    );
+    tracing::info!(
+        "App loop - Node 1 location: {:?}",
+        config_node1.network_api.location
+    );
+    tracing::info!(
+        "App loop - Node 2 location: {:?}",
+        config_node2.network_api.location
+    );
 
     // Free ports so they don't fail on initialization
     std::mem::drop(network_socket_gw);
@@ -1243,10 +1271,10 @@ async fn test_ping_application_loop() -> TestResult {
         };
         let temp_params = Parameters::from(serde_json::to_vec(&temp_options).unwrap());
         let container = common::load_contract(&path_to_code, temp_params)?;
-        
+
         // Now get the actual code hash and create proper options for all nodes
         let code_hash = CodeHash::from_code(container.data());
-        
+
         let gw_options = PingContractOptions {
             frequency: Duration::from_secs(3),
             ttl: Duration::from_secs(30),

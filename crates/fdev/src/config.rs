@@ -44,6 +44,12 @@ pub enum SubCommand {
     Publish(PutConfig),
     /// Query the local node for information. Currently only shows open connections.
     Query {},
+    /// Get detailed node diagnostics including network state, subscriptions, and metrics.
+    Diagnostics {
+        /// Contract keys to include in diagnostics (Base58 encoded)
+        #[arg(long = "contract")]
+        contract_keys: Vec<String>,
+    },
     WasmRuntime(ExecutorConfig),
     Execute(RunCliConfig),
     Test(crate::testing::TestConfig),

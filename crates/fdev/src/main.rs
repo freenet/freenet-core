@@ -6,6 +6,7 @@ use freenet_stdlib::client_api::ClientRequest;
 mod build;
 mod commands;
 mod config;
+mod diagnostics;
 mod inspect;
 pub(crate) mod network_metrics_server;
 mod new_package;
@@ -72,6 +73,10 @@ fn main() -> anyhow::Result<()> {
             }
             SubCommand::Query {} => {
                 query::query(config.additional).await?;
+                Ok(())
+            }
+            SubCommand::Diagnostics { contract_keys } => {
+                diagnostics::diagnostics(config.additional, contract_keys).await?;
                 Ok(())
             }
             SubCommand::GetContractId(get_contract_id_config) => {
