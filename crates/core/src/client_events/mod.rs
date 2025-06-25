@@ -259,7 +259,6 @@ where
                                     freenet_stdlib::client_api::SubscriptionInfo {
                                         contract_key: sub.contract_key,
                                         client_id: sub.client_id.into(),
-                                        last_update: sub.last_update,
                                     }
                                 }).collect();
 
@@ -273,6 +272,9 @@ where
                                         connected_peers,
                                     }
                                 )))
+                            }
+                            QueryResult::NodeDiagnostics(response) => {
+                                Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(response)))
                             }
                         };
                         if let Ok(result) = &res {
@@ -711,6 +713,12 @@ async fn process_open_request(
                     }
                     freenet_stdlib::client_api::NodeQuery::SubscriptionInfo => {
                         NodeEvent::QuerySubscriptions { callback: tx }
+                    }
+                    freenet_stdlib::client_api::NodeQuery::NodeDiagnostics { config } => {
+                        NodeEvent::QueryNodeDiagnostics {
+                            config,
+                            callback: tx,
+                        }
                     }
                 };
 
