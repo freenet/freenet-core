@@ -37,7 +37,7 @@ async fn collect_node_diagnostics(
 ) -> anyhow::Result<()> {
     use std::time::Duration;
 
-    print!("=== NODE DIAGNOSTICS: {} ===\n", phase);
+    println!("=== NODE DIAGNOSTICS: {} ===", phase);
 
     // Create diagnostic config with features enabled
     let config = NodeDiagnosticsConfig {
@@ -51,10 +51,7 @@ async fn collect_node_diagnostics(
     };
 
     for (i, (client, node_name)) in clients.iter_mut().zip(node_names.iter()).enumerate() {
-        print!(
-            "Collecting diagnostics from {} (index {})...\n",
-            node_name, i
-        );
+        println!("Collecting diagnostics from {} (index {})...", node_name, i);
 
         // Send diagnostic request
         match client
@@ -70,12 +67,12 @@ async fn collect_node_diagnostics(
                         Ok(Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(
                             response,
                         )))) => {
-                            print!("--- {} DIAGNOSTICS ---\n", node_name.to_uppercase());
+                            println!("--- {} DIAGNOSTICS ---", node_name.to_uppercase());
 
                             // Node info
                             if let Some(node_info) = &response.node_info {
-                                print!(
-                                    "📍 Node: {} ({})\n",
+                                println!(
+                                    "📍 Node: {} ({})",
                                     node_info.peer_id,
                                     if node_info.is_gateway {
                                         "Gateway"
@@ -87,64 +84,64 @@ async fn collect_node_diagnostics(
 
                             // Simplified peer information
                             if !response.connected_peers_detailed.is_empty() {
-                                print!(
-                                    "🔗 Connected to {} peer(s):\n",
+                                println!(
+                                    "🔗 Connected to {} peer(s):",
                                     response.connected_peers_detailed.len()
                                 );
                                 for peer in &response.connected_peers_detailed {
-                                    print!("  - Peer: {} ({})\n", peer.peer_id, peer.address);
+                                    println!("  - Peer: {} ({})", peer.peer_id, peer.address);
                                 }
                             } else if let Some(network_info) = &response.network_info {
-                                print!(
-                                    "🔗 Connected to {} peer(s):\n",
+                                println!(
+                                    "🔗 Connected to {} peer(s):",
                                     network_info.connected_peers.len()
                                 );
                                 for (peer_id, addr) in &network_info.connected_peers {
-                                    print!("  - {} at {}\n", peer_id, addr);
+                                    println!("  - {} at {}", peer_id, addr);
                                 }
                             }
 
                             // Subscription info
                             if !response.subscriptions.is_empty() {
-                                print!("Subscriptions:\n");
+                                println!("Subscriptions:");
                                 for sub in &response.subscriptions {
-                                    print!("  - Contract: {}\n", sub.contract_key);
-                                    print!("    Client ID: {}\n", sub.client_id);
+                                    println!("  - Contract: {}", sub.contract_key);
+                                    println!("    Client ID: {}", sub.client_id);
                                 }
                             } else {
-                                print!("No active subscriptions\n");
+                                println!("No active subscriptions");
                             }
 
                             // Contract states
                             if !response.contract_states.is_empty() {
-                                print!(
-                                    "📋 Contract States ({} contract(s)):\n",
+                                println!(
+                                    "📋 Contract States ({} contract(s)):",
                                     response.contract_states.len()
                                 );
                                 for (key, state) in &response.contract_states {
-                                    print!("  📄 Contract: {}\n", key);
-                                    print!("     {} subscribers\n", state.subscribers);
+                                    println!("  📄 Contract: {}", key);
+                                    println!("     {} subscribers", state.subscribers);
 
                                     // Show subscriber peer IDs (NODOS SUSCRITOS)
                                     if !state.subscriber_peer_ids.is_empty() {
-                                        print!(
-                                            "     👥 Subscribed nodes: [{}]\n",
+                                        println!(
+                                            "     👥 Subscribed nodes: [{}]",
                                             state.subscriber_peer_ids.join(", ")
                                         );
                                     } else {
-                                        print!("     👥 No subscribers\n");
+                                        println!("     👥 No subscribers");
                                     }
                                 }
                             }
 
                             // System metrics (only show meaningful info)
                             if let Some(metrics) = &response.system_metrics {
-                                print!("Network metrics:\n");
-                                print!("  - Active connections: {}\n", metrics.active_connections);
-                                print!("  - Seeding contracts: {}\n", metrics.seeding_contracts);
+                                println!("Network metrics:");
+                                println!("  - Active connections: {}", metrics.active_connections);
+                                println!("  - Seeding contracts: {}", metrics.seeding_contracts);
                             }
 
-                            print!("--- END {} DIAGNOSTICS ---\n", node_name.to_uppercase());
+                            println!("--- END {} DIAGNOSTICS ---", node_name.to_uppercase());
                             break; // Got the diagnostic response, exit the loop
                         }
                         Ok(Ok(_other_message)) => {
@@ -152,28 +149,28 @@ async fn collect_node_diagnostics(
                             continue;
                         }
                         Ok(Err(e)) => {
-                            print!("ERROR: {} returned error: {}\n", node_name, e);
+                            println!("ERROR: {} returned error: {}", node_name, e);
                             break;
                         }
                         Err(_) => {
-                            print!("ERROR: {} diagnostic request timed out\n", node_name);
+                            println!("ERROR: {} diagnostic request timed out", node_name);
                             break;
                         }
                     }
                 }
             }
             Err(e) => {
-                print!(
-                    "ERROR: Failed to send diagnostic request to {}: {}\n",
+                println!(
+                    "ERROR: Failed to send diagnostic request to {}: {}",
                     node_name, e
                 );
             }
         }
 
-        print!("\n");
+        println!();
     }
 
-    print!("=== END DIAGNOSTICS: {} ===\n\n", phase);
+    println!("=== END DIAGNOSTICS: {} ===\n", phase);
     Ok(())
 }
 
@@ -190,8 +187,8 @@ async fn test_node_diagnostics_query() -> TestResult {
     let test_seed = *b"diagnostics_test_seed_1234567890";
     let mut test_rng = rand::rngs::StdRng::from_seed(test_seed);
 
-    print!("Testing NodeDiagnostics query functionality\n");
-    print!("Using deterministic test seed: {:?}\n", test_seed);
+    println!("Testing NodeDiagnostics query functionality");
+    println!("Using deterministic test seed: {:?}", test_seed);
 
     // Configure gateway node
     let (config_gw, preset_cfg_gw) = base_node_test_config_with_rng(
@@ -224,17 +221,14 @@ async fn test_node_diagnostics_query() -> TestResult {
     .await?;
     let ws_api_port_node = config_node.ws_api.ws_api_port.unwrap();
 
-    print!(
-        "Gateway node data dir: {:?}\n",
-        preset_cfg_gw.temp_dir.path()
-    );
-    print!(
-        "Client node data dir: {:?}\n",
+    println!("Gateway node data dir: {:?}", preset_cfg_gw.temp_dir.path());
+    println!(
+        "Client node data dir: {:?}",
         preset_cfg_node.temp_dir.path()
     );
-    print!("Gateway location: {:?}\n", config_gw.network_api.location);
-    print!(
-        "Client node location: {:?}\n",
+    println!("Gateway location: {:?}", config_gw.network_api.location);
+    println!(
+        "Client node location: {:?}",
         config_node.network_api.location
     );
 
@@ -286,9 +280,9 @@ async fn test_node_diagnostics_query() -> TestResult {
         let mut client_gw = WebApi::start(stream_gw);
         let mut client_node = WebApi::start(stream_node);
 
-        print!("=== TESTING NODE DIAGNOSTICS QUERIES ===\n");
+        println!("=== TESTING NODE DIAGNOSTICS QUERIES ===");
 
-        print!("Test 1: Querying diagnostics from gateway...\n");
+        println!("Test 1: Querying diagnostics from gateway...");
         let config_basic = NodeDiagnosticsConfig {
             include_node_info: true,
             include_network_info: true,
@@ -307,17 +301,17 @@ async fn test_node_diagnostics_query() -> TestResult {
 
         match timeout(Duration::from_secs(10), client_gw.recv()).await {
             Ok(Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(response)))) => {
-                print!("✓ Gateway diagnostics received successfully!\n");
+                println!("✓ Gateway diagnostics received successfully!");
 
                 // Validate response structure
                 if let Some(node_info) = &response.node_info {
-                    print!("  - Node ID: {}\n", node_info.peer_id);
-                    print!("  - Is Gateway: {}\n", node_info.is_gateway);
+                    println!("  - Node ID: {}", node_info.peer_id);
+                    println!("  - Is Gateway: {}", node_info.is_gateway);
                     if let Some(location) = &node_info.location {
-                        print!("  - Location: {}\n", location);
+                        println!("  - Location: {}", location);
                     }
                     if let Some(listening_address) = &node_info.listening_address {
-                        print!("  - Listening Address: {}\n", listening_address);
+                        println!("  - Listening Address: {}", listening_address);
                     }
                     assert!(node_info.is_gateway, "Gateway node should report is_gateway=true");
                 } else {
@@ -325,15 +319,15 @@ async fn test_node_diagnostics_query() -> TestResult {
                 }
 
                 if let Some(network_info) = &response.network_info {
-                    print!("  - Active connections: {}\n", network_info.active_connections);
-                    print!("  - Connected peers: {}\n", network_info.connected_peers.len());
+                    println!("  - Active connections: {}", network_info.active_connections);
+                    println!("  - Connected peers: {}", network_info.connected_peers.len());
                 } else {
                     return Err(anyhow!("Gateway diagnostics missing network_info"));
                 }
 
                 if let Some(metrics) = &response.system_metrics {
-                    print!("  - Active connections: {}\n", metrics.active_connections);
-                    print!("  - Seeding contracts: {}\n", metrics.seeding_contracts);
+                    println!("  - Active connections: {}", metrics.active_connections);
+                    println!("  - Seeding contracts: {}", metrics.seeding_contracts);
                 } else {
                     return Err(anyhow!("Gateway diagnostics missing system_metrics"));
                 }
@@ -350,7 +344,7 @@ async fn test_node_diagnostics_query() -> TestResult {
         }
 
         // Test 2: Basic node diagnostics from client node
-        print!("\nTest 2: Querying basic diagnostics from client node...\n");
+        println!("\nTest 2: Querying basic diagnostics from client node...");
 
         client_node
             .send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
@@ -360,16 +354,16 @@ async fn test_node_diagnostics_query() -> TestResult {
 
         match timeout(Duration::from_secs(10), client_node.recv()).await {
             Ok(Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(response)))) => {
-                print!("✓ Client node diagnostics received successfully!\n");
+                println!("✓ Client node diagnostics received successfully!");
 
                 if let Some(node_info) = &response.node_info {
-                    print!("  - Node ID: {}\n", node_info.peer_id);
-                    print!("  - Is Gateway: {}\n", node_info.is_gateway);
+                    println!("  - Node ID: {}", node_info.peer_id);
+                    println!("  - Is Gateway: {}", node_info.is_gateway);
                     if let Some(location) = &node_info.location {
-                        print!("  - Location: {}\n", location);
+                        println!("  - Location: {}", location);
                     }
                     if let Some(listening_address) = &node_info.listening_address {
-                        print!("  - Listening Address: {}\n", listening_address);
+                        println!("  - Listening Address: {}", listening_address);
                     }
                     assert!(!node_info.is_gateway, "Client node should report is_gateway=false");
                 } else {
@@ -377,18 +371,18 @@ async fn test_node_diagnostics_query() -> TestResult {
                 }
 
                 if let Some(network_info) = &response.network_info {
-                    print!("  - Active connections: {}\n", network_info.active_connections);
-                    print!("  - Connected peers: {}\n", network_info.connected_peers.len());
+                    println!("  - Active connections: {}", network_info.active_connections);
+                    println!("  - Connected peers: {}", network_info.connected_peers.len());
                     // Note: Client might not be connected immediately, this is acceptable
-                    if network_info.connected_peers.len() == 0 {
-                        print!("  - Note: Client not yet connected to gateway (expected during startup)\n");
+                    if network_info.connected_peers.is_empty() {
+                        println!("  - Note: Client not yet connected to gateway (expected during startup)");
                     }
                 }
 
                 if let Some(metrics) = &response.system_metrics {
-                    print!("  - Active connections: {}\n", metrics.active_connections);
-                    print!("  - Seeding contracts: {}\n", metrics.seeding_contracts);
-                    print!("  - System metrics collection working\n");
+                    println!("  - Active connections: {}", metrics.active_connections);
+                    println!("  - Seeding contracts: {}", metrics.seeding_contracts);
+                    println!("  - System metrics collection working");
                 }
             }
             Ok(Ok(response)) => {
@@ -403,7 +397,7 @@ async fn test_node_diagnostics_query() -> TestResult {
         }
 
         // Test 3: Full diagnostics including subscriptions and operations
-        print!("\nTest 3: Querying full diagnostics...\n");
+        println!("\nTest 3: Querying full diagnostics...");
         let config_full = NodeDiagnosticsConfig {
             include_node_info: true,
             include_network_info: true,
@@ -422,10 +416,10 @@ async fn test_node_diagnostics_query() -> TestResult {
 
         match timeout(Duration::from_secs(10), client_gw.recv()).await {
             Ok(Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(response)))) => {
-                print!("✓ Full diagnostics received successfully!\n");
-                print!("  - Subscriptions: {}\n", response.subscriptions.len());
-                print!("  - Contract states: {}\n", response.contract_states.len());
-                print!("  - Connected peers detailed: {}\n", response.connected_peers_detailed.len());
+                println!("✓ Full diagnostics received successfully!");
+                println!("  - Subscriptions: {}", response.subscriptions.len());
+                println!("  - Contract states: {}", response.contract_states.len());
+                println!("  - Connected peers detailed: {}", response.connected_peers_detailed.len());
 
                 // All fields should be present in full diagnostics
                 assert!(response.node_info.is_some(), "Full diagnostics should include node_info");
@@ -443,13 +437,13 @@ async fn test_node_diagnostics_query() -> TestResult {
             }
         }
 
-        print!("\n=== ALL DIAGNOSTICS TESTS PASSED! ===\n");
-        print!("✓ Gateway basic diagnostics working\n");
-        print!("✓ Client node basic diagnostics working\n");
-        print!("✓ Full diagnostics functionality working\n");
-        print!("✓ Node info validation passed\n");
-        print!("✓ Network connectivity validation passed\n");
-        print!("✓ System metrics validation passed\n");
+        println!("\n=== ALL DIAGNOSTICS TESTS PASSED! ===");
+        println!("✓ Gateway basic diagnostics working");
+        println!("✓ Client node basic diagnostics working");
+        println!("✓ Full diagnostics functionality working");
+        println!("✓ Node info validation passed");
+        println!("✓ Network connectivity validation passed");
+        println!("✓ System metrics validation passed");
 
         Ok::<_, anyhow::Error>(())
     })
@@ -489,8 +483,8 @@ async fn test_ping_multi_node() -> TestResult {
     let test_seed = *b"app_loop_test_seed_0123456789012";
     let mut test_rng = rand::rngs::StdRng::from_seed(test_seed);
 
-    print!("Using deterministic test seed: {:?}\n", test_seed);
-    print!("Test RNG initial state configured for deterministic network topology\n");
+    println!("Using deterministic test seed: {:?}", test_seed);
+    println!("Test RNG initial state configured for deterministic network topology");
 
     // Configure gateway node
     let (config_gw, preset_cfg_gw, config_gw_info) = {
@@ -544,18 +538,15 @@ async fn test_ping_multi_node() -> TestResult {
     let ws_api_port_node2 = config_node2.ws_api.ws_api_port.unwrap();
 
     // Log data directories and ring locations for debugging
-    print!(
-        "Gateway node data dir: {:?}\n",
-        preset_cfg_gw.temp_dir.path()
-    );
-    print!("Node 1 data dir: {:?}\n", preset_cfg_node1.temp_dir.path());
-    print!("Node 2 data dir: {:?}\n", preset_cfg_node2.temp_dir.path());
+    println!("Gateway node data dir: {:?}", preset_cfg_gw.temp_dir.path());
+    println!("Node 1 data dir: {:?}", preset_cfg_node1.temp_dir.path());
+    println!("Node 2 data dir: {:?}", preset_cfg_node2.temp_dir.path());
 
     // Log ring locations for network topology analysis
-    print!("=== RING TOPOLOGY ANALYSIS ===\n");
-    print!("Gateway location: {:?}\n", config_gw.network_api.location);
-    print!("Node 1 location: {:?}\n", config_node1.network_api.location);
-    print!("Node 2 location: {:?}\n", config_node2.network_api.location);
+    println!("=== RING TOPOLOGY ANALYSIS ===");
+    println!("Gateway location: {:?}", config_gw.network_api.location);
+    println!("Node 1 location: {:?}", config_node1.network_api.location);
+    println!("Node 2 location: {:?}", config_node2.network_api.location);
 
     // Calculate distances in the ring
     if let (Some(gw_loc), Some(n1_loc), Some(n2_loc)) = (
@@ -567,10 +558,10 @@ async fn test_ping_multi_node() -> TestResult {
         let gw_to_n2_dist = (gw_loc - n2_loc).abs().min(1.0 - (gw_loc - n2_loc).abs());
         let n1_to_n2_dist = (n1_loc - n2_loc).abs().min(1.0 - (n1_loc - n2_loc).abs());
 
-        print!("Ring distances:\n");
-        print!("  Gateway ↔ Node1: {:.6}\n", gw_to_n1_dist);
-        print!("  Gateway ↔ Node2: {:.6}\n", gw_to_n2_dist);
-        print!("  Node1 ↔ Node2: {:.6}\n", n1_to_n2_dist);
+        println!("Ring distances:");
+        println!("  Gateway ↔ Node1: {:.6}", gw_to_n1_dist);
+        println!("  Gateway ↔ Node2: {:.6}", gw_to_n2_dist);
+        println!("  Node1 ↔ Node2: {:.6}", n1_to_n2_dist);
 
         // Warn about potentially problematic distances
         let max_distance_threshold = 0.4; // Arbitrary threshold for "far" nodes
@@ -596,7 +587,7 @@ async fn test_ping_multi_node() -> TestResult {
             );
         }
     }
-    print!("==============================\n");
+    println!("==============================");
 
     // Free ports so they don't fail on initialization
     std::mem::drop(network_socket_gw);
@@ -666,7 +657,7 @@ async fn test_ping_multi_node() -> TestResult {
 
         // Load the ping contract
         let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
-        print!("loading contract code: {}\n", path_to_code.display());
+        println!("loading contract code: {}", path_to_code.display());
 
         // First compile to get the code hash, then create proper options
         let temp_options = PingContractOptions {
@@ -691,7 +682,7 @@ async fn test_ping_multi_node() -> TestResult {
         let contract_key = container.key();
 
         // Step 1: Gateway node puts the contrac
-        print!("Gateway node putting contract...\n");
+        println!("Gateway node putting contract...");
         let wrapped_state = {
             let ping = Ping::default();
             let serialized = serde_json::to_vec(&ping)?;
@@ -711,10 +702,10 @@ async fn test_ping_multi_node() -> TestResult {
         let key = wait_for_put_response(&mut client_gw, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-        print!("Gateway: put ping contract successfully! key={}\n", key);
+        println!("Gateway: put ping contract successfully! key={}", key);
 
         // Step 2: Node 1 gets the contrac
-        print!("Node 1 getting contract...\n");
+        println!("Node 1 getting contract...");
         client_node1
             .send(ClientRequest::ContractOp(ContractRequest::Get {
                 key: contract_key,
@@ -727,10 +718,10 @@ async fn test_ping_multi_node() -> TestResult {
         let node1_state = wait_for_get_response(&mut client_node1, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-        print!("Node 1: got contract with {} entries\n", node1_state.len());
+        println!("Node 1: got contract with {} entries", node1_state.len());
 
         // Step 3: Node 2 gets the contrac
-        print!("Node 2 getting contract...\n");
+        println!("Node 2 getting contract...");
         client_node2
             .send(ClientRequest::ContractOp(ContractRequest::Get {
                 key: contract_key,
@@ -743,60 +734,60 @@ async fn test_ping_multi_node() -> TestResult {
         let node2_state = wait_for_get_response(&mut client_node2, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-        print!("Node 2: got contract with {} entries\n", node2_state.len());
+        println!("Node 2: got contract with {} entries", node2_state.len());
 
         // Step 4: All nodes subscribe to the contract
-        print!("=== SUBSCRIPTION PHASE ===\n");
-        print!("All nodes subscribing to contract: {}\n", contract_key);
+        println!("=== SUBSCRIPTION PHASE ===");
+        println!("All nodes subscribing to contract: {}", contract_key);
 
         // Gateway subscribes
-        print!("Gateway attempting subscription...\n");
+        println!("Gateway attempting subscription...");
         client_gw
             .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
                 key: contract_key,
                 summary: None,
             }))
             .await?;
-        let gw_sub_result = wait_for_subscribe_response(&mut client_gw, &contract_key)
+        wait_for_subscribe_response(&mut client_gw, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-        print!("Gateway: subscribed successfully! Response: {:?}\n", gw_sub_result);
+        println!("Gateway: subscribed successfully!");
 
         // Node 1 subscribes
-        print!("Node 1 attempting subscription...\n");
+        println!("Node 1 attempting subscription...");
         client_node1
             .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
                 key: contract_key,
                 summary: None,
             }))
             .await?;
-        let node1_sub_result = wait_for_subscribe_response(&mut client_node1, &contract_key)
+        wait_for_subscribe_response(&mut client_node1, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-        print!("Node 1: subscribed successfully! Response: {:?}\n", node1_sub_result);
+        println!("Node 1: subscribed successfully!");
 
         // Node 2 subscribes
-        print!("Node 2 attempting subscription...\n");
+        println!("Node 2 attempting subscription...");
         client_node2
             .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
                 key: contract_key,
                 summary: None,
             }))
             .await?;
-        let node2_sub_result = wait_for_subscribe_response(&mut client_node2, &contract_key)
+        wait_for_subscribe_response(&mut client_node2, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-        print!("Node 2: subscribed successfully! Response: {:?}\n", node2_sub_result);
+        println!("Node 2: subscribed successfully!");
 
-        print!("=== ALL SUBSCRIPTIONS COMPLETED ===\n");
-        print!("All nodes are now subscribed and should receive all updates regardless of ring location\n");
+        println!("=== ALL SUBSCRIPTIONS COMPLETED ===");
+        println!("All nodes are now subscribed and should receive all updates regardless of ring location");
 
         // Add a delay to ensure subscription system is fully active
-        print!("Waiting 5 seconds for subscription system to stabilize...\n");
+        println!("Waiting 5 seconds for subscription system to stabilize...");
         sleep(Duration::from_secs(5)).await;
 
         // Collect diagnostics after subscription phase
-        print!("=== AFTER SUBSCRIPTIONS DIAGNOSTICS ===\n");
+        println!("=== AFTER SUBSCRIPTIONS DIAGNOSTICS ===");
         {
             let mut clients_for_diagnostics = vec![&mut client_gw, &mut client_node1, &mut client_node2];
             let node_names = ["Gateway", "Node1", "Node2"];
@@ -812,16 +803,16 @@ async fn test_ping_multi_node() -> TestResult {
 
         // Each node will send multiple pings to build history
         let ping_rounds = 3;
-        print!("Each node will send {} pings to build history\n", ping_rounds);
+        println!("Each node will send {} pings to build history", ping_rounds);
 
         for round in 1..=ping_rounds {
-            print!("=== ROUND {} UPDATE CYCLE ===\n", round);
+            println!("=== ROUND {} UPDATE CYCLE ===", round);
 
             // Gateway sends update with its tag
             let mut gw_ping = Ping::default();
             gw_ping.insert(gw_tag.clone());
             let gw_timestamp = gw_ping.get(&gw_tag).and_then(|v| v.first()).unwrap();
-            print!("Gateway sending update: tag='{}', timestamp={} (round {})\n",
+            println!("Gateway sending update: tag='{}', timestamp={} (round {})",
                          gw_tag, gw_timestamp, round);
             client_gw
                 .send(ClientRequest::ContractOp(ContractRequest::Update {
@@ -834,7 +825,7 @@ async fn test_ping_multi_node() -> TestResult {
             let mut node1_ping = Ping::default();
             node1_ping.insert(node1_tag.clone());
             let node1_timestamp = node1_ping.get(&node1_tag).and_then(|v| v.first()).unwrap();
-            print!("Node 1 sending update: tag='{}', timestamp={} (round {})\n",
+            println!("Node 1 sending update: tag='{}', timestamp={} (round {})",
                          node1_tag, node1_timestamp, round);
             client_node1
                 .send(ClientRequest::ContractOp(ContractRequest::Update {
@@ -847,7 +838,7 @@ async fn test_ping_multi_node() -> TestResult {
             let mut node2_ping = Ping::default();
             node2_ping.insert(node2_tag.clone());
             let node2_timestamp = node2_ping.get(&node2_tag).and_then(|v| v.first()).unwrap();
-            print!("Node 2 sending update: tag='{}', timestamp={} (round {})\n",
+            println!("Node 2 sending update: tag='{}', timestamp={} (round {})",
                          node2_tag, node2_timestamp, round);
             client_node2
                 .send(ClientRequest::ContractOp(ContractRequest::Update {
@@ -857,14 +848,14 @@ async fn test_ping_multi_node() -> TestResult {
                 .await?;
 
             // Small delay between rounds to ensure distinct timestamps
-            print!("Waiting 30ms before next round...\n");
+            println!("Waiting 30ms before next round...");
             sleep(Duration::from_millis(30)).await;
         }
 
-        print!("=== ALL UPDATES SENT, WAITING FOR PROPAGATION ===\n");
+        println!("=== ALL UPDATES SENT, WAITING FOR PROPAGATION ===");
 
         // Wait for updates to propagate across the network - longer wait to ensure eventual consistency
-        print!("Waiting for updates to propagate across the network...\n");
+        println!("Waiting for updates to propagate across the network...");
         sleep(Duration::from_secs(30)).await;
 
         // Collect diagnostics after propagation wait period
@@ -875,7 +866,7 @@ async fn test_ping_multi_node() -> TestResult {
         }
 
         // Request the current state from all nodes
-        print!("Querying all nodes for current state...\n");
+        println!("Querying all nodes for current state...");
 
         client_gw
             .send(ClientRequest::ContractOp(ContractRequest::Get {
@@ -914,9 +905,9 @@ async fn test_ping_multi_node() -> TestResult {
             .map_err(anyhow::Error::msg)?;
 
         // Log the final state from each node
-        print!("Gateway final state: {}\n", final_state_gw);
-        print!("Node 1 final state: {}\n", final_state_node1);
-        print!("Node 2 final state: {}\n", final_state_node2);
+        println!("Gateway final state: {}", final_state_gw);
+        println!("Node 1 final state: {}", final_state_node1);
+        println!("Node 2 final state: {}", final_state_node2);
 
         // Final diagnostic collection to understand the issue
         {
@@ -926,28 +917,28 @@ async fn test_ping_multi_node() -> TestResult {
         }
 
         // Show detailed comparison of ping history per tag
-        print!("===== DETAILED PROPAGATION ANALYSIS =====\n");
+        println!("===== DETAILED PROPAGATION ANALYSIS =====");
 
         let tags = vec![gw_tag.clone(), node1_tag.clone(), node2_tag.clone()];
         let mut all_histories_match = true;
         let mut propagation_matrix = std::collections::HashMap::new();
 
         // First, analyze what each node received
-        print!("=== PROPAGATION MATRIX ===\n");
+        println!("=== PROPAGATION MATRIX ===");
         let nodes = [("Gateway", &final_state_gw), ("Node1", &final_state_node1), ("Node2", &final_state_node2)];
 
         for (node_name, state) in &nodes {
-            print!("{} received tags: {:?}\n", node_name, state.keys().collect::<Vec<_>>());
+            println!("{} received tags: {:?}", node_name, state.keys().collect::<Vec<_>>());
             for tag in &tags {
                 let has_tag = state.contains_key(tag);
                 let count = state.get(tag).map(|v| v.len()).unwrap_or(0);
-                print!("  {} has '{}': {} (count: {})\n", node_name, tag, has_tag, count);
+                println!("  {} has '{}': {} (count: {})", node_name, tag, has_tag, count);
                 propagation_matrix.insert((node_name.to_string(), tag.clone()), (has_tag, count));
             }
         }
 
         // Analyze cross-propagation success
-        print!("=== CROSS-PROPAGATION ANALYSIS ===\n");
+        println!("=== CROSS-PROPAGATION ANALYSIS ===");
 
         // Gateway should have all tags
         let gw_has_node1 = final_state_gw.contains_key(&node1_tag);
@@ -961,10 +952,10 @@ async fn test_ping_multi_node() -> TestResult {
         let node2_has_gw = final_state_node2.contains_key(&gw_tag);
         let node2_has_node1 = final_state_node2.contains_key(&node1_tag);
 
-        print!("Cross-propagation success rates:\n");
-        print!("  Gateway ← Node1: {} | Gateway ← Node2: {}\n", gw_has_node1, gw_has_node2);
-        print!("  Node1 ← Gateway: {} | Node1 ← Node2: {}\n", node1_has_gw, node1_has_node2);
-        print!("  Node2 ← Gateway: {} | Node2 ← Node1: {}\n", node2_has_gw, node2_has_node1);
+        println!("Cross-propagation success rates:");
+        println!("  Gateway ← Node1: {} | Gateway ← Node2: {}", gw_has_node1, gw_has_node2);
+        println!("  Node1 ← Gateway: {} | Node1 ← Node2: {}", node1_has_gw, node1_has_node2);
+        println!("  Node2 ← Gateway: {} | Node2 ← Node1: {}", node2_has_gw, node2_has_node1);
 
         // Calculate overall propagation success
         let total_propagation_attempts = 6; // 3 nodes × 2 cross-propagations each
@@ -973,11 +964,11 @@ async fn test_ping_multi_node() -> TestResult {
                                      .iter().filter(|&&x| x).count();
         let propagation_rate = successful_propagations as f64 / total_propagation_attempts as f64;
 
-        print!("Overall propagation success: {}/{} ({:.1}%)\n",
+        println!("Overall propagation success: {}/{} ({:.1}%)",
                       successful_propagations, total_propagation_attempts, propagation_rate * 100.0);
 
         for tag in &tags {
-            print!("=== DETAILED ANALYSIS FOR TAG '{}' ===\n", tag);
+            println!("=== DETAILED ANALYSIS FOR TAG '{}' ===", tag);
 
             // Get the vector of timestamps for this tag from each node
             let gw_history = final_state_gw.get(tag).cloned().unwrap_or_default();
@@ -985,10 +976,10 @@ async fn test_ping_multi_node() -> TestResult {
             let node2_history = final_state_node2.get(tag).cloned().unwrap_or_default();
 
             // Log which nodes have this tag
-            print!("Tag '{}' presence:\n", tag);
-            print!("  Gateway: {} (count: {})\n", !gw_history.is_empty(), gw_history.len());
-            print!("  Node1: {} (count: {})\n", !node1_history.is_empty(), node1_history.len());
-            print!("  Node2: {} (count: {})\n", !node2_history.is_empty(), node2_history.len());
+            println!("Tag '{}' presence:", tag);
+            println!("  Gateway: {} (count: {})", !gw_history.is_empty(), gw_history.len());
+            println!("  Node1: {} (count: {})", !node1_history.is_empty(), node1_history.len());
+            println!("  Node2: {} (count: {})", !node2_history.is_empty(), node2_history.len());
 
             // Histories should be non-empty if eventual consistency worked
             if gw_history.is_empty() || node1_history.is_empty() || node2_history.is_empty() {
@@ -1001,9 +992,9 @@ async fn test_ping_multi_node() -> TestResult {
             }
 
             // Log the number of entries in each history
-            print!("  - Gateway: {} entries\n", gw_history.len());
-            print!("  - Node 1:  {} entries\n", node1_history.len());
-            print!("  - Node 2:  {} entries\n", node2_history.len());
+            println!("  - Gateway: {} entries", gw_history.len());
+            println!("  - Node 1:  {} entries", node1_history.len());
+            println!("  - Node 2:  {} entries", node2_history.len());
 
             // Check if the histories have the same length
             if gw_history.len() != node1_history.len() || gw_history.len() != node2_history.len() {
@@ -1025,14 +1016,14 @@ async fn test_ping_multi_node() -> TestResult {
             }
 
             if timestamps_match {
-                print!("History for tag '{}' is identical across all nodes!\n", tag);
+                println!("History for tag '{}' is identical across all nodes!", tag);
             } else {
                 tracing::warn!("History timestamps for tag '{}' differ between nodes!", tag);
                 all_histories_match = false;
             }
         }
 
-        print!("=================================================\n");
+        println!("=================================================");
 
         // Final diagnosis before assertion
         if !all_histories_match {
@@ -1082,7 +1073,7 @@ async fn test_ping_multi_node() -> TestResult {
             propagation_rate * 100.0, successful_propagations, total_propagation_attempts
         );
 
-        print!("Eventual consistency test PASSED - all nodes have identical ping histories!\n");
+        println!("Eventual consistency test PASSED - all nodes have identical ping histories!");
 
         Ok::<_, anyhow::Error>(())
     })
@@ -1268,7 +1259,7 @@ async fn test_ping_application_loop() -> TestResult {
 
         // Load the ping contract
         let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
-        print!("loading contract code: {}\n", path_to_code.display());
+        println!("loading contract code: {}", path_to_code.display());
 
         // First compile to get the code hash, then create proper options
         let temp_options = PingContractOptions {
@@ -1309,7 +1300,7 @@ async fn test_ping_application_loop() -> TestResult {
         let contract_key = container.key();
 
         // Step 1: Gateway node puts the contrac
-        print!("Gateway node putting contract...\n");
+        println!("Gateway node putting contract...");
         let ping = Ping::default();
         let serialized = serde_json::to_vec(&ping)?;
         let wrapped_state = WrappedState::new(serialized);
@@ -1327,10 +1318,10 @@ async fn test_ping_application_loop() -> TestResult {
         let key = wait_for_put_response(&mut client_gw, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-        print!("Gateway: put ping contract successfully! key={}\n", key);
+        println!("Gateway: put ping contract successfully! key={}", key);
 
         // Step 2: Node 1 gets the contrac
-        print!("Node 1 getting contract...\n");
+        println!("Node 1 getting contract...");
         client_node1
             .send(ClientRequest::ContractOp(ContractRequest::Get {
                 key: contract_key,
@@ -1343,10 +1334,10 @@ async fn test_ping_application_loop() -> TestResult {
         let node1_state = wait_for_get_response(&mut client_node1, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-        print!("Node 1: got contract with {} entries\n", node1_state.len());
+        println!("Node 1: got contract with {} entries", node1_state.len());
 
         // Step 3: Node 2 gets the contrac
-        print!("Node 2 getting contract...\n");
+        println!("Node 2 getting contract...");
         client_node2
             .send(ClientRequest::ContractOp(ContractRequest::Get {
                 key: contract_key,
@@ -1359,7 +1350,7 @@ async fn test_ping_application_loop() -> TestResult {
         let node2_state = wait_for_get_response(&mut client_node2, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-        print!("Node 2: got contract with {} entries\n", node2_state.len());
+        println!("Node 2: got contract with {} entries", node2_state.len());
 
         // Step 4: Subscribe all clients to the contrac
         // Gateway subscribes
@@ -1372,7 +1363,7 @@ async fn test_ping_application_loop() -> TestResult {
         wait_for_subscribe_response(&mut client_gw, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-        print!("Gateway: subscribed successfully!\n");
+        println!("Gateway: subscribed successfully!");
 
         // Node 1 subscribes
         client_node1
@@ -1384,7 +1375,7 @@ async fn test_ping_application_loop() -> TestResult {
         wait_for_subscribe_response(&mut client_node1, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-        print!("Node 1: subscribed successfully!\n");
+        println!("Node 1: subscribed successfully!");
 
         // Node 2 subscribes
         client_node2
@@ -1396,7 +1387,7 @@ async fn test_ping_application_loop() -> TestResult {
         wait_for_subscribe_response(&mut client_node2, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-        print!("Node 2: subscribed successfully!\n");
+        println!("Node 2: subscribed successfully!");
 
         // Step 5: Run the ping clients on all nodes simultaneously
         // Create channels for controlled shutdown

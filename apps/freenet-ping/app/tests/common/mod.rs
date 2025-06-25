@@ -59,6 +59,7 @@ pub fn get_free_socket_addr() -> Result<SocketAddr> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::await_holding_lock)]
 pub async fn base_node_test_config(
     is_gateway: bool,
     gateways: Vec<String>,
@@ -68,6 +69,7 @@ pub async fn base_node_test_config(
     base_tmp_dir: Option<&Path>,
     blocked_addresses: Option<Vec<SocketAddr>>,
 ) -> Result<(ConfigArgs, PresetConfig)> {
+    let mut rng = RNG.lock().unwrap();
     base_node_test_config_with_rng(
         is_gateway,
         gateways,
@@ -76,7 +78,7 @@ pub async fn base_node_test_config(
         data_dir_suffix,
         base_tmp_dir,
         blocked_addresses,
-        &mut *RNG.lock().unwrap(),
+        &mut rng,
     )
     .await
 }
@@ -139,7 +141,7 @@ pub async fn base_node_test_config_with_rng(
 }
 
 pub fn gw_config_from_path(port: u16, path: &Path) -> Result<InlineGwConfig> {
-    gw_config_from_path_with_rng(port, path, &mut *RNG.lock().unwrap())
+    gw_config_from_path_with_rng(port, path, &mut RNG.lock().unwrap())
 }
 
 pub fn gw_config_from_path_with_rng(

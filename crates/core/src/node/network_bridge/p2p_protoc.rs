@@ -461,13 +461,14 @@ impl P2pConnManager {
 
                                     // Get application subscriptions from contract executor
                                     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-                                    if let Ok(_) = op_manager
+                                    if op_manager
                                         .notify_contract_handler(
                                             ContractHandlerEvent::QuerySubscriptions {
                                                 callback: tx,
                                             },
                                         )
                                         .await
+                                        .is_ok()
                                     {
                                         let app_subscriptions = match timeout(
                                             Duration::from_secs(1),
@@ -542,7 +543,7 @@ impl P2pConnManager {
                                 if config.include_detailed_peer_info {
                                     use freenet_stdlib::client_api::ConnectedPeerInfo;
                                     // Populate detailed peer information from actual connections
-                                    for (peer, _connection) in &self.connections {
+                                    for peer in self.connections.keys() {
                                         response.connected_peers_detailed.push(ConnectedPeerInfo {
                                             peer_id: peer.to_string(),
                                             address: peer.addr.to_string(),
