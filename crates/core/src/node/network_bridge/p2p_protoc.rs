@@ -419,16 +419,23 @@ impl P2pConnManager {
 
                                 // Collect node information
                                 if config.include_node_info {
+                                    // Calculate location and adress if is set
+                                    let (addr, location) = if let Some(peer_id) =
+                                        op_manager.ring.connection_manager.get_peer_key()
+                                    {
+                                        let location = Location::from_address(&peer_id.addr);
+                                        (Some(peer_id.addr), Some(location))
+                                    } else {
+                                        (None, None)
+                                    };
+
+                                    // Always include basic node info, but only include address/location if available
                                     response.node_info = Some(NodeInfo {
-                                        peer_id: format!(
-                                            "{}:{}",
-                                            self.listening_ip, self.listening_port
-                                        ),
+                                        peer_id: self.key_pair.public().to_string(),
                                         is_gateway: self.is_gateway,
-                                        location: format!(
-                                            "{}:{}",
-                                            self.listening_ip, self.listening_port
-                                        ),
+                                        location: location.map(|loc| format!("{:.6}", loc.0)),
+                                        listening_address: addr
+                                            .map(|peer_addr| peer_addr.to_string()),
                                         uptime_seconds: 0, // TODO: implement actual uptime tracking
                                     });
                                 }

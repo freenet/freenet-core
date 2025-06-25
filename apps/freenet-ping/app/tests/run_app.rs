@@ -313,8 +313,12 @@ async fn test_node_diagnostics_query() -> TestResult {
                 if let Some(node_info) = &response.node_info {
                     print!("  - Node ID: {}\n", node_info.peer_id);
                     print!("  - Is Gateway: {}\n", node_info.is_gateway);
-                    print!("  - Location: {}\n", node_info.location);
-                    print!("  - Uptime: {} seconds\n", node_info.uptime_seconds);
+                    if let Some(location) = &node_info.location {
+                        print!("  - Location: {}\n", location);
+                    }
+                    if let Some(listening_address) = &node_info.listening_address {
+                        print!("  - Listening Address: {}\n", listening_address);
+                    }
                     assert!(node_info.is_gateway, "Gateway node should report is_gateway=true");
                 } else {
                     return Err(anyhow!("Gateway diagnostics missing node_info"));
@@ -361,8 +365,12 @@ async fn test_node_diagnostics_query() -> TestResult {
                 if let Some(node_info) = &response.node_info {
                     print!("  - Node ID: {}\n", node_info.peer_id);
                     print!("  - Is Gateway: {}\n", node_info.is_gateway);
-                    print!("  - Location: {}\n", node_info.location);
-                    print!("  - Uptime: {} seconds\n", node_info.uptime_seconds);
+                    if let Some(location) = &node_info.location {
+                        print!("  - Location: {}\n", location);
+                    }
+                    if let Some(listening_address) = &node_info.listening_address {
+                        print!("  - Listening Address: {}\n", listening_address);
+                    }
                     assert!(!node_info.is_gateway, "Client node should report is_gateway=false");
                 } else {
                     return Err(anyhow!("Client node diagnostics missing node_info"));
