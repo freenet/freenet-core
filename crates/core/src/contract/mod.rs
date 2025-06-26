@@ -37,6 +37,9 @@ where
                 key,
                 return_contract_code,
             } => {
+                let start = std::time::Instant::now();
+                tracing::info!(%key, %return_contract_code, "Starting contract GET execution");
+
                 match contract_handler
                     .executor()
                     .fetch_contract(key, return_contract_code)
@@ -44,6 +47,13 @@ where
                     .await
                 {
                     Ok((state, contract)) => {
+                        let elapsed = start.elapsed();
+                        if elapsed > std::time::Duration::from_millis(10) {
+                            tracing::warn!(%key, elapsed_ms = elapsed.as_millis(), "SLOW contract GET execution blocked message pipeline!");
+                        } else {
+                            tracing::info!(%key, elapsed_ms = elapsed.as_millis(), "Contract GET execution completed");
+                        }
+
                         tracing::debug!(with_contract_code = %return_contract_code, has_contract = %contract.is_some(), "Fetched contract {key}");
                         contract_handler
                             .channel()
@@ -88,6 +98,9 @@ where
                 related_contracts,
                 contract,
             } => {
+                let start = std::time::Instant::now();
+                tracing::info!(%key, "Starting contract PUT execution");
+
                 let put_result = contract_handler
                     .executor()
                     .upsert_contract_state(
@@ -98,6 +111,13 @@ where
                     )
                     .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await;
+
+                let elapsed = start.elapsed();
+                if elapsed > std::time::Duration::from_millis(10) {
+                    tracing::warn!(%key, elapsed_ms = elapsed.as_millis(), "SLOW contract PUT execution blocked message pipeline!");
+                } else {
+                    tracing::info!(%key, elapsed_ms = elapsed.as_millis(), "Contract PUT execution completed");
+                }
 
                 let event_result = match put_result {
                     Ok(UpsertResult::NoChange) => ContractHandlerEvent::PutResponse {

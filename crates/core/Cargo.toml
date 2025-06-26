@@ -12,6 +12,10 @@ repository = "https://github.com/freenet/freenet-core"
 name = "freenet"
 path = "src/bin/freenet.rs"
 
+[[bin]]
+name = "transport-test"
+path = "src/bin/transport_test.rs"
+
 [dependencies]
 ahash = "0.8"
 anyhow = "1"
