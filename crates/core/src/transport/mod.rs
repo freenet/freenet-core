@@ -131,7 +131,7 @@ mod tests {
                     // Simulate resending packet
                     sent_tracker.report_sent_packet(id, packet);
                 }
-                _ => panic!("Expected resend action for packet {}", id),
+                _ => panic!("Expected resend action for packet {id}"),
             }
         }
     }

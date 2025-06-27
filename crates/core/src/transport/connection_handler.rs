@@ -327,6 +327,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         let dropped_count = self.dropped_packets.entry(remote_addr).or_insert(0);
                                         *dropped_count += 1;
 
+                                        // INSTRUMENTATION: Log every channel overflow immediately
+                                        tracing::warn!(
+                                            %remote_addr,
+                                            dropped_count = *dropped_count,
+                                            "CHANNEL_OVERFLOW: Dropping packet due to full channel (buffer size: 100)"
+                                        );
+
                                         // Log warning every 10 seconds if packets are being dropped
                                         let now = Instant::now();
                                         if now.duration_since(self.last_drop_warning) > Duration::from_secs(10) {
@@ -1097,9 +1104,9 @@ mod version_cmp {
             };
 
             if !flags_str.is_empty() {
-                format!("{}.{}.{}-{}", major, minor, patch, flags_str)
+                format!("{major}.{minor}.{patch}-{flags_str}")
             } else {
-                format!("{}.{}.{}", major, minor, patch)
+                format!("{major}.{minor}.{patch}")
             }
         }
 
@@ -1122,8 +1129,7 @@ mod version_cmp {
             // Step 3: Compare the decoded string with the original version string
             assert_eq!(
                 decoded, version_str,
-                "Failed for version string '{}', decoded as '{}'",
-                version_str, decoded
+                "Failed for version string '{version_str}', decoded as '{decoded}'"
             );
         }
 

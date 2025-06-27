@@ -30,7 +30,7 @@ pub async fn start_server_v1(supervisor: Arc<Supervisor>) -> Result<(), NetworkS
 
         axum::serve(listener, router)
             .await
-            .map_err(|e| NetworkSimulationError::ServerStartFailure(format!("Server error: {}", e)))
+            .map_err(|e| NetworkSimulationError::ServerStartFailure(format!("Server error: {e}")))
     });
 
     startup_receiver

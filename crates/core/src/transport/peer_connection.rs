@@ -523,10 +523,20 @@ impl PeerConnection {
                             continue;
                         }
                     }
+                    let process_start = std::time::Instant::now();
                     if let Some(msg) = self.process_inbound(payload).await.map_err(|error| {
                         tracing::error!(%error, %packet_id, remote = %self.remote_conn.remote_addr, "error processing inbound packet");
                         error
                     })? {
+                        let process_elapsed = process_start.elapsed();
+                        if process_elapsed > std::time::Duration::from_millis(50) {
+                            tracing::warn!(
+                                %packet_id,
+                                remote = %self.remote_conn.remote_addr,
+                                elapsed_ms = process_elapsed.as_millis(),
+                                "SLOW inbound packet processing!"
+                            );
+                        }
                         tracing::trace!(%packet_id, "returning full stream message");
                         return Ok(msg);
                     }

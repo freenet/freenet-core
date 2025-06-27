@@ -95,6 +95,11 @@ where
             return Ok(None);
         }
         Err(err) => {
+            tracing::error!(
+                %tx_id,
+                error = %err,
+                "PUT_ERROR: Operation failed with error"
+            );
             if let Some(sender) = sender {
                 network_bridge
                     .send(&sender, NetMessage::V1(NetMessageV1::Aborted(tx_id)))
