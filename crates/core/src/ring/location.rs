@@ -287,8 +287,7 @@ mod test {
             let gap = sorted_locs[i] - sorted_locs[i - 1];
             assert!(
                 gap < max_acceptable_gap,
-                "Found too large gap ({}) between consecutive locations",
-                gap
+                "Found too large gap ({gap}) between consecutive locations"
             );
         }
 
@@ -296,8 +295,7 @@ mod test {
         let wrap_gap = 1.0 - sorted_locs.last().unwrap() + sorted_locs[0];
         assert!(
             wrap_gap < max_acceptable_gap,
-            "Found too large wrap-around gap ({})",
-            wrap_gap
+            "Found too large wrap-around gap ({wrap_gap})"
         );
     }
 

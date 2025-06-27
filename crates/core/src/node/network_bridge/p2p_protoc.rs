@@ -99,7 +99,7 @@ impl NetworkBridge for P2pBridge {
                 crate::message::NetMessageV1::Get(_) => "GET".to_string(),
                 crate::message::NetMessageV1::Update(_) => "UPDATE".to_string(),
                 crate::message::NetMessageV1::Subscribe(_) => "SUBSCRIBE".to_string(),
-                _ => format!("{:?}", inner)
+                _ => format!("{inner:?}")
                     .split('(')
                     .next()
                     .unwrap_or("Unknown")
@@ -620,7 +620,7 @@ impl P2pConnManager {
                             NodeEvent::Disconnect { cause } => {
                                 tracing::info!(
                                     "Disconnecting from network{}",
-                                    cause.map(|c| format!(": {}", c)).unwrap_or_default()
+                                    cause.map(|c| format!(": {c}")).unwrap_or_default()
                                 );
                                 break;
                             }

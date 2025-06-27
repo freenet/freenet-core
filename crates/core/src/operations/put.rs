@@ -796,7 +796,7 @@ async fn try_to_broadcast(
                 new_state = None;
                 tracing::info!(
                     tx = %id,
-                    key = %key,  
+                    key = %key,
                     target = %upstream.peer,
                     "PUT_SUCCESS_SEND: Final hop complete, sending SuccessfulPut upstream"
                 );
