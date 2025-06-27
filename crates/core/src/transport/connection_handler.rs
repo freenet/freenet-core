@@ -327,6 +327,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         let dropped_count = self.dropped_packets.entry(remote_addr).or_insert(0);
                                         *dropped_count += 1;
 
+                                        // INSTRUMENTATION: Log every channel overflow immediately
+                                        tracing::warn!(
+                                            %remote_addr,
+                                            dropped_count = *dropped_count,
+                                            "CHANNEL_OVERFLOW: Dropping packet due to full channel (buffer size: 100)"
+                                        );
+
                                         // Log warning every 10 seconds if packets are being dropped
                                         let now = Instant::now();
                                         if now.duration_since(self.last_drop_warning) > Duration::from_secs(10) {

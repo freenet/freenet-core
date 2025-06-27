@@ -592,8 +592,22 @@ async fn process_message_v1<CB>(
                 .await;
             }
             NetMessageV1::Put(ref op) => {
+                let put_start = std::time::Instant::now();
+                tracing::info!(
+                    op_id = %op.id(),
+                    "PUT_START: Beginning PUT operation"
+                );
+
                 let op_result =
                     handle_op_request::<put::PutOp, _>(&op_manager, &mut conn_manager, op).await;
+
+                let elapsed = put_start.elapsed();
+                tracing::info!(
+                    op_id = %op.id(),
+                    elapsed_ms = elapsed.as_millis(),
+                    completed = is_operation_completed(&op_result),
+                    "PUT_END: Completed PUT operation"
+                );
 
                 if is_operation_completed(&op_result) {
                     if let Some(ref op_execution_callback) = pending_op_result {

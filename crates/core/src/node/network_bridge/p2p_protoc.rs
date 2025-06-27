@@ -92,15 +92,60 @@ impl NetworkBridge for P2pBridge {
     }
 
     async fn send(&self, target: &PeerId, msg: NetMessage) -> super::ConnResult<()> {
+        let send_start = std::time::Instant::now();
+        let msg_type = match &msg {
+            NetMessage::V1(inner) => match inner {
+                crate::message::NetMessageV1::Put(_) => "PUT".to_string(),
+                crate::message::NetMessageV1::Get(_) => "GET".to_string(),
+                crate::message::NetMessageV1::Update(_) => "UPDATE".to_string(),
+                crate::message::NetMessageV1::Subscribe(_) => "SUBSCRIBE".to_string(),
+                _ => format!("{:?}", inner)
+                    .split('(')
+                    .next()
+                    .unwrap_or("Unknown")
+                    .to_string(),
+            },
+        };
+
+        tracing::info!(
+            target = %target,
+            msg_type = %msg_type,
+            "MESSAGE_SEND_START: Sending message to peer"
+        );
+
         self.log_register
             .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager.ring))
             .await;
         self.op_manager.sending_transaction(target, &msg);
-        self.ev_listener_tx
+
+        let send_result = self
+            .ev_listener_tx
             .send(Left((target.clone(), Box::new(msg))))
-            .await
-            .map_err(|_| ConnectionError::SendNotCompleted(target.clone()))?;
-        Ok(())
+            .await;
+
+        let elapsed = send_start.elapsed();
+
+        match send_result {
+            Ok(_) => {
+                tracing::info!(
+                    target = %target,
+                    msg_type = %msg_type,
+                    elapsed_ms = elapsed.as_millis(),
+                    "MESSAGE_SEND_SUCCESS: Message sent successfully"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!(
+                    target = %target,
+                    msg_type = %msg_type,
+                    elapsed_ms = elapsed.as_millis(),
+                    error = %e,
+                    "MESSAGE_SEND_FAILED: Failed to send message"
+                );
+                Err(ConnectionError::SendNotCompleted(target.clone()))
+            }
+        }
     }
 }
 
