@@ -140,6 +140,7 @@ impl Operation for PutOp {
             let return_msg;
             let new_state;
             let stats = self.stats;
+            let old_state = format!("{:?}", self.state); // Capture before moving
 
             match input {
                 PutMsg::RequestPut {
@@ -431,6 +432,12 @@ impl Operation for PutOp {
                     );
 
                     // Subscriber nodes have been notified of the change, the operation is completed
+                    tracing::info!(
+                        tx = %id,
+                        key = %key,
+                        target = %upstream.peer,
+                        "PUT_SUCCESS_SEND: Broadcasting complete, sending SuccessfulPut upstream"
+                    );
                     return_msg = Some(PutMsg::SuccessfulPut {
                         id: *id,
                         target: upstream.clone(),
@@ -440,6 +447,11 @@ impl Operation for PutOp {
                     new_state = None;
                 }
                 PutMsg::SuccessfulPut { id, .. } => {
+                    tracing::info!(
+                        tx = %id,
+                        current_state = ?self.state,
+                        "PUT_SUCCESS_MSG: Received SuccessfulPut message"
+                    );
                     match self.state {
                         Some(PutState::AwaitingResponse {
                             key,
@@ -519,6 +531,12 @@ impl Operation for PutOp {
 
                             // Forward success message upstream if needed
                             if let Some(upstream) = upstream {
+                                tracing::info!(
+                                    tx = %id,
+                                    key = %key,
+                                    target = %upstream.peer,
+                                    "PUT_SUCCESS_SEND: Contract stored, sending SuccessfulPut upstream"
+                                );
                                 return_msg = Some(PutMsg::SuccessfulPut {
                                     id: *id,
                                     target: upstream,
@@ -675,6 +693,14 @@ impl Operation for PutOp {
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
+            tracing::info!(
+                tx = %self.id,
+                old_state = %old_state,
+                new_state = ?new_state,
+                has_return_msg = return_msg.is_some(),
+                "PUT_STATE_TRANSITION: PUT operation state change"
+            );
+
             build_op_result(self.id, new_state, return_msg, stats)
         })
     }
@@ -768,6 +794,12 @@ async fn try_to_broadcast(
                 return Err(OpError::StatePushed);
             } else {
                 new_state = None;
+                tracing::info!(
+                    tx = %id,
+                    key = %key,  
+                    target = %upstream.peer,
+                    "PUT_SUCCESS_SEND: Final hop complete, sending SuccessfulPut upstream"
+                );
                 return_msg = Some(PutMsg::SuccessfulPut {
                     id,
                     target: upstream,
@@ -810,6 +842,7 @@ pub(crate) fn start_op(
     }
 }
 
+#[derive(Debug)]
 pub enum PutState {
     ReceivedRequest,
     /// Preparing request for put op.
