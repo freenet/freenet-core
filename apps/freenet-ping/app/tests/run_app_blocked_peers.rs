@@ -223,17 +223,13 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
         tokio::time::sleep(config.initial_wait).await;
 
         // Connect to nodes via WebSocket
-        let uri_gw = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_gw
-        );
+        let uri_gw =
+            format!("ws://127.0.0.1:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
         let uri_node1 = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_node1
+            "ws://127.0.0.1:{ws_api_port_node1}/v1/contract/command?encodingProtocol=native"
         );
         let uri_node2 = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_node2
+            "ws://127.0.0.1:{ws_api_port_node2}/v1/contract/command?encodingProtocol=native"
         );
 
         tracing::info!("Connecting to Gateway at {}", uri_gw);
@@ -496,7 +492,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
                     );
 
                     let mut gw_ping_refresh = Ping::default();
-                    let gw_refresh_tag = format!("{}-refresh", gw_tag);
+                    let gw_refresh_tag = format!("{gw_tag}-refresh");
                     gw_ping_refresh.insert(gw_refresh_tag.clone());
                     tracing::info!("Gateway sending refresh update: {}", gw_refresh_tag);
                     client_gw
@@ -509,7 +505,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
                         .await?;
 
                     let mut node1_ping_refresh = Ping::default();
-                    let node1_refresh_tag = format!("{}-refresh", node1_tag);
+                    let node1_refresh_tag = format!("{node1_tag}-refresh");
                     node1_ping_refresh.insert(node1_refresh_tag.clone());
                     tracing::info!("Node1 sending refresh update: {}", node1_refresh_tag);
                     client_node1
@@ -522,7 +518,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
                         .await?;
 
                     let mut node2_ping_refresh = Ping::default();
-                    let node2_refresh_tag = format!("{}-refresh", node2_tag);
+                    let node2_refresh_tag = format!("{node2_tag}-refresh");
                     node2_ping_refresh.insert(node2_refresh_tag.clone());
                     tracing::info!("Node2 sending refresh update: {}", node2_refresh_tag);
                     client_node2
@@ -540,7 +536,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
             for i in 1..=config.update_rounds {
                 // Gateway update
                 let mut gw_ping_refresh = Ping::default();
-                let gw_refresh_tag = format!("{}-round{}", gw_tag, i);
+                let gw_refresh_tag = format!("{gw_tag}-round{i}");
                 gw_ping_refresh.insert(gw_refresh_tag.clone());
                 tracing::info!("Gateway sending round {} update: {}", i, gw_refresh_tag);
                 client_gw
@@ -554,7 +550,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
 
                 // Node1 update
                 let mut node1_ping_refresh = Ping::default();
-                let node1_refresh_tag = format!("{}-round{}", node1_tag, i);
+                let node1_refresh_tag = format!("{node1_tag}-round{i}");
                 node1_ping_refresh.insert(node1_refresh_tag.clone());
                 tracing::info!("Node1 sending round {} update: {}", i, node1_refresh_tag);
                 client_node1
@@ -568,7 +564,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
 
                 // Node2 update
                 let mut node2_ping_refresh = Ping::default();
-                let node2_refresh_tag = format!("{}-round{}", node2_tag, i);
+                let node2_refresh_tag = format!("{node2_tag}-round{i}");
                 node2_ping_refresh.insert(node2_refresh_tag.clone());
                 tracing::info!("Node2 sending round {} update: {}", i, node2_refresh_tag);
                 client_node2
@@ -631,7 +627,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
 
             // Gateway final update
             let mut gw_ping_final = Ping::default();
-            let gw_final_tag = format!("{}-final", gw_tag);
+            let gw_final_tag = format!("{gw_tag}-final");
             gw_ping_final.insert(gw_final_tag.clone());
             tracing::info!("Gateway sending final update: {}", gw_final_tag);
             client_gw
@@ -645,7 +641,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
 
             // Node1 final update
             let mut node1_ping_final = Ping::default();
-            let node1_final_tag = format!("{}-final", node1_tag);
+            let node1_final_tag = format!("{node1_tag}-final");
             node1_ping_final.insert(node1_final_tag.clone());
             tracing::info!("Node1 sending final update: {}", node1_final_tag);
             client_node1
@@ -659,7 +655,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
 
             // Node2 final update
             let mut node2_ping_final = Ping::default();
-            let node2_final_tag = format!("{}-final", node2_tag);
+            let node2_final_tag = format!("{node2_tag}-final");
             node2_ping_final.insert(node2_final_tag.clone());
             tracing::info!("Node2 sending final update: {}", node2_final_tag);
             client_node2

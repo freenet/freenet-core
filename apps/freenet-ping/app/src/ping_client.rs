@@ -169,7 +169,7 @@ pub async fn wait_for_subscribe_response(
 pub async fn connect_to_host(
     host: &str,
 ) -> Result<WebApi, Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let uri = format!("ws://{}/v1/contract/command?encodingProtocol=native", host);
+    let uri = format!("ws://{host}/v1/contract/command?encodingProtocol=native");
     let (stream, _resp) = tokio_tungstenite::connect_async(&uri).await.map_err(|e| {
         tracing::error!(err=%e);
         e

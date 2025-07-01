@@ -321,7 +321,7 @@ mod tests {
                 // Ensure decrypted data matches original
                 assert_eq!(&decrypted_data.data(), &original_data.data());
             }
-            Err(e) => panic!("Decryption failed with error: {:?}", e),
+            Err(e) => panic!("Decryption failed with error: {e:?}"),
         }
     }
 
