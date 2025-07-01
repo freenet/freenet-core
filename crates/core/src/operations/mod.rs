@@ -318,21 +318,30 @@ async fn start_subscription_request(
     try_get: bool,
     skip_list: HashSet<PeerId>,
 ) {
+    tracing::info!(
+        %key,
+        try_get,
+        skip_list_size = skip_list.len(),
+        "SUBSCRIPTION_START: Starting subscription request for contract"
+    );
+
     let sub_op = subscribe::start_op(key);
     if let Err(error) = subscribe::request_subscribe(op_manager, sub_op).await {
         if !try_get {
-            tracing::warn!(%error, "Error subscribing to contract");
+            tracing::warn!(%error, %key, "SUBSCRIPTION_ERROR: Error subscribing to contract");
             return;
         }
         if let OpError::ContractError(ContractError::ContractNotFound(key)) = &error {
-            tracing::debug!(%key, "Contract not found, trying to get it first");
+            tracing::debug!(%key, "SUBSCRIPTION_RETRY: Contract not found, trying to get it first");
             let get_op = get::start_op(*key, true, true);
             if let Err(error) = get::request_get(op_manager, get_op, skip_list).await {
-                tracing::warn!(%error, "Error getting contract");
+                tracing::warn!(%error, %key, "SUBSCRIPTION_ERROR: Error getting contract");
             }
         } else {
-            tracing::warn!(%error, "Error subscribing to contract");
+            tracing::warn!(%error, %key, "SUBSCRIPTION_ERROR: Error subscribing to contract");
         }
+    } else {
+        tracing::info!(%key, "SUBSCRIPTION_SUCCESS: Successfully subscribed to contract");
     }
 }
 

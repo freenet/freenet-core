@@ -666,7 +666,7 @@ impl P2pConnManager {
                     }
                     Err(HandshakeError::ChannelClosed) => Ok(EventResult::Event(ConnEvent::ClosedChannel.into())),
                     Err(e) => {
-                        tracing::warn!("Handshake error: {:?}", e);
+                        tracing::warn!("HANDSHAKE_ERROR: Handshake failed with error: {:?}", e);
                         Ok(EventResult::Continue)
                     }
                 }

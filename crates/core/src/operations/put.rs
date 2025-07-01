@@ -227,6 +227,15 @@ impl Operation for PutOp {
                     let should_seed = op_manager.ring.should_seed(&key);
                     let should_handle_locally = !is_subscribed_contract && should_seed;
 
+                    tracing::info!(
+                        tx = %id,
+                        %key,
+                        is_subscribed_contract,
+                        should_seed,
+                        should_handle_locally,
+                        "PUT_SEEDING_DECISION: Evaluating if node should cache contract"
+                    );
+
                     tracing::debug!(
                         tx = %id,
                         %key,
@@ -941,6 +950,12 @@ async fn put_contract(
     related_contracts: RelatedContracts<'static>,
     contract: &ContractContainer,
 ) -> Result<WrappedState, OpError> {
+    tracing::info!(
+        %key,
+        state_size = state.size(),
+        "PUT_CONTRACT_START: Attempting to cache contract locally"
+    );
+
     // after the contract has been cached, push the update query
     match op_manager
         .notify_contract_handler(ContractHandlerEvent::PutQuery {
@@ -953,16 +968,29 @@ async fn put_contract(
     {
         Ok(ContractHandlerEvent::PutResponse {
             new_value: Ok(new_val),
-        }) => Ok(new_val),
+        }) => {
+            tracing::info!(
+                %key,
+                new_state_size = new_val.size(),
+                "PUT_CONTRACT_SUCCESS: Contract cached successfully"
+            );
+            Ok(new_val)
+        }
         Ok(ContractHandlerEvent::PutResponse {
             new_value: Err(err),
         }) => {
-            tracing::error!(%key, "Failed to update contract value: {}", err);
+            tracing::error!(%key, error = %err, "PUT_CONTRACT_ERROR: Failed to update contract value");
             Err(OpError::from(err))
             // TODO: not a valid value update, notify back to requester
         }
-        Err(err) => Err(err.into()),
-        Ok(_) => Err(OpError::UnexpectedOpState),
+        Err(err) => {
+            tracing::error!(%key, error = %err, "PUT_CONTRACT_ERROR: Contract handler error");
+            Err(err.into())
+        }
+        Ok(other) => {
+            tracing::error!(%key, response = ?other, "PUT_CONTRACT_ERROR: Unexpected contract handler response");
+            Err(OpError::UnexpectedOpState)
+        }
     }
 }
 

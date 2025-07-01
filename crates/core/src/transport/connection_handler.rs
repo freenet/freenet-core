@@ -139,7 +139,11 @@ impl OutboundConnectionHandler {
     ) -> Result<(Self, mpsc::Receiver<PeerConnection>), TransportError> {
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
-        let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
+        // Increase buffer size to prevent blocking - gateways can have many connections
+        let (new_connection_sender, new_connection_notifier) = mpsc::channel(1000);
+        tracing::info!(
+            "Creating connection handler with new_connection_notifier buffer size: 1000 (was 10)"
+        );
 
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (outbound_sender, outbound_recv) = mpsc::channel(100);
@@ -447,12 +451,24 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                             self.remote_connections.insert(remote_addr, inbound_remote_connection);
 
-                            if self.new_connection_notifier
-                                .send(PeerConnection::new(outbound_remote_conn))
-                                .await
-                                .is_err() {
-                                tracing::error!(%remote_addr, "gateway connection established but failed to notify new connection");
-                                break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
+                            // CRITICAL: Use try_send to avoid blocking the entire UDP listener
+                            match self.new_connection_notifier
+                                .try_send(PeerConnection::new(outbound_remote_conn)) {
+                                Ok(()) => {
+                                    tracing::debug!(%remote_addr, "Successfully notified new gateway connection");
+                                }
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    tracing::error!(
+                                        %remote_addr,
+                                        "CRITICAL: new_connection_notifier channel is FULL (capacity: 10). This blocks all packet processing!"
+                                    );
+                                    // TODO: We should handle this better - maybe increase buffer size or process connections differently
+                                    break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    tracing::error!(%remote_addr, "new_connection_notifier channel is closed");
+                                    break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
+                                }
                             }
 
                             sent_tracker.lock().report_sent_packet(
