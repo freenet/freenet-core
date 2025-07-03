@@ -139,7 +139,14 @@ impl OutboundConnectionHandler {
     ) -> Result<(Self, mpsc::Receiver<PeerConnection>), TransportError> {
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
-        let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
+        // Increase buffer size for gateways which can have many concurrent connections
+        let buffer_size = if is_gateway { 1000 } else { 100 };
+        let (new_connection_sender, new_connection_notifier) = mpsc::channel(buffer_size);
+        tracing::debug!(
+            "Creating connection handler with buffer size: {} (gateway: {})",
+            buffer_size,
+            is_gateway
+        );
 
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (outbound_sender, outbound_recv) = mpsc::channel(100);
@@ -288,9 +295,12 @@ impl<S: Socket> UdpPacketsListener<S> {
         > = BTreeMap::new();
         let mut connection_tasks = FuturesUnordered::new();
         let mut gw_connection_tasks = FuturesUnordered::new();
+        let mut connection_notification_tasks: FuturesUnordered<
+            BoxFuture<'static, Result<(), (SocketAddr, PeerConnection)>>,
+        > = FuturesUnordered::new();
         let mut outdated_peer: HashMap<SocketAddr, Instant> = HashMap::new();
 
-        'outer: loop {
+        loop {
             tokio::select! {
                 recv_result = self.socket_listener.recv_from(&mut buf) => {
                     match recv_result {
@@ -440,13 +450,23 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                             self.remote_connections.insert(remote_addr, inbound_remote_connection);
 
-                            if self.new_connection_notifier
-                                .send(PeerConnection::new(outbound_remote_conn))
-                                .await
-                                .is_err() {
-                                tracing::error!(%remote_addr, "gateway connection established but failed to notify new connection");
-                                break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
-                            }
+                            // Clone the sender and handle notification in parallel to avoid blocking
+                            let notifier = self.new_connection_notifier.clone();
+                            let peer_conn = PeerConnection::new(outbound_remote_conn);
+                            let notification_task = async move {
+                                match notifier.send(peer_conn).await {
+                                    Ok(()) => {
+                                        tracing::debug!(%remote_addr, "Successfully notified new gateway connection");
+                                        Ok(())
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(%remote_addr, "new_connection_notifier channel closed");
+                                        Err((remote_addr, e.0))
+                                    }
+                                }
+                            }.boxed();
+
+                            connection_notification_tasks.push(notification_task);
 
                             sent_tracker.lock().report_sent_packet(
                                 SymmetricMessage::FIRST_PACKET_ID,
@@ -485,6 +505,23 @@ impl<S: Socket> UdpPacketsListener<S> {
                             if let Some((_, result_sender)) = ongoing_connections.remove(&remote_addr) {
                                 let _ = result_sender.send(Err(error));
                             }
+                        }
+                    }
+                }
+                // Handle connection notification tasks
+                notification_result = connection_notification_tasks.next(), if !connection_notification_tasks.is_empty() => {
+                    let Some(result) = notification_result else {
+                        unreachable!("connection_notification_tasks.next() should only return None if empty, which is guarded");
+                    };
+                    match result {
+                        Ok(()) => {
+                            // Successfully notified connection
+                        }
+                        Err((remote_addr, peer_conn)) => {
+                            // Notification failed, handle the error
+                            tracing::error!(%remote_addr, "Failed to notify new connection, channel might be full");
+                            // Could implement retry logic or buffering here
+                            drop(peer_conn); // Connection will be closed
                         }
                     }
                 }
