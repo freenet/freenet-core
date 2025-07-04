@@ -265,7 +265,7 @@ mod tests {
 
         // Check that the errors are small
         let average_error = errors.iter().sum::<f64>() / errors.len() as f64;
-        println!("Average error: {}", average_error);
+        println!("Average error: {average_error}");
         assert!(average_error < 0.01);
     }
 
@@ -302,7 +302,7 @@ mod tests {
 
         // Check that the errors are small
         let average_error = errors.iter().sum::<f64>() / errors.len() as f64;
-        println!("Average error: {}", average_error);
+        println!("Average error: {average_error}");
         assert!(average_error < 0.01);
     }
 

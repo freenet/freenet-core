@@ -37,7 +37,7 @@ async fn collect_node_diagnostics(
 ) -> anyhow::Result<()> {
     use std::time::Duration;
 
-    println!("=== NODE DIAGNOSTICS: {} ===", phase);
+    println!("=== NODE DIAGNOSTICS: {phase} ===");
 
     // Create diagnostic config with features enabled
     let config = NodeDiagnosticsConfig {
@@ -51,7 +51,7 @@ async fn collect_node_diagnostics(
     };
 
     for (i, (client, node_name)) in clients.iter_mut().zip(node_names.iter()).enumerate() {
-        println!("Collecting diagnostics from {} (index {})...", node_name, i);
+        println!("Collecting diagnostics from {node_name} (index {i})...");
 
         // Send diagnostic request
         match client
@@ -97,7 +97,7 @@ async fn collect_node_diagnostics(
                                     network_info.connected_peers.len()
                                 );
                                 for (peer_id, addr) in &network_info.connected_peers {
-                                    println!("  - {} at {}", peer_id, addr);
+                                    println!("  - {peer_id} at {addr}");
                                 }
                             }
 
@@ -119,7 +119,7 @@ async fn collect_node_diagnostics(
                                     response.contract_states.len()
                                 );
                                 for (key, state) in &response.contract_states {
-                                    println!("  📄 Contract: {}", key);
+                                    println!("  📄 Contract: {key}");
                                     println!("     {} subscribers", state.subscribers);
 
                                     // Show subscriber peer IDs (NODOS SUSCRITOS)
@@ -149,28 +149,25 @@ async fn collect_node_diagnostics(
                             continue;
                         }
                         Ok(Err(e)) => {
-                            println!("ERROR: {} returned error: {}", node_name, e);
+                            println!("ERROR: {node_name} returned error: {e}");
                             break;
                         }
                         Err(_) => {
-                            println!("ERROR: {} diagnostic request timed out", node_name);
+                            println!("ERROR: {node_name} diagnostic request timed out");
                             break;
                         }
                     }
                 }
             }
             Err(e) => {
-                println!(
-                    "ERROR: Failed to send diagnostic request to {}: {}",
-                    node_name, e
-                );
+                println!("ERROR: Failed to send diagnostic request to {node_name}: {e}");
             }
         }
 
         println!();
     }
 
-    println!("=== END DIAGNOSTICS: {} ===\n", phase);
+    println!("=== END DIAGNOSTICS: {phase} ===\n");
     Ok(())
 }
 
@@ -188,7 +185,7 @@ async fn test_node_diagnostics_query() -> TestResult {
     let mut test_rng = rand::rngs::StdRng::from_seed(test_seed);
 
     println!("Testing NodeDiagnostics query functionality");
-    println!("Using deterministic test seed: {:?}", test_seed);
+    println!("Using deterministic test seed: {test_seed:?}");
 
     // Configure gateway node
     let (config_gw, preset_cfg_gw) = base_node_test_config_with_rng(
@@ -266,12 +263,10 @@ async fn test_node_diagnostics_query() -> TestResult {
 
         // Connect to both nodes
         let uri_gw = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_gw
+            "ws://127.0.0.1:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native"
         );
         let uri_node = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_node
+            "ws://127.0.0.1:{ws_api_port_node}/v1/contract/command?encodingProtocol=native"
         );
 
         let (stream_gw, _) = connect_async(&uri_gw).await?;
@@ -308,10 +303,10 @@ async fn test_node_diagnostics_query() -> TestResult {
                     println!("  - Node ID: {}", node_info.peer_id);
                     println!("  - Is Gateway: {}", node_info.is_gateway);
                     if let Some(location) = &node_info.location {
-                        println!("  - Location: {}", location);
+                        println!("  - Location: {location}");
                     }
                     if let Some(listening_address) = &node_info.listening_address {
-                        println!("  - Listening Address: {}", listening_address);
+                        println!("  - Listening Address: {listening_address}");
                     }
                     assert!(node_info.is_gateway, "Gateway node should report is_gateway=true");
                 } else {
@@ -360,10 +355,10 @@ async fn test_node_diagnostics_query() -> TestResult {
                     println!("  - Node ID: {}", node_info.peer_id);
                     println!("  - Is Gateway: {}", node_info.is_gateway);
                     if let Some(location) = &node_info.location {
-                        println!("  - Location: {}", location);
+                        println!("  - Location: {location}");
                     }
                     if let Some(listening_address) = &node_info.listening_address {
-                        println!("  - Listening Address: {}", listening_address);
+                        println!("  - Listening Address: {listening_address}");
                     }
                     assert!(!node_info.is_gateway, "Client node should report is_gateway=false");
                 } else {
@@ -484,7 +479,7 @@ async fn test_ping_multi_node() -> TestResult {
     let test_seed = *b"app_loop_test_seed_0123456789012";
     let mut test_rng = rand::rngs::StdRng::from_seed(test_seed);
 
-    println!("Using deterministic test seed: {:?}", test_seed);
+    println!("Using deterministic test seed: {test_seed:?}");
     println!("Test RNG initial state configured for deterministic network topology");
 
     // Configure gateway node
@@ -560,9 +555,9 @@ async fn test_ping_multi_node() -> TestResult {
         let n1_to_n2_dist = (n1_loc - n2_loc).abs().min(1.0 - (n1_loc - n2_loc).abs());
 
         println!("Ring distances:");
-        println!("  Gateway ↔ Node1: {:.6}", gw_to_n1_dist);
-        println!("  Gateway ↔ Node2: {:.6}", gw_to_n2_dist);
-        println!("  Node1 ↔ Node2: {:.6}", n1_to_n2_dist);
+        println!("  Gateway ↔ Node1: {gw_to_n1_dist:.6}");
+        println!("  Gateway ↔ Node2: {gw_to_n2_dist:.6}");
+        println!("  Node1 ↔ Node2: {n1_to_n2_dist:.6}");
 
         // Warn about potentially problematic distances
         let max_distance_threshold = 0.4; // Arbitrary threshold for "far" nodes
@@ -636,16 +631,13 @@ async fn test_ping_multi_node() -> TestResult {
 
         // Connect to all three nodes
         let uri_gw = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_gw
+            "ws://127.0.0.1:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native"
         );
         let uri_node1 = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_node1
+            "ws://127.0.0.1:{ws_api_port_node1}/v1/contract/command?encodingProtocol=native"
         );
         let uri_node2 = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_node2
+            "ws://127.0.0.1:{ws_api_port_node2}/v1/contract/command?encodingProtocol=native"
         );
 
         let (stream_gw, _) = connect_async(&uri_gw).await?;
@@ -703,7 +695,7 @@ async fn test_ping_multi_node() -> TestResult {
         let key = wait_for_put_response(&mut client_gw, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-        println!("Gateway: put ping contract successfully! key={}", key);
+        println!("Gateway: put ping contract successfully! key={key}");
 
         // Step 2: Node 1 gets the contrac
         println!("Node 1 getting contract...");
@@ -739,7 +731,7 @@ async fn test_ping_multi_node() -> TestResult {
 
         // Step 4: All nodes subscribe to the contract
         println!("=== SUBSCRIPTION PHASE ===");
-        println!("All nodes subscribing to contract: {}", contract_key);
+        println!("All nodes subscribing to contract: {contract_key}");
 
         // Gateway subscribes
         println!("Gateway attempting subscription...");
@@ -804,17 +796,16 @@ async fn test_ping_multi_node() -> TestResult {
 
         // Each node will send multiple pings to build history
         let ping_rounds = 3;
-        println!("Each node will send {} pings to build history", ping_rounds);
+        println!("Each node will send {ping_rounds} pings to build history");
 
         for round in 1..=ping_rounds {
-            println!("=== ROUND {} UPDATE CYCLE ===", round);
+            println!("=== ROUND {round} UPDATE CYCLE ===");
 
             // Gateway sends update with its tag
             let mut gw_ping = Ping::default();
             gw_ping.insert(gw_tag.clone());
             let gw_timestamp = gw_ping.get(&gw_tag).and_then(|v| v.first()).unwrap();
-            println!("Gateway sending update: tag='{}', timestamp={} (round {})",
-                         gw_tag, gw_timestamp, round);
+            println!("Gateway sending update: tag='{gw_tag}', timestamp={gw_timestamp} (round {round})");
             client_gw
                 .send(ClientRequest::ContractOp(ContractRequest::Update {
                     key: contract_key,
@@ -826,8 +817,7 @@ async fn test_ping_multi_node() -> TestResult {
             let mut node1_ping = Ping::default();
             node1_ping.insert(node1_tag.clone());
             let node1_timestamp = node1_ping.get(&node1_tag).and_then(|v| v.first()).unwrap();
-            println!("Node 1 sending update: tag='{}', timestamp={} (round {})",
-                         node1_tag, node1_timestamp, round);
+            println!("Node 1 sending update: tag='{node1_tag}', timestamp={node1_timestamp} (round {round})");
             client_node1
                 .send(ClientRequest::ContractOp(ContractRequest::Update {
                     key: contract_key,
@@ -839,8 +829,7 @@ async fn test_ping_multi_node() -> TestResult {
             let mut node2_ping = Ping::default();
             node2_ping.insert(node2_tag.clone());
             let node2_timestamp = node2_ping.get(&node2_tag).and_then(|v| v.first()).unwrap();
-            println!("Node 2 sending update: tag='{}', timestamp={} (round {})",
-                         node2_tag, node2_timestamp, round);
+            println!("Node 2 sending update: tag='{node2_tag}', timestamp={node2_timestamp} (round {round})");
             client_node2
                 .send(ClientRequest::ContractOp(ContractRequest::Update {
                     key: contract_key,
@@ -906,9 +895,9 @@ async fn test_ping_multi_node() -> TestResult {
             .map_err(anyhow::Error::msg)?;
 
         // Log the final state from each node
-        println!("Gateway final state: {}", final_state_gw);
-        println!("Node 1 final state: {}", final_state_node1);
-        println!("Node 2 final state: {}", final_state_node2);
+        println!("Gateway final state: {final_state_gw}");
+        println!("Node 1 final state: {final_state_node1}");
+        println!("Node 2 final state: {final_state_node2}");
 
         // Final diagnostic collection to understand the issue
         {
@@ -933,7 +922,7 @@ async fn test_ping_multi_node() -> TestResult {
             for tag in &tags {
                 let has_tag = state.contains_key(tag);
                 let count = state.get(tag).map(|v| v.len()).unwrap_or(0);
-                println!("  {} has '{}': {} (count: {})", node_name, tag, has_tag, count);
+                println!("  {node_name} has '{tag}': {has_tag} (count: {count})");
                 propagation_matrix.insert((node_name.to_string(), tag.clone()), (has_tag, count));
             }
         }
@@ -954,9 +943,9 @@ async fn test_ping_multi_node() -> TestResult {
         let node2_has_node1 = final_state_node2.contains_key(&node1_tag);
 
         println!("Cross-propagation success rates:");
-        println!("  Gateway ← Node1: {} | Gateway ← Node2: {}", gw_has_node1, gw_has_node2);
-        println!("  Node1 ← Gateway: {} | Node1 ← Node2: {}", node1_has_gw, node1_has_node2);
-        println!("  Node2 ← Gateway: {} | Node2 ← Node1: {}", node2_has_gw, node2_has_node1);
+        println!("  Gateway ← Node1: {gw_has_node1} | Gateway ← Node2: {gw_has_node2}");
+        println!("  Node1 ← Gateway: {node1_has_gw} | Node1 ← Node2: {node1_has_node2}");
+        println!("  Node2 ← Gateway: {node2_has_gw} | Node2 ← Node1: {node2_has_node1}");
 
         // Calculate overall propagation success
         let total_propagation_attempts = 6; // 3 nodes × 2 cross-propagations each
@@ -969,7 +958,7 @@ async fn test_ping_multi_node() -> TestResult {
                       successful_propagations, total_propagation_attempts, propagation_rate * 100.0);
 
         for tag in &tags {
-            println!("=== DETAILED ANALYSIS FOR TAG '{}' ===", tag);
+            println!("=== DETAILED ANALYSIS FOR TAG '{tag}' ===");
 
             // Get the vector of timestamps for this tag from each node
             let gw_history = final_state_gw.get(tag).cloned().unwrap_or_default();
@@ -977,7 +966,7 @@ async fn test_ping_multi_node() -> TestResult {
             let node2_history = final_state_node2.get(tag).cloned().unwrap_or_default();
 
             // Log which nodes have this tag
-            println!("Tag '{}' presence:", tag);
+            println!("Tag '{tag}' presence:");
             println!("  Gateway: {} (count: {})", !gw_history.is_empty(), gw_history.len());
             println!("  Node1: {} (count: {})", !node1_history.is_empty(), node1_history.len());
             println!("  Node2: {} (count: {})", !node2_history.is_empty(), node2_history.len());
@@ -1017,7 +1006,7 @@ async fn test_ping_multi_node() -> TestResult {
             }
 
             if timestamps_match {
-                println!("History for tag '{}' is identical across all nodes!", tag);
+                println!("History for tag '{tag}' is identical across all nodes!");
             } else {
                 tracing::warn!("History timestamps for tag '{}' differ between nodes!", tag);
                 all_histories_match = false;
@@ -1238,17 +1227,13 @@ async fn test_ping_application_loop() -> TestResult {
         tokio::time::sleep(Duration::from_secs(10)).await;
 
         // Connect to all three nodes
-        let uri_gw = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_gw
-        );
+        let uri_gw =
+            format!("ws://127.0.0.1:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
         let uri_node1 = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_node1
+            "ws://127.0.0.1:{ws_api_port_node1}/v1/contract/command?encodingProtocol=native"
         );
         let uri_node2 = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_node2
+            "ws://127.0.0.1:{ws_api_port_node2}/v1/contract/command?encodingProtocol=native"
         );
 
         let (stream_gw, _) = connect_async(&uri_gw).await?;
@@ -1320,7 +1305,7 @@ async fn test_ping_application_loop() -> TestResult {
         let key = wait_for_put_response(&mut client_gw, &contract_key)
             .await
             .map_err(anyhow::Error::msg)?;
-        println!("Gateway: put ping contract successfully! key={}", key);
+        println!("Gateway: put ping contract successfully! key={key}");
 
         // Step 2: Node 1 gets the contrac
         println!("Node 1 getting contract...");
@@ -1497,8 +1482,8 @@ async fn test_ping_application_loop() -> TestResult {
         // Check that each node received a reasonable number of pings
         let check_ping_counts = |name: &str, stats: &PingStats| {
             for (source, count) in &stats.received_counts {
-                tracing::info!("{} received {} pings from {}", name, count, source);
-                assert!(*count > 0, "{} received no pings from {}", name, source);
+                tracing::info!("{name} received {count} pings from {source}");
+                assert!(*count > 0, "{name} received no pings from {source}");
             }
         };
 
@@ -1605,7 +1590,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
     let mut gateway_presets = Vec::with_capacity(NUM_GATEWAYS);
 
     for i in 0..NUM_GATEWAYS {
-        let data_dir_suffix = format!("gw_{}", i);
+        let data_dir_suffix = format!("gw_{i}");
 
         let (cfg, preset) = base_node_test_config(
             true,
@@ -1663,7 +1648,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         let effective_connections = (NUM_REGULAR_NODES - 1) - blocked_addresses.len();
         node_connections.push(effective_connections);
 
-        let data_dir_suffix = format!("node_{}", i);
+        let data_dir_suffix = format!("node_{i}");
 
         let (cfg, preset) = base_node_test_config(
             false,
@@ -1739,8 +1724,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         let mut gateway_clients = Vec::with_capacity(NUM_GATEWAYS);
         for (i, port) in ws_api_ports_gw.iter().enumerate() {
             let uri = format!(
-                "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-                port
+                "ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native"
             );
             let (stream, _) = connect_async(&uri).await?;
             let client = WebApi::start(stream);
@@ -1751,8 +1735,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         let mut node_clients = Vec::with_capacity(NUM_REGULAR_NODES);
         for (i, port) in ws_api_ports_nodes.iter().enumerate() {
             let uri = format!(
-                "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-                port
+                "ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native"
             );
             let (stream, _) = connect_async(&uri).await?;
             let client = WebApi::start(stream);
@@ -2038,7 +2021,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         tracing::info!("Node {} will send an update", updater_idx);
 
         // Create a unique tag for the updater
-        let update_tag = format!("ping-from-node-{}", updater_idx);
+        let update_tag = format!("ping-from-node-{updater_idx}");
 
         // Send the update
         let mut update_ping = Ping::default();

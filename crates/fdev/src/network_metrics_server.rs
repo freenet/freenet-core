@@ -144,7 +144,7 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                 .await?;
             }
             Err(e) => {
-                tracing::debug!("Websocket error: {}", e);
+                tracing::debug!("Websocket error: {e}");
                 break;
             }
         }

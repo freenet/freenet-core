@@ -262,8 +262,7 @@ impl std::fmt::Display for SymmetricMessagePayload {
                 ..
             } => write!(
                 f,
-                "StreamFragment: (stream id: {:?}, fragment no: {:?}) ",
-                stream_id, fragment_number
+                "StreamFragment: (stream id: {stream_id:?}, fragment no: {fragment_number:?}) "
             ),
             SymmetricMessagePayload::NoOp => write!(f, "NoOp"),
         }
