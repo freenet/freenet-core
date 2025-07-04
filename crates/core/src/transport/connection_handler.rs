@@ -143,9 +143,7 @@ impl OutboundConnectionHandler {
         let buffer_size = if is_gateway { 1000 } else { 100 };
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(buffer_size);
         tracing::debug!(
-            "Creating connection handler with buffer size: {} (gateway: {})",
-            buffer_size,
-            is_gateway
+            "Creating connection handler with buffer size: {buffer_size} (gateway: {is_gateway})"
         );
 
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
