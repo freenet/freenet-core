@@ -29,7 +29,7 @@ pub(crate) struct PutOp {
 }
 
 impl PutOp {
-    pub(super) fn outcome(&self) -> OpOutcome {
+    pub(super) fn outcome(&self) -> OpOutcome<'_> {
         // todo: track in the future
         // match &self.stats {
         //     Some(PutStats {

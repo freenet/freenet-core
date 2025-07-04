@@ -174,7 +174,7 @@ impl OpEnum {
             OpEnum::Update(op) => op,
         } {
             pub fn id(&self) -> &Transaction;
-            pub fn outcome(&self) -> OpOutcome;
+            pub fn outcome(&self) -> OpOutcome<'_>;
             pub fn finalized(&self) -> bool;
             pub fn to_host_result(&self) -> HostResult;
         }

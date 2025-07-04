@@ -501,22 +501,19 @@ mod tests {
         // Since TTL is 25s, all ping3 entries (4) and most ping2 entries should be included
         assert_eq!(
             ping3_count, 4,
-            "Expected all 4 entries from ping3 (newest), but found {}",
-            ping3_count
+            "Expected all 4 entries from ping3 (newest), but found {ping3_count}"
         );
 
         // Check that we have at least 3 entries from ping2
         assert!(
             ping2_count >= 3,
-            "Expected at least 3 entries from ping2 (middle), but found {}",
-            ping2_count
+            "Expected at least 3 entries from ping2 (middle), but found {ping2_count}"
         );
 
         // Due to TTL, we expect at most 3 entries from ping1
         assert!(
             ping1_count <= 3,
-            "Expected at most 3 entries from ping1 (oldest), but got {}",
-            ping1_count
+            "Expected at most 3 entries from ping1 (oldest), but got {ping1_count}"
         );
 
         // Verify total count matches what we found

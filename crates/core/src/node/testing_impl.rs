@@ -627,7 +627,7 @@ impl SimNetwork {
             HashSet::from_iter(self.number_of_gateways..num_nodes + self.number_of_gateways);
         let mut missing: Vec<_> = expected
             .difference(&connected)
-            .map(|n| format!("node-{}", n))
+            .map(|n| format!("node-{n}"))
             .collect();
 
         tracing::info!("Number of simulated nodes: {num_nodes}");

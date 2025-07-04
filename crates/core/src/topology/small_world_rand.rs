@@ -67,8 +67,7 @@ mod tests {
         // Check if p_value is above 0.05, indicating that we fail to reject the null hypothesis
         assert!(
             p_value > 0.05,
-            "Chi-squared test failed, p_value = {}",
-            p_value
+            "Chi-squared test failed, p_value = {p_value}"
         );
     }
 }

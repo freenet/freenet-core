@@ -229,7 +229,7 @@ impl NodeConfig {
         let hostname = if hostname.ends_with('.') {
             hostname
         } else {
-            Cow::Owned(format!("{}.", hostname))
+            Cow::Owned(format!("{hostname}."))
         };
 
         let ips = resolver.lookup_ip(hostname.as_ref()).await?;

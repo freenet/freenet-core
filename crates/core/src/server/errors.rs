@@ -34,10 +34,10 @@ impl WebSocketApiError {
     pub fn error_message(&self) -> String {
         match self {
             WebSocketApiError::InvalidParam { error_cause } => {
-                format!("Invalid request params: {}", error_cause)
+                format!("Invalid request params: {error_cause}")
             }
-            WebSocketApiError::NodeError { error_cause } => format!("Node error: {}", error_cause),
-            WebSocketApiError::AxumError { error } => format!("Server error: {}", error),
+            WebSocketApiError::NodeError { error_cause } => format!("Node error: {error_cause}"),
+            WebSocketApiError::AxumError { error } => format!("Server error: {error}"),
             WebSocketApiError::MissingContract { key } => format!("Missing contract {key}"),
         }
     }
