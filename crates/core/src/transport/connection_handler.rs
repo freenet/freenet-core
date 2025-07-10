@@ -293,9 +293,6 @@ impl<S: Socket> UdpPacketsListener<S> {
         > = BTreeMap::new();
         let mut connection_tasks = FuturesUnordered::new();
         let mut gw_connection_tasks = FuturesUnordered::new();
-        let mut connection_notification_tasks: FuturesUnordered<
-            BoxFuture<'static, Result<(), (SocketAddr, PeerConnection)>>,
-        > = FuturesUnordered::new();
         let mut outdated_peer: HashMap<SocketAddr, Instant> = HashMap::new();
 
         loop {
@@ -334,6 +331,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         // Track dropped packets and log warnings periodically
                                         let dropped_count = self.dropped_packets.entry(remote_addr).or_insert(0);
                                         *dropped_count += 1;
+
+                                        // INSTRUMENTATION: Log every channel overflow immediately
+                                        tracing::warn!(
+                                            %remote_addr,
+                                            dropped_count = *dropped_count,
+                                            "CHANNEL_OVERFLOW: Dropping packet due to full channel (buffer size: 100)"
+                                        );
 
                                         // Log warning every 10 seconds if packets are being dropped
                                         let now = Instant::now();
@@ -448,23 +452,28 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                             self.remote_connections.insert(remote_addr, inbound_remote_connection);
 
-                            // Clone the sender and handle notification in parallel to avoid blocking
-                            let notifier = self.new_connection_notifier.clone();
-                            let peer_conn = PeerConnection::new(outbound_remote_conn);
-                            let notification_task = async move {
-                                match notifier.send(peer_conn).await {
-                                    Ok(()) => {
-                                        tracing::debug!(%remote_addr, "Successfully notified new gateway connection");
-                                        Ok(())
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(%remote_addr, "new_connection_notifier channel closed");
-                                        Err((remote_addr, e.0))
-                                    }
+                            // CRITICAL: Use try_send to avoid blocking the entire UDP listener
+                            match self.new_connection_notifier
+                                .try_send(PeerConnection::new(outbound_remote_conn)) {
+                                Ok(()) => {
+                                    tracing::debug!(%remote_addr, "Successfully notified new gateway connection");
                                 }
-                            }.boxed();
-
-                            connection_notification_tasks.push(notification_task);
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    tracing::error!(
+                                        %remote_addr,
+                                        is_gateway = self.is_gateway,
+                                        "CRITICAL: new_connection_notifier channel is FULL. This blocks all packet processing!"
+                                    );
+                                    // TODO: We should handle this better - maybe increase buffer size or process connections differently
+                                    // For now, continue processing other packets
+                                    continue;
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    tracing::error!(%remote_addr, "new_connection_notifier channel is closed");
+                                    // Channel closed means we should stop the entire listener
+                                    return Err(TransportError::ConnectionClosed(self.this_addr));
+                                }
+                            }
 
                             sent_tracker.lock().report_sent_packet(
                                 SymmetricMessage::FIRST_PACKET_ID,
@@ -503,23 +512,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                             if let Some((_, result_sender)) = ongoing_connections.remove(&remote_addr) {
                                 let _ = result_sender.send(Err(error));
                             }
-                        }
-                    }
-                }
-                // Handle connection notification tasks
-                notification_result = connection_notification_tasks.next(), if !connection_notification_tasks.is_empty() => {
-                    let Some(result) = notification_result else {
-                        unreachable!("connection_notification_tasks.next() should only return None if empty, which is guarded");
-                    };
-                    match result {
-                        Ok(()) => {
-                            // Successfully notified connection
-                        }
-                        Err((remote_addr, peer_conn)) => {
-                            // Notification failed, handle the error
-                            tracing::error!(%remote_addr, "Failed to notify new connection, channel might be full");
-                            // Could implement retry logic or buffering here
-                            drop(peer_conn); // Connection will be closed
                         }
                     }
                 }
