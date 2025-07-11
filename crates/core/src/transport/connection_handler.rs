@@ -319,8 +319,20 @@ impl<S: Socket> UdpPacketsListener<S> {
                             );
 
                             if let Some(remote_conn) = self.remote_connections.remove(&remote_addr) {
+                                // Check if this might be a keep-alive packet (NoOp)
+                                let packet_size = buf[..size].len();
+                                let is_likely_keepalive = packet_size < 100; // Keep-alives are small
+                                
                                 match remote_conn.inbound_packet_sender.try_send(packet_data) {
                                     Ok(_) => {
+                                        if is_likely_keepalive {
+                                            tracing::debug!(
+                                                target: "freenet_core::transport::gateway_keepalive",
+                                                %remote_addr,
+                                                packet_size,
+                                                "GATEWAY_KEEPALIVE_FORWARD: Forwarded likely keep-alive packet"
+                                            );
+                                        }
                                         self.remote_connections.insert(remote_addr, remote_conn);
                                         continue;
                                     }
