@@ -515,6 +515,11 @@ impl PeerConnection {
                         .report_received_receipts(&confirm_receipt);
 
                     let report_result = self.received_tracker.report_received_packet(packet_id);
+                    let trigger_str = match &report_result {
+                        ReportResult::QueueFull => "QueueFull",
+                        ReportResult::Ok => "Ok",
+                        ReportResult::AlreadyReceived => "AlreadyReceived",
+                    };
                     match (report_result, should_send_receipts) {
                         (ReportResult::QueueFull, _) | (_, true) => {
                             let receipts = self.received_tracker.get_receipts();
@@ -524,7 +529,7 @@ impl PeerConnection {
                                     remote = ?self.remote_conn.remote_addr,
                                     receipt_count = receipts.len(),
                                     receipts = ?receipts,
-                                    trigger = ?report_result,
+                                    trigger = trigger_str,
                                     should_send_receipts,
                                     "KEEP_ALIVE_RESPONSE: Sending receipt NoOp packet"
                                 );
