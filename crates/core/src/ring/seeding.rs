@@ -127,7 +127,7 @@ impl SeedingManager {
     pub fn subscribers_of(
         &self,
         contract: &ContractKey,
-    ) -> Option<DmRef<ContractKey, Vec<PeerKeyLocation>>> {
+    ) -> Option<DmRef<'_, ContractKey, Vec<PeerKeyLocation>>> {
         self.subscribers.get(contract)
     }
 

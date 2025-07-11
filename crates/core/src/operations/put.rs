@@ -29,7 +29,7 @@ pub(crate) struct PutOp {
 }
 
 impl PutOp {
-    pub(super) fn outcome(&self) -> OpOutcome {
+    pub(super) fn outcome(&self) -> OpOutcome<'_> {
         // todo: track in the future
         // match &self.stats {
         //     Some(PutStats {
@@ -140,6 +140,7 @@ impl Operation for PutOp {
             let return_msg;
             let new_state;
             let stats = self.stats;
+            let old_state = format!("{:?}", self.state); // Capture before moving
 
             match input {
                 PutMsg::RequestPut {
@@ -225,6 +226,15 @@ impl Operation for PutOp {
                     let is_subscribed_contract = op_manager.ring.is_seeding_contract(&key);
                     let should_seed = op_manager.ring.should_seed(&key);
                     let should_handle_locally = !is_subscribed_contract && should_seed;
+
+                    tracing::info!(
+                        tx = %id,
+                        %key,
+                        is_subscribed_contract,
+                        should_seed,
+                        should_handle_locally,
+                        "PUT_SEEDING_DECISION: Evaluating if node should cache contract"
+                    );
 
                     tracing::debug!(
                         tx = %id,
@@ -431,6 +441,12 @@ impl Operation for PutOp {
                     );
 
                     // Subscriber nodes have been notified of the change, the operation is completed
+                    tracing::info!(
+                        tx = %id,
+                        key = %key,
+                        target = %upstream.peer,
+                        "PUT_SUCCESS_SEND: Broadcasting complete, sending SuccessfulPut upstream"
+                    );
                     return_msg = Some(PutMsg::SuccessfulPut {
                         id: *id,
                         target: upstream.clone(),
@@ -440,6 +456,11 @@ impl Operation for PutOp {
                     new_state = None;
                 }
                 PutMsg::SuccessfulPut { id, .. } => {
+                    tracing::info!(
+                        tx = %id,
+                        current_state = ?self.state,
+                        "PUT_SUCCESS_MSG: Received SuccessfulPut message"
+                    );
                     match self.state {
                         Some(PutState::AwaitingResponse {
                             key,
@@ -519,6 +540,12 @@ impl Operation for PutOp {
 
                             // Forward success message upstream if needed
                             if let Some(upstream) = upstream {
+                                tracing::info!(
+                                    tx = %id,
+                                    key = %key,
+                                    target = %upstream.peer,
+                                    "PUT_SUCCESS_SEND: Contract stored, sending SuccessfulPut upstream"
+                                );
                                 return_msg = Some(PutMsg::SuccessfulPut {
                                     id: *id,
                                     target: upstream,
@@ -675,6 +702,14 @@ impl Operation for PutOp {
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
+            tracing::info!(
+                tx = %self.id,
+                old_state = %old_state,
+                new_state = ?new_state,
+                has_return_msg = return_msg.is_some(),
+                "PUT_STATE_TRANSITION: PUT operation state change"
+            );
+
             build_op_result(self.id, new_state, return_msg, stats)
         })
     }
@@ -768,6 +803,12 @@ async fn try_to_broadcast(
                 return Err(OpError::StatePushed);
             } else {
                 new_state = None;
+                tracing::info!(
+                    tx = %id,
+                    key = %key,
+                    target = %upstream.peer,
+                    "PUT_SUCCESS_SEND: Final hop complete, sending SuccessfulPut upstream"
+                );
                 return_msg = Some(PutMsg::SuccessfulPut {
                     id,
                     target: upstream,
@@ -810,6 +851,7 @@ pub(crate) fn start_op(
     }
 }
 
+#[derive(Debug)]
 pub enum PutState {
     ReceivedRequest,
     /// Preparing request for put op.
@@ -908,6 +950,12 @@ async fn put_contract(
     related_contracts: RelatedContracts<'static>,
     contract: &ContractContainer,
 ) -> Result<WrappedState, OpError> {
+    tracing::info!(
+        %key,
+        state_size = state.size(),
+        "PUT_CONTRACT_START: Attempting to cache contract locally"
+    );
+
     // after the contract has been cached, push the update query
     match op_manager
         .notify_contract_handler(ContractHandlerEvent::PutQuery {
@@ -920,16 +968,29 @@ async fn put_contract(
     {
         Ok(ContractHandlerEvent::PutResponse {
             new_value: Ok(new_val),
-        }) => Ok(new_val),
+        }) => {
+            tracing::info!(
+                %key,
+                new_state_size = new_val.size(),
+                "PUT_CONTRACT_SUCCESS: Contract cached successfully"
+            );
+            Ok(new_val)
+        }
         Ok(ContractHandlerEvent::PutResponse {
             new_value: Err(err),
         }) => {
-            tracing::error!(%key, "Failed to update contract value: {}", err);
+            tracing::error!(%key, error = %err, "PUT_CONTRACT_ERROR: Failed to update contract value");
             Err(OpError::from(err))
             // TODO: not a valid value update, notify back to requester
         }
-        Err(err) => Err(err.into()),
-        Ok(_) => Err(OpError::UnexpectedOpState),
+        Err(err) => {
+            tracing::error!(%key, error = %err, "PUT_CONTRACT_ERROR: Contract handler error");
+            Err(err.into())
+        }
+        Ok(other) => {
+            tracing::error!(%key, response = ?other, "PUT_CONTRACT_ERROR: Unexpected contract handler response");
+            Err(OpError::UnexpectedOpState)
+        }
     }
 }
 

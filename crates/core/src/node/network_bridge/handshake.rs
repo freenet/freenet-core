@@ -279,7 +279,12 @@ impl HandshakeHandler {
                             Ok(Event::OutboundConnectionSuccessful { peer_id, connection })
                         }
                         Some(Ok(InternalEvent::OutboundGwConnEstablished(id, connection))) => {
-                            tracing::info!(at=?connection.my_address(), from=%connection.remote_addr(), "Outbound gateway connection successful");
+                            tracing::info!(
+                                at=?connection.my_address(),
+                                from=%connection.remote_addr(),
+                                peer_id=%id.addr,
+                                "Outbound gateway connection successful - peer_id address vs connection address"
+                            );
                             if let Some(addr) = connection.my_address() {
                                 tracing::debug!(%addr, "Attempting setting own peer key");
                                 self.connection_manager.try_set_peer_key(addr);
@@ -289,11 +294,22 @@ impl HandshakeHandler {
                                 }
                             }
                             tracing::debug!(at=?connection.my_address(), from=%connection.remote_addr(), "Outbound connection to gw successful");
+                            tracing::info!(
+                                at=?connection.my_address(),
+                                from=%connection.remote_addr(),
+                                "HANDSHAKE_WAIT_GW: Starting wait_for_gw_confirmation"
+                            );
                             self.wait_for_gw_confirmation(id, connection, Ring::DEFAULT_MAX_HOPS_TO_LIVE).await?;
                             continue;
                         }
                         Some(Ok(InternalEvent::FinishedOutboundConnProcess(tracker))) => {
                             self.connecting.remove(&tracker.gw_peer.peer.addr);
+                            tracing::warn!(
+                                "CONNECTING_MAP: Removed entry for {} (FinishedOutboundConnProcess), map now has {} entries: {:?}",
+                                tracker.gw_peer.peer.addr,
+                                self.connecting.len(),
+                                self.connecting.keys().collect::<Vec<_>>()
+                            );
                             // at this point we are done checking all the accepts inbound from a transient gw conn
                             tracing::debug!(at=?tracker.gw_conn.my_address(), gw=%tracker.gw_conn.remote_addr(), "Done checking, connection not accepted by gw, dropping connection");
                             Ok(Event::OutboundGatewayConnectionRejected { peer_id: tracker.gw_peer.peer })
@@ -302,6 +318,12 @@ impl HandshakeHandler {
                             tracing::debug!(at=?tracker.gw_conn.my_address(), from=%tracker.gw_conn.remote_addr(), "Outbound connection to gw confirmed");
                             self.connected.insert(tracker.gw_conn.remote_addr());
                             self.connecting.remove(&tracker.gw_conn.remote_addr());
+                            tracing::info!(
+                                "CONNECTING_MAP: Removed entry for {} (OutboundGwConnConfirmed), map now has {} entries: {:?}",
+                                tracker.gw_conn.remote_addr(),
+                                self.connecting.len(),
+                                self.connecting.keys().collect::<Vec<_>>()
+                            );
                             return Ok(Event::OutboundGatewayConnectionSuccessful {
                                 peer_id: tracker.gw_peer.peer,
                                 connection: tracker.gw_conn,
@@ -333,12 +355,40 @@ impl HandshakeHandler {
                         }
                         Some(Ok(InternalEvent::DropInboundConnection(addr))) => {
                             self.connecting.remove(&addr);
+                            tracing::warn!(
+                                "CONNECTING_MAP: Removed entry for {} (DropInboundConnection), map now has {} entries: {:?}",
+                                addr,
+                                self.connecting.len(),
+                                self.connecting.keys().collect::<Vec<_>>()
+                            );
                             self.outbound_messages.remove(&addr);
                             continue;
                         }
                         Some(Err((peer_id, error))) => {
                             tracing::debug!(from=%peer_id.addr, "Outbound connection failed: {error}");
-                            self.connecting.remove(&peer_id.addr);
+
+                            // Only remove from connecting map if this isn't a duplicate connection attempt
+                            // Otherwise we might remove the entry for a connection that's still being established
+                            let should_remove = !matches!(&error, HandshakeError::TransportError(e)
+                                if e.to_string().contains("connection attempt already in progress"));
+
+                            if should_remove {
+                                self.connecting.remove(&peer_id.addr);
+                                tracing::warn!(
+                                    "CONNECTING_MAP: Removed entry for {} (OutboundConnectionFailed: {}), map now has {} entries: {:?}",
+                                    peer_id.addr,
+                                    error,
+                                    self.connecting.len(),
+                                    self.connecting.keys().collect::<Vec<_>>()
+                                );
+                            } else {
+                                tracing::info!(
+                                    "CONNECTING_MAP: NOT removing entry for {} (duplicate connection attempt), map still has {} entries",
+                                    peer_id.addr,
+                                    self.connecting.len()
+                                );
+                            }
+
                             self.outbound_messages.remove(&peer_id.addr);
                             self.connection_manager.prune_alive_connection(&peer_id);
                             Ok(Event::OutboundConnectionFailed { peer_id, error })
@@ -508,6 +558,12 @@ impl HandshakeHandler {
                                     Ok(ForwardResult::Rejected) => {
                                         self.outbound_messages.remove(&remote);
                                         self.connecting.remove(&remote);
+                                        tracing::warn!(
+                                            "CONNECTING_MAP: Removed entry for {} (ForwardResult::Rejected), map now has {} entries: {:?}",
+                                            remote,
+                                            self.connecting.len(),
+                                            self.connecting.keys().collect::<Vec<_>>()
+                                        );
                                         return Ok(Event::InboundConnectionRejected { peer_id: joiner });
                                     }
                                     Err(e) => {
@@ -520,6 +576,12 @@ impl HandshakeHandler {
                         InternalEvent::DropInboundConnection(addr) => {
                             self.outbound_messages.remove(&addr);
                             self.connecting.remove(&addr);
+                            tracing::warn!(
+                                "CONNECTING_MAP: Removed entry for {} (DropInboundConnection in unconfirmed), map now has {} entries: {:?}",
+                                addr,
+                                self.connecting.len(),
+                                self.connecting.keys().collect::<Vec<_>>()
+                            );
                             continue;
                         }
                         other => {
@@ -547,11 +609,23 @@ impl HandshakeHandler {
                             self.connected.remove(&peer.addr);
                             self.outbound_messages.remove(&peer.addr);
                             self.connecting.remove(&peer.addr);
+                            tracing::warn!(
+                                "CONNECTING_MAP: Removed entry for {} (ExternConnection::Dropped), map now has {} entries: {:?}",
+                                peer.addr,
+                                self.connecting.len(),
+                                self.connecting.keys().collect::<Vec<_>>()
+                            );
                         }
                         Some(ExternConnection::DropConnectionByAddr(addr)) => {
                             self.connected.remove(&addr);
                             self.outbound_messages.remove(&addr);
                             self.connecting.remove(&addr);
+                            tracing::warn!(
+                                "CONNECTING_MAP: Removed entry for {} (DropConnectionByAddr), map now has {} entries: {:?}",
+                                addr,
+                                self.connecting.len(),
+                                self.connecting.keys().collect::<Vec<_>>()
+                            );
                         }
                         None => return Err(HandshakeError::ChannelClosed),
                     }
@@ -663,11 +737,24 @@ impl HandshakeHandler {
                     return Some(Event::RemoveTransaction(tx));
                 }
                 self.connecting.insert(addr, tx);
+                tracing::info!(
+                    "CONNECTING_MAP: Added entry for {} in outbound() (tx: {}), map now has {} entries: {:?}",
+                    addr,
+                    tx,
+                    self.connecting.len(),
+                    self.connecting.keys().collect::<Vec<_>>()
+                );
             }
 
             if alive_conn.send(op).await.is_err() {
                 self.outbound_messages.remove(&addr);
                 self.connecting.remove(&addr);
+                tracing::warn!(
+                    "CONNECTING_MAP: Removed entry for {} (send failed), map now has {} entries: {:?}",
+                    addr,
+                    self.connecting.len(),
+                    self.connecting.keys().collect::<Vec<_>>()
+                );
             }
             None
         } else {
@@ -723,6 +810,13 @@ impl HandshakeHandler {
             return;
         }
         self.connecting.insert(remote.addr, transaction);
+        tracing::info!(
+            "CONNECTING_MAP: Added entry for {} (tx: {}), map now has {} entries: {:?}",
+            remote.addr,
+            transaction,
+            self.connecting.len(),
+            self.connecting.keys().collect::<Vec<_>>()
+        );
         tracing::debug!("Starting outbound connection to {addr}", addr = remote.addr);
         let f = self
             .outbound_conn_handler
@@ -753,10 +847,29 @@ impl HandshakeHandler {
         conn: PeerConnection,
         max_hops_to_live: usize,
     ) -> Result<()> {
+        tracing::info!(
+            "CONNECTING_MAP_CHECK: Looking for gateway {} in connecting map, connection remote is {}, thread: {:?}",
+            gw_peer_id.addr,
+            conn.remote_addr(),
+            std::thread::current().id()
+        );
         let tx = *self
             .connecting
             .get(&gw_peer_id.addr)
-            .ok_or_else(|| HandshakeError::ConnectionClosed(conn.remote_addr()))?;
+            .ok_or_else(|| {
+                tracing::warn!(
+                    "HANDSHAKE_FAIL: No connecting entry found for gateway {}, connecting map has {} entries: {:?}",
+                    gw_peer_id.addr,
+                    self.connecting.len(),
+                    self.connecting.keys().collect::<Vec<_>>()
+                );
+                HandshakeError::ConnectionClosed(conn.remote_addr())
+            })?;
+        tracing::info!(
+            "CONNECTING_MAP_CHECK: Successfully found entry for gateway {} with tx: {}, proceeding with confirmation",
+            gw_peer_id.addr,
+            tx
+        );
         let this_peer = self.connection_manager.own_location().peer;
         tracing::debug!(at=?conn.my_address(), %this_peer.addr, from=%conn.remote_addr(), remote_addr = %gw_peer_id, "Waiting for confirmation from gw");
         self.ongoing_outbound_connections.push(
@@ -994,11 +1107,22 @@ async fn gw_peer_connection_listener(
     mut conn: PeerConnection,
     mut outbound: PeerOutboundMessage,
 ) -> Result<(InternalEvent, PeerOutboundMessage), HandshakeError> {
-    tracing::debug!(from=%conn.remote_addr(), "Starting gw_peer_connection_listener");
+    tracing::info!(
+        from=%conn.remote_addr(),
+        at=?conn.my_address(),
+        "HANDSHAKE_START: Starting gateway peer connection listener"
+    );
     loop {
         tokio::select! {
             msg = outbound.0.recv() => {
-                let Some(msg) = msg else { break Err(HandshakeError::ConnectionClosed(conn.remote_addr())); };
+                let Some(msg) = msg else {
+                    tracing::warn!(
+                        at=?conn.my_address(),
+                        from=%conn.remote_addr(),
+                        "HANDSHAKE_FAIL: Outbound message channel closed during handshake"
+                    );
+                    break Err(HandshakeError::ConnectionClosed(conn.remote_addr()));
+                };
 
                 tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr() ,"Sending message to peer. Msg: {msg}");
                         conn
@@ -1007,8 +1131,13 @@ async fn gw_peer_connection_listener(
             }
             msg = conn.recv() => {
                 let Ok(msg) = msg.map_err(|error| {
-                    tracing::error!(at=?conn.my_address(), from=%conn.remote_addr(), "Error while receiving message: {error}");
+                    tracing::error!(at=?conn.my_address(), from=%conn.remote_addr(), "HANDSHAKE_FAIL: Error while receiving message: {error}");
                 }) else {
+                    tracing::warn!(
+                        at=?conn.my_address(),
+                        from=%conn.remote_addr(),
+                        "HANDSHAKE_FAIL: Connection recv failed during handshake"
+                    );
                      break Err(HandshakeError::ConnectionClosed(conn.remote_addr()));
                 };
                 let net_message = decode_msg(&msg).unwrap();

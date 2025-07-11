@@ -116,7 +116,7 @@ pub(crate) struct SubscribeOp {
 }
 
 impl SubscribeOp {
-    pub(super) fn outcome(&self) -> OpOutcome {
+    pub(super) fn outcome(&self) -> OpOutcome<'_> {
         OpOutcome::Irrelevant
     }
 

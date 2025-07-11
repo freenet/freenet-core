@@ -66,10 +66,10 @@ pub async fn diagnostics(base_cfg: BaseConfig, contract_keys: Vec<String>) -> an
             }
         );
         if let Some(listening_address) = &node_info.listening_address {
-            println!("  Listening Address: {}", listening_address);
+            println!("  Listening Address: {listening_address}");
         }
         if let Some(location) = &node_info.location {
-            println!("  Location: {}", location);
+            println!("  Location: {location}");
         }
         println!();
     }

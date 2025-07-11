@@ -181,7 +181,7 @@ impl ConfigArgs {
                     }
                     ext => Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("Invalid configuration file extension: {}", ext),
+                        format!("Invalid configuration file extension: {ext}"),
                     )),
                 }
             }
@@ -815,7 +815,7 @@ impl ConfigPaths {
         self
     }
 
-    pub fn iter(&self) -> ConfigPathsIter {
+    pub fn iter(&self) -> ConfigPathsIter<'_> {
         ConfigPathsIter {
             curr: 0,
             config_paths: self,

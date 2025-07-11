@@ -390,7 +390,7 @@ impl std::fmt::Display for ContractHandlerEvent {
                     let mut params = String::new();
                     params.push_str("0x");
                     for b in contract.params().as_ref().iter().take(8) {
-                        write!(&mut params, "{:02x}", b)?;
+                        write!(&mut params, "{b:02x}")?;
                     }
                     params.push_str("...");
                     write!(f, "put query {{ {key}, params: {params} }}",)

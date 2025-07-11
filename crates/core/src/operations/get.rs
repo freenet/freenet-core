@@ -169,8 +169,7 @@ impl Display for GetState {
             } => {
                 write!(
                     f,
-                    "PrepareRequest(key: {}, id: {}, fetch_contract: {}, subscribe: {})",
-                    key, id, fetch_contract, subscribe
+                    "PrepareRequest(key: {key}, id: {id}, fetch_contract: {fetch_contract}, subscribe: {subscribe})"
                 )
             }
             GetState::AwaitingResponse {
@@ -183,9 +182,9 @@ impl Display for GetState {
                 alternatives: _,
                 attempts_at_hop: _,
             } => {
-                write!(f, "AwaitingResponse(requester: {:?}, fetch_contract: {}, retries: {}, current_hop: {}, subscribe: {})", requester, fetch_contract, retries, current_hop, subscribe)
+                write!(f, "AwaitingResponse(requester: {requester:?}, fetch_contract: {fetch_contract}, retries: {retries}, current_hop: {current_hop}, subscribe: {subscribe})")
             }
-            GetState::Finished { key, .. } => write!(f, "Finished(key: {})", key),
+            GetState::Finished { key, .. } => write!(f, "Finished(key: {key})"),
         }
     }
 }
@@ -226,7 +225,7 @@ pub(crate) struct GetOp {
 }
 
 impl GetOp {
-    pub(super) fn outcome(&self) -> OpOutcome {
+    pub(super) fn outcome(&self) -> OpOutcome<'_> {
         if let Some((
             GetResult {
                 state, contract, ..
@@ -738,50 +737,50 @@ impl Operation for GetOp {
                     };
 
                     // Handle case where contract is required but not provided
-                    if require_contract && contract.is_none() && requester.is_some() {
-                        // no contract, consider this like an error ignoring the incoming update value
-                        tracing::warn!(
-                            tx = %id,
-                            "Contract not received from peer {} while required",
-                            sender.peer
-                        );
+                    if require_contract && contract.is_none() {
+                        if let Some(requester) = requester {
+                            // no contract, consider this like an error ignoring the incoming update value
+                            tracing::warn!(
+                                tx = %id,
+                                "Contract not received from peer {} while required",
+                                sender.peer
+                            );
 
-                        let mut new_skip_list = skip_list.clone();
-                        new_skip_list.insert(sender.peer.clone());
+                            let mut new_skip_list = skip_list.clone();
+                            new_skip_list.insert(sender.peer.clone());
 
-                        let requester = requester.unwrap();
+                            tracing::warn!(
+                                tx = %id,
+                                %key,
+                                at = %sender.peer,
+                                target = %requester,
+                                "Contract not received while required, returning response to requester",
+                            );
 
-                        tracing::warn!(
-                            tx = %id,
-                            %key,
-                            at = %sender.peer,
-                            target = %requester,
-                            "Contract not received while required, returning response to requester",
-                        );
-
-                        // Forward error to requester
-                        op_manager
-                            .notify_op_change(
-                                NetMessage::from(GetMsg::ReturnGet {
-                                    id,
-                                    key,
-                                    value: StoreResponse {
-                                        state: None,
-                                        contract: None,
-                                    },
-                                    sender: sender.clone(),
-                                    target: requester.clone(),
-                                    skip_list: new_skip_list,
-                                }),
-                                OpEnum::Get(GetOp {
-                                    id,
-                                    state: self.state,
-                                    result: None,
-                                    stats,
-                                }),
-                            )
-                            .await?;
-                        return Err(OpError::StatePushed);
+                            // Forward error to requester
+                            op_manager
+                                .notify_op_change(
+                                    NetMessage::from(GetMsg::ReturnGet {
+                                        id,
+                                        key,
+                                        value: StoreResponse {
+                                            state: None,
+                                            contract: None,
+                                        },
+                                        sender: sender.clone(),
+                                        target: requester.clone(),
+                                        skip_list: new_skip_list,
+                                    }),
+                                    OpEnum::Get(GetOp {
+                                        id,
+                                        state: self.state,
+                                        result: None,
+                                        stats,
+                                    }),
+                                )
+                                .await?;
+                            return Err(OpError::StatePushed);
+                        }
                     }
 
                     // Check if this is the original requester

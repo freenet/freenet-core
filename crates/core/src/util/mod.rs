@@ -271,8 +271,7 @@ pub(crate) mod test {
             .unwrap();
         assert!(
             total > Duration::from_secs(18) && total < Duration::from_secs(20),
-            "total: {:?}",
-            total
+            "total: {total:?}"
         );
 
         let base = Duration::from_millis(600);

@@ -193,7 +193,11 @@ impl Runtime {
         )
     }
 
-    pub(super) fn init_buf<T>(&mut self, instance: &Instance, data: T) -> RuntimeResult<BufferMut>
+    pub(super) fn init_buf<T>(
+        &mut self,
+        instance: &Instance,
+        data: T,
+    ) -> RuntimeResult<BufferMut<'_>>
     where
         T: AsRef<[u8]>,
     {

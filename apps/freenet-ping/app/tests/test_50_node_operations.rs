@@ -34,8 +34,8 @@ async fn test_50_node_operations() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::INFO), None);
 
     println!("🚀 Starting 50-node operations test");
-    println!("   Gateway nodes: {}", NUM_GATEWAYS);
-    println!("   Regular nodes: {}", NUM_REGULAR_NODES);
+    println!("   Gateway nodes: {NUM_GATEWAYS}");
+    println!("   Regular nodes: {NUM_REGULAR_NODES}");
     println!("   Total nodes: {}", NUM_GATEWAYS + NUM_REGULAR_NODES);
     println!("   Connectivity: {:.0}%", CONNECTIVITY_RATIO * 100.0);
 
@@ -90,7 +90,7 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
             vec![],
             Some(gateway_sockets[i].local_addr()?.port()),
             ws_api_gateway_sockets[i].local_addr()?.port(),
-            &format!("gw_50node_{}", i),
+            &format!("gw_50node_{i}"),
             None,
             None,
         )
@@ -141,7 +141,7 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
             serialized_gateways.clone(),
             None,
             listener.local_addr()?.port(),
-            &format!("node_50node_{}", i),
+            &format!("node_50node_{i}"),
             None,
             Some(blocked_addresses.clone()),
         )
@@ -157,7 +157,7 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
     std::mem::drop(ws_api_gateway_sockets);
     std::mem::drop(ws_api_node_sockets);
 
-    println!("🌐 Starting {} gateways...", NUM_GATEWAYS);
+    println!("🌐 Starting {NUM_GATEWAYS} gateways...");
     let mut gateway_futures = Vec::with_capacity(NUM_GATEWAYS);
     for i in 0..NUM_GATEWAYS {
         let config = gateway_configs.remove(0);
@@ -181,10 +181,7 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
     // Longer delay for gateways to stabilize
     tokio::time::sleep(Duration::from_secs(8)).await;
 
-    println!(
-        "🔗 Starting {} regular nodes in batches...",
-        NUM_REGULAR_NODES
-    );
+    println!("🔗 Starting {NUM_REGULAR_NODES} regular nodes in batches...");
     let mut regular_node_futures = Vec::with_capacity(NUM_REGULAR_NODES);
     const BATCH_SIZE: usize = 12; // Start nodes in larger batches
 
@@ -218,17 +215,14 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
         tokio::time::sleep(Duration::from_secs(90)).await;
 
         // Connect to all nodes with staggered connections
-        println!("📡 Connecting to {} gateways...", NUM_GATEWAYS);
+        println!("📡 Connecting to {NUM_GATEWAYS} gateways...");
         let mut gateway_clients = Vec::with_capacity(NUM_GATEWAYS);
         for (i, port) in ws_api_ports_gw.iter().enumerate() {
-            let uri = format!(
-                "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-                port
-            );
+            let uri = format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native");
             let (stream, _) = connect_async(&uri).await?;
             let client = WebApi::start(stream);
             gateway_clients.push(client);
-            println!("📡 Connected to gateway {}", i);
+            println!("📡 Connected to gateway {i}");
 
             // Small delay between connections
             if i < NUM_GATEWAYS - 1 {
@@ -236,13 +230,10 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
             }
         }
 
-        println!("📡 Connecting to {} regular nodes...", NUM_REGULAR_NODES);
+        println!("📡 Connecting to {NUM_REGULAR_NODES} regular nodes...");
         let mut node_clients = Vec::with_capacity(NUM_REGULAR_NODES);
         for (i, port) in ws_api_ports_nodes.iter().enumerate() {
-            let uri = format!(
-                "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-                port
-            );
+            let uri = format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native");
             let (stream, _) = connect_async(&uri).await?;
             let client = WebApi::start(stream);
             node_clients.push(client);
@@ -336,7 +327,7 @@ async fn test_put_propagation(
     let mut last_error: Option<anyhow::Error> = None;
 
     for (i, client) in gateway_clients.iter_mut().enumerate() {
-        println!("   🔄 Attempting PUT via gateway {}...", i);
+        println!("   🔄 Attempting PUT via gateway {i}...");
 
         let put_request = ClientRequest::ContractOp(ContractRequest::Put {
             contract: container.clone(),
@@ -348,20 +339,17 @@ async fn test_put_propagation(
         match client.send(put_request.clone()).await {
             Ok(_) => match wait_for_put_response(client, contract_key).await {
                 Ok(put_response) => {
-                    println!(
-                        "   ✅ Contract published via gateway {}: {}",
-                        i, put_response
-                    );
+                    println!("   ✅ Contract published via gateway {i}: {put_response}");
                     put_success = true;
                     break;
                 }
                 Err(e) => {
-                    println!("   ⚠️  Gateway {} PUT failed: {}", i, e);
+                    println!("   ⚠️  Gateway {i} PUT failed: {e}");
                     last_error = Some(anyhow::anyhow!("Gateway {} PUT failed: {}", i, e));
                 }
             },
             Err(e) => {
-                println!("   ⚠️  Gateway {} send failed: {}", i, e);
+                println!("   ⚠️  Gateway {i} send failed: {e}");
                 last_error = Some(e.into());
             }
         }
@@ -377,7 +365,7 @@ async fn test_put_propagation(
     }
 
     let put_time = start_time.elapsed();
-    println!("   ⏱️  PUT operation took: {:?}", put_time);
+    println!("   ⏱️  PUT operation took: {put_time:?}");
 
     // For 50 nodes, just verify PUT succeeded - skip propagation testing
     println!("   ✅ PUT operation completed successfully");
@@ -393,10 +381,7 @@ async fn test_concurrent_gets(
     println!("\n📥 Testing concurrent GET operations...");
 
     let concurrent_requests = std::cmp::min(10, node_clients.len());
-    println!(
-        "   🚀 Testing {} sequential GET requests...",
-        concurrent_requests
-    );
+    println!("   🚀 Testing {concurrent_requests} sequential GET requests...");
 
     let start_time = std::time::Instant::now();
     let mut successful_requests = 0;
@@ -437,21 +422,21 @@ async fn test_concurrent_gets(
                 total_response_time += duration;
                 min_time = min_time.min(duration);
                 max_time = max_time.max(duration);
-                println!("   ❌ Node {} unexpected response: {:?}", i, response);
+                println!("   ❌ Node {i} unexpected response: {response:?}");
             }
             Ok(Err(e)) => {
                 let duration = request_start.elapsed();
                 total_response_time += duration;
                 min_time = min_time.min(duration);
                 max_time = max_time.max(duration);
-                println!("   ❌ Node {} error: {}", i, e);
+                println!("   ❌ Node {i} error: {e}");
             }
             Err(_) => {
                 let duration = request_start.elapsed();
                 total_response_time += duration;
                 min_time = min_time.min(duration);
                 max_time = max_time.max(duration);
-                println!("   ⏰ Node {} timed out", i);
+                println!("   ⏰ Node {i} timed out");
             }
         }
     }
@@ -462,13 +447,12 @@ async fn test_concurrent_gets(
 
     println!("   📊 Sequential GET Results:");
     println!(
-        "      - Success rate: {:.1}% ({}/{})",
-        success_rate, successful_requests, concurrent_requests
+        "      - Success rate: {success_rate:.1}% ({successful_requests}/{concurrent_requests})"
     );
-    println!("      - Total time: {:?}", total_time);
-    println!("      - Avg response time: {:?}", avg_response_time);
-    println!("      - Min response time: {:?}", min_time);
-    println!("      - Max response time: {:?}", max_time);
+    println!("      - Total time: {total_time:?}");
+    println!("      - Avg response time: {avg_response_time:?}");
+    println!("      - Min response time: {min_time:?}");
+    println!("      - Max response time: {max_time:?}");
 
     if success_rate < 70.0 {
         return Err(anyhow!("Sequential GET success rate too low: {:.1}%", success_rate).into());
@@ -486,7 +470,7 @@ async fn test_mass_subscription(
     println!("\n🔔 Testing mass subscription operations...");
 
     let subscribers = std::cmp::min(15, node_clients.len());
-    println!("   📡 Setting up {} subscriptions...", subscribers);
+    println!("   📡 Setting up {subscribers} subscriptions...");
 
     let mut successful_subscriptions = 0;
     let start_time = std::time::Instant::now();
@@ -512,23 +496,17 @@ async fn test_mass_subscription(
             }))) => {
                 successful_subscriptions += 1;
                 if successful_subscriptions % 5 == 0 {
-                    println!(
-                        "   ✅ {} subscriptions established",
-                        successful_subscriptions
-                    );
+                    println!("   ✅ {successful_subscriptions} subscriptions established");
                 }
             }
             Ok(Ok(response)) => {
-                println!(
-                    "   ❌ Node {} unexpected subscribe response: {:?}",
-                    i, response
-                );
+                println!("   ❌ Node {i} unexpected subscribe response: {response:?}");
             }
             Ok(Err(e)) => {
-                println!("   ❌ Node {} subscribe error: {}", i, e);
+                println!("   ❌ Node {i} subscribe error: {e}");
             }
             Err(_) => {
-                println!("   ⏰ Node {} subscribe timed out", i);
+                println!("   ⏰ Node {i} subscribe timed out");
             }
         }
     }
@@ -538,10 +516,9 @@ async fn test_mass_subscription(
 
     println!("   📊 Mass Subscription Results:");
     println!(
-        "      - Success rate: {:.1}% ({}/{})",
-        subscription_rate, successful_subscriptions, subscribers
+        "      - Success rate: {subscription_rate:.1}% ({successful_subscriptions}/{subscribers})"
     );
-    println!("      - Subscription time: {:?}", subscription_time);
+    println!("      - Subscription time: {subscription_time:?}");
 
     if subscription_rate < 75.0 {
         return Err(anyhow!(
@@ -593,11 +570,11 @@ async fn test_update_propagation(
             key,
             summary,
         }))) => {
-            println!("   ✅ Update sent successfully: {}", key);
-            println!("   📝 Update summary: {:?}", summary);
+            println!("   ✅ Update sent successfully: {key}");
+            println!("   📝 Update summary: {summary:?}");
         }
         Ok(Ok(response)) => {
-            println!("   ❌ Unexpected update response: {:?}", response);
+            println!("   ❌ Unexpected update response: {response:?}");
             return Err(anyhow!("Unexpected update response").into());
         }
         Ok(Err(e)) => {
@@ -609,7 +586,7 @@ async fn test_update_propagation(
     }
 
     let update_time = start_time.elapsed();
-    println!("   ⏱️  UPDATE operation took: {:?}", update_time);
+    println!("   ⏱️  UPDATE operation took: {update_time:?}");
 
     // Test that other nodes can see the updated state
     println!("   🔍 Verifying update propagation...");
@@ -645,7 +622,7 @@ async fn test_update_propagation(
                     {
                         propagation_verified += 1;
                         if propagation_verified % 3 == 0 {
-                            println!("   ✅ {} nodes have updated state", propagation_verified);
+                            println!("   ✅ {propagation_verified} nodes have updated state");
                         }
                     } else {
                         println!(
@@ -655,17 +632,17 @@ async fn test_update_propagation(
                         );
                     }
                 } else {
-                    println!("   ❌ Node {} state deserialization failed", i);
+                    println!("   ❌ Node {i} state deserialization failed");
                 }
             }
             Ok(Ok(response)) => {
-                println!("   ❌ Node {} unexpected response: {:?}", i, response);
+                println!("   ❌ Node {i} unexpected response: {response:?}");
             }
             Ok(Err(e)) => {
-                println!("   ❌ Node {} error: {}", i, e);
+                println!("   ❌ Node {i} error: {e}");
             }
             Err(_) => {
-                println!("   ⏰ Node {} verification timed out", i);
+                println!("   ⏰ Node {i} verification timed out");
             }
         }
     }
@@ -674,10 +651,9 @@ async fn test_update_propagation(
 
     println!("   📊 Update Propagation Results:");
     println!(
-        "      - Propagation rate: {:.1}% ({}/{})",
-        propagation_rate, propagation_verified, verification_nodes
+        "      - Propagation rate: {propagation_rate:.1}% ({propagation_verified}/{verification_nodes})"
     );
-    println!("      - Update time: {:?}", update_time);
+    println!("      - Update time: {update_time:?}");
 
     if propagation_rate < 60.0 {
         println!("   ⚠️  Low propagation rate, but continuing (partial connectivity expected)");
