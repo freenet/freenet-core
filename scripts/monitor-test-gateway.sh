@@ -4,8 +4,8 @@
 # Real-time monitoring of keep-alive behavior and connection health
 
 VEGA_HOST="100.27.151.80"
-VEGA_USER="ubuntu"
-TEST_DIR="/home/ubuntu/freenet-test-gateway"
+VEGA_USER="ian"
+TEST_DIR="/home/ian/freenet-test-gateway"
 
 # Colors for output
 RED='\033[0;31m'

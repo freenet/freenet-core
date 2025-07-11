@@ -9,11 +9,11 @@ PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
 
 # Configuration
 VEGA_HOST="100.27.151.80"
-VEGA_USER="ubuntu"
+VEGA_USER="ian"
 TEST_PORT="31338"
-TEST_DIR="/home/ubuntu/freenet-test-gateway"
-CONFIG_DIR="/home/ubuntu/.config/freenet-test"
-DATA_DIR="/home/ubuntu/.local/share/freenet-test"
+TEST_DIR="/home/ian/freenet-test-gateway"
+CONFIG_DIR="/home/ian/.config/freenet-test"
+DATA_DIR="/home/ian/.local/share/freenet-test"
 BINARY_NAME="freenet"
 
 echo "=== Freenet Test Gateway Deployment Script ==="
@@ -27,7 +27,8 @@ cd "$PROJECT_ROOT"
 
 # Add extra logging for keep-alive debugging
 export RUST_LOG="freenet=debug,freenet::transport=trace,freenet::transport::peer_connection=trace"
-export RUSTFLAGS="-C target-cpu=native"
+# Build for generic x86-64 to ensure compatibility with vega
+export RUSTFLAGS="-C target-cpu=x86-64"
 
 cargo build --release --bin freenet
 if [ $? -ne 0 ]; then
@@ -50,8 +51,8 @@ set -e
 
 TEST_PORT="${1:-31338}"
 LOG_FILE="freenet-test-gateway.log"
-CONFIG_DIR="/home/ubuntu/.config/freenet-test"
-DATA_DIR="/home/ubuntu/.local/share/freenet-test"
+CONFIG_DIR="/home/ian/.config/freenet-test"
+DATA_DIR="/home/ian/.local/share/freenet-test"
 
 echo "Starting test gateway on port $TEST_PORT..."
 echo "Config dir: $CONFIG_DIR"
