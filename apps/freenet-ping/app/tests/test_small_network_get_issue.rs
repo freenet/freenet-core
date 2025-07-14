@@ -306,7 +306,7 @@ async fn test_small_network_get_failure() -> TestResult {
         let start = std::time::Instant::now();
         match timeout(Duration::from_secs(45), client_node2.recv()).await {
             Ok(Ok(HostResponse::ContractResponse(response))) => {
-                println!("Get response after {:?}: {:?}", start.elapsed(), response);
+                println!("Get response after {:?}: {response:?}", start.elapsed());
                 match response {
                     ContractResponse::GetResponse { key, state, .. } if key == contract_key => {
                         if !state.is_empty() {

@@ -265,7 +265,7 @@ pub async fn run_network(
                         continue;
                     }
                     Err(e) => {
-                        tracing::error!("Test finalized with error: {}", e);
+                        tracing::error!("Test finalized with error: {e}");
                         return Err(e);
                     }
                 }
@@ -285,7 +285,7 @@ async fn config_handler(
     peers_config: Arc<Mutex<HashMap<NodeLabel, NodeConfig>>>,
     Path(peer_id): Path<String>,
 ) -> axum::response::Response {
-    tracing::debug!("Received config request for peer_id: {}", peer_id);
+    tracing::debug!("Received config request for peer_id: {peer_id}");
     let config = peers_config.lock().await;
     let id = NodeLabel::from(peer_id.as_str());
     match config.get(&id) {
@@ -403,23 +403,23 @@ async fn handle_peer_message(
             tracing::info!("Received status: {:?}", status);
             match status {
                 PeerStatus::PeerStarted(id) => {
-                    tracing::info!("Received peer started message for id {}", id);
+                    tracing::info!("Received peer started message for id {id}");
                     supervisor.dequeue_peer(id).await;
                     Ok(())
                 }
                 PeerStatus::GatewayStarted(id) => {
-                    tracing::info!("Received gateway started message for id {}", id);
+                    tracing::info!("Received gateway started message for id {id}");
                     supervisor.dequeue_gateway(id).await;
                     Ok(())
                 }
                 PeerStatus::Error(error_msg) => {
-                    tracing::error!("{}", error_msg);
+                    tracing::error!("{error_msg}");
                     Ok(())
                 }
             }
         }
         PeerMessage::Info(info_msg) => {
-            tracing::info!("{}", info_msg);
+            tracing::info!("{info_msg}");
             Ok(())
         }
     }
@@ -490,11 +490,11 @@ impl Supervisor {
     }
 
     async fn wait_while_node_start(&self, id: &usize) {
-        tracing::info!("Waiting for node {} to start", id);
+        tracing::info!("Waiting for node {id} to start");
         while !self.waiting_peers.lock().await.contains(id) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        tracing::info!("Node {} started", id);
+        tracing::info!("Node {id} started");
     }
 
     pub async fn start_peer_nodes(&self, cmd_args: &[String]) -> Result<(), Error> {
@@ -509,11 +509,11 @@ impl Supervisor {
     }
 
     async fn wait_while_gateway_start(&self, id: &usize) {
-        tracing::info!("Waiting for gateway {} to start", id);
+        tracing::info!("Waiting for gateway {id} to start");
         while !self.waiting_gateways.lock().await.contains(id) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        tracing::info!("Gateway {} started", id);
+        tracing::info!("Gateway {id} started");
     }
 
     pub async fn start_peer_gateways(&self, cmd_args: &[String]) -> Result<(), Error> {
@@ -529,13 +529,13 @@ impl Supervisor {
     }
 
     pub async fn enqueue_node(&self, id: usize) {
-        tracing::info!("Enqueueing node {}", id);
+        tracing::info!("Enqueueing node {id}");
         let mut queue = self.waiting_peers.lock().await;
         queue.push_back(id);
     }
 
     pub async fn dequeue_peer(&self, id: usize) {
-        tracing::info!("Dequeueing node {}", id);
+        tracing::info!("Dequeueing node {id}");
         let mut queue = self.waiting_peers.lock().await;
         if let Some(position) = queue.iter().position(|x| x == &id) {
             queue.remove(position);
@@ -543,13 +543,13 @@ impl Supervisor {
     }
 
     pub async fn enqueue_gateway(&self, id: usize) {
-        tracing::info!("Enqueueing gateway {}", id);
+        tracing::info!("Enqueueing gateway {id}");
         let mut queue = self.waiting_gateways.lock().await;
         queue.push_back(id);
     }
 
     pub async fn dequeue_gateway(&self, id: usize) {
-        tracing::info!("Dequeueing gateway {}", id);
+        tracing::info!("Dequeueing gateway {id}");
         let mut queue = self.waiting_gateways.lock().await;
         if let Some(position) = queue.iter().position(|x| x == &id) {
             queue.remove(position);
@@ -565,9 +565,9 @@ impl Runnable for NetworkPeer {
     async fn run(&self, config: &TestConfig, peer_id: String) -> anyhow::Result<()> {
         let peer = self.config.key_pair.public().clone();
         if self.config.is_gateway {
-            tracing::info!(%peer, "Starting gateway {}", peer_id);
+            tracing::info!(%peer, "Starting gateway {peer_id}");
         } else {
-            tracing::info!(%peer, "Starting node {}", peer_id);
+            tracing::info!(%peer, "Starting node {peer_id}");
         }
         let mut receiver_ch = self.receiver_ch.deref().clone();
         receiver_ch.borrow_and_update();
@@ -605,9 +605,9 @@ impl Runnable for NetworkPeer {
             Ok(node) => match node.run().await {
                 Ok(_) => {
                     if self.config.is_gateway {
-                        tracing::info!("Gateway {} finished", peer_id);
+                        tracing::info!("Gateway {peer_id} finished");
                     } else {
-                        tracing::info!("Node {} finished", peer_id);
+                        tracing::info!("Node {peer_id} finished");
                     }
                     let msg = match self.config.is_gateway {
                         true => PeerMessage::Status(PeerStatus::GatewayStarted(peer_id_num)),
@@ -616,12 +616,12 @@ impl Runnable for NetworkPeer {
                     self.send_peer_msg(msg).await;
                 }
                 Err(e) => {
-                    tracing::error!("Node {} failed: {}", peer_id, e);
-                    bail!("Node {} failed: {}", peer_id, e);
+                    tracing::error!("Node {peer_id} failed: {e}");
+                    bail!("Node {peer_id} failed: {e}");
                 }
             },
             Err(e) => {
-                tracing::error!("Failed to build node: {}", e);
+                tracing::error!("Failed to build node: {e}");
             }
         }
 

@@ -9,7 +9,7 @@ impl AppState {
         .await
         .map_err(|e| {
             tracing::error!(err=%e);
-            anyhow::anyhow!(format!("fail to connect to the host({target}): {e}"))
+            anyhow::anyhow!("fail to connect to the host({target}): {e}")
         })?;
 
         Ok(AppState {
