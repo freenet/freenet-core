@@ -1482,7 +1482,7 @@ async fn test_ping_application_loop() -> TestResult {
         // Check that each node received a reasonable number of pings
         let check_ping_counts = |name: &str, stats: &PingStats| {
             for (source, count) in &stats.received_counts {
-                tracing::info!("{name} received {count} pings from {source}");
+                tracing::info!("{} received {} pings from {}", name, count, source);
                 assert!(*count > 0, "{name} received no pings from {source}");
             }
         };

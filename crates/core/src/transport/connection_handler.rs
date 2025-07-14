@@ -322,7 +322,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 // Check if this might be a keep-alive packet (NoOp)
                                 let packet_size = buf[..size].len();
                                 let is_likely_keepalive = packet_size < 100; // Keep-alives are small
-                                
+
                                 match remote_conn.inbound_packet_sender.try_send(packet_data) {
                                     Ok(_) => {
                                         if is_likely_keepalive {
