@@ -149,8 +149,7 @@ impl SubProcess {
             .spawn()
             .map_err(|e| {
                 NetworkSimulationError::SubProcessStartFailure(format!(
-                    "Failed to start subprocess: {}",
-                    e
+                    "Failed to start subprocess: {e}"
                 ))
             })?;
 
@@ -164,10 +163,7 @@ impl SubProcess {
 
 async fn start_supervisor(config: &TestConfig) -> anyhow::Result<(), Error> {
     let mut network = super::config_sim_network(config).await.map_err(|e| {
-        NetworkSimulationError::NetworkError(format!(
-            "Failed to configure simulation network: {}",
-            e
-        ))
+        NetworkSimulationError::NetworkError(format!("Failed to configure simulation network: {e}"))
     })?;
 
     let supervisor = Arc::new(Supervisor::new(&mut network).await);
@@ -295,7 +291,7 @@ async fn config_handler(
     match config.get(&id) {
         Some(node_config) => axum::response::Json(node_config.clone()).into_response(),
         None => {
-            let body = format!("No config found for peer_id: {}", peer_id);
+            let body = format!("No config found for peer_id: {peer_id}");
             let response = Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::from(body))
@@ -368,7 +364,7 @@ async fn handle_incoming_messages(
         // Handle the received message or log the error.
         match result {
             Ok(message) => process_message(message, supervisor).await?,
-            Err(e) => eprintln!("Error in WebSocket communication: {}", e),
+            Err(e) => eprintln!("Error in WebSocket communication: {e}"),
         }
     }
     Ok(())

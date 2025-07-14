@@ -575,7 +575,7 @@ impl P2pConnManager {
                             NodeEvent::Disconnect { cause } => {
                                 tracing::info!(
                                     "Disconnecting from network{}",
-                                    cause.map(|c| format!(": {}", c)).unwrap_or_default()
+                                    cause.map(|c| format!(": {c}")).unwrap_or_default()
                                 );
                                 break;
                             }

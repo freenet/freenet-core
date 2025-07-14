@@ -169,8 +169,7 @@ impl Display for GetState {
             } => {
                 write!(
                     f,
-                    "PrepareRequest(key: {}, id: {}, fetch_contract: {}, subscribe: {})",
-                    key, id, fetch_contract, subscribe
+                    "PrepareRequest(key: {key}, id: {id}, fetch_contract: {fetch_contract}, subscribe: {subscribe})"
                 )
             }
             GetState::AwaitingResponse {
@@ -183,9 +182,9 @@ impl Display for GetState {
                 alternatives: _,
                 attempts_at_hop: _,
             } => {
-                write!(f, "AwaitingResponse(requester: {:?}, fetch_contract: {}, retries: {}, current_hop: {}, subscribe: {})", requester, fetch_contract, retries, current_hop, subscribe)
+                write!(f, "AwaitingResponse(requester: {requester:?}, fetch_contract: {fetch_contract}, retries: {retries}, current_hop: {current_hop}, subscribe: {subscribe})")
             }
-            GetState::Finished { key, .. } => write!(f, "Finished(key: {})", key),
+            GetState::Finished { key, .. } => write!(f, "Finished(key: {key})"),
         }
     }
 }
