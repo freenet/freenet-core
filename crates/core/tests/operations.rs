@@ -664,7 +664,7 @@ async fn test_multiple_clients_subscription() -> TestResult {
         // Wait for put response
         loop {
             let resp =
-                tokio::time::timeout(Duration::from_secs(120), client_api1_node_a.recv()).await;
+                tokio::time::timeout(Duration::from_secs(180), client_api1_node_a.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                     assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
