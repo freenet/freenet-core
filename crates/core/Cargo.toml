@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2021"
 rust-version = "1.80"
 publish = true
@@ -11,6 +11,10 @@ repository = "https://github.com/freenet/freenet-core"
 [[bin]]
 name = "freenet"
 path = "src/bin/freenet.rs"
+
+[[bin]]
+name = "transport-test"
+path = "src/bin/transport_test.rs"
 
 [dependencies]
 ahash = "0.8"

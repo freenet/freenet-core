@@ -71,8 +71,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
     // Configure logging
     freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
     println!(
-        "Starting test with {} gateways and {} regular nodes (connectivity ratio: {})",
-        NUM_GATEWAYS, NUM_REGULAR_NODES, CONNECTIVITY_RATIO
+        "Starting test with {NUM_GATEWAYS} gateways and {NUM_REGULAR_NODES} regular nodes (connectivity ratio: {CONNECTIVITY_RATIO})"
     );
 
     // Setup network sockets for the gateways
@@ -110,9 +109,9 @@ async fn test_ping_partially_connected_network() -> TestResult {
             vec![],
             Some(gateway_sockets[i].local_addr()?.port()),
             ws_api_gateway_sockets[i].local_addr()?.port(),
-            &format!("gw_partial_{}", i), // data_dir_suffix
-            None,                         // base_tmp_dir
-            None,                         // No blocked addresses for gateways
+            &format!("gw_partial_{i}"), // data_dir_suffix
+            None,                       // base_tmp_dir
+            None,                       // No blocked addresses for gateways
         )
         .await?;
 
@@ -172,7 +171,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
             serialized_gateways.clone(), // All nodes connect to all gateways
             None,                        // Regular nodes pick their own network port or use default
             listener.local_addr()?.port(),
-            &format!("node_partial_{}", i),  // data_dir_suffix
+            &format!("node_partial_{i}"),    // data_dir_suffix
             None,                            // base_tmp_dir
             Some(blocked_addresses.clone()), // Use blocked_addresses for regular nodes
         )
@@ -238,37 +237,34 @@ async fn test_ping_partially_connected_network() -> TestResult {
         let mut gateway_clients = Vec::with_capacity(NUM_GATEWAYS);
         for (i, port) in ws_api_ports_gw.iter().enumerate() {
             let uri = format!(
-                "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-                port
+                "ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native"
             );
             let (stream, _) = connect_async(&uri).await.inspect_err(|err| {
-                println!("Failed to connect to gateway ws {}: {}", i, err);
+                println!("Failed to connect to gateway ws {i}: {err}");
             })?;
             let client = WebApi::start(stream);
             gateway_clients.push(client);
-            println!("Connected to gateway {}", i);
+            println!("Connected to gateway {i}");
         }
 
         let mut node_clients = Vec::with_capacity(NUM_REGULAR_NODES);
         for (i, port) in ws_api_ports_nodes.iter().enumerate() {
             let uri = format!(
-                "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-                port
+                "ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native"
             );
             let (stream, _) = connect_async(&uri).await.inspect_err(|err| {
-                println!("Failed to connect to regular node ws {}: {}", i, err);
+                println!("Failed to connect to regular node ws {i}: {err}");
             })?;
             let client = WebApi::start(stream);
             node_clients.push(client);
-            println!("Connected to regular node {}", i);
+            println!("Connected to regular node {i}");
         }
 
         // Log the node connectivity
         println!("Node connectivity setup:");
         for (i, num_connections) in node_connections.iter().enumerate() {
             println!(
-                "Node {} is connected to all {} gateways and {} other regular nodes",
-                i, NUM_GATEWAYS, num_connections
+                "Node {i} is connected to all {NUM_GATEWAYS} gateways and {num_connections} other regular nodes"
             );
         }
 
@@ -290,7 +286,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
 
         // Choose a node to publish the contract
         let publisher_idx = 0;
-        println!("Node {} will publish the contract", publisher_idx);
+        println!("Node {publisher_idx} will publish the contract");
 
         // Publisher node puts the contract
         let ping = Ping::default();
@@ -317,8 +313,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         .map_err(anyhow::Error::msg)?;
 
         println!(
-            "Publisher node {} put ping contract successfully!",
-            publisher_idx
+            "Publisher node {publisher_idx} put ping contract successfully!"
         );
         // wait for put propagation
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -375,7 +370,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                         ..
                     }))) => {
                         if key == contract_key {
-                            println!("Node {} successfully got the contract", node_idx);
+                            println!("Node {node_idx} successfully got the contract");
                             nodes_with_contract[node_idx] = true;
                             get_requests.remove(i);
                             continue;
@@ -383,7 +378,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     }
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
-                        println!("Error receiving from node {}: {}", node_idx, e);
+                        println!("Error receiving from node {node_idx}: {e}");
                         get_requests.remove(i);
                         continue;
                     }
@@ -404,7 +399,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                         ..
                     }))) => {
                         if key == contract_key {
-                            println!("Gateway {} successfully got the contract", gw_idx);
+                            println!("Gateway {gw_idx} successfully got the contract");
                             gateways_with_contract[gw_idx] = true;
                             gw_get_requests.remove(i);
                             continue;
@@ -412,7 +407,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     }
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
-                        println!("Error receiving from gateway {}: {}", gw_idx, e);
+                        println!("Error receiving from gateway {gw_idx}: {e}");
                         gw_get_requests.remove(i);
                         continue;
                     }
@@ -442,8 +437,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         for (i, has_contract) in nodes_with_contract.iter().enumerate() {
             if !has_contract {
                 println!(
-                    "Node {} still doesn't have contract, making final attempt to get it",
-                    i
+                    "Node {i} still doesn't have contract, making final attempt to get it"
                 );
                 node_clients[i]
                     .send(ClientRequest::ContractOp(ContractRequest::Get {
@@ -478,8 +472,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     }))) => {
                         if key == contract_key {
                             println!(
-                                "Node {} successfully got the contract on final attempt",
-                                node_idx
+                                "Node {node_idx} successfully got the contract on final attempt"
                             );
                             nodes_with_contract[node_idx] = true;
                             final_get_requests.remove(i);
@@ -489,8 +482,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
                         println!(
-                            "Error receiving from node {} on final get attempt: {}",
-                            node_idx, e
+                            "Error receiving from node {node_idx} on final get attempt: {e}"
                         );
                         final_get_requests.remove(i);
                         continue;
@@ -517,7 +509,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
 
         for (i, has_contract) in nodes_with_contract.iter().enumerate() {
             if *has_contract {
-                println!("Node {} has contract, subscribing to it", i);
+                println!("Node {i} has contract, subscribing to it");
                 node_clients[i]
                     .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
                         key: contract_key,
@@ -526,7 +518,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     .await?;
                 subscription_requests.push(i);
             } else {
-                println!("Node {} does not have contract, cannot subscribe", i);
+                println!("Node {i} does not have contract, cannot subscribe");
             }
         }
 
@@ -536,7 +528,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
 
         for (i, has_contract) in gateways_with_contract.iter().enumerate() {
             if *has_contract {
-                println!("Gateway {} has contract, subscribing to it", i);
+                println!("Gateway {i} has contract, subscribing to it");
                 gateway_clients[i]
                     .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
                         key: contract_key,
@@ -545,7 +537,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     .await?;
                 gw_subscription_requests.push(i);
             } else {
-                println!("Gateway {} does not have contract, cannot subscribe", i);
+                println!("Gateway {i} does not have contract, cannot subscribe");
             }
         }
 
@@ -572,7 +564,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                         },
                     ))) => {
                         if key == contract_key {
-                            println!("Node {} subscription result: {}", node_idx, subscribed);
+                            println!("Node {node_idx} subscription result: {subscribed}");
                             subscribed_nodes[node_idx] = subscribed;
                             subscription_requests.remove(i);
                             continue;
@@ -580,7 +572,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     }
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
-                        println!("Error receiving from node {}: {}", node_idx, e);
+                        println!("Error receiving from node {node_idx}: {e}");
                         subscription_requests.remove(i);
                         continue;
                     }
@@ -602,7 +594,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                         },
                     ))) => {
                         if key == contract_key {
-                            println!("Gateway {} subscription result: {}", gw_idx, subscribed);
+                            println!("Gateway {gw_idx} subscription result: {subscribed}");
                             subscribed_gateways[gw_idx] = subscribed;
                             gw_subscription_requests.remove(i);
                             continue;
@@ -610,7 +602,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     }
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
-                        println!("Error receiving from gateway {}: {}", gw_idx, e);
+                        println!("Error receiving from gateway {gw_idx}: {e}");
                         gw_subscription_requests.remove(i);
                         continue;
                     }
@@ -649,18 +641,17 @@ async fn test_ping_partially_connected_network() -> TestResult {
         }
 
         let updater_idx = updater_indices[0];
-        println!("Node {} will send an update", updater_idx);
+        println!("Node {updater_idx} will send an update");
 
         // Create a unique tag for the updater
-        let update_tag = format!("ping-from-node-{}", updater_idx);
+        let update_tag = format!("ping-from-node-{updater_idx}");
 
         // Send the update
         let mut update_ping = Ping::default();
         update_ping.insert(update_tag.clone());
 
         println!(
-            "Node {} sending update with tag: {}",
-            updater_idx, update_tag
+            "Node {updater_idx} sending update with tag: {update_tag}"
         );
         node_clients[updater_idx]
             .send(ClientRequest::ContractOp(ContractRequest::Update {
@@ -736,7 +727,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                             match serde_json::from_slice::<Ping>(&state) {
                                 Ok(ping_state) => {
                                     let has_update = ping_state.get(&update_tag).is_some();
-                                    println!("Node {} has update: {}", node_idx, has_update);
+                                    println!("Node {node_idx} has update: {has_update}");
 
                                     if has_update {
                                         let timestamps = ping_state.get(&update_tag).unwrap();
@@ -752,8 +743,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                                 }
                                 Err(e) => {
                                     println!(
-                                        "Failed to deserialize state from node {}: {}",
-                                        node_idx, e
+                                        "Failed to deserialize state from node {node_idx}: {e}"
                                     );
                                 }
                             }
@@ -763,7 +753,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     }
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
-                        println!("Error receiving from node {}: {}", node_idx, e);
+                        println!("Error receiving from node {node_idx}: {e}");
                         get_state_requests.remove(i);
                         continue;
                     }
@@ -789,7 +779,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                             match serde_json::from_slice::<Ping>(&state) {
                                 Ok(ping_state) => {
                                     let has_update = ping_state.get(&update_tag).is_some();
-                                    println!("Gateway {} has update: {}", gw_idx, has_update);
+                                    println!("Gateway {gw_idx} has update: {has_update}");
 
                                     if has_update {
                                         let timestamps = ping_state.get(&update_tag).unwrap();
@@ -805,8 +795,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                                 }
                                 Err(e) => {
                                     println!(
-                                        "Failed to deserialize state from gateway {}: {}",
-                                        gw_idx, e
+                                        "Failed to deserialize state from gateway {gw_idx}: {e}"
                                     );
                                 }
                             }
@@ -816,7 +805,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                     }
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
-                        println!("Error receiving from gateway {}: {}", gw_idx, e);
+                        println!("Error receiving from gateway {gw_idx}: {e}");
                         gw_get_state_requests.remove(i);
                         continue;
                     }
@@ -869,15 +858,13 @@ async fn test_ping_partially_connected_network() -> TestResult {
         {
             if *subscribed && !updated {
                 println!(
-                    "Node {} was subscribed but did not receive the update!",
-                    node_idx
+                    "Node {node_idx} was subscribed but did not receive the update!"
                 );
 
                 // Get the node connectivity info
                 let connections = node_connections[node_idx];
                 println!(
-                    "Node {} is connected to {} other regular nodes",
-                    node_idx, connections
+                    "Node {node_idx} is connected to {connections} other regular nodes"
                 );
             }
         }

@@ -97,10 +97,8 @@ async fn test_connection_timing() -> TestResult {
         println!("📡 Testing WebSocket connections...");
 
         let ws_start = Instant::now();
-        let uri_gw = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_gw
-        );
+        let uri_gw =
+            format!("ws://127.0.0.1:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
         let (stream_gw, _) = connect_async(&uri_gw).await?;
         let _client_gw = WebApi::start(stream_gw);
         println!(
@@ -110,8 +108,7 @@ async fn test_connection_timing() -> TestResult {
 
         let ws_start = Instant::now();
         let uri_node1 = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_node1
+            "ws://127.0.0.1:{ws_api_port_node1}/v1/contract/command?encodingProtocol=native"
         );
         let (stream_node1, _) = connect_async(&uri_node1).await?;
         let _client_node1 = WebApi::start(stream_node1);
