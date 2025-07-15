@@ -147,7 +147,7 @@ impl PeerConnection {
         let last_packet_id = remote_conn.last_packet_id.clone();
 
         let keep_alive_handle = tokio::spawn(async move {
-            tracing::info!(
+            tracing::debug!(
                 target: "freenet_core::transport::keepalive_lifecycle",
                 remote = ?remote_addr,
                 "Keep-alive task STARTED for connection"
@@ -170,7 +170,7 @@ impl PeerConnection {
                 let elapsed_since_start = task_start.elapsed();
                 let elapsed_since_last_tick = tick_start.elapsed();
 
-                tracing::info!(
+                tracing::trace!(
                     target: "freenet_core::transport::keepalive_lifecycle",
                     remote = ?remote_addr,
                     tick_count,
@@ -196,7 +196,7 @@ impl PeerConnection {
 
                 // Send the keep-alive packet
                 let send_time = std::time::Instant::now();
-                tracing::info!(
+                tracing::debug!(
                     target: "freenet_core::transport::keepalive_lifecycle",
                     remote = ?remote_addr,
                     packet_id,
@@ -207,7 +207,7 @@ impl PeerConnection {
                 match outbound_packets.send((remote_addr, noop_packet)).await {
                     Ok(_) => {
                         let send_duration = send_time.elapsed();
-                        tracing::info!(
+                        tracing::trace!(
                             target: "freenet_core::transport::keepalive_lifecycle",
                             remote = ?remote_addr,
                             packet_id,
@@ -239,7 +239,7 @@ impl PeerConnection {
             );
         });
 
-        tracing::info!(remote = ?remote_addr, "PeerConnection created with persistent keep-alive task");
+        tracing::debug!(remote = ?remote_addr, "PeerConnection created with persistent keep-alive task");
 
         Self {
             remote_conn,
@@ -467,7 +467,7 @@ impl PeerConnection {
                     // Log keep-alive packets specifically
                     if matches!(payload, SymmetricMessagePayload::NoOp) {
                         if confirm_receipt.is_empty() {
-                            tracing::info!(
+                            tracing::trace!(
                                 target: "freenet_core::transport::keepalive_received",
                                 remote = ?self.remote_conn.remote_addr,
                                 packet_id,
@@ -524,7 +524,7 @@ impl PeerConnection {
                         (ReportResult::QueueFull, _) | (_, true) => {
                             let receipts = self.received_tracker.get_receipts();
                             if !receipts.is_empty() {
-                                tracing::info!(
+                                tracing::trace!(
                                     target: "freenet_core::transport::keepalive_response",
                                     remote = ?self.remote_conn.remote_addr,
                                     receipt_count = receipts.len(),
@@ -615,7 +615,7 @@ impl PeerConnection {
                         // Connection is healthy, log periodically with more details
                         let health_check_interval = 5.0; // Log every 5 seconds
                         if elapsed.as_secs_f64() % health_check_interval < 1.0 {
-                            tracing::info!(
+                            tracing::trace!(
                                 target: "freenet_core::transport::keepalive_health",
                                 remote = ?self.remote_conn.remote_addr,
                                 elapsed_seconds = elapsed.as_secs_f64(),

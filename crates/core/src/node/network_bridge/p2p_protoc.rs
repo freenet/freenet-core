@@ -107,7 +107,7 @@ impl NetworkBridge for P2pBridge {
             },
         };
 
-        tracing::info!(
+        tracing::debug!(
             target = %target,
             msg_type = %msg_type,
             "MESSAGE_SEND_START: Sending message to peer"
@@ -127,7 +127,7 @@ impl NetworkBridge for P2pBridge {
 
         match send_result {
             Ok(_) => {
-                tracing::info!(
+                tracing::debug!(
                     target = %target,
                     msg_type = %msg_type,
                     elapsed_ms = elapsed.as_millis(),
