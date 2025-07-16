@@ -137,8 +137,8 @@ impl OutboundConnectionHandler {
         socket_addr: SocketAddr,
         bandwidth_limit: Option<usize>,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection>), TransportError> {
-        // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
-        let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
+        // Increase channel buffer size to prevent packet drops under load
+        let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(1000);
         // Increase buffer size for gateways which can have many concurrent connections
         let buffer_size = if is_gateway { 1000 } else { 100 };
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(buffer_size);
@@ -146,8 +146,8 @@ impl OutboundConnectionHandler {
             "Creating connection handler with buffer size: {buffer_size} (gateway: {is_gateway})"
         );
 
-        // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
-        let (outbound_sender, outbound_recv) = mpsc::channel(100);
+        // Increase channel buffer size to prevent packet drops under load
+        let (outbound_sender, outbound_recv) = mpsc::channel(1000);
         let transport = UdpPacketsListener {
             is_gateway,
             socket_listener: socket.clone(),
@@ -348,7 +348,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         tracing::warn!(
                                             %remote_addr,
                                             dropped_count = *dropped_count,
-                                            "CHANNEL_OVERFLOW: Dropping packet due to full channel (buffer size: 100)"
+                                            "CHANNEL_OVERFLOW: Dropping packet due to full channel (buffer size: 1000)"
                                         );
 
                                         // Log warning every 10 seconds if packets are being dropped
@@ -591,7 +591,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         let bandwidth_limit = self.bandwidth_limit;
 
         let (inbound_from_remote, mut next_inbound) =
-            mpsc::channel::<PacketData<UnknownEncryption>>(100);
+            mpsc::channel::<PacketData<UnknownEncryption>>(1000);
         let f = async move {
             let decrypted_intro_packet =
                 secret.decrypt(remote_intro_packet.data()).map_err(|err| {
@@ -667,7 +667,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
             let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
 
-            let (inbound_packet_tx, inbound_packet_rx) = mpsc::channel(100);
+            let (inbound_packet_tx, inbound_packet_rx) = mpsc::channel(1000);
             let remote_conn = RemoteConnection {
                 outbound_packets,
                 outbound_symmetric_key: outbound_key,
@@ -757,7 +757,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         let transport_secret_key = self.this_peer_keypair.secret.clone();
         let bandwidth_limit = self.bandwidth_limit;
         let (inbound_from_remote, mut next_inbound) =
-            mpsc::channel::<PacketData<UnknownEncryption>>(100);
+            mpsc::channel::<PacketData<UnknownEncryption>>(1000);
         let this_addr = self.this_addr;
         let f = async move {
             let mut state = ConnectionState::StartOutbound {};
@@ -860,7 +860,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 ))
                                                 .await
                                                 .map_err(|_| TransportError::ChannelClosed)?;
-                                            let (inbound_sender, inbound_recv) = mpsc::channel(100);
+                                            let (inbound_sender, inbound_recv) =
+                                                mpsc::channel(1000);
                                             tracing::debug!(%remote_addr, "connection established");
                                             return Ok((
                                                 RemoteConnection {
@@ -929,7 +930,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     continue;
                                 }
                                 // if is not an intro packet, the connection is successful and we can proceed
-                                let (inbound_sender, inbound_recv) = mpsc::channel(100);
+                                let (inbound_sender, inbound_recv) = mpsc::channel(1000);
                                 return Ok((
                                     RemoteConnection {
                                         outbound_packets: outbound_packets.clone(),
