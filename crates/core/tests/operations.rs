@@ -1576,8 +1576,10 @@ async fn test_put_with_subscribe_flag() -> TestResult {
     .boxed_local();
 
     let test = tokio::time::timeout(Duration::from_secs(60), async {
+        tracing::info!("TEST_DEBUG: Starting test sequence");
         // Wait for nodes to start up
         tokio::time::sleep(Duration::from_secs(20)).await;
+        tracing::info!("TEST_DEBUG: Nodes should be started, connecting clients");
 
         // Connect first client to node A's websocket API (for putting with auto-subscribe)
         let uri_a =
@@ -1589,6 +1591,7 @@ async fn test_put_with_subscribe_flag() -> TestResult {
         let (stream2, _) = connect_async(&uri_a).await?;
         let mut client_api2 = WebApi::start(stream2);
 
+        tracing::info!("TEST_DEBUG: Clients connected, putting contract with subscribe=true");
         // First client puts contract with initial state and auto-subscribes
         make_put(
             &mut client_api1,
@@ -1618,6 +1621,7 @@ async fn test_put_with_subscribe_flag() -> TestResult {
             }
         }
 
+        tracing::info!("TEST_DEBUG: PUT successful, client 2 getting contract");
         // Second client gets the contract (without subscribing)
         make_get(&mut client_api2, contract_key, true, false).await?;
 
@@ -1666,7 +1670,7 @@ async fn test_put_with_subscribe_flag() -> TestResult {
         let updated_state = WrappedState::from(updated_bytes);
 
         // Second client updates the contract
-        tracing::info!("Client 2: Updating contract to trigger notification");
+        tracing::info!("TEST_DEBUG: Client 2 updating contract to trigger notification");
         make_update(&mut client_api2, contract_key, updated_state.clone()).await?;
 
         // Wait for update response
@@ -1704,6 +1708,7 @@ async fn test_put_with_subscribe_flag() -> TestResult {
             priority: 5,
         };
 
+        tracing::info!("TEST_DEBUG: Update successful, waiting for notification on client 1");
         // Wait for update notification on client 1 (should be auto-subscribed from PUT)
         let mut client1_received_notification = false;
 
@@ -1775,6 +1780,10 @@ async fn test_put_with_subscribe_flag() -> TestResult {
 
             // Small delay before trying again
             tokio::time::sleep(Duration::from_millis(100)).await;
+            tracing::debug!(
+                "TEST_DEBUG: Still waiting for notification, elapsed: {:?}",
+                start_time.elapsed()
+            );
         }
 
         // Assert that client 1 received the notification (proving auto-subscribe worked)

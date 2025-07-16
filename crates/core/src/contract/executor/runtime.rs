@@ -199,6 +199,7 @@ impl ContractExecutor for Executor<Runtime> {
         summary: Option<StateSummary<'_>>,
     ) -> Result<(), Box<RequestError>> {
         let channels = self.update_notifications.entry(key).or_default();
+        tracing::info!(%key, %cli_id, "SUBSCRIBE_DEBUG: Registering subscription, existing channels: {}", channels.len());
         if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
             let (_, existing_ch) = &channels[i];
             if !existing_ch.same_channel(&notification_ch) {
@@ -223,6 +224,7 @@ impl ContractExecutor for Executor<Runtime> {
                 "contract {key} already was registered for peer {cli_id}; replaced summary"
             );
         }
+        tracing::info!(%key, %cli_id, "SUBSCRIBE_DEBUG: Subscription registered successfully");
         Ok(())
     }
 
@@ -1049,8 +1051,10 @@ impl Executor<Runtime> {
         new_state: &WrappedState,
     ) -> Result<(), ExecutorError> {
         tracing::debug!(contract = %key, "notify of contract update");
+        tracing::info!(%key, "UPDATE_NOTIFICATION_DEBUG: Starting notification process");
         let key = *key;
         if let Some(notifiers) = self.update_notifications.get_mut(&key) {
+            tracing::info!(%key, "UPDATE_NOTIFICATION_DEBUG: Found {} subscribers", notifiers.len());
             let summaries = self.subscriber_summaries.get_mut(&key).unwrap();
             // in general there should be less than 32 failures
             let mut failures = Vec::with_capacity(32);
@@ -1068,20 +1072,25 @@ impl Executor<Runtime> {
                         .into(),
                     None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
                 };
+                tracing::info!(%key, %peer_key, "UPDATE_NOTIFICATION_DEBUG: Sending notification to subscriber");
                 if let Err(err) =
                     notifier.send(Ok(
                         ContractResponse::UpdateNotification { key, update }.into()
                     ))
                 {
+                    tracing::error!(%key, %peer_key, ?err, "UPDATE_NOTIFICATION_DEBUG: Failed to send notification");
                     failures.push(*peer_key);
                     tracing::error!(cli_id = %peer_key, "{err}");
                 } else {
+                    tracing::info!(%key, %peer_key, "UPDATE_NOTIFICATION_DEBUG: Notification sent successfully");
                     tracing::debug!(cli_id = %peer_key, contract = %key, "notified of update");
                 }
             }
             if !failures.is_empty() {
                 notifiers.retain(|(c, _)| !failures.contains(c));
             }
+        } else {
+            tracing::warn!(%key, "UPDATE_NOTIFICATION_DEBUG: No subscribers found for contract");
         }
         Ok(())
     }

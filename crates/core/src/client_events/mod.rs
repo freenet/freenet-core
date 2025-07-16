@@ -377,6 +377,7 @@ async fn process_open_request(
                         // Register subscription listener if subscribe=true
                         if subscribe {
                             if let Some(subscription_listener) = subscription_listener {
+                                tracing::info!(%client_id, %contract_key, "CLIENT_EVENTS_DEBUG: About to register subscription for PUT");
                                 tracing::debug!(%client_id, %contract_key, "Registering subscription for PUT with auto-subscribe");
                                 let register_listener = op_manager
                                     .notify_contract_handler(
@@ -398,6 +399,7 @@ async fn process_open_request(
                                     Ok(
                                         ContractHandlerEvent::RegisterSubscriberListenerResponse,
                                     ) => {
+                                        tracing::info!(%client_id, %contract_key, "CLIENT_EVENTS_DEBUG: Subscription registration confirmed");
                                         tracing::debug!(
                                             %client_id, %contract_key,
                                             "Subscriber listener registered successfully for PUT"
@@ -406,12 +408,12 @@ async fn process_open_request(
                                     _ => {
                                         tracing::error!(
                                             %client_id, %contract_key,
-                                            "Subscriber listener registration failed for PUT"
+                                            "CLIENT_EVENTS_DEBUG: Subscriber listener registration failed for PUT"
                                         );
                                     }
                                 }
                             } else {
-                                tracing::warn!(%client_id, %contract_key, "PUT with subscribe=true but no subscription_listener");
+                                tracing::error!(%client_id, %contract_key, "CLIENT_EVENTS_DEBUG: PUT with subscribe=true but no subscription_listener");
                             }
                         }
                     }
