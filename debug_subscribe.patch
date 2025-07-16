@@ -1,0 +1,139 @@
+diff --git a/crates/core/src/contract/executor/runtime.rs b/crates/core/src/contract/executor/runtime.rs
+index abc..def 100644
+--- a/crates/core/src/contract/executor/runtime.rs
++++ b/crates/core/src/contract/executor/runtime.rs
+@@ -199,6 +199,7 @@ impl<'a, R: Runtime, S: RuntimeStorage> ContractExecutor<'a, R, S> {
+         summary: Option<StateSummary<'_>>,
+     ) -> Result<(), Box<RequestError>> {
+         let channels = self.update_notifications.entry(key).or_default();
++        tracing::info!(%key, %cli_id, "SUBSCRIBE_DEBUG: Registering subscription, existing channels: {}", channels.len());
+         if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
+             let (_, existing_ch) = &channels[i];
+             if !existing_ch.same_channel(&notification_ch) {
+@@ -209,6 +210,7 @@ impl<'a, R: Runtime, S: RuntimeStorage> ContractExecutor<'a, R, S> {
+             channels.insert(i, (cli_id, notification_ch));
+         }
+         self.subscriber_summaries.entry(key).or_default().insert(cli_id, summary.map(|s| s.into_owned()));
++        tracing::info!(%key, %cli_id, "SUBSCRIBE_DEBUG: Subscription registered successfully");
+         Ok(())
+     }
+ 
+@@ -1049,7 +1051,9 @@ impl<'a, R: Runtime, S: RuntimeStorage> ContractExecutor<'a, R, S> {
+         state: &WrappedState,
+     ) -> Result<(), ExecutorError> {
+         tracing::debug!(contract = %key, "notify of contract update");
++        tracing::info!(%key, "UPDATE_NOTIFICATION_DEBUG: Starting notification process");
+         let key = *key;
+         if let Some(notifiers) = self.update_notifications.get_mut(&key) {
++            tracing::info!(%key, "UPDATE_NOTIFICATION_DEBUG: Found {} subscribers", notifiers.len());
+             let summaries = self.subscriber_summaries.get_mut(&key).unwrap();
+             // in general there should be less than 32 failures
+             let mut failures = Vec::with_capacity(32);
+@@ -1069,11 +1073,15 @@ impl<'a, R: Runtime, S: RuntimeStorage> ContractExecutor<'a, R, S> {
+                     }
+                 };
++                tracing::info!(%key, %peer_key, "UPDATE_NOTIFICATION_DEBUG: Sending notification to subscriber");
+                 if let Err(err) =
+                     notifier.send(Ok(
+                         ContractResponse::UpdateNotification { key, update }.into()
+                     ))
+                 {
++                    tracing::error!(%key, %peer_key, ?err, "UPDATE_NOTIFICATION_DEBUG: Failed to send notification");
+                     failures.push(*peer_key);
++                } else {
++                    tracing::info!(%key, %peer_key, "UPDATE_NOTIFICATION_DEBUG: Notification sent successfully");
+                 }
+             }
+             for failure in failures {
+@@ -1081,6 +1089,8 @@ impl<'a, R: Runtime, S: RuntimeStorage> ContractExecutor<'a, R, S> {
+                 notifiers.retain(|(peer, _)| peer != &failure);
+                 summaries.remove(&failure);
+             }
++        } else {
++            tracing::warn!(%key, "UPDATE_NOTIFICATION_DEBUG: No subscribers found for contract");
+         }
+         Ok(())
+     }
+diff --git a/crates/core/src/client_events/mod.rs b/crates/core/src/client_events/mod.rs
+index abc..def 100644
+--- a/crates/core/src/client_events/mod.rs
++++ b/crates/core/src/client_events/mod.rs
+@@ -366,6 +366,7 @@ impl<CH: ClientEventsProxy + Send + 'static> ClientEventsCombined<CH> {
+                         // Register subscription listener if subscribe=true
+                         if subscribe {
+                             if let Some(subscription_listener) = subscription_listener {
++                                tracing::info!(%client_id, %contract_key, "CLIENT_EVENTS_DEBUG: About to register subscription for PUT");
+                                 tracing::debug!(%client_id, %contract_key, "Registering subscription for PUT with auto-subscribe");
+                                 let register_listener = op_manager
+                                     .notify_contract_handler(
+@@ -377,10 +378,12 @@ impl<CH: ClientEventsProxy + Send + 'static> ClientEventsCombined<CH> {
+                                     .await;
+                                 
+                                 if let Err(e) = register_listener {
++                                    tracing::error!(%client_id, %contract_key, ?e, "CLIENT_EVENTS_DEBUG: Failed to register subscription");
+                                     tracing::error!("Error notifying contract handler: {}", e);
+                                 }
++                                tracing::info!(%client_id, %contract_key, "CLIENT_EVENTS_DEBUG: Subscription registration request sent");
+                             } else {
+-                                tracing::warn!(%client_id, %contract_key, "PUT with subscribe=true but no subscription_listener");
++                                tracing::error!(%client_id, %contract_key, "CLIENT_EVENTS_DEBUG: PUT with subscribe=true but no subscription_listener");
+                             }
+                         }
+ 
+diff --git a/crates/core/tests/operations.rs b/crates/core/tests/operations.rs
+index abc..def 100644
+--- a/crates/core/tests/operations.rs
++++ b/crates/core/tests/operations.rs
+@@ -1577,8 +1577,10 @@ async fn test_put_with_subscribe_flag() -> TestResult {
+     .boxed_local();
+ 
+     let test = tokio::time::timeout(Duration::from_secs(60), async {
++        tracing::info!("TEST_DEBUG: Starting test sequence");
+         // Wait for nodes to start up
+-        tokio::time::sleep(Duration::from_secs(20)).await;
++        tokio::time::sleep(Duration::from_secs(10)).await; // Reduced from 20s to make failures more likely
++        tracing::info!("TEST_DEBUG: Nodes should be started, connecting clients");
+ 
+         // Connect first client to node A's websocket API (for putting with auto-subscribe)
+         let uri_a =
+@@ -1590,6 +1592,7 @@ async fn test_put_with_subscribe_flag() -> TestResult {
+         let (stream2, _) = connect_async(&uri_a).await?;
+         let mut client_api2 = WebApi::start(stream2);
+ 
++        tracing::info!("TEST_DEBUG: Clients connected, putting contract with subscribe=true");
+         // First client puts contract with initial state and auto-subscribes
+         make_put(
+             &mut client_api1,
+@@ -1619,6 +1622,7 @@ async fn test_put_with_subscribe_flag() -> TestResult {
+             }
+         }
+ 
++        tracing::info!("TEST_DEBUG: PUT successful, client 2 getting contract");
+         // Second client gets the contract (without subscribing)
+         make_get(&mut client_api2, contract_key, true, false).await?;
+ 
+@@ -1667,7 +1671,7 @@ async fn test_put_with_subscribe_flag() -> TestResult {
+         let updated_state = WrappedState::from(updated_bytes);
+ 
+         // Second client updates the contract
+-        tracing::info!("Client 2: Updating contract to trigger notification");
++        tracing::info!("TEST_DEBUG: Client 2 updating contract to trigger notification");
+         make_update(&mut client_api2, contract_key, updated_state.clone()).await?;
+ 
+         // Wait for update response
+@@ -1705,6 +1709,7 @@ async fn test_put_with_subscribe_flag() -> TestResult {
+             priority: 5,
+         };
+ 
++        tracing::info!("TEST_DEBUG: Update successful, waiting for notification on client 1");
+         // Wait for update notification on client 1 (should be auto-subscribed from PUT)
+         let mut client1_received_notification = false;
+ 
+@@ -1775,6 +1780,7 @@ async fn test_put_with_subscribe_flag() -> TestResult {
+ 
+             // Small delay before trying again
+             tokio::time::sleep(Duration::from_millis(100)).await;
++            tracing::debug!("TEST_DEBUG: Still waiting for notification, elapsed: {:?}", start_time.elapsed());
+         }
+ 
+         // Assert that client 1 received the notification (proving auto-subscribe worked)
