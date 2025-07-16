@@ -351,6 +351,28 @@ impl PeerConnection {
         loop {
             // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
             tokio::select! {
+                // Check completed streams first to prevent channel backup
+                inbound_stream = self.inbound_stream_futures.next(), if !self.inbound_stream_futures.is_empty() => {
+                    let Some(res) = inbound_stream else {
+                        tracing::error!("unexpected no-stream from ongoing_inbound_streams");
+                        continue
+                    };
+                    let Ok((stream_id, msg)) = res.map_err(|e| TransportError::Other(e.into()))? else {
+                        tracing::error!("unexpected error from ongoing_inbound_streams");
+                        // TODO: may leave orphan stream recvs hanging around in this case
+                        continue;
+                    };
+                    self.inbound_streams.remove(&stream_id);
+                    tracing::trace!(%stream_id, "stream finished");
+                    return Ok(msg);
+                }
+                outbound_stream = self.outbound_stream_futures.next(), if !self.outbound_stream_futures.is_empty() => {
+                    let Some(res) = outbound_stream else {
+                        tracing::error!("unexpected no-stream from ongoing_outbound_streams");
+                        continue
+                    };
+                    res.map_err(|e| TransportError::Other(e.into()))??
+                }
                 inbound = self.remote_conn.inbound_packet_recv.recv() => {
                     let packet_data = inbound.ok_or(TransportError::ConnectionClosed(self.remote_addr()))?;
                     last_received = std::time::Instant::now();
@@ -559,27 +581,6 @@ impl PeerConnection {
                         tracing::trace!(%packet_id, "returning full stream message");
                         return Ok(msg);
                     }
-                }
-                inbound_stream = self.inbound_stream_futures.next(), if !self.inbound_stream_futures.is_empty() => {
-                    let Some(res) = inbound_stream else {
-                        tracing::error!("unexpected no-stream from ongoing_inbound_streams");
-                        continue
-                    };
-                    let Ok((stream_id, msg)) = res.map_err(|e| TransportError::Other(e.into()))? else {
-                        tracing::error!("unexpected error from ongoing_inbound_streams");
-                        // TODO: may leave orphan stream recvs hanging around in this case
-                        continue;
-                    };
-                    self.inbound_streams.remove(&stream_id);
-                    tracing::trace!(%stream_id, "stream finished");
-                    return Ok(msg);
-                }
-                outbound_stream = self.outbound_stream_futures.next(), if !self.outbound_stream_futures.is_empty() => {
-                    let Some(res) = outbound_stream else {
-                        tracing::error!("unexpected no-stream from ongoing_outbound_streams");
-                        continue
-                    };
-                    res.map_err(|e| TransportError::Other(e.into()))??
                 }
                 _ = timeout_check.tick() => {
                     let elapsed = last_received.elapsed();
