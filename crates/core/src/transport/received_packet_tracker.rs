@@ -50,7 +50,6 @@ impl ReceivedPacketTracker<InstantTimeSrc> {
 }
 
 impl<T: TimeSource> ReceivedPacketTracker<T> {
-
     /// Returns a list of packets that have been received since the last call to this function.
     /// This should be called every time a packet is sent to ensure that receipts are sent
     /// promptly. Every `MAX_CONFIRMATION_DELAY` (50ms) this should be called and if the returned
@@ -79,7 +78,6 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
         // be emptied every time get_receipts is called.
     }
 }
-
 
 #[cfg(test)]
 pub(in crate::transport) mod tests {

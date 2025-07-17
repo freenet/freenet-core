@@ -83,7 +83,6 @@ impl<T: TimeSource> SentPacketTracker<T> {
         });
     }
 
-
     /// Either get a packet that needs to be resent, or how long the caller should wait until
     /// calling this function again. If a packet is resent you **must** call
     /// `report_sent_packet` again with the same packet_id.

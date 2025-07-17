@@ -69,7 +69,6 @@ impl std::fmt::Display for StreamId {
     }
 }
 
-
 /// The `PeerConnection` struct is responsible for managing the connection with a remote peer.
 /// It provides methods for sending and receiving messages to and from the remote peer.
 ///
@@ -556,7 +555,6 @@ impl PeerConnection {
         self.remote_conn.remote_addr
     }
 
-
     #[inline]
     async fn noop(&mut self, receipts: Vec<u32>) -> Result<()> {
         packet_sending(
@@ -727,8 +725,5 @@ mod tests {
     use futures::TryFutureExt;
     use std::net::Ipv4Addr;
 
-    use super::{
-        outbound_stream::send_stream,
-        *,
-    };
+    use super::{outbound_stream::send_stream, *};
 }
