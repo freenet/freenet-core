@@ -83,15 +83,6 @@ impl<T: TimeSource> SentPacketTracker<T> {
         });
     }
 
-    pub(super) fn report_received_receipts(&mut self, packet_ids: &[PacketId]) {
-        for packet_id in packet_ids {
-            // This can be simplified but I'm leaving it like this for readability.
-            self.packet_loss_proportion = self.packet_loss_proportion
-                * (1.0 - PACKET_LOSS_DECAY_FACTOR)
-                + (PACKET_LOSS_DECAY_FACTOR * 0.0);
-            self.pending_receipts.remove(packet_id);
-        }
-    }
 
     /// Either get a packet that needs to be resent, or how long the caller should wait until
     /// calling this function again. If a packet is resent you **must** call
