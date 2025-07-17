@@ -20,10 +20,10 @@ mod inbound_stream;
 mod outbound_stream;
 
 use super::{
+    async_packet_handler::{PacketHandlerManager, ProcessResult},
     connection_handler::SerializedMessage,
     packet_data::{self, PacketData},
     received_packet_tracker::ReceivedPacketTracker,
-    received_packet_tracker::ReportResult,
     sent_packet_tracker::{ResendAction, SentPacketTracker},
     symmetric_message::{self, SymmetricMessage, SymmetricMessagePayload},
     TransportError,
@@ -103,6 +103,7 @@ pub(crate) struct PeerConnection {
     first_failure_time: Option<std::time::Instant>,
     last_packet_report_time: Instant,
     keep_alive_handle: Option<JoinHandle<()>>,
+    packet_handler_manager: PacketHandlerManager,
 }
 
 impl std::fmt::Debug for PeerConnection {
@@ -251,6 +252,7 @@ impl PeerConnection {
             first_failure_time: None,
             last_packet_report_time: Instant::now(),
             keep_alive_handle: Some(keep_alive_handle),
+            packet_handler_manager: PacketHandlerManager::new(50), // Conservative flood threshold
         }
     }
 
@@ -377,209 +379,130 @@ impl PeerConnection {
                     let packet_data = inbound.ok_or(TransportError::ConnectionClosed(self.remote_addr()))?;
                     last_received = std::time::Instant::now();
 
-                    // Debug logging for 256-byte packets
-                    if packet_data.data().len() == 256 {
-                        tracing::warn!(
-                            remote = ?self.remote_conn.remote_addr,
-                            packet_bytes = ?&packet_data.data()[..32], // First 32 bytes
-                            packet_len = packet_data.data().len(),
-                            "Received 256-byte packet"
+                    // Spawn async packet processing to prevent blocking the main loop
+                    let handler_id = self.packet_handler_manager.spawn_packet_handler(
+                        packet_data,
+                        &self.remote_conn.inbound_symmetric_key,
+                        self.remote_conn.inbound_symmetric_key_bytes,
+                        &self.remote_conn.transport_secret_key,
+                        &self.remote_conn.outbound_symmetric_key,
+                        &self.remote_conn.outbound_packets,
+                        self.remote_conn.remote_addr,
+                    ).await?;
+
+                    tracing::trace!(
+                        remote = %self.remote_conn.remote_addr,
+                        handler_id = %handler_id.0,
+                        "Spawned packet handler for inbound packet"
+                    );
+                }
+                
+                // Check for completed packet handlers
+                completed_handler = self.packet_handler_manager.next_completed_handler() => {
+                    if let Some((handler_id, result)) = completed_handler {
+                        tracing::trace!(
+                            remote = %self.remote_conn.remote_addr,
+                            handler_id = %handler_id.0,
+                            "Packet handler completed"
                         );
-                    }
 
-                    let Ok(decrypted) = packet_data.try_decrypt_sym(&self.remote_conn.inbound_symmetric_key).inspect_err(|error| {
-                        tracing::warn!(
-                            %error,
-                            remote = ?self.remote_conn.remote_addr,
-                            inbound_key = ?self.remote_conn.inbound_symmetric_key_bytes,
-                            packet_len = packet_data.data().len(),
-                            packet_first_bytes = ?&packet_data.data()[..std::cmp::min(32, packet_data.data().len())],
-                            "Failed to decrypt packet, might be an intro packet or a partial packet"
-                        );
-                    }) else {
-                        // Check if this is a 256-byte RSA intro packet
-                        if packet_data.data().len() == 256 {
-                            tracing::info!(
-                                remote = ?self.remote_conn.remote_addr,
-                                "Attempting to decrypt potential RSA intro packet"
-                            );
-
-                            // Try to decrypt as RSA intro packet
-                            match self.remote_conn.transport_secret_key.decrypt(packet_data.data()) {
-                                Ok(_decrypted_intro) => {
-                                    tracing::info!(
-                                        remote = ?self.remote_conn.remote_addr,
-                                        "Successfully decrypted RSA intro packet, sending ACK"
-                                    );
-
-                                    // Send ACK response for intro packet
-                                    let ack_packet = SymmetricMessage::ack_ok(
-                                        &self.remote_conn.outbound_symmetric_key,
-                                        self.remote_conn.inbound_symmetric_key_bytes,
-                                        self.remote_conn.remote_addr,
-                                    );
-
-                                    if let Ok(ack) = ack_packet {
-                                        if let Err(send_err) = self.remote_conn
-                                            .outbound_packets
-                                            .send((self.remote_conn.remote_addr, ack.data().into()))
-                                            .await
-                                        {
-                                            tracing::warn!(
-                                                remote = ?self.remote_conn.remote_addr,
-                                                error = ?send_err,
-                                                "Failed to send ACK for intro packet"
-                                            );
-                                        } else {
-                                            tracing::info!(
-                                                remote = ?self.remote_conn.remote_addr,
-                                                "Successfully sent ACK for intro packet"
-                                            );
-                                        }
-                                    } else {
+                        match result {
+                            Ok(ProcessResult::KeepAlive) => {
+                                tracing::trace!(
+                                    target: "freenet_core::transport::keepalive_received",
+                                    remote = %self.remote_conn.remote_addr,
+                                    "KEEP_ALIVE_RECEIVED: Processed keep-alive packet"
+                                );
+                                
+                                // Send keep-alive receipt if needed
+                                let current_time = Instant::now();
+                                if current_time > self.last_packet_report_time + MESSAGE_CONFIRMATION_TIMEOUT {
+                                    let receipts = self.received_tracker.get_receipts();
+                                    if !receipts.is_empty() {
+                                        tracing::trace!(
+                                            target: "freenet_core::transport::keepalive_response",
+                                            remote = %self.remote_conn.remote_addr,
+                                            receipt_count = receipts.len(),
+                                            "KEEP_ALIVE_RESPONSE: Sending receipt NoOp packet"
+                                        );
+                                        self.noop(receipts).await?;
+                                    }
+                                    self.last_packet_report_time = current_time;
+                                }
+                            }
+                            Ok(ProcessResult::Message(msg)) => {
+                                tracing::trace!(
+                                    remote = %self.remote_conn.remote_addr,
+                                    msg_len = msg.len(),
+                                    "Processed complete message"
+                                );
+                                return Ok(msg);
+                            }
+                            Ok(ProcessResult::Fragment { stream_id, fragment_data }) => {
+                                tracing::trace!(
+                                    remote = %self.remote_conn.remote_addr,
+                                    stream_id = %stream_id.0,
+                                    fragment_len = fragment_data.len(),
+                                    "Processed stream fragment"
+                                );
+                                
+                                // Forward fragment to existing stream processing
+                                if let Some(sender) = self.inbound_streams.get(&stream_id) {
+                                    if let Err(e) = sender.send((0, fragment_data)).await {
                                         tracing::warn!(
-                                            remote = ?self.remote_conn.remote_addr,
-                                            "Failed to create ACK packet for intro"
+                                            remote = %self.remote_conn.remote_addr,
+                                            stream_id = %stream_id.0,
+                                            error = %e,
+                                            "Failed to send fragment to stream"
                                         );
                                     }
-
-                                    // Continue to next packet
-                                    continue;
-                                }
-                                Err(rsa_err) => {
-                                    tracing::debug!(
-                                        remote = ?self.remote_conn.remote_addr,
-                                        error = ?rsa_err,
-                                        "256-byte packet is not a valid RSA intro packet"
-                                    );
                                 }
                             }
-                        }
-                        let now = Instant::now();
-                        if let Some(first_failure_time) = self.first_failure_time {
-                            if now.duration_since(first_failure_time) <= FAILURE_TIME_WINDOW {
-                                self.failure_count += 1;
-                            } else {
-                                // Reset the failure count and time window
-                                self.failure_count = 1;
-                                self.first_failure_time = Some(now);
-                            }
-                        } else {
-                            // Initialize the failure count and time window
-                            self.failure_count = 1;
-                            self.first_failure_time = Some(now);
-                        }
-
-                        if self.failure_count > NAT_TRAVERSAL_MAX_ATTEMPTS {
-                            tracing::warn!(remote = ?self.remote_conn.remote_addr, "Dropping connection due to repeated decryption failures");
-                            // Drop the connection (implement the logic to drop the connection here)
-                            return Err(TransportError::ConnectionClosed(self.remote_addr()));
-                        }
-
-                        tracing::trace!(remote = ?self.remote_conn.remote_addr, "ignoring packet");
-                        continue;
-                    };
-                    let msg = SymmetricMessage::deser(decrypted.data()).unwrap();
-                    let SymmetricMessage {
-                        packet_id,
-                        confirm_receipt,
-                        payload,
-                    } = msg;
-
-                    // Log keep-alive packets specifically
-                    if matches!(payload, SymmetricMessagePayload::NoOp) {
-                        if confirm_receipt.is_empty() {
-                            tracing::trace!(
-                                target: "freenet_core::transport::keepalive_received",
-                                remote = ?self.remote_conn.remote_addr,
-                                packet_id,
-                                time_since_last_received_ms = last_received.elapsed().as_millis(),
-                                "KEEP_ALIVE_RECEIVED: Received NoOp keep-alive packet (no receipts)"
-                            );
-                        } else {
-                            tracing::debug!(
-                                target: "freenet_core::transport::keepalive_received",
-                                remote = ?self.remote_conn.remote_addr,
-                                packet_id,
-                                receipt_count = confirm_receipt.len(),
-                                "Received NoOp receipt packet"
-                            );
-                        }
-                    }
-
-                    {
-                        tracing::trace!(
-                            remote = %self.remote_conn.remote_addr,
-                            %packet_id,
-                            confirm_receipts_count = ?confirm_receipt.len(),
-                            confirm_receipts = ?confirm_receipt,
-                            "received inbound packet with confirmations"
-                        );
-                    }
-
-                    let current_time = Instant::now();
-                    let should_send_receipts = if current_time > self.last_packet_report_time + MESSAGE_CONFIRMATION_TIMEOUT {
-                        tracing::trace!(
-                            remote = %self.remote_conn.remote_addr,
-                            elapsed = ?current_time.duration_since(self.last_packet_report_time),
-                            timeout = ?MESSAGE_CONFIRMATION_TIMEOUT,
-                            "timeout reached, should send receipts"
-                        );
-                        self.last_packet_report_time = current_time;
-                        true
-                    } else {
-                        false
-                    };
-
-                    self.remote_conn
-                        .sent_tracker
-                        .lock()
-                        .report_received_receipts(&confirm_receipt);
-
-                    let report_result = self.received_tracker.report_received_packet(packet_id);
-                    let trigger_str = match &report_result {
-                        ReportResult::QueueFull => "QueueFull",
-                        ReportResult::Ok => "Ok",
-                        ReportResult::AlreadyReceived => "AlreadyReceived",
-                    };
-                    match (report_result, should_send_receipts) {
-                        (ReportResult::QueueFull, _) | (_, true) => {
-                            let receipts = self.received_tracker.get_receipts();
-                            if !receipts.is_empty() {
+                            Ok(ProcessResult::StreamCompleted(msg)) => {
                                 tracing::trace!(
-                                    target: "freenet_core::transport::keepalive_response",
-                                    remote = ?self.remote_conn.remote_addr,
-                                    receipt_count = receipts.len(),
-                                    receipts = ?receipts,
-                                    trigger = trigger_str,
-                                    should_send_receipts,
-                                    "KEEP_ALIVE_RESPONSE: Sending receipt NoOp packet"
+                                    remote = %self.remote_conn.remote_addr,
+                                    msg_len = msg.len(),
+                                    "Processed completed stream"
                                 );
-                                self.noop(receipts).await?;
+                                return Ok(msg);
                             }
-                        },
-                        (ReportResult::Ok, _) => {}
-                        (ReportResult::AlreadyReceived, _) => {
-                            tracing::trace!(%packet_id, "already received packet");
-                            continue;
+                            Ok(ProcessResult::ProcessingFailed(error)) => {
+                                tracing::warn!(
+                                    remote = %self.remote_conn.remote_addr,
+                                    error = %error,
+                                    "Packet processing failed"
+                                );
+                                // Update failure tracking
+                                let now = Instant::now();
+                                if let Some(first_failure_time) = self.first_failure_time {
+                                    if now.duration_since(first_failure_time) <= FAILURE_TIME_WINDOW {
+                                        self.failure_count += 1;
+                                    } else {
+                                        self.failure_count = 1;
+                                        self.first_failure_time = Some(now);
+                                    }
+                                } else {
+                                    self.failure_count = 1;
+                                    self.first_failure_time = Some(now);
+                                }
+
+                                if self.failure_count > NAT_TRAVERSAL_MAX_ATTEMPTS {
+                                    tracing::warn!(
+                                        remote = %self.remote_conn.remote_addr,
+                                        "Dropping connection due to repeated processing failures"
+                                    );
+                                    return Err(TransportError::ConnectionClosed(self.remote_addr()));
+                                }
+                            }
+                            Err(transport_error) => {
+                                tracing::error!(
+                                    remote = %self.remote_conn.remote_addr,
+                                    error = %transport_error,
+                                    "Transport error in packet processing"
+                                );
+                                return Err(transport_error);
+                            }
                         }
-                    }
-                    let process_start = std::time::Instant::now();
-                    if let Some(msg) = self.process_inbound(payload).await.map_err(|error| {
-                        tracing::error!(%error, %packet_id, remote = %self.remote_conn.remote_addr, "error processing inbound packet");
-                        error
-                    })? {
-                        let process_elapsed = process_start.elapsed();
-                        if process_elapsed > std::time::Duration::from_millis(50) {
-                            tracing::warn!(
-                                %packet_id,
-                                remote = %self.remote_conn.remote_addr,
-                                elapsed_ms = process_elapsed.as_millis(),
-                                "SLOW inbound packet processing!"
-                            );
-                        }
-                        tracing::trace!(%packet_id, "returning full stream message");
-                        return Ok(msg);
                     }
                 }
                 _ = timeout_check.tick() => {
