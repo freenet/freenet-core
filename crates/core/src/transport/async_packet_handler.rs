@@ -1,15 +1,17 @@
-use crate::transport::TransportError;
-use crate::transport::peer_connection::StreamId;
-use crate::transport::packet_data::{PacketData, UnknownEncryption};
+#![allow(dead_code)] // Allow dead code for development and testing infrastructure
+
 use crate::transport::crypto::TransportSecretKey;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::task::JoinHandle;
-use tokio::sync::mpsc;
+use crate::transport::packet_data::{PacketData, UnknownEncryption};
+use crate::transport::peer_connection::StreamId;
+use crate::transport::TransportError;
 use aes_gcm::Aes128Gcm;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 /// Unique identifier for packet handlers
@@ -29,6 +31,7 @@ pub enum ProcessResult {
         fragment_data: Vec<u8>,
     },
     /// Complete stream assembled and processed
+    #[allow(dead_code)]
     StreamCompleted(Vec<u8>),
     /// Packet was malformed or couldn't be processed
     ProcessingFailed(String),
@@ -121,7 +124,9 @@ impl PacketHandlerManager {
     }
 
     /// Clean up completed handlers and collect their results
-    pub async fn cleanup_completed_handlers(&mut self) -> Vec<(HandlerId, Result<ProcessResult, TransportError>)> {
+    pub async fn cleanup_completed_handlers(
+        &mut self,
+    ) -> Vec<(HandlerId, Result<ProcessResult, TransportError>)> {
         let mut completed = Vec::new();
         let mut to_remove = Vec::new();
 
@@ -169,10 +174,10 @@ impl PacketHandlerManager {
 
         let now = Instant::now();
         let mut handlers_to_warn = Vec::new();
-        
+
         for handler in self.active_handlers.values() {
             let processing_time = now.duration_since(handler.started_at);
-            
+
             if processing_time > CRITICAL_THRESHOLD {
                 handlers_to_warn.push((handler.id, processing_time, "CRITICAL"));
             } else if processing_time > VERY_SLOW_THRESHOLD {
@@ -181,7 +186,7 @@ impl PacketHandlerManager {
                 handlers_to_warn.push((handler.id, processing_time, "SLOW"));
             }
         }
-        
+
         // Log warnings and update stats
         for (handler_id, processing_time, severity) in handlers_to_warn {
             match severity {
@@ -214,18 +219,18 @@ impl PacketHandlerManager {
             }
         }
     }
-    
+
     /// Get detailed monitoring statistics
     pub fn get_monitoring_stats(&self) -> MonitoringStats {
         let now = Instant::now();
         let mut handler_ages = Vec::new();
         let mut oldest_handler_age = None;
         let mut newest_handler_age = None;
-        
+
         for handler in self.active_handlers.values() {
             let age = now.duration_since(handler.started_at);
             handler_ages.push(age);
-            
+
             if oldest_handler_age.is_none() || age > oldest_handler_age.unwrap() {
                 oldest_handler_age = Some(age);
             }
@@ -233,7 +238,7 @@ impl PacketHandlerManager {
                 newest_handler_age = Some(age);
             }
         }
-        
+
         MonitoringStats {
             active_handlers: self.active_handlers.len(),
             oldest_handler_age,
@@ -247,17 +252,19 @@ impl PacketHandlerManager {
             processing_failures: self.stats.processing_failures,
         }
     }
-    
+
     /// Check if the handler manager is in a healthy state
     pub fn is_healthy(&self) -> bool {
         let now = Instant::now();
         const MAX_CRITICAL_HANDLERS: usize = 3;
         const CRITICAL_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(5000);
-        
-        let critical_handlers = self.active_handlers.values()
+
+        let critical_handlers = self
+            .active_handlers
+            .values()
             .filter(|handler| now.duration_since(handler.started_at) > CRITICAL_THRESHOLD)
             .count();
-            
+
         critical_handlers < MAX_CRITICAL_HANDLERS
     }
 
@@ -297,6 +304,7 @@ impl PacketHandlerManager {
     }
 
     /// Spawn a new packet handler for processing
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_packet_handler(
         &mut self,
         packet_data: PacketData<UnknownEncryption>,
@@ -314,7 +322,7 @@ impl PacketHandlerManager {
         }
 
         let handler_id = self.next_handler_id();
-        
+
         let inbound_symmetric_key = inbound_symmetric_key.clone();
         let transport_secret_key = transport_secret_key.clone();
         let outbound_symmetric_key = outbound_symmetric_key.clone();
@@ -329,7 +337,8 @@ impl PacketHandlerManager {
                 &outbound_symmetric_key,
                 &outbound_packets,
                 remote_addr,
-            ).await
+            )
+            .await
         });
 
         let handler = PacketHandler {
@@ -349,10 +358,12 @@ impl PacketHandlerManager {
     }
 
     /// Check for completed handlers and return the first one found
-    pub async fn next_completed_handler(&mut self) -> Option<(HandlerId, Result<ProcessResult, TransportError>)> {
+    pub async fn next_completed_handler(
+        &mut self,
+    ) -> Option<(HandlerId, Result<ProcessResult, TransportError>)> {
         // Check each active handler to see if it's completed
         let mut completed_handler = None;
-        
+
         for (handler_id, handler) in &mut self.active_handlers {
             if handler.handle.is_finished() {
                 completed_handler = Some(*handler_id);
@@ -394,7 +405,7 @@ pub async fn process_packet_fully(
     remote_addr: std::net::SocketAddr,
 ) -> Result<ProcessResult, TransportError> {
     use crate::transport::symmetric_message::{SymmetricMessage, SymmetricMessagePayload};
-    
+
     // Try symmetric decryption first
     let decrypted = match packet_data.try_decrypt_sym(inbound_symmetric_key) {
         Ok(decrypted) => {
@@ -495,13 +506,9 @@ pub async fn process_packet_fully(
     // Process the payload
     match payload {
         SymmetricMessagePayload::NoOp => Ok(ProcessResult::KeepAlive),
-        SymmetricMessagePayload::ShortMessage { payload } => {
-            Ok(ProcessResult::Message(payload))
-        }
+        SymmetricMessagePayload::ShortMessage { payload } => Ok(ProcessResult::Message(payload)),
         SymmetricMessagePayload::StreamFragment {
-            stream_id,
-            payload,
-            ..
+            stream_id, payload, ..
         } => Ok(ProcessResult::Fragment {
             stream_id,
             fragment_data: payload,
@@ -520,21 +527,19 @@ pub async fn process_packet_fully(
                 "AckConnection processed".to_string(),
             ))
         }
-        SymmetricMessagePayload::AckConnection { result: Err(cause) } => {
-            Ok(ProcessResult::ProcessingFailed(format!(
-                "Connection establishment failure: {}",
-                cause
-            )))
-        }
+        SymmetricMessagePayload::AckConnection { result: Err(cause) } => Ok(
+            ProcessResult::ProcessingFailed(format!("Connection establishment failure: {cause}")),
+        ),
     }
 }
 
 /// Ultra-minimal main loop that spawns packet handlers before decryption
 /// This prevents keep-alive packet starvation by ensuring the main loop never blocks
+#[allow(clippy::too_many_arguments)]
 pub async fn minimal_packet_processing_loop(
-    mut inbound_packet_recv: tokio::sync::mpsc::Receiver<crate::transport::packet_data::PacketData<
-        crate::transport::packet_data::UnknownEncryption,
-    >>,
+    mut inbound_packet_recv: tokio::sync::mpsc::Receiver<
+        crate::transport::packet_data::PacketData<crate::transport::packet_data::UnknownEncryption>,
+    >,
     inbound_symmetric_key: aes_gcm::Aes128Gcm,
     inbound_symmetric_key_bytes: [u8; 16],
     transport_secret_key: crate::transport::crypto::TransportSecretKey,
@@ -544,7 +549,7 @@ pub async fn minimal_packet_processing_loop(
     flood_threshold: usize,
 ) -> Result<(), TransportError> {
     let mut handler_manager = PacketHandlerManager::new(flood_threshold);
-    
+
     // Main loop that never blocks
     loop {
         tokio::select! {
@@ -557,7 +562,7 @@ pub async fn minimal_packet_processing_loop(
                         break;
                     }
                 };
-                
+
                 // Apply flood protection
                 if handler_manager.should_apply_flood_protection() {
                     handler_manager.record_flood_drop();
@@ -571,14 +576,14 @@ pub async fn minimal_packet_processing_loop(
                     );
                     continue;
                 }
-                
+
                 // Spawn handler BEFORE decryption to prevent blocking
                 let handler_id = handler_manager.next_handler_id();
                 let inbound_key = inbound_symmetric_key.clone();
                 let transport_key = transport_secret_key.clone();
                 let outbound_key = outbound_symmetric_key.clone();
                 let outbound_sender = outbound_packets.clone();
-                
+
                 tracing::debug!(
                     target: "freenet_core::transport::async_packet_handler::spawn",
                     handler_id = ?handler_id,
@@ -587,7 +592,7 @@ pub async fn minimal_packet_processing_loop(
                     active_handlers = handler_manager.active_handler_count(),
                     "SPAWN_HANDLER: Spawning packet handler before decryption"
                 );
-                
+
                 let handle = tokio::spawn(async move {
                     let start_time = std::time::Instant::now();
                     let result = process_packet_fully(
@@ -599,7 +604,7 @@ pub async fn minimal_packet_processing_loop(
                         &outbound_sender,
                         remote_addr,
                     ).await;
-                    
+
                     let processing_time = start_time.elapsed();
                     tracing::debug!(
                         target: "freenet_core::transport::async_packet_handler::process_complete",
@@ -608,23 +613,23 @@ pub async fn minimal_packet_processing_loop(
                         result = ?result,
                         "PROCESS_COMPLETE: Handler finished processing"
                     );
-                    
+
                     result
                 });
-                
+
                 let packet_handler = PacketHandler {
                     id: handler_id,
                     started_at: std::time::Instant::now(),
                     handle,
                 };
-                
+
                 handler_manager.add_handler(packet_handler);
             }
-            
+
             // Clean up completed handlers and check health every 10ms
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
                 let completed_handlers = handler_manager.cleanup_completed_handlers().await;
-                
+
                 // Process completed results
                 for (handler_id, result) in completed_handlers {
                     match result {
@@ -687,10 +692,10 @@ pub async fn minimal_packet_processing_loop(
                         }
                     }
                 }
-                
+
                 // Check for slow handlers periodically
                 handler_manager.check_slow_handlers();
-                
+
                 // Check overall health and log warnings if needed
                 if !handler_manager.is_healthy() {
                     let stats = handler_manager.get_monitoring_stats();
@@ -704,7 +709,7 @@ pub async fn minimal_packet_processing_loop(
                     );
                 }
             }
-            
+
             // Periodic health monitoring every 5 seconds
             _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
                 let stats = handler_manager.get_monitoring_stats();
@@ -724,7 +729,7 @@ pub async fn minimal_packet_processing_loop(
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -747,7 +752,7 @@ mod tests {
     async fn test_flood_protection_threshold() {
         let manager = PacketHandlerManager::new(2);
         assert!(!manager.should_apply_flood_protection());
-        
+
         // Add handlers up to threshold
         let mut manager = manager;
         for i in 0..2 {
@@ -761,27 +766,25 @@ mod tests {
                 handle,
             });
         }
-        
+
         assert!(manager.should_apply_flood_protection());
     }
 
     #[tokio::test]
     async fn test_handler_cleanup() {
         let mut manager = PacketHandlerManager::new(100);
-        
+
         // Add a quick handler
-        let handle = tokio::spawn(async {
-            Ok(ProcessResult::KeepAlive)
-        });
+        let handle = tokio::spawn(async { Ok(ProcessResult::KeepAlive) });
         manager.add_handler(PacketHandler {
             id: HandlerId(1),
             started_at: Instant::now(),
             handle,
         });
-        
+
         // Give it time to complete
         sleep(Duration::from_millis(10)).await;
-        
+
         let completed = manager.cleanup_completed_handlers().await;
         assert_eq!(completed.len(), 1);
         assert_eq!(manager.active_handler_count(), 0);
@@ -791,30 +794,31 @@ mod tests {
     #[tokio::test]
     async fn test_async_packet_processing() {
         use crate::transport::crypto::TransportKeypair;
-        use crate::transport::packet_data::{PacketData, UnknownEncryption};
+        use crate::transport::packet_data::PacketData;
         use crate::transport::symmetric_message::{SymmetricMessage, SymmetricMessagePayload};
         use aes_gcm::KeyInit;
         use std::net::SocketAddr;
-        
+
         // Create test keys
         let keypair = TransportKeypair::new();
         let inbound_key = aes_gcm::Aes128Gcm::new(&[42u8; 16].into());
         let outbound_key = aes_gcm::Aes128Gcm::new(&[43u8; 16].into());
-        
+
         // Create test packet (keep-alive) - simulate incoming packet
         let symmetric_packet = SymmetricMessage::serialize_msg_to_packet_data(
             1,
             SymmetricMessagePayload::NoOp,
             &inbound_key,
             vec![],
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         // Convert to UnknownEncryption packet to simulate incoming data
         let test_packet = PacketData::from_buf(symmetric_packet.data());
-        
+
         let test_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let (tx, _rx) = tokio::sync::mpsc::channel(10);
-        
+
         // Process the packet
         let result = process_packet_fully(
             test_packet,
@@ -824,8 +828,9 @@ mod tests {
             &outbound_key,
             &tx,
             test_addr,
-        ).await;
-        
+        )
+        .await;
+
         // Verify keep-alive was processed correctly
         assert!(result.is_ok());
         matches!(result.unwrap(), ProcessResult::KeepAlive);
@@ -834,7 +839,7 @@ mod tests {
     #[tokio::test]
     async fn test_flood_protection() {
         let mut manager = PacketHandlerManager::new(2);
-        
+
         // Add handlers up to threshold
         for i in 0..2 {
             let handle = tokio::spawn(async move {
@@ -847,10 +852,10 @@ mod tests {
                 handle,
             });
         }
-        
+
         // Should now trigger flood protection
         assert!(manager.should_apply_flood_protection());
-        
+
         // Test flood drop recording
         manager.record_flood_drop();
         assert_eq!(manager.stats().packets_dropped_flood, 1);
@@ -859,7 +864,7 @@ mod tests {
     #[tokio::test]
     async fn test_monitoring_stats() {
         let mut manager = PacketHandlerManager::new(100);
-        
+
         // Add some handlers with different processing times
         for i in 0..3 {
             let delay = (i + 1) * 50; // 50ms, 100ms, 150ms delays
@@ -873,17 +878,17 @@ mod tests {
                 handle,
             });
         }
-        
+
         // Give handlers time to start
         sleep(Duration::from_millis(25)).await;
-        
+
         let stats = manager.get_monitoring_stats();
         assert_eq!(stats.active_handlers, 3);
         assert_eq!(stats.flood_threshold, 100);
         assert!(!stats.flood_protection_active);
         assert!(stats.oldest_handler_age.is_some());
         assert!(stats.newest_handler_age.is_some());
-        
+
         // Check health
         assert!(manager.is_healthy());
     }
@@ -891,7 +896,7 @@ mod tests {
     #[tokio::test]
     async fn test_slow_handler_detection() {
         let mut manager = PacketHandlerManager::new(100);
-        
+
         // Add a slow handler
         let handle = tokio::spawn(async {
             sleep(Duration::from_millis(200)).await; // Above SLOW_THRESHOLD
@@ -902,13 +907,13 @@ mod tests {
             started_at: Instant::now(),
             handle,
         });
-        
+
         // Wait for handler to become slow
         sleep(Duration::from_millis(150)).await;
-        
+
         // Check for slow handlers
         manager.check_slow_handlers();
-        
+
         // Should detect one slow handler
         assert_eq!(manager.stats().slow_processing_count, 1);
     }
@@ -916,7 +921,7 @@ mod tests {
     #[tokio::test]
     async fn test_health_check() {
         let mut manager = PacketHandlerManager::new(100);
-        
+
         // Add many fast handlers - should be healthy
         for i in 0..5 {
             let handle = tokio::spawn(async move {
@@ -929,9 +934,9 @@ mod tests {
                 handle,
             });
         }
-        
+
         assert!(manager.is_healthy());
-        
+
         // Add critical handlers - should become unhealthy
         for i in 5..8 {
             let handle = tokio::spawn(async move {
@@ -944,7 +949,7 @@ mod tests {
                 handle,
             });
         }
-        
+
         assert!(!manager.is_healthy());
     }
 
@@ -952,11 +957,11 @@ mod tests {
     async fn test_keepalive_starvation_prevention() {
         // This test simulates the original problem: stream processing starving keep-alive packets
         // With the new async handler system, this should NOT happen
-        
+
         let mut manager = PacketHandlerManager::new(100);
         let mut keepalive_processed = 0;
         let mut stream_processed = 0;
-        
+
         // Simulate many long-running stream handlers (like the original problem)
         for i in 0..10 {
             let handle = tokio::spawn(async move {
@@ -973,7 +978,7 @@ mod tests {
                 handle,
             });
         }
-        
+
         // Simulate keep-alive packets arriving while streams are processing
         for i in 10..20 {
             let handle = tokio::spawn(async move {
@@ -987,13 +992,13 @@ mod tests {
                 handle,
             });
         }
-        
+
         // Process all handlers
         let mut all_completed = false;
         while !all_completed {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let completed = manager.cleanup_completed_handlers().await;
-            
+
             for (_, result) in completed {
                 match result {
                     Ok(ProcessResult::KeepAlive) => keepalive_processed += 1,
@@ -1001,15 +1006,15 @@ mod tests {
                     _ => {}
                 }
             }
-            
+
             all_completed = manager.active_handler_count() == 0;
         }
-        
+
         // Both keep-alive and stream packets should be processed
         // Keep-alive should not be starved by stream processing
         assert_eq!(keepalive_processed, 10);
         assert_eq!(stream_processed, 10);
-        
+
         // Verify health remained good throughout
         assert!(manager.is_healthy());
     }
@@ -1018,7 +1023,7 @@ mod tests {
     async fn test_flood_protection_under_load() {
         // Test that flood protection works correctly under high load
         let mut manager = PacketHandlerManager::new(5); // Low threshold for testing
-        
+
         // Add more handlers than the threshold
         for i in 0..10 {
             let handle = tokio::spawn(async move {
@@ -1030,27 +1035,27 @@ mod tests {
                 started_at: Instant::now(),
                 handle,
             });
-            
+
             // Should hit flood protection after 5 handlers
             if i >= 5 {
                 assert!(manager.should_apply_flood_protection());
             }
         }
-        
+
         // Simulate flood protection dropping packets
         for _ in 0..5 {
             manager.record_flood_drop();
         }
-        
+
         assert_eq!(manager.stats().packets_dropped_flood, 5);
-        
+
         // Cleanup should still work
         tokio::time::sleep(Duration::from_millis(150)).await;
         let completed = manager.cleanup_completed_handlers().await;
         assert_eq!(completed.len(), 10); // All handlers should complete
     }
 
-    #[tokio::test] 
+    #[tokio::test]
     async fn test_comprehensive_packet_processing() {
         // Test processing different types of packets in realistic scenarios
         use crate::transport::crypto::TransportKeypair;
@@ -1058,21 +1063,22 @@ mod tests {
         use crate::transport::symmetric_message::{SymmetricMessage, SymmetricMessagePayload};
         use aes_gcm::KeyInit;
         use std::net::SocketAddr;
-        
+
         let keypair = TransportKeypair::new();
         let inbound_key = aes_gcm::Aes128Gcm::new(&[42u8; 16].into());
         let outbound_key = aes_gcm::Aes128Gcm::new(&[43u8; 16].into());
         let test_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let (tx, _rx) = tokio::sync::mpsc::channel(10);
-        
+
         // Test keep-alive packet
         let keepalive_packet = SymmetricMessage::serialize_msg_to_packet_data(
             1,
             SymmetricMessagePayload::NoOp,
             &inbound_key,
             vec![],
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         let result = process_packet_fully(
             PacketData::from_buf(keepalive_packet.data()),
             &inbound_key,
@@ -1081,18 +1087,22 @@ mod tests {
             &outbound_key,
             &tx,
             test_addr,
-        ).await;
-        
+        )
+        .await;
+
         assert!(matches!(result, Ok(ProcessResult::KeepAlive)));
-        
+
         // Test regular message packet
         let message_packet = SymmetricMessage::serialize_msg_to_packet_data(
             2,
-            SymmetricMessagePayload::ShortMessage { payload: vec![1, 2, 3, 4] },
+            SymmetricMessagePayload::ShortMessage {
+                payload: vec![1, 2, 3, 4],
+            },
             &inbound_key,
             vec![],
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         let result = process_packet_fully(
             PacketData::from_buf(message_packet.data()),
             &inbound_key,
@@ -1101,10 +1111,11 @@ mod tests {
             &outbound_key,
             &tx,
             test_addr,
-        ).await;
-        
+        )
+        .await;
+
         assert!(matches!(result, Ok(ProcessResult::Message(_))));
-        
+
         // Test stream fragment
         let test_stream_id = crate::transport::peer_connection::StreamId::next();
         let fragment_packet = SymmetricMessage::serialize_msg_to_packet_data(
@@ -1117,8 +1128,9 @@ mod tests {
             },
             &inbound_key,
             vec![],
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         let result = process_packet_fully(
             PacketData::from_buf(fragment_packet.data()),
             &inbound_key,
@@ -1127,8 +1139,11 @@ mod tests {
             &outbound_key,
             &tx,
             test_addr,
-        ).await;
-        
-        assert!(matches!(result, Ok(ProcessResult::Fragment { stream_id, .. }) if stream_id == test_stream_id));
+        )
+        .await;
+
+        assert!(
+            matches!(result, Ok(ProcessResult::Fragment { stream_id, .. }) if stream_id == test_stream_id)
+        );
     }
 }

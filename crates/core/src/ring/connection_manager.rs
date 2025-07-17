@@ -144,13 +144,30 @@ impl ConnectionManager {
         let open = self
             .open_connections
             .load(std::sync::atomic::Ordering::SeqCst);
+        let reserved = self
+            .reserved_connections
+            .load(std::sync::atomic::Ordering::SeqCst);
         let total_conn = self
             .reserved_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + open;
 
+        tracing::info!(
+            "SHOULD_ACCEPT: Checking peer {} - open_connections: {}, reserved: {}, total_after_reserve: {}, min: {}, max: {}",
+            peer_id.addr,
+            open,
+            reserved,
+            total_conn,
+            self.min_connections,
+            self.max_connections
+        );
+
         if open == 0 {
             // if this is the first connection, then accept it
+            tracing::info!(
+                "SHOULD_ACCEPT: Accepting {} - first connection",
+                peer_id.addr
+            );
             return true;
         }
 
@@ -158,7 +175,10 @@ impl ConnectionManager {
             // avoid connecting more than once to the same peer
             self.reserved_connections
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            tracing::debug!(%peer_id, "Peer already connected");
+            tracing::warn!(
+                "SHOULD_ACCEPT: Rejecting {} - peer already in location_for_peer map",
+                peer_id.addr
+            );
             return false;
         }
 

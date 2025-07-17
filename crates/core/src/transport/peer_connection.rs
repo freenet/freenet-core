@@ -396,7 +396,7 @@ impl PeerConnection {
                         "Spawned packet handler for inbound packet"
                     );
                 }
-                
+
                 // Check for completed packet handlers
                 completed_handler = self.packet_handler_manager.next_completed_handler() => {
                     if let Some((handler_id, result)) = completed_handler {
@@ -413,7 +413,7 @@ impl PeerConnection {
                                     remote = %self.remote_conn.remote_addr,
                                     "KEEP_ALIVE_RECEIVED: Processed keep-alive packet"
                                 );
-                                
+
                                 // Send keep-alive receipt if needed
                                 let current_time = Instant::now();
                                 if current_time > self.last_packet_report_time + MESSAGE_CONFIRMATION_TIMEOUT {
@@ -445,7 +445,7 @@ impl PeerConnection {
                                     fragment_len = fragment_data.len(),
                                     "Processed stream fragment"
                                 );
-                                
+
                                 // Forward fragment to existing stream processing
                                 if let Some(sender) = self.inbound_streams.get(&stream_id) {
                                     if let Err(e) = sender.send((0, fragment_data)).await {
