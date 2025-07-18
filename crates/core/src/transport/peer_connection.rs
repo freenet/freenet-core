@@ -400,7 +400,7 @@ impl PeerConnection {
                 }
 
                 // Check for completed packet handlers periodically (reduced frequency)
-                () = tokio::time::sleep(Duration::from_millis(10)) => {
+                () = tokio::time::sleep(Duration::from_millis(50)) => {
                     // Check if any handlers have completed
                     if let Some((handler_id, handle)) = self.packet_handler_manager.take_next_completed() {
                         // Await the handler result
