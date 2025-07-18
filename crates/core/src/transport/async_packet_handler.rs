@@ -102,6 +102,11 @@ impl PacketHandlerManager {
         self.active_handlers.len() >= self.flood_threshold
     }
 
+    /// Check if there are any active handlers
+    pub fn has_active_handlers(&self) -> bool {
+        !self.active_handlers.is_empty()
+    }
+
     /// Add a new packet handler to tracking
     pub fn add_handler(&mut self, handler: PacketHandler) {
         info!(
@@ -385,6 +390,45 @@ impl PacketHandlerManager {
                 }
             } else {
                 None
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Wait for the next completed handler, blocking if necessary
+    pub async fn wait_for_next_completed(
+        &mut self,
+    ) -> Option<(HandlerId, Result<ProcessResult, TransportError>)> {
+        if self.active_handlers.is_empty() {
+            return None;
+        }
+
+        // Create a future that completes when any handler finishes
+        let mut handles = Vec::new();
+        let mut handler_ids = Vec::new();
+
+        for (handler_id, handler) in self.active_handlers.iter_mut() {
+            handles.push(&mut handler.handle);
+            handler_ids.push(*handler_id);
+        }
+
+        // Wait for the first handler to complete
+        let (result, index, _) = futures::future::select_all(handles).await;
+        let handler_id = handler_ids[index];
+
+        // Remove the completed handler
+        if let Some(_handler) = self.active_handlers.remove(&handler_id) {
+            match result {
+                Ok(process_result) => {
+                    self.stats.total_packets_processed += 1;
+                    self.update_stats_for_result(&process_result);
+                    Some((handler_id, process_result))
+                }
+                Err(join_error) => {
+                    self.stats.processing_failures += 1;
+                    Some((handler_id, Err(TransportError::Other(join_error.into()))))
+                }
             }
         } else {
             None

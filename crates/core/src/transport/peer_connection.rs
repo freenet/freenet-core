@@ -377,7 +377,19 @@ impl PeerConnection {
                 }
 
                 // Check for completed packet handlers
-                completed_handler = self.packet_handler_manager.next_completed_handler() => {
+                completed_handler = async {
+                    // First check for immediately completed handlers
+                    if let Some(result) = self.packet_handler_manager.next_completed_handler().await {
+                        Some(result)
+                    } else if self.packet_handler_manager.has_active_handlers() {
+                        // If we have active handlers but none are immediately ready,
+                        // wait for at least one to complete
+                        self.packet_handler_manager.wait_for_next_completed().await
+                    } else {
+                        // No active handlers
+                        futures::future::pending().await
+                    }
+                } => {
                     if let Some((handler_id, result)) = completed_handler {
                         tracing::trace!(
                             remote = %self.remote_conn.remote_addr,
@@ -720,6 +732,4 @@ async fn packet_sending(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-}
+mod tests {}
