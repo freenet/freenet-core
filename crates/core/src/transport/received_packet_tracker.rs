@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 /// How long to retain packets in case they need to be retransmitted
 const RETAIN_TIME: Duration = Duration::from_secs(60);
 
+#[cfg(test)]
+const MAX_PENDING_RECEIPTS: usize = 20;
+
 /// This struct is responsible for tracking received packets and deciding when to send receipts
 /// from/to a specific peer.
 ///
@@ -50,6 +53,27 @@ impl ReceivedPacketTracker<InstantTimeSrc> {
 }
 
 impl<T: TimeSource> ReceivedPacketTracker<T> {
+    #[cfg(test)]
+    pub(super) fn report_received_packet(&mut self, packet_id: PacketId) -> ReportResult {
+        self.cleanup();
+        let current_time = self.time_source.now();
+
+        match self.time_by_packet_id.entry(packet_id) {
+            std::collections::hash_map::Entry::Occupied(_) => ReportResult::AlreadyReceived,
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(current_time);
+                self.packet_id_time.push_back((packet_id, current_time));
+                self.pending_receipts.push(packet_id);
+
+                if self.pending_receipts.len() < MAX_PENDING_RECEIPTS {
+                    ReportResult::Ok
+                } else {
+                    ReportResult::QueueFull
+                }
+            }
+        }
+    }
+
     /// Returns a list of packets that have been received since the last call to this function.
     /// This should be called every time a packet is sent to ensure that receipts are sent
     /// promptly. Every `MAX_CONFIRMATION_DELAY` (50ms) this should be called and if the returned
@@ -77,6 +101,21 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
         // Note: We deliberately don't clean up the pending_receipts list because it will
         // be emptied every time get_receipts is called.
     }
+}
+
+#[cfg(test)]
+#[must_use]
+#[derive(Debug, PartialEq)]
+pub(super) enum ReportResult {
+    /// Packet was received for the first time and recorded
+    Ok,
+
+    /// The packet has already been received, it will be re-acknowledged but
+    /// should otherwise be ignored
+    AlreadyReceived,
+
+    /// The queue is full and receipts must be sent immediately
+    QueueFull,
 }
 
 #[cfg(test)]

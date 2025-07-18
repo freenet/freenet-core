@@ -98,6 +98,7 @@ impl Socket for UdpSocket {
 mod tests {
     use super::*;
     use crate::transport::sent_packet_tracker::{ResendAction, MESSAGE_CONFIRMATION_TIMEOUT};
+    use crate::transport::received_packet_tracker::ReportResult;
 
     #[test]
     fn test_packet_send_receive_acknowledge_flow() {

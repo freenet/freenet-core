@@ -32,9 +32,10 @@ const PACKET_LOSS_DECAY_FACTOR: f64 = 1.0 / 1000.0;
 /// This struct is responsible for tracking packets that have been sent but not yet acknowledged.
 /// It is also responsible for deciding when to resend packets that have not been acknowledged.
 ///
-/// The caller must report when packets are sent and when receipts are received using the
-/// `report_sent_packet` and `report_received_receipts` functions. The caller must also call
-/// `get_resend` periodically to check if any packets need to be resent.
+/// The caller must report when packets are sent using the `report_sent_packet` function.
+/// The caller must also call `get_resend` periodically to check if any packets need to be resent.
+/// 
+/// In test code, receipts can be reported using the `report_received_receipts` function.
 ///
 /// The expectation is that get_resend will be called as part of a loop that looks something like
 /// this:
@@ -81,6 +82,17 @@ impl<T: TimeSource> SentPacketTracker<T> {
             timeout_at: self.time_source.now() + MESSAGE_CONFIRMATION_TIMEOUT,
             packet_id,
         });
+    }
+
+    #[cfg(test)]
+    pub(super) fn report_received_receipts(&mut self, packet_ids: &[PacketId]) {
+        for packet_id in packet_ids {
+            // This can be simplified but I'm leaving it like this for readability.
+            self.packet_loss_proportion = self.packet_loss_proportion
+                * (1.0 - PACKET_LOSS_DECAY_FACTOR)
+                + (PACKET_LOSS_DECAY_FACTOR * 0.0);
+            self.pending_receipts.remove(packet_id);
+        }
     }
 
     /// Either get a packet that needs to be resent, or how long the caller should wait until
