@@ -350,8 +350,23 @@ impl PeerConnection {
         timeout_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         const FAILURE_TIME_WINDOW: Duration = Duration::from_secs(30);
+
+        // Track when we last spawned a handler to know when to check more frequently
+        let mut last_handler_spawn = std::time::Instant::now();
+
         loop {
             // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
+
+            // Determine polling interval based on recent activity
+            let handler_check_interval =
+                if last_handler_spawn.elapsed() < Duration::from_millis(100) {
+                    // If we recently spawned a handler, check more frequently
+                    Duration::from_millis(5)
+                } else {
+                    // Otherwise use the conservative interval
+                    Duration::from_millis(50)
+                };
+
             tokio::select! {
                 // Check completed inbound streams first
                 inbound_stream = self.inbound_stream_futures.next(), if !self.inbound_stream_futures.is_empty() => {
@@ -392,6 +407,9 @@ impl PeerConnection {
                         self.remote_conn.remote_addr,
                     ).await?;
 
+                    // Record when we spawned this handler for adaptive polling
+                    last_handler_spawn = std::time::Instant::now();
+
                     tracing::trace!(
                         remote = %self.remote_conn.remote_addr,
                         handler_id = %handler_id.0,
@@ -399,8 +417,8 @@ impl PeerConnection {
                     );
                 }
 
-                // Check for completed packet handlers periodically (reduced frequency)
-                () = tokio::time::sleep(Duration::from_millis(50)) => {
+                // Check for completed packet handlers periodically (adaptive frequency)
+                () = tokio::time::sleep(handler_check_interval) => {
                     // Check if any handlers have completed
                     if let Some((handler_id, handle)) = self.packet_handler_manager.take_next_completed() {
                         // Await the handler result
