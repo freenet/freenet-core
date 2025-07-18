@@ -34,7 +34,7 @@ const PACKET_LOSS_DECAY_FACTOR: f64 = 1.0 / 1000.0;
 ///
 /// The caller must report when packets are sent using the `report_sent_packet` function.
 /// The caller must also call `get_resend` periodically to check if any packets need to be resent.
-/// 
+///
 /// In test code, receipts can be reported using the `report_received_receipts` function.
 ///
 /// The expectation is that get_resend will be called as part of a loop that looks something like

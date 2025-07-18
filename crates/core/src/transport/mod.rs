@@ -97,8 +97,8 @@ impl Socket for UdpSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::sent_packet_tracker::{ResendAction, MESSAGE_CONFIRMATION_TIMEOUT};
     use crate::transport::received_packet_tracker::ReportResult;
+    use crate::transport::sent_packet_tracker::{ResendAction, MESSAGE_CONFIRMATION_TIMEOUT};
 
     #[test]
     fn test_packet_send_receive_acknowledge_flow() {
