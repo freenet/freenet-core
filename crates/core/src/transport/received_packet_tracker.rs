@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 /// How long to retain packets in case they need to be retransmitted
 const RETAIN_TIME: Duration = Duration::from_secs(60);
 
-#[cfg(test)]
 const MAX_PENDING_RECEIPTS: usize = 20;
 
 /// This struct is responsible for tracking received packets and deciding when to send receipts
@@ -53,7 +52,6 @@ impl ReceivedPacketTracker<InstantTimeSrc> {
 }
 
 impl<T: TimeSource> ReceivedPacketTracker<T> {
-    #[cfg(test)]
     pub(super) fn report_received_packet(&mut self, packet_id: PacketId) -> ReportResult {
         self.cleanup();
         let current_time = self.time_source.now();
@@ -103,7 +101,6 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
     }
 }
 
-#[cfg(test)]
 #[must_use]
 #[derive(Debug, PartialEq)]
 pub(super) enum ReportResult {

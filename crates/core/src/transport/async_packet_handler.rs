@@ -22,12 +22,20 @@ pub struct HandlerId(pub u64);
 #[derive(Debug)]
 pub enum ProcessResult {
     /// Keep-alive packet processed
-    KeepAlive,
+    KeepAlive { packet_id: u32, receipts: Vec<u32> },
     /// Regular message processed
-    Message(Vec<u8>),
+    Message {
+        packet_id: u32,
+        receipts: Vec<u32>,
+        data: Vec<u8>,
+    },
     /// Stream fragment processed (may contribute to stream completion)
     Fragment {
+        packet_id: u32,
+        receipts: Vec<u32>,
         stream_id: StreamId,
+        total_length_bytes: u64,
+        fragment_number: u32,
         fragment_data: Vec<u8>,
     },
     /// Complete stream assembled and processed
@@ -276,10 +284,10 @@ impl PacketHandlerManager {
     /// Update statistics based on processing result
     fn update_stats_for_result(&mut self, result: &Result<ProcessResult, TransportError>) {
         match result {
-            Ok(ProcessResult::KeepAlive) => {
+            Ok(ProcessResult::KeepAlive { .. }) => {
                 self.stats.keepalive_packets += 1;
             }
-            Ok(ProcessResult::Message(_)) => {
+            Ok(ProcessResult::Message { .. }) => {
                 self.stats.message_packets += 1;
             }
             Ok(ProcessResult::Fragment { .. }) => {
@@ -545,16 +553,34 @@ pub async fn process_packet_fully(
         }
     };
 
-    let SymmetricMessage { payload, .. } = msg;
+    let SymmetricMessage {
+        packet_id,
+        confirm_receipt,
+        payload,
+    } = msg;
 
     // Process the payload
     match payload {
-        SymmetricMessagePayload::NoOp => Ok(ProcessResult::KeepAlive),
-        SymmetricMessagePayload::ShortMessage { payload } => Ok(ProcessResult::Message(payload)),
+        SymmetricMessagePayload::NoOp => Ok(ProcessResult::KeepAlive {
+            packet_id,
+            receipts: confirm_receipt,
+        }),
+        SymmetricMessagePayload::ShortMessage { payload } => Ok(ProcessResult::Message {
+            packet_id,
+            receipts: confirm_receipt,
+            data: payload,
+        }),
         SymmetricMessagePayload::StreamFragment {
-            stream_id, payload, ..
-        } => Ok(ProcessResult::Fragment {
             stream_id,
+            total_length_bytes,
+            fragment_number,
+            payload,
+        } => Ok(ProcessResult::Fragment {
+            packet_id,
+            receipts: confirm_receipt,
+            stream_id,
+            total_length_bytes,
+            fragment_number,
             fragment_data: payload,
         }),
         SymmetricMessagePayload::AckConnection { result: Ok(_) } => {
@@ -677,7 +703,7 @@ pub async fn minimal_packet_processing_loop(
                 // Process completed results
                 for (handler_id, result) in completed_handlers {
                     match result {
-                        Ok(ProcessResult::KeepAlive) => {
+                        Ok(ProcessResult::KeepAlive { .. }) => {
                             tracing::trace!(
                                 target: "freenet_core::transport::async_packet_handler::keepalive",
                                 handler_id = ?handler_id,
@@ -685,17 +711,17 @@ pub async fn minimal_packet_processing_loop(
                                 "KEEPALIVE_PROCESSED: Keep-alive packet processed"
                             );
                         }
-                        Ok(ProcessResult::Message(payload)) => {
+                        Ok(ProcessResult::Message { data, .. }) => {
                             tracing::info!(
                                 target: "freenet_core::transport::async_packet_handler::message",
                                 handler_id = ?handler_id,
-                                payload_len = payload.len(),
+                                payload_len = data.len(),
                                 remote_addr = %remote_addr,
                                 "MESSAGE_PROCESSED: Message packet processed"
                             );
                             // TODO: Forward message to higher-level processor
                         }
-                        Ok(ProcessResult::Fragment { stream_id, fragment_data }) => {
+                        Ok(ProcessResult::Fragment { stream_id, fragment_data, .. }) => {
                             tracing::debug!(
                                 target: "freenet_core::transport::async_packet_handler::fragment",
                                 handler_id = ?handler_id,
@@ -802,7 +828,10 @@ mod tests {
         for i in 0..2 {
             let handle = tokio::spawn(async move {
                 sleep(Duration::from_millis(100)).await;
-                Ok(ProcessResult::KeepAlive)
+                Ok(ProcessResult::KeepAlive {
+                    packet_id: i as u32,
+                    receipts: vec![],
+                })
             });
             manager.add_handler(PacketHandler {
                 id: HandlerId(i),
@@ -819,7 +848,12 @@ mod tests {
         let mut manager = PacketHandlerManager::new(100);
 
         // Add a quick handler
-        let handle = tokio::spawn(async { Ok(ProcessResult::KeepAlive) });
+        let handle = tokio::spawn(async {
+            Ok(ProcessResult::KeepAlive {
+                packet_id: 1,
+                receipts: vec![],
+            })
+        });
         manager.add_handler(PacketHandler {
             id: HandlerId(1),
             started_at: Instant::now(),
@@ -877,7 +911,7 @@ mod tests {
 
         // Verify keep-alive was processed correctly
         assert!(result.is_ok());
-        matches!(result.unwrap(), ProcessResult::KeepAlive);
+        matches!(result.unwrap(), ProcessResult::KeepAlive { .. });
     }
 
     #[tokio::test]
@@ -888,7 +922,10 @@ mod tests {
         for i in 0..2 {
             let handle = tokio::spawn(async move {
                 sleep(Duration::from_millis(100)).await;
-                Ok(ProcessResult::KeepAlive)
+                Ok(ProcessResult::KeepAlive {
+                    packet_id: i as u32,
+                    receipts: vec![],
+                })
             });
             manager.add_handler(PacketHandler {
                 id: HandlerId(i),
@@ -914,7 +951,10 @@ mod tests {
             let delay = (i + 1) * 50; // 50ms, 100ms, 150ms delays
             let handle = tokio::spawn(async move {
                 sleep(Duration::from_millis(delay)).await;
-                Ok(ProcessResult::KeepAlive)
+                Ok(ProcessResult::KeepAlive {
+                    packet_id: i as u32,
+                    receipts: vec![],
+                })
             });
             manager.add_handler(PacketHandler {
                 id: HandlerId(i),
@@ -944,7 +984,10 @@ mod tests {
         // Add a slow handler
         let handle = tokio::spawn(async {
             sleep(Duration::from_millis(200)).await; // Above SLOW_THRESHOLD
-            Ok(ProcessResult::KeepAlive)
+            Ok(ProcessResult::KeepAlive {
+                packet_id: 1,
+                receipts: vec![],
+            })
         });
         manager.add_handler(PacketHandler {
             id: HandlerId(1),
@@ -970,7 +1013,10 @@ mod tests {
         for i in 0..5 {
             let handle = tokio::spawn(async move {
                 sleep(Duration::from_millis(10)).await;
-                Ok(ProcessResult::KeepAlive)
+                Ok(ProcessResult::KeepAlive {
+                    packet_id: i as u32,
+                    receipts: vec![],
+                })
             });
             manager.add_handler(PacketHandler {
                 id: HandlerId(i),
@@ -985,7 +1031,10 @@ mod tests {
         for i in 5..8 {
             let handle = tokio::spawn(async move {
                 sleep(Duration::from_secs(10)).await; // Very long delay
-                Ok(ProcessResult::KeepAlive)
+                Ok(ProcessResult::KeepAlive {
+                    packet_id: i as u32,
+                    receipts: vec![],
+                })
             });
             manager.add_handler(PacketHandler {
                 id: HandlerId(i),
@@ -1012,7 +1061,11 @@ mod tests {
                 // Simulate long stream processing (like the original 10+ second transfers)
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 Ok(ProcessResult::Fragment {
+                    packet_id: i as u32,
+                    receipts: vec![],
                     stream_id: crate::transport::peer_connection::StreamId::next(),
+                    total_length_bytes: 10000,
+                    fragment_number: 1,
                     fragment_data: vec![0u8; 1024],
                 })
             });
@@ -1028,7 +1081,10 @@ mod tests {
             let handle = tokio::spawn(async move {
                 // Keep-alive should be processed quickly
                 tokio::time::sleep(Duration::from_millis(10)).await;
-                Ok(ProcessResult::KeepAlive)
+                Ok(ProcessResult::KeepAlive {
+                    packet_id: i as u32,
+                    receipts: vec![],
+                })
             });
             manager.add_handler(PacketHandler {
                 id: HandlerId(i as u64),
@@ -1045,7 +1101,7 @@ mod tests {
 
             for (_, result) in completed {
                 match result {
-                    Ok(ProcessResult::KeepAlive) => keepalive_processed += 1,
+                    Ok(ProcessResult::KeepAlive { .. }) => keepalive_processed += 1,
                     Ok(ProcessResult::Fragment { .. }) => stream_processed += 1,
                     _ => {}
                 }
@@ -1072,7 +1128,10 @@ mod tests {
         for i in 0..10 {
             let handle = tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                Ok(ProcessResult::KeepAlive)
+                Ok(ProcessResult::KeepAlive {
+                    packet_id: i as u32,
+                    receipts: vec![],
+                })
             });
             manager.add_handler(PacketHandler {
                 id: HandlerId(i as u64),
@@ -1134,7 +1193,10 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Ok(ProcessResult::KeepAlive)));
+        assert!(matches!(
+            result,
+            Ok(ProcessResult::KeepAlive { packet_id: 1, .. })
+        ));
 
         // Test regular message packet
         let message_packet = SymmetricMessage::serialize_msg_to_packet_data(
@@ -1158,7 +1220,10 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Ok(ProcessResult::Message(_))));
+        assert!(matches!(
+            result,
+            Ok(ProcessResult::Message { packet_id: 2, .. })
+        ));
 
         // Test stream fragment
         let test_stream_id = crate::transport::peer_connection::StreamId::next();

@@ -16,20 +16,23 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{instrument, span, Instrument};
 
+mod inbound_stream;
 mod outbound_stream;
 
 use super::{
     async_packet_handler::{PacketHandlerManager, ProcessResult},
     connection_handler::SerializedMessage,
     packet_data::{self, PacketData},
-    received_packet_tracker::ReceivedPacketTracker,
+    received_packet_tracker::{self, ReceivedPacketTracker},
     sent_packet_tracker::{ResendAction, SentPacketTracker},
     symmetric_message::{self, SymmetricMessage, SymmetricMessagePayload},
     TransportError,
 };
 use crate::util::time_source::InstantTimeSrc;
+use std::collections::HashMap;
 
 type Result<T = (), E = TransportError> = std::result::Result<T, E>;
+type InboundStreamResult = std::result::Result<(StreamId, Vec<u8>), StreamId>;
 
 // TODO: measure the space overhead of SymmetricMessage::ShortMessage since is likely less than 100
 /// The max payload we can send in a single fragment, this MUST be less than packet_data::MAX_DATA_SIZE
@@ -93,6 +96,8 @@ impl std::fmt::Display for StreamId {
 pub(crate) struct PeerConnection {
     remote_conn: RemoteConnection,
     received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
+    inbound_streams: HashMap<StreamId, mpsc::Sender<(u32, Vec<u8>)>>,
+    inbound_stream_futures: FuturesUnordered<JoinHandle<InboundStreamResult>>,
     outbound_stream_futures: FuturesUnordered<JoinHandle<Result>>,
     failure_count: usize,
     first_failure_time: Option<std::time::Instant>,
@@ -240,6 +245,8 @@ impl PeerConnection {
         Self {
             remote_conn,
             received_tracker: ReceivedPacketTracker::new(),
+            inbound_streams: HashMap::new(),
+            inbound_stream_futures: FuturesUnordered::new(),
             outbound_stream_futures: FuturesUnordered::new(),
             failure_count: 0,
             first_failure_time: None,
@@ -346,7 +353,23 @@ impl PeerConnection {
         loop {
             // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
             tokio::select! {
-                // Check completed streams first to prevent channel backup
+                // Check completed inbound streams first
+                inbound_stream = self.inbound_stream_futures.next(), if !self.inbound_stream_futures.is_empty() => {
+                    let Some(res) = inbound_stream else {
+                        tracing::error!("unexpected no-stream from ongoing_inbound_streams");
+                        continue
+                    };
+                    let Ok((stream_id, msg)) = res.map_err(|e| TransportError::Other(e.into()))? else {
+                        tracing::error!("unexpected error from ongoing_inbound_streams");
+                        // TODO: may leave orphan stream recvs hanging around in this case
+                        continue;
+                    };
+                    self.inbound_streams.remove(&stream_id);
+                    tracing::trace!(%stream_id, "stream finished");
+                    return Ok(msg);
+                }
+
+                // Check completed outbound streams
                 outbound_stream = self.outbound_stream_futures.next(), if !self.outbound_stream_futures.is_empty() => {
                     let Some(res) = outbound_stream else {
                         tracing::error!("unexpected no-stream from ongoing_outbound_streams");
@@ -398,12 +421,20 @@ impl PeerConnection {
                         );
 
                         match result {
-                            Ok(ProcessResult::KeepAlive) => {
+                            Ok(ProcessResult::KeepAlive { packet_id, receipts }) => {
                                 tracing::trace!(
                                     target: "freenet_core::transport::keepalive_received",
                                     remote = %self.remote_conn.remote_addr,
+                                    packet_id,
+                                    receipt_count = receipts.len(),
                                     "KEEP_ALIVE_RECEIVED: Processed keep-alive packet"
                                 );
+
+                                // Report received receipts to sent tracker
+                                self.remote_conn.sent_tracker.lock().report_received_receipts(&receipts);
+
+                                // Report the received packet
+                                let _ = self.received_tracker.report_received_packet(packet_id);
 
                                 // Send keep-alive receipt if needed
                                 let current_time = Instant::now();
@@ -421,23 +452,68 @@ impl PeerConnection {
                                     self.last_packet_report_time = current_time;
                                 }
                             }
-                            Ok(ProcessResult::Message(msg)) => {
+                            Ok(ProcessResult::Message { packet_id, receipts, data }) => {
                                 tracing::trace!(
                                     remote = %self.remote_conn.remote_addr,
-                                    msg_len = msg.len(),
+                                    packet_id,
+                                    receipt_count = receipts.len(),
+                                    msg_len = data.len(),
                                     "Processed complete message"
                                 );
-                                return Ok(msg);
+
+                                // Report received receipts to sent tracker
+                                self.remote_conn.sent_tracker.lock().report_received_receipts(&receipts);
+
+                                // Report the received packet
+                                let report_result = self.received_tracker.report_received_packet(packet_id);
+                                if matches!(report_result, received_packet_tracker::ReportResult::QueueFull) {
+                                    let receipts = self.received_tracker.get_receipts();
+                                    if !receipts.is_empty() {
+                                        self.noop(receipts).await?;
+                                    }
+                                }
+
+                                return Ok(data);
                             }
-                            Ok(ProcessResult::Fragment { stream_id, fragment_data }) => {
+                            Ok(ProcessResult::Fragment { packet_id, receipts, stream_id, total_length_bytes, fragment_number, fragment_data }) => {
                                 tracing::trace!(
                                     remote = %self.remote_conn.remote_addr,
+                                    packet_id,
+                                    receipt_count = receipts.len(),
                                     stream_id = %stream_id.0,
+                                    fragment_number,
                                     fragment_len = fragment_data.len(),
                                     "Processed stream fragment"
                                 );
 
-                                // Fragment processed, no further action needed
+                                // Report received receipts to sent tracker
+                                self.remote_conn.sent_tracker.lock().report_received_receipts(&receipts);
+
+                                // Report the received packet
+                                let _ = self.received_tracker.report_received_packet(packet_id);
+
+                                // Handle the stream fragment
+                                if let Some(sender) = self.inbound_streams.get(&stream_id) {
+                                    if sender.send((fragment_number, fragment_data)).await.is_err() {
+                                        tracing::warn!(
+                                            remote = %self.remote_conn.remote_addr,
+                                            stream_id = %stream_id.0,
+                                            "Failed to send fragment to stream handler - receiver dropped"
+                                        );
+                                        self.inbound_streams.remove(&stream_id);
+                                    }
+                                } else {
+                                    // New stream, create handler
+                                    let (tx, rx) = mpsc::channel(100);
+                                    let stream = inbound_stream::InboundStream::new(total_length_bytes);
+                                    self.inbound_streams.insert(stream_id, tx.clone());
+
+                                    if tx.send((fragment_number, fragment_data)).await.is_ok() {
+                                        self.inbound_stream_futures.push(
+                                            tokio::spawn(inbound_stream::recv_stream(stream_id, rx, stream))
+                                        );
+                                    }
+                                }
                             }
                             Ok(ProcessResult::StreamCompleted(msg)) => {
                                 tracing::trace!(

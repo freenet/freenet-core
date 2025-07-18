@@ -84,7 +84,6 @@ impl<T: TimeSource> SentPacketTracker<T> {
         });
     }
 
-    #[cfg(test)]
     pub(super) fn report_received_receipts(&mut self, packet_ids: &[PacketId]) {
         for packet_id in packet_ids {
             // This can be simplified but I'm leaving it like this for readability.
