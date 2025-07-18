@@ -399,8 +399,8 @@ impl PeerConnection {
                     );
                 }
 
-                // Check for completed packet handlers
-                _ = tokio::time::sleep(Duration::from_millis(0)) => {
+                // Check for completed packet handlers when no other work is available
+                () = tokio::time::sleep(Duration::from_millis(0)) => {
                     // Check if any handlers have completed
                     if let Some((handler_id, handle)) = self.packet_handler_manager.take_next_completed() {
                         // Await the handler result
@@ -552,6 +552,9 @@ impl PeerConnection {
                                 return Err(transport_error);
                             }
                         }
+                    } else {
+                        // No handlers completed, yield control briefly
+                        tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                 }
                 _ = timeout_check.tick() => {
