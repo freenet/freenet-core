@@ -1159,6 +1159,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_wait_for_next_completed() {
+        let mut manager = PacketHandlerManager::new(100);
+
+        // Test with no handlers
+        assert!(manager.wait_for_next_completed().await.is_none());
+
+        // Add multiple handlers with different delays
+        let handle1 = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(ProcessResult::KeepAlive {
+                packet_id: 1,
+                receipts: vec![],
+            })
+        });
+        manager.add_handler(PacketHandler {
+            id: HandlerId(1),
+            started_at: Instant::now(),
+            handle: handle1,
+        });
+
+        let handle2 = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(ProcessResult::KeepAlive {
+                packet_id: 2,
+                receipts: vec![],
+            })
+        });
+        manager.add_handler(PacketHandler {
+            id: HandlerId(2),
+            started_at: Instant::now(),
+            handle: handle2,
+        });
+
+        // Should get handler 2 first (shorter delay)
+        let result = manager.wait_for_next_completed().await;
+        assert!(result.is_some());
+        let (handler_id, process_result) = result.unwrap();
+        assert_eq!(handler_id.0, 2);
+        assert!(matches!(
+            process_result,
+            Ok(ProcessResult::KeepAlive { packet_id: 2, .. })
+        ));
+
+        // Should get handler 1 next
+        let result = manager.wait_for_next_completed().await;
+        assert!(result.is_some());
+        let (handler_id, process_result) = result.unwrap();
+        assert_eq!(handler_id.0, 1);
+        assert!(matches!(
+            process_result,
+            Ok(ProcessResult::KeepAlive { packet_id: 1, .. })
+        ));
+
+        // No more handlers
+        assert!(manager.wait_for_next_completed().await.is_none());
+    }
+
+    #[tokio::test]
     async fn test_comprehensive_packet_processing() {
         // Test processing different types of packets in realistic scenarios
         use crate::transport::crypto::TransportKeypair;
