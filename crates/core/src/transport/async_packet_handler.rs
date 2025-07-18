@@ -404,42 +404,39 @@ impl PacketHandlerManager {
         }
     }
 
-    /// Wait for the next completed handler, blocking if necessary
-    pub async fn wait_for_next_completed(
+    /// Get and remove a completed handler if one exists
+    pub fn take_next_completed(
         &mut self,
-    ) -> Option<(HandlerId, Result<ProcessResult, TransportError>)> {
-        if self.active_handlers.is_empty() {
-            return None;
-        }
+    ) -> Option<(HandlerId, JoinHandle<Result<ProcessResult, TransportError>>)> {
+        // Find a completed handler
+        let completed_id = self
+            .active_handlers
+            .iter()
+            .find(|(_, handler)| handler.handle.is_finished())
+            .map(|(id, _)| *id)?;
 
-        // Create a future that completes when any handler finishes
-        let mut handles = Vec::new();
-        let mut handler_ids = Vec::new();
+        // Remove and return it
+        self.active_handlers
+            .remove(&completed_id)
+            .map(|handler| (completed_id, handler.handle))
+    }
 
-        for (handler_id, handler) in self.active_handlers.iter_mut() {
-            handles.push(&mut handler.handle);
-            handler_ids.push(*handler_id);
-        }
-
-        // Wait for the first handler to complete
-        let (result, index, _) = futures::future::select_all(handles).await;
-        let handler_id = handler_ids[index];
-
-        // Remove the completed handler
-        if let Some(_handler) = self.active_handlers.remove(&handler_id) {
-            match result {
-                Ok(process_result) => {
-                    self.stats.total_packets_processed += 1;
-                    self.update_stats_for_result(&process_result);
-                    Some((handler_id, process_result))
-                }
-                Err(join_error) => {
-                    self.stats.processing_failures += 1;
-                    Some((handler_id, Err(TransportError::Other(join_error.into()))))
-                }
+    /// Process the result of a completed handler
+    pub fn process_handler_result(
+        &mut self,
+        _handler_id: HandlerId,
+        result: Result<Result<ProcessResult, TransportError>, tokio::task::JoinError>,
+    ) -> Result<ProcessResult, TransportError> {
+        match result {
+            Ok(process_result) => {
+                self.stats.total_packets_processed += 1;
+                self.update_stats_for_result(&process_result);
+                process_result
             }
-        } else {
-            None
+            Err(join_error) => {
+                self.stats.processing_failures += 1;
+                Err(TransportError::Other(join_error.into()))
+            }
         }
     }
 }
@@ -1159,11 +1156,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wait_for_next_completed() {
+    async fn test_handler_completion() {
         let mut manager = PacketHandlerManager::new(100);
 
         // Test with no handlers
-        assert!(manager.wait_for_next_completed().await.is_none());
+        assert!(manager.take_next_completed().is_none());
 
         // Add multiple handlers with different delays
         let handle1 = tokio::spawn(async {
@@ -1192,28 +1189,41 @@ mod tests {
             handle: handle2,
         });
 
-        // Should get handler 2 first (shorter delay)
-        let result = manager.wait_for_next_completed().await;
-        assert!(result.is_some());
-        let (handler_id, process_result) = result.unwrap();
+        // Wait for handlers to complete
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Should have a completed handler
+        let completed = manager.take_next_completed();
+        assert!(completed.is_some());
+        let (handler_id, handle) = completed.unwrap();
         assert_eq!(handler_id.0, 2);
+
+        // Process the result
+        let result = handle.await;
+        let process_result = manager.process_handler_result(handler_id, result);
         assert!(matches!(
             process_result,
             Ok(ProcessResult::KeepAlive { packet_id: 2, .. })
         ));
 
+        // Wait for the other handler
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
         // Should get handler 1 next
-        let result = manager.wait_for_next_completed().await;
-        assert!(result.is_some());
-        let (handler_id, process_result) = result.unwrap();
+        let completed = manager.take_next_completed();
+        assert!(completed.is_some());
+        let (handler_id, handle) = completed.unwrap();
         assert_eq!(handler_id.0, 1);
+
+        let result = handle.await;
+        let process_result = manager.process_handler_result(handler_id, result);
         assert!(matches!(
             process_result,
             Ok(ProcessResult::KeepAlive { packet_id: 1, .. })
         ));
 
         // No more handlers
-        assert!(manager.wait_for_next_completed().await.is_none());
+        assert!(manager.take_next_completed().is_none());
     }
 
     #[tokio::test]

@@ -400,27 +400,19 @@ impl PeerConnection {
                 }
 
                 // Check for completed packet handlers
-                completed_handler = async {
-                    // First check for immediately completed handlers
-                    if let Some(result) = self.packet_handler_manager.next_completed_handler().await {
-                        Some(result)
-                    } else if self.packet_handler_manager.has_active_handlers() {
-                        // If we have active handlers but none are immediately ready,
-                        // wait for at least one to complete
-                        self.packet_handler_manager.wait_for_next_completed().await
-                    } else {
-                        // No active handlers
-                        futures::future::pending().await
-                    }
-                } => {
-                    if let Some((handler_id, result)) = completed_handler {
+                _ = tokio::time::sleep(Duration::from_millis(0)) => {
+                    // Check if any handlers have completed
+                    if let Some((handler_id, handle)) = self.packet_handler_manager.take_next_completed() {
+                        // Await the handler result
+                        let result = handle.await;
+                        let processed_result = self.packet_handler_manager.process_handler_result(handler_id, result);
                         tracing::trace!(
                             remote = %self.remote_conn.remote_addr,
                             handler_id = %handler_id.0,
                             "Packet handler completed"
                         );
 
-                        match result {
+                        match processed_result {
                             Ok(ProcessResult::KeepAlive { packet_id, receipts }) => {
                                 tracing::trace!(
                                     target: "freenet_core::transport::keepalive_received",
