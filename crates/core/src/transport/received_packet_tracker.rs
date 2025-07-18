@@ -10,7 +10,7 @@ const RETAIN_TIME: Duration = Duration::from_secs(60);
 /// This struct is responsible for tracking received packets and deciding when to send receipts
 /// from/to a specific peer.
 ///
-/// The caller must report when packets are received using the `report_received_packets` method.
+/// The caller can get receipts to send using the `get_receipts` method.
 /// The caller must also call `get_receipts` periodically to check if any receipts need to be sent.
 ///
 /// `get_receipts` should be called whenever a packet is sent.
@@ -108,79 +108,6 @@ pub(in crate::transport) mod tests {
         assert_eq!(tracker.time_by_packet_id.len(), 0);
     }
 
-    #[test]
-    fn test_report_receipt_ok() {
-        let mut tracker = ReceivedPacketTracker {
-            pending_receipts: Vec::new(),
-            packet_id_time: VecDeque::new(),
-            time_by_packet_id: HashMap::new(),
-            time_source: MockTimeSource::new(Instant::now()),
-        };
-
-        assert_eq!(tracker.report_received_packet(0), ReportResult::Ok);
-        assert_eq!(tracker.pending_receipts.len(), 1);
-        assert_eq!(tracker.time_by_packet_id.len(), 1);
-    }
-
-    #[test]
-    fn test_report_receipt_already_received() {
-        let mut tracker = mock_received_packet_tracker();
-
-        assert_eq!(tracker.report_received_packet(0), ReportResult::Ok);
-        assert_eq!(
-            tracker.report_received_packet(0),
-            ReportResult::AlreadyReceived
-        );
-        assert_eq!(tracker.pending_receipts.len(), 1);
-        assert_eq!(tracker.time_by_packet_id.len(), 1);
-    }
-
-    #[test]
-    fn test_report_receipt_queue_full() {
-        let mut tracker = ReceivedPacketTracker {
-            pending_receipts: Vec::new(),
-            packet_id_time: VecDeque::new(),
-            time_by_packet_id: HashMap::new(),
-            time_source: MockTimeSource::new(Instant::now()),
-        };
-
-        for i in 0..(MAX_PENDING_RECEIPTS - 1) {
-            assert_eq!(
-                tracker.report_received_packet(i as PacketId),
-                ReportResult::Ok
-            );
-        }
-        assert_eq!(
-            tracker.report_received_packet((MAX_PENDING_RECEIPTS as PacketId) + 1),
-            ReportResult::QueueFull
-        );
-        assert_eq!(tracker.pending_receipts.len(), MAX_PENDING_RECEIPTS);
-        assert_eq!(tracker.time_by_packet_id.len(), MAX_PENDING_RECEIPTS);
-    }
-
-    #[test]
-    fn test_cleanup() {
-        let mut tracker = ReceivedPacketTracker {
-            pending_receipts: Vec::new(),
-            packet_id_time: VecDeque::new(),
-            time_by_packet_id: HashMap::new(),
-            time_source: MockTimeSource::new(Instant::now()),
-        };
-
-        for i in 0..10 {
-            assert_eq!(tracker.report_received_packet(i), ReportResult::Ok);
-        }
-        assert_eq!(tracker.time_by_packet_id.len(), 10);
-        assert_eq!(tracker.packet_id_time.len(), 10);
-
-        tracker
-            .time_source
-            .advance_time(RETAIN_TIME + Duration::from_secs(1));
-
-        tracker.cleanup();
-        assert_eq!(tracker.time_by_packet_id.len(), 0);
-        assert_eq!(tracker.packet_id_time.len(), 0);
-    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_many_trackers() {

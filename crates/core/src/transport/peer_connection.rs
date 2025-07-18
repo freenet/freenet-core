@@ -721,9 +721,5 @@ async fn packet_sending(
 
 #[cfg(test)]
 mod tests {
-    use aes_gcm::KeyInit;
-    use futures::TryFutureExt;
-    use std::net::Ipv4Addr;
-
-    use super::{outbound_stream::send_stream, *};
+    use super::*;
 }
