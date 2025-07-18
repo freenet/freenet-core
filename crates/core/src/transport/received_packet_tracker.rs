@@ -108,7 +108,6 @@ pub(in crate::transport) mod tests {
         assert_eq!(tracker.time_by_packet_id.len(), 0);
     }
 
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_many_trackers() {
         let mut trackers = vec![];
