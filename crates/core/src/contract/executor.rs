@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use blake3::traits::digest::generic_array::GenericArray;
 use either::Either;
 use freenet_stdlib::client_api::{
     ClientError as WsClientError, ClientRequest, ContractError as StdContractError,
@@ -537,9 +536,10 @@ pub(crate) trait ContractExecutor: Send + 'static {
 
     fn execute_delegate_request(
         &mut self,
-        req: DelegateRequest<'_>,
+        req: DelegateRequest<'static>,
         attested_contract: Option<&ContractInstanceId>,
-    ) -> Response;
+    ) -> impl Future<Output = impl Future<Output = (Self::InnerExecutor, Response)> + Send + 'static>
+           + Send;
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo>;
 }

@@ -23,6 +23,7 @@ pub(crate) use handler::{
 pub use executor::{Executor, ExecutorError, OperationMode};
 
 use executor::ContractExecutor;
+use tracing::Instrument;
 
 pub(crate) async fn contract_handling<CH>(mut contract_handler: CH) -> Result<(), ContractError>
 where
@@ -122,6 +123,7 @@ where
                 related_contracts,
                 contract,
             } => {
+                let start = std::time::Instant::now();
                 // Clone needed values for the task
                 let put_future = contract_handler
                     .executor()
@@ -131,7 +133,15 @@ where
                         related_contracts,
                         contract,
                     )
+                    .instrument(tracing::info_span!("upsert_contract_state", %key))
                     .await;
+
+                let elapsed = start.elapsed();
+                if elapsed > std::time::Duration::from_millis(10) {
+                    tracing::warn!(%key, elapsed_ms = elapsed.as_millis(), "SLOW contract PUT execution blocked message pipeline!");
+                } else {
+                    tracing::info!(%key, elapsed_ms = elapsed.as_millis(), "Contract PUT execution completed");
+                }
 
                 pending_tasks.spawn(async move {
                     let span = tracing::info_span!("upsert_contract_state", %key);
@@ -201,7 +211,90 @@ where
                     (id, event_result, executor)
                 });
             }
+            ContractHandlerEvent::DelegateRequest {
+                req,
+                attested_contract,
+            } => {
+                let delegate_key = req.key().clone();
+                tracing::debug!(
+                    delegate_key = %delegate_key,
+                    ?attested_contract,
+                    "Processing delegate request"
+                );
 
+                // Convert borrowed request to owned for async processing
+                let req_owned = match req {
+                    freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
+                        delegate,
+                        cipher,
+                        nonce,
+                    } => freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
+                        delegate: delegate.clone(),
+                        cipher: cipher.clone(),
+                        nonce: nonce.clone(),
+                    },
+                    freenet_stdlib::client_api::DelegateRequest::UnregisterDelegate(key) => {
+                        freenet_stdlib::client_api::DelegateRequest::UnregisterDelegate(key.clone())
+                    }
+                    freenet_stdlib::client_api::DelegateRequest::GetSecretRequest {
+                        key,
+                        params,
+                        get_request,
+                    } => freenet_stdlib::client_api::DelegateRequest::GetSecretRequest {
+                        key: key.clone(),
+                        params: params.clone(),
+                        get_request: get_request.clone(),
+                    },
+                    freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                        key,
+                        inbound,
+                        params,
+                    } => freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                        key: key.clone(),
+                        inbound: inbound.iter().map(|msg| msg.clone().into_owned()).collect(),
+                        params: params.clone(),
+                    },
+                    _ => freenet_stdlib::client_api::DelegateRequest::UnregisterDelegate(
+                        freenet_stdlib::prelude::DelegateKey::new(
+                            [0u8; 32],
+                            freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
+                        ),
+                    ),
+                };
+
+                let delegate_future = contract_handler
+                    .executor()
+                    .execute_delegate_request(req_owned, attested_contract.as_ref())
+                    .await;
+                let id_clone = id;
+
+                pending_tasks.spawn(async move {
+                    let span = tracing::info_span!("execute_delegate_request", %delegate_key);
+                    let _guard = span.enter();
+
+                    let (executor, result) = delegate_future.await;
+
+                    let response_event = match result {
+                        Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
+                            key: _,
+                            values,
+                        }) => ContractHandlerEvent::DelegateResponse(values),
+                        Ok(freenet_stdlib::client_api::HostResponse::Ok) => {
+                            ContractHandlerEvent::DelegateResponse(Vec::new())
+                        }
+                        Ok(_other) => {
+                            tracing::error!("unexpected response type from delegate request");
+                            ContractHandlerEvent::DelegateResponse(Vec::new())
+                        }
+                        Err(err) => {
+                            tracing::error!("failed executing delegate request: {}", err);
+                            ContractHandlerEvent::DelegateResponse(Vec::new())
+                        }
+                    };
+
+                    (id_clone, response_event, executor)
+                });
+            }
             ContractHandlerEvent::RegisterSubscriberListener {
                 key,
                 client_id,
@@ -230,8 +323,28 @@ where
                     )));
                 }
             }
+            ContractHandlerEvent::QuerySubscriptions { callback } => {
+                // Get subscription information from the executor and send it through the callback
+                let subscriptions = contract_handler.executor().get_subscription_info();
+                let connections = vec![]; // For now, we'll populate this from the calling context
+                let network_debug = crate::message::NetworkDebugInfo {
+                    application_subscriptions: subscriptions,
+                    network_subscriptions: vec![], // Contract handler only tracks application subscriptions
+                    connected_peers: connections,
+                };
+                let _ = callback
+                    .send(crate::message::QueryResult::NetworkDebug(network_debug))
+                    .await;
 
-            _ => unreachable!(),
+                contract_handler
+                    .channel()
+                    .send_to_sender(id, ContractHandlerEvent::QuerySubscriptionsResponse)
+                    .await
+                    .inspect_err(|error| {
+                        tracing::debug!(%error, "shutting down contract handler");
+                    })?;
+            }
+            _ => unreachable!("ContractHandlerEvent enum should be exhaustive here"),
         }
     }
 }
