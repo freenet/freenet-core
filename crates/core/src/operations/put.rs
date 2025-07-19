@@ -832,6 +832,7 @@ pub(crate) fn start_op(
 ) -> PutOp {
     let key = contract.key();
     let contract_location = Location::from(&key);
+    tracing::info!(%contract_location, %key, "PUT_OP_START: Starting PUT operation");
     tracing::debug!(%contract_location, %key, "Requesting put");
 
     let id = Transaction::new::<PutMsg>();
@@ -880,9 +881,12 @@ pub enum PutState {
 
 /// Request to insert/update a value into a contract.
 pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Result<(), OpError> {
+    tracing::info!(op_id = %put_op.id, "PUT_REQUEST_START: Beginning PUT request processing");
+
     let (key, ..) = if let Some(PutState::PrepareRequest { contract, .. }) = &put_op.state {
         (contract.key(), contract.clone())
     } else {
+        tracing::error!(op_id = %put_op.id, "PUT_REQUEST_ERROR: Unexpected op state");
         return Err(OpError::UnexpectedOpState);
     };
 
@@ -891,12 +895,15 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
     // the initial request must provide:
     // - a peer as close as possible to the contract location
     // - and the value to put
+    tracing::info!(op_id = %put_op.id, contract_key = %key, "PUT_REQUEST: Finding closest peer for contract");
     let target = op_manager
         .ring
         .closest_potentially_caching(&key, [&sender.peer].as_slice())
         .into_iter()
         .next()
         .ok_or(RingError::EmptyRing)?;
+
+    tracing::info!(op_id = %put_op.id, target_peer = %target.peer, "PUT_REQUEST: Found target peer");
 
     let id = put_op.id;
     if let Some(stats) = &mut put_op.stats {

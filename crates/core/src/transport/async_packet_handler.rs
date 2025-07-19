@@ -328,9 +328,22 @@ impl PacketHandlerManager {
         outbound_packets: &mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
         remote_addr: SocketAddr,
     ) -> Result<HandlerId, TransportError> {
+        tracing::info!(
+            target: "freenet_core::transport::async_packet_handler::spawn_called",
+            remote_addr = %remote_addr,
+            packet_size = packet_data.size,
+            active_handlers = self.active_handlers.len(),
+            "SPAWN_CALLED: spawn_packet_handler function called"
+        );
+
         // Check for flood protection
         if self.should_apply_flood_protection() {
             self.stats.packets_dropped_flood += 1;
+            tracing::warn!(
+                target: "freenet_core::transport::async_packet_handler::spawn_called",
+                remote_addr = %remote_addr,
+                "SPAWN_FLOOD_PROTECTION: Dropping packet due to flood protection"
+            );
             return Err(TransportError::FloodProtection);
         }
 
@@ -424,17 +437,98 @@ impl PacketHandlerManager {
     /// Process the result of a completed handler
     pub fn process_handler_result(
         &mut self,
-        _handler_id: HandlerId,
+        handler_id: HandlerId,
         result: Result<Result<ProcessResult, TransportError>, tokio::task::JoinError>,
     ) -> Result<ProcessResult, TransportError> {
         match result {
             Ok(process_result) => {
                 self.stats.total_packets_processed += 1;
                 self.update_stats_for_result(&process_result);
+
+                // Log detailed information about what was processed
+                match &process_result {
+                    Ok(ProcessResult::KeepAlive {
+                        packet_id,
+                        receipts,
+                    }) => {
+                        tracing::info!(
+                            target: "freenet_core::transport::async_packet_handler::result",
+                            handler_id = ?handler_id,
+                            packet_id = %packet_id,
+                            receipt_count = receipts.len(),
+                            "HANDLER_RESULT: KeepAlive processed successfully"
+                        );
+                    }
+                    Ok(ProcessResult::Message {
+                        packet_id,
+                        receipts,
+                        data,
+                    }) => {
+                        tracing::info!(
+                            target: "freenet_core::transport::async_packet_handler::result",
+                            handler_id = ?handler_id,
+                            packet_id = %packet_id,
+                            receipt_count = receipts.len(),
+                            message_len = data.len(),
+                            message_preview = ?&data[..std::cmp::min(32, data.len())],
+                            "HANDLER_RESULT: Message processed successfully - THIS SHOULD RETURN TO RECV LOOP"
+                        );
+                    }
+                    Ok(ProcessResult::Fragment {
+                        packet_id,
+                        receipts,
+                        stream_id,
+                        fragment_number,
+                        fragment_data,
+                        ..
+                    }) => {
+                        tracing::info!(
+                            target: "freenet_core::transport::async_packet_handler::result",
+                            handler_id = ?handler_id,
+                            packet_id = %packet_id,
+                            receipt_count = receipts.len(),
+                            stream_id = %stream_id,
+                            fragment_number = %fragment_number,
+                            fragment_len = fragment_data.len(),
+                            "HANDLER_RESULT: Fragment processed successfully"
+                        );
+                    }
+                    Ok(ProcessResult::StreamCompleted(data)) => {
+                        tracing::info!(
+                            target: "freenet_core::transport::async_packet_handler::result",
+                            handler_id = ?handler_id,
+                            message_len = data.len(),
+                            "HANDLER_RESULT: Stream completed"
+                        );
+                    }
+                    Ok(ProcessResult::ProcessingFailed(error)) => {
+                        tracing::warn!(
+                            target: "freenet_core::transport::async_packet_handler::result",
+                            handler_id = ?handler_id,
+                            error = %error,
+                            "HANDLER_RESULT: Processing failed"
+                        );
+                    }
+                    Err(transport_error) => {
+                        tracing::error!(
+                            target: "freenet_core::transport::async_packet_handler::result",
+                            handler_id = ?handler_id,
+                            error = %transport_error,
+                            "HANDLER_RESULT: Transport error"
+                        );
+                    }
+                }
+
                 process_result
             }
             Err(join_error) => {
                 self.stats.processing_failures += 1;
+                tracing::error!(
+                    target: "freenet_core::transport::async_packet_handler::result",
+                    handler_id = ?handler_id,
+                    error = %join_error,
+                    "HANDLER_RESULT: Join error - handler panicked or was cancelled"
+                );
                 Err(TransportError::Other(join_error.into()))
             }
         }
@@ -453,6 +547,12 @@ pub async fn process_packet_fully(
     outbound_packets: &tokio::sync::mpsc::Sender<(std::net::SocketAddr, std::sync::Arc<[u8]>)>,
     remote_addr: std::net::SocketAddr,
 ) -> Result<ProcessResult, TransportError> {
+    tracing::info!(
+        target: "freenet_core::transport::async_packet_handler::process_start",
+        remote_addr = %remote_addr,
+        packet_size = packet_data.size,
+        "PROCESS_START: Beginning packet processing"
+    );
     use crate::transport::symmetric_message::{SymmetricMessage, SymmetricMessagePayload};
 
     // Try symmetric decryption first
@@ -562,11 +662,20 @@ pub async fn process_packet_fully(
             packet_id,
             receipts: confirm_receipt,
         }),
-        SymmetricMessagePayload::ShortMessage { payload } => Ok(ProcessResult::Message {
-            packet_id,
-            receipts: confirm_receipt,
-            data: payload,
-        }),
+        SymmetricMessagePayload::ShortMessage { payload } => {
+            tracing::info!(
+                target: "freenet_core::transport::async_packet_handler::complete",
+                remote_addr = %remote_addr,
+                packet_id = %packet_id,
+                data_len = payload.len(),
+                "PROCESS_COMPLETE: Returning Message result for ShortMessage"
+            );
+            Ok(ProcessResult::Message {
+                packet_id,
+                receipts: confirm_receipt,
+                data: payload,
+            })
+        }
         SymmetricMessagePayload::StreamFragment {
             stream_id,
             total_length_bytes,

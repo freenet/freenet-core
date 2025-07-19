@@ -354,18 +354,25 @@ impl PeerConnection {
         // Track when we last spawned a handler to know when to check more frequently
         let mut last_handler_spawn = std::time::Instant::now();
 
+        // Track if we should check for completed handlers immediately
+        let mut check_handlers_immediately = false;
+
         loop {
             // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
 
             // Determine polling interval based on recent activity
-            let handler_check_interval =
-                if last_handler_spawn.elapsed() < Duration::from_millis(100) {
-                    // If we recently spawned a handler, check more frequently
-                    Duration::from_millis(5)
-                } else {
-                    // Otherwise use the conservative interval
-                    Duration::from_millis(50)
-                };
+            let handler_check_interval = if check_handlers_immediately {
+                // Reset the flag
+                check_handlers_immediately = false;
+                // Check immediately (0ms)
+                Duration::from_millis(0)
+            } else if last_handler_spawn.elapsed() < Duration::from_millis(100) {
+                // If we recently spawned a handler, check more frequently
+                Duration::from_millis(5)
+            } else {
+                // Otherwise use the conservative interval
+                Duration::from_millis(50)
+            };
 
             tokio::select! {
                 // Check completed inbound streams first
@@ -409,6 +416,9 @@ impl PeerConnection {
 
                     // Record when we spawned this handler for adaptive polling
                     last_handler_spawn = std::time::Instant::now();
+
+                    // Set flag to check for completed handlers immediately on next iteration
+                    check_handlers_immediately = true;
 
                     tracing::trace!(
                         remote = %self.remote_conn.remote_addr,
@@ -463,12 +473,14 @@ impl PeerConnection {
                                 }
                             }
                             Ok(ProcessResult::Message { packet_id, receipts, data }) => {
-                                tracing::trace!(
+                                tracing::info!(
+                                    target: "freenet_core::transport::peer_connection::message_return",
                                     remote = %self.remote_conn.remote_addr,
                                     packet_id,
                                     receipt_count = receipts.len(),
                                     msg_len = data.len(),
-                                    "Processed complete message"
+                                    message_preview = ?&data[..std::cmp::min(32, data.len())],
+                                    "RECV_LOOP_RETURN: Returning message from recv() - this should reach the calling code"
                                 );
 
                                 // Report received receipts to sent tracker
@@ -572,7 +584,13 @@ impl PeerConnection {
                         }
                     } else {
                         // No handlers completed, yield control briefly
-                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        // But only sleep if we didn't just do an immediate check
+                        if handler_check_interval > Duration::from_millis(0) {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        } else {
+                            // We just did an immediate check and found nothing - yield without sleeping
+                            tokio::task::yield_now().await;
+                        }
                     }
                 }
                 _ = timeout_check.tick() => {
@@ -821,4 +839,78 @@ async fn packet_sending(
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use aes_gcm::KeyInit;
+    use tokio::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn test_immediate_handler_completion_check() {
+        // This test verifies that completed handlers are checked immediately
+        // after spawning a new handler, rather than waiting for the next polling interval
+
+        // Use matching keys so the packet actually processes successfully
+        let inbound_key = aes_gcm::Aes128Gcm::new(&[42; 16].into());
+        let outbound_key = aes_gcm::Aes128Gcm::new(&[43; 16].into());
+
+        let (mut peer_conn, inbound_sender, _outbound_recv) = PeerConnection::new_test(
+            "127.0.0.1:8080".parse().unwrap(),
+            "127.0.0.1:8081".parse().unwrap(),
+            outbound_key.clone(),
+            inbound_key.clone(),
+        );
+
+        // Create a simple short message packet that should process very quickly
+        use crate::transport::packet_data::PacketData;
+        use crate::transport::symmetric_message::{SymmetricMessage, SymmetricMessagePayload};
+
+        let message_data = vec![1, 2, 3, 4];
+        let message_packet = SymmetricMessage::serialize_msg_to_packet_data(
+            1,
+            SymmetricMessagePayload::ShortMessage {
+                payload: message_data.clone(),
+            },
+            &inbound_key, // Use the correct inbound key
+            vec![],
+        )
+        .unwrap();
+
+        let test_packet = PacketData::from_buf(message_packet.data());
+
+        // Send the packet to the peer connection
+        inbound_sender.send(test_packet).await.unwrap();
+
+        // Measure how long it takes to receive the processed packet
+        let start_time = Instant::now();
+
+        // The recv() call should complete quickly due to immediate handler checking
+        let result = tokio::time::timeout(Duration::from_millis(100), peer_conn.recv()).await;
+
+        let elapsed = start_time.elapsed();
+
+        match result {
+            Ok(Ok(received_data)) => {
+                // Success! And it should happen quickly
+                assert_eq!(received_data, message_data);
+                assert!(
+                    elapsed < Duration::from_millis(25),
+                    "Handler completion check took too long: {elapsed:?}"
+                );
+                println!("Handler completion check took: {elapsed:?} - SUCCESS");
+            }
+            Ok(Err(e)) => {
+                // Processing failed, but if it failed quickly, the optimization is working
+                println!("Processing failed but quickly ({elapsed:?}): {e:?}");
+                assert!(
+                    elapsed < Duration::from_millis(25),
+                    "Handler completion check took too long: {elapsed:?}"
+                );
+            }
+            Err(_timeout) => {
+                panic!(
+                    "Handler completion check timed out after {elapsed:?} - optimization not working"
+                );
+            }
+        }
+    }
+}
