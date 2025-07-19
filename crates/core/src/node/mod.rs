@@ -18,7 +18,7 @@
 use anyhow::Context;
 use either::Either;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ErrorKind},
+    client_api::{ClientRequest, ContractResponse, ErrorKind, HostResponse},
     prelude::ContractKey,
 };
 use std::{
@@ -377,8 +377,20 @@ async fn report_result(
         Ok(Some(op_res)) => {
             if let Some((client_ids, cb)) = client_req_handler_callback {
                 for client_id in client_ids {
-                    tracing::debug!(?tx, %client_id,  "Sending response to client");
-                    let _ = cb.send((client_id, op_res.to_host_result()));
+                    let host_result = op_res.to_host_result();
+                    tracing::info!(
+                        ?tx,
+                        %client_id,
+                        op_type = ?op_res.id().transaction_type(),
+                        "NODE: Sending operation result to client - {:?}",
+                        match &host_result {
+                            Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key })) =>
+                                format!("PUT response for key: {key}"),
+                            Ok(_) => "Other response".to_string(),
+                            Err(e) => format!("Error: {e:?}")
+                        }
+                    );
+                    let _ = cb.send((client_id, host_result));
                 }
             }
             // check operations.rs:handle_op_result to see what's the meaning of each state

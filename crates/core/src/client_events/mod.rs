@@ -185,7 +185,7 @@ where
             client_request = client_events.recv() => {
                 let req = match client_request {
                     Ok(request) => {
-                        tracing::debug!(%request, "got client request event");
+                        tracing::info!(%request, "NODE: Received client request event");
                         request
                     }
                     Err(error) if matches!(error.kind(), ErrorKind::Shutdown) => {
@@ -347,12 +347,15 @@ async fn process_open_request(
                             return Err(Error::Disconnected);
                         };
 
-                        tracing::debug!(
+                        let contract_key = contract.key();
+                        tracing::info!(
                             this_peer = %peer_id,
-                            "Received put from user event",
+                            contract_key = %contract_key,
+                            state_size = state.size(),
+                            subscribe = subscribe,
+                            "NODE: Processing PUT request from client",
                         );
 
-                        let contract_key = contract.key();
                         let op = put::start_op(
                             contract,
                             related_contracts,
@@ -362,6 +365,17 @@ async fn process_open_request(
                         );
                         let op_id = op.id;
 
+                        tracing::info!(
+                            op_id = %op_id,
+                            contract_key = %contract_key,
+                            "NODE: Created PUT operation"
+                        );
+
+                        // Start the PUT operation BEFORE waiting for result to avoid deadlock
+                        if let Err(err) = put::request_put(&op_manager, op).await {
+                            tracing::error!("Put request error: {}", err);
+                        }
+
                         op_manager
                             .ch_outbound
                             .waiting_for_transaction_result(op_id, client_id)
@@ -369,10 +383,6 @@ async fn process_open_request(
                             .inspect_err(|err| {
                                 tracing::error!("Error waiting for transaction result: {}", err);
                             })?;
-
-                        if let Err(err) = put::request_put(&op_manager, op).await {
-                            tracing::error!("Put request error: {}", err);
-                        }
 
                         // Register subscription listener if subscribe=true
                         if subscribe {
@@ -465,18 +475,20 @@ async fn process_open_request(
                             "Sending update op",
                         );
                         let op = update::start_op(key, new_state, related_contracts);
+                        let op_id = op.id;
+
+                        // Start the UPDATE operation BEFORE waiting for result to avoid deadlock
+                        if let Err(err) = update::request_update(&op_manager, op).await {
+                            tracing::error!("request update error {}", err)
+                        }
 
                         op_manager
                             .ch_outbound
-                            .waiting_for_transaction_result(op.id, client_id)
+                            .waiting_for_transaction_result(op_id, client_id)
                             .await
                             .inspect_err(|err| {
                                 tracing::error!("Error waiting for transaction result: {}", err);
                             })?;
-
-                        if let Err(err) = update::request_update(&op_manager, op).await {
-                            tracing::error!("request update error {}", err)
-                        }
                     }
                     ContractRequest::Get {
                         key,
@@ -578,10 +590,18 @@ async fn process_open_request(
                             );
 
                             let op = get::start_op(key, return_contract_code, subscribe);
+                            let op_id = op.id;
+
+                            // Start the GET operation BEFORE waiting for result to avoid deadlock
+                            if let Err(err) =
+                                get::request_get(&op_manager, op, HashSet::new()).await
+                            {
+                                tracing::error!("get::request_get error: {}", err);
+                            }
 
                             op_manager
                                 .ch_outbound
-                                .waiting_for_transaction_result(op.id, client_id)
+                                .waiting_for_transaction_result(op_id, client_id)
                                 .await
                                 .inspect_err(|err| {
                                     tracing::error!(
@@ -589,12 +609,6 @@ async fn process_open_request(
                                         err
                                     );
                                 })?;
-
-                            if let Err(err) =
-                                get::request_get(&op_manager, op, HashSet::new()).await
-                            {
-                                tracing::error!("get::request_get error: {}", err);
-                            }
                         }
                     }
                     ContractRequest::Subscribe { key, summary } => {

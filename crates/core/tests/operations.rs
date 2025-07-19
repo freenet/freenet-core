@@ -211,7 +211,12 @@ async fn test_put_contract() -> TestResult {
         .await?;
 
         // Wait for put response
+        tracing::info!("TEST: Waiting for PUT response (timeout: 60s)");
+        let wait_start = std::time::Instant::now();
         let resp = tokio::time::timeout(Duration::from_secs(60), client_api_a.recv()).await;
+        let wait_duration = wait_start.elapsed();
+
+        tracing::info!("TEST: Response received after {:?}", wait_duration);
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                 assert_eq!(key, contract_key);
@@ -368,7 +373,7 @@ async fn test_update_contract() -> TestResult {
 
     let test = tokio::time::timeout(Duration::from_secs(60), async {
         // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(20)).await; // Increased sleep duration
+        tokio::time::sleep(Duration::from_secs(15)).await; // Increased sleep duration
 
         // Connect to node A websocket API
         let uri =
@@ -1276,8 +1281,10 @@ async fn test_get_with_subscribe_flag() -> TestResult {
     .boxed_local();
 
     let test = tokio::time::timeout(Duration::from_secs(120), async {
-        // Wait for nodes to start up
+        // Wait for nodes to start up (increased from 15s to match delegate test)
+        tracing::info!("TEST_DEBUG: Waiting 20 seconds for nodes to establish connections and routing...");
         tokio::time::sleep(Duration::from_secs(15)).await;
+        tracing::info!("TEST_DEBUG: Startup wait complete, attempting PUT operation");
 
         // Connect first client to node A's websocket API (for putting the contract)
         let uri_a = format!(
@@ -1578,7 +1585,7 @@ async fn test_put_with_subscribe_flag() -> TestResult {
     let test = tokio::time::timeout(Duration::from_secs(60), async {
         tracing::info!("TEST_DEBUG: Starting test sequence");
         // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(20)).await;
+        tokio::time::sleep(Duration::from_secs(15)).await;
         tracing::info!("TEST_DEBUG: Nodes should be started, connecting clients");
 
         // Connect first client to node A's websocket API (for putting with auto-subscribe)
@@ -1896,7 +1903,7 @@ async fn test_delegate_request() -> TestResult {
     // Wait for the nodes to start and run the test
     let test = tokio::time::timeout(Duration::from_secs(60), async {
         // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(20)).await;
+        tokio::time::sleep(Duration::from_secs(15)).await;
 
         // Connect to the client node's WebSocket API
         let uri = format!(
@@ -2146,7 +2153,7 @@ async fn test_gateway_packet_size_change_after_60s() -> TestResult {
 
     let test = tokio::time::timeout(Duration::from_secs(180), async {
         // Wait for nodes to start (gateways need to connect to each other)
-        tokio::time::sleep(Duration::from_secs(20)).await;
+        tokio::time::sleep(Duration::from_secs(15)).await;
 
         // Connect to client node
         let uri = format!(

@@ -11,6 +11,7 @@ use std::{borrow::Cow, io, net::SocketAddr};
 use futures::Future;
 use tokio::net::UdpSocket;
 
+mod async_packet_handler;
 mod connection_handler;
 mod crypto;
 mod packet_data;
@@ -53,6 +54,8 @@ pub(crate) enum TransportError {
         expected: String,
         actual: &'static str,
     },
+    #[error("flood protection activated - too many concurrent packet handlers")]
+    FloodProtection,
     #[error(transparent)]
     IO(#[from] std::io::Error),
     #[error(transparent)]

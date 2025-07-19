@@ -102,6 +102,17 @@ impl WebSocketProxy {
                 auth_token,
                 attested_contract,
             } => {
+                tracing::info!(
+                    "SERVER: Processing request in WebSocketProxy - client_id: {}, request_type: {}",
+                    client_id,
+                    match req.as_ref() {
+                        ClientRequest::ContractOp(ContractRequest::Put { .. }) => "PUT",
+                        ClientRequest::ContractOp(ContractRequest::Get { .. }) => "GET",
+                        ClientRequest::ContractOp(ContractRequest::Subscribe { .. }) => "SUBSCRIBE",
+                        ClientRequest::ContractOp(ContractRequest::Update { .. }) => "UPDATE",
+                        _ => "OTHER",
+                    }
+                );
                 let open_req = match &*req {
                     ClientRequest::ContractOp(ContractRequest::Subscribe { key, .. }) => {
                         tracing::debug!(%client_id, contract = %key, "subscribing to contract");
@@ -521,7 +532,25 @@ async fn process_client_request(
         *auth_token = Some(AuthToken::from(token.clone()));
     }
 
-    tracing::debug!(req = %req, "received client request");
+    tracing::info!(req = %req, client_id = %client_id, "SERVER: Received client request");
+
+    // Log specific details for PUT requests
+    if let ClientRequest::ContractOp(ContractRequest::Put {
+        contract,
+        state,
+        subscribe,
+        ..
+    }) = &req
+    {
+        tracing::info!(
+            "SERVER: PUT request details - contract_key: {}, state_size: {} bytes, subscribe: {}",
+            contract.key(),
+            state.size(),
+            subscribe
+        );
+    }
+
+    let send_start = std::time::Instant::now();
     request_sender
         .send(ClientConnection::Request {
             client_id,
@@ -531,6 +560,11 @@ async fn process_client_request(
         })
         .await
         .map_err(|err| Some(err.into()))?;
+
+    tracing::info!(
+        "SERVER: Request forwarded to node - elapsed: {:?}",
+        send_start.elapsed()
+    );
     Ok(None)
 }
 
@@ -552,7 +586,14 @@ async fn process_host_response(
                         HostResponse::Ok => "HostResponse::Ok",
                         _ => "Unknown",
                     };
-                    tracing::debug!(response = %res, response_type, cli_id = %id, "sending response");
+                    tracing::info!(response = %res, response_type, cli_id = %id, "SERVER: Sending response to client");
+
+                    // Log specific details for PUT responses
+                    if let HostResponse::ContractResponse(ContractResponse::PutResponse { key }) =
+                        &res
+                    {
+                        tracing::info!("SERVER: PUT response - contract_key: {key}");
+                    }
                     match res {
                         HostResponse::ContractResponse(ContractResponse::GetResponse {
                             key,

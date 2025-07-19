@@ -32,6 +32,14 @@ pub async fn make_put(
     contract: ContractContainer,
     subscribe: bool,
 ) -> anyhow::Result<()> {
+    tracing::info!(
+        "TEST: Sending PUT request - contract_key: {}, subscribe: {}, state_size: {} bytes",
+        contract.key(),
+        subscribe,
+        state.size()
+    );
+    let start_time = std::time::Instant::now();
+
     client
         .send(ClientRequest::ContractOp(ContractRequest::Put {
             contract: contract.clone(),
@@ -40,6 +48,11 @@ pub async fn make_put(
             subscribe,
         }))
         .await?;
+
+    tracing::info!(
+        "TEST: PUT request sent successfully - elapsed: {:?}",
+        start_time.elapsed()
+    );
     Ok(())
 }
 

@@ -16,6 +16,7 @@ pub(super) struct PacketRateLimiter<T: TimeSource> {
     current_bandwidth: usize,
     outbound_packets: mpsc::Receiver<(SocketAddr, Arc<[u8]>)>,
     time_source: T,
+    last_backlog_warning: Option<Instant>,
 }
 
 impl PacketRateLimiter<InstantTimeSrc> {
@@ -29,6 +30,7 @@ impl PacketRateLimiter<InstantTimeSrc> {
             current_bandwidth: 0,
             outbound_packets,
             time_source: InstantTimeSrc::new(),
+            last_backlog_warning: None,
         }
     }
 }
@@ -60,11 +62,23 @@ impl<T: TimeSource> PacketRateLimiter<T> {
             // INSTRUMENTATION: Track channel depth
             let channel_len = self.outbound_packets.len();
             if channel_len > 50 {
-                tracing::warn!(
-                    %socket_addr,
-                    channel_depth = channel_len,
-                    "CHANNEL_BACKLOG: Outbound packet channel backing up"
-                );
+                // Rate limit the warning to once every 10 seconds
+                let now = self.time_source.now();
+                let should_warn = match self.last_backlog_warning {
+                    None => true,
+                    Some(last_warning) => {
+                        now.duration_since(last_warning) >= Duration::from_secs(10)
+                    }
+                };
+
+                if should_warn {
+                    tracing::warn!(
+                        %socket_addr,
+                        channel_depth = channel_len,
+                        "CHANNEL_BACKLOG: Outbound packet channel backing up"
+                    );
+                    self.last_backlog_warning = Some(now);
+                }
             }
 
             if let Some(bandwidth_limit) = bandwidth_limit {
@@ -235,6 +249,7 @@ mod tests {
             current_bandwidth: 0,
             outbound_packets: mpsc::channel(1).1,
             time_source: MockTimeSource::new(Instant::now()),
+            last_backlog_warning: None,
         }
     }
 

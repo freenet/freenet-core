@@ -727,11 +727,22 @@ pub(crate) async fn initial_join_procedure(
                     number_of_parallel_connections.min(unconnected_count)
                 );
                 let select_all = futures::stream::FuturesUnordered::new();
+
+                // Get own peer key safely - might not be set during initial connection
+                let own_peer_key = op_manager.ring.connection_manager.get_peer_key();
+
                 for gateway in unconnected_gateways
                     .into_iter()
                     .shuffle()
                     .take(number_of_parallel_connections)
                 {
+                    // Skip self-connections to prevent routing conflicts
+                    if let Some(ref own_peer) = own_peer_key {
+                        if gateway.peer.addr == own_peer.addr {
+                            tracing::debug!(%gateway, "Skipping self-connection to prevent routing conflicts");
+                            continue;
+                        }
+                    }
                     tracing::info!(%gateway, "Attempting connection to gateway");
                     let op_manager = op_manager.clone();
                     select_all.push(async move {

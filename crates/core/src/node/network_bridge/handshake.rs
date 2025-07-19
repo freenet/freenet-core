@@ -411,12 +411,27 @@ impl HandshakeHandler {
                     tracing::debug!("Unconfirmed connection event: {:?}", event);
                     match event {
                         InternalEvent::InboundGwJoinRequest(mut req) => {
+                            tracing::info!(
+                                "GATEWAY_JOIN_REQ: Received StartJoinReq from {} (tx: {})",
+                                req.joiner.addr,
+                                req.id
+                            );
                             let location = if let Some((_, other)) = self.this_location.zip(req.location) {
                                 other
                             } else {
                                 Location::from_address(&req.conn.remote_addr())
                             };
+                            tracing::info!(
+                                "GATEWAY_JOIN_REQ: Checking should_accept for peer {} at location {}",
+                                req.joiner.addr,
+                                location
+                            );
                             let should_accept = self.connection_manager.should_accept(location, &req.joiner);
+                            tracing::info!(
+                                "GATEWAY_JOIN_REQ: should_accept returned {} for peer {}",
+                                should_accept,
+                                req.joiner.addr
+                            );
                             if should_accept {
                                 let accepted_msg = NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
                                     id: req.id,
@@ -518,6 +533,10 @@ impl HandshakeHandler {
                                 })
 
                             } else {
+                                tracing::warn!(
+                                    "GATEWAY_JOIN_REQ: Rejected join request from {} - gateway NOT accepting new connections",
+                                    req.joiner.addr
+                                );
                                 let InboundGwJoinRequest {
                                     mut conn,
                                     id,
@@ -974,6 +993,11 @@ async fn wait_for_gw_confirmation(
     mut tracker: AcceptedTracker,
 ) -> OutboundConnResult {
     let gw_peer_id = tracker.gw_peer.peer.clone();
+    tracing::info!(
+        "HANDSHAKE_JOIN_REQ: Preparing StartJoinReq to gateway {}, tx: {}",
+        gw_peer_id.addr,
+        tracker.tx
+    );
     let msg = NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
         id: tracker.tx,
         target: tracker.gw_peer.clone(),
@@ -993,11 +1017,22 @@ async fn wait_for_gw_confirmation(
         msg = ?msg,
         "Sending initial connection message to gw"
     );
-    tracker
-        .gw_conn
-        .send(msg)
-        .await
-        .map_err(|err| (gw_peer_id.clone(), HandshakeError::TransportError(err)))?;
+    tracing::info!(
+        "HANDSHAKE_JOIN_REQ: Sending StartJoinReq message to gateway {}",
+        tracker.gw_conn.remote_addr()
+    );
+    tracker.gw_conn.send(msg).await.map_err(|err| {
+        tracing::error!(
+            "HANDSHAKE_JOIN_REQ: Failed to send message to gateway {}: {:?}",
+            tracker.gw_conn.remote_addr(),
+            err
+        );
+        (gw_peer_id.clone(), HandshakeError::TransportError(err))
+    })?;
+    tracing::info!(
+        "HANDSHAKE_JOIN_REQ: Message sent successfully to gateway {}, now waiting for response",
+        tracker.gw_conn.remote_addr()
+    );
     tracing::debug!(
         at=?tracker.gw_conn.my_address(),
         from=%tracker.gw_conn.remote_addr(),
@@ -1024,12 +1059,22 @@ async fn wait_for_gw_confirmation(
 async fn check_remaining_hops(mut tracker: AcceptedTracker) -> OutboundConnResult {
     let remote_addr = tracker.gw_conn.remote_addr();
     let gw_peer_id = tracker.gw_peer.peer.clone();
+    tracing::info!(
+        "HANDSHAKE_RESPONSE_WAIT: Starting to wait for response from gateway {}, remaining_checks: {}",
+        remote_addr,
+        tracker.remaining_checks
+    );
     tracing::debug!(
         at=?tracker.gw_conn.my_address(),
         from=%tracker.gw_conn.remote_addr(),
         "Checking for remaining hops, left: {}", tracker.remaining_checks
     );
     while tracker.remaining_checks > 0 {
+        tracing::info!(
+            "HANDSHAKE_RESPONSE_WAIT: Waiting for message #{} from gateway {}",
+            tracker.remaining_checks,
+            remote_addr
+        );
         let msg = tokio::time::timeout(
             TIMEOUT,
             tracker
@@ -1038,6 +1083,10 @@ async fn check_remaining_hops(mut tracker: AcceptedTracker) -> OutboundConnResul
                 .map_err(|err| (gw_peer_id.clone(), HandshakeError::TransportError(err))),
         )
         .map_err(|_| {
+            tracing::error!(
+                "HANDSHAKE_RESPONSE_WAIT: TIMEOUT waiting for response from gateway {}, no response received",
+                remote_addr
+            );
             tracing::debug!(from = %gw_peer_id, "Timed out waiting for response from gw");
             (
                 gw_peer_id.clone(),
@@ -1045,6 +1094,10 @@ async fn check_remaining_hops(mut tracker: AcceptedTracker) -> OutboundConnResul
             )
         })
         .await??;
+        tracing::info!(
+            "HANDSHAKE_RESPONSE_WAIT: Received message from gateway {}",
+            remote_addr
+        );
         let msg = decode_msg(&msg).map_err(|e| (gw_peer_id.clone(), e))?;
         match msg {
             NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
