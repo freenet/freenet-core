@@ -42,6 +42,17 @@ jobs:
           name: binaries-x86_64-fdev
           path: target/release/fdev
 
+      - name: Build freenet-ping
+        run: |
+          cd apps/freenet-ping/app
+          cargo build --release
+
+      - name: Upload freenet-ping binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-x86_64-freenet-ping
+          path: apps/freenet-ping/target/release/freenet-ping
+
   build-arm64:
     name: Build for aarch64-unknown-linux-gnu
 
@@ -73,3 +84,14 @@ jobs:
         with:
           name: binaries-arm64-fdev
           path: target/release/fdev
+
+      - name: Build freenet-ping
+        run: |
+          cd apps/freenet-ping/app
+          cargo build --release
+
+      - name: Upload freenet-ping binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-arm64-freenet-ping
+          path: apps/freenet-ping/target/release/freenet-ping

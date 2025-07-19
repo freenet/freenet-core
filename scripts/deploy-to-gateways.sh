@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/opt/homebrew/bin/bash
 
 # Deploy to Gateways Script
 # This script handles cross-compilation, testing, and deployment of Freenet to gateway servers
@@ -36,6 +36,7 @@ show_help() {
     echo -e "  -f, --force                Force deployment even if tests fail"
     echo -e "  -g, --gateway NAME         Deploy only to specific gateway (vega or ziggy)"
     echo -e "  -v, --verbose              Show detailed output"
+    echo -e "  -p, --ping-only            Deploy only freenet-ping binary"
     echo -e "      --force-old-artifacts  Use GitHub artifacts older than 12 hours\n"
     echo -e "${YELLOW}Target Gateways:${NC}"
     echo -e "  vega (x86_64):   vega.locut.us"
@@ -52,6 +53,7 @@ FORCE_DEPLOY=false
 SPECIFIC_GATEWAY=""
 VERBOSE=false
 FORCE_OLD_ARTIFACTS=false
+PING_ONLY=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -73,6 +75,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -v|--verbose)
             VERBOSE=true
+            shift
+            ;;
+        -p|--ping-only)
+            PING_ONLY=true
             shift
             ;;
         --force-old-artifacts)
@@ -196,7 +202,15 @@ compile_for_target() {
         
         # Check if artifact is older than 12 hours
         local current_time=$(date +%s)
-        local artifact_time=$(date -d "$created_at" +%s)
+        local artifact_time
+        # macOS date compatibility
+        if date -r 0 >/dev/null 2>&1; then
+            # macOS/BSD date
+            artifact_time=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "${created_at%.*}Z" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S" "${created_at%.*}" +%s)
+        else
+            # GNU date (Linux)
+            artifact_time=$(date -d "$created_at" +%s)
+        fi
         local age_hours=$(( (current_time - artifact_time) / 3600 ))
         
         if [ $age_hours -gt 12 ] && [ "$FORCE_OLD_ARTIFACTS" = false ]; then
@@ -209,25 +223,59 @@ compile_for_target() {
                 show_progress "Using GitHub artifacts ($age_hours hours old)" "warning"
             fi
             
-            # Determine artifact name based on architecture
-            local artifact_name
+            # Determine artifact names based on architecture
+            local freenet_artifact_name
+            local fdev_artifact_name
+            local ping_artifact_name
             if [ "$target" = "x86_64-unknown-linux-gnu" ]; then
-                artifact_name="binaries-x86_64-freenet"
+                freenet_artifact_name="binaries-x86_64-freenet"
+                fdev_artifact_name="binaries-x86_64-fdev"
+                ping_artifact_name="binaries-x86_64-freenet-ping"
             else
-                artifact_name="binaries-arm64-freenet"
+                freenet_artifact_name="binaries-arm64-freenet"
+                fdev_artifact_name="binaries-arm64-fdev"
+                ping_artifact_name="binaries-arm64-freenet-ping"
             fi
             
-            # Download the freenet binary artifact
+            # Download artifacts
             local temp_dir=$(mktemp -d)
-            if gh run download "$run_id" --repo freenet/freenet-core --name "$artifact_name" --dir "$temp_dir" 2>&1; then
-                cp "$temp_dir/freenet" "$CROSS_BINARIES_DIR/freenet-$gateway_name"
-                chmod +x "$CROSS_BINARIES_DIR/freenet-$gateway_name"
-                rm -rf "$temp_dir"
+            local download_success=true
+            
+            # Download freenet binary (unless ping-only mode)
+            if [ "$PING_ONLY" = false ]; then
+                if gh run download "$run_id" --repo freenet/freenet-core --name "$freenet_artifact_name" --dir "$temp_dir" 2>&1; then
+                    cp "$temp_dir/freenet" "$CROSS_BINARIES_DIR/freenet-$gateway_name"
+                    chmod +x "$CROSS_BINARIES_DIR/freenet-$gateway_name"
+                else
+                    compile_output="Failed to download freenet binary from workflow run $run_id"
+                    download_success=false
+                fi
+                
+                # Download fdev binary
+                if gh run download "$run_id" --repo freenet/freenet-core --name "$fdev_artifact_name" --dir "$temp_dir" 2>&1; then
+                    cp "$temp_dir/fdev" "$CROSS_BINARIES_DIR/fdev-$gateway_name"
+                    chmod +x "$CROSS_BINARIES_DIR/fdev-$gateway_name"
+                else
+                    compile_output="Failed to download fdev binary from workflow run $run_id"
+                    download_success=false
+                fi
+            fi
+            
+            # Download freenet-ping binary
+            if gh run download "$run_id" --repo freenet/freenet-core --name "$ping_artifact_name" --dir "$temp_dir" 2>&1; then
+                cp "$temp_dir/freenet-ping" "$CROSS_BINARIES_DIR/freenet-ping-$gateway_name"
+                chmod +x "$CROSS_BINARIES_DIR/freenet-ping-$gateway_name"
+            else
+                compile_output="Failed to download freenet-ping binary from workflow run $run_id"
+                download_success=false
+            fi
+            
+            rm -rf "$temp_dir"
+            
+            if [ "$download_success" = true ]; then
                 compile_result=0
             else
-                compile_output="Failed to download $target binary from workflow run $run_id"
                 compile_result=1
-                rm -rf "$temp_dir"
             fi
         fi
     fi
@@ -249,9 +297,11 @@ verify_deployment() {
     local hostname=$2
     local ssh_opts=$3
     
-    # Get version
-    local version
-    version=$(ssh $ssh_opts freenet@$hostname "/usr/local/bin/freenet --version 2>&1" || echo "Unknown")
+    # Get versions
+    local freenet_version
+    local fdev_version
+    freenet_version=$(ssh $ssh_opts freenet@$hostname "/usr/local/bin/freenet --version 2>&1" || echo "Unknown")
+    fdev_version=$(ssh $ssh_opts freenet@$hostname "/usr/local/bin/fdev --version 2>&1" || echo "Unknown")
     
     # Check for connection success
     local test_output
@@ -259,11 +309,13 @@ verify_deployment() {
     
     # Look for successful startup and no critical errors
     if echo "$test_output" | grep -q "Opening network listener" && ! echo "$test_output" | grep -i "panic\|crash\|error.*failed"; then
-        echo -e "  ${GREEN}✓${NC} Version: $version"
+        echo -e "  ${GREEN}✓${NC} Freenet: $freenet_version"
+        echo -e "  ${GREEN}✓${NC} Fdev: $fdev_version"
         echo -e "  ${GREEN}✓${NC} Service: Running"
         return 0
     else
-        echo -e "  ${YELLOW}⚠️${NC} Version: $version"
+        echo -e "  ${YELLOW}⚠️${NC} Freenet: $freenet_version"
+        echo -e "  ${YELLOW}⚠️${NC} Fdev: $fdev_version"
         echo -e "  ${YELLOW}⚠️${NC} Check logs for issues"
         return 1
     fi
@@ -277,11 +329,24 @@ deploy_to_gateway() {
     
     echo -e "\n${BLUE}📦 Deploying to $gateway_name${NC}"
     
-    local binary_path="$CROSS_BINARIES_DIR/freenet-$gateway_name"
+    local freenet_binary_path="$CROSS_BINARIES_DIR/freenet-$gateway_name"
+    local fdev_binary_path="$CROSS_BINARIES_DIR/fdev-$gateway_name"
+    local ping_binary_path="$CROSS_BINARIES_DIR/freenet-ping-$gateway_name"
     
-    # Check if binary exists
-    if [ ! -f "$binary_path" ]; then
-        show_progress "Binary not found for $gateway_name" "error"
+    # Check if required binaries exist
+    if [ "$PING_ONLY" = false ]; then
+        if [ ! -f "$freenet_binary_path" ]; then
+            show_progress "Freenet binary not found for $gateway_name" "error"
+            return 1
+        fi
+        if [ ! -f "$fdev_binary_path" ]; then
+            show_progress "Fdev binary not found for $gateway_name" "error"
+            return 1
+        fi
+    fi
+    
+    if [ ! -f "$ping_binary_path" ]; then
+        show_progress "Freenet-ping binary not found for $gateway_name" "error"
         return 1
     fi
     
@@ -291,67 +356,168 @@ deploy_to_gateway() {
         ssh_opts="-p $port"
     fi
     
-    # Stop the service
-    show_progress "Stopping service on $gateway_name" "start"
-    if ssh $ssh_opts freenet@$hostname "sudo systemctl stop freenet-gateway" 2>/dev/null; then
-        show_progress "Service stopped on $gateway_name" "success"
-    else
-        show_progress "Failed to stop service on $gateway_name" "error"
-        return 1
+    # Stop the service (only if deploying freenet)
+    if [ "$PING_ONLY" = false ]; then
+        show_progress "Stopping service on $gateway_name" "start"
+        if ssh $ssh_opts freenet@$hostname "sudo systemctl stop freenet-gateway" 2>/dev/null; then
+            show_progress "Service stopped on $gateway_name" "success"
+        else
+            show_progress "Failed to stop service on $gateway_name" "error"
+            return 1
+        fi
     fi
     
-    # Copy the binary
-    show_progress "Copying binary to $gateway_name" "start"
-    if scp ${ssh_opts//-p/-P} "$binary_path" "freenet@$hostname:freenet-new" 2>/dev/null; then
-        show_progress "Binary copied to $gateway_name" "success"
-    else
-        show_progress "Failed to copy binary to $gateway_name" "error"
-        ssh $ssh_opts freenet@$hostname "sudo systemctl start freenet-gateway" 2>/dev/null
-        return 1
-    fi
-    
-    # Install the binary
-    show_progress "Installing binary on $gateway_name" "start"
-    if ssh $ssh_opts freenet@$hostname "sudo cp freenet-new /usr/local/bin/freenet && sudo chown root:root /usr/local/bin/freenet && sudo chmod 755 /usr/local/bin/freenet && rm -f freenet-new" 2>/dev/null; then
-        show_progress "Binary installed on $gateway_name" "success"
-    else
-        show_progress "Failed to install binary on $gateway_name" "error"
-        ssh $ssh_opts freenet@$hostname "sudo systemctl start freenet-gateway" 2>/dev/null
-        return 1
-    fi
-    
-    # Clear journal logs
-    ssh $ssh_opts freenet@$hostname "sudo journalctl --vacuum-time=1s -u freenet-gateway" 2>/dev/null || true
-    
-    # Start the service
-    show_progress "Starting service on $gateway_name" "start"
-    if ssh $ssh_opts freenet@$hostname "sudo systemctl start freenet-gateway" 2>/dev/null; then
-        show_progress "Service started on $gateway_name" "success"
-    else
-        show_progress "Failed to start service on $gateway_name" "error"
-        return 1
-    fi
-    
-    # Wait a moment for service to start
-    sleep 3
-    
-    # Verify deployment
-    show_progress "Verifying deployment on $gateway_name" "start"
-    if verify_deployment "$gateway_name" "$hostname" "$ssh_opts"; then
-        show_progress "Deployment verified on $gateway_name" "success"
-        return 0
-    else
-        show_progress "Deployment verification failed on $gateway_name" "warning"
-        
-        # Show error details if verbose
-        if [ "$VERBOSE" = true ]; then
-            echo -e "${YELLOW}Recent logs from $gateway_name:${NC}"
-            ssh $ssh_opts freenet@$hostname "sudo journalctl -u freenet-gateway -n 20 --no-pager | grep -E '(ERROR|WARN|error|failed)'" || true
+    # Copy and install freenet binary (unless ping-only mode)
+    if [ "$PING_ONLY" = false ]; then
+        show_progress "Copying freenet binary to $gateway_name" "start"
+        if scp ${ssh_opts//-p/-P} "$freenet_binary_path" "freenet@$hostname:freenet-new" 2>/dev/null; then
+            show_progress "Freenet binary copied to $gateway_name" "success"
+        else
+            show_progress "Failed to copy freenet binary to $gateway_name" "error"
+            ssh $ssh_opts freenet@$hostname "sudo systemctl start freenet-gateway" 2>/dev/null
+            return 1
         fi
         
-        echo -e "${YELLOW}To monitor logs:${NC} ssh ${ssh_opts} freenet@$hostname 'sudo journalctl -u freenet-gateway -f'"
+        # Install the freenet binary in both locations
+        show_progress "Installing freenet binary on $gateway_name" "start"
+        if ssh $ssh_opts freenet@$hostname "
+            # Install in /usr/local/bin/
+            sudo cp freenet-new /usr/local/bin/freenet && 
+            sudo chown root:root /usr/local/bin/freenet && 
+            sudo chmod 755 /usr/local/bin/freenet &&
+            # Install in ~/.cargo/bin/ (create directory if needed)
+            mkdir -p ~/.cargo/bin &&
+            cp freenet-new ~/.cargo/bin/freenet &&
+            chmod 755 ~/.cargo/bin/freenet &&
+            rm -f freenet-new
+        " 2>/dev/null; then
+            show_progress "Freenet binary installed on $gateway_name" "success"
+        else
+            show_progress "Failed to install freenet binary on $gateway_name" "error"
+            ssh $ssh_opts freenet@$hostname "sudo systemctl start freenet-gateway" 2>/dev/null
+            return 1
+        fi
+        
+        # Copy and install fdev binary
+        show_progress "Copying fdev binary to $gateway_name" "start"
+        if scp ${ssh_opts//-p/-P} "$fdev_binary_path" "freenet@$hostname:fdev-new" 2>/dev/null; then
+            show_progress "Fdev binary copied to $gateway_name" "success"
+        else
+            show_progress "Failed to copy fdev binary to $gateway_name" "error"
+            ssh $ssh_opts freenet@$hostname "sudo systemctl start freenet-gateway" 2>/dev/null
+            return 1
+        fi
+        
+        # Install the fdev binary in both locations
+        show_progress "Installing fdev binary on $gateway_name" "start"
+        if ssh $ssh_opts freenet@$hostname "
+            # Install in /usr/local/bin/
+            sudo cp fdev-new /usr/local/bin/fdev && 
+            sudo chown root:root /usr/local/bin/fdev && 
+            sudo chmod 755 /usr/local/bin/fdev &&
+            # Install in ~/.cargo/bin/ (create directory if needed)
+            mkdir -p ~/.cargo/bin &&
+            cp fdev-new ~/.cargo/bin/fdev &&
+            chmod 755 ~/.cargo/bin/fdev &&
+            rm -f fdev-new
+        " 2>/dev/null; then
+            show_progress "Fdev binary installed on $gateway_name" "success"
+        else
+            show_progress "Failed to install fdev binary on $gateway_name" "error"
+            ssh $ssh_opts freenet@$hostname "sudo systemctl start freenet-gateway" 2>/dev/null
+            return 1
+        fi
+    fi
+    
+    # Copy and install freenet-ping binary
+    show_progress "Copying freenet-ping binary to $gateway_name" "start"
+    if scp ${ssh_opts//-p/-P} "$ping_binary_path" "freenet@$hostname:freenet-ping-new" 2>/dev/null; then
+        show_progress "Freenet-ping binary copied to $gateway_name" "success"
+    else
+        show_progress "Failed to copy freenet-ping binary to $gateway_name" "error"
+        if [ "$PING_ONLY" = false ]; then
+            ssh $ssh_opts freenet@$hostname "sudo systemctl start freenet-gateway" 2>/dev/null
+        fi
         return 1
     fi
+    
+    # Install the freenet-ping binary in both locations
+    show_progress "Installing freenet-ping binary on $gateway_name" "start"
+    if ssh $ssh_opts freenet@$hostname "
+        # Install in /usr/local/bin/
+        sudo cp freenet-ping-new /usr/local/bin/freenet-ping && 
+        sudo chown root:root /usr/local/bin/freenet-ping && 
+        sudo chmod 755 /usr/local/bin/freenet-ping &&
+        # Install in ~/.cargo/bin/ (create directory if needed)
+        mkdir -p ~/.cargo/bin &&
+        cp freenet-ping-new ~/.cargo/bin/freenet-ping &&
+        chmod 755 ~/.cargo/bin/freenet-ping &&
+        rm -f freenet-ping-new
+    " 2>/dev/null; then
+        show_progress "Freenet-ping binary installed on $gateway_name" "success"
+    else
+        show_progress "Failed to install freenet-ping binary on $gateway_name" "error"
+        if [ "$PING_ONLY" = false ]; then
+            ssh $ssh_opts freenet@$hostname "sudo systemctl start freenet-gateway" 2>/dev/null
+        fi
+        return 1
+    fi
+    
+    # Start the service and verify (only if deploying freenet)
+    if [ "$PING_ONLY" = false ]; then
+        # Clear journal logs
+        ssh $ssh_opts freenet@$hostname "sudo journalctl --vacuum-time=1s -u freenet-gateway" 2>/dev/null || true
+        
+        # Start the service
+        show_progress "Starting service on $gateway_name" "start"
+        if ssh $ssh_opts freenet@$hostname "sudo systemctl start freenet-gateway" 2>/dev/null; then
+            show_progress "Service started on $gateway_name" "success"
+        else
+            show_progress "Failed to start service on $gateway_name" "error"
+            return 1
+        fi
+        
+        # Wait a moment for service to start
+        sleep 3
+        
+        # Verify deployment
+        show_progress "Verifying deployment on $gateway_name" "start"
+        if verify_deployment "$gateway_name" "$hostname" "$ssh_opts"; then
+            show_progress "Deployment verified on $gateway_name" "success"
+        else
+            show_progress "Deployment verification failed on $gateway_name" "warning"
+            
+            # Show error details if verbose
+            if [ "$VERBOSE" = true ]; then
+                echo -e "${YELLOW}Recent logs from $gateway_name:${NC}"
+                ssh $ssh_opts freenet@$hostname "sudo journalctl -u freenet-gateway -n 20 --no-pager | grep -E '(ERROR|WARN|error|failed)'" || true
+            fi
+            
+            echo -e "${YELLOW}To monitor logs:${NC} ssh ${ssh_opts} freenet@$hostname 'sudo journalctl -u freenet-gateway -f'"
+            return 1
+        fi
+    else
+        # For ping-only deployment, verify the binary is installed in both locations
+        show_progress "Verifying freenet-ping installation on $gateway_name" "start"
+        if ssh $ssh_opts freenet@$hostname "
+            /usr/local/bin/freenet-ping --version >/dev/null 2>&1 &&
+            ~/.cargo/bin/freenet-ping --version >/dev/null 2>&1
+        " 2>/dev/null; then
+            # Get and display version info
+            local ping_version_system
+            local ping_version_cargo
+            ping_version_system=$(ssh $ssh_opts freenet@$hostname "/usr/local/bin/freenet-ping --version 2>&1" || echo "Unknown")
+            ping_version_cargo=$(ssh $ssh_opts freenet@$hostname "~/.cargo/bin/freenet-ping --version 2>&1" || echo "Unknown")
+            echo -e "  ${GREEN}✓${NC} System freenet-ping: $ping_version_system"
+            echo -e "  ${GREEN}✓${NC} Cargo freenet-ping: $ping_version_cargo"
+            show_progress "Freenet-ping installed successfully on $gateway_name" "success"
+        else
+            show_progress "Freenet-ping installation verification failed on $gateway_name" "warning"
+            return 1
+        fi
+    fi
+    
+    return 0
 }
 
 # Main execution
