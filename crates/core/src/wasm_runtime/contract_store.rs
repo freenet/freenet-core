@@ -148,11 +148,25 @@ impl ContractStore {
             RuntimeInnerError::UnwrapContract
         })?;
         if self.contract_cache.get(code_hash).is_some() {
+            // Check if this contract instance is in the index
+            let in_index = self.key_to_code_part.contains_key(key.id());
             tracing::debug!(
                 contract = %key,
                 code_hash = %code_hash,
-                "STORE_CONTRACT: Already in cache, skipping"
+                in_index = in_index,
+                "STORE_CONTRACT: Already in cache, checking index"
             );
+            if !in_index {
+                tracing::warn!(
+                    contract = %key,
+                    code_hash = %code_hash,
+                    "STORE_CONTRACT: Contract in cache but NOT in index! Updating index now"
+                );
+                // Update the index even if contract is in cache
+                let offset = Self::insert(&mut self.index_file, *key.id(), code_hash)?;
+                self.key_to_code_part
+                    .insert(*key.id(), (offset, *code_hash));
+            }
             return Ok(());
         }
         let key_path = code_hash.encode();
@@ -160,6 +174,25 @@ impl ContractStore {
         if let Ok((code, _ver)) = ContractCode::load_versioned_from_path(&key_path) {
             let size = code.data().len() as i64;
             self.contract_cache.insert(*code_hash, Arc::new(code), size);
+            // Check if this contract instance is in the index
+            let in_index = self.key_to_code_part.contains_key(key.id());
+            tracing::debug!(
+                contract = %key,
+                code_hash = %code_hash,
+                in_index = in_index,
+                "STORE_CONTRACT: Loaded from disk into cache, checking index"
+            );
+            if !in_index {
+                tracing::warn!(
+                    contract = %key,
+                    code_hash = %code_hash,
+                    "STORE_CONTRACT: Contract loaded from disk but NOT in index! Updating index now"
+                );
+                // Update the index even if contract is on disk
+                let offset = Self::insert(&mut self.index_file, *key.id(), code_hash)?;
+                self.key_to_code_part
+                    .insert(*key.id(), (offset, *code_hash));
+            }
             return Ok(());
         }
 
