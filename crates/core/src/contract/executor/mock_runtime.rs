@@ -92,6 +92,8 @@ impl RuntimePool<String, MockRuntime> {
 
         runtimes.push(Some(executor));
 
+        let shared_storage = Storage::new(&exec_dir).await?;
+
         Ok(RuntimePool {
             runtimes,
             available: Semaphore::new(num_executors.get()),
@@ -101,6 +103,7 @@ impl RuntimePool<String, MockRuntime> {
             pending_registrations: HashMap::new(),
             next_executor_id: 1, // We start at 1 since the initial executor has ID 0
             delegate_attested_ids: HashMap::new(),
+            shared_storage,
         })
     }
 

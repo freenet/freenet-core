@@ -46,6 +46,8 @@ pub(crate) struct RuntimePool<C = Arc<Config>, R = Runtime> {
     pub next_executor_id: usize,
     // Track attested contracts for delegates
     pub delegate_attested_ids: HashMap<DelegateKey, Vec<ContractInstanceId>>,
+    // Shared storage instance to avoid database locking conflicts
+    pub(super) shared_storage: Storage,
 }
 
 impl RuntimePool<Arc<Config>, Runtime> {
@@ -90,6 +92,7 @@ impl RuntimePool<Arc<Config>, Runtime> {
             pending_registrations: HashMap::new(),
             next_executor_id: next_id,
             delegate_attested_ids: HashMap::new(),
+            shared_storage,
         })
     }
 
@@ -213,22 +216,9 @@ impl ContractExecutor for RuntimePool<Arc<Config>, Runtime> {
     }
 
     async fn create_new_executor(&mut self) -> Self::InnerExecutor {
-        // Get storage from an existing executor to avoid database locking
-        let storage = {
-            // Find the first available executor to get its storage
-            let existing_executor = self
-                .runtimes
-                .iter()
-                .find_map(|slot| slot.as_ref())
-                .expect("No existing executors to clone storage from");
-
-            // Clone the storage from the existing executor's state_store
-            existing_executor.state_store.storage().clone()
-        };
-
         let mut executor = Executor::from_config(
             self.config.clone(),
-            Some(storage),
+            Some(self.shared_storage.clone()),
             Some(self.op_sender.clone()),
             Some(self.op_manager.clone()),
         )

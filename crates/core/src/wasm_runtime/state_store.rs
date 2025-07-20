@@ -71,11 +71,6 @@ where
         })
     }
 
-    /// Get a reference to the underlying storage
-    pub fn storage(&self) -> &S {
-        &self.store
-    }
-
     pub async fn update(
         &mut self,
         key: &ContractKey,
