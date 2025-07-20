@@ -237,6 +237,14 @@ async fn test_put_contract() -> TestResult {
             // Verify the responses
             assert_eq!(response_key, contract_key);
             assert_eq!(response_contract, contract);
+
+            // Debug the state comparison
+            tracing::info!("Original state: {:?}", wrapped_state);
+            tracing::info!("Response state: {:?}", response_state);
+            tracing::info!("Original state bytes: {:x?}", wrapped_state.as_ref());
+            tracing::info!("Response state bytes: {:x?}", response_state.as_ref());
+            tracing::info!("States equal: {}", response_state == wrapped_state);
+
             assert_eq!(response_state, wrapped_state);
         }
 

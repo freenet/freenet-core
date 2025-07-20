@@ -62,9 +62,13 @@ impl RuntimePool<Arc<Config>, Runtime> {
         let mut runtimes = Vec::with_capacity(pool_size.into());
         let mut next_id = 0;
 
+        // Create shared storage once to avoid database locking conflicts
+        let shared_storage = Storage::new(&config.db_dir()).await?;
+
         for _ in 0..pool_size.into() {
             let mut executor = Executor::from_config(
                 config.clone(),
+                Some(shared_storage.clone()),
                 Some(op_sender.clone()),
                 Some(op_manager.clone()),
             )
@@ -209,8 +213,22 @@ impl ContractExecutor for RuntimePool<Arc<Config>, Runtime> {
     }
 
     async fn create_new_executor(&mut self) -> Self::InnerExecutor {
+        // Get storage from an existing executor to avoid database locking
+        let storage = {
+            // Find the first available executor to get its storage
+            let existing_executor = self
+                .runtimes
+                .iter()
+                .find_map(|slot| slot.as_ref())
+                .expect("No existing executors to clone storage from");
+
+            // Clone the storage from the existing executor's state_store
+            existing_executor.state_store.storage().clone()
+        };
+
         let mut executor = Executor::from_config(
             self.config.clone(),
+            Some(storage),
             Some(self.op_sender.clone()),
             Some(self.op_manager.clone()),
         )
@@ -412,6 +430,18 @@ async fn upsert_contract_state_inner(
         false
     };
 
+    // Check if this is an initial PUT or an UPDATE to existing contract
+    let is_initial_put = match &update {
+        Either::Left(_) => {
+            // For PUT operations, check if contract already exists
+            executor.state_store.get(&key).await.is_err()
+        }
+        Either::Right(_) => {
+            // Delta operations are always updates to existing contracts
+            false
+        }
+    };
+
     let mut updates = match update {
         Either::Left(incoming_state) => {
             let result = match executor.runtime.validate_state(
@@ -460,61 +490,75 @@ async fn upsert_contract_state_inner(
         }
     };
 
-    let current_state = match executor.state_store.get(&key).await {
-        Ok(s) => s,
-        Err(StateStoreError::MissingContract(_)) => {
-            tracing::warn!("Missing contract {key} for upsert");
-            return Err(ExecutorError::request(StdContractError::MissingContract {
-                key: key.into(),
-            }));
-        }
-        Err(StateStoreError::Any(err)) => return Err(ExecutorError::other(err)),
-    };
-
-    for (id, state) in related_contracts
-        .states()
-        .filter_map(|(id, c)| c.as_ref().map(|c| (id, c)))
-    {
-        updates.push(UpdateData::RelatedState {
-            related_to: *id,
-            state: state.clone(),
-        });
-    }
-
-    let updated_state = match executor
-        .attempt_state_update(&params, &current_state, &key, &updates)
-        .await?
-    {
-        Either::Left(s) => s,
-        Either::Right(mut r) => {
-            let Some(c) = r.pop() else {
-                // this branch should be unreachable since attempt_state_update should only
-                return Err(ExecutorError::internal_error());
-            };
-            return Err(ExecutorError::request(StdContractError::MissingRelated {
-                key: c.contract_instance_id,
-            }));
-        }
-    };
-    match executor
-        .runtime
-        .validate_state(&key, &params, &updated_state, &related_contracts)
-        .map_err(|e| ExecutorError::execution(e, None))?
-    {
-        ValidateResult::Valid => {
-            if updated_state.as_ref() == current_state.as_ref() {
-                Ok(UpsertResult::NoChange)
-            } else {
-                Ok(UpsertResult::Updated(updated_state))
+    if is_initial_put {
+        // For initial PUT operations: only validate and store, don't call update_state
+        let stored_state = match executor.state_store.get(&key).await {
+            Ok(s) => s,
+            Err(StateStoreError::MissingContract(_)) => {
+                return Err(ExecutorError::request(StdContractError::MissingContract {
+                    key: key.into(),
+                }));
             }
+            Err(StateStoreError::Any(err)) => return Err(ExecutorError::other(err)),
+        };
+        Ok(UpsertResult::Updated(stored_state))
+    } else {
+        let current_state = match executor.state_store.get(&key).await {
+            Ok(s) => s,
+            Err(StateStoreError::MissingContract(_)) => {
+                tracing::warn!("Missing contract {key} for upsert");
+                return Err(ExecutorError::request(StdContractError::MissingContract {
+                    key: key.into(),
+                }));
+            }
+            Err(StateStoreError::Any(err)) => return Err(ExecutorError::other(err)),
+        };
+
+        for (id, state) in related_contracts
+            .states()
+            .filter_map(|(id, c)| c.as_ref().map(|c| (id, c)))
+        {
+            updates.push(UpdateData::RelatedState {
+                related_to: *id,
+                state: state.clone(),
+            });
         }
-        ValidateResult::Invalid => Err(ExecutorError::request(
-            freenet_stdlib::client_api::ContractError::Update {
-                key,
-                cause: "invalid outcome state".into(),
-            },
-        )),
-        ValidateResult::RequestRelated(_) => todo!(),
+
+        let updated_state = match executor
+            .attempt_state_update(&params, &current_state, &key, &updates)
+            .await?
+        {
+            Either::Left(s) => s,
+            Either::Right(mut r) => {
+                let Some(c) = r.pop() else {
+                    // this branch should be unreachable since attempt_state_update should only
+                    return Err(ExecutorError::internal_error());
+                };
+                return Err(ExecutorError::request(StdContractError::MissingRelated {
+                    key: c.contract_instance_id,
+                }));
+            }
+        };
+        match executor
+            .runtime
+            .validate_state(&key, &params, &updated_state, &related_contracts)
+            .map_err(|e| ExecutorError::execution(e, None))?
+        {
+            ValidateResult::Valid => {
+                if updated_state.as_ref() == current_state.as_ref() {
+                    Ok(UpsertResult::NoChange)
+                } else {
+                    Ok(UpsertResult::Updated(updated_state))
+                }
+            }
+            ValidateResult::Invalid => Err(ExecutorError::request(
+                freenet_stdlib::client_api::ContractError::Update {
+                    key,
+                    cause: "invalid outcome state".into(),
+                },
+            )),
+            ValidateResult::RequestRelated(_) => todo!(),
+        }
     }
 }
 
@@ -531,12 +575,26 @@ impl Executor<Runtime> {
 
     async fn from_config(
         config: Arc<Config>,
+        storage: Option<Storage>,
         op_sender: Option<OpResult>,
         op_manager: Option<Arc<OpManager>>,
     ) -> anyhow::Result<Self> {
-        let (contract_store, delegate_store, secret_store, state_store) =
-            Self::get_stores(&config).await?;
+        const MAX_SIZE: i64 = 10 * 1024 * 1024;
+        const MAX_MEM_CACHE: u32 = 10_000_000;
+
+        let state_store = match storage {
+            Some(storage) => StateStore::new(storage, MAX_MEM_CACHE).unwrap(),
+            None => {
+                let storage = Storage::new(&config.db_dir()).await?;
+                StateStore::new(storage, MAX_MEM_CACHE).unwrap()
+            }
+        };
+
+        let contract_store = ContractStore::new(config.contracts_dir(), MAX_SIZE)?;
+        let delegate_store = DelegateStore::new(config.delegates_dir(), MAX_SIZE)?;
+        let secret_store = SecretsStore::new(config.secrets_dir(), config.secrets.clone())?;
         let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+
         let mut executor =
             Executor::new(state_store, config.mode, rt, op_sender, op_manager).await?;
         executor.id = 0; // ID will be assigned by the pool
@@ -842,6 +900,7 @@ impl Executor<Runtime> {
 
         if self.get_local_contract(key.id()).await.is_ok() {
             // already existing contract, just try to merge states
+            tracing::warn!("CONTRACT_EXISTS_DEBUG: Contract already exists during PUT, treating as update, key: {}", key);
             return self
                 .perform_contract_update(key, UpdateData::State(state.into()))
                 .await;
