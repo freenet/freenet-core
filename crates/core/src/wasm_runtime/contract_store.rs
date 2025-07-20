@@ -70,10 +70,23 @@ impl ContractStore {
         key: &ContractKey,
         params: &Parameters<'_>,
     ) -> Option<ContractContainer> {
+        tracing::debug!(
+            contract = %key,
+            has_code_hash = key.code_hash().is_some(),
+            "FETCH_CONTRACT_START: Attempting to fetch contract"
+        );
+
         let result = key
             .code_hash()
             .and_then(|code_hash| {
-                self.contract_cache.get(code_hash).map(|data| {
+                let cached = self.contract_cache.get(code_hash);
+                tracing::debug!(
+                    contract = %key,
+                    code_hash = %code_hash,
+                    found_in_cache = cached.is_some(),
+                    "FETCH_CONTRACT: Checking cache by code hash"
+                );
+                cached.map(|data| {
                     Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
                         WrappedContract::new(data.value().clone(), params.clone().into_owned()),
                     )))
@@ -81,10 +94,18 @@ impl ContractStore {
             })
             .flatten();
         if result.is_some() {
+            tracing::debug!(contract = %key, "FETCH_CONTRACT: Found in cache");
             return result;
         }
 
-        self.key_to_code_part.get(key.id()).and_then(|key| {
+        let key_lookup = self.key_to_code_part.get(key.id());
+        tracing::debug!(
+            contract = %key,
+            found_in_index = key_lookup.is_some(),
+            "FETCH_CONTRACT: Checking key_to_code_part index"
+        );
+
+        key_lookup.and_then(|key| {
             let code_hash = key.value().1;
             let path = code_hash.encode();
             let key_path = self.contracts_dir.join(path).with_extension("wasm");
@@ -118,11 +139,20 @@ impl ContractStore {
             }
             _ => unimplemented!(),
         };
+        tracing::debug!(
+            contract = %key,
+            "STORE_CONTRACT_START: Attempting to store contract"
+        );
         let code_hash = key.code_hash().ok_or_else(|| {
             tracing::warn!("trying to store partially unspecified contract `{}`", key);
             RuntimeInnerError::UnwrapContract
         })?;
         if self.contract_cache.get(code_hash).is_some() {
+            tracing::debug!(
+                contract = %key,
+                code_hash = %code_hash,
+                "STORE_CONTRACT: Already in cache, skipping"
+            );
             return Ok(());
         }
         let key_path = code_hash.encode();
@@ -165,6 +195,11 @@ impl ContractStore {
             }
         }
 
+        tracing::debug!(
+            contract = %key,
+            code_hash = %code_hash,
+            "STORE_CONTRACT_SUCCESS: Contract stored successfully"
+        );
         Ok(())
     }
 
