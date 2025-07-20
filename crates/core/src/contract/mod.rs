@@ -230,8 +230,8 @@ where
                         nonce,
                     } => freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
                         delegate: delegate.clone(),
-                        cipher: cipher.clone(),
-                        nonce: nonce.clone(),
+                        cipher,
+                        nonce,
                     },
                     freenet_stdlib::client_api::DelegateRequest::UnregisterDelegate(key) => {
                         freenet_stdlib::client_api::DelegateRequest::UnregisterDelegate(key.clone())

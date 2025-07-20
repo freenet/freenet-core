@@ -44,8 +44,6 @@ pub(crate) struct RuntimePool<C = Arc<Config>, R = Runtime> {
     pub(super) pending_registrations: HashMap<usize, Vec<PendingRegistration>>,
     // Next executor ID to assign
     pub next_executor_id: usize,
-    // Track attested contracts for delegates
-    pub delegate_attested_ids: HashMap<DelegateKey, Vec<ContractInstanceId>>,
     // Shared storage instance to avoid database locking conflicts
     pub(super) shared_storage: Storage,
 }
@@ -91,7 +89,6 @@ impl RuntimePool<Arc<Config>, Runtime> {
             op_manager,
             pending_registrations: HashMap::new(),
             next_executor_id: next_id,
-            delegate_attested_ids: HashMap::new(),
             shared_storage,
         })
     }
@@ -232,6 +229,7 @@ impl ContractExecutor for RuntimePool<Arc<Config>, Runtime> {
         executor
     }
 
+    #[allow(clippy::async_yields_async)]
     fn execute_delegate_request(
         &mut self,
         req: DelegateRequest<'static>,
@@ -357,10 +355,10 @@ impl ContractExecutor for RuntimePool<Arc<Config>, Runtime> {
 
         // Since we can't access executors that are currently in use,
         // we'll return subscription info from pending registrations
-        for (_executor_id, registrations) in &self.pending_registrations {
+        for registrations in self.pending_registrations.values() {
             for reg in registrations {
                 subscriptions.push(crate::message::SubscriptionInfo {
-                    contract_key: reg.key.clone(),
+                    contract_key: reg.key,
                     client_id: reg.cli_id,
                     last_update: Some(std::time::SystemTime::now()),
                 });

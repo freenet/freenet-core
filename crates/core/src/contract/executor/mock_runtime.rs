@@ -102,7 +102,6 @@ impl RuntimePool<String, MockRuntime> {
             config: identifier.to_string(),
             pending_registrations: HashMap::new(),
             next_executor_id: 1, // We start at 1 since the initial executor has ID 0
-            delegate_attested_ids: HashMap::new(),
             shared_storage,
         })
     }
@@ -259,6 +258,7 @@ impl ContractExecutor for RuntimePool<String, MockRuntime> {
         Ok(())
     }
 
+    #[allow(clippy::manual_async_fn, clippy::async_yields_async)]
     fn execute_delegate_request(
         &mut self,
         _req: DelegateRequest<'static>,
@@ -266,25 +266,25 @@ impl ContractExecutor for RuntimePool<String, MockRuntime> {
     ) -> impl Future<Output = impl Future<Output = (Self::InnerExecutor, Response)> + Send + 'static>
            + Send {
         async move {
+            // Create a dummy executor for error case
+            let executor = Executor {
+                id: 0,
+                mode: OperationMode::Local,
+                runtime: MockRuntime {
+                    contract_store: ContractStore::new(std::env::temp_dir(), 1024).unwrap(),
+                },
+                state_store: StateStore::new(
+                    Storage::new(&std::env::temp_dir()).await.unwrap(),
+                    1024,
+                )
+                .unwrap(),
+                update_notifications: std::collections::HashMap::default(),
+                subscriber_summaries: std::collections::HashMap::default(),
+                delegate_attested_ids: std::collections::HashMap::default(),
+                op_sender: None,
+                op_manager: None,
+            };
             async move {
-                // Create a dummy executor for error case
-                let executor = Executor {
-                    id: 0,
-                    mode: OperationMode::Local,
-                    runtime: MockRuntime {
-                        contract_store: ContractStore::new(std::env::temp_dir(), 1024).unwrap(),
-                    },
-                    state_store: StateStore::new(
-                        Storage::new(&std::env::temp_dir()).await.unwrap(),
-                        1024,
-                    )
-                    .unwrap(),
-                    update_notifications: std::collections::HashMap::default(),
-                    subscriber_summaries: std::collections::HashMap::default(),
-                    delegate_attested_ids: std::collections::HashMap::default(),
-                    op_sender: None,
-                    op_manager: None,
-                };
                 (
                     executor,
                     Err(ExecutorError::other(anyhow::anyhow!(
