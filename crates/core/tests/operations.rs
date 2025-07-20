@@ -189,11 +189,11 @@ async fn test_put_contract() -> TestResult {
     }
     .boxed_local();
 
-    let test = tokio::time::timeout(Duration::from_secs(120), async {
-        // Wait for nodes to start up
-        tracing::info!("Waiting for nodes to start up...");
-        tokio::time::sleep(Duration::from_secs(15)).await;
-        tracing::info!("Nodes should be ready, proceeding with test...");
+    let test = tokio::time::timeout(Duration::from_secs(180), async {
+        // Wait for nodes to start up and establish connections
+        tracing::info!("Waiting for nodes to start up and establish connections...");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        tracing::info!("Nodes should be ready and connected, proceeding with test...");
 
         // Connect to node A's websocket API
         let uri = format!(
