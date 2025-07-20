@@ -163,8 +163,8 @@ async fn test_put_contract() -> TestResult {
     .await?;
     let ws_api_port_peer_a = config_a.ws_api.ws_api_port.unwrap();
 
-    tracing::info!("Node A data dir: {:?}", preset_cfg_b.temp_dir.path());
-    tracing::info!("Node B data dir: {:?}", preset_cfg_a.temp_dir.path());
+    tracing::info!("Node A data dir: {:?}", preset_cfg_a.temp_dir.path());
+    tracing::info!("Node B data dir: {:?}", preset_cfg_b.temp_dir.path());
 
     std::mem::drop(ws_api_port_socket_a); // Free the port so it does not fail on initialization
     let node_a = async move {
