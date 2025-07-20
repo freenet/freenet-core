@@ -38,7 +38,7 @@ use crate::{
     router::Router,
 };
 
-mod connection_manager;
+pub mod connection_manager;
 pub(crate) use connection_manager::ConnectionManager;
 mod connection;
 mod live_tx;
@@ -236,10 +236,10 @@ impl Ring {
         &self,
         peers: impl Iterator<Item = &'a PeerKeyLocation>,
     ) -> impl Iterator<Item = &'a PeerKeyLocation> + Send {
-        let locs = &*self.connection_manager.location_for_peer.read();
+        let connections = &*self.connection_manager.location_for_peer.read();
         let mut filtered = Vec::new();
         for peer in peers {
-            if !locs.contains_key(&peer.peer) {
+            if !connections.contains_key(&peer.peer) {
                 filtered.push(peer);
             }
         }
