@@ -416,17 +416,18 @@ impl HandshakeHandler {
                             } else {
                                 Location::from_address(&req.conn.remote_addr())
                             };
-                            // Check if this peer has a gateway connection - if not, add it as transient
-                            let has_existing = self.connection_manager.is_connected(&req.joiner);
-                            if !has_existing {
-                                // This is a new gateway connection - add as transient
-                                self.connection_manager.add_connection_with_state(location, req.joiner.clone(), false, crate::ring::connection_manager::ConnectionState::Transient);
-                            }
 
+                            // First check if we should accept the connection
+                            let has_existing = self.connection_manager.is_connected(&req.joiner);
                             let should_accept = self.connection_manager.should_accept_with_upgrade(location, &req.joiner, true);
+
                             if should_accept {
-                                // If we're upgrading from transient, do the upgrade
-                                if has_existing {
+                                // Only add the connection if we're going to accept it
+                                if !has_existing {
+                                    // This is a new gateway connection - add as transient
+                                    self.connection_manager.add_connection_with_state(location, req.joiner.clone(), false, crate::ring::connection_manager::ConnectionState::Transient);
+                                } else {
+                                    // If we're upgrading from transient, do the upgrade
                                     self.connection_manager.upgrade_gateway_connection(&req.joiner);
                                 }
                                 let accepted_msg = NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
