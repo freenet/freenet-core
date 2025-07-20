@@ -70,10 +70,23 @@ impl ContractStore {
         key: &ContractKey,
         params: &Parameters<'_>,
     ) -> Option<ContractContainer> {
+        tracing::debug!(
+            contract = %key,
+            has_code_hash = key.code_hash().is_some(),
+            "FETCH_CONTRACT_START: Attempting to fetch contract"
+        );
+
         let result = key
             .code_hash()
             .and_then(|code_hash| {
-                self.contract_cache.get(code_hash).map(|data| {
+                let cached = self.contract_cache.get(code_hash);
+                tracing::debug!(
+                    contract = %key,
+                    code_hash = %code_hash,
+                    found_in_cache = cached.is_some(),
+                    "FETCH_CONTRACT: Checking cache by code hash"
+                );
+                cached.map(|data| {
                     Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
                         WrappedContract::new(data.value().clone(), params.clone().into_owned()),
                     )))
@@ -81,10 +94,18 @@ impl ContractStore {
             })
             .flatten();
         if result.is_some() {
+            tracing::debug!(contract = %key, "FETCH_CONTRACT: Found in cache");
             return result;
         }
 
-        self.key_to_code_part.get(key.id()).and_then(|key| {
+        let key_lookup = self.key_to_code_part.get(key.id());
+        tracing::debug!(
+            contract = %key,
+            found_in_index = key_lookup.is_some(),
+            "FETCH_CONTRACT: Checking key_to_code_part index"
+        );
+
+        key_lookup.and_then(|key| {
             let code_hash = key.value().1;
             let path = code_hash.encode();
             let key_path = self.contracts_dir.join(path).with_extension("wasm");
@@ -118,11 +139,34 @@ impl ContractStore {
             }
             _ => unimplemented!(),
         };
+        tracing::debug!(
+            contract = %key,
+            "STORE_CONTRACT_START: Attempting to store contract"
+        );
         let code_hash = key.code_hash().ok_or_else(|| {
             tracing::warn!("trying to store partially unspecified contract `{}`", key);
             RuntimeInnerError::UnwrapContract
         })?;
         if self.contract_cache.get(code_hash).is_some() {
+            // Check if this contract instance is in the index
+            let in_index = self.key_to_code_part.contains_key(key.id());
+            tracing::debug!(
+                contract = %key,
+                code_hash = %code_hash,
+                in_index = in_index,
+                "STORE_CONTRACT: Already in cache, checking index"
+            );
+            if !in_index {
+                tracing::warn!(
+                    contract = %key,
+                    code_hash = %code_hash,
+                    "STORE_CONTRACT: Contract in cache but NOT in index! Updating index now"
+                );
+                // Update the index even if contract is in cache
+                let offset = Self::insert(&mut self.index_file, *key.id(), code_hash)?;
+                self.key_to_code_part
+                    .insert(*key.id(), (offset, *code_hash));
+            }
             return Ok(());
         }
         let key_path = code_hash.encode();
@@ -130,6 +174,25 @@ impl ContractStore {
         if let Ok((code, _ver)) = ContractCode::load_versioned_from_path(&key_path) {
             let size = code.data().len() as i64;
             self.contract_cache.insert(*code_hash, Arc::new(code), size);
+            // Check if this contract instance is in the index
+            let in_index = self.key_to_code_part.contains_key(key.id());
+            tracing::debug!(
+                contract = %key,
+                code_hash = %code_hash,
+                in_index = in_index,
+                "STORE_CONTRACT: Loaded from disk into cache, checking index"
+            );
+            if !in_index {
+                tracing::warn!(
+                    contract = %key,
+                    code_hash = %code_hash,
+                    "STORE_CONTRACT: Contract loaded from disk but NOT in index! Updating index now"
+                );
+                // Update the index even if contract is on disk
+                let offset = Self::insert(&mut self.index_file, *key.id(), code_hash)?;
+                self.key_to_code_part
+                    .insert(*key.id(), (offset, *code_hash));
+            }
             return Ok(());
         }
 
@@ -165,6 +228,11 @@ impl ContractStore {
             }
         }
 
+        tracing::debug!(
+            contract = %key,
+            code_hash = %code_hash,
+            "STORE_CONTRACT_SUCCESS: Contract stored successfully"
+        );
         Ok(())
     }
 

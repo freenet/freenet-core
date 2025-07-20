@@ -4,11 +4,27 @@ use crate::topology::{Limits, TopologyManager};
 
 use super::*;
 
+/// State of a peer connection within the ring topology
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    /// Transient gateway connection used for bootstrapping
+    Transient,
+    /// Full peer connection that's part of the ring topology
+    Ring,
+}
+
+/// Information about a connected peer
+#[derive(Debug, Clone)]
+pub struct ConnectionInfo {
+    pub location: Location,
+    pub state: ConnectionState,
+}
+
 #[derive(Clone)]
 pub(crate) struct ConnectionManager {
     open_connections: Arc<AtomicUsize>,
     reserved_connections: Arc<AtomicUsize>,
-    pub(super) location_for_peer: Arc<RwLock<BTreeMap<PeerId, Location>>>,
+    pub(super) location_for_peer: Arc<RwLock<BTreeMap<PeerId, ConnectionInfo>>>,
     pub(super) topology_manager: Arc<RwLock<TopologyManager>>,
     connections_by_location: Arc<RwLock<BTreeMap<Location, Vec<Connection>>>>,
     /// Interim connections ongoing handshake or successfully open connections
@@ -140,6 +156,15 @@ impl ConnectionManager {
     /// # Panic
     /// Will panic if the node checking for this condition has no location assigned.
     pub fn should_accept(&self, location: Location, peer_id: &PeerId) -> bool {
+        self.should_accept_with_upgrade(location, peer_id, false)
+    }
+
+    pub fn should_accept_with_upgrade(
+        &self,
+        location: Location,
+        peer_id: &PeerId,
+        allow_upgrade: bool,
+    ) -> bool {
         tracing::debug!("Checking if should accept connection");
         let open = self
             .open_connections
@@ -154,12 +179,19 @@ impl ConnectionManager {
             return true;
         }
 
-        if self.location_for_peer.read().get(peer_id).is_some() {
-            // avoid connecting more than once to the same peer
-            self.reserved_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            tracing::debug!(%peer_id, "Peer already connected");
-            return false;
+        if let Some(connection_info) = self.location_for_peer.read().get(peer_id) {
+            if allow_upgrade && connection_info.state == ConnectionState::Transient {
+                // Allow upgrading transient gateway connection to ring connection
+                tracing::debug!(%peer_id, "Allowing upgrade from transient to ring connection");
+                // Don't decrement reserved_connections here - the upgrade will handle it
+                return true;
+            } else {
+                // avoid connecting more than once to the same peer
+                self.reserved_connections
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                tracing::debug!(%peer_id, state=?connection_info.state, "Peer already connected, rejecting");
+                return false;
+            }
         }
 
         let accepted = if total_conn < self.min_connections {
@@ -250,7 +282,17 @@ impl ConnectionManager {
     }
 
     pub fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) {
-        tracing::debug!(%peer, "Adding connection");
+        self.add_connection_with_state(loc, peer, was_reserved, ConnectionState::Ring);
+    }
+
+    pub fn add_connection_with_state(
+        &self,
+        loc: Location,
+        peer: PeerId,
+        was_reserved: bool,
+        state: ConnectionState,
+    ) {
+        tracing::debug!(%peer, state=?state, "Adding connection");
         debug_assert!(self.get_peer_key().expect("should be set") != peer);
         if was_reserved {
             let old = self
@@ -266,7 +308,13 @@ impl ConnectionManager {
             let _ = old;
         }
         let mut lop = self.location_for_peer.write();
-        lop.insert(peer.clone(), loc);
+        lop.insert(
+            peer.clone(),
+            ConnectionInfo {
+                location: loc,
+                state,
+            },
+        );
         {
             let mut cbl = self.connections_by_location.write();
             cbl.entry(loc).or_default().push(Connection {
@@ -288,7 +336,7 @@ impl ConnectionManager {
 
         let mut locations_for_peer = self.location_for_peer.write();
 
-        let Some(loc) = locations_for_peer.remove(peer) else {
+        let Some(connection_info) = locations_for_peer.remove(peer) else {
             if is_alive {
                 tracing::debug!("no location found for peer, skip pruning");
                 return None;
@@ -300,7 +348,7 @@ impl ConnectionManager {
         };
 
         let conns = &mut *self.connections_by_location.write();
-        if let Some(conns) = conns.get_mut(&loc) {
+        if let Some(conns) = conns.get_mut(&connection_info.location) {
             if let Some(pos) = conns.iter().position(|c| &c.location.peer == peer) {
                 conns.swap_remove(pos);
             }
@@ -314,7 +362,29 @@ impl ConnectionManager {
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
 
-        Some(loc)
+        Some(connection_info.location)
+    }
+
+    /// Check if a peer is connected (in any state)
+    pub fn is_connected(&self, peer_id: &PeerId) -> bool {
+        self.location_for_peer.read().contains_key(peer_id)
+    }
+
+    /// Upgrade a transient gateway connection to a full ring connection
+    pub fn upgrade_gateway_connection(&self, peer_id: &PeerId) -> bool {
+        let mut connections = self.location_for_peer.write();
+        if let Some(connection_info) = connections.get_mut(peer_id) {
+            if connection_info.state == ConnectionState::Transient {
+                tracing::debug!(%peer_id, "Upgrading gateway connection to ring connection");
+                connection_info.state = ConnectionState::Ring;
+                return true;
+            } else {
+                tracing::warn!(%peer_id, state=?connection_info.state, "Cannot upgrade connection - not in transient state");
+                return false;
+            }
+        }
+        tracing::warn!(%peer_id, "Cannot upgrade connection - peer not found");
+        false
     }
 
     pub(super) fn get_open_connections(&self) -> usize {
@@ -343,14 +413,14 @@ impl ConnectionManager {
                 return None;
             }
             let selected = rng.gen_range(0..amount);
-            let (peer, loc) = peers.iter().nth(selected).expect("infallible");
+            let (peer, connection_info) = peers.iter().nth(selected).expect("infallible");
             if !filter_fn(peer) {
                 attempts += 1;
                 continue;
             } else {
                 return Some(PeerKeyLocation {
                     peer: peer.clone(),
-                    location: Some(*loc),
+                    location: Some(connection_info.location),
                 });
             }
         }
@@ -384,6 +454,110 @@ impl ConnectionManager {
 
     pub(super) fn connected_peers(&self) -> impl Iterator<Item = PeerId> {
         let read = self.location_for_peer.read();
-        read.keys().cloned().collect::<Vec<_>>().into_iter()
+        read.iter()
+            .filter(|(_, connection_info)| connection_info.state == ConnectionState::Ring)
+            .map(|(peer_id, _)| peer_id.clone())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dev_tool::{Location, PeerId, TransportKeypair};
+
+    fn create_test_connection_manager() -> ConnectionManager {
+        let keypair = TransportKeypair::new();
+        let cm = ConnectionManager::default_with_key(keypair.public().clone());
+        cm.try_set_peer_key("127.0.0.1:8080".parse().unwrap());
+        cm
+    }
+
+    fn create_test_peer() -> PeerId {
+        let keypair = TransportKeypair::new();
+        PeerId::new("127.0.0.1:8000".parse().unwrap(), keypair.public().clone())
+    }
+
+    #[test]
+    fn test_add_transient_connection() {
+        let cm = create_test_connection_manager();
+        let peer = create_test_peer();
+        let location = Location::from_address(&peer.addr);
+
+        // Add as transient connection
+        cm.add_connection_with_state(location, peer.clone(), false, ConnectionState::Transient);
+
+        // Should be connected
+        assert!(cm.is_connected(&peer));
+
+        // Should not appear in connected_peers (only Ring connections)
+        assert_eq!(cm.connected_peers().count(), 0);
+    }
+
+    #[test]
+    fn test_upgrade_gateway_connection() {
+        let cm = create_test_connection_manager();
+        let peer = create_test_peer();
+        let location = Location::from_address(&peer.addr);
+
+        // Add as transient connection
+        cm.add_connection_with_state(location, peer.clone(), false, ConnectionState::Transient);
+
+        // Upgrade to ring connection
+        assert!(cm.upgrade_gateway_connection(&peer));
+
+        // Should still be connected
+        assert!(cm.is_connected(&peer));
+
+        // Should now appear in connected_peers
+        assert_eq!(cm.connected_peers().count(), 1);
+    }
+
+    #[test]
+    fn test_should_accept_with_upgrade() {
+        let cm = create_test_connection_manager();
+        let peer = create_test_peer();
+        let location = Location::from_address(&peer.addr);
+
+        // First connection should be accepted
+        assert!(cm.should_accept(location, &peer));
+
+        // Add as transient connection
+        cm.add_connection_with_state(location, peer.clone(), true, ConnectionState::Transient);
+
+        // Normal should_accept should reject
+        assert!(!cm.should_accept(location, &peer));
+
+        // should_accept_with_upgrade should allow
+        assert!(cm.should_accept_with_upgrade(location, &peer, true));
+
+        // Upgrade the connection
+        assert!(cm.upgrade_gateway_connection(&peer));
+
+        // After upgrade, should_accept_with_upgrade should still reject (already Ring)
+        assert!(!cm.should_accept_with_upgrade(location, &peer, true));
+    }
+
+    #[test]
+    fn test_upgrade_nonexistent_connection() {
+        let cm = create_test_connection_manager();
+        let peer = create_test_peer();
+
+        // Should not be able to upgrade non-existent connection
+        assert!(!cm.upgrade_gateway_connection(&peer));
+    }
+
+    #[test]
+    fn test_upgrade_ring_connection() {
+        let cm = create_test_connection_manager();
+        let peer = create_test_peer();
+        let location = Location::from_address(&peer.addr);
+
+        // Add as ring connection directly
+        cm.add_connection(location, peer.clone(), false);
+
+        // Should not be able to upgrade ring connection
+        assert!(!cm.upgrade_gateway_connection(&peer));
     }
 }
