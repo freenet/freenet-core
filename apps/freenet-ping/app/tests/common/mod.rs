@@ -179,7 +179,6 @@ pub async fn connect_ws_client(ws_port: u16) -> Result<WebApi> {
     Ok(WebApi::start(stream))
 }
 
-
 pub fn load_contract(
     contract_path: &PathBuf,
     params: Parameters<'static>,
@@ -195,7 +194,10 @@ pub fn load_contract(
 fn compile_contract(contract_path: &PathBuf) -> anyhow::Result<Vec<u8>> {
     println!("module path: {contract_path:?}");
     let target = get_workspace_target_dir();
-    println!("trying to compile the test contract, target: {}", target.display());
+    println!(
+        "trying to compile the test contract, target: {}",
+        target.display()
+    );
 
     compile_rust_wasm_lib(
         &BuildToolConfig {
@@ -214,7 +216,6 @@ fn compile_contract(contract_path: &PathBuf) -> anyhow::Result<Vec<u8>> {
     println!("output file: {output_file:?}");
     Ok(std::fs::read(output_file)?)
 }
-
 
 pub async fn deploy_contract(
     client: &mut WebApi,

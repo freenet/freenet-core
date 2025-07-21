@@ -122,7 +122,7 @@ fn get_target_from_cargo_metadata() -> Result<PathBuf, Box<dyn std::error::Error
 /// Finds the workspace root directory starting from the current working directory.
 fn find_workspace_from_cwd() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let current_dir = std::env::current_dir()?;
-    
+
     current_dir
         .ancestors()
         .find(|p| {
