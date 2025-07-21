@@ -314,7 +314,7 @@ fn handle_execution_call(
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 // Check every 10ms for up to configured timeout using async sleep
-                for i in 0..max_iterations {
+                for _ in 0..max_iterations {
                     if r.is_finished() {
                         break;
                     }
@@ -335,7 +335,7 @@ fn handle_execution_call(
         })
     } else {
         // We're not in an async context (e.g., in tests), fall back to thread::sleep
-        for i in 0..max_iterations {
+        for _ in 0..max_iterations {
             if r.is_finished() {
                 break;
             }

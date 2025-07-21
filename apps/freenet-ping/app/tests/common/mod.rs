@@ -6,6 +6,8 @@ use freenet::{
     dev_tool::TransportKeypair,
     local_node::NodeConfig,
     server::serve_gateway,
+    test_utils::{compile_rust_wasm_lib, BuildToolConfig, PackageType, WASM_TARGET},
+    util::workspace::get_workspace_target_dir,
 };
 use freenet_ping_app::ping_client::{
     wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
@@ -33,8 +35,6 @@ use tokio_tungstenite::connect_async;
 use tracing::{info, span, Instrument, Level};
 
 use serde::{Deserialize, Serialize};
-
-const TARGET_DIR_VAR: &str = "CARGO_TARGET_DIR";
 
 pub static RNG: once_cell::sync::Lazy<Mutex<rand::rngs::StdRng>> =
     once_cell::sync::Lazy::new(|| {
@@ -179,51 +179,6 @@ pub async fn connect_ws_client(ws_port: u16) -> Result<WebApi> {
     Ok(WebApi::start(stream))
 }
 
-/// Builds and packages a contract or delegate.
-///
-/// This tool will build the WASM contract or delegate and publish it to the network.
-#[derive(clap::Parser, Clone, Debug)]
-pub struct BuildToolConfig {
-    /// Compile the contract or delegate with specific features.
-    #[arg(long)]
-    pub(crate) features: Option<String>,
-
-    // /// Compile the contract or delegate with a specific API version.
-    // #[arg(long, value_parser = parse_version, default_value_t=Version::new(0, 0, 1))]
-    // pub(crate) version: Version,
-    /// Output object type.
-    #[arg(long, value_enum, default_value_t=PackageType::default())]
-    pub(crate) package_type: PackageType,
-
-    /// Compile in debug mode instead of release.
-    #[arg(long)]
-    pub(crate) debug: bool,
-}
-
-#[derive(Default, Debug, Clone, Copy, ValueEnum)]
-pub(crate) enum PackageType {
-    #[default]
-    Contract,
-    Delegate,
-}
-
-impl PackageType {
-    pub fn feature(&self) -> &'static str {
-        match self {
-            PackageType::Contract => "freenet-main-contract",
-            PackageType::Delegate => "freenet-main-delegate",
-        }
-    }
-}
-
-impl std::fmt::Display for PackageType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PackageType::Contract => write!(f, "contract"),
-            PackageType::Delegate => write!(f, "delegate"),
-        }
-    }
-}
 
 pub fn load_contract(
     contract_path: &PathBuf,
@@ -237,35 +192,10 @@ pub fn load_contract(
     Ok(contract)
 }
 
-const WASM_TARGET: &str = "wasm32-unknown-unknown";
-fn compile_options(cli_config: &BuildToolConfig) -> impl Iterator<Item = String> {
-    let release: &[&str] = if cli_config.debug {
-        &[]
-    } else {
-        &["--release"]
-    };
-    let feature_list = cli_config
-        .features
-        .iter()
-        .flat_map(|s| {
-            s.split(',')
-                .filter(|p| *p != cli_config.package_type.feature())
-        })
-        .chain([cli_config.package_type.feature()]);
-    let features = [
-        "--features".to_string(),
-        feature_list.collect::<Vec<_>>().join(","),
-    ];
-    features
-        .into_iter()
-        .chain(release.iter().map(|s| s.to_string()))
-}
-// TODO: refactor so we share the implementation with fdev (need to extract to )
 fn compile_contract(contract_path: &PathBuf) -> anyhow::Result<Vec<u8>> {
     println!("module path: {contract_path:?}");
-    let target = std::env::var(TARGET_DIR_VAR)
-        .map_err(|_| anyhow::anyhow!("CARGO_TARGET_DIR should be set"))?;
-    println!("trying to compile the test contract, target: {target}");
+    let target = get_workspace_target_dir();
+    println!("trying to compile the test contract, target: {}", target.display());
 
     compile_rust_wasm_lib(
         &BuildToolConfig {
@@ -276,7 +206,7 @@ fn compile_contract(contract_path: &PathBuf) -> anyhow::Result<Vec<u8>> {
         contract_path,
     )?;
 
-    let output_file = Path::new(&target)
+    let output_file = target
         .join(WASM_TARGET)
         .join("debug")
         .join(WASM_FILE_NAME.replace('-', "_"))
@@ -285,89 +215,6 @@ fn compile_contract(contract_path: &PathBuf) -> anyhow::Result<Vec<u8>> {
     Ok(std::fs::read(output_file)?)
 }
 
-fn compile_rust_wasm_lib(cli_config: &BuildToolConfig, work_dir: &Path) -> anyhow::Result<()> {
-    const RUST_TARGET_ARGS: &[&str] = &["build", "--lib", "--target"];
-    use std::io::IsTerminal;
-    let comp_opts = compile_options(cli_config).collect::<Vec<_>>();
-    let cmd_args = if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
-        RUST_TARGET_ARGS
-            .iter()
-            .copied()
-            .chain([WASM_TARGET, "--color", "always"])
-            .chain(comp_opts.iter().map(|s| s.as_str()))
-            .collect::<Vec<_>>()
-    } else {
-        RUST_TARGET_ARGS
-            .iter()
-            .copied()
-            .chain([WASM_TARGET])
-            .chain(comp_opts.iter().map(|s| s.as_str()))
-            .collect::<Vec<_>>()
-    };
-
-    let package_type = cli_config.package_type;
-    println!("Compiling {package_type} with rust");
-    let child = Command::new("cargo")
-        .args(&cmd_args)
-        .current_dir(work_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            eprintln!("Error while executing cargo command: {e}");
-            anyhow::anyhow!("Error while executing cargo command: {e}")
-        })?;
-    pipe_std_streams(child)?;
-    Ok(())
-}
-
-pub(crate) fn pipe_std_streams(mut child: Child) -> anyhow::Result<()> {
-    let c_stdout = child.stdout.take().expect("Failed to open command stdout");
-    let c_stderr = child.stderr.take().expect("Failed to open command stderr");
-
-    let write_child_stderr = move || -> anyhow::Result<()> {
-        use std::io::BufRead;
-        let mut stderr = io::stderr();
-        let reader = std::io::BufReader::new(c_stderr);
-        for line in reader.lines() {
-            let line = line?;
-            writeln!(stderr, "{line}")?;
-        }
-        Ok(())
-    };
-
-    let write_child_stdout = move || -> anyhow::Result<()> {
-        use std::io::BufRead;
-        let mut stdout = io::stdout();
-        let reader = std::io::BufReader::new(c_stdout);
-        for line in reader.lines() {
-            let line = line?;
-            writeln!(stdout, "{line}")?;
-        }
-        Ok(())
-    };
-    std::thread::spawn(write_child_stdout);
-    std::thread::spawn(write_child_stderr);
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    anyhow::bail!("exit with status: {status}");
-                }
-                break;
-            }
-            Ok(None) => {
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            Err(err) => {
-                return Err(err.into());
-            }
-        }
-    }
-
-    Ok(())
-}
 
 pub async fn deploy_contract(
     client: &mut WebApi,
