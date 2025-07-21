@@ -137,6 +137,7 @@ pub struct Runtime {
     /// loaded contract modules
     pub(super) contract_modules: HashMap<ContractKey, Module>,
     pub(crate) enabled_metering: bool,
+    pub(crate) config: RuntimeConfig,
 }
 
 impl Runtime {
@@ -175,6 +176,7 @@ impl Runtime {
             contract_store,
             delegate_modules: HashMap::new(),
             enabled_metering: config.enable_metering,
+            config,
         })
     }
 
