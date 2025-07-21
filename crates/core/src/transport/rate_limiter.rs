@@ -57,10 +57,9 @@ impl<T: TimeSource> PacketRateLimiter<T> {
                 last_log_time = Instant::now();
             }
 
-            // INSTRUMENTATION: Track channel depth
             let channel_len = self.outbound_packets.len();
             if channel_len > 50 {
-                tracing::warn!(
+                tracing::debug!(
                     %socket_addr,
                     channel_depth = channel_len,
                     "CHANNEL_BACKLOG: Outbound packet channel backing up"
