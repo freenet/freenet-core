@@ -58,14 +58,17 @@ where
 
         // Wait for next event with a timeout to allow checking pending tasks
         let recv_result = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(10),
             contract_handler.channel().recv_from_sender(),
         )
         .await;
 
         let (id, event) = match recv_result {
             Ok(Ok(result)) => result,
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(error)) => {
+                tracing::error!(%error, "Fatal contract handler channel error");
+                return Err(error);
+            }
             Err(_) => continue, // Timeout, continue to check pending tasks
         };
 
