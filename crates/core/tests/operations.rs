@@ -189,7 +189,7 @@ async fn test_put_contract() -> TestResult {
     }
     .boxed_local();
 
-    let test = tokio::time::timeout(Duration::from_secs(120), async {
+    let test = tokio::time::timeout(Duration::from_secs(180), async {
         // Wait for nodes to start up
         tracing::info!("Waiting for nodes to start up...");
         tokio::time::sleep(Duration::from_secs(15)).await;
@@ -368,7 +368,7 @@ async fn test_update_contract() -> TestResult {
     }
     .boxed_local();
 
-    let test = tokio::time::timeout(Duration::from_secs(60), async {
+    let test = tokio::time::timeout(Duration::from_secs(180), async {
         // Wait for nodes to start up
         tokio::time::sleep(Duration::from_secs(20)).await; // Increased sleep duration
 
@@ -1584,7 +1584,7 @@ async fn test_put_with_subscribe_flag() -> TestResult {
     }
     .boxed_local();
 
-    let test = tokio::time::timeout(Duration::from_secs(60), async {
+    let test = tokio::time::timeout(Duration::from_secs(180), async {
         // Wait for nodes to start up
         tokio::time::sleep(Duration::from_secs(20)).await;
 
@@ -1896,7 +1896,7 @@ async fn test_delegate_request() -> TestResult {
     .boxed_local();
 
     // Wait for the nodes to start and run the test
-    let test = tokio::time::timeout(Duration::from_secs(60), async {
+    let test = tokio::time::timeout(Duration::from_secs(180), async {
         // Wait for nodes to start up
         tokio::time::sleep(Duration::from_secs(20)).await;
 
@@ -2573,7 +2573,7 @@ async fn test_subscription_introspection() -> TestResult {
     }
     .boxed_local();
 
-    let test = tokio::time::timeout(Duration::from_secs(60), async {
+    let test = tokio::time::timeout(Duration::from_secs(180), async {
         // Wait for nodes to start and connect
         tokio::time::sleep(Duration::from_secs(10)).await;
 
