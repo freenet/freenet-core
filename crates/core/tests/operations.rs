@@ -163,8 +163,8 @@ async fn test_put_contract() -> TestResult {
     .await?;
     let ws_api_port_peer_a = config_a.ws_api.ws_api_port.unwrap();
 
-    tracing::info!("Node A data dir: {:?}", preset_cfg_b.temp_dir.path());
-    tracing::info!("Node B data dir: {:?}", preset_cfg_a.temp_dir.path());
+    tracing::info!("Node A data dir: {:?}", preset_cfg_a.temp_dir.path());
+    tracing::info!("Node B data dir: {:?}", preset_cfg_b.temp_dir.path());
 
     std::mem::drop(ws_api_port_socket_a); // Free the port so it does not fail on initialization
     let node_a = async move {
@@ -189,11 +189,11 @@ async fn test_put_contract() -> TestResult {
     }
     .boxed_local();
 
-    let test = tokio::time::timeout(Duration::from_secs(120), async {
-        // Wait for nodes to start up
-        tracing::info!("Waiting for nodes to start up...");
-        tokio::time::sleep(Duration::from_secs(15)).await;
-        tracing::info!("Nodes should be ready, proceeding with test...");
+    let test = tokio::time::timeout(Duration::from_secs(180), async {
+        // Wait for nodes to start up and establish connections
+        tracing::info!("Waiting for nodes to start up and establish connections...");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        tracing::info!("Nodes should be ready and connected, proceeding with test...");
 
         // Connect to node A's websocket API
         let uri = format!(
@@ -237,6 +237,14 @@ async fn test_put_contract() -> TestResult {
             // Verify the responses
             assert_eq!(response_key, contract_key);
             assert_eq!(response_contract, contract);
+
+            // Debug the state comparison
+            tracing::info!("Original state: {:?}", wrapped_state);
+            tracing::info!("Response state: {:?}", response_state);
+            tracing::info!("Original state bytes: {:x?}", wrapped_state.as_ref());
+            tracing::info!("Response state bytes: {:x?}", response_state.as_ref());
+            tracing::info!("States equal: {}", response_state == wrapped_state);
+
             assert_eq!(response_state, wrapped_state);
         }
 

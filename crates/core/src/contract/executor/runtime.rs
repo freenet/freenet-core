@@ -1,34 +1,138 @@
 use super::*;
 use super::{
-    ContractExecutor, ContractRequest, ContractResponse, ExecutorError, ExecutorHalve,
-    ExecutorToEventLoopChannel, RequestError, Response, StateStoreError,
+    ContractExecutor, ContractRequest, ContractResponse, ExecutorError, InnerOpError, RequestError,
+    Response, StateStoreError,
 };
+use blake3::traits::digest::generic_array::GenericArray;
+use freenet_stdlib::client_api::{DelegateError as StdDelegateError, HostResponse};
+use freenet_stdlib::prelude::InboundDelegateMsg;
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
-impl ContractExecutor for Executor<Runtime> {
+/// Trait for executors that can identify themselves
+pub trait ExecutorWithId: Send + 'static {
+    fn id(&self) -> usize;
+}
+
+impl<T: Send + Sync + 'static> ExecutorWithId for Executor<T> {
+    fn id(&self) -> usize {
+        self.id
+    }
+}
+
+pub(super) struct PendingRegistration {
+    key: ContractKey,
+    cli_id: ClientId,
+    notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
+    summary: Option<StateSummary<'static>>,
+}
+
+pub(crate) struct RuntimePool<C = Arc<Config>, R = Runtime> {
+    // Keeping track of available executors
+    pub runtimes: Vec<Option<Executor<R>>>,
+    // Semaphore to control access to executors
+    pub available: Semaphore,
+    pub config: C,
+    pub op_sender: mpsc::Sender<(
+        Transaction,
+        tokio::sync::oneshot::Sender<Result<OpEnum, CallbackError>>,
+    )>,
+    pub op_manager: Arc<OpManager>,
+    // Track pending registrations by executor index
+    pub(super) pending_registrations: HashMap<usize, Vec<PendingRegistration>>,
+    // Next executor ID to assign
+    pub next_executor_id: usize,
+    // Shared storage instance to avoid database locking conflicts
+    pub(super) shared_storage: Storage,
+}
+
+impl RuntimePool<Arc<Config>, Runtime> {
+    /// Create a new pool with the given number of runtime executors
+    pub async fn new(
+        config: Arc<Config>,
+        op_sender: mpsc::Sender<(
+            Transaction,
+            tokio::sync::oneshot::Sender<Result<OpEnum, CallbackError>>,
+        )>,
+        op_manager: Arc<OpManager>,
+        pool_size: NonZeroUsize,
+    ) -> anyhow::Result<Self> {
+        let mut runtimes = Vec::with_capacity(pool_size.into());
+        let mut next_id = 0;
+
+        // Create shared storage once to avoid database locking conflicts
+        let shared_storage = Storage::new(&config.db_dir()).await?;
+
+        for _ in 0..pool_size.into() {
+            let mut executor = Executor::from_config(
+                config.clone(),
+                Some(shared_storage.clone()),
+                Some(op_sender.clone()),
+                Some(op_manager.clone()),
+            )
+            .await?;
+
+            // Assign an ID to the executor
+            executor.id = next_id;
+            next_id += 1;
+
+            runtimes.push(Some(executor));
+        }
+
+        Ok(Self {
+            runtimes,
+            available: Semaphore::new(pool_size.into()),
+            config,
+            op_sender,
+            op_manager,
+            pending_registrations: HashMap::new(),
+            next_executor_id: next_id,
+            shared_storage,
+        })
+    }
+
+    // Pop an executor from the pool - blocks until one is available
+    async fn pop_executor(&mut self) -> Executor<Runtime> {
+        // Wait for an available permit
+        let _ = self.available.acquire().await.expect("Semaphore is closed");
+
+        // Find the first available executor
+        for slot in &mut self.runtimes {
+            if let Some(executor) = slot.take() {
+                let id = executor.id();
+                // Ensure there's an entry in pending_registrations for this executor
+                // This will track any registrations that happen while it's out of the pool
+                let existing = self.pending_registrations.insert(id, Vec::new());
+                assert!(
+                    existing.is_none(),
+                    "Executor ID already exists in pending registrations"
+                );
+                return executor;
+            }
+        }
+
+        // This should never happen because of the semaphore
+        unreachable!("No executors available despite semaphore permit")
+    }
+}
+
+impl ContractExecutor for RuntimePool<Arc<Config>, Runtime> {
+    type InnerExecutor = Executor<Runtime>;
+
     async fn fetch_contract(
         &mut self,
         key: ContractKey,
         return_contract_code: bool,
-    ) -> Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError> {
-        tracing::debug!(
-            contract = %key,
-            return_code = return_contract_code,
-            "fetching contract"
-        );
-        let result = self.perform_contract_get(return_contract_code, key).await;
-        if let Ok((Some(ref state), ref code)) = result {
-            let hash = blake3::hash(state.as_ref());
-            tracing::debug!(
-                contract = %key,
-                state_size = state.as_ref().len(),
-                state_hash = %hash,
-                has_code = code.is_some(),
-                "fetched contract state"
-            );
-        }
-        match result {
-            Ok((state, code)) => Ok((state, code)),
-            Err(err) => Err(err),
+    ) -> impl Future<Output = (Self::InnerExecutor, FetchContractR)> + Send + 'static {
+        let mut executor = self.pop_executor().await;
+
+        async move {
+            let result = executor
+                .perform_contract_get(return_contract_code, key)
+                .await;
+            (executor, result)
         }
     }
 
@@ -38,100 +142,356 @@ impl ContractExecutor for Executor<Runtime> {
         update: Either<WrappedState, StateDelta<'static>>,
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
-    ) -> Result<UpsertResult, ExecutorError> {
-        if let Either::Left(ref state) = update {
-            let hash = blake3::hash(state.as_ref());
-            tracing::debug!(
-                contract = %key,
-                state_size = state.as_ref().len(),
-                state_hash = %hash,
-                "upserting contract state"
-            );
+    ) -> impl Future<Output = (Self::InnerExecutor, UpsertContractR)> + Send + 'static {
+        let mut executor = self.pop_executor().await;
+        async move {
+            let res =
+                upsert_contract_state_inner(&mut executor, key, update, related_contracts, code)
+                    .await;
+            (executor, res)
         }
-        let params = if let Some(code) = &code {
-            code.params()
-        } else {
-            self.state_store
-                .get_params(&key)
-                .await
-                .map_err(ExecutorError::other)?
-                .ok_or_else(|| {
-                    ExecutorError::request(StdContractError::Put {
-                        key,
-                        cause: "missing contract parameters".into(),
-                    })
-                })?
-        };
+    }
 
-        let remove_if_fail = if self
+    fn register_contract_notifier(
+        &mut self,
+        key: ContractKey,
+        cli_id: ClientId,
+        notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
+        summary: Option<StateSummary<'_>>,
+    ) -> Result<(), Box<RequestError>> {
+        let mut last_error = None;
+        let owned_summary = summary.map(StateSummary::into_owned);
+
+        // Register with all available executors
+        for executor in self.runtimes.iter_mut().flatten() {
+            if let Err(err) = executor.register_contract_notifier(
+                key,
+                cli_id,
+                notification_ch.clone(),
+                owned_summary.clone(),
+            ) {
+                last_error = Some(err);
+            }
+        }
+
+        // Add to all pending registration entries
+        // These represent executors that are currently out of the pool
+        for pending in self.pending_registrations.values_mut() {
+            pending.push(PendingRegistration {
+                key,
+                cli_id,
+                notification_ch: notification_ch.clone(),
+                summary: owned_summary.clone(),
+            });
+        }
+
+        last_error.map_or(Ok(()), Err)
+    }
+
+    fn return_executor(&mut self, mut executor: Self::InnerExecutor) {
+        let executor_id = executor.id();
+
+        // Apply any pending registrations for this executor
+        if let Some(pending) = self.pending_registrations.remove(&executor_id) {
+            for registration in pending {
+                let _ = executor.register_contract_notifier(
+                    registration.key,
+                    registration.cli_id,
+                    registration.notification_ch,
+                    registration.summary.clone(),
+                );
+            }
+        }
+
+        // Return the executor to the pool
+        if let Some(empty_slot) = self.runtimes.iter_mut().find(|slot| slot.is_none()) {
+            *empty_slot = Some(executor);
+            self.available.add_permits(1);
+        } else {
+            unreachable!("No empty slot found in the pool");
+        }
+    }
+
+    async fn create_new_executor(&mut self) -> Self::InnerExecutor {
+        let mut executor = Executor::from_config(
+            self.config.clone(),
+            Some(self.shared_storage.clone()),
+            Some(self.op_sender.clone()),
+            Some(self.op_manager.clone()),
+        )
+        .await
+        .expect("Failed to create new executor");
+
+        // Assign a new ID to this executor
+        executor.id = self.next_executor_id;
+        self.next_executor_id += 1;
+
+        executor
+    }
+
+    #[allow(clippy::async_yields_async)]
+    fn execute_delegate_request(
+        &mut self,
+        req: DelegateRequest<'static>,
+        attested_contract: Option<&ContractInstanceId>,
+    ) -> impl Future<Output = impl Future<Output = (Self::InnerExecutor, Response)> + Send + 'static>
+           + Send {
+        // req is already 'static, no need to clone
+        let req_owned = req;
+
+        let attested_contract_clone = attested_contract.copied();
+        let pop_future = self.pop_executor();
+
+        async move {
+            let mut executor = pop_future.await;
+
+            async move {
+                tracing::debug!(
+                    attested_contract = ?attested_contract_clone,
+                    "received delegate request"
+                );
+
+                let result = match req_owned {
+                    DelegateRequest::RegisterDelegate {
+                        delegate,
+                        cipher,
+                        nonce,
+                    } => {
+                        use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
+                        let key = delegate.key().clone();
+                        let arr = GenericArray::from_slice(&cipher);
+                        let cipher = XChaCha20Poly1305::new(arr);
+                        let nonce = GenericArray::from_slice(&nonce).to_owned();
+                        match executor.runtime.register_delegate(delegate, cipher, nonce) {
+                            Ok(_) => Ok(HostResponse::DelegateResponse {
+                                key,
+                                values: Vec::new(),
+                            }),
+                            Err(err) => {
+                                tracing::warn!("failed registering delegate `{key}`: {err}");
+                                Err(ExecutorError::other(StdDelegateError::RegisterError(key)))
+                            }
+                        }
+                    }
+                    DelegateRequest::UnregisterDelegate(key) => {
+                        // Handle both real unregister and dummy unsupported cases
+                        if key
+                            == DelegateKey::new(
+                                [0u8; 32],
+                                freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
+                            )
+                        {
+                            return (
+                                executor,
+                                Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
+                            );
+                        }
+                        match executor.runtime.unregister_delegate(&key) {
+                            Ok(_) => Ok(HostResponse::Ok),
+                            Err(err) => {
+                                tracing::warn!("failed unregistering delegate `{key}`: {err}");
+                                Ok(HostResponse::Ok)
+                            }
+                        }
+                    }
+                    DelegateRequest::GetSecretRequest {
+                        key,
+                        params,
+                        get_request,
+                    } => {
+                        tracing::debug!(
+                            delegate_key = %key,
+                            params_size = params.as_ref().len(),
+                            attested_contract = ?attested_contract_clone,
+                            "Handling GetSecretRequest for delegate"
+                        );
+                        let attested_bytes = attested_contract_clone.map(|c| c.as_bytes().to_vec());
+                        match executor.runtime.inbound_app_message(
+                            &key,
+                            &params,
+                            attested_bytes.as_deref(),
+                            vec![InboundDelegateMsg::GetSecretRequest(get_request)],
+                        ) {
+                            Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
+                            Err(err) => Err(ExecutorError::execution(
+                                err,
+                                Some(InnerOpError::Delegate(key.clone())),
+                            )),
+                        }
+                    }
+                    DelegateRequest::ApplicationMessages {
+                        key,
+                        inbound,
+                        params,
+                    } => {
+                        let attested_bytes = attested_contract_clone.map(|c| c.as_bytes().to_vec());
+                        match executor.runtime.inbound_app_message(
+                            &key,
+                            &params,
+                            attested_bytes.as_deref(),
+                            inbound,
+                        ) {
+                            Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
+                            Err(err) => {
+                                tracing::error!("failed executing delegate `{key}`: {err}");
+                                Err(ExecutorError::execution(
+                                    err,
+                                    Some(InnerOpError::Delegate(key)),
+                                ))
+                            }
+                        }
+                    }
+                    _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
+                };
+
+                (executor, result)
+            }
+        }
+    }
+
+    fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
+        // For pool implementation, collect subscription info from all executors
+        let mut subscriptions = Vec::new();
+
+        // Since we can't access executors that are currently in use,
+        // we'll return subscription info from pending registrations
+        for registrations in self.pending_registrations.values() {
+            for reg in registrations {
+                subscriptions.push(crate::message::SubscriptionInfo {
+                    contract_key: reg.key,
+                    client_id: reg.cli_id,
+                    last_update: Some(std::time::SystemTime::now()),
+                });
+            }
+        }
+
+        subscriptions
+    }
+}
+
+impl Executor<Runtime> {
+    // Private implementation methods
+}
+
+async fn upsert_contract_state_inner(
+    executor: &mut Executor<Runtime>,
+    key: ContractKey,
+    update: Either<WrappedState, StateDelta<'static>>,
+    related_contracts: RelatedContracts<'static>,
+    code: Option<ContractContainer>,
+) -> UpsertContractR {
+    let params = if let Some(code) = &code {
+        code.params()
+    } else {
+        executor
+            .state_store
+            .get_params(&key)
+            .await
+            .transpose()
+            .ok_or_else(|| {
+                ExecutorError::request(StdContractError::Put {
+                    key,
+                    cause: "missing contract parameters".into(),
+                })
+            })?
+            .map_err(ExecutorError::other)?
+    };
+
+    let remove_if_fail = if executor
+        .runtime
+        .contract_store
+        .fetch_contract(&key, &params)
+        .is_none()
+    {
+        let Some(code) = code else {
+            return Err(ExecutorError::request(StdContractError::MissingContract {
+                key: key.into(),
+            }));
+        };
+        executor
             .runtime
             .contract_store
-            .fetch_contract(&key, &params)
-            .is_none()
-        {
-            let code = code.ok_or_else(|| {
-                ExecutorError::request(StdContractError::MissingContract { key: key.into() })
-            })?;
-            self.runtime
-                .contract_store
-                .store_contract(code.clone())
-                .map_err(ExecutorError::other)?;
-            true
-        } else {
+            .store_contract(code.clone())
+            .map_err(ExecutorError::other)?;
+        true
+    } else {
+        false
+    };
+
+    // Check if this is an initial PUT or an UPDATE to existing contract
+    let is_initial_put = match &update {
+        Either::Left(_) => {
+            // For PUT operations, check if contract already exists
+            executor.state_store.get(&key).await.is_err()
+        }
+        Either::Right(_) => {
+            // Delta operations are always updates to existing contracts
             false
-        };
+        }
+    };
 
-        let is_new_contract = self.state_store.get(&key).await.is_err();
-
-        let mut updates = match update {
-            Either::Left(incoming_state) => {
-                let result = self
-                    .runtime
-                    .validate_state(&key, &params, &incoming_state, &related_contracts)
-                    .map_err(|err| {
-                        if remove_if_fail {
-                            let _ = self.runtime.contract_store.remove_contract(&key);
-                        }
-                        ExecutorError::execution(err, None)
-                    })?;
-                match result {
-                    ValidateResult::Valid => {
-                        tracing::debug!("The incoming state is valid");
-
-                        // If the contract is new, we store the incoming state as the initial state avoiding the update
-                        if is_new_contract {
-                            tracing::debug!("Contract is new, storing initial state");
-                            let state_to_store = incoming_state.clone();
-                            self.state_store
-                                .store(key, state_to_store, params.clone())
-                                .await
-                                .map_err(ExecutorError::other)?;
-
-                            return Ok(UpsertResult::Updated(incoming_state));
-                        }
+    let mut updates = match update {
+        Either::Left(incoming_state) => {
+            let result = match executor.runtime.validate_state(
+                &key,
+                &params,
+                &incoming_state,
+                &related_contracts,
+            ) {
+                Ok(result) => result,
+                Err(err) => {
+                    if remove_if_fail {
+                        let _ = executor.runtime.contract_store.remove_contract(&key);
                     }
-                    ValidateResult::Invalid => {
-                        return Err(ExecutorError::request(StdContractError::invalid_put(key)));
-                    }
-                    ValidateResult::RequestRelated(mut related) => {
-                        if let Some(key) = related.pop() {
-                            return Err(ExecutorError::request(StdContractError::MissingRelated {
-                                key,
-                            }));
-                        } else {
-                            return Err(ExecutorError::internal_error());
-                        }
+                    return Err(ExecutorError::execution(err, None));
+                }
+            };
+            match result {
+                ValidateResult::Valid => {
+                    executor
+                        .state_store
+                        .store(key, incoming_state.clone(), params.clone())
+                        .await
+                        .map_err(ExecutorError::other)?;
+                }
+                ValidateResult::Invalid => {
+                    return Err(ExecutorError::request(StdContractError::invalid_put(key)));
+                }
+                ValidateResult::RequestRelated(mut related) => {
+                    if let Some(key) = related.pop() {
+                        // TODO: support recursive related contracts
+                        return Err(ExecutorError::request(StdContractError::MissingRelated {
+                            key,
+                        }));
+                    } else {
+                        return Err(ExecutorError::internal_error());
                     }
                 }
+            }
 
-                vec![UpdateData::State(incoming_state.clone().into())]
+            vec![UpdateData::State(incoming_state.clone().into())]
+        }
+        Either::Right(delta) => {
+            // todo: forward delta like we are doing with puts
+            tracing::warn!("Delta updates are not yet supported");
+            vec![UpdateData::Delta(delta)]
+        }
+    };
+
+    if is_initial_put {
+        // For initial PUT operations: only validate and store, don't call update_state
+        let stored_state = match executor.state_store.get(&key).await {
+            Ok(s) => s,
+            Err(StateStoreError::MissingContract(_)) => {
+                return Err(ExecutorError::request(StdContractError::MissingContract {
+                    key: key.into(),
+                }));
             }
-            Either::Right(delta) => {
-                vec![UpdateData::Delta(delta)]
-            }
+            Err(StateStoreError::Any(err)) => return Err(ExecutorError::other(err)),
         };
-
-        let current_state = match self.state_store.get(&key).await {
+        Ok(UpsertResult::Updated(stored_state))
+    } else {
+        let current_state = match executor.state_store.get(&key).await {
             Ok(s) => s,
             Err(StateStoreError::MissingContract(_)) => {
                 tracing::warn!("Missing contract {key} for upsert");
@@ -152,7 +512,7 @@ impl ContractExecutor for Executor<Runtime> {
             });
         }
 
-        let updated_state = match self
+        let updated_state = match executor
             .attempt_state_update(&params, &current_state, &key, &updates)
             .await?
         {
@@ -167,7 +527,7 @@ impl ContractExecutor for Executor<Runtime> {
                 }));
             }
         };
-        match self
+        match executor
             .runtime
             .validate_state(&key, &params, &updated_state, &related_contracts)
             .map_err(|e| ExecutorError::execution(e, None))?
@@ -176,8 +536,6 @@ impl ContractExecutor for Executor<Runtime> {
                 if updated_state.as_ref() == current_state.as_ref() {
                     Ok(UpsertResult::NoChange)
                 } else {
-                    // todo: forward delta like we are doing with puts
-                    tracing::warn!("Delta updates are not yet supported");
                     Ok(UpsertResult::Updated(updated_state))
                 }
             }
@@ -190,8 +548,48 @@ impl ContractExecutor for Executor<Runtime> {
             ValidateResult::RequestRelated(_) => todo!(),
         }
     }
+}
 
-    fn register_contract_notifier(
+impl Executor<Runtime> {
+    pub async fn local(config: Arc<Config>) -> anyhow::Result<Self> {
+        let (contract_store, delegate_store, secret_store, state_store) =
+            Self::get_stores(&config).await?;
+        let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+        assert!(config.mode == OperationMode::Local);
+        let mut executor = Executor::new(state_store, OperationMode::Local, rt, None, None).await?;
+        executor.id = 0; // Default ID for local executors
+        Ok(executor)
+    }
+
+    async fn from_config(
+        config: Arc<Config>,
+        storage: Option<Storage>,
+        op_sender: Option<OpResult>,
+        op_manager: Option<Arc<OpManager>>,
+    ) -> anyhow::Result<Self> {
+        const MAX_SIZE: i64 = 10 * 1024 * 1024;
+        const MAX_MEM_CACHE: u32 = 10_000_000;
+
+        let state_store = match storage {
+            Some(storage) => StateStore::new(storage, MAX_MEM_CACHE).unwrap(),
+            None => {
+                let storage = Storage::new(&config.db_dir()).await?;
+                StateStore::new(storage, MAX_MEM_CACHE).unwrap()
+            }
+        };
+
+        let contract_store = ContractStore::new(config.contracts_dir(), MAX_SIZE)?;
+        let delegate_store = DelegateStore::new(config.delegates_dir(), MAX_SIZE)?;
+        let secret_store = SecretsStore::new(config.secrets_dir(), config.secrets.clone())?;
+        let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+
+        let mut executor =
+            Executor::new(state_store, config.mode, rt, op_sender, op_manager).await?;
+        executor.id = 0; // ID will be assigned by the pool
+        Ok(executor)
+    }
+
+    pub fn register_contract_notifier(
         &mut self,
         key: ContractKey,
         cli_id: ClientId,
@@ -199,7 +597,6 @@ impl ContractExecutor for Executor<Runtime> {
         summary: Option<StateSummary<'_>>,
     ) -> Result<(), Box<RequestError>> {
         let channels = self.update_notifications.entry(key).or_default();
-        tracing::info!(%key, %cli_id, "SUBSCRIBE_DEBUG: Registering subscription, existing channels: {}", channels.len());
         if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
             let (_, existing_ch) = &channels[i];
             if !existing_ch.same_channel(&notification_ch) {
@@ -224,147 +621,7 @@ impl ContractExecutor for Executor<Runtime> {
                 "contract {key} already was registered for peer {cli_id}; replaced summary"
             );
         }
-        tracing::info!(%key, %cli_id, "SUBSCRIBE_DEBUG: Subscription registered successfully");
         Ok(())
-    }
-
-    fn execute_delegate_request(
-        &mut self,
-        req: DelegateRequest<'_>,
-        attested_contract: Option<&ContractInstanceId>,
-    ) -> Response {
-        tracing::debug!(
-            attested_contract = ?attested_contract,
-            "received delegate request"
-        );
-        match req {
-            DelegateRequest::RegisterDelegate {
-                delegate,
-                cipher,
-                nonce,
-            } => {
-                use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
-                let key = delegate.key().clone();
-                let arr = GenericArray::from_slice(&cipher);
-                let cipher = XChaCha20Poly1305::new(arr);
-                let nonce = GenericArray::from_slice(&nonce).to_owned();
-                if let Some(contract) = attested_contract {
-                    self.delegate_attested_ids
-                        .entry(key.clone())
-                        .or_default()
-                        .push(*contract);
-                }
-                match self.runtime.register_delegate(delegate, cipher, nonce) {
-                    Ok(_) => Ok(DelegateResponse {
-                        key,
-                        values: Vec::new(),
-                    }),
-                    Err(err) => {
-                        tracing::warn!("failed registering delegate `{key}`: {err}");
-                        Err(ExecutorError::other(StdDelegateError::RegisterError(key)))
-                    }
-                }
-            }
-            DelegateRequest::UnregisterDelegate(key) => {
-                self.delegate_attested_ids.remove(&key);
-                match self.runtime.unregister_delegate(&key) {
-                    Ok(_) => Ok(HostResponse::Ok),
-                    Err(err) => {
-                        tracing::warn!("failed unregistering delegate `{key}`: {err}");
-                        Ok(HostResponse::Ok)
-                    }
-                }
-            }
-            DelegateRequest::GetSecretRequest {
-                key,
-                params,
-                get_request,
-            } => {
-                tracing::debug!(
-                    delegate_key = %key,
-                    params_size = params.as_ref().len(),
-                    attested_contract = ?attested_contract,
-                    "Handling GetSecretRequest for delegate"
-                );
-                let attested = attested_contract.and_then(|contract| {
-                    self.delegate_attested_ids
-                        .get(&key)
-                        .and_then(|contracts| contracts.iter().find(|c| *c == contract))
-                });
-                match self.runtime.inbound_app_message(
-                    &key,
-                    &params,
-                    attested.map(|c| c.as_bytes()),
-                    vec![InboundDelegateMsg::GetSecretRequest(get_request)],
-                ) {
-                    Ok(values) => Ok(DelegateResponse { key, values }),
-                    Err(err) => Err(ExecutorError::execution(
-                        err,
-                        Some(InnerOpError::Delegate(key.clone())),
-                    )),
-                }
-            }
-            DelegateRequest::ApplicationMessages {
-                key,
-                inbound,
-                params,
-            } => {
-                // Use the attested_contract directly instead of looking it up in delegate_attested_ids
-                let attested_bytes = attested_contract.map(|c| c.as_bytes());
-                match self.runtime.inbound_app_message(
-                    &key,
-                    &params,
-                    attested_bytes,
-                    inbound
-                        .into_iter()
-                        .map(InboundDelegateMsg::into_owned)
-                        .collect(),
-                ) {
-                    Ok(values) => Ok(DelegateResponse { key, values }),
-                    Err(err) => {
-                        tracing::error!("failed executing delegate `{key}`: {err}");
-                        Err(ExecutorError::execution(
-                            err,
-                            Some(InnerOpError::Delegate(key)),
-                        ))
-                    }
-                }
-            }
-            _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
-        }
-    }
-
-    fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
-        self.get_subscription_info()
-    }
-}
-
-impl Executor<Runtime> {
-    // Private implementation methods
-}
-
-impl Executor<Runtime> {
-    pub async fn from_config(
-        config: Arc<Config>,
-        event_loop_channel: Option<ExecutorToEventLoopChannel<ExecutorHalve>>,
-    ) -> anyhow::Result<Self> {
-        let (contract_store, delegate_store, secret_store, state_store) =
-            Self::get_stores(&config).await?;
-        let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
-        Executor::new(
-            state_store,
-            move || {
-                let _ =
-                    crate::util::set_cleanup_on_exit(config.paths().clone()).inspect_err(|error| {
-                        tracing::error!("Failed to set cleanup on exit: {error}");
-                    });
-                Ok(())
-            },
-            OperationMode::Local,
-            rt,
-            event_loop_channel,
-        )
-        .await
     }
 
     pub async fn preload(
@@ -583,7 +840,7 @@ impl Executor<Runtime> {
                     attested.map(|c| c.as_bytes()),
                     vec![InboundDelegateMsg::GetSecretRequest(get_request)],
                 ) {
-                    Ok(values) => Ok(DelegateResponse { key, values }),
+                    Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
                     Err(err) => Err(ExecutorError::execution(
                         err,
                         Some(InnerOpError::Delegate(key.clone())),
@@ -606,7 +863,7 @@ impl Executor<Runtime> {
                         .map(InboundDelegateMsg::into_owned)
                         .collect(),
                 ) {
-                    Ok(values) => Ok(DelegateResponse { key, values }),
+                    Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
                     Err(err) => {
                         tracing::error!("failed executing delegate `{key}`: {err}");
                         Err(ExecutorError::execution(
@@ -631,6 +888,7 @@ impl Executor<Runtime> {
 
         if self.get_local_contract(key.id()).await.is_ok() {
             // already existing contract, just try to merge states
+            tracing::warn!("CONTRACT_EXISTS_DEBUG: Contract already exists during PUT, treating as update, key: {}", key);
             return self
                 .perform_contract_update(key, UpdateData::State(state.into()))
                 .await;

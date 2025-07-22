@@ -185,7 +185,7 @@ fn compile_delegate(name: &str) -> anyhow::Result<Vec<u8>> {
     Ok(wasm_data)
 }
 
-const WASM_TARGET: &str = "wasm32-unknown-unknown";
+pub const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
 fn compile_options(cli_config: &BuildToolConfig) -> impl Iterator<Item = String> {
     let release: &[&str] = if cli_config.debug {
@@ -210,7 +210,7 @@ fn compile_options(cli_config: &BuildToolConfig) -> impl Iterator<Item = String>
         .chain(release.iter().map(|s| s.to_string()))
 }
 
-fn compile_rust_wasm_lib(cli_config: &BuildToolConfig, work_dir: &Path) -> anyhow::Result<()> {
+pub fn compile_rust_wasm_lib(cli_config: &BuildToolConfig, work_dir: &Path) -> anyhow::Result<()> {
     const RUST_TARGET_ARGS: &[&str] = &["build", "--lib", "--target"];
     use std::io::IsTerminal;
     let comp_opts = compile_options(cli_config).collect::<Vec<_>>();
@@ -304,22 +304,22 @@ pub(crate) fn pipe_std_streams(mut child: Child) -> anyhow::Result<()> {
 pub struct BuildToolConfig {
     /// Compile the contract or delegate with specific features.
     #[arg(long)]
-    pub(crate) features: Option<String>,
+    pub features: Option<String>,
 
     // /// Compile the contract or delegate with a specific API version.
     // #[arg(long, value_parser = parse_version, default_value_t=Version::new(0, 0, 1))]
     // pub(crate) version: Version,
     /// Output object type.
     #[arg(long, value_enum, default_value_t=PackageType::default())]
-    pub(crate) package_type: PackageType,
+    pub package_type: PackageType,
 
     /// Compile in debug mode instead of release.
     #[arg(long)]
-    pub(crate) debug: bool,
+    pub debug: bool,
 }
 
 #[derive(Default, Debug, Clone, Copy, ValueEnum)]
-pub(crate) enum PackageType {
+pub enum PackageType {
     #[default]
     Contract,
     Delegate,

@@ -305,20 +305,24 @@ fn handle_execution_call(
     r: JoinHandle<(Result<i64, wasmer::RuntimeError>, Store)>,
     rt: &mut super::Runtime,
 ) -> Result<i64, Errors> {
+    let timeout_ms = (rt.config.max_execution_seconds * 1000.0) as u64;
+    let check_interval_ms = 10;
+    let max_iterations = timeout_ms / check_interval_ms;
     // Check if we're in a tokio runtime context
     if tokio::runtime::Handle::try_current().is_ok() {
         // We're in an async context, use block_in_place to avoid blocking the executor
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                // Check every 10ms for up to 5 seconds using async sleep
-                for _ in 0..500 {
+                // Check every 10ms for up to configured timeout using async sleep
+                for _ in 0..max_iterations {
                     if r.is_finished() {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;
                 }
 
                 if !r.is_finished() {
+                    tracing::debug!("Execution timed out after {} ms", timeout_ms);
                     return Err(Errors::MaxComputeTimeExceeded);
                 }
 
@@ -331,12 +335,11 @@ fn handle_execution_call(
         })
     } else {
         // We're not in an async context (e.g., in tests), fall back to thread::sleep
-        // This is still better than the original 1-second sleep
-        for _ in 0..500 {
+        for _ in 0..max_iterations {
             if r.is_finished() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(check_interval_ms));
         }
 
         if !r.is_finished() {
