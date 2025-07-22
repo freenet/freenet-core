@@ -714,7 +714,7 @@ async fn process_open_request(
                     freenet_stdlib::client_api::NodeQuery::NodeDiagnostics { .. } => {
                         // TODO: Implement node diagnostics query
                         tracing::warn!("NodeDiagnostics query not yet implemented");
-                        return Err(Error::Disconnected);  // Using existing error variant
+                        return Err(Error::Disconnected); // Using existing error variant
                     }
                 };
 

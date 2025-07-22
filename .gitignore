@@ -39,6 +39,8 @@ aider.conf.yaml
 # Claude-specific files
 CLAUDE.md
 **/CLAUDE.md
+CLAUDE.local.md
+**/CLAUDE.local.md
 CI_STATUS.md
 claude_notes/
 
