@@ -30,8 +30,7 @@ impl ContractInterface for Contract {
 
         #[cfg(feature = "contract")]
         freenet_stdlib::log::info(&format!(
-            "[VALIDATE_STATE] State validated successfully: {:?}",
-            ping
+            "[VALIDATE_STATE] State validated successfully: {ping:?}"
         ));
 
         Ok(ValidateResult::Valid)
@@ -181,7 +180,7 @@ impl ContractInterface for Contract {
         }
 
         #[cfg(feature = "contract")]
-        freenet_stdlib::log::info(&format!("[UPDATE_STATE] Returning final state: {:?}", ping));
+        freenet_stdlib::log::info(&format!("[UPDATE_STATE] Returning final state: {ping:?}", ping));
 
         Ok(UpdateModification::valid(State::from(
             serde_json::to_vec(&ping).map_err(|e| ContractError::Other(e.to_string()))?,
@@ -210,7 +209,7 @@ impl ContractInterface for Contract {
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
         #[cfg(feature = "contract")]
-        freenet_stdlib::log::info(&format!("[SUMMARIZE_STATE] State summarized: {:?}", ping));
+        freenet_stdlib::log::info(&format!("[SUMMARIZE_STATE] State summarized: {ping:?}", ping));
 
         Ok(StateSummary::from(state.to_vec()))
     }
@@ -231,7 +230,7 @@ impl ContractInterface for Contract {
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
         #[cfg(feature = "contract")]
-        freenet_stdlib::log::info(&format!("[GET_STATE_DELTA] Contract options: {:?}", opts));
+        freenet_stdlib::log::info(&format!("[GET_STATE_DELTA] Contract options: {ping:?}", opts));
 
         let mut ping = if state.is_empty() {
             #[cfg(feature = "contract")]
@@ -243,7 +242,7 @@ impl ContractInterface for Contract {
                 .map_err(|e| ContractError::Deser(e.to_string()))?;
 
             #[cfg(feature = "contract")]
-            freenet_stdlib::log::info(&format!("[GET_STATE_DELTA] Loaded state: {:?}", p));
+            freenet_stdlib::log::info(&format!("[GET_STATE_DELTA] Loaded state: {ping:?}", p));
 
             p
         };
@@ -257,7 +256,7 @@ impl ContractInterface for Contract {
                 .map_err(|e| ContractError::Deser(e.to_string()))?;
 
             #[cfg(feature = "contract")]
-            freenet_stdlib::log::info(&format!("[GET_STATE_DELTA] Loaded summary: {:?}", ps));
+            freenet_stdlib::log::info(&format!("[GET_STATE_DELTA] Loaded summary: {ping:?}", ps));
 
             ps
         };
@@ -265,7 +264,7 @@ impl ContractInterface for Contract {
         ping.merge(ping_summary, opts.ttl);
 
         #[cfg(feature = "contract")]
-        freenet_stdlib::log::info(&format!("[GET_STATE_DELTA] Merged result: {:?}", ping));
+        freenet_stdlib::log::info(&format!("[GET_STATE_DELTA] Merged result: {ping:?}", ping));
 
         let result = serde_json::to_vec(&ping).map_err(|e| ContractError::Other(e.to_string()))?;
 

@@ -690,7 +690,7 @@ mod tests {
                     assert_eq!(peers.len(), 1);
                     assert_eq!(peers[0], *worst_peer);
                 }
-                _ => panic!("Expected to remove a peer, adjustment was {:?}", adjustment),
+                _ => panic!("Expected to remove a peer, adjustment was {adjustment:?}"),
             }
         });
     }
@@ -740,8 +740,7 @@ mod tests {
                     assert!(locations[0] <= peers[1].location.unwrap());
                 }
                 _ => panic!(
-                    "Expected to add a connection, adjustment was {:?}",
-                    adjustment
+                    "Expected to add a connection, adjustment was {adjustment:?}"
                 ),
             }
         });
@@ -777,7 +776,7 @@ mod tests {
 
             match adjustment {
                 TopologyAdjustment::NoChange => {}
-                _ => panic!("Expected no adjustment, adjustment was {:?}", adjustment),
+                _ => panic!("Expected no adjustment, adjustment was {adjustment:?}"),
             }
         });
     }
@@ -822,7 +821,7 @@ mod tests {
                         assert_eq!(location, my_location);
                     }
                 }
-                _ => panic!("Expected AddConnections, but was: {:?}", adjustment),
+                _ => panic!("Expected AddConnections, but was: {adjustment:?}"),
             }
         });
     }

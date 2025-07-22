@@ -266,14 +266,12 @@ mod tests {
         // But with 8 packets and 1 packet per 10ms batch, actual time is ~70-80ms
         // Allow margin for processing overhead and timing precision
         println!(
-            "Transfer took: {:?}, packets sent: {}, expected: {}",
-            elapsed, packet_count, expected_packets
+            "Transfer took: {elapsed:?}, packets sent: {packet_count}, expected: {expected_packets}"
         );
-        println!("Bytes per packet: ~{}", MAX_DATA_SIZE);
+        println!("Bytes per packet: ~{MAX_DATA_SIZE}");
         assert!(
             elapsed.as_millis() >= 60,
-            "Transfer completed too quickly: {:?}",
-            elapsed
+            "Transfer completed too quickly: {elapsed:?}"
         );
 
         Ok(())
@@ -338,8 +336,7 @@ mod tests {
         // Without rate limiting, should complete very quickly (< 50ms)
         assert!(
             elapsed.as_millis() < 50,
-            "Transfer took too long without rate limit: {:?}",
-            elapsed
+            "Transfer took too long without rate limit: {elapsed:?}"
         );
 
         Ok(())

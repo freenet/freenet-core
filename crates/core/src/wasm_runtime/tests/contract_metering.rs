@@ -52,7 +52,7 @@ fn validate_state_metering() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let duration = time.elapsed().as_secs_f64();
-    println!("Duration: {:.2}s", duration);
+    println!("Duration: {duration:.2}s");
 
     assert!(duration < 5.0, "Should not timeout");
     assert!(
@@ -103,7 +103,7 @@ fn test_update_state_metering() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let duration = time.elapsed().as_secs_f64();
-    println!("Duration: {:.2}s", duration);
+    println!("Duration: {duration:.2}s");
 
     assert!(duration < 5.0, "Should not timeout");
     assert!(
@@ -150,7 +150,7 @@ fn test_summarize_state_metering() -> Result<(), Box<dyn std::error::Error>> {
     let result = runtime.summarize_state(&contract_key, &Parameters::from([].as_ref()), &state);
 
     let duration = time.elapsed().as_secs_f64();
-    println!("Duration: {:.2}s", duration);
+    println!("Duration: {duration:.2}s");
 
     assert!(duration < 5.0, "Should not timeout");
     assert!(
@@ -202,7 +202,7 @@ fn test_get_state_delta_metering() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let duration = time.elapsed().as_secs_f64();
-    println!("Duration: {:.2}s", duration);
+    println!("Duration: {duration:.2}s");
 
     assert!(duration < 5.0, "Should not timeout");
     assert!(
@@ -256,8 +256,7 @@ fn test_timeout_metering() -> Result<(), Box<dyn std::error::Error>> {
     let duration = time.elapsed().as_secs_f64();
     assert!(
         duration < 5.5,
-        "Took {:.2}s, should timeout before",
-        duration
+        "Took {duration:.2}s, should timeout before"
     );
 
     assert!(
