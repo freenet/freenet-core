@@ -739,9 +739,7 @@ mod tests {
                     assert!(locations[0] >= peers[0].location.unwrap());
                     assert!(locations[0] <= peers[1].location.unwrap());
                 }
-                _ => panic!(
-                    "Expected to add a connection, adjustment was {adjustment:?}"
-                ),
+                _ => panic!("Expected to add a connection, adjustment was {adjustment:?}"),
             }
         });
     }

@@ -163,9 +163,7 @@ impl SubProcess {
 
 async fn start_supervisor(config: &TestConfig) -> anyhow::Result<(), Error> {
     let mut network = super::config_sim_network(config).await.map_err(|e| {
-        NetworkSimulationError::NetworkError(format!(
-            "Failed to configure simulation network: {e}"
-        ))
+        NetworkSimulationError::NetworkError(format!("Failed to configure simulation network: {e}"))
     })?;
 
     let supervisor = Arc::new(Supervisor::new(&mut network).await);
