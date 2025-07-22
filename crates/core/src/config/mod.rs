@@ -181,7 +181,7 @@ impl ConfigArgs {
                     }
                     ext => Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("Invalid configuration file extension: {}", ext),
+                        format!("Invalid configuration file extension: {ext}"),
                     )),
                 }
             }

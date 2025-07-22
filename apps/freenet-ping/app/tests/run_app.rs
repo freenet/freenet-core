@@ -129,16 +129,13 @@ async fn test_ping_multi_node() -> TestResult {
 
         // Connect to all three nodes
         let uri_gw = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_gw
+            "ws://127.0.0.1:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native"
         );
         let uri_node1 = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_node1
+            "ws://127.0.0.1:{ws_api_port_node1}/v1/contract/command?encodingProtocol=native"
         );
         let uri_node2 = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_node2
+            "ws://127.0.0.1:{ws_api_port_node2}/v1/contract/command?encodingProtocol=native"
         );
 
         let (stream_gw, _) = connect_async(&uri_gw).await?;
@@ -557,17 +554,13 @@ async fn test_ping_application_loop() -> TestResult {
         tokio::time::sleep(Duration::from_secs(10)).await;
 
         // Connect to all three nodes
-        let uri_gw = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_gw
-        );
+        let uri_gw =
+            format!("ws://127.0.0.1:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
         let uri_node1 = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_node1
+            "ws://127.0.0.1:{ws_api_port_node1}/v1/contract/command?encodingProtocol=native"
         );
         let uri_node2 = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_node2
+            "ws://127.0.0.1:{ws_api_port_node2}/v1/contract/command?encodingProtocol=native"
         );
 
         let (stream_gw, _) = connect_async(&uri_gw).await?;
@@ -809,7 +802,7 @@ async fn test_ping_application_loop() -> TestResult {
         let check_ping_counts = |name: &str, stats: &PingStats| {
             for (source, count) in &stats.received_counts {
                 tracing::info!("{} received {} pings from {}", name, count, source);
-                assert!(*count > 0, "{} received no pings from {}", name, source);
+                assert!(*count > 0, "{name} received no pings from {source}");
             }
         };
 
@@ -916,7 +909,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
     let mut gateway_presets = Vec::with_capacity(NUM_GATEWAYS);
 
     for i in 0..NUM_GATEWAYS {
-        let data_dir_suffix = format!("gw_{}", i);
+        let data_dir_suffix = format!("gw_{i}");
 
         let (cfg, preset) = base_node_test_config(
             true,
@@ -974,7 +967,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         let effective_connections = (NUM_REGULAR_NODES - 1) - blocked_addresses.len();
         node_connections.push(effective_connections);
 
-        let data_dir_suffix = format!("node_{}", i);
+        let data_dir_suffix = format!("node_{i}");
 
         let (cfg, preset) = base_node_test_config(
             false,
@@ -1050,8 +1043,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         let mut gateway_clients = Vec::with_capacity(NUM_GATEWAYS);
         for (i, port) in ws_api_ports_gw.iter().enumerate() {
             let uri = format!(
-                "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-                port
+                "ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native"
             );
             let (stream, _) = connect_async(&uri).await?;
             let client = WebApi::start(stream);
@@ -1062,8 +1054,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         let mut node_clients = Vec::with_capacity(NUM_REGULAR_NODES);
         for (i, port) in ws_api_ports_nodes.iter().enumerate() {
             let uri = format!(
-                "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-                port
+                "ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native"
             );
             let (stream, _) = connect_async(&uri).await?;
             let client = WebApi::start(stream);
@@ -1349,7 +1340,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         tracing::info!("Node {} will send an update", updater_idx);
 
         // Create a unique tag for the updater
-        let update_tag = format!("ping-from-node-{}", updater_idx);
+        let update_tag = format!("ping-from-node-{updater_idx}");
 
         // Send the update
         let mut update_ping = Ping::default();

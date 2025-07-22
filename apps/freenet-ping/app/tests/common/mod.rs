@@ -140,10 +140,7 @@ const WASM_FILE_NAME: &str = "freenet-ping-contract";
 pub const APP_TAG: &str = "ping-app";
 
 pub async fn connect_ws_client(ws_port: u16) -> Result<WebApi> {
-    let uri = format!(
-        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-        ws_port
-    );
+    let uri = format!("ws://127.0.0.1:{ws_port}/v1/contract/command?encodingProtocol=native");
     let (stream, _) = connect_async(&uri).await?;
     Ok(WebApi::start(stream))
 }
@@ -300,7 +297,7 @@ pub(crate) fn pipe_std_streams(mut child: Child) -> anyhow::Result<()> {
         let reader = std::io::BufReader::new(c_stderr);
         for line in reader.lines() {
             let line = line?;
-            writeln!(stderr, "{}", line)?;
+            writeln!(stderr, "{line}")?;
         }
         Ok(())
     };
@@ -311,7 +308,7 @@ pub(crate) fn pipe_std_streams(mut child: Child) -> anyhow::Result<()> {
         let reader = std::io::BufReader::new(c_stdout);
         for line in reader.lines() {
             let line = line?;
-            writeln!(stdout, "{}", line)?;
+            writeln!(stdout, "{line}")?;
         }
         Ok(())
     };

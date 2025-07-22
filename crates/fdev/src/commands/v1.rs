@@ -16,8 +16,7 @@ pub(super) async fn start_api_client(cfg: BaseConfig) -> anyhow::Result<WebApi> 
     };
 
     let (stream, _) = tokio_tungstenite::connect_async(&format!(
-        "ws://{}/v1/contract/command?encodingProtocol=native",
-        target
+        "ws://{target}/v1/contract/command?encodingProtocol=native"
     ))
     .await
     .map_err(|e| {

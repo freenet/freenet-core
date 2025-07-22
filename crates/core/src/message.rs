@@ -378,7 +378,7 @@ impl Display for NodeEvent {
                 write!(f, "QuerySubscriptions")
             }
             NodeEvent::TransactionTimedOut(transaction) => {
-                write!(f, "Transaction timed out ({})", transaction)
+                write!(f, "Transaction timed out ({transaction})")
             }
         }
     }
@@ -455,7 +455,7 @@ impl Display for NetMessage {
                 Update(msg) => msg.fmt(f)?,
                 Aborted(msg) => msg.fmt(f)?,
                 Unsubscribed { key, from, .. } => {
-                    write!(f, "Unsubscribed {{  key: {}, from: {} }}", key, from)?;
+                    write!(f, "Unsubscribed {{  key: {key}, from: {from} }}")?;
                 }
             },
         };
