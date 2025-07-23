@@ -68,7 +68,7 @@ async fn home() -> axum::response::Response {
 
 impl ClientEventsProxy for HttpGateway {
     #[instrument(level = "debug", skip(self))]
-    fn recv(&mut self) -> BoxFuture<'_, Result<OpenRequest<'static>, ClientError>> {
+    fn recv(&mut self) -> BoxFuture<Result<OpenRequest<'static>, ClientError>> {
         async move {
             while let Some(msg) = self.proxy_server_request.recv().await {
                 match msg {
@@ -118,7 +118,7 @@ impl ClientEventsProxy for HttpGateway {
         &mut self,
         id: ClientId,
         result: Result<HostResponse, ClientError>,
-    ) -> BoxFuture<'_, Result<(), ClientError>> {
+    ) -> BoxFuture<Result<(), ClientError>> {
         async move {
             if let Some(ch) = self.response_channels.remove(&id) {
                 let should_rm = result

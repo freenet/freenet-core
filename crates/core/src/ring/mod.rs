@@ -304,7 +304,7 @@ impl Ring {
     pub fn subscribers_of(
         &self,
         contract: &ContractKey,
-    ) -> Option<DmRef<'_, ContractKey, Vec<PeerKeyLocation>>> {
+    ) -> Option<DmRef<ContractKey, Vec<PeerKeyLocation>>> {
         self.seeding_manager.subscribers_of(contract)
     }
 

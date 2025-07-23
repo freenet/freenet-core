@@ -53,7 +53,7 @@ impl ConnectOp {
         self.backoff.is_some()
     }
 
-    pub(super) fn outcome(&self) -> OpOutcome<'_> {
+    pub(super) fn outcome(&self) -> OpOutcome {
         OpOutcome::Irrelevant
     }
 

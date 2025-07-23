@@ -430,7 +430,7 @@ impl Config {
         self.secrets.transport_keypair()
     }
 
-    pub fn paths(&self) -> Arc<ConfigPaths> {
+    pub(crate) fn paths(&self) -> Arc<ConfigPaths> {
         self.config_paths.clone()
     }
 }
@@ -815,7 +815,7 @@ impl ConfigPaths {
         self
     }
 
-    pub fn iter(&self) -> ConfigPathsIter<'_> {
+    pub fn iter(&self) -> ConfigPathsIter {
         ConfigPathsIter {
             curr: 0,
             config_paths: self,

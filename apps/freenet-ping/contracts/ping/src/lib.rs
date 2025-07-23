@@ -44,7 +44,8 @@ impl ContractInterface for Contract {
         #[cfg(feature = "contract")]
         freenet_stdlib::log::info(
             &format!(
-                "[UPDATE_STATE] Ping contract update_state called with parameters: {parameters:?}, state: {state:?}, data: {data:?}"
+                "[UPDATE_STATE] Ping contract update_state called with parameters: {:?}, state: {:?}, data: {:?}",
+                parameters, state, data
             )
         );
         let opts = serde_json::from_slice::<PingContractOptions>(parameters.as_ref())

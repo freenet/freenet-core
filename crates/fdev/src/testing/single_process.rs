@@ -73,7 +73,7 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
                         break;
                     }
                     Err(e) => {
-                        tracing::error!("Test finalized with error: {e}");
+                        tracing::error!("Test finalized with error: {}", e);
                         return Err(e);
                     }
                 }

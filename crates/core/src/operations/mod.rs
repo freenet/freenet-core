@@ -95,11 +95,6 @@ where
             return Ok(None);
         }
         Err(err) => {
-            tracing::error!(
-                %tx_id,
-                error = %err,
-                "PUT_ERROR: Operation failed with error"
-            );
             if let Some(sender) = sender {
                 network_bridge
                     .send(&sender, NetMessage::V1(NetMessageV1::Aborted(tx_id)))
@@ -179,7 +174,7 @@ impl OpEnum {
             OpEnum::Update(op) => op,
         } {
             pub fn id(&self) -> &Transaction;
-            pub fn outcome(&self) -> OpOutcome<'_>;
+            pub fn outcome(&self) -> OpOutcome;
             pub fn finalized(&self) -> bool;
             pub fn to_host_result(&self) -> HostResult;
         }
@@ -318,30 +313,21 @@ async fn start_subscription_request(
     try_get: bool,
     skip_list: HashSet<PeerId>,
 ) {
-    tracing::info!(
-        %key,
-        try_get,
-        skip_list_size = skip_list.len(),
-        "SUBSCRIPTION_START: Starting subscription request for contract"
-    );
-
     let sub_op = subscribe::start_op(key);
     if let Err(error) = subscribe::request_subscribe(op_manager, sub_op).await {
         if !try_get {
-            tracing::warn!(%error, %key, "SUBSCRIPTION_ERROR: Error subscribing to contract");
+            tracing::warn!(%error, "Error subscribing to contract");
             return;
         }
         if let OpError::ContractError(ContractError::ContractNotFound(key)) = &error {
-            tracing::debug!(%key, "SUBSCRIPTION_RETRY: Contract not found, trying to get it first");
+            tracing::debug!(%key, "Contract not found, trying to get it first");
             let get_op = get::start_op(*key, true, true);
             if let Err(error) = get::request_get(op_manager, get_op, skip_list).await {
-                tracing::warn!(%error, %key, "SUBSCRIPTION_ERROR: Error getting contract");
+                tracing::warn!(%error, "Error getting contract");
             }
         } else {
-            tracing::warn!(%error, %key, "SUBSCRIPTION_ERROR: Error subscribing to contract");
+            tracing::warn!(%error, "Error subscribing to contract");
         }
-    } else {
-        tracing::info!(%key, "SUBSCRIPTION_SUCCESS: Successfully subscribed to contract");
     }
 }
 

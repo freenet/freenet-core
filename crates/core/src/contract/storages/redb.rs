@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::sync::Arc;
 
 use freenet_stdlib::prelude::*;
 use redb::{Database, TableDefinition};
@@ -10,14 +9,13 @@ const CONTRACT_PARAMS_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("contract_params");
 const STATE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state");
 
-#[derive(Clone)]
-pub struct ReDb(Arc<Database>);
+pub struct ReDb(Database);
 
 impl ReDb {
     pub async fn new(data_dir: &Path) -> Result<Self, redb::Error> {
         let db_path = data_dir.join("db");
         tracing::info!("loading contract store from {db_path:?}");
-        match Database::create(db_path).map(Arc::new).map(Self) {
+        match Database::create(db_path).map(Self) {
             Ok(db) => {
                 let txn = db.0.begin_write()?;
                 {

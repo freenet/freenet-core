@@ -18,10 +18,12 @@ use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use super::executor::runtime::RuntimePool;
 use super::executor::{ExecutorHalve, ExecutorToEventLoopChannel};
 use super::ExecutorError;
-use super::{executor::ContractExecutor, ContractError};
+use super::{
+    executor::{ContractExecutor, Executor},
+    ContractError,
+};
 use crate::client_events::HostResult;
 use crate::config::Config;
 use crate::message::{QueryResult, Transaction};
@@ -60,7 +62,7 @@ impl std::ops::Deref for ClientResponsesSender {
 }
 
 pub(crate) trait ContractHandler {
-    type Builder: Clone;
+    type Builder;
     type ContractExecutor: ContractExecutor;
 
     fn build(
@@ -76,15 +78,14 @@ pub(crate) trait ContractHandler {
     fn executor(&mut self) -> &mut Self::ContractExecutor;
 }
 
-pub(crate) struct NetworkContractHandler<C = Arc<Config>, R = Runtime> {
-    executor: RuntimePool<C, R>,
+pub(crate) struct NetworkContractHandler<R = Runtime> {
+    executor: Executor<R>,
     channel: ContractHandlerChannel<ContractHandlerHalve>,
-    op_res_handle: tokio::task::JoinHandle<()>,
 }
 
-impl ContractHandler for NetworkContractHandler<Arc<Config>, Runtime> {
+impl ContractHandler for NetworkContractHandler<Runtime> {
     type Builder = Arc<Config>;
-    type ContractExecutor = RuntimePool<Self::Builder, Runtime>;
+    type ContractExecutor = Executor<Runtime>;
 
     async fn build(
         channel: ContractHandlerChannel<ContractHandlerHalve>,
@@ -94,17 +95,8 @@ impl ContractHandler for NetworkContractHandler<Arc<Config>, Runtime> {
     where
         Self: Sized + 'static,
     {
-        let num_executors = std::thread::available_parallelism()?;
-        let (to_process_tx, to_process) = mpsc::channel(num_executors.into());
-        let op_manager = executor_request_sender.op_manager.clone();
-        let op_res_handle =
-            tokio::spawn(executor_request_sender.handle_operation_result(to_process));
-        let executor = RuntimePool::new(config, to_process_tx, op_manager, num_executors).await?;
-        Ok(Self {
-            executor,
-            channel,
-            op_res_handle,
-        })
+        let executor = Executor::from_config(config.clone(), Some(executor_request_sender)).await?;
+        Ok(Self { executor, channel })
     }
 
     fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve> {
@@ -112,17 +104,14 @@ impl ContractHandler for NetworkContractHandler<Arc<Config>, Runtime> {
     }
 
     fn executor(&mut self) -> &mut Self::ContractExecutor {
-        if self.op_res_handle.is_finished() {
-            panic!("executor handle is finished");
-        }
         &mut self.executor
     }
 }
 
 #[cfg(test)]
-impl ContractHandler for NetworkContractHandler<String, super::MockRuntime> {
+impl ContractHandler for NetworkContractHandler<super::MockRuntime> {
     type Builder = String;
-    type ContractExecutor = RuntimePool<Self::Builder, super::MockRuntime>;
+    type ContractExecutor = Executor<super::MockRuntime>;
 
     async fn build(
         channel: ContractHandlerChannel<ContractHandlerHalve>,
@@ -132,19 +121,8 @@ impl ContractHandler for NetworkContractHandler<String, super::MockRuntime> {
     where
         Self: Sized + 'static,
     {
-        let num_executors = std::thread::available_parallelism()?;
-        let (to_process_tx, to_process) = mpsc::channel(num_executors.into());
-        let op_manager = executor_request_sender.op_manager.clone();
-        let op_res_handle =
-            tokio::spawn(executor_request_sender.handle_operation_result(to_process));
-        let executor =
-            RuntimePool::new_mock(&identifier, to_process_tx, op_manager, num_executors).await?;
-
-        Ok(Self {
-            executor,
-            channel,
-            op_res_handle,
-        })
+        let executor = Executor::new_mock(&identifier, executor_request_sender).await?;
+        Ok(Self { executor, channel })
     }
 
     fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve> {
@@ -152,9 +130,6 @@ impl ContractHandler for NetworkContractHandler<String, super::MockRuntime> {
     }
 
     fn executor(&mut self) -> &mut Self::ContractExecutor {
-        if self.op_res_handle.is_finished() {
-            panic!("executor handle is finished");
-        }
         &mut self.executor
     }
 }
@@ -538,22 +513,17 @@ pub mod test {
 }
 
 pub(super) mod in_memory {
-    use tokio::sync::mpsc;
-
-    use crate::contract::executor::runtime::RuntimePool;
-
     use super::{
         super::{
             executor::{ExecutorHalve, ExecutorToEventLoopChannel},
-            MockRuntime,
+            Executor, MockRuntime,
         },
         ContractHandler, ContractHandlerChannel, ContractHandlerHalve,
     };
 
     pub(crate) struct MemoryContractHandler {
         channel: ContractHandlerChannel<ContractHandlerHalve>,
-        runtime: RuntimePool<String, MockRuntime>,
-        op_res_handle: tokio::task::JoinHandle<()>,
+        runtime: Executor<MockRuntime>,
     }
 
     impl MemoryContractHandler {
@@ -562,27 +532,18 @@ pub(super) mod in_memory {
             executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
             identifier: &str,
         ) -> Self {
-            let num_executors = std::thread::available_parallelism().unwrap();
-            let (to_process_tx, to_process) = mpsc::channel(num_executors.into());
-            let op_manager = executor_request_sender.op_manager.clone();
-            let op_res_handle =
-                tokio::spawn(executor_request_sender.handle_operation_result(to_process));
-            let runtime =
-                RuntimePool::new_mock(identifier, to_process_tx, op_manager, num_executors)
-                    .await
-                    .unwrap();
-
             MemoryContractHandler {
                 channel,
-                runtime,
-                op_res_handle,
+                runtime: Executor::new_mock(identifier, executor_request_sender)
+                    .await
+                    .expect("should start mock executor"),
             }
         }
     }
 
     impl ContractHandler for MemoryContractHandler {
         type Builder = String;
-        type ContractExecutor = RuntimePool<Self::Builder, MockRuntime>;
+        type ContractExecutor = Executor<MockRuntime>;
 
         async fn build(
             channel: ContractHandlerChannel<ContractHandlerHalve>,
@@ -600,9 +561,6 @@ pub(super) mod in_memory {
         }
 
         fn executor(&mut self) -> &mut Self::ContractExecutor {
-            if self.op_res_handle.is_finished() {
-                panic!("executor handle is finished");
-            }
             &mut self.runtime
         }
     }

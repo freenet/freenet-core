@@ -19,10 +19,7 @@ async fn run_local(config: Config) -> anyhow::Result<()> {
     tracing::info!("Starting freenet node in local mode");
     let socket = config.ws_api;
 
-    let _ = freenet::util::set_cleanup_on_exit(config.paths()).inspect_err(|error| {
-        tracing::error!("Failed to set cleanup on exit: {error}");
-    });
-    let executor = Executor::local(Arc::new(config))
+    let executor = Executor::from_config(Arc::new(config), None)
         .await
         .map_err(anyhow::Error::msg)?;
 

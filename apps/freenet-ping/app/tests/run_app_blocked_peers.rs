@@ -223,24 +223,28 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
         tokio::time::sleep(config.initial_wait).await;
 
         // Connect to nodes via WebSocket
-        let uri_gw =
-            format!("ws://127.0.0.1:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
+        let uri_gw = format!(
+            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+            ws_api_port_gw
+        );
         let uri_node1 = format!(
-            "ws://127.0.0.1:{ws_api_port_node1}/v1/contract/command?encodingProtocol=native"
+            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+            ws_api_port_node1
         );
         let uri_node2 = format!(
-            "ws://127.0.0.1:{ws_api_port_node2}/v1/contract/command?encodingProtocol=native"
+            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+            ws_api_port_node2
         );
 
-        tracing::info!("Connecting to Gateway at {uri_gw}");
+        tracing::info!("Connecting to Gateway at {}", uri_gw);
         let (stream_gw, _) = connect_async(&uri_gw).await?;
         let mut client_gw = WebApi::start(stream_gw);
 
-        tracing::info!("Connecting to Node1 at {uri_node1}");
+        tracing::info!("Connecting to Node1 at {}", uri_node1);
         let (stream_node1, _) = connect_async(&uri_node1).await?;
         let mut client_node1 = WebApi::start(stream_node1);
 
-        tracing::info!("Connecting to Node2 at {uri_node2}");
+        tracing::info!("Connecting to Node2 at {}", uri_node2);
         let (stream_node2, _) = connect_async(&uri_node2).await?;
         let mut client_node2 = WebApi::start(stream_node2);
 
@@ -402,7 +406,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
         // Gateway sends update
         let mut gw_ping = Ping::default();
         gw_ping.insert(gw_tag.clone());
-        tracing::info!("Gateway sending update with tag: {gw_tag}");
+        tracing::info!("Gateway sending update with tag: {}", gw_tag);
         client_gw
             .send(ClientRequest::ContractOp(ContractRequest::Update {
                 key: contract_key,
@@ -413,7 +417,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
         // Node1 sends update
         let mut node1_ping = Ping::default();
         node1_ping.insert(node1_tag.clone());
-        tracing::info!("Node 1 sending update with tag: {node1_tag}");
+        tracing::info!("Node 1 sending update with tag: {}", node1_tag);
         client_node1
             .send(ClientRequest::ContractOp(ContractRequest::Update {
                 key: contract_key,
@@ -424,7 +428,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
         // Node2 sends update
         let mut node2_ping = Ping::default();
         node2_ping.insert(node2_tag.clone());
-        tracing::info!("Node 2 sending update with tag: {node2_tag}");
+        tracing::info!("Node 2 sending update with tag: {}", node2_tag);
         client_node2
             .send(ClientRequest::ContractOp(ContractRequest::Update {
                 key: contract_key,
@@ -461,16 +465,16 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
                 node2_seen_gw |= node2_seen_gw_now;
                 node2_seen_node1 |= node2_seen_node1_now;
 
-                tracing::info!("Check {i}: Update propagation status:");
+                tracing::info!("Check {}: Update propagation status:", i);
                 tracing::info!("Gateway state: {:?}", state_gw);
                 tracing::info!("Node 1 state: {:?}", state_node1);
                 tracing::info!("Node 2 state: {:?}", state_node2);
-                tracing::info!("Gateway seen Node1: {gw_seen_node1}");
-                tracing::info!("Gateway seen Node2: {gw_seen_node2}");
-                tracing::info!("Node1 seen Gateway: {node1_seen_gw}");
-                tracing::info!("Node1 seen Node2: {node1_seen_node2}");
-                tracing::info!("Node2 seen Gateway: {node2_seen_gw}");
-                tracing::info!("Node2 seen Node1: {node2_seen_node1}");
+                tracing::info!("Gateway seen Node1: {}", gw_seen_node1);
+                tracing::info!("Gateway seen Node2: {}", gw_seen_node2);
+                tracing::info!("Node1 seen Gateway: {}", node1_seen_gw);
+                tracing::info!("Node1 seen Node2: {}", node1_seen_node2);
+                tracing::info!("Node2 seen Gateway: {}", node2_seen_gw);
+                tracing::info!("Node2 seen Node1: {}", node2_seen_node1);
 
                 if gw_seen_node1
                     && gw_seen_node2
@@ -492,9 +496,9 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
                     );
 
                     let mut gw_ping_refresh = Ping::default();
-                    let gw_refresh_tag = format!("{gw_tag}-refresh");
+                    let gw_refresh_tag = format!("{}-refresh", gw_tag);
                     gw_ping_refresh.insert(gw_refresh_tag.clone());
-                    tracing::info!("Gateway sending refresh update: {gw_refresh_tag}");
+                    tracing::info!("Gateway sending refresh update: {}", gw_refresh_tag);
                     client_gw
                         .send(ClientRequest::ContractOp(ContractRequest::Update {
                             key: contract_key,
@@ -505,9 +509,9 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
                         .await?;
 
                     let mut node1_ping_refresh = Ping::default();
-                    let node1_refresh_tag = format!("{node1_tag}-refresh");
+                    let node1_refresh_tag = format!("{}-refresh", node1_tag);
                     node1_ping_refresh.insert(node1_refresh_tag.clone());
-                    tracing::info!("Node1 sending refresh update: {node1_refresh_tag}");
+                    tracing::info!("Node1 sending refresh update: {}", node1_refresh_tag);
                     client_node1
                         .send(ClientRequest::ContractOp(ContractRequest::Update {
                             key: contract_key,
@@ -518,9 +522,9 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
                         .await?;
 
                     let mut node2_ping_refresh = Ping::default();
-                    let node2_refresh_tag = format!("{node2_tag}-refresh");
+                    let node2_refresh_tag = format!("{}-refresh", node2_tag);
                     node2_ping_refresh.insert(node2_refresh_tag.clone());
-                    tracing::info!("Node2 sending refresh update: {node2_refresh_tag}");
+                    tracing::info!("Node2 sending refresh update: {}", node2_refresh_tag);
                     client_node2
                         .send(ClientRequest::ContractOp(ContractRequest::Update {
                             key: contract_key,
@@ -536,9 +540,9 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
             for i in 1..=config.update_rounds {
                 // Gateway update
                 let mut gw_ping_refresh = Ping::default();
-                let gw_refresh_tag = format!("{gw_tag}-round{i}");
+                let gw_refresh_tag = format!("{}-round{}", gw_tag, i);
                 gw_ping_refresh.insert(gw_refresh_tag.clone());
-                tracing::info!("Gateway sending round {i} update: {gw_refresh_tag}");
+                tracing::info!("Gateway sending round {} update: {}", i, gw_refresh_tag);
                 client_gw
                     .send(ClientRequest::ContractOp(ContractRequest::Update {
                         key: contract_key,
@@ -550,9 +554,9 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
 
                 // Node1 update
                 let mut node1_ping_refresh = Ping::default();
-                let node1_refresh_tag = format!("{node1_tag}-round{i}");
+                let node1_refresh_tag = format!("{}-round{}", node1_tag, i);
                 node1_ping_refresh.insert(node1_refresh_tag.clone());
-                tracing::info!("Node1 sending round {i} update: {node1_refresh_tag}");
+                tracing::info!("Node1 sending round {} update: {}", i, node1_refresh_tag);
                 client_node1
                     .send(ClientRequest::ContractOp(ContractRequest::Update {
                         key: contract_key,
@@ -564,9 +568,9 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
 
                 // Node2 update
                 let mut node2_ping_refresh = Ping::default();
-                let node2_refresh_tag = format!("{node2_tag}-round{i}");
+                let node2_refresh_tag = format!("{}-round{}", node2_tag, i);
                 node2_ping_refresh.insert(node2_refresh_tag.clone());
-                tracing::info!("Node2 sending round {i} update: {node2_refresh_tag}");
+                tracing::info!("Node2 sending round {} update: {}", i, node2_refresh_tag);
                 client_node2
                     .send(ClientRequest::ContractOp(ContractRequest::Update {
                         key: contract_key,
@@ -607,12 +611,12 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
         tracing::info!("Gateway state: {:?}", state_gw);
         tracing::info!("Node 1 state: {:?}", state_node1);
         tracing::info!("Node 2 state: {:?}", state_node2);
-        tracing::info!("Gateway seen Node1: {gw_seen_node1}");
-        tracing::info!("Gateway seen Node2: {gw_seen_node2}");
-        tracing::info!("Node1 seen Gateway: {node1_seen_gw}");
-        tracing::info!("Node1 seen Node2: {node1_seen_node2}");
-        tracing::info!("Node2 seen Gateway: {node2_seen_gw}");
-        tracing::info!("Node2 seen Node1: {node2_seen_node1}");
+        tracing::info!("Gateway seen Node1: {}", gw_seen_node1);
+        tracing::info!("Gateway seen Node2: {}", gw_seen_node2);
+        tracing::info!("Node1 seen Gateway: {}", node1_seen_gw);
+        tracing::info!("Node1 seen Node2: {}", node1_seen_node2);
+        tracing::info!("Node2 seen Gateway: {}", node2_seen_gw);
+        tracing::info!("Node2 seen Node1: {}", node2_seen_node1);
 
         // Check if we need final updates when propagation is incomplete
         if config.send_final_updates
@@ -627,9 +631,9 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
 
             // Gateway final update
             let mut gw_ping_final = Ping::default();
-            let gw_final_tag = format!("{gw_tag}-final");
+            let gw_final_tag = format!("{}-final", gw_tag);
             gw_ping_final.insert(gw_final_tag.clone());
-            tracing::info!("Gateway sending final update: {gw_final_tag}");
+            tracing::info!("Gateway sending final update: {}", gw_final_tag);
             client_gw
                 .send(ClientRequest::ContractOp(ContractRequest::Update {
                     key: contract_key,
@@ -641,9 +645,9 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
 
             // Node1 final update
             let mut node1_ping_final = Ping::default();
-            let node1_final_tag = format!("{node1_tag}-final");
+            let node1_final_tag = format!("{}-final", node1_tag);
             node1_ping_final.insert(node1_final_tag.clone());
-            tracing::info!("Node1 sending final update: {node1_final_tag}");
+            tracing::info!("Node1 sending final update: {}", node1_final_tag);
             client_node1
                 .send(ClientRequest::ContractOp(ContractRequest::Update {
                     key: contract_key,
@@ -655,9 +659,9 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
 
             // Node2 final update
             let mut node2_ping_final = Ping::default();
-            let node2_final_tag = format!("{node2_tag}-final");
+            let node2_final_tag = format!("{}-final", node2_tag);
             node2_ping_final.insert(node2_final_tag.clone());
-            tracing::info!("Node2 sending final update: {node2_final_tag}");
+            tracing::info!("Node2 sending final update: {}", node2_final_tag);
             client_node2
                 .send(ClientRequest::ContractOp(ContractRequest::Update {
                     key: contract_key,
@@ -703,12 +707,12 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
             tracing::info!("Gateway state: {:?}", state_gw);
             tracing::info!("Node 1 state: {:?}", state_node1);
             tracing::info!("Node 2 state: {:?}", state_node2);
-            tracing::info!("Gateway seen Node1: {gw_seen_node1}");
-            tracing::info!("Gateway seen Node2: {gw_seen_node2}");
-            tracing::info!("Node1 seen Gateway: {node1_seen_gw}");
-            tracing::info!("Node1 seen Node2: {node1_seen_node2}");
-            tracing::info!("Node2 seen Gateway: {node2_seen_gw}");
-            tracing::info!("Node2 seen Node1: {node2_seen_node1}");
+            tracing::info!("Gateway seen Node1: {}", gw_seen_node1);
+            tracing::info!("Gateway seen Node2: {}", gw_seen_node2);
+            tracing::info!("Node1 seen Gateway: {}", node1_seen_gw);
+            tracing::info!("Node1 seen Node2: {}", node1_seen_node2);
+            tracing::info!("Node2 seen Gateway: {}", node2_seen_gw);
+            tracing::info!("Node2 seen Node1: {}", node2_seen_node1);
         }
 
         // Verify that all updates have been seen
@@ -769,7 +773,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
                     Ok(())
                 }
                 Ok(Err(e)) => {
-                    tracing::error!("Test failed: {e}");
+                    tracing::error!("Test failed: {}", e);
                     Err(e.into())
                 }
                 Err(_) => {

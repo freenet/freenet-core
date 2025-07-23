@@ -281,7 +281,7 @@ pub(crate) async fn execute_command(
             Ok(())
         }
         Err(e) => {
-            tracing::error!("Server returned error: {e}");
+            tracing::error!("Server returned error: {}", e);
             Err(e)
         }
     }

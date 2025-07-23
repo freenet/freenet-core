@@ -20,7 +20,7 @@ pub(crate) struct UpdateOp {
 }
 
 impl UpdateOp {
-    pub fn outcome(&self) -> OpOutcome<'_> {
+    pub fn outcome(&self) -> OpOutcome {
         OpOutcome::Irrelevant
     }
 

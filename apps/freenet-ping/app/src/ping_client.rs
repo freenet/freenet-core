@@ -72,7 +72,7 @@ pub async fn wait_for_put_response(
                 }
             }
             Ok(Ok(other)) => {
-                tracing::warn!("Unexpected response while waiting for put: {other}");
+                tracing::warn!("Unexpected response while waiting for put: {}", other);
             }
             Ok(Err(err)) => {
                 tracing::error!(err=%err);
@@ -108,14 +108,14 @@ pub async fn wait_for_get_response(
                         return Ok(ping);
                     }
                     Err(e) => {
-                        tracing::error!("Failed to deserialize Ping: {e}");
+                        tracing::error!("Failed to deserialize Ping: {}", e);
                         tracing::error!("Raw state data: {:?}", String::from_utf8_lossy(&state));
                         return Err(Box::new(e));
                     }
                 };
             }
             Ok(Ok(other)) => {
-                tracing::warn!("Unexpected response while waiting for get: {other}");
+                tracing::warn!("Unexpected response while waiting for get: {}", other);
             }
             Ok(Err(err)) => {
                 tracing::error!(err=%err);
@@ -152,7 +152,7 @@ pub async fn wait_for_subscribe_response(
                 }
             }
             Ok(Ok(other)) => {
-                tracing::warn!("Unexpected response while waiting for subscribe: {other}");
+                tracing::warn!("Unexpected response while waiting for subscribe: {}", other);
             }
             Ok(Err(err)) => {
                 tracing::error!(err=%err);
@@ -246,7 +246,7 @@ pub async fn run_ping_client(
                                         for (name, timestamps) in updates.into_iter() {
                                             if !timestamps.is_empty() {
                                                 if let Some(last) = timestamps.first() {
-                                                    tracing::info!("{name} last updated at {last}");
+                                                    tracing::info!("{} last updated at {}", name, last);
                                                 }
                                                 stats.record_received(name, timestamps);
                                             }

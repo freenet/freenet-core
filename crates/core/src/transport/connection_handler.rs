@@ -139,12 +139,7 @@ impl OutboundConnectionHandler {
     ) -> Result<(Self, mpsc::Receiver<PeerConnection>), TransportError> {
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
-        // Increase buffer size for gateways which can have many concurrent connections
-        let buffer_size = if is_gateway { 1000 } else { 100 };
-        let (new_connection_sender, new_connection_notifier) = mpsc::channel(buffer_size);
-        tracing::debug!(
-            "Creating connection handler with buffer size: {buffer_size} (gateway: {is_gateway})"
-        );
+        let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
 
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (outbound_sender, outbound_recv) = mpsc::channel(100);
@@ -295,7 +290,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         let mut gw_connection_tasks = FuturesUnordered::new();
         let mut outdated_peer: HashMap<SocketAddr, Instant> = HashMap::new();
 
-        loop {
+        'outer: loop {
             tokio::select! {
                 recv_result = self.socket_listener.recv_from(&mut buf) => {
                     match recv_result {
@@ -319,20 +314,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                             );
 
                             if let Some(remote_conn) = self.remote_connections.remove(&remote_addr) {
-                                // Check if this might be a keep-alive packet (NoOp)
-                                let packet_size = buf[..size].len();
-                                let is_likely_keepalive = packet_size < 100; // Keep-alives are small
-
                                 match remote_conn.inbound_packet_sender.try_send(packet_data) {
                                     Ok(_) => {
-                                        if is_likely_keepalive {
-                                            tracing::debug!(
-                                                target: "freenet_core::transport::gateway_keepalive",
-                                                %remote_addr,
-                                                packet_size,
-                                                "GATEWAY_KEEPALIVE_FORWARD: Forwarded likely keep-alive packet"
-                                            );
-                                        }
                                         self.remote_connections.insert(remote_addr, remote_conn);
                                         continue;
                                     }
@@ -343,12 +326,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         // Track dropped packets and log warnings periodically
                                         let dropped_count = self.dropped_packets.entry(remote_addr).or_insert(0);
                                         *dropped_count += 1;
-
-                                        tracing::debug!(
-                                            %remote_addr,
-                                            dropped_count = *dropped_count,
-                                            "CHANNEL_OVERFLOW: Dropping packet due to full channel (buffer size: 100)"
-                                        );
 
                                         // Log warning every 10 seconds if packets are being dropped
                                         let now = Instant::now();
@@ -463,27 +440,12 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                             self.remote_connections.insert(remote_addr, inbound_remote_connection);
 
-                            // CRITICAL: Use try_send to avoid blocking the entire UDP listener
-                            match self.new_connection_notifier
-                                .try_send(PeerConnection::new(outbound_remote_conn)) {
-                                Ok(()) => {
-                                    tracing::debug!(%remote_addr, "Successfully notified new gateway connection");
-                                }
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    tracing::error!(
-                                        %remote_addr,
-                                        is_gateway = self.is_gateway,
-                                        "CRITICAL: new_connection_notifier channel is FULL. This blocks all packet processing!"
-                                    );
-                                    // TODO: We should handle this better - maybe increase buffer size or process connections differently
-                                    // For now, continue processing other packets
-                                    continue;
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    tracing::error!(%remote_addr, "new_connection_notifier channel is closed");
-                                    // Channel closed means we should stop the entire listener
-                                    return Err(TransportError::ConnectionClosed(self.this_addr));
-                                }
+                            if self.new_connection_notifier
+                                .send(PeerConnection::new(outbound_remote_conn))
+                                .await
+                                .is_err() {
+                                tracing::error!(%remote_addr, "gateway connection established but failed to notify new connection");
+                                break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
                             }
 
                             sent_tracker.lock().report_sent_packet(

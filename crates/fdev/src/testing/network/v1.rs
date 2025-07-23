@@ -16,7 +16,7 @@ pub async fn start_server_v1(supervisor: Arc<Supervisor>) -> Result<(), NetworkS
     let socket = SocketAddr::from(([0, 0, 0, 0], 3000));
 
     tokio::spawn(async move {
-        tracing::info!("Supervisor running on {socket}");
+        tracing::info!("Supervisor running on {}", socket);
         let listener = tokio::net::TcpListener::bind(socket).await.map_err(|_| {
             NetworkSimulationError::ServerStartFailure("Failed to bind TCP listener".into())
         })?;

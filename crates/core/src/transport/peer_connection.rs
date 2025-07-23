@@ -147,7 +147,7 @@ impl PeerConnection {
         let last_packet_id = remote_conn.last_packet_id.clone();
 
         let keep_alive_handle = tokio::spawn(async move {
-            tracing::debug!(
+            tracing::info!(
                 target: "freenet_core::transport::keepalive_lifecycle",
                 remote = ?remote_addr,
                 "Keep-alive task STARTED for connection"
@@ -170,7 +170,7 @@ impl PeerConnection {
                 let elapsed_since_start = task_start.elapsed();
                 let elapsed_since_last_tick = tick_start.elapsed();
 
-                tracing::trace!(
+                tracing::info!(
                     target: "freenet_core::transport::keepalive_lifecycle",
                     remote = ?remote_addr,
                     tick_count,
@@ -195,25 +195,20 @@ impl PeerConnection {
                 };
 
                 // Send the keep-alive packet
-                let send_time = std::time::Instant::now();
-                tracing::debug!(
+                tracing::info!(
                     target: "freenet_core::transport::keepalive_lifecycle",
                     remote = ?remote_addr,
                     packet_id,
-                    tick_count,
-                    "KEEP_ALIVE_SENT: Sending keep-alive NoOp packet"
+                    "Sending keep-alive NoOp packet"
                 );
 
                 match outbound_packets.send((remote_addr, noop_packet)).await {
                     Ok(_) => {
-                        let send_duration = send_time.elapsed();
-                        tracing::trace!(
+                        tracing::info!(
                             target: "freenet_core::transport::keepalive_lifecycle",
                             remote = ?remote_addr,
                             packet_id,
-                            tick_count,
-                            send_duration_ms = send_duration.as_millis(),
-                            "KEEP_ALIVE_SENT_SUCCESS: Keep-alive NoOp packet sent successfully"
+                            "Keep-alive NoOp packet sent successfully"
                         );
                     }
                     Err(e) => {
@@ -239,7 +234,7 @@ impl PeerConnection {
             );
         });
 
-        tracing::debug!(remote = ?remote_addr, "PeerConnection created with persistent keep-alive task");
+        tracing::info!(remote = ?remote_addr, "PeerConnection created with persistent keep-alive task");
 
         Self {
             remote_conn,
@@ -351,28 +346,6 @@ impl PeerConnection {
         loop {
             // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
             tokio::select! {
-                // Check completed streams first to prevent channel backup
-                inbound_stream = self.inbound_stream_futures.next(), if !self.inbound_stream_futures.is_empty() => {
-                    let Some(res) = inbound_stream else {
-                        tracing::error!("unexpected no-stream from ongoing_inbound_streams");
-                        continue
-                    };
-                    let Ok((stream_id, msg)) = res.map_err(|e| TransportError::Other(e.into()))? else {
-                        tracing::error!("unexpected error from ongoing_inbound_streams");
-                        // TODO: may leave orphan stream recvs hanging around in this case
-                        continue;
-                    };
-                    self.inbound_streams.remove(&stream_id);
-                    tracing::trace!(%stream_id, "stream finished");
-                    return Ok(msg);
-                }
-                outbound_stream = self.outbound_stream_futures.next(), if !self.outbound_stream_futures.is_empty() => {
-                    let Some(res) = outbound_stream else {
-                        tracing::error!("unexpected no-stream from ongoing_outbound_streams");
-                        continue
-                    };
-                    res.map_err(|e| TransportError::Other(e.into()))??
-                }
                 inbound = self.remote_conn.inbound_packet_recv.recv() => {
                     let packet_data = inbound.ok_or(TransportError::ConnectionClosed(self.remote_addr()))?;
                     last_received = std::time::Instant::now();
@@ -489,12 +462,12 @@ impl PeerConnection {
                     // Log keep-alive packets specifically
                     if matches!(payload, SymmetricMessagePayload::NoOp) {
                         if confirm_receipt.is_empty() {
-                            tracing::trace!(
+                            tracing::info!(
                                 target: "freenet_core::transport::keepalive_received",
                                 remote = ?self.remote_conn.remote_addr,
                                 packet_id,
                                 time_since_last_received_ms = last_received.elapsed().as_millis(),
-                                "KEEP_ALIVE_RECEIVED: Received NoOp keep-alive packet (no receipts)"
+                                "Received NoOp keep-alive packet (no receipts)"
                             );
                         } else {
                             tracing::debug!(
@@ -537,24 +510,10 @@ impl PeerConnection {
                         .report_received_receipts(&confirm_receipt);
 
                     let report_result = self.received_tracker.report_received_packet(packet_id);
-                    let trigger_str = match &report_result {
-                        ReportResult::QueueFull => "QueueFull",
-                        ReportResult::Ok => "Ok",
-                        ReportResult::AlreadyReceived => "AlreadyReceived",
-                    };
                     match (report_result, should_send_receipts) {
                         (ReportResult::QueueFull, _) | (_, true) => {
                             let receipts = self.received_tracker.get_receipts();
                             if !receipts.is_empty() {
-                                tracing::trace!(
-                                    target: "freenet_core::transport::keepalive_response",
-                                    remote = ?self.remote_conn.remote_addr,
-                                    receipt_count = receipts.len(),
-                                    receipts = ?receipts,
-                                    trigger = trigger_str,
-                                    should_send_receipts,
-                                    "KEEP_ALIVE_RESPONSE: Sending receipt NoOp packet"
-                                );
                                 self.noop(receipts).await?;
                             }
                         },
@@ -564,23 +523,34 @@ impl PeerConnection {
                             continue;
                         }
                     }
-                    let process_start = std::time::Instant::now();
                     if let Some(msg) = self.process_inbound(payload).await.map_err(|error| {
                         tracing::error!(%error, %packet_id, remote = %self.remote_conn.remote_addr, "error processing inbound packet");
                         error
                     })? {
-                        let process_elapsed = process_start.elapsed();
-                        if process_elapsed > std::time::Duration::from_millis(50) {
-                            tracing::warn!(
-                                %packet_id,
-                                remote = %self.remote_conn.remote_addr,
-                                elapsed_ms = process_elapsed.as_millis(),
-                                "SLOW inbound packet processing!"
-                            );
-                        }
                         tracing::trace!(%packet_id, "returning full stream message");
                         return Ok(msg);
                     }
+                }
+                inbound_stream = self.inbound_stream_futures.next(), if !self.inbound_stream_futures.is_empty() => {
+                    let Some(res) = inbound_stream else {
+                        tracing::error!("unexpected no-stream from ongoing_inbound_streams");
+                        continue
+                    };
+                    let Ok((stream_id, msg)) = res.map_err(|e| TransportError::Other(e.into()))? else {
+                        tracing::error!("unexpected error from ongoing_inbound_streams");
+                        // TODO: may leave orphan stream recvs hanging around in this case
+                        continue;
+                    };
+                    self.inbound_streams.remove(&stream_id);
+                    tracing::trace!(%stream_id, "stream finished");
+                    return Ok(msg);
+                }
+                outbound_stream = self.outbound_stream_futures.next(), if !self.outbound_stream_futures.is_empty() => {
+                    let Some(res) = outbound_stream else {
+                        tracing::error!("unexpected no-stream from ongoing_outbound_streams");
+                        continue
+                    };
+                    res.map_err(|e| TransportError::Other(e.into()))??
                 }
                 _ = timeout_check.tick() => {
                     let elapsed = last_received.elapsed();
@@ -590,7 +560,7 @@ impl PeerConnection {
                             remote = ?self.remote_conn.remote_addr,
                             elapsed_seconds = elapsed.as_secs_f64(),
                             timeout_threshold_secs = KILL_CONNECTION_AFTER.as_secs(),
-                            "KEEP_ALIVE_TIMEOUT: CONNECTION TIMEOUT - no packets received for {:.8}s",
+                            "CONNECTION TIMEOUT - no packets received for {:.8}s",
                             elapsed.as_secs_f64()
                         );
 
@@ -613,18 +583,13 @@ impl PeerConnection {
 
                         return Err(TransportError::ConnectionClosed(self.remote_addr()));
                     } else {
-                        // Connection is healthy, log periodically with more details
-                        let health_check_interval = 5.0; // Log every 5 seconds
-                        if elapsed.as_secs_f64() % health_check_interval < 1.0 {
-                            tracing::trace!(
-                                target: "freenet_core::transport::keepalive_health",
-                                remote = ?self.remote_conn.remote_addr,
-                                elapsed_seconds = elapsed.as_secs_f64(),
-                                remaining_seconds = (KILL_CONNECTION_AFTER - elapsed).as_secs_f64(),
-                                keep_alive_task_running = self.keep_alive_handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false),
-                                "KEEP_ALIVE_HEALTH: Connection health check - still alive"
-                            );
-                        }
+                        tracing::trace!(
+                            target: "freenet_core::transport::keepalive_health",
+                            remote = ?self.remote_conn.remote_addr,
+                            elapsed_seconds = elapsed.as_secs_f64(),
+                            remaining_seconds = (KILL_CONNECTION_AFTER - elapsed).as_secs_f64(),
+                            "Connection health check - still alive"
+                        );
                     }
                 }
                 _ = resend_check.take().unwrap_or(tokio::time::sleep(Duration::from_millis(10))) => {

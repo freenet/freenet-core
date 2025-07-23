@@ -137,7 +137,6 @@ pub struct Runtime {
     /// loaded contract modules
     pub(super) contract_modules: HashMap<ContractKey, Module>,
     pub(crate) enabled_metering: bool,
-    pub(crate) config: RuntimeConfig,
 }
 
 impl Runtime {
@@ -176,7 +175,6 @@ impl Runtime {
             contract_store,
             delegate_modules: HashMap::new(),
             enabled_metering: config.enable_metering,
-            config,
         })
     }
 
@@ -195,11 +193,7 @@ impl Runtime {
         )
     }
 
-    pub(super) fn init_buf<T>(
-        &mut self,
-        instance: &Instance,
-        data: T,
-    ) -> RuntimeResult<BufferMut<'_>>
+    pub(super) fn init_buf<T>(&mut self, instance: &Instance, data: T) -> RuntimeResult<BufferMut>
     where
         T: AsRef<[u8]>,
     {
@@ -406,6 +400,8 @@ fn get_cpu_cycles_per_second_runtime() -> Option<u64> {
 
     if output.status.success() {
         let output_str = String::from_utf8_lossy(&output.stdout);
+        tracing::debug!("sysctl output (hw.cpufrequency_max): {}", output_str); // Debugging information
+
         if let Some(freq) = parse_sysctl_output(&output_str) {
             return Some(freq);
         }
@@ -418,6 +414,7 @@ fn get_cpu_cycles_per_second_runtime() -> Option<u64> {
 
     if output.status.success() {
         let output_str = String::from_utf8_lossy(&output.stdout);
+        tracing::debug!("sysctl output (hw.tbfrequency): {}", output_str); // Debugging information
 
         if let Some(freq) = parse_sysctl_output(&output_str) {
             return Some(freq);

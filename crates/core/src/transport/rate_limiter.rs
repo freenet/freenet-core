@@ -40,57 +40,13 @@ impl<T: TimeSource> PacketRateLimiter<T> {
         socket: Arc<S>,
     ) {
         tracing::info!("Rate limiter task started");
-        let mut packet_count = 0u64;
-        let mut last_log_time = Instant::now();
-
         while let Some((socket_addr, packet)) = self.outbound_packets.recv().await {
-            packet_count += 1;
-
-            // Log statistics every 10 seconds
-            if last_log_time.elapsed() > Duration::from_secs(10) {
-                tracing::info!(
-                    "OUTBOUND_STATS: {} packets sent in last 10s, channel backlog: {}",
-                    packet_count,
-                    self.outbound_packets.len()
-                );
-                packet_count = 0;
-                last_log_time = Instant::now();
-            }
-
-            let channel_len = self.outbound_packets.len();
-            if channel_len > 50 {
-                tracing::debug!(
-                    %socket_addr,
-                    channel_depth = channel_len,
-                    "CHANNEL_BACKLOG: Outbound packet channel backing up"
-                );
-            }
-
+            // tracing::trace!(%socket_addr, packet_len = %packet.len(), "Sending outbound packet");
             if let Some(bandwidth_limit) = bandwidth_limit {
                 self.rate_limiting(bandwidth_limit, &*socket, packet, socket_addr)
                     .await;
             } else {
-                let send_start = Instant::now();
-                match socket.send_to(&packet, socket_addr).await {
-                    Ok(bytes_sent) => {
-                        let elapsed = send_start.elapsed();
-                        if elapsed > Duration::from_millis(50) {
-                            tracing::warn!(
-                                %socket_addr,
-                                elapsed_ms = elapsed.as_millis(),
-                                bytes_sent,
-                                "SLOW_UDP_SEND: UDP send took longer than 50ms"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            %socket_addr,
-                            error = %e,
-                            "UDP_SEND_FAILED: Failed to send packet"
-                        );
-                    }
-                }
+                let _ = socket.send_to(&packet, socket_addr).await;
             }
         }
         tracing::debug!("Rate limiter task ended unexpectedly");

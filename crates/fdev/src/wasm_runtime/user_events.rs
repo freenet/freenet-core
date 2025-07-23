@@ -272,7 +272,7 @@ impl ClientEventsProxy for StdInput {
                             let state: State = match self.get_command_input(Command::Put) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    tracing::debug!("Put event error: {e}");
+                                    tracing::debug!("Put event error: {}", e);
                                     return Ok(Either::Right(()));
                                 }
                             };

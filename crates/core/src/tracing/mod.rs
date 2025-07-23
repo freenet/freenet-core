@@ -38,9 +38,9 @@ pub(crate) trait NetEventRegister: std::any::Any + Send + Sync + 'static {
         &'a self,
         events: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
     ) -> BoxFuture<'a, ()>;
-    fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<'_, ()>;
+    fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<()>;
     fn trait_clone(&self) -> Box<dyn NetEventRegister>;
-    fn get_router_events(&self, number: usize) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>>;
+    fn get_router_events(&self, number: usize) -> BoxFuture<anyhow::Result<Vec<RouteEvent>>>;
 }
 
 #[cfg(feature = "trace-ot")]
@@ -71,7 +71,7 @@ impl<const N: usize> NetEventRegister for CombinedRegister<N> {
         Box::new(self.clone())
     }
 
-    fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<'_, ()> {
+    fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<()> {
         async move {
             for reg in &mut self.0 {
                 reg.notify_of_time_out(tx).await;
@@ -80,7 +80,7 @@ impl<const N: usize> NetEventRegister for CombinedRegister<N> {
         .boxed()
     }
 
-    fn get_router_events(&self, number: usize) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
+    fn get_router_events(&self, number: usize) -> BoxFuture<anyhow::Result<Vec<RouteEvent>>> {
         async move {
             for reg in &self.0 {
                 let events = reg.get_router_events(number).await?;
@@ -551,11 +551,11 @@ impl NetEventRegister for EventRegister {
         Box::new(self.clone())
     }
 
-    fn notify_of_time_out(&mut self, _: Transaction) -> BoxFuture<'_, ()> {
+    fn notify_of_time_out(&mut self, _: Transaction) -> BoxFuture<()> {
         async {}.boxed()
     }
 
-    fn get_router_events(&self, number: usize) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
+    fn get_router_events(&self, number: usize) -> BoxFuture<anyhow::Result<Vec<RouteEvent>>> {
         async move { aof::LogFile::get_router_events(number, &self.log_file).await }.boxed()
     }
 }
@@ -1080,7 +1080,7 @@ mod opentelemetry_tracer {
             Box::new(self.clone())
         }
 
-        fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<'_, ()> {
+        fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<()> {
             async move {
                 if cfg!(test) {
                     let _ = self.finished_tx_notifier.send(tx).await;
@@ -1089,10 +1089,7 @@ mod opentelemetry_tracer {
             .boxed()
         }
 
-        fn get_router_events(
-            &self,
-            _number: usize,
-        ) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
+        fn get_router_events(&self, _number: usize) -> BoxFuture<anyhow::Result<Vec<RouteEvent>>> {
             async { Ok(vec![]) }.boxed()
         }
     }
@@ -1483,14 +1480,11 @@ pub(super) mod test {
             Box::new(self.clone())
         }
 
-        fn notify_of_time_out(&mut self, _: Transaction) -> BoxFuture<'_, ()> {
+        fn notify_of_time_out(&mut self, _: Transaction) -> BoxFuture<()> {
             async {}.boxed()
         }
 
-        fn get_router_events(
-            &self,
-            _number: usize,
-        ) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
+        fn get_router_events(&self, _number: usize) -> BoxFuture<anyhow::Result<Vec<RouteEvent>>> {
             async { Ok(vec![]) }.boxed()
         }
     }
