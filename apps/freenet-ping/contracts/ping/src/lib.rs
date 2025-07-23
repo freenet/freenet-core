@@ -180,9 +180,7 @@ impl ContractInterface for Contract {
         }
 
         #[cfg(feature = "contract")]
-        freenet_stdlib::log::info(&format!(
-            "[UPDATE_STATE] Returning final state: {ping:?}"
-        ));
+        freenet_stdlib::log::info(&format!("[UPDATE_STATE] Returning final state: {ping:?}"));
 
         Ok(UpdateModification::valid(State::from(
             serde_json::to_vec(&ping).map_err(|e| ContractError::Other(e.to_string()))?,
@@ -211,9 +209,7 @@ impl ContractInterface for Contract {
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
         #[cfg(feature = "contract")]
-        freenet_stdlib::log::info(&format!(
-            "[SUMMARIZE_STATE] State summarized: {ping:?}"
-        ));
+        freenet_stdlib::log::info(&format!("[SUMMARIZE_STATE] State summarized: {ping:?}"));
 
         Ok(StateSummary::from(state.to_vec()))
     }
@@ -234,9 +230,7 @@ impl ContractInterface for Contract {
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
         #[cfg(feature = "contract")]
-        freenet_stdlib::log::info(&format!(
-            "[GET_STATE_DELTA] Contract options: {opts:?}"
-        ));
+        freenet_stdlib::log::info(&format!("[GET_STATE_DELTA] Contract options: {opts:?}"));
 
         let mut ping = if state.is_empty() {
             #[cfg(feature = "contract")]
