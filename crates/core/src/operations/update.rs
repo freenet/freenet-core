@@ -108,6 +108,22 @@ impl Operation for UpdateOp {
         &self.id
     }
 
+    //process_message executes `Message` order.
+    // arguments:
+    //   - `&'a mut NB` `conn_manager`
+    //   - `crate::node::OpManager` `op_manager`
+    //   - `Self::Message` `input` message that will update the state. Could be:
+    //     - if `UpdateMsg::RequestUpdate`: send request to ask to start to register the message as a state of the p2p network.
+    //     - if `UpdateMsg::SeekNode` : read p2p message in order to send it latter.
+    //     - if `UpdateMsg::BroadcastTo`  : Ensure each peer is ready to update
+    //     - if `UpdateMsg::Broadcasting`
+    //     - if `UpdateMsg::SuccessfulUpdate` : send the message to tell that the message is already availabe for each peer.
+    //
+    // returns `OperationResult` if success or an `OpError` dependending of the error.
+    //
+    // ```
+    // 
+    // ```
     fn process_message<'a, NB: NetworkBridge>(
         self,
         conn_manager: &'a mut NB,
@@ -170,6 +186,8 @@ impl Operation for UpdateOp {
                     );
 
                     let broadcast_to = op_manager.get_broadcast_targets_update(key, &sender.peer);
+
+                    //ensure validity of contract in local first there soon
 
                     if is_subscribed_contract {
                         tracing::debug!("Peer is subscribed to contract. About to update it");
