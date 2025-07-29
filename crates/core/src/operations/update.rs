@@ -133,7 +133,7 @@ impl Operation for UpdateOp {
                     let sender = op_manager.ring.connection_manager.own_location();
 
                     tracing::debug!(
-                        "Requesting update for contract {} from {} to {}",
+                        "UPDATE RequestUpdate: forwarding update for contract {} from {} to {}",
                         key,
                         sender.peer,
                         target.peer
@@ -339,6 +339,7 @@ impl Operation for UpdateOp {
                                 tx = %id,
                                 %key,
                                 this_peer = ?op_manager.ring.connection_manager.get_peer_key(),
+                                ?upstream,
                                 "Peer completed contract value update - SuccessfulUpdate",
                             );
 
@@ -347,6 +348,10 @@ impl Operation for UpdateOp {
                                 summary: summary.clone(),
                             });
                             if let Some(upstream) = upstream {
+                                tracing::debug!(
+                                    "UPDATE: Sending SuccessfulUpdate to upstream peer {:?}",
+                                    upstream
+                                );
                                 return_msg = Some(UpdateMsg::SuccessfulUpdate {
                                     id: *id,
                                     target: upstream,
@@ -355,9 +360,23 @@ impl Operation for UpdateOp {
                                     sender: op_manager.ring.connection_manager.own_location(),
                                 });
                             } else {
-                                // this means op finalized
+                                // Operation originated locally (no upstream peer)
+                                // The operation is complete - the framework will notify any waiting clients
+                                tracing::debug!(
+                                    "UPDATE: Operation {} completed successfully (originated locally)",
+                                    id
+                                );
                                 return_msg = None;
                             }
+                        }
+                        Some(UpdateState::ReceivedRequest) => {
+                            // This is the target node that processed the update
+                            // It should have already sent the response, this shouldn't happen
+                            tracing::error!(
+                                tx = %id,
+                                "UPDATE: Unexpected SuccessfulUpdate in ReceivedRequest state",
+                            );
+                            return Err(OpError::invalid_transition(self.id));
                         }
                         _ => {
                             tracing::error!(
