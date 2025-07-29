@@ -81,7 +81,17 @@ impl ContractExecutor for Executor<Runtime> {
             false
         };
 
-        let is_new_contract = self.state_store.get(&key).await.is_err();
+        let state_result = self.state_store.get(&key).await;
+        let is_new_contract = match &state_result {
+            Ok(_) => {
+                tracing::debug!(contract = %key, "State exists, treating as update");
+                false
+            }
+            Err(e) => {
+                tracing::debug!(contract = %key, error = %e, "State get error, treating as new contract");
+                true
+            }
+        };
 
         let mut updates = match update {
             Either::Left(incoming_state) => {
