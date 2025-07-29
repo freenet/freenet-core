@@ -159,20 +159,27 @@ impl Operation for UpdateOp {
                     target,
                     sender,
                 } => {
-                    let is_subscribed_contract = op_manager.ring.is_seeding_contract(key);
+                    // Check if we're seeding or subscribed to this contract
+                    let is_seeding = op_manager.ring.is_seeding_contract(key);
+                    let has_subscribers = op_manager.ring.subscribers_of(key).is_some();
+                    let should_handle_update = is_seeding || has_subscribers;
 
                     tracing::debug!(
                         tx = %id,
                         %key,
                         target = %target.peer,
                         sender = %sender.peer,
+                        is_seeding = %is_seeding,
+                        has_subscribers = %has_subscribers,
                         "Updating contract at target peer",
                     );
 
                     let broadcast_to = op_manager.get_broadcast_targets_update(key, &sender.peer);
 
-                    if is_subscribed_contract {
-                        tracing::debug!("Peer is subscribed to contract. About to update it");
+                    if should_handle_update {
+                        tracing::debug!(
+                            "Peer is seeding or has subscribers for contract. About to update it"
+                        );
                         update_contract(op_manager, *key, value.clone(), related_contracts.clone())
                             .await?;
                         tracing::debug!(
@@ -182,7 +189,7 @@ impl Operation for UpdateOp {
                             target.location
                         );
                     } else {
-                        tracing::debug!("contract not found in this peer. Should throw an error");
+                        tracing::debug!("contract not found in this peer (not seeding and no subscribers). Should throw an error");
                         return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
                     }
 
@@ -576,19 +583,28 @@ pub(crate) async fn request_update(
             .next();
 
         if closest.is_none() {
-            tracing::debug!(
-                "UPDATE: No other peers available to cache contract {}, handling locally",
-                key
-            );
+            // Check if we actually have any connected peers at all
+            let has_connections = op_manager.ring.connection_manager.num_connections() > 0;
 
-            // If no other peers, we should be subscribed and handle locally
-            op_manager
-                .ring
-                .add_subscriber(key, sender.clone())
-                .map_err(|_| RingError::NoCachingPeers(*key))?;
+            if has_connections {
+                // We have connections but no suitable peer for this contract
+                return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
+            } else {
+                // We truly have no peers, handle locally
+                tracing::debug!(
+                    "UPDATE: No peer connections available, handling contract {} locally",
+                    key
+                );
 
-            // Target ourselves
-            sender.clone()
+                // If no other peers, we should be subscribed and handle locally
+                op_manager
+                    .ring
+                    .add_subscriber(key, sender.clone())
+                    .map_err(|_| RingError::NoCachingPeers(*key))?;
+
+                // Target ourselves
+                sender.clone()
+            }
         } else {
             let target = closest.unwrap();
 
