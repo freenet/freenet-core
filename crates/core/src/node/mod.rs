@@ -131,6 +131,10 @@ pub struct NodeConfig {
 impl NodeConfig {
     pub async fn new(config: Config) -> anyhow::Result<NodeConfig> {
         tracing::info!("Loading node configuration for mode {}", config.mode);
+
+        // Get our own public key to filter out self-connections
+        let own_pub_key = config.transport_keypair().public();
+
         let mut gateways = Vec::with_capacity(config.gateways.len());
         for gw in &config.gateways {
             let GatewayConfig {
@@ -146,9 +150,19 @@ impl NodeConfig {
             key_file.read_to_string(&mut buf)?;
 
             let pub_key = rsa::RsaPublicKey::from_public_key_pem(&buf)?;
+            let transport_pub_key = TransportPublicKey::from(pub_key);
+
+            // Skip if this gateway's public key matches our own
+            if &transport_pub_key == own_pub_key {
+                tracing::warn!(
+                    "Skipping gateway with same public key as self: {:?}",
+                    public_key_path
+                );
+                continue;
+            }
 
             let address = Self::parse_socket_addr(address).await?;
-            let peer_id = PeerId::new(address, TransportPublicKey::from(pub_key));
+            let peer_id = PeerId::new(address, transport_pub_key);
             let location = location
                 .map(Location::new)
                 .unwrap_or_else(|| Location::from_address(&address));
