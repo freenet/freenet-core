@@ -93,7 +93,7 @@ pub(crate) async fn request_get(
                     ..
                 }) => {
                     // Contract found locally, complete the operation
-                    tracing::info!("GET: Contract {} found locally", key);
+                    tracing::debug!("GET: Contract {} found locally", key);
 
                     // Mark operation as successful
                     let completed_op = GetOp {
@@ -433,7 +433,7 @@ impl Operation for GetOp {
                             ..
                         }) => {
                             // Contract found locally!
-                            tracing::info!(tx = %id, %key, "Contract found locally in RequestGet handler");
+                            tracing::debug!(tx = %id, %key, "Contract found locally in RequestGet handler");
 
                             // Since this is RequestGet, we are the original requester
                             new_state = Some(GetState::Finished { key: *key });
