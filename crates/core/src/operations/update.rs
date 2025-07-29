@@ -568,19 +568,38 @@ pub(crate) async fn request_update(
             .pop()
             .ok_or(OpError::RingError(RingError::NoLocation))?
     } else {
+        // Check if we have any other peers that can cache contracts
         let closest = op_manager
             .ring
             .closest_potentially_caching(key, [sender.peer.clone()].as_slice())
             .into_iter()
-            .next()
-            .ok_or_else(|| RingError::EmptyRing)?;
+            .next();
 
-        op_manager
-            .ring
-            .add_subscriber(key, sender)
-            .map_err(|_| RingError::NoCachingPeers(*key))?;
+        if closest.is_none() {
+            tracing::debug!(
+                "UPDATE: No other peers available to cache contract {}, handling locally",
+                key
+            );
 
-        closest
+            // If no other peers, we should be subscribed and handle locally
+            op_manager
+                .ring
+                .add_subscriber(key, sender.clone())
+                .map_err(|_| RingError::NoCachingPeers(*key))?;
+
+            // Target ourselves
+            sender.clone()
+        } else {
+            let target = closest.unwrap();
+
+            // Subscribe to the contract
+            op_manager
+                .ring
+                .add_subscriber(key, sender)
+                .map_err(|_| RingError::NoCachingPeers(*key))?;
+
+            target
+        }
     };
 
     let id = update_op.id;
