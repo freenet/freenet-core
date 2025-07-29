@@ -54,22 +54,77 @@ pub(crate) async fn request_get(
     get_op: GetOp,
     skip_list: HashSet<PeerId>,
 ) -> Result<(), OpError> {
-    let (mut candidates, id, key_val) =
-        if let Some(GetState::PrepareRequest { key, id, .. }) = &get_op.state {
-            // the initial request must provide:
-            // - a location in the network where the contract resides
-            // - and the key of the contract value to get
-            let candidates =
-                op_manager
-                    .ring
-                    .k_closest_potentially_caching(key, &skip_list, DEFAULT_MAX_BREADTH);
-            if candidates.is_empty() {
-                return Err(RingError::EmptyRing.into());
+    let (mut candidates, id, key_val, _fetch_contract) = if let Some(GetState::PrepareRequest {
+        key,
+        id,
+        fetch_contract,
+        ..
+    }) = &get_op.state
+    {
+        // the initial request must provide:
+        // - a location in the network where the contract resides
+        // - and the key of the contract value to get
+        let candidates =
+            op_manager
+                .ring
+                .k_closest_potentially_caching(key, &skip_list, DEFAULT_MAX_BREADTH);
+        if candidates.is_empty() {
+            // No peers available - check if we have the contract locally
+            tracing::debug!(
+                "GET: No other peers available to query for contract {}, checking locally",
+                key
+            );
+
+            // Try to get the contract from local storage
+            let get_result = op_manager
+                .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                    key: *key,
+                    return_contract_code: *fetch_contract,
+                })
+                .await;
+
+            match get_result {
+                Ok(ContractHandlerEvent::GetResponse {
+                    response:
+                        Ok(StoreResponse {
+                            state: Some(state),
+                            contract,
+                        }),
+                    ..
+                }) => {
+                    // Contract found locally, complete the operation
+                    tracing::debug!("GET: Contract {} found locally", key);
+
+                    // Mark operation as successful
+                    let completed_op = GetOp {
+                        id: *id,
+                        state: Some(GetState::Finished { key: *key }),
+                        result: Some(GetResult {
+                            key: *key,
+                            state,
+                            contract,
+                        }),
+                        stats: get_op.stats,
+                    };
+
+                    // Push the completed operation to be processed
+                    op_manager.push(*id, OpEnum::Get(completed_op)).await?;
+                    return Ok(());
+                }
+                _ => {
+                    // Contract not found locally and no peers to query
+                    tracing::warn!(
+                        "GET: Contract {} not found locally and no peers available",
+                        key
+                    );
+                    return Err(RingError::EmptyRing.into());
+                }
             }
-            (candidates, *id, *key)
-        } else {
-            return Err(OpError::UnexpectedOpState);
-        };
+        }
+        (candidates, *id, *key, *fetch_contract)
+    } else {
+        return Err(OpError::UnexpectedOpState);
+    };
 
     // Take the first candidate as the target
     let target = candidates.remove(0);
@@ -360,24 +415,59 @@ impl Operation for GetOp {
                         first_response_time: None,
                     }));
 
-                    // Keep current state
-                    new_state = self.state;
+                    // First check if we have the contract locally before forwarding
+                    let get_result = op_manager
+                        .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                            key: *key,
+                            return_contract_code: *fetch_contract,
+                        })
+                        .await;
 
-                    // Prepare skip list with own peer ID
-                    let own_loc = op_manager.ring.connection_manager.own_location();
-                    let mut new_skip_list = skip_list.clone();
-                    new_skip_list.insert(own_loc.peer.clone());
+                    match get_result {
+                        Ok(ContractHandlerEvent::GetResponse {
+                            response:
+                                Ok(StoreResponse {
+                                    state: Some(state),
+                                    contract,
+                                }),
+                            ..
+                        }) => {
+                            // Contract found locally!
+                            tracing::debug!(tx = %id, %key, "Contract found locally in RequestGet handler");
 
-                    // Create seek node message
-                    return_msg = Some(GetMsg::SeekNode {
-                        key: *key,
-                        id: *id,
-                        target: target.clone(),
-                        sender: own_loc.clone(),
-                        fetch_contract: *fetch_contract,
-                        htl: op_manager.ring.max_hops_to_live,
-                        skip_list: new_skip_list,
-                    });
+                            // Since this is RequestGet, we are the original requester
+                            new_state = Some(GetState::Finished { key: *key });
+                            return_msg = None;
+                            result = Some(GetResult {
+                                key: *key,
+                                state,
+                                contract,
+                            });
+                        }
+                        _ => {
+                            // Contract not found locally, proceed with forwarding
+                            tracing::debug!(tx = %id, %key, "Contract not found locally, forwarding to {}", target.peer);
+
+                            // Keep current state
+                            new_state = self.state;
+
+                            // Prepare skip list with own peer ID
+                            let own_loc = op_manager.ring.connection_manager.own_location();
+                            let mut new_skip_list = skip_list.clone();
+                            new_skip_list.insert(own_loc.peer.clone());
+
+                            // Create seek node message
+                            return_msg = Some(GetMsg::SeekNode {
+                                key: *key,
+                                id: *id,
+                                target: target.clone(),
+                                sender: own_loc.clone(),
+                                fetch_contract: *fetch_contract,
+                                htl: op_manager.ring.max_hops_to_live,
+                                skip_list: new_skip_list,
+                            });
+                        }
+                    }
                 }
                 GetMsg::SeekNode {
                     key,
