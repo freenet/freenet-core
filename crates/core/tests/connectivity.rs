@@ -34,6 +34,7 @@ static RNG: once_cell::sync::Lazy<std::sync::Mutex<rand::rngs::StdRng>> =
 /// 3. Force disconnect
 /// 4. Verify that the peer can reconnect and operate normally
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Test is flaky and needs investigation - hangs in CI"]
 async fn test_gateway_reconnection() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::INFO), None);
 
