@@ -62,8 +62,6 @@ pub(super) enum Event {
         id: Transaction,
         conn: PeerConnection,
         joiner: PeerId,
-        #[allow(dead_code)]
-        location: Location,
         op: Option<Box<ConnectOp>>,
         forward_info: Option<Box<ForwardInfo>>,
     },
@@ -463,7 +461,6 @@ impl HandshakeHandler {
                                     id,
                                     conn,
                                     joiner,
-                                    location,
                                     op: ok.map(|ok_value| Box::new(ConnectOp::new(id, Some(ok_value), None, None))),
                                     forward_info: forward_info.map(Box::new),
                                 })

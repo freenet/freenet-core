@@ -782,7 +782,6 @@ impl P2pConnManager {
                 id,
                 conn,
                 joiner,
-                location: _, // Not used - connection only added after StartJoinReq accepted
                 op,
                 forward_info,
             } => {
