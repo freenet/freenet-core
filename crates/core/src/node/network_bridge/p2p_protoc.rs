@@ -782,7 +782,6 @@ impl P2pConnManager {
                 id,
                 conn,
                 joiner,
-                location,
                 op,
                 forward_info,
             } => {
@@ -797,15 +796,14 @@ impl P2pConnManager {
                 }
                 let (tx, rx) = mpsc::channel(1);
                 self.connections.insert(joiner.clone(), tx);
-                let was_reserved = {
-                    // this is an unexpected inbound request at a gateway so it didn't have a reserved spot
-                    false
-                };
-                self.bridge
-                    .op_manager
-                    .ring
-                    .add_connection(location, joiner.clone(), was_reserved)
-                    .await;
+                // IMPORTANT: Do NOT add connection to ring here!
+                // Connection should only be added after StartJoinReq is accepted
+                // via CheckConnectivity. This prevents the "already connected" bug
+                // where gateways reject valid join requests.
+                //
+                // The connection will be properly added in the CheckConnectivity
+                // handler when should_accept() returns true.
+
                 if let Some(op) = op {
                     self.bridge
                         .op_manager
