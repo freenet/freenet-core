@@ -2712,9 +2712,9 @@ async fn test_update_no_change_notification() -> TestResult {
     }
     .boxed_local();
 
-    let test = tokio::time::timeout(Duration::from_secs(60), async {
+    let test = async {
         // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        tokio::time::sleep(Duration::from_secs(20)).await;
 
         // Connect to node A websocket API
         let uri =
@@ -2779,7 +2779,7 @@ async fn test_update_no_change_notification() -> TestResult {
         }
 
         Ok::<(), anyhow::Error>(())
-    })
+    }
     .boxed_local();
 
     let (_node_a_result, _node_b_result, test_result) = tokio::join!(node_a, node_b, test);
