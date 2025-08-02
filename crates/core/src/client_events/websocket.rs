@@ -715,15 +715,12 @@ impl ClientEventsProxy for WebSocketProxy {
 
             if let Some(ch) = self.response_channels.remove(&id) {
                 // Log success/failure of sending UPDATE responses
-                match &result {
-                    Ok(HostResponse::ContractResponse(freenet_stdlib::client_api::ContractResponse::UpdateResponse { key, .. })) => {
-                        tracing::info!(
-                            "[UPDATE_DEBUG] Found WebSocket channel for client {}, sending UpdateResponse for key {}",
-                            id,
-                            key
-                        );
-                    }
-                    _ => {}
+                if let Ok(HostResponse::ContractResponse(freenet_stdlib::client_api::ContractResponse::UpdateResponse { key, .. })) = &result {
+                    tracing::info!(
+                        "[UPDATE_DEBUG] Found WebSocket channel for client {}, sending UpdateResponse for key {}",
+                        id,
+                        key
+                    );
                 }
 
                 // Check if this is an UPDATE response and extract key before moving result

@@ -2749,8 +2749,23 @@ async fn test_update_no_change_notification() -> TestResult {
         }
 
         // Now update with the EXACT SAME state (should trigger UpdateNoChange)
-        tracing::info!("Sending UPDATE with identical state to trigger UpdateNoChange");
-        make_update(&mut client_api_a, contract_key, wrapped_state.clone()).await?;
+        // Note: The test-contract-integration contract increments version on every update,
+        // so we need to send a state that's actually identical including version to trigger NoChange
+
+        // First get the current state after PUT
+        make_get(&mut client_api_a, contract_key, false, false).await?;
+
+        let current_state = match tokio::time::timeout(Duration::from_secs(10), client_api_a.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                contract: _,
+                state,
+                ..
+            }))) => state,
+            _ => bail!("Failed to get current state after PUT"),
+        };
+
+        tracing::info!("Sending UPDATE with identical state (including version) to trigger UpdateNoChange");
+        make_update(&mut client_api_a, contract_key, current_state).await?;
 
         // Wait for update response - THIS SHOULD NOT TIMEOUT
         // Currently this will timeout after 30 seconds due to the bug
@@ -2783,7 +2798,7 @@ async fn test_update_no_change_notification() -> TestResult {
     .boxed_local();
 
     let (_node_a_result, _node_b_result, test_result) = tokio::join!(node_a, node_b, test);
-    test_result??;
+    test_result?;
 
     Ok(())
 }
