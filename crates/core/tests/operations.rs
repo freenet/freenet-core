@@ -2633,23 +2633,23 @@ async fn test_subscription_introspection() -> TestResult {
 async fn test_update_no_change_notification() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::INFO), None);
 
-    // Load test contract
-    const TEST_CONTRACT: &str = "test-contract-integration";
+    // Load test contract that properly handles NoChange
+    const TEST_CONTRACT: &str = "test-contract-update-nochange";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
     let contract_key = contract.key();
 
-    // Create initial state with a todo list containing one task
-    let todo_list = test_utils::TodoList {
-        tasks: vec![test_utils::Task {
-            id: 1,
-            title: "Initial task".to_string(),
-            description: "This is the initial task".to_string(),
-            completed: false,
-            priority: 1,
-        }],
-        version: 1,
+    // Create initial state - a simple state that we can update
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct SimpleState {
+        value: String,
+        counter: u64,
+    }
+
+    let initial_state = SimpleState {
+        value: "initial".to_string(),
+        counter: 1,
     };
-    let initial_state_bytes = serde_json::to_vec(&todo_list)?;
+    let initial_state_bytes = serde_json::to_vec(&initial_state)?;
     let wrapped_state = WrappedState::from(initial_state_bytes);
 
     // Create network sockets
@@ -2749,26 +2749,10 @@ async fn test_update_no_change_notification() -> TestResult {
         }
 
         // Now update with the EXACT SAME state (should trigger UpdateNoChange)
-        // Note: The test-contract-integration contract increments version on every update,
-        // so we need to send a state that's actually identical including version to trigger NoChange
-
-        // First get the current state after PUT
-        make_get(&mut client_api_a, contract_key, false, false).await?;
-
-        let current_state = match tokio::time::timeout(Duration::from_secs(10), client_api_a.recv()).await {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                contract: _,
-                state,
-                ..
-            }))) => state,
-            _ => bail!("Failed to get current state after PUT"),
-        };
-
-        tracing::info!("Sending UPDATE with identical state (including version) to trigger UpdateNoChange");
-        make_update(&mut client_api_a, contract_key, current_state).await?;
+        tracing::info!("Sending UPDATE with identical state to trigger UpdateNoChange");
+        make_update(&mut client_api_a, contract_key, wrapped_state.clone()).await?;
 
         // Wait for update response - THIS SHOULD NOT TIMEOUT
-        // Currently this will timeout after 30 seconds due to the bug
         let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
