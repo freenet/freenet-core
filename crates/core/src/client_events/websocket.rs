@@ -552,10 +552,13 @@ async fn process_host_response(
                         HostResponse::Ok => "HostResponse::Ok",
                         _ => "Unknown",
                     };
-                    
+
                     // Enhanced logging for UPDATE responses
                     match &res {
-                        HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, summary }) => {
+                        HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                            key,
+                            summary,
+                        }) => {
                             tracing::info!(
                                 "[UPDATE_DEBUG] Processing UpdateResponse for WebSocket delivery - client: {}, key: {}, summary length: {}",
                                 id,
@@ -567,7 +570,7 @@ async fn process_host_response(
                             tracing::debug!(response = %res, response_type, cli_id = %id, "sending response");
                         }
                     }
-                    
+
                     match res {
                         HostResponse::ContractResponse(ContractResponse::GetResponse {
                             key,
@@ -589,7 +592,10 @@ async fn process_host_response(
             };
             // Log when UPDATE response is about to be sent over WebSocket
             let is_update_response = match &result {
-                Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. })) => {
+                Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                    key,
+                    ..
+                })) => {
                     tracing::info!(
                         "[UPDATE_DEBUG] About to serialize UpdateResponse for WebSocket delivery - client: {}, key: {}",
                         client_id,
@@ -597,9 +603,9 @@ async fn process_host_response(
                     );
                     Some(*key)
                 }
-                _ => None
+                _ => None,
             };
-            
+
             let serialized_res = match encoding_protoc {
                 EncodingProtocol::Flatbuffers => match result {
                     Ok(res) => res.into_fbs_bytes()?,
@@ -607,7 +613,7 @@ async fn process_host_response(
                 },
                 EncodingProtocol::Native => bincode::serialize(&result)?,
             };
-            
+
             // Log serialization completion for UPDATE responses
             if let Some(key) = is_update_response {
                 tracing::info!(
@@ -617,9 +623,9 @@ async fn process_host_response(
                     serialized_res.len()
                 );
             }
-            
+
             let send_result = tx.send(Message::Binary(serialized_res)).await;
-            
+
             // Log WebSocket send result for UPDATE responses
             if let Some(key) = is_update_response {
                 match &send_result {
@@ -640,7 +646,7 @@ async fn process_host_response(
                     }
                 }
             }
-            
+
             send_result?;
             Ok(None)
         }
@@ -731,9 +737,9 @@ impl ClientEventsProxy for WebSocketProxy {
                     .map_err(|err| matches!(err.kind(), ErrorKind::Disconnect))
                     .err()
                     .unwrap_or(false);
-                
+
                 let send_result = ch.send(HostCallbackResult::Result { id, result });
-                
+
                 // Log UPDATE response send result
                 if let Some(key) = update_key {
                     match send_result.is_ok() {
@@ -753,7 +759,7 @@ impl ClientEventsProxy for WebSocketProxy {
                         }
                     }
                 }
-                
+
                 if send_result.is_ok() && !should_rm {
                     // still alive connection, keep it
                     self.response_channels.insert(id, ch);

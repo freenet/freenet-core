@@ -390,7 +390,10 @@ async fn report_result(
     // Add UPDATE-specific debug logging at the start
     if let Some(tx_id) = tx {
         if tx_id.transaction_type().to_string().contains("Update") {
-            tracing::info!("[UPDATE_DEBUG] report_result called for UPDATE transaction {}", tx_id);
+            tracing::info!(
+                "[UPDATE_DEBUG] report_result called for UPDATE transaction {}",
+                tx_id
+            );
         }
     }
 
@@ -414,7 +417,7 @@ async fn report_result(
                             client_id,
                             update_op.id
                         );
-                        
+
                         // Log the result being sent
                         let host_result = op_res.to_host_result();
                         match &host_result {
