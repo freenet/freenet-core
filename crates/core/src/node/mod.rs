@@ -439,7 +439,21 @@ async fn report_result(
                     } else {
                         tracing::debug!(?tx, %client_id,  "Sending response to client");
                     }
-                    let _ = cb.send((client_id, op_res.to_host_result()));
+
+                    // Send the response
+                    if let Err(e) = cb.send((client_id, op_res.to_host_result())) {
+                        tracing::error!(
+                            ?tx, %client_id,
+                            "[UPDATE_RACE_FIX] Failed to send response to client: {:?}",
+                            e
+                        );
+                    } else if let crate::operations::OpEnum::Update(ref update_op) = op_res {
+                        tracing::info!(
+                            "[UPDATE_RACE_FIX] Successfully queued UPDATE response for client {} (tx: {})",
+                            client_id,
+                            update_op.id
+                        );
+                    }
                 }
             } else {
                 // Log when no client callback is found for UPDATE operations
