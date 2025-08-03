@@ -529,6 +529,8 @@ async fn process_open_request(
                                 if subscribe {
                                     if let Some(subscription_listener) = subscription_listener {
                                         tracing::debug!(%client_id, %key, "Subscribing to locally found contract");
+
+                                        // First, register the local listener
                                         let register_listener = op_manager
                                             .notify_contract_handler(
                                                 ContractHandlerEvent::RegisterSubscriberListener {
@@ -558,6 +560,27 @@ async fn process_open_request(
                                                     "Subscriber listener registration failed for local GET"
                                                 );
                                             }
+                                        }
+
+                                        // Also create a network subscription to ensure we receive updates
+                                        // This matches the behavior of PUT with subscribe=true
+                                        tracing::debug!(%client_id, %key, "Creating network subscription for locally cached contract");
+                                        if let Err(err) = crate::node::subscribe(
+                                            op_manager.clone(),
+                                            key,
+                                            Some(client_id),
+                                        )
+                                        .await
+                                        {
+                                            tracing::error!(
+                                                %client_id, %key,
+                                                "Failed to create network subscription for local GET: {}", err
+                                            );
+                                        } else {
+                                            tracing::debug!(
+                                                %client_id, %key,
+                                                "Network subscription created successfully for local GET"
+                                            );
                                         }
                                     } else {
                                         tracing::warn!(%client_id, %key, "GET with subscribe=true but no subscription_listener");
