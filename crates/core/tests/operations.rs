@@ -785,6 +785,9 @@ async fn test_multiple_clients_subscription() -> TestResult {
         }
 
         // Third client gets the contract from node C (without subscribing)
+        // Add delay to allow contract to propagate from Node A to Node B/C
+        tracing::info!("Waiting 5 seconds for contract to propagate across nodes...");
+        tokio::time::sleep(Duration::from_secs(5)).await;
         make_get(&mut client_api_node_b, contract_key, true, false).await?;
 
         // Wait for get response on third client
