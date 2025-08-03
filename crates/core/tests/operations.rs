@@ -2712,7 +2712,7 @@ async fn test_update_no_change_notification() -> TestResult {
     }
     .boxed_local();
 
-    let test = async {
+    let test = tokio::time::timeout(Duration::from_secs(180), async {
         // Wait for nodes to start up
         tokio::time::sleep(Duration::from_secs(20)).await;
 
@@ -2778,11 +2778,23 @@ async fn test_update_no_change_notification() -> TestResult {
         }
 
         Ok::<(), anyhow::Error>(())
-    }
-    .boxed_local();
+    });
 
-    let (_node_a_result, _node_b_result, test_result) = tokio::join!(node_a, node_b, test);
-    test_result?;
+    select! {
+        a = node_a => {
+            let Err(a) = a;
+            return Err(anyhow!(a).into());
+        }
+        b = node_b => {
+            let Err(b) = b;
+            return Err(anyhow!(b).into());
+        }
+        r = test => {
+            r??;
+            // Give time for cleanup before dropping nodes
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
 
     Ok(())
 }
