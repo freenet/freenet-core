@@ -448,7 +448,7 @@ async fn report_result(
                             e
                         );
                     } else if let crate::operations::OpEnum::Update(ref update_op) = op_res {
-                        tracing::info!(
+                        tracing::debug!(
                             "[UPDATE_RACE_FIX] Successfully queued UPDATE response for client {} (tx: {})",
                             client_id,
                             update_op.id
