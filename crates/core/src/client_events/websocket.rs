@@ -559,8 +559,8 @@ async fn process_host_response(
                             key,
                             summary,
                         }) => {
-                            tracing::debug!(
-                                "Processing UpdateResponse for WebSocket delivery - client: {}, key: {}, summary length: {}",
+                            tracing::info!(
+                                "[UPDATE_DEBUG] Processing UpdateResponse for WebSocket delivery - client: {}, key: {}, summary length: {}",
                                 id,
                                 key,
                                 summary.size()
@@ -596,8 +596,8 @@ async fn process_host_response(
                     key,
                     ..
                 })) => {
-                    tracing::debug!(
-                        "About to serialize UpdateResponse for WebSocket delivery - client: {}, key: {}",
+                    tracing::info!(
+                        "[UPDATE_DEBUG] About to serialize UpdateResponse for WebSocket delivery - client: {}, key: {}",
                         client_id,
                         key
                     );
@@ -616,8 +616,8 @@ async fn process_host_response(
 
             // Log serialization completion for UPDATE responses
             if let Some(key) = is_update_response {
-                tracing::debug!(
-                    "Serialized UpdateResponse for WebSocket delivery - client: {}, key: {}, size: {} bytes",
+                tracing::info!(
+                    "[UPDATE_DEBUG] Serialized UpdateResponse for WebSocket delivery - client: {}, key: {}, size: {} bytes",
                     client_id,
                     key,
                     serialized_res.len()
@@ -630,15 +630,15 @@ async fn process_host_response(
             if let Some(key) = is_update_response {
                 match &send_result {
                     Ok(()) => {
-                        tracing::debug!(
-                            "Successfully sent UpdateResponse over WebSocket to client {} for key {}",
+                        tracing::info!(
+                            "[UPDATE_DEBUG] Successfully sent UpdateResponse over WebSocket to client {} for key {}",
                             client_id,
                             key
                         );
                     }
                     Err(err) => {
                         tracing::error!(
-                            "Failed to send UpdateResponse over WebSocket to client {} for key {}: {:?}",
+                            "[UPDATE_DEBUG] Failed to send UpdateResponse over WebSocket to client {} for key {}: {:?}",
                             client_id,
                             key,
                             err
@@ -698,8 +698,8 @@ impl ClientEventsProxy for WebSocketProxy {
             // Log UPDATE responses specifically
             match &result {
                 Ok(HostResponse::ContractResponse(freenet_stdlib::client_api::ContractResponse::UpdateResponse { key, summary })) => {
-                    tracing::debug!(
-                        "WebSocket send() called with UpdateResponse for client {} - key: {}, summary length: {}",
+                    tracing::info!(
+                        "[UPDATE_DEBUG] WebSocket send() called with UpdateResponse for client {} - key: {}, summary length: {}",
                         id,
                         key,
                         summary.size()
@@ -716,8 +716,8 @@ impl ClientEventsProxy for WebSocketProxy {
             if let Some(ch) = self.response_channels.remove(&id) {
                 // Log success/failure of sending UPDATE responses
                 if let Ok(HostResponse::ContractResponse(freenet_stdlib::client_api::ContractResponse::UpdateResponse { key, .. })) = &result {
-                    tracing::debug!(
-                        "Found WebSocket channel for client {}, sending UpdateResponse for key {}",
+                    tracing::info!(
+                        "[UPDATE_DEBUG] Found WebSocket channel for client {}, sending UpdateResponse for key {}",
                         id,
                         key
                     );
@@ -741,15 +741,15 @@ impl ClientEventsProxy for WebSocketProxy {
                 if let Some(key) = update_key {
                     match send_result.is_ok() {
                         true => {
-                            tracing::debug!(
-                                "Successfully sent UpdateResponse to client {} for key {}",
+                            tracing::info!(
+                                "[UPDATE_DEBUG] Successfully sent UpdateResponse to client {} for key {}",
                                 id,
                                 key
                             );
                         }
                         false => {
                             tracing::error!(
-                                "Failed to send UpdateResponse to client {} for key {} - channel send failed",
+                                "[UPDATE_DEBUG] Failed to send UpdateResponse to client {} for key {} - channel send failed",
                                 id,
                                 key
                             );
@@ -768,7 +768,7 @@ impl ClientEventsProxy for WebSocketProxy {
                 match &result {
                     Ok(HostResponse::ContractResponse(freenet_stdlib::client_api::ContractResponse::UpdateResponse { key, .. })) => {
                         tracing::error!(
-                            "Client {} not found in WebSocket response channels when trying to send UpdateResponse for key {}",
+                            "[UPDATE_DEBUG] Client {} not found in WebSocket response channels when trying to send UpdateResponse for key {}",
                             id,
                             key
                         );

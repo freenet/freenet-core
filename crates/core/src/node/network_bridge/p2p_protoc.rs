@@ -566,7 +566,7 @@ impl P2pConnManager {
                             NodeEvent::TransactionTimedOut(tx) => {
                                 // Add logging for UPDATE transaction timeouts
                                 if tx.transaction_type().to_string().contains("Update") {
-                                    tracing::warn!(
+                                    tracing::debug!(
                                         %tx,
                                         "[UPDATE_RACE_DEBUG] UPDATE transaction timed out"
                                     );
@@ -579,7 +579,7 @@ impl P2pConnManager {
                                 if !clients.is_empty()
                                     && tx.transaction_type().to_string().contains("Update")
                                 {
-                                    tracing::error!(
+                                    tracing::debug!(
                                         %tx,
                                         client_count = %clients.len(),
                                         "[UPDATE_RACE_DEBUG] Notifying {} clients of UPDATE timeout",
@@ -713,14 +713,14 @@ impl P2pConnManager {
                 .map(|clients| clients.into_iter().collect::<Vec<_>>());
 
             if let Some(ref client_list) = clients {
-                tracing::info!(
+                tracing::debug!(
                     tx = %msg.id(),
                     client_count = %client_list.len(),
                     "[UPDATE_RACE_FIX] Processing UPDATE with {} waiting clients",
                     client_list.len()
                 );
             } else {
-                tracing::warn!(
+                tracing::debug!(
                     tx = %msg.id(),
                     "[UPDATE_RACE_FIX] Processing UPDATE but no clients found in tx_to_client"
                 );
@@ -1129,7 +1129,7 @@ impl P2pConnManager {
                 // Enhanced logging to debug race condition
                 let tx_type = tx.transaction_type();
                 if tx_type.to_string().contains("Update") {
-                    tracing::info!(
+                    tracing::debug!(
                         %tx, %client_id, ?tx_type,
                         "[UPDATE_RACE_DEBUG] Subscribing UPDATE client to transaction results"
                     );
@@ -1142,7 +1142,7 @@ impl P2pConnManager {
                 state.tx_to_client.entry(tx).or_default().insert(client_id);
 
                 if tx_type.to_string().contains("Update") && had_existing {
-                    tracing::warn!(
+                    tracing::debug!(
                         %tx, %client_id,
                         "[UPDATE_RACE_DEBUG] UPDATE transaction already had clients - possible race condition"
                     );
