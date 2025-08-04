@@ -389,11 +389,8 @@ async fn report_result(
 ) {
     // Add UPDATE-specific debug logging at the start
     if let Some(tx_id) = tx {
-        if tx_id.transaction_type().to_string().contains("Update") {
-            tracing::info!(
-                "[UPDATE_DEBUG] report_result called for UPDATE transaction {}",
-                tx_id
-            );
+        if matches!(tx_id.transaction_type(), TransactionType::Update) {
+            tracing::debug!("report_result called for UPDATE transaction {}", tx_id);
         }
     }
 
@@ -401,8 +398,8 @@ async fn report_result(
         Ok(Some(op_res)) => {
             // Log specifically for UPDATE operations
             if let crate::operations::OpEnum::Update(ref update_op) = op_res {
-                tracing::info!(
-                    "[UPDATE_DEBUG] UPDATE operation {} completed, finalized: {}",
+                tracing::debug!(
+                    "UPDATE operation {} completed, finalized: {}",
                     update_op.id,
                     update_op.finalized()
                 );
@@ -412,8 +409,8 @@ async fn report_result(
                 for client_id in client_ids {
                     // Enhanced logging for UPDATE operations
                     if let crate::operations::OpEnum::Update(ref update_op) = op_res {
-                        tracing::info!(
-                            "[UPDATE_DEBUG] Sending UPDATE response to client {} for transaction {}",
+                        tracing::debug!(
+                            "Sending UPDATE response to client {} for transaction {}",
                             client_id,
                             update_op.id
                         );
@@ -422,15 +419,15 @@ async fn report_result(
                         let host_result = op_res.to_host_result();
                         match &host_result {
                             Ok(response) => {
-                                tracing::info!(
-                                    "[UPDATE_DEBUG] Client {} callback found, sending successful UPDATE response: {:?}",
+                                tracing::debug!(
+                                    "Client {} callback found, sending successful UPDATE response: {:?}",
                                     client_id,
                                     response
                                 );
                             }
                             Err(error) => {
                                 tracing::error!(
-                                    "[UPDATE_DEBUG] Client {} callback found, sending UPDATE error: {:?}",
+                                    "Client {} callback found, sending UPDATE error: {:?}",
                                     client_id,
                                     error
                                 );
@@ -444,8 +441,8 @@ async fn report_result(
             } else {
                 // Log when no client callback is found for UPDATE operations
                 if let crate::operations::OpEnum::Update(ref update_op) = op_res {
-                    tracing::warn!(
-                        "[UPDATE_DEBUG] No client callback found for UPDATE transaction {} - this may indicate a missing client subscription",
+                    tracing::debug!(
+                        "No client callback found for UPDATE transaction {} - this may indicate a missing client subscription",
                         update_op.id
                     );
                 }

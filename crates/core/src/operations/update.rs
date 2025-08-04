@@ -30,8 +30,8 @@ impl UpdateOp {
 
     pub(super) fn to_host_result(&self) -> HostResult {
         if let Some(UpdateState::Finished { key, summary }) = &self.state {
-            tracing::info!(
-                "[UPDATE_DEBUG] Creating UpdateResponse for transaction {} with key {} and summary length {}",
+            tracing::debug!(
+                "Creating UpdateResponse for transaction {} with key {} and summary length {}",
                 self.id,
                 key,
                 summary.size()
@@ -44,7 +44,7 @@ impl UpdateOp {
             ))
         } else {
             tracing::error!(
-                "[UPDATE_DEBUG] UPDATE operation {} failed to finish successfully, current state: {:?}",
+                "UPDATE operation {} failed to finish successfully, current state: {:?}",
                 self.id,
                 self.state
             );
@@ -354,8 +354,8 @@ impl Operation for UpdateOp {
                                 "Peer completed contract value update - SuccessfulUpdate",
                             );
 
-                            tracing::info!(
-                                "[UPDATE_DEBUG] UPDATE operation {} transitioning to Finished state for key {} with summary length {}",
+                            tracing::debug!(
+                                "UPDATE operation {} transitioning to Finished state for key {} with summary length {}",
                                 id,
                                 key,
                                 summary.size()
