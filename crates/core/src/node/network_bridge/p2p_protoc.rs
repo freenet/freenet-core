@@ -564,29 +564,9 @@ impl P2pConnManager {
                                 })??;
                             }
                             NodeEvent::TransactionTimedOut(tx) => {
-                                // Add logging for UPDATE transaction timeouts
-                                if tx.transaction_type().to_string().contains("Update") {
-                                    tracing::debug!(
-                                        %tx,
-                                        "[UPDATE_RACE_DEBUG] UPDATE transaction timed out"
-                                    );
-                                }
-
                                 let Some(clients) = state.tx_to_client.remove(&tx) else {
                                     continue;
                                 };
-
-                                if !clients.is_empty()
-                                    && tx.transaction_type().to_string().contains("Update")
-                                {
-                                    tracing::debug!(
-                                        %tx,
-                                        client_count = %clients.len(),
-                                        "[UPDATE_RACE_DEBUG] Notifying {} clients of UPDATE timeout",
-                                        clients.len()
-                                    );
-                                }
-
                                 for client in clients {
                                     cli_response_sender
                                         .send((client, Err(ErrorKind::FailedOperation.into())))?;
@@ -702,51 +682,24 @@ impl P2pConnManager {
             .pending_from_executor
             .remove(msg.id())
             .then(|| executor_listener.callback());
-        // For UPDATE operations, add extra logging and ensure proper state management
-        let is_update_op = msg.id().transaction_type().to_string().contains("Update");
-
-        let pending_client_req = if is_update_op {
-            // For UPDATE operations, remove clients from tracking to prevent stale state
-            let clients = state
-                .tx_to_client
-                .remove(msg.id())
-                .map(|clients| clients.into_iter().collect::<Vec<_>>());
-
-            if let Some(ref client_list) = clients {
-                tracing::debug!(
-                    tx = %msg.id(),
-                    client_count = %client_list.len(),
-                    "[UPDATE_RACE_FIX] Processing UPDATE with {} waiting clients",
-                    client_list.len()
-                );
-            } else {
-                tracing::debug!(
-                    tx = %msg.id(),
-                    "[UPDATE_RACE_FIX] Processing UPDATE but no clients found in tx_to_client"
-                );
-            }
-
-            clients
-        } else {
-            // For non-UPDATE operations, keep the old behavior
-            state
-                .tx_to_client
-                .get(msg.id())
-                .cloned()
-                .map(|clients| clients.into_iter().collect::<Vec<_>>())
-        }
-        .or(state
-            .client_waiting_transaction
-            .iter_mut()
-            .find_map(|(tx, clients)| match (&msg, &tx) {
-                (
-                    NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::ReturnSub {
-                        key, ..
-                    })),
-                    WaitingTransaction::Subscription { contract_key },
-                ) if contract_key == key.id() => Some(clients.drain().collect::<Vec<_>>()),
-                _ => None,
-            }));
+        let pending_client_req = state
+            .tx_to_client
+            .get(msg.id())
+            .cloned()
+            .map(|clients| clients.into_iter().collect::<Vec<_>>())
+            .or(state
+                .client_waiting_transaction
+                .iter_mut()
+                .find_map(|(tx, clients)| match (&msg, &tx) {
+                    (
+                        NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::ReturnSub {
+                            key,
+                            ..
+                        })),
+                        WaitingTransaction::Subscription { contract_key },
+                    ) if contract_key == key.id() => Some(clients.drain().collect::<Vec<_>>()),
+                    _ => None,
+                }));
         let client_req_handler_callback = pending_client_req
             .is_some()
             .then(|| cli_response_sender.clone());
@@ -1126,27 +1079,8 @@ impl P2pConnManager {
         };
         match transaction {
             WaitingTransaction::Transaction(tx) => {
-                // Enhanced logging to debug race condition
-                let tx_type = tx.transaction_type();
-                if tx_type.to_string().contains("Update") {
-                    tracing::debug!(
-                        %tx, %client_id, ?tx_type,
-                        "[UPDATE_RACE_DEBUG] Subscribing UPDATE client to transaction results"
-                    );
-                } else {
-                    tracing::debug!(%tx, %client_id, "Subscribing client to transaction results");
-                }
-
-                // Check for potential race condition
-                let had_existing = state.tx_to_client.contains_key(&tx);
+                tracing::debug!(%tx, %client_id, "Subscribing client to transaction results");
                 state.tx_to_client.entry(tx).or_default().insert(client_id);
-
-                if tx_type.to_string().contains("Update") && had_existing {
-                    tracing::debug!(
-                        %tx, %client_id,
-                        "[UPDATE_RACE_DEBUG] UPDATE transaction already had clients - possible race condition"
-                    );
-                }
             }
             WaitingTransaction::Subscription { contract_key } => {
                 tracing::debug!(%client_id, %contract_key, "Client waiting for subscription");

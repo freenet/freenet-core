@@ -387,81 +387,12 @@ async fn report_result(
     client_req_handler_callback: Option<(Vec<ClientId>, ClientResponsesSender)>,
     event_listener: &mut dyn NetEventRegister,
 ) {
-    // Add UPDATE-specific debug logging at the start
-    if let Some(tx_id) = tx {
-        if tx_id.transaction_type().to_string().contains("Update") {
-            tracing::info!(
-                "[UPDATE_DEBUG] report_result called for UPDATE transaction {}",
-                tx_id
-            );
-        }
-    }
-
     match op_result {
         Ok(Some(op_res)) => {
-            // Log specifically for UPDATE operations
-            if let crate::operations::OpEnum::Update(ref update_op) = op_res {
-                tracing::info!(
-                    "[UPDATE_DEBUG] UPDATE operation {} completed, finalized: {}",
-                    update_op.id,
-                    update_op.finalized()
-                );
-            }
-
             if let Some((client_ids, cb)) = client_req_handler_callback {
                 for client_id in client_ids {
-                    // Enhanced logging for UPDATE operations
-                    if let crate::operations::OpEnum::Update(ref update_op) = op_res {
-                        tracing::info!(
-                            "[UPDATE_DEBUG] Sending UPDATE response to client {} for transaction {}",
-                            client_id,
-                            update_op.id
-                        );
-
-                        // Log the result being sent
-                        let host_result = op_res.to_host_result();
-                        match &host_result {
-                            Ok(response) => {
-                                tracing::info!(
-                                    "[UPDATE_DEBUG] Client {} callback found, sending successful UPDATE response: {:?}",
-                                    client_id,
-                                    response
-                                );
-                            }
-                            Err(error) => {
-                                tracing::error!(
-                                    "[UPDATE_DEBUG] Client {} callback found, sending UPDATE error: {:?}",
-                                    client_id,
-                                    error
-                                );
-                            }
-                        }
-                    } else {
-                        tracing::debug!(?tx, %client_id,  "Sending response to client");
-                    }
-
-                    // Send the response
-                    if let Err(e) = cb.send((client_id, op_res.to_host_result())) {
-                        tracing::error!(
-                            ?tx, %client_id,
-                            "[UPDATE_RACE_FIX] Failed to send response to client: {:?}",
-                            e
-                        );
-                    } else if let crate::operations::OpEnum::Update(ref update_op) = op_res {
-                        tracing::debug!(
-                            "[UPDATE_RACE_FIX] Successfully queued UPDATE response for client {} (tx: {})",
-                            client_id,
-                            update_op.id
-                        );
-                    }
-                }
-            } else {
-                // Log when no client callback is found for UPDATE operations
-                if let crate::operations::OpEnum::Update(ref update_op) = op_res {
-                    tracing::warn!(
-                        "[UPDATE_DEBUG] No client callback found for UPDATE transaction {} - this may indicate a missing client subscription",
-                        update_op.id
-                    );
+                    tracing::debug!(?tx, %client_id,  "Sending response to client");
+                    let _ = cb.send((client_id, op_res.to_host_result()));
                 }
             }
             // check operations.rs:handle_op_result to see what's the meaning of each state
