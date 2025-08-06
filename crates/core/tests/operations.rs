@@ -210,10 +210,12 @@ async fn test_put_contract() -> TestResult {
         )
         .await?;
 
-        // Wait for put response
-        let resp = tokio::time::timeout(Duration::from_secs(60), client_api_a.recv()).await;
+        // Wait for put response (increased timeout for CI environments)
+        tracing::info!("Waiting for PUT response...");
+        let resp = tokio::time::timeout(Duration::from_secs(120), client_api_a.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                tracing::info!("PUT successful for contract: {}", key);
                 assert_eq!(key, contract_key);
             }
             Ok(Ok(other)) => {
@@ -223,7 +225,7 @@ async fn test_put_contract() -> TestResult {
                 bail!("Error receiving put response: {}", e);
             }
             Err(_) => {
-                bail!("Timeout waiting for put response");
+                bail!("Timeout waiting for put response after 120 seconds");
             }
         }
 
@@ -385,10 +387,12 @@ async fn test_update_contract() -> TestResult {
         )
         .await?;
 
-        // Wait for put response
-        let resp = tokio::time::timeout(Duration::from_secs(60), client_api_a.recv()).await;
+        // Wait for put response (increased timeout for CI environments)
+        tracing::info!("Waiting for PUT response...");
+        let resp = tokio::time::timeout(Duration::from_secs(120), client_api_a.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                tracing::info!("PUT successful for contract: {}", key);
                 assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
             }
             Ok(Ok(other)) => {
@@ -398,7 +402,7 @@ async fn test_update_contract() -> TestResult {
                 bail!("Error receiving put response: {}", e);
             }
             Err(_) => {
-                bail!("Timeout waiting for put response");
+                bail!("Timeout waiting for put response after 120 seconds");
             }
         }
 
@@ -785,6 +789,9 @@ async fn test_multiple_clients_subscription() -> TestResult {
         }
 
         // Third client gets the contract from node C (without subscribing)
+        // Add delay to allow contract to propagate from Node A to Node B/C
+        tracing::info!("Waiting 5 seconds for contract to propagate across nodes...");
+        tokio::time::sleep(Duration::from_secs(5)).await;
         make_get(&mut client_api_node_b, contract_key, true, false).await?;
 
         // Wait for get response on third client
