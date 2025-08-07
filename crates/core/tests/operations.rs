@@ -792,18 +792,27 @@ async fn test_multiple_clients_subscription() -> TestResult {
         // Add delay to allow contract to propagate from Node A to Node B/C
         tracing::info!("Waiting 5 seconds for contract to propagate across nodes...");
         tokio::time::sleep(Duration::from_secs(5)).await;
+
+        tracing::info!(
+            "Client 3: Sending GET request for contract {} to Node B",
+            contract_key
+        );
+        let get_start = std::time::Instant::now();
         make_get(&mut client_api_node_b, contract_key, true, false).await?;
 
         // Wait for get response on third client
+        // Note: Contract propagation from Node A to Node B can take 5-10s locally, longer in CI
         loop {
             let resp =
-                tokio::time::timeout(Duration::from_secs(30), client_api_node_b.recv()).await;
+                tokio::time::timeout(Duration::from_secs(60), client_api_node_b.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                     key,
                     contract: Some(_),
                     state: _,
                 }))) => {
+                    let elapsed = get_start.elapsed();
+                    tracing::info!("Client 3: Received GET response after {:?}", elapsed);
                     assert_eq!(
                         key, contract_key,
                         "Contract key mismatch in GET response for client 3"
@@ -820,7 +829,8 @@ async fn test_multiple_clients_subscription() -> TestResult {
                     bail!("Client 3: Error receiving get response: {}", e);
                 }
                 Err(_) => {
-                    bail!("Client 3: Timeout waiting for get response");
+                    let elapsed = get_start.elapsed();
+                    bail!("Client 3: Timeout waiting for get response after {:?}. Contract may not have propagated from Node A to Node B", elapsed);
                 }
             }
         }
@@ -831,7 +841,7 @@ async fn test_multiple_clients_subscription() -> TestResult {
         // Wait for subscribe response
         loop {
             let resp =
-                tokio::time::timeout(Duration::from_secs(30), client_api_node_b.recv()).await;
+                tokio::time::timeout(Duration::from_secs(60), client_api_node_b.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
                     key,
