@@ -1,0 +1,18 @@
+[package]
+name = "test-contract-update-nochange"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+freenet-stdlib = { workspace = true, features = ["contract"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []
+
+# No release profile here - use workspace defaults
