@@ -118,7 +118,7 @@ impl ClientEventsProxy for HttpGateway {
         &mut self,
         id: ClientId,
         result: Result<HostResponse, ClientError>,
-    ) -> BoxFuture<Result<(), ClientError>> {
+    ) -> BoxFuture<'_, Result<(), ClientError>> {
         async move {
             if let Some(ch) = self.response_channels.remove(&id) {
                 let should_rm = result

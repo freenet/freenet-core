@@ -166,7 +166,7 @@ pub trait ClientEventsProxy {
         &mut self,
         id: ClientId,
         response: Result<HostResponse, ClientError>,
-    ) -> BoxFuture<Result<(), ClientError>>;
+    ) -> BoxFuture<'_, Result<(), ClientError>>;
 }
 
 /// Process client events.

@@ -693,7 +693,7 @@ impl ClientEventsProxy for WebSocketProxy {
         &mut self,
         id: ClientId,
         result: Result<HostResponse, ClientError>,
-    ) -> BoxFuture<Result<(), ClientError>> {
+    ) -> BoxFuture<'_, Result<(), ClientError>> {
         async move {
             // Log UPDATE responses specifically
             match &result {
