@@ -552,7 +552,25 @@ async fn process_host_response(
                         HostResponse::Ok => "HostResponse::Ok",
                         _ => "Unknown",
                     };
-                    tracing::debug!(response = %res, response_type, cli_id = %id, "sending response");
+
+                    // Enhanced logging for UPDATE responses
+                    match &res {
+                        HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                            key,
+                            summary,
+                        }) => {
+                            tracing::debug!(
+                                "Processing UpdateResponse for WebSocket delivery - client: {}, key: {}, summary length: {}",
+                                id,
+                                key,
+                                summary.size()
+                            );
+                        }
+                        _ => {
+                            tracing::debug!(response = %res, response_type, cli_id = %id, "sending response");
+                        }
+                    }
+
                     match res {
                         HostResponse::ContractResponse(ContractResponse::GetResponse {
                             key,
@@ -572,6 +590,22 @@ async fn process_host_response(
                     Err(err)
                 }
             };
+            // Log when UPDATE response is about to be sent over WebSocket
+            let is_update_response = match &result {
+                Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                    key,
+                    ..
+                })) => {
+                    tracing::debug!(
+                        "About to serialize UpdateResponse for WebSocket delivery - client: {}, key: {}",
+                        client_id,
+                        key
+                    );
+                    Some(*key)
+                }
+                _ => None,
+            };
+
             let serialized_res = match encoding_protoc {
                 EncodingProtocol::Flatbuffers => match result {
                     Ok(res) => res.into_fbs_bytes()?,
@@ -579,7 +613,41 @@ async fn process_host_response(
                 },
                 EncodingProtocol::Native => bincode::serialize(&result)?,
             };
-            tx.send(Message::Binary(serialized_res)).await?;
+
+            // Log serialization completion for UPDATE responses
+            if let Some(key) = is_update_response {
+                tracing::debug!(
+                    "Serialized UpdateResponse for WebSocket delivery - client: {}, key: {}, size: {} bytes",
+                    client_id,
+                    key,
+                    serialized_res.len()
+                );
+            }
+
+            let send_result = tx.send(Message::Binary(serialized_res)).await;
+
+            // Log WebSocket send result for UPDATE responses
+            if let Some(key) = is_update_response {
+                match &send_result {
+                    Ok(()) => {
+                        tracing::debug!(
+                            "Successfully sent UpdateResponse over WebSocket to client {} for key {}",
+                            client_id,
+                            key
+                        );
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            "Failed to send UpdateResponse over WebSocket to client {} for key {}: {:?}",
+                            client_id,
+                            key,
+                            err
+                        );
+                    }
+                }
+            }
+
+            send_result?;
             Ok(None)
         }
         Some(HostCallbackResult::SubscriptionChannel { key, id, callback }) => {
@@ -627,20 +695,88 @@ impl ClientEventsProxy for WebSocketProxy {
         result: Result<HostResponse, ClientError>,
     ) -> BoxFuture<Result<(), ClientError>> {
         async move {
+            // Log UPDATE responses specifically
+            match &result {
+                Ok(HostResponse::ContractResponse(freenet_stdlib::client_api::ContractResponse::UpdateResponse { key, summary })) => {
+                    tracing::debug!(
+                        "WebSocket send() called with UpdateResponse for client {} - key: {}, summary length: {}",
+                        id,
+                        key,
+                        summary.size()
+                    );
+                }
+                Ok(other_response) => {
+                    tracing::debug!("WebSocket send() called with response for client {}: {:?}", id, other_response);
+                }
+                Err(error) => {
+                    tracing::debug!("WebSocket send() called with error for client {}: {:?}", id, error);
+                }
+            }
+
             if let Some(ch) = self.response_channels.remove(&id) {
+                // Log success/failure of sending UPDATE responses
+                if let Ok(HostResponse::ContractResponse(freenet_stdlib::client_api::ContractResponse::UpdateResponse { key, .. })) = &result {
+                    tracing::debug!(
+                        "Found WebSocket channel for client {}, sending UpdateResponse for key {}",
+                        id,
+                        key
+                    );
+                }
+
+                // Check if this is an UPDATE response and extract key before moving result
+                let update_key = match &result {
+                    Ok(HostResponse::ContractResponse(freenet_stdlib::client_api::ContractResponse::UpdateResponse { key, .. })) => Some(*key),
+                    _ => None
+                };
+
                 let should_rm = result
                     .as_ref()
                     .map_err(|err| matches!(err.kind(), ErrorKind::Disconnect))
                     .err()
                     .unwrap_or(false);
-                if ch.send(HostCallbackResult::Result { id, result }).is_ok() && !should_rm {
+
+                let send_result = ch.send(HostCallbackResult::Result { id, result });
+
+                // Log UPDATE response send result
+                if let Some(key) = update_key {
+                    match send_result.is_ok() {
+                        true => {
+                            tracing::debug!(
+                                "Successfully sent UpdateResponse to client {} for key {}",
+                                id,
+                                key
+                            );
+                        }
+                        false => {
+                            tracing::error!(
+                                "Failed to send UpdateResponse to client {} for key {} - channel send failed",
+                                id,
+                                key
+                            );
+                        }
+                    }
+                }
+
+                if send_result.is_ok() && !should_rm {
                     // still alive connection, keep it
                     self.response_channels.insert(id, ch);
                 } else {
                     tracing::info!("dropped connection to client #{id}");
                 }
             } else {
-                tracing::warn!("client: {id} not found");
+                // Log when client is not found for UPDATE responses
+                match &result {
+                    Ok(HostResponse::ContractResponse(freenet_stdlib::client_api::ContractResponse::UpdateResponse { key, .. })) => {
+                        tracing::error!(
+                            "Client {} not found in WebSocket response channels when trying to send UpdateResponse for key {}",
+                            id,
+                            key
+                        );
+                    }
+                    _ => {
+                        tracing::warn!("client: {id} not found");
+                    }
+                }
             }
             Ok(())
         }

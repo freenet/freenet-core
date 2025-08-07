@@ -144,7 +144,29 @@ where
                     .await;
 
                 let event_result = match update_result {
-                    Ok(UpsertResult::NoChange) => ContractHandlerEvent::UpdateNoChange { key },
+                    Ok(UpsertResult::NoChange) => {
+                        tracing::info!(%key, "UPDATE resulted in NoChange, fetching current state to return UpdateResponse");
+                        // When there's no change, we still need to return the current state
+                        // so the client gets a proper response
+                        match contract_handler.executor().fetch_contract(key, false).await {
+                            Ok((Some(current_state), _)) => {
+                                tracing::info!(%key, "Successfully fetched current state for NoChange update");
+                                ContractHandlerEvent::UpdateResponse {
+                                    new_value: Ok(current_state),
+                                }
+                            }
+                            Ok((None, _)) => {
+                                tracing::warn!(%key, "No state found when fetching for NoChange update");
+                                // Fallback to the old behavior if we can't fetch the state
+                                ContractHandlerEvent::UpdateNoChange { key }
+                            }
+                            Err(err) => {
+                                tracing::error!(%key, %err, "Error fetching state for NoChange update");
+                                // Fallback to the old behavior if we can't fetch the state
+                                ContractHandlerEvent::UpdateNoChange { key }
+                            }
+                        }
+                    }
                     Ok(UpsertResult::Updated(state)) => ContractHandlerEvent::UpdateResponse {
                         new_value: Ok(state),
                     },
