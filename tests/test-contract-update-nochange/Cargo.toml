@@ -14,5 +14,3 @@ serde_json = "1"
 [features]
 default = ["freenet-main-contract"]
 freenet-main-contract = []
-
-# No release profile here - use workspace defaults
