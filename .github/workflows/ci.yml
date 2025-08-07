@@ -41,8 +41,8 @@ jobs:
 
       - name: Build
         run: |
-          cargo install --locked --force --path ./crates/core
-          cargo install --locked --force --path ./crates/fdev
+          cargo install --locked --force --debug --path ./crates/core
+          cargo install --locked --force --debug --path ./crates/fdev
           make -C apps/freenet-ping -f run-ping.mk build
           cargo build --locked
 
@@ -79,7 +79,7 @@ jobs:
 
       - name: Build
         run: |
-          cargo install --locked --force --path ../../crates/fdev
+          cargo install --locked --force --debug --path ../../crates/fdev
           make -f run-ping.mk build
         working-directory: apps/freenet-ping
 
