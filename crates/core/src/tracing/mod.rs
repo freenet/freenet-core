@@ -38,7 +38,7 @@ pub(crate) trait NetEventRegister: std::any::Any + Send + Sync + 'static {
         &'a self,
         events: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
     ) -> BoxFuture<'a, ()>;
-    fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<()>;
+    fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<'_, ()>;
     fn trait_clone(&self) -> Box<dyn NetEventRegister>;
     fn get_router_events(&self, number: usize) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>>;
 }
@@ -551,7 +551,7 @@ impl NetEventRegister for EventRegister {
         Box::new(self.clone())
     }
 
-    fn notify_of_time_out(&mut self, _: Transaction) -> BoxFuture<()> {
+    fn notify_of_time_out(&mut self, _: Transaction) -> BoxFuture<'_, ()> {
         async {}.boxed()
     }
 
