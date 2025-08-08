@@ -166,7 +166,7 @@ pub trait ClientEventsProxy {
         &mut self,
         id: ClientId,
         response: Result<HostResponse, ClientError>,
-    ) -> BoxFuture<Result<(), ClientError>>;
+    ) -> BoxFuture<'_, Result<(), ClientError>>;
 }
 
 /// Process client events.
@@ -864,7 +864,7 @@ pub(crate) mod test {
             self.events_to_gen.extend(events)
         }
 
-        fn generate_deterministic_event(&mut self, id: &EventId) -> Option<ClientRequest> {
+        fn generate_deterministic_event(&mut self, id: &EventId) -> Option<ClientRequest<'_>> {
             self.events_to_gen.remove(id)
         }
     }

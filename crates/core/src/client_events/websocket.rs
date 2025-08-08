@@ -85,7 +85,7 @@ impl WebSocketProxy {
     async fn internal_proxy_recv(
         &mut self,
         msg: ClientConnection,
-    ) -> Result<Option<OpenRequest>, ClientError> {
+    ) -> Result<Option<OpenRequest<'_>>, ClientError> {
         match msg {
             ClientConnection::NewConnection { callbacks, .. } => {
                 // is a new client, assign an id and open a channel to communicate responses from the node
@@ -673,7 +673,7 @@ async fn process_host_response(
 }
 
 impl ClientEventsProxy for WebSocketProxy {
-    fn recv(&mut self) -> BoxFuture<Result<OpenRequest<'static>, ClientError>> {
+    fn recv(&mut self) -> BoxFuture<'_, Result<OpenRequest<'static>, ClientError>> {
         async move {
             loop {
                 let msg = self.proxy_server_request.recv().await;
@@ -693,7 +693,7 @@ impl ClientEventsProxy for WebSocketProxy {
         &mut self,
         id: ClientId,
         result: Result<HostResponse, ClientError>,
-    ) -> BoxFuture<Result<(), ClientError>> {
+    ) -> BoxFuture<'_, Result<(), ClientError>> {
         async move {
             // Log UPDATE responses specifically
             match &result {
