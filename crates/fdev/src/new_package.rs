@@ -1,10 +1,13 @@
 use std::{
+    collections::BTreeMap,
     env,
     fs::{self, File},
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
+
+use serde::{Deserialize, Serialize};
 
 use crate::{
     build::*,
@@ -68,6 +71,30 @@ fn create_regular_contract(cwd: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Minimal Cargo.toml that only contains fields we need.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct Manifest {
+    package: toml::Value,
+    dependencies: toml::Value,
+    #[serde(default)]
+    lib: Option<ManifestLib>,
+    #[serde(default)]
+    features: Option<BTreeMap<String, Vec<String>>>,
+    // Catch-all to ensure we don't drop any fields.
+    #[serde(default, flatten)]
+    any: Option<BTreeMap<String, toml::Value>>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct ManifestLib {
+    name: Option<String>,
+    path: Option<PathBuf>,
+    crate_type: Option<Vec<String>>,
+    required_features: Option<Vec<String>>,
+}
+
 fn create_rust_crate(cwd: &Path, kind: ContractKind) -> anyhow::Result<()> {
     let (dest_path, cmd) = match kind {
         ContractKind::WebApp => (cwd.join("container"), &["new"]),
@@ -113,20 +140,26 @@ fn create_rust_crate(cwd: &Path, kind: ContractKind) -> anyhow::Result<()> {
 
     // add any additional config keys
     // todo: improve error handling here, in case something fails would have to rollback any changes
-    let mut cargo_file = File::open(dest_path.join("Cargo.toml"))?;
-    let mut buf = vec![];
-    cargo_file.read_to_end(&mut buf)?;
-    let cargo_file_content = std::str::from_utf8(buf.as_slice()).expect("Found invalid cargo file");
-    let mut cargo_def: toml::Value = toml::from_str(cargo_file_content)?;
-    let lib_entry = toml::map::Map::from_iter([(
-        "crate-type".into(),
-        toml::Value::Array(vec![toml::Value::String("cdylib".into())]),
-    )]);
-    let root = cargo_def.as_table_mut().unwrap();
-    root.insert("lib".into(), toml::Value::Table(lib_entry));
-    std::mem::drop(cargo_file);
-    let mut cargo_file = File::create(dest_path.join("Cargo.toml"))?;
-    cargo_file.write_all(toml::to_string(&cargo_def)?.into_bytes().as_slice())?;
+    let manifest_path = dest_path.join("Cargo.toml");
+    let toml_str = fs::read_to_string(&manifest_path)?;
+    let mut manifest: Manifest = toml::from_str(&toml_str)?;
+
+    manifest.lib = Some(ManifestLib {
+        crate_type: Some(vec!["cdylib".into()]),
+        ..Default::default()
+    });
+    manifest.features = Some(
+        [
+            ("default".into(), vec!["freenet-main-contract".into()]),
+            ("contract".into(), vec!["freenet-stdlib/contract".into()]),
+            ("freenet-main-contract".into(), vec![]),
+            ("trace".into(), vec!["freenet-stdlib/trace".into()]),
+        ]
+        .into_iter()
+        .collect(),
+    );
+
+    fs::write(&manifest_path, toml::to_string(&manifest)?)?;
     Ok(())
 }
 
