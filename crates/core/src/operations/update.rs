@@ -20,7 +20,7 @@ pub(crate) struct UpdateOp {
 }
 
 impl UpdateOp {
-    pub fn outcome(&self) -> OpOutcome {
+    pub fn outcome(&self) -> OpOutcome<'_> {
         OpOutcome::Irrelevant
     }
 
@@ -618,7 +618,15 @@ pub(crate) async fn request_update(
             .into_iter()
             .next();
 
-        if closest.is_none() {
+        if let Some(target) = closest {
+            // Subscribe to the contract
+            op_manager
+                .ring
+                .add_subscriber(key, sender)
+                .map_err(|_| RingError::NoCachingPeers(*key))?;
+
+            target
+        } else {
             // Check if we actually have any connected peers at all
             let has_connections = op_manager.ring.connection_manager.num_connections() > 0;
 
@@ -641,16 +649,6 @@ pub(crate) async fn request_update(
                 // Target ourselves
                 sender.clone()
             }
-        } else {
-            let target = closest.unwrap();
-
-            // Subscribe to the contract
-            op_manager
-                .ring
-                .add_subscriber(key, sender)
-                .map_err(|_| RingError::NoCachingPeers(*key))?;
-
-            target
         }
     };
 
