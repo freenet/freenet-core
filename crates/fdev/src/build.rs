@@ -1,3 +1,4 @@
+use bytesize::ByteSize;
 use freenet::server::WebApp;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
@@ -9,7 +10,6 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
-use bytesize::ByteSize;
 use tar::Builder;
 
 use crate::{
