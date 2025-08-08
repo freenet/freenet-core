@@ -280,7 +280,7 @@ pub(crate) struct GetOp {
 }
 
 impl GetOp {
-    pub(super) fn outcome(&self) -> OpOutcome {
+    pub(super) fn outcome(&self) -> OpOutcome<'_> {
         if let Some((
             GetResult {
                 state, contract, ..

@@ -71,7 +71,7 @@ impl<const N: usize> NetEventRegister for CombinedRegister<N> {
         Box::new(self.clone())
     }
 
-    fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<()> {
+    fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<'_, ()> {
         async move {
             for reg in &mut self.0 {
                 reg.notify_of_time_out(tx).await;
@@ -1080,7 +1080,7 @@ mod opentelemetry_tracer {
             Box::new(self.clone())
         }
 
-        fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<()> {
+        fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<'_, ()> {
             async move {
                 if cfg!(test) {
                     let _ = self.finished_tx_notifier.send(tx).await;
