@@ -14,10 +14,3 @@ serde_json = "1"
 [features]
 default = ["freenet-main-contract"]
 freenet-main-contract = []
-
-[profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true
