@@ -33,7 +33,7 @@ tracing-subscriber = "0.3"
 wasmer = "5.0.4"
 wasmer-compiler-singlepass = "5.0.4"
 
-freenet-stdlib = { version = "0.1.11" }
+freenet-stdlib = { version = "0.1.13" }
 
 [profile.dev.package."*"]
 opt-level = 3
