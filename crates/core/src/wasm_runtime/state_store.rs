@@ -84,12 +84,13 @@ where
                 .map_err(Into::into)?
                 .ok_or_else(|| StateStoreError::MissingContract(*key))?;
         }
-        self.store
-            .store(*key, state.clone())
-            .await
-            .map_err(Into::into)?;
+        // Update memory cache first to prevent race condition where GET requests
+        // could read stale cached data while persistent store is being updated
         let cost = state.size() as i64;
-        self.state_mem_cache.insert(*key, state, cost).await;
+        self.state_mem_cache.insert(*key, state.clone(), cost).await;
+
+        // Then update persistent store
+        self.store.store(*key, state).await.map_err(Into::into)?;
         Ok(())
     }
 
@@ -99,12 +100,12 @@ where
         state: WrappedState,
         params: Parameters<'static>,
     ) -> Result<(), StateStoreError> {
-        self.store
-            .store(key, state.clone())
-            .await
-            .map_err(Into::into)?;
+        // Update memory cache first to prevent race condition
         let cost = state.size() as i64;
-        self.state_mem_cache.insert(key, state, cost).await;
+        self.state_mem_cache.insert(key, state.clone(), cost).await;
+
+        // Then update persistent stores
+        self.store.store(key, state).await.map_err(Into::into)?;
         self.store
             .store_params(key, params.clone())
             .await
