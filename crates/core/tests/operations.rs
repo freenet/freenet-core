@@ -126,7 +126,7 @@ async fn get_contract(
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_put_contract() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::INFO), None);
     const TEST_CONTRACT: &str = "test-contract-integration";
