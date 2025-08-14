@@ -376,6 +376,8 @@ async fn process_open_request(
 
                         // Register subscription listener if subscribe=true
                         if subscribe {
+                            // Note: The actual subscription to the contract happens in the PUT operation
+                            // when it receives SuccessfulPut. Here we just register the listener for updates.
                             if let Some(subscription_listener) = subscription_listener {
                                 tracing::debug!(%client_id, %contract_key, "Registering subscription for PUT with auto-subscribe");
                                 let register_listener = op_manager
