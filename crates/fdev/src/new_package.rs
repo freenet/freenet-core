@@ -7,27 +7,31 @@ use std::{
     process::{Command, Stdio},
 };
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     build::*,
-    config::{ContractKind, NewPackageConfig},
+    config::{ContractKind, InitPackageConfig},
     util::pipe_std_streams,
     Error,
 };
 
-pub fn create_new_package(config: NewPackageConfig) -> anyhow::Result<()> {
-    let cwd = env::current_dir()?;
-    match config.kind {
-        ContractKind::WebApp => create_view_package(&cwd)?,
-        ContractKind::Contract => create_regular_contract(&cwd)?,
+pub fn create_new_package(config: InitPackageConfig) -> anyhow::Result<()> {
+    let InitPackageConfig { kind, path } = config;
+    let path = path
+        .or_else(|| env::current_dir().ok())
+        .context("Valid path for creating a new package")?;
+    match kind {
+        ContractKind::WebApp => create_view_package(&path),
+        ContractKind::Contract => create_regular_contract(&path),
     }
-    Ok(())
 }
 
-fn create_view_package(cwd: &Path) -> anyhow::Result<()> {
-    create_rust_crate(cwd, ContractKind::WebApp)?;
-    create_web_init_files(cwd)?;
+fn create_view_package(dir: impl AsRef<Path>) -> anyhow::Result<()> {
+    let dir = dir.as_ref();
+    create_rust_crate(dir, ContractKind::WebApp)?;
+    create_web_init_files(dir)?;
     let freenet_file_config = ContractBuildConfig {
         contract: Contract {
             c_type: Some(ContractType::WebApp),
@@ -47,14 +51,15 @@ fn create_view_package(cwd: &Path) -> anyhow::Result<()> {
         state: None,
     };
     let serialized = toml::to_string(&freenet_file_config)?.into_bytes();
-    let path = cwd.join("freenet").with_extension("toml");
+    let path = dir.join("freenet").with_extension("toml");
     let mut file = File::create(path)?;
     file.write_all(&serialized)?;
     Ok(())
 }
 
-fn create_regular_contract(cwd: &Path) -> anyhow::Result<()> {
-    create_rust_crate(cwd, ContractKind::Contract)?;
+fn create_regular_contract(dir: impl AsRef<Path>) -> anyhow::Result<()> {
+    let dir = dir.as_ref();
+    create_rust_crate(dir, ContractKind::Contract)?;
     let freenet_file_config = ContractBuildConfig {
         contract: Contract {
             c_type: Some(ContractType::Standard),
@@ -65,7 +70,7 @@ fn create_regular_contract(cwd: &Path) -> anyhow::Result<()> {
         state: None,
     };
     let serialized = toml::to_string(&freenet_file_config)?.into_bytes();
-    let path = cwd.join("freenet").with_extension("toml");
+    let path = dir.join("freenet").with_extension("toml");
     let mut file = File::create(path)?;
     file.write_all(&serialized)?;
     Ok(())
@@ -95,23 +100,29 @@ struct ManifestLib {
     required_features: Option<Vec<String>>,
 }
 
-fn create_rust_crate(cwd: &Path, kind: ContractKind) -> anyhow::Result<()> {
-    let (dest_path, cmd) = match kind {
-        ContractKind::WebApp => (cwd.join("container"), &["new"]),
-        ContractKind::Contract => (cwd.to_owned(), &["init"]),
+fn create_rust_crate(dir: impl AsRef<Path>, kind: ContractKind) -> anyhow::Result<()> {
+    let dir = match kind {
+        ContractKind::WebApp => dir.as_ref().join("container"),
+        ContractKind::Contract => dir.as_ref().to_owned(),
     };
+    let command = if dir.exists() { "init" } else { "new" };
+    let colored = [command, "--color", "always", "--lib"];
+    let auto_colored = [command, "--lib"];
     use std::io::IsTerminal;
     let cmd_args = if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
-        cmd.iter()
+        colored
+            .as_slice()
+            .iter()
             .copied()
-            .chain(["--color", "always"])
-            .chain(["--lib", dest_path.to_str().unwrap()])
-            .collect::<Vec<_>>()
+            .map(std::ffi::OsStr::new)
+            .chain([dir.as_os_str()])
     } else {
-        cmd.iter()
+        auto_colored
+            .as_slice()
+            .iter()
             .copied()
-            .chain(["--lib", dest_path.to_str().unwrap()])
-            .collect::<Vec<_>>()
+            .map(std::ffi::OsStr::new)
+            .chain([dir.as_os_str()])
     };
 
     let child = Command::new("cargo")
@@ -128,7 +139,7 @@ fn create_rust_crate(cwd: &Path, kind: ContractKind) -> anyhow::Result<()> {
     // add the stdlib dependency
     let child = Command::new("cargo")
         .args(["add", "freenet-stdlib"])
-        .current_dir(&dest_path)
+        .current_dir(&dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -140,7 +151,7 @@ fn create_rust_crate(cwd: &Path, kind: ContractKind) -> anyhow::Result<()> {
 
     // add any additional config keys
     // todo: improve error handling here, in case something fails would have to rollback any changes
-    let manifest_path = dest_path.join("Cargo.toml");
+    let manifest_path = dir.join("Cargo.toml");
     let toml_str = fs::read_to_string(&manifest_path)?;
     let mut manifest: Manifest = toml::from_str(&toml_str)?;
 
@@ -173,12 +184,13 @@ const TSC: &str = "tsc.cmd";
 #[cfg(unix)]
 const TSC: &str = "tsc";
 
-fn create_web_init_files(cwd: &Path) -> anyhow::Result<()> {
+fn create_web_init_files(dir: impl AsRef<Path>) -> anyhow::Result<()> {
+    let dir = dir.as_ref();
     let child = Command::new(NPM)
         .args(["init", "--force"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .current_dir(cwd)
+        .current_dir(dir)
         .spawn()
         .map_err(|e| {
             eprintln!("Error while executing npm command: {e}");
@@ -192,7 +204,7 @@ fn create_web_init_files(cwd: &Path) -> anyhow::Result<()> {
         .args(["--init", "--pretty"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .current_dir(cwd)
+        .current_dir(dir)
         .spawn()
         .map_err(|e| {
             eprintln!("Error while executing npm command: {e}");
@@ -232,15 +244,15 @@ fn create_web_init_files(cwd: &Path) -> anyhow::Result<()> {
         },
         };"#;
 
-    let mut f = File::create(cwd.join("webpack.config.js"))?;
+    let mut f = File::create(dir.join("webpack.config.js"))?;
     f.write_all(WEBPACK_CONFIG.as_bytes())?;
 
-    fs::create_dir_all(cwd.join("src"))?;
-    let idx = cwd.join("src").join("index").with_extension("ts");
+    fs::create_dir_all(dir.join("src"))?;
+    let idx = dir.join("src").join("index").with_extension("ts");
     File::create(idx)?;
 
-    fs::create_dir_all(cwd.join("dist"))?;
-    let idx = cwd.join("dist").join("index").with_extension("html");
+    fs::create_dir_all(dir.join("dist"))?;
+    let idx = dir.join("dist").join("index").with_extension("html");
     File::create(idx)?;
 
     Ok(())

@@ -38,6 +38,7 @@ pub struct BaseConfig {
 
 #[derive(clap::Subcommand, Clone)]
 pub enum SubCommand {
+    Init(InitPackageConfig),
     New(NewPackageConfig),
     Build(BuildToolConfig),
     Inspect(crate::inspect::InspectConfig),
@@ -191,11 +192,31 @@ fn parse_version(src: &str) -> Result<Version, String> {
     Version::parse(src).map_err(|e| e.to_string())
 }
 
+/// Initialize a new Freenet contract and/or app in the CWD by default.
+#[derive(clap::Parser, Clone)]
+pub struct InitPackageConfig {
+    #[arg(id = "type", value_enum)]
+    pub(crate) kind: ContractKind,
+    #[arg(short, long, value_name = "PATH", value_hint = clap::ValueHint::DirPath)]
+    pub(crate) path: Option<PathBuf>,
+}
+
+impl From<NewPackageConfig> for InitPackageConfig {
+    fn from(NewPackageConfig { kind, path }: NewPackageConfig) -> Self {
+        Self {
+            kind,
+            path: path.into(),
+        }
+    }
+}
+
 /// Create a new Freenet contract and/or app.
 #[derive(clap::Parser, Clone)]
 pub struct NewPackageConfig {
     #[arg(id = "type", value_enum)]
     pub(crate) kind: ContractKind,
+    #[arg(value_name = "PATH", value_hint = clap::ValueHint::DirPath)]
+    pub(crate) path: PathBuf,
 }
 
 #[derive(clap::ValueEnum, Clone)]
