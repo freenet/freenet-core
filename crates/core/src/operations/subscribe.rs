@@ -279,15 +279,32 @@ impl Operation for SubscribeOp {
                         );
                     }
 
+                    // SUBSCRIPTION_DIAG: Log subscription attempt
+                    tracing::info!(
+                        "SUBSCRIPTION_DIAG: Attempting to add subscriber {} to contract {}",
+                        subscriber.peer,
+                        key.id()
+                    );
+
                     if op_manager
                         .ring
                         .add_subscriber(key, subscriber.clone())
                         .is_err()
                     {
                         tracing::debug!(tx = %id, %key, "Max number of subscribers reached for contract");
+                        tracing::info!(
+                            "SUBSCRIPTION_DIAG: FAILED to add subscriber {} to contract {} - max subscribers reached",
+                            subscriber.peer, key.id()
+                        );
                         // max number of subscribers for this contract reached
                         return Ok(return_not_subbed());
                     }
+
+                    tracing::info!(
+                        "SUBSCRIPTION_DIAG: SUCCESS - Added subscriber {} to contract {}",
+                        subscriber.peer,
+                        key.id()
+                    );
 
                     match self.state {
                         Some(SubscribeState::ReceivedRequest) => {
@@ -386,6 +403,11 @@ impl Operation for SubscribeOp {
                             this_peer = %target.peer,
                             provider = %sender.peer,
                             "Subscribed to contract"
+                        );
+                        // SUBSCRIPTION_DIAG: Gateway adding itself as subscriber
+                        tracing::info!(
+                            "SUBSCRIPTION_DIAG: Gateway {} adding itself as subscriber to contract {}",
+                            sender.peer, key.id()
                         );
                         if op_manager.ring.add_subscriber(key, sender.clone()).is_err() {
                             // concurrently it reached max number of subscribers for this contract

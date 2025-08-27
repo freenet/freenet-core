@@ -187,6 +187,20 @@ impl Operation for UpdateOp {
 
                     let broadcast_to = op_manager.get_broadcast_targets_update(key, &sender.peer);
 
+                    // SUBSCRIPTION_DIAG: Log broadcast targets
+                    tracing::info!(
+                        "SUBSCRIPTION_DIAG: Update for contract {} - has_subscribers: {}, broadcast_targets: {} peers",
+                        key.id(), has_subscribers, broadcast_to.len()
+                    );
+                    if !broadcast_to.is_empty() {
+                        for target in &broadcast_to {
+                            tracing::info!(
+                                "SUBSCRIPTION_DIAG: Will broadcast update to peer: {}",
+                                target.peer
+                            );
+                        }
+                    }
+
                     if should_handle_update {
                         tracing::debug!(
                             "Peer is seeding or has subscribers for contract. About to update it"
@@ -505,13 +519,32 @@ impl OpManager {
             .ring
             .subscribers_of(key)
             .map(|subs| {
-                subs.value()
+                let all_subs = subs.value();
+                tracing::info!(
+                    "SUBSCRIPTION_DIAG: Contract {} has {} total subscribers",
+                    key.id(),
+                    all_subs.len()
+                );
+                for sub in all_subs.iter() {
+                    tracing::info!(
+                        "SUBSCRIPTION_DIAG: Subscriber: {} (filtering sender: {})",
+                        sub.peer,
+                        sender
+                    );
+                }
+                all_subs
                     .iter()
                     .filter(|pk| &pk.peer != sender)
                     .cloned()
                     .collect::<Vec<_>>()
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                tracing::info!(
+                    "SUBSCRIPTION_DIAG: Contract {} has NO subscribers",
+                    key.id()
+                );
+                vec![]
+            });
 
         subscribers
     }
