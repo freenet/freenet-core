@@ -51,7 +51,8 @@ fn main() -> anyhow::Result<()> {
             }
             SubCommand::Build(build_tool_config) => build_package(build_tool_config, &cwd),
             SubCommand::Inspect(inspect_config) => inspect(inspect_config),
-            SubCommand::New(new_pckg_config) => create_new_package(new_pckg_config),
+            SubCommand::Init(init_pckg_config) => create_new_package(init_pckg_config),
+            SubCommand::New(new_pckg_config) => create_new_package(new_pckg_config.into()),
             SubCommand::Publish(publish_config) => put(publish_config, config.additional).await,
             SubCommand::Execute(cmd_config) => match cmd_config.command {
                 config::NodeCommand::Put(put_config) => put(put_config, config.additional).await,
