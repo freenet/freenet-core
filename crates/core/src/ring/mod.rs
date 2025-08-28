@@ -62,7 +62,6 @@ pub use self::live_tx::LiveTransactionTracker;
 pub use connection::Connection;
 pub use location::{Distance, Location};
 pub use peer_key_location::PeerKeyLocation;
-pub use CachingTarget;
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
