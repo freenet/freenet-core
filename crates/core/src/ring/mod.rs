@@ -28,6 +28,15 @@ use crate::message::TransactionType;
 use crate::topology::rate::Rate;
 use crate::topology::TopologyAdjustment;
 use crate::tracing::{NetEventLog, NetEventRegister};
+
+/// Represents where a contract should be cached
+#[derive(Debug, Clone)]
+pub enum CachingTarget {
+    /// Store the contract locally on this node
+    Local,
+    /// Forward the contract to a remote peer
+    Remote(PeerKeyLocation),
+}
 use crate::transport::TransportPublicKey;
 use crate::util::Contains;
 use crate::{
@@ -246,62 +255,73 @@ impl Ring {
         filtered.into_iter()
     }
 
-    /// Return the most optimal peer caching a given contract.
+    /// Return the most optimal location for caching a given contract.
     ///
     /// This function considers both connected peers and the node itself as potential
-    /// caching locations. The node itself is included to ensure that contracts can be
-    /// stored locally when the node is at the optimal location, particularly important
-    /// for gateways which may be the best location for certain contracts.
+    /// caching locations. Returns `CachingTarget::Local` when this node should store
+    /// the contract locally, or `CachingTarget::Remote` with a peer location when
+    /// the contract should be forwarded.
     ///
-    /// Historical context: Previously, only connected peers were considered, which caused
-    /// issues where gateways couldn't store contracts even when they were the optimal
-    /// location. This led to "Contract not found" errors in production.
-    ///
-    /// The current approach ensures contracts are stored at the most optimal location
-    /// in the network, whether that's a connected peer or the node itself.
+    /// Returns `None` if no suitable caching location can be found.
     #[inline]
-    pub fn closest_potentially_caching(
+    pub fn closest_caching_target(
         &self,
         contract_key: &ContractKey,
         skip_list: impl Contains<PeerId>,
-    ) -> Option<PeerKeyLocation> {
+    ) -> Option<CachingTarget> {
         let router = self.router.read();
         let target_location = Location::from(contract_key);
 
-        // First check if self should be considered
+        // Check if self should be considered
         let own_peer = self.connection_manager.get_peer_key();
         let consider_self = own_peer
             .as_ref()
             .is_some_and(|p| !skip_list.has_element(p.clone()));
 
-        // Check connected peers
+        // Get best connected peer
         let best_peer = self
             .connection_manager
             .routing(target_location, None, skip_list, &router);
 
-        // Also consider self if we have a location and aren't in skip list
+        // Determine if we should cache locally or remotely
         if consider_self {
             let own_pkloc = self.connection_manager.own_location();
             if let Some(own_location) = own_pkloc.location {
                 match best_peer {
                     Some(peer) if peer.location.is_some() => {
                         let peer_loc = peer.location.unwrap();
-                        // Return closer of self or peer
+                        // Compare distances to determine best location
                         if own_location.distance(target_location)
                             < peer_loc.distance(target_location)
                         {
-                            Some(own_pkloc)
+                            Some(CachingTarget::Local)
                         } else {
-                            Some(peer)
+                            Some(CachingTarget::Remote(peer))
                         }
                     }
-                    _ => Some(own_pkloc), // No peer with location, use self
+                    _ => Some(CachingTarget::Local), // No peer with location, cache locally
                 }
             } else {
-                best_peer // Self has no location, use peer
+                // Self has no location, use peer if available
+                best_peer.map(CachingTarget::Remote)
             }
         } else {
-            best_peer // Self is in skip list or no own peer, use best peer
+            // Self is in skip list or no own peer, use best peer
+            best_peer.map(CachingTarget::Remote)
+        }
+    }
+    
+    /// Legacy method that returns a PeerKeyLocation. 
+    /// Returns None if the target is Local, or the peer if Remote.
+    #[inline]
+    pub fn closest_potentially_caching(
+        &self,
+        contract_key: &ContractKey,
+        skip_list: impl Contains<PeerId>,
+    ) -> Option<PeerKeyLocation> {
+        match self.closest_caching_target(contract_key, skip_list)? {
+            CachingTarget::Local => None,
+            CachingTarget::Remote(peer) => Some(peer),
         }
     }
 

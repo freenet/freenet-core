@@ -10,7 +10,7 @@ use crate::{
     contract::ContractError,
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
-    ring::{Location, PeerKeyLocation, RingError},
+    ring::{CachingTarget, Location, PeerKeyLocation, RingError},
 };
 use freenet_stdlib::{
     client_api::{ContractResponse, ErrorKind, HostResponse},
@@ -74,15 +74,15 @@ pub(crate) async fn request_subscribe(
             )));
         }
         const EMPTY: &[PeerId] = &[];
-        (
-            op_manager
-                .ring
-                .closest_potentially_caching(key, EMPTY)
-                .into_iter()
-                .next()
-                .ok_or_else(|| RingError::NoCachingPeers(*key))?,
-            *id,
-        )
+        let target = match op_manager.ring.closest_caching_target(key, EMPTY) {
+            Some(CachingTarget::Remote(peer)) => peer,
+            Some(CachingTarget::Local) => {
+                // If we're the best location, use our own location
+                op_manager.ring.connection_manager.own_location()
+            }
+            None => return Err(RingError::NoCachingPeers(*key).into()),
+        };
+        (target, *id)
     } else {
         return Err(OpError::UnexpectedOpState);
     };
@@ -240,10 +240,12 @@ impl Operation for SubscribeOp {
                     if !super::has_contract(op_manager, *key).await? {
                         tracing::debug!(tx = %id, %key, "Contract not found, trying other peer");
 
-                        let Some(new_target) =
-                            op_manager.ring.closest_potentially_caching(key, skip_list)
-                        else {
-                            tracing::warn!(tx = %id, %key, "No target peer found while trying getting contract");
+                        let caching_target =
+                            op_manager.ring.closest_caching_target(key, skip_list);
+                        
+                        // Can only forward to remote peers, not to ourselves
+                        let Some(CachingTarget::Remote(new_target)) = caching_target else {
+                            tracing::warn!(tx = %id, %key, "No remote peer available for forwarding");
                             return Ok(return_not_subbed());
                         };
                         let new_htl = htl - 1;
@@ -349,11 +351,9 @@ impl Operation for SubscribeOp {
                         }) => {
                             if retries < MAX_RETRIES {
                                 skip_list.insert(sender.peer.clone());
-                                if let Some(target) = op_manager
+                                if let Some(CachingTarget::Remote(target)) = op_manager
                                     .ring
-                                    .closest_potentially_caching(key, &skip_list)
-                                    .into_iter()
-                                    .next()
+                                    .closest_caching_target(key, &skip_list)
                                 {
                                     let subscriber =
                                         op_manager.ring.connection_manager.own_location();
