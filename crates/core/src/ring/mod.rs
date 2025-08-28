@@ -247,6 +247,18 @@ impl Ring {
     }
 
     /// Return the most optimal peer caching a given contract.
+    ///
+    /// This function considers both connected peers and the node itself as potential
+    /// caching locations. The node itself is included to ensure that contracts can be
+    /// stored locally when the node is at the optimal location, particularly important
+    /// for gateways which may be the best location for certain contracts.
+    ///
+    /// Historical context: Previously, only connected peers were considered, which caused
+    /// issues where gateways couldn't store contracts even when they were the optimal
+    /// location. This led to "Contract not found" errors in production.
+    ///
+    /// The current approach ensures contracts are stored at the most optimal location
+    /// in the network, whether that's a connected peer or the node itself.
     #[inline]
     pub fn closest_potentially_caching(
         &self,
@@ -305,25 +317,30 @@ impl Ring {
 
         // Get all connected peers through the connection manager
         let connections = self.connection_manager.get_connections_by_location();
-        let mut candidates: Vec<PeerKeyLocation> = connections
-            .values()
-            .filter_map(|conns| {
-                use rand::seq::SliceRandom;
-                let conn = conns.choose(&mut rand::thread_rng())?;
-                (!skip_list.has_element(conn.location.peer.clone()))
-                    .then_some(conn.location.clone())
-            })
-            .collect();
+        let peer_candidates = connections.values().filter_map(|conns| {
+            use rand::seq::SliceRandom;
+            let conn = conns.choose(&mut rand::thread_rng())?;
+            (!skip_list.has_element(conn.location.peer.clone())).then_some(conn.location.clone())
+        });
 
-        // Also consider self if we have a location and aren't in skip list
-        if let Some(own_peer) = self.connection_manager.get_peer_key() {
+        // Chain with self if we have a location and aren't in skip list
+        let candidates = if let Some(own_peer) = self.connection_manager.get_peer_key() {
             if !skip_list.has_element(own_peer) {
                 let own_pkloc = self.connection_manager.own_location();
                 if own_pkloc.location.is_some() {
-                    candidates.push(own_pkloc);
+                    // Chain peer candidates with self location
+                    peer_candidates
+                        .chain(std::iter::once(own_pkloc))
+                        .collect::<Vec<_>>()
+                } else {
+                    peer_candidates.collect()
                 }
+            } else {
+                peer_candidates.collect()
             }
-        }
+        } else {
+            peer_candidates.collect()
+        };
 
         router
             .select_k_best_peers(candidates.iter(), target_location, k)
