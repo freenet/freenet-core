@@ -927,9 +927,9 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
 
                 // Mark operation as successful
                 put_op.state = Some(PutState::Finished { key });
-                return Ok(());
+                Ok(())
             } else {
-                return Err(OpError::UnexpectedOpState);
+                Err(OpError::UnexpectedOpState)
             }
         }
         Some(CachingTarget::Remote(target)) => {
