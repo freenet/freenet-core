@@ -66,32 +66,56 @@ pub(crate) async fn request_subscribe(
     op_manager: &OpManager,
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
-    let (target, _id) = if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        if !super::has_contract(op_manager, *key).await? {
-            tracing::debug!(%key, "Contract not found, trying other peer");
-            return Err(OpError::ContractError(ContractError::ContractNotFound(
-                *key,
-            )));
-        }
+    let (should_handle_locally, target, _id) = if let Some(SubscribeState::PrepareRequest {
+        id,
+        key,
+    }) = &sub_op.state
+    {
         const EMPTY: &[PeerId] = &[];
         let caching_target = op_manager.ring.closest_caching_target(key, EMPTY);
+
         match caching_target {
-            Some(CachingTarget::Remote(peer)) => (peer, *id),
+            Some(CachingTarget::Remote(peer)) => {
+                // Remote peer is the best location
+                if !super::has_contract(op_manager, *key).await? {
+                    tracing::debug!(%key, "Contract not found locally, will forward to peer");
+                }
+                (false, peer, *id)
+            }
             Some(CachingTarget::Local) | None => {
-                // If we're the best location or no peers available, handle locally
-                tracing::debug!(%key, "Node is best location for subscription, handling locally");
-                // We can't send messages to ourselves, so complete the operation directly
-                let op = SubscribeOp {
-                    id: *id,
-                    state: Some(SubscribeState::Completed { key: *key }),
-                };
-                op_manager.push(*id, OpEnum::Subscribe(op)).await?;
-                return Ok(());
+                // We are the best location or no peers available
+                if !super::has_contract(op_manager, *key).await? {
+                    tracing::debug!(%key, "Contract not found locally and we're the best location");
+                    return Err(OpError::ContractError(ContractError::ContractNotFound(
+                        *key,
+                    )));
+                }
+                // We have the contract and we're the best location, handle locally
+                tracing::debug!(%key, "Node is best location and has contract, handling subscription locally");
+                (true, op_manager.ring.connection_manager.own_location(), *id)
             }
         }
     } else {
         return Err(OpError::UnexpectedOpState);
     };
+
+    if should_handle_locally {
+        // Handle the subscription locally without network messages
+        // Get the key from the state
+        let contract_key = if let Some(SubscribeState::PrepareRequest { key, .. }) = sub_op.state {
+            key
+        } else {
+            return Err(OpError::UnexpectedOpState);
+        };
+
+        // Mark the subscription as completed
+        let op = SubscribeOp {
+            id: _id,
+            state: Some(SubscribeState::Completed { key: contract_key }),
+        };
+        op_manager.push(_id, OpEnum::Subscribe(op)).await?;
+        return Ok(());
+    }
 
     match sub_op.state {
         Some(SubscribeState::PrepareRequest { id, key, .. }) => {
