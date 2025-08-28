@@ -247,6 +247,18 @@ impl Ring {
     }
 
     /// Return the most optimal peer caching a given contract.
+    ///
+    /// This function considers both connected peers and the node itself as potential
+    /// caching locations. The node itself is included to ensure that contracts can be
+    /// stored locally when the node is at the optimal location, particularly important
+    /// for gateways which may be the best location for certain contracts.
+    ///
+    /// Historical context: Previously, only connected peers were considered, which caused
+    /// issues where gateways couldn't store contracts even when they were the optimal
+    /// location. This led to "Contract not found" errors in production.
+    ///
+    /// The current approach ensures contracts are stored at the most optimal location
+    /// in the network, whether that's a connected peer or the node itself.
     #[inline]
     pub fn closest_potentially_caching(
         &self,
