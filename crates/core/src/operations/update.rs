@@ -665,13 +665,13 @@ pub(crate) async fn request_update(
                     "UPDATE: We are the closest node for contract {}, handling locally",
                     key
                 );
-                
+
                 // Subscribe ourselves
                 op_manager
                     .ring
                     .add_subscriber(key, sender)
                     .map_err(|_| RingError::NoCachingPeers(*key))?;
-                
+
                 op_manager.ring.connection_manager.own_location()
             }
             None => {
@@ -682,21 +682,21 @@ pub(crate) async fn request_update(
                     // We have connections but no suitable peer for this contract
                     return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
                 } else {
-                // We truly have no peers, handle locally
-                tracing::debug!(
-                    "UPDATE: No peer connections available, handling contract {} locally",
-                    key
-                );
+                    // We truly have no peers, handle locally
+                    tracing::debug!(
+                        "UPDATE: No peer connections available, handling contract {} locally",
+                        key
+                    );
 
-                // If no other peers, we should be subscribed and handle locally
-                op_manager
-                    .ring
-                    .add_subscriber(key, sender.clone())
-                    .map_err(|_| RingError::NoCachingPeers(*key))?;
+                    // If no other peers, we should be subscribed and handle locally
+                    op_manager
+                        .ring
+                        .add_subscriber(key, sender.clone())
+                        .map_err(|_| RingError::NoCachingPeers(*key))?;
 
-                // Target ourselves
-                sender.clone()
-            }
+                    // Target ourselves
+                    sender.clone()
+                }
             }
         }
     };
