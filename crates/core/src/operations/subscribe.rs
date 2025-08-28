@@ -66,56 +66,32 @@ pub(crate) async fn request_subscribe(
     op_manager: &OpManager,
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
-    let (should_handle_locally, target, _id) = if let Some(SubscribeState::PrepareRequest {
-        id,
-        key,
-    }) = &sub_op.state
-    {
-        const EMPTY: &[PeerId] = &[];
-        let caching_target = op_manager.ring.closest_caching_target(key, EMPTY);
-
-        match caching_target {
-            Some(CachingTarget::Remote(peer)) => {
-                // Remote peer is the best location
-                if !super::has_contract(op_manager, *key).await? {
-                    tracing::debug!(%key, "Contract not found locally, will forward to peer");
-                }
-                (false, peer, *id)
-            }
-            Some(CachingTarget::Local) | None => {
-                // We are the best location or no peers available
-                if !super::has_contract(op_manager, *key).await? {
-                    tracing::debug!(%key, "Contract not found locally and we're the best location");
-                    return Err(OpError::ContractError(ContractError::ContractNotFound(
-                        *key,
-                    )));
-                }
-                // We have the contract and we're the best location, handle locally
-                tracing::debug!(%key, "Node is best location and has contract, handling subscription locally");
-                (true, op_manager.ring.connection_manager.own_location(), *id)
-            }
+    let (target, _id) = if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
+        if !super::has_contract(op_manager, *key).await? {
+            tracing::debug!(%key, "Contract not found, trying other peer");
+            return Err(OpError::ContractError(ContractError::ContractNotFound(
+                *key,
+            )));
         }
+        const EMPTY: &[PeerId] = &[];
+        // TODO: Subscriptions currently don't support local handling properly.
+        // The subscription protocol expects message flow for client notification,
+        // so we use closest_potentially_caching which returns None for local targets.
+        // This means subscriptions won't work when the node is the best location.
+        // This should be fixed to properly handle local subscriptions in the future.
+        let target = match op_manager.ring.closest_potentially_caching(key, EMPTY) {
+            Some(peer) => peer,
+            None => {
+                // No remote peers available - we're either alone or the best location
+                // Subscriptions currently require remote peers for the message protocol
+                tracing::warn!(%key, "Cannot subscribe locally - subscription protocol requires remote peer");
+                return Err(RingError::NoCachingPeers(*key).into());
+            }
+        };
+        (target, *id)
     } else {
         return Err(OpError::UnexpectedOpState);
     };
-
-    if should_handle_locally {
-        // Handle the subscription locally without network messages
-        // Get the key from the state
-        let contract_key = if let Some(SubscribeState::PrepareRequest { key, .. }) = sub_op.state {
-            key
-        } else {
-            return Err(OpError::UnexpectedOpState);
-        };
-
-        // Mark the subscription as completed
-        let op = SubscribeOp {
-            id: _id,
-            state: Some(SubscribeState::Completed { key: contract_key }),
-        };
-        op_manager.push(_id, OpEnum::Subscribe(op)).await?;
-        return Ok(());
-    }
 
     match sub_op.state {
         Some(SubscribeState::PrepareRequest { id, key, .. }) => {
