@@ -611,29 +611,44 @@ pub(crate) async fn request_update(
             .pop()
             .ok_or(OpError::RingError(RingError::NoLocation))?
     } else {
-        // Check if we have any other peers that can cache contracts
-        let closest = op_manager
+        // Determine where this contract should be cached
+        let caching_target = op_manager
             .ring
-            .closest_potentially_caching(key, [sender.peer.clone()].as_slice())
-            .into_iter()
-            .next();
+            .closest_caching_target(key, [sender.peer.clone()].as_slice());
 
-        if let Some(target) = closest {
-            // Subscribe to the contract
-            op_manager
-                .ring
-                .add_subscriber(key, sender)
-                .map_err(|_| RingError::NoCachingPeers(*key))?;
+        match caching_target {
+            Some(CachingTarget::Remote(target)) => {
+                // Subscribe to the contract
+                op_manager
+                    .ring
+                    .add_subscriber(key, sender)
+                    .map_err(|_| RingError::NoCachingPeers(*key))?;
 
-            target
-        } else {
-            // Check if we actually have any connected peers at all
-            let has_connections = op_manager.ring.connection_manager.num_connections() > 0;
+                target
+            }
+            Some(CachingTarget::Local) => {
+                // We are the best location - handle locally
+                tracing::debug!(
+                    "UPDATE: We are the closest node for contract {}, handling locally",
+                    key
+                );
+                
+                // Subscribe ourselves
+                op_manager
+                    .ring
+                    .add_subscriber(key, sender)
+                    .map_err(|_| RingError::NoCachingPeers(*key))?;
+                
+                op_manager.ring.connection_manager.own_location()
+            }
+            None => {
+                // Check if we actually have any connected peers at all
+                let has_connections = op_manager.ring.connection_manager.num_connections() > 0;
 
-            if has_connections {
-                // We have connections but no suitable peer for this contract
-                return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
-            } else {
+                if has_connections {
+                    // We have connections but no suitable peer for this contract
+                    return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
+                } else {
                 // We truly have no peers, handle locally
                 tracing::debug!(
                     "UPDATE: No peer connections available, handling contract {} locally",
@@ -648,6 +663,7 @@ pub(crate) async fn request_update(
 
                 // Target ourselves
                 sender.clone()
+            }
             }
         }
     };
@@ -705,7 +721,7 @@ mod messages {
 
     use crate::{
         message::{InnerMessage, Transaction},
-        ring::{Location, PeerKeyLocation},
+        ring::{CachingTarget, Location, PeerKeyLocation},
     };
 
     #[derive(Debug, Serialize, Deserialize, Clone)]

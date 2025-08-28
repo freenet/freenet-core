@@ -19,7 +19,7 @@ use crate::{
     contract::{ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, NetMessage, NetMessageV1, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
-    ring::{Location, PeerKeyLocation},
+    ring::{CachingTarget, Location, PeerKeyLocation},
 };
 
 pub(crate) struct PutOp {
@@ -846,16 +846,14 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
 
     let sender = op_manager.ring.connection_manager.own_location();
 
-    // Check if we have any other peers that can cache contracts
-    // If not, we should handle the PUT locally without the SeekNode dance
-    let target = op_manager
+    // Determine where to cache this contract
+    let caching_target = op_manager
         .ring
-        .closest_potentially_caching(&key, [&sender.peer].as_slice())
-        .into_iter()
-        .next();
+        .closest_caching_target(&key, [&sender.peer].as_slice());
 
-    // If no suitable target found, handle locally
-    if target.is_none() {
+    // Handle based on whether we should cache locally or remotely
+    match caching_target {
+        Some(CachingTarget::Local) | None => {
         tracing::debug!(
             "PUT: No other peers available to cache contract {}, handling locally",
             key
@@ -934,10 +932,8 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
             return Err(OpError::UnexpectedOpState);
         }
     }
-
-    let target = target.unwrap();
-
-    tracing::debug!("PUT: Selected target {} for contract {}", target.peer, key);
+    Some(CachingTarget::Remote(target)) => {
+        tracing::debug!("PUT: Selected target {} for contract {}", target.peer, key);
 
     let id = put_op.id;
     if let Some(stats) = &mut put_op.stats {
@@ -982,6 +978,8 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
     }
 
     Ok(())
+    }
+    }
 }
 
 async fn put_contract(
@@ -1035,9 +1033,9 @@ where
 {
     let key = contract.key();
     let contract_loc = Location::from(&key);
-    let forward_to = op_manager
+    let caching_target = op_manager
         .ring
-        .closest_potentially_caching(&key, &skip_list);
+        .closest_caching_target(&key, &skip_list);
     let own_pkloc = op_manager.ring.connection_manager.own_location();
     let own_loc = own_pkloc.location.expect("infallible");
 
@@ -1050,7 +1048,8 @@ where
         "Evaluating PUT forwarding decision"
     );
 
-    if let Some(peer) = forward_to {
+    match caching_target {
+        Some(CachingTarget::Remote(peer)) => {
         let other_loc = peer.location.as_ref().expect("infallible");
         let other_distance = contract_loc.distance(other_loc);
         let self_distance = contract_loc.distance(own_loc);
@@ -1102,14 +1101,17 @@ where
                 "Not forwarding - this peer is closest"
             );
         }
-    } else {
+        true
+    }
+    Some(CachingTarget::Local) | None => {
         tracing::debug!(
             tx = %id,
             %key,
-            "No forward target found - this peer will store"
+            "Caching locally - this peer is the best location"
         );
+        true
     }
-    true
+    }
 }
 
 mod messages {
