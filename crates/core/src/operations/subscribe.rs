@@ -74,15 +74,21 @@ pub(crate) async fn request_subscribe(
             )));
         }
         const EMPTY: &[PeerId] = &[];
-        let target = match op_manager.ring.closest_caching_target(key, EMPTY) {
-            Some(CachingTarget::Remote(peer)) => peer,
-            Some(CachingTarget::Local) => {
-                // If we're the best location, use our own location
-                op_manager.ring.connection_manager.own_location()
+        let caching_target = op_manager.ring.closest_caching_target(key, EMPTY);
+        match caching_target {
+            Some(CachingTarget::Remote(peer)) => (peer, *id),
+            Some(CachingTarget::Local) | None => {
+                // If we're the best location or no peers available, handle locally
+                tracing::debug!(%key, "Node is best location for subscription, handling locally");
+                // We can't send messages to ourselves, so complete the operation directly
+                let op = SubscribeOp {
+                    id: *id,
+                    state: Some(SubscribeState::Completed { key: *key }),
+                };
+                op_manager.push(*id, OpEnum::Subscribe(op)).await?;
+                return Ok(());
             }
-            None => return Err(RingError::NoCachingPeers(*key).into()),
-        };
-        (target, *id)
+        }
     } else {
         return Err(OpError::UnexpectedOpState);
     };
