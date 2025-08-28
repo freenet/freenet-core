@@ -62,6 +62,7 @@ pub use self::live_tx::LiveTransactionTracker;
 pub use connection::Connection;
 pub use location::{Distance, Location};
 pub use peer_key_location::PeerKeyLocation;
+pub use CachingTarget;
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
@@ -310,8 +311,8 @@ impl Ring {
             best_peer.map(CachingTarget::Remote)
         }
     }
-    
-    /// Legacy method that returns a PeerKeyLocation. 
+
+    /// Legacy method that returns a PeerKeyLocation.
     /// Returns None if the target is Local, or the peer if Remote.
     #[inline]
     pub fn closest_potentially_caching(

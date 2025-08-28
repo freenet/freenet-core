@@ -854,131 +854,131 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
     // Handle based on whether we should cache locally or remotely
     match caching_target {
         Some(CachingTarget::Local) | None => {
-        tracing::debug!(
-            "PUT: No other peers available to cache contract {}, handling locally",
-            key
-        );
-
-        // Store the contract locally
-        if let Some(PutState::PrepareRequest {
-            contract,
-            value,
-            related_contracts,
-            ..
-        }) = &put_op.state
-        {
-            // Check if contract already exists locally
-            let get_result = op_manager
-                .notify_contract_handler(ContractHandlerEvent::GetQuery {
-                    key,
-                    return_contract_code: false,
-                })
-                .await;
-
-            let contract_exists = matches!(
-                get_result,
-                Ok(ContractHandlerEvent::GetResponse {
-                    response: Ok(StoreResponse { state: Some(_), .. }),
-                    ..
-                })
+            tracing::debug!(
+                "PUT: No other peers available to cache contract {}, handling locally",
+                key
             );
 
-            if contract_exists {
-                // Contract already exists, update it
-                tracing::debug!("Contract {} already exists locally, updating", key);
-                match op_manager
-                    .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
+            // Store the contract locally
+            if let Some(PutState::PrepareRequest {
+                contract,
+                value,
+                related_contracts,
+                ..
+            }) = &put_op.state
+            {
+                // Check if contract already exists locally
+                let get_result = op_manager
+                    .notify_contract_handler(ContractHandlerEvent::GetQuery {
                         key,
-                        data: UpdateData::State(value.clone().into()),
-                        related_contracts: related_contracts.clone(),
+                        return_contract_code: false,
                     })
-                    .await
-                {
-                    Ok(ContractHandlerEvent::UpdateResponse {
-                        new_value: Ok(_), ..
-                    }) => {
-                        tracing::debug!("Successfully updated existing contract {}", key);
-                    }
-                    Ok(ContractHandlerEvent::UpdateResponse {
-                        new_value: Err(err),
+                    .await;
+
+                let contract_exists = matches!(
+                    get_result,
+                    Ok(ContractHandlerEvent::GetResponse {
+                        response: Ok(StoreResponse { state: Some(_), .. }),
                         ..
-                    }) => {
-                        tracing::error!("Failed to update existing contract {}: {}", key, err);
-                        return Err(OpError::from(err));
+                    })
+                );
+
+                if contract_exists {
+                    // Contract already exists, update it
+                    tracing::debug!("Contract {} already exists locally, updating", key);
+                    match op_manager
+                        .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
+                            key,
+                            data: UpdateData::State(value.clone().into()),
+                            related_contracts: related_contracts.clone(),
+                        })
+                        .await
+                    {
+                        Ok(ContractHandlerEvent::UpdateResponse {
+                            new_value: Ok(_), ..
+                        }) => {
+                            tracing::debug!("Successfully updated existing contract {}", key);
+                        }
+                        Ok(ContractHandlerEvent::UpdateResponse {
+                            new_value: Err(err),
+                            ..
+                        }) => {
+                            tracing::error!("Failed to update existing contract {}: {}", key, err);
+                            return Err(OpError::from(err));
+                        }
+                        Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
+                            tracing::debug!("No change needed for contract {}", key);
+                        }
+                        Err(err) => return Err(err.into()),
+                        Ok(_) => return Err(OpError::UnexpectedOpState),
                     }
-                    Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
-                        tracing::debug!("No change needed for contract {}", key);
-                    }
-                    Err(err) => return Err(err.into()),
-                    Ok(_) => return Err(OpError::UnexpectedOpState),
+                } else {
+                    // New contract, use PutQuery which will handle it properly
+                    tracing::debug!("Contract {} is new, storing locally", key);
+                    put_contract(
+                        op_manager,
+                        key,
+                        value.clone(),
+                        related_contracts.clone(),
+                        contract,
+                    )
+                    .await?;
                 }
+
+                // Mark operation as successful
+                put_op.state = Some(PutState::Finished { key });
+                return Ok(());
             } else {
-                // New contract, use PutQuery which will handle it properly
-                tracing::debug!("Contract {} is new, storing locally", key);
-                put_contract(
-                    op_manager,
-                    key,
-                    value.clone(),
-                    related_contracts.clone(),
-                    contract,
-                )
-                .await?;
+                return Err(OpError::UnexpectedOpState);
+            }
+        }
+        Some(CachingTarget::Remote(target)) => {
+            tracing::debug!("PUT: Selected target {} for contract {}", target.peer, key);
+
+            let id = put_op.id;
+            if let Some(stats) = &mut put_op.stats {
+                stats.target = Some(target.clone());
             }
 
-            // Mark operation as successful
-            put_op.state = Some(PutState::Finished { key });
-            return Ok(());
-        } else {
-            return Err(OpError::UnexpectedOpState);
+            match put_op.state {
+                Some(PutState::PrepareRequest {
+                    contract,
+                    related_contracts,
+                    value,
+                    htl,
+                    subscribe,
+                }) => {
+                    let new_state = Some(PutState::AwaitingResponse {
+                        key,
+                        upstream: None,
+                        contract: contract.clone(),
+                        state: value.clone(),
+                        subscribe,
+                    });
+                    let msg = PutMsg::RequestPut {
+                        id,
+                        contract,
+                        related_contracts,
+                        value,
+                        htl,
+                        target: target.clone(),
+                    };
+
+                    let op = PutOp {
+                        id,
+                        state: new_state,
+                        stats: put_op.stats,
+                    };
+
+                    op_manager
+                        .notify_op_change(NetMessage::from(msg), OpEnum::Put(op))
+                        .await?;
+                }
+                _ => return Err(OpError::invalid_transition(put_op.id)),
+            }
+
+            Ok(())
         }
-    }
-    Some(CachingTarget::Remote(target)) => {
-        tracing::debug!("PUT: Selected target {} for contract {}", target.peer, key);
-
-    let id = put_op.id;
-    if let Some(stats) = &mut put_op.stats {
-        stats.target = Some(target.clone());
-    }
-
-    match put_op.state {
-        Some(PutState::PrepareRequest {
-            contract,
-            related_contracts,
-            value,
-            htl,
-            subscribe,
-        }) => {
-            let new_state = Some(PutState::AwaitingResponse {
-                key,
-                upstream: None,
-                contract: contract.clone(),
-                state: value.clone(),
-                subscribe,
-            });
-            let msg = PutMsg::RequestPut {
-                id,
-                contract,
-                related_contracts,
-                value,
-                htl,
-                target: target.clone(),
-            };
-
-            let op = PutOp {
-                id,
-                state: new_state,
-                stats: put_op.stats,
-            };
-
-            op_manager
-                .notify_op_change(NetMessage::from(msg), OpEnum::Put(op))
-                .await?;
-        }
-        _ => return Err(OpError::invalid_transition(put_op.id)),
-    }
-
-    Ok(())
-    }
     }
 }
 
@@ -1033,9 +1033,7 @@ where
 {
     let key = contract.key();
     let contract_loc = Location::from(&key);
-    let caching_target = op_manager
-        .ring
-        .closest_caching_target(&key, &skip_list);
+    let caching_target = op_manager.ring.closest_caching_target(&key, &skip_list);
     let own_pkloc = op_manager.ring.connection_manager.own_location();
     let own_loc = own_pkloc.location.expect("infallible");
 
@@ -1050,67 +1048,67 @@ where
 
     match caching_target {
         Some(CachingTarget::Remote(peer)) => {
-        let other_loc = peer.location.as_ref().expect("infallible");
-        let other_distance = contract_loc.distance(other_loc);
-        let self_distance = contract_loc.distance(own_loc);
+            let other_loc = peer.location.as_ref().expect("infallible");
+            let other_distance = contract_loc.distance(other_loc);
+            let self_distance = contract_loc.distance(own_loc);
 
-        tracing::debug!(
-            tx = %id,
-            %key,
-            target_peer = %peer.peer,
-            target_location = %other_loc.0,
-            target_distance = ?other_distance,
-            self_distance = ?self_distance,
-            "Found potential forward target"
-        );
-
-        if other_distance < self_distance {
-            // forward the contract towards this node since it is indeed closer to the contract location
-            // and forget about it, no need to keep track of this op or wait for response
-            tracing::info!(
-                tx = %id,
-                %key,
-                from_peer = %own_pkloc.peer,
-                to_peer = %peer.peer,
-                contract_location = %contract_loc.0,
-                from_location = %own_loc.0,
-                to_location = %other_loc.0,
-                "Forwarding PUT to closer peer"
-            );
-
-            let _ = conn_manager
-                .send(
-                    &peer.peer,
-                    (PutMsg::PutForward {
-                        id,
-                        sender: own_pkloc,
-                        target: peer.clone(),
-                        contract: contract.clone(),
-                        new_value: new_value.clone(),
-                        htl,
-                        skip_list,
-                    })
-                    .into(),
-                )
-                .await;
-            return false;
-        } else {
             tracing::debug!(
                 tx = %id,
                 %key,
-                "Not forwarding - this peer is closest"
+                target_peer = %peer.peer,
+                target_location = %other_loc.0,
+                target_distance = ?other_distance,
+                self_distance = ?self_distance,
+                "Found potential forward target"
             );
+
+            if other_distance < self_distance {
+                // forward the contract towards this node since it is indeed closer to the contract location
+                // and forget about it, no need to keep track of this op or wait for response
+                tracing::info!(
+                    tx = %id,
+                    %key,
+                    from_peer = %own_pkloc.peer,
+                    to_peer = %peer.peer,
+                    contract_location = %contract_loc.0,
+                    from_location = %own_loc.0,
+                    to_location = %other_loc.0,
+                    "Forwarding PUT to closer peer"
+                );
+
+                let _ = conn_manager
+                    .send(
+                        &peer.peer,
+                        (PutMsg::PutForward {
+                            id,
+                            sender: own_pkloc,
+                            target: peer.clone(),
+                            contract: contract.clone(),
+                            new_value: new_value.clone(),
+                            htl,
+                            skip_list,
+                        })
+                        .into(),
+                    )
+                    .await;
+                return false;
+            } else {
+                tracing::debug!(
+                    tx = %id,
+                    %key,
+                    "Not forwarding - this peer is closest"
+                );
+            }
+            true
         }
-        true
-    }
-    Some(CachingTarget::Local) | None => {
-        tracing::debug!(
-            tx = %id,
-            %key,
-            "Caching locally - this peer is the best location"
-        );
-        true
-    }
+        Some(CachingTarget::Local) | None => {
+            tracing::debug!(
+                tx = %id,
+                %key,
+                "Caching locally - this peer is the best location"
+            );
+            true
+        }
     }
 }
 

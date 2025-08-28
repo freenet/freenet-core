@@ -240,9 +240,8 @@ impl Operation for SubscribeOp {
                     if !super::has_contract(op_manager, *key).await? {
                         tracing::debug!(tx = %id, %key, "Contract not found, trying other peer");
 
-                        let caching_target =
-                            op_manager.ring.closest_caching_target(key, skip_list);
-                        
+                        let caching_target = op_manager.ring.closest_caching_target(key, skip_list);
+
                         // Can only forward to remote peers, not to ourselves
                         let Some(CachingTarget::Remote(new_target)) = caching_target else {
                             tracing::warn!(tx = %id, %key, "No remote peer available for forwarding");
@@ -334,9 +333,8 @@ impl Operation for SubscribeOp {
                         }) => {
                             if retries < MAX_RETRIES {
                                 skip_list.insert(sender.peer.clone());
-                                if let Some(CachingTarget::Remote(target)) = op_manager
-                                    .ring
-                                    .closest_caching_target(key, &skip_list)
+                                if let Some(CachingTarget::Remote(target)) =
+                                    op_manager.ring.closest_caching_target(key, &skip_list)
                                 {
                                     let subscriber =
                                         op_manager.ring.connection_manager.own_location();
