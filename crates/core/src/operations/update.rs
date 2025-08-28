@@ -7,7 +7,7 @@ use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationRe
 use crate::contract::ContractHandlerEvent;
 use crate::message::{InnerMessage, NetMessage, Transaction};
 use crate::node::IsOperationCompleted;
-use crate::ring::{Location, PeerKeyLocation, RingError};
+use crate::ring::{CachingTarget, Location, PeerKeyLocation, RingError};
 use crate::{
     client_events::HostResult,
     node::{NetworkBridge, OpManager, PeerId},
@@ -754,7 +754,7 @@ mod messages {
 
     use crate::{
         message::{InnerMessage, Transaction},
-        ring::{CachingTarget, Location, PeerKeyLocation},
+        ring::{Location, PeerKeyLocation},
     };
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
