@@ -314,6 +314,7 @@ impl Ring {
     /// Legacy method that returns a PeerKeyLocation.
     /// Returns None if the target is Local, or the peer if Remote.
     #[inline]
+    #[allow(dead_code)]
     pub fn closest_potentially_caching(
         &self,
         contract_key: &ContractKey,
