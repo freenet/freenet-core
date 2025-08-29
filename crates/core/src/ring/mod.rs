@@ -28,6 +28,15 @@ use crate::message::TransactionType;
 use crate::topology::rate::Rate;
 use crate::topology::TopologyAdjustment;
 use crate::tracing::{NetEventLog, NetEventRegister};
+
+/// Represents where a contract should be cached
+#[derive(Debug, Clone)]
+pub enum CachingTarget {
+    /// Store the contract locally on this node
+    Local,
+    /// Forward the contract to a remote peer
+    Remote(PeerKeyLocation),
+}
 use crate::transport::TransportPublicKey;
 use crate::util::Contains;
 use crate::{
@@ -246,17 +255,75 @@ impl Ring {
         filtered.into_iter()
     }
 
-    /// Return the most optimal peer caching a given contract.
+    /// Return the most optimal location for caching a given contract.
+    ///
+    /// This function considers both connected peers and the node itself as potential
+    /// caching locations. Returns `CachingTarget::Local` when this node should store
+    /// the contract locally, or `CachingTarget::Remote` with a peer location when
+    /// the contract should be forwarded.
+    ///
+    /// Returns `None` if no suitable caching location can be found.
     #[inline]
+    pub fn closest_caching_target(
+        &self,
+        contract_key: &ContractKey,
+        skip_list: impl Contains<PeerId>,
+    ) -> Option<CachingTarget> {
+        let router = self.router.read();
+        let target_location = Location::from(contract_key);
+
+        // Check if self should be considered
+        let own_peer = self.connection_manager.get_peer_key();
+        let consider_self = own_peer
+            .as_ref()
+            .is_some_and(|p| !skip_list.has_element(p.clone()));
+
+        // Get best connected peer
+        let best_peer = self
+            .connection_manager
+            .routing(target_location, None, skip_list, &router);
+
+        // Determine if we should cache locally or remotely
+        if consider_self {
+            let own_pkloc = self.connection_manager.own_location();
+            if let Some(own_location) = own_pkloc.location {
+                match best_peer {
+                    Some(peer) if peer.location.is_some() => {
+                        let peer_loc = peer.location.unwrap();
+                        // Compare distances to determine best location
+                        if own_location.distance(target_location)
+                            < peer_loc.distance(target_location)
+                        {
+                            Some(CachingTarget::Local)
+                        } else {
+                            Some(CachingTarget::Remote(peer))
+                        }
+                    }
+                    _ => Some(CachingTarget::Local), // No peer with location, cache locally
+                }
+            } else {
+                // Self has no location, use peer if available
+                best_peer.map(CachingTarget::Remote)
+            }
+        } else {
+            // Self is in skip list or no own peer, use best peer
+            best_peer.map(CachingTarget::Remote)
+        }
+    }
+
+    /// Legacy method that returns a PeerKeyLocation.
+    /// Returns None if the target is Local, or the peer if Remote.
+    #[inline]
+    #[allow(dead_code)]
     pub fn closest_potentially_caching(
         &self,
         contract_key: &ContractKey,
         skip_list: impl Contains<PeerId>,
     ) -> Option<PeerKeyLocation> {
-        let router = self.router.read();
-
-        self.connection_manager
-            .routing(Location::from(contract_key), None, skip_list, &router)
+        match self.closest_caching_target(contract_key, skip_list)? {
+            CachingTarget::Local => None,
+            CachingTarget::Remote(peer) => Some(peer),
+        }
     }
 
     /// Get k best peers for caching a contract, ranked by routing predictions
@@ -271,14 +338,33 @@ impl Ring {
 
         // Get all connected peers through the connection manager
         let connections = self.connection_manager.get_connections_by_location();
-        let peers = connections.values().filter_map(|conns| {
+        let peer_candidates = connections.values().filter_map(|conns| {
             use rand::seq::SliceRandom;
             let conn = conns.choose(&mut rand::thread_rng())?;
-            (!skip_list.has_element(conn.location.peer.clone())).then_some(&conn.location)
+            (!skip_list.has_element(conn.location.peer.clone())).then_some(conn.location.clone())
         });
 
+        // Chain with self if we have a location and aren't in skip list
+        let candidates = if let Some(own_peer) = self.connection_manager.get_peer_key() {
+            if !skip_list.has_element(own_peer) {
+                let own_pkloc = self.connection_manager.own_location();
+                if own_pkloc.location.is_some() {
+                    // Chain peer candidates with self location
+                    peer_candidates
+                        .chain(std::iter::once(own_pkloc))
+                        .collect::<Vec<_>>()
+                } else {
+                    peer_candidates.collect()
+                }
+            } else {
+                peer_candidates.collect()
+            }
+        } else {
+            peer_candidates.collect()
+        };
+
         router
-            .select_k_best_peers(peers, target_location, k)
+            .select_k_best_peers(candidates.iter(), target_location, k)
             .into_iter()
             .cloned()
             .collect()

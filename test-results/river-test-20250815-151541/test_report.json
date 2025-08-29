@@ -1,0 +1,24 @@
+{
+  "issues_detected": {
+    "error_count": 0,
+    "issues": [],
+    "warning_count": 0
+  },
+  "log_files": {
+    "unified_timeline": "./test-results/river-test-20250815-151541/unified_timeline.log"
+  },
+  "test_results": {
+    "errors": [
+      "Room creation: No such file or directory (os error 2)"
+    ],
+    "success": false,
+    "timings": {
+      "gateway_startup_ms": 0,
+      "message_send_ms": null,
+      "peer_connection_ms": 15000,
+      "room_creation_ms": null,
+      "total_ms": 17967
+    },
+    "warnings": []
+  }
+}

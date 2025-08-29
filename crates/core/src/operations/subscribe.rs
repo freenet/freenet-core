@@ -7,10 +7,9 @@ use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationRe
 use crate::node::IsOperationCompleted;
 use crate::{
     client_events::HostResult,
-    contract::ContractError,
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
-    ring::{Location, PeerKeyLocation, RingError},
+    ring::{CachingTarget, Location, PeerKeyLocation, RingError},
 };
 use freenet_stdlib::{
     client_api::{ContractResponse, ErrorKind, HostResponse},
@@ -66,45 +65,60 @@ pub(crate) async fn request_subscribe(
     op_manager: &OpManager,
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
-    let (target, _id) = if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        if !super::has_contract(op_manager, *key).await? {
-            tracing::debug!(%key, "Contract not found, trying other peer");
-            return Err(OpError::ContractError(ContractError::ContractNotFound(
-                *key,
-            )));
-        }
-        const EMPTY: &[PeerId] = &[];
-        (
+    if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
+        // First check if we have the contract locally
+        if super::has_contract(op_manager, *key).await? {
+            // We have the contract locally - handle subscription immediately
+            tracing::debug!(%key, "Contract found locally, handling subscription directly");
+
+            // Note: For local subscriptions, we don't add ourselves to the ring subscribers
+            // as that's for tracking remote subscribers who need updates.
+            // The local client gets updates through the contract handler directly.
+
+            // Mark the operation as completed
+            let completed_op = SubscribeOp {
+                id: *id,
+                state: Some(SubscribeState::Completed { key: *key }),
+            };
+
+            // Push the completed operation which will trigger client notification
             op_manager
-                .ring
-                .closest_potentially_caching(key, EMPTY)
-                .into_iter()
-                .next()
-                .ok_or_else(|| RingError::NoCachingPeers(*key))?,
-            *id,
-        )
+                .push(*id, OpEnum::Subscribe(completed_op))
+                .await?;
+            return Ok(());
+        }
+
+        // Contract not local, try to find a remote peer
+        const EMPTY: &[PeerId] = &[];
+        let target = match op_manager.ring.closest_potentially_caching(key, EMPTY) {
+            Some(peer) => peer,
+            None => {
+                tracing::debug!(%key, "No peers available for subscription");
+                return Err(RingError::NoCachingPeers(*key).into());
+            }
+        };
+
+        // Forward to remote peer
+        let new_state = Some(SubscribeState::AwaitingResponse {
+            skip_list: vec![].into_iter().collect(),
+            retries: 0,
+            current_hop: op_manager.ring.max_hops_to_live,
+            upstream_subscriber: None,
+        });
+        let msg = SubscribeMsg::RequestSub {
+            id: *id,
+            key: *key,
+            target,
+        };
+        let op = SubscribeOp {
+            id: *id,
+            state: new_state,
+        };
+        op_manager
+            .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op))
+            .await?;
     } else {
         return Err(OpError::UnexpectedOpState);
-    };
-
-    match sub_op.state {
-        Some(SubscribeState::PrepareRequest { id, key, .. }) => {
-            let new_state = Some(SubscribeState::AwaitingResponse {
-                skip_list: vec![].into_iter().collect(),
-                retries: 0,
-                current_hop: op_manager.ring.max_hops_to_live,
-                upstream_subscriber: None,
-            });
-            let msg = SubscribeMsg::RequestSub { id, key, target };
-            let op = SubscribeOp {
-                id,
-                state: new_state,
-            };
-            op_manager
-                .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op))
-                .await?;
-        }
-        _ => return Err(OpError::invalid_transition(sub_op.id)),
     }
 
     Ok(())
@@ -240,10 +254,11 @@ impl Operation for SubscribeOp {
                     if !super::has_contract(op_manager, *key).await? {
                         tracing::debug!(tx = %id, %key, "Contract not found, trying other peer");
 
-                        let Some(new_target) =
-                            op_manager.ring.closest_potentially_caching(key, skip_list)
-                        else {
-                            tracing::warn!(tx = %id, %key, "No target peer found while trying getting contract");
+                        let caching_target = op_manager.ring.closest_caching_target(key, skip_list);
+
+                        // Can only forward to remote peers, not to ourselves
+                        let Some(CachingTarget::Remote(new_target)) = caching_target else {
+                            tracing::warn!(tx = %id, %key, "No remote peer available for forwarding");
                             return Ok(return_not_subbed());
                         };
                         let new_htl = htl - 1;
@@ -279,15 +294,32 @@ impl Operation for SubscribeOp {
                         );
                     }
 
+                    // SUBSCRIPTION_DIAG: Log subscription attempt
+                    tracing::info!(
+                        "SUBSCRIPTION_DIAG: Attempting to add subscriber {} to contract {}",
+                        subscriber.peer,
+                        key.id()
+                    );
+
                     if op_manager
                         .ring
                         .add_subscriber(key, subscriber.clone())
                         .is_err()
                     {
                         tracing::debug!(tx = %id, %key, "Max number of subscribers reached for contract");
+                        tracing::info!(
+                            "SUBSCRIPTION_DIAG: FAILED to add subscriber {} to contract {} - max subscribers reached",
+                            subscriber.peer, key.id()
+                        );
                         // max number of subscribers for this contract reached
                         return Ok(return_not_subbed());
                     }
+
+                    tracing::info!(
+                        "SUBSCRIPTION_DIAG: SUCCESS - Added subscriber {} to contract {}",
+                        subscriber.peer,
+                        key.id()
+                    );
 
                     match self.state {
                         Some(SubscribeState::ReceivedRequest) => {
@@ -332,11 +364,8 @@ impl Operation for SubscribeOp {
                         }) => {
                             if retries < MAX_RETRIES {
                                 skip_list.insert(sender.peer.clone());
-                                if let Some(target) = op_manager
-                                    .ring
-                                    .closest_potentially_caching(key, &skip_list)
-                                    .into_iter()
-                                    .next()
+                                if let Some(CachingTarget::Remote(target)) =
+                                    op_manager.ring.closest_caching_target(key, &skip_list)
                                 {
                                     let subscriber =
                                         op_manager.ring.connection_manager.own_location();
@@ -386,6 +415,11 @@ impl Operation for SubscribeOp {
                             this_peer = %target.peer,
                             provider = %sender.peer,
                             "Subscribed to contract"
+                        );
+                        // SUBSCRIPTION_DIAG: Gateway adding itself as subscriber
+                        tracing::info!(
+                            "SUBSCRIPTION_DIAG: Gateway {} adding itself as subscriber to contract {}",
+                            sender.peer, key.id()
                         );
                         if op_manager.ring.add_subscriber(key, sender.clone()).is_err() {
                             // concurrently it reached max number of subscribers for this contract

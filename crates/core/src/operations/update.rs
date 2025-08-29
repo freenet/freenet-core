@@ -7,7 +7,7 @@ use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationRe
 use crate::contract::ContractHandlerEvent;
 use crate::message::{InnerMessage, NetMessage, Transaction};
 use crate::node::IsOperationCompleted;
-use crate::ring::{Location, PeerKeyLocation, RingError};
+use crate::ring::{CachingTarget, Location, PeerKeyLocation, RingError};
 use crate::{
     client_events::HostResult,
     node::{NetworkBridge, OpManager, PeerId},
@@ -186,6 +186,20 @@ impl Operation for UpdateOp {
                     );
 
                     let broadcast_to = op_manager.get_broadcast_targets_update(key, &sender.peer);
+
+                    // SUBSCRIPTION_DIAG: Log broadcast targets
+                    tracing::info!(
+                        "SUBSCRIPTION_DIAG: Update for contract {} - has_subscribers: {}, broadcast_targets: {} peers",
+                        key.id(), has_subscribers, broadcast_to.len()
+                    );
+                    if !broadcast_to.is_empty() {
+                        for target in &broadcast_to {
+                            tracing::info!(
+                                "SUBSCRIPTION_DIAG: Will broadcast update to peer: {}",
+                                target.peer
+                            );
+                        }
+                    }
 
                     if should_handle_update {
                         tracing::debug!(
@@ -505,13 +519,32 @@ impl OpManager {
             .ring
             .subscribers_of(key)
             .map(|subs| {
-                subs.value()
+                let all_subs = subs.value();
+                tracing::info!(
+                    "SUBSCRIPTION_DIAG: Contract {} has {} total subscribers",
+                    key.id(),
+                    all_subs.len()
+                );
+                for sub in all_subs.iter() {
+                    tracing::info!(
+                        "SUBSCRIPTION_DIAG: Subscriber: {} (filtering sender: {})",
+                        sub.peer,
+                        sender
+                    );
+                }
+                all_subs
                     .iter()
                     .filter(|pk| &pk.peer != sender)
                     .cloned()
                     .collect::<Vec<_>>()
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                tracing::info!(
+                    "SUBSCRIPTION_DIAG: Contract {} has NO subscribers",
+                    key.id()
+                );
+                vec![]
+            });
 
         subscribers
     }
@@ -611,43 +644,59 @@ pub(crate) async fn request_update(
             .pop()
             .ok_or(OpError::RingError(RingError::NoLocation))?
     } else {
-        // Check if we have any other peers that can cache contracts
-        let closest = op_manager
+        // Determine where this contract should be cached
+        let caching_target = op_manager
             .ring
-            .closest_potentially_caching(key, [sender.peer.clone()].as_slice())
-            .into_iter()
-            .next();
+            .closest_caching_target(key, [sender.peer.clone()].as_slice());
 
-        if let Some(target) = closest {
-            // Subscribe to the contract
-            op_manager
-                .ring
-                .add_subscriber(key, sender)
-                .map_err(|_| RingError::NoCachingPeers(*key))?;
+        match caching_target {
+            Some(CachingTarget::Remote(target)) => {
+                // Subscribe to the contract
+                op_manager
+                    .ring
+                    .add_subscriber(key, sender)
+                    .map_err(|_| RingError::NoCachingPeers(*key))?;
 
-            target
-        } else {
-            // Check if we actually have any connected peers at all
-            let has_connections = op_manager.ring.connection_manager.num_connections() > 0;
-
-            if has_connections {
-                // We have connections but no suitable peer for this contract
-                return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
-            } else {
-                // We truly have no peers, handle locally
+                target
+            }
+            Some(CachingTarget::Local) => {
+                // We are the best location - handle locally
                 tracing::debug!(
-                    "UPDATE: No peer connections available, handling contract {} locally",
+                    "UPDATE: We are the closest node for contract {}, handling locally",
                     key
                 );
 
-                // If no other peers, we should be subscribed and handle locally
+                // Subscribe ourselves
                 op_manager
                     .ring
-                    .add_subscriber(key, sender.clone())
+                    .add_subscriber(key, sender)
                     .map_err(|_| RingError::NoCachingPeers(*key))?;
 
-                // Target ourselves
-                sender.clone()
+                op_manager.ring.connection_manager.own_location()
+            }
+            None => {
+                // Check if we actually have any connected peers at all
+                let has_connections = op_manager.ring.connection_manager.num_connections() > 0;
+
+                if has_connections {
+                    // We have connections but no suitable peer for this contract
+                    return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
+                } else {
+                    // We truly have no peers, handle locally
+                    tracing::debug!(
+                        "UPDATE: No peer connections available, handling contract {} locally",
+                        key
+                    );
+
+                    // If no other peers, we should be subscribed and handle locally
+                    op_manager
+                        .ring
+                        .add_subscriber(key, sender.clone())
+                        .map_err(|_| RingError::NoCachingPeers(*key))?;
+
+                    // Target ourselves
+                    sender.clone()
+                }
             }
         }
     };
