@@ -87,36 +87,15 @@ pub(crate) async fn request_subscribe(
             // Contract is cached locally or we're the only node
             tracing::info!(%key, "Subscribing to locally cached contract");
 
-            // For local subscriptions, we need to complete the subscription locally
-            // by transitioning directly to completed state and notifying through the operation manager
-            let this_peer = op_manager.ring.connection_manager.own_location();
-
-            // Create a ReturnSub message to ourselves to complete the subscription
-            let msg = SubscribeMsg::ReturnSub {
+            // For local subscriptions, complete immediately since we're already storing the contract
+            // The subscription tracking happens at the contract handler level
+            let completed_op = SubscribeOp {
                 id,
-                key,
-                sender: this_peer.clone(),
-                target: this_peer,
-                subscribed: true,
+                state: Some(SubscribeState::Completed { key }),
             };
 
-            // Transition to awaiting response state briefly
-            let new_state = Some(SubscribeState::AwaitingResponse {
-                skip_list: vec![].into_iter().collect(),
-                retries: 0,
-                current_hop: 0,
-                upstream_subscriber: None,
-            });
-
-            let op = SubscribeOp {
-                id,
-                state: new_state,
-            };
-
-            // Process the message through the operation manager which will complete the subscription
-            op_manager
-                .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op))
-                .await?;
+            // Push the completed state directly
+            op_manager.push(id, OpEnum::Subscribe(completed_op)).await?;
         }
         Some(CachingTarget::Remote(target)) => {
             // Forward to remote peer using existing protocol
