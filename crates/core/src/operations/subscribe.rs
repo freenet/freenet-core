@@ -66,39 +66,31 @@ pub(crate) async fn request_subscribe(
     op_manager: &OpManager,
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
-    let (caching_target, id, key) =
-        if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-            if !super::has_contract(op_manager, *key).await? {
-                tracing::debug!(%key, "Contract not found, trying other peer");
-                return Err(OpError::ContractError(ContractError::ContractNotFound(
-                    *key,
-                )));
-            }
-
-            const EMPTY: &[PeerId] = &[];
-            let caching_target = op_manager.ring.closest_caching_target(key, EMPTY);
-            (caching_target, *id, *key)
-        } else {
-            return Err(OpError::UnexpectedOpState);
-        };
-
-    match caching_target {
-        Some(CachingTarget::Local) | None => {
-            // Contract is cached locally or we're the only node
-            tracing::info!(%key, "Subscribing to locally cached contract");
-
-            // For local subscriptions, complete immediately since we're already storing the contract
-            // The subscription tracking happens at the contract handler level
-            let completed_op = SubscribeOp {
-                id,
-                state: Some(SubscribeState::Completed { key }),
-            };
-
-            // Push the completed state directly
-            op_manager.push(id, OpEnum::Subscribe(completed_op)).await?;
+    let (target, _id) = if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
+        if !super::has_contract(op_manager, *key).await? {
+            tracing::debug!(%key, "Contract not found, trying other peer");
+            return Err(OpError::ContractError(ContractError::ContractNotFound(
+                *key,
+            )));
         }
-        Some(CachingTarget::Remote(target)) => {
-            // Forward to remote peer using existing protocol
+        const EMPTY: &[PeerId] = &[];
+        // Still use the old function for subscriptions until we figure out local handling
+        // This is a known limitation - subscriptions don't work with locally cached contracts yet
+        let target = match op_manager.ring.closest_potentially_caching(key, EMPTY) {
+            Some(peer) => peer,
+            None => {
+                // No remote peers available
+                tracing::warn!(%key, "Cannot subscribe to locally cached contract - not implemented yet");
+                return Err(RingError::NoCachingPeers(*key).into());
+            }
+        };
+        (target, *id)
+    } else {
+        return Err(OpError::UnexpectedOpState);
+    };
+
+    match sub_op.state {
+        Some(SubscribeState::PrepareRequest { id, key, .. }) => {
             let new_state = Some(SubscribeState::AwaitingResponse {
                 skip_list: vec![].into_iter().collect(),
                 retries: 0,
@@ -114,6 +106,7 @@ pub(crate) async fn request_subscribe(
                 .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op))
                 .await?;
         }
+        _ => return Err(OpError::invalid_transition(sub_op.id)),
     }
 
     Ok(())
