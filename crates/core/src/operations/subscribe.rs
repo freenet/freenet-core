@@ -28,6 +28,10 @@ enum SubscribeState {
     },
     /// Received a request to subscribe to this network.
     ReceivedRequest,
+    /// Local subscription - contract is cached locally, shortcut to completion.
+    LocalSubscription {
+        key: ContractKey,
+    },
     /// Awaitinh response from petition.
     AwaitingResponse {
         skip_list: HashSet<PeerId>,
@@ -66,10 +70,14 @@ pub(crate) async fn request_subscribe(
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
     if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        // TODO: Local subscription handling
-        // Currently, subscriptions always go to remote peers even if we have the contract locally.
-        // This is a known limitation that will be addressed in a follow-up PR.
-        // The subscription protocol needs adjustment to handle local contracts properly.
+        // TODO: Local subscription handling is temporarily disabled
+        // The implementation causes failures in complex multi-node tests.
+        // This will be re-enabled once the root cause is identified and fixed.
+        // For now, subscriptions always go to remote peers even if contract is local.
+        
+        // if super::has_contract(op_manager, *key).await? {
+        //     // Handle local subscription...
+        // }
 
         // Find a remote peer to handle the subscription
         const EMPTY: &[PeerId] = &[];
@@ -388,6 +396,10 @@ impl Operation for SubscribeOp {
                     target,
                     ..
                 } => match self.state {
+                    // LocalSubscription handling temporarily disabled - see TODO in request_subscribe
+                    // Some(SubscribeState::LocalSubscription { .. }) => {
+                    //     ...
+                    // }
                     Some(SubscribeState::AwaitingResponse {
                         upstream_subscriber,
                         ..
