@@ -72,7 +72,7 @@ pub(crate) async fn request_subscribe(
         // A proper implementation would handle local subscriptions without network messages.
         // The challenge is ensuring clients get proper notification when subscribing locally.
         // See: https://github.com/freenet/freenet-core/issues/1782
-        
+
         // Find a remote peer to handle the subscription
         const EMPTY: &[PeerId] = &[];
         let target = match op_manager.ring.closest_potentially_caching(key, EMPTY) {
