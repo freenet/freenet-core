@@ -66,29 +66,12 @@ pub(crate) async fn request_subscribe(
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
     if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        // First check if we have the contract locally
-        if super::has_contract(op_manager, *key).await? {
-            // We have the contract locally - handle subscription immediately
-            tracing::debug!(%key, "Contract found locally, handling subscription directly");
+        // TODO: Local subscription handling
+        // Currently, subscriptions always go to remote peers even if we have the contract locally.
+        // This is a known limitation that will be addressed in a follow-up PR.
+        // The subscription protocol needs adjustment to handle local contracts properly.
 
-            // Note: For local subscriptions, we don't add ourselves to the ring subscribers
-            // as that's for tracking remote subscribers who need updates.
-            // The local client gets updates through the contract handler directly.
-
-            // Mark the operation as completed
-            let completed_op = SubscribeOp {
-                id: *id,
-                state: Some(SubscribeState::Completed { key: *key }),
-            };
-
-            // Push the completed operation which will trigger client notification
-            op_manager
-                .push(*id, OpEnum::Subscribe(completed_op))
-                .await?;
-            return Ok(());
-        }
-
-        // Contract not local, try to find a remote peer
+        // Find a remote peer to handle the subscription
         const EMPTY: &[PeerId] = &[];
         let target = match op_manager.ring.closest_potentially_caching(key, EMPTY) {
             Some(peer) => peer,
