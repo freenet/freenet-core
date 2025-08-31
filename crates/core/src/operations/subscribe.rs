@@ -72,7 +72,7 @@ pub(crate) async fn request_subscribe(
                 "Contract {} found locally, handling subscription without network communication",
                 key
             );
-            
+
             // Create an operation in AwaitingResponse state so it can process the ReturnSub message
             let waiting_op = SubscribeOp {
                 id: *id,
@@ -83,7 +83,7 @@ pub(crate) async fn request_subscribe(
                     upstream_subscriber: None, // No upstream since this is a local client request
                 }),
             };
-            
+
             // Create a ReturnSub message as if we received a successful subscription response
             let own_location = op_manager.ring.connection_manager.own_location().clone();
             let return_msg = SubscribeMsg::ReturnSub {
@@ -93,13 +93,13 @@ pub(crate) async fn request_subscribe(
                 sender: own_location.clone(),
                 target: own_location,
             };
-            
+
             // Use notify_op_change to trigger the state machine without network communication
             // This will process the ReturnSub message through the normal flow
             op_manager
                 .notify_op_change(NetMessage::from(return_msg), OpEnum::Subscribe(waiting_op))
                 .await?;
-            
+
             // Return Ok to indicate the operation was initiated successfully
             return Ok(());
         }
