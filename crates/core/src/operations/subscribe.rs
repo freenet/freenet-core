@@ -66,29 +66,17 @@ pub(crate) async fn request_subscribe(
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
     if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        // Find the best peer to handle the subscription (including ourselves)
+        // TODO: Handle local subscriptions properly
+        // Currently, if a contract is cached locally, subscriptions still go through
+        // the network protocol by finding a remote peer. This works but is inefficient.
+        // A proper implementation would handle local subscriptions without network messages.
+        // The challenge is ensuring clients get proper notification when subscribing locally.
+        // See: https://github.com/freenet/freenet-core/issues/1782
+        
+        // Find a remote peer to handle the subscription
         const EMPTY: &[PeerId] = &[];
-        let caching_target = op_manager.ring.closest_caching_target(key, EMPTY);
-
-        let target = match caching_target {
-            Some(CachingTarget::Local) => {
-                // Contract should be cached locally - use our own location as target
-                tracing::debug!(
-                    tx = %id,
-                    %key,
-                    "Contract should be cached locally, targeting self for subscription"
-                );
-                op_manager.ring.connection_manager.own_location().clone()
-            }
-            Some(CachingTarget::Remote(peer)) => {
-                tracing::debug!(
-                    tx = %id,
-                    %key,
-                    target = %peer.peer,
-                    "Targeting remote peer for subscription"
-                );
-                peer
-            }
+        let target = match op_manager.ring.closest_potentially_caching(key, EMPTY) {
+            Some(peer) => peer,
             None => {
                 tracing::debug!(%key, "No peers available for subscription");
                 return Err(RingError::NoCachingPeers(*key).into());
