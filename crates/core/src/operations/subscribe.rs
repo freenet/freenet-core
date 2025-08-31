@@ -28,10 +28,6 @@ enum SubscribeState {
     },
     /// Received a request to subscribe to this network.
     ReceivedRequest,
-    /// Local subscription - contract is cached locally, shortcut to completion.
-    LocalSubscription {
-        key: ContractKey,
-    },
     /// Awaitinh response from petition.
     AwaitingResponse {
         skip_list: HashSet<PeerId>,
@@ -70,14 +66,43 @@ pub(crate) async fn request_subscribe(
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
     if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        // TODO: Local subscription handling is temporarily disabled
-        // The implementation causes failures in complex multi-node tests.
-        // This will be re-enabled once the root cause is identified and fixed.
-        // For now, subscriptions always go to remote peers even if contract is local.
-        
-        // if super::has_contract(op_manager, *key).await? {
-        //     // Handle local subscription...
-        // }
+        // Check if we have the contract locally first
+        if super::has_contract(op_manager, *key).await? {
+            tracing::debug!(
+                "Contract {} found locally, handling subscription without network communication",
+                key
+            );
+            
+            // Create an operation in AwaitingResponse state so it can process the ReturnSub message
+            let waiting_op = SubscribeOp {
+                id: *id,
+                state: Some(SubscribeState::AwaitingResponse {
+                    skip_list: HashSet::new(),
+                    retries: 0,
+                    current_hop: 0,
+                    upstream_subscriber: None, // No upstream since this is a local client request
+                }),
+            };
+            
+            // Create a ReturnSub message as if we received a successful subscription response
+            let own_location = op_manager.ring.connection_manager.own_location().clone();
+            let return_msg = SubscribeMsg::ReturnSub {
+                key: *key,
+                id: *id,
+                subscribed: true,
+                sender: own_location.clone(),
+                target: own_location,
+            };
+            
+            // Use notify_op_change to trigger the state machine without network communication
+            // This will process the ReturnSub message through the normal flow
+            op_manager
+                .notify_op_change(NetMessage::from(return_msg), OpEnum::Subscribe(waiting_op))
+                .await?;
+            
+            // Return Ok to indicate the operation was initiated successfully
+            return Ok(());
+        }
 
         // Find a remote peer to handle the subscription
         const EMPTY: &[PeerId] = &[];
