@@ -66,48 +66,29 @@ pub(crate) async fn request_subscribe(
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
     if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        // Check if we have the contract locally first
-        if super::has_contract(op_manager, *key).await? {
-            tracing::debug!(
-                "Contract {} found locally, handling subscription without network communication",
-                key
-            );
-
-            // Create an operation in AwaitingResponse state so it can process the ReturnSub message
-            let waiting_op = SubscribeOp {
-                id: *id,
-                state: Some(SubscribeState::AwaitingResponse {
-                    skip_list: HashSet::new(),
-                    retries: 0,
-                    current_hop: 0,
-                    upstream_subscriber: None, // No upstream since this is a local client request
-                }),
-            };
-
-            // Create a ReturnSub message as if we received a successful subscription response
-            let own_location = op_manager.ring.connection_manager.own_location().clone();
-            let return_msg = SubscribeMsg::ReturnSub {
-                key: *key,
-                id: *id,
-                subscribed: true,
-                sender: own_location.clone(),
-                target: own_location,
-            };
-
-            // Use notify_op_change to trigger the state machine without network communication
-            // This will process the ReturnSub message through the normal flow
-            op_manager
-                .notify_op_change(NetMessage::from(return_msg), OpEnum::Subscribe(waiting_op))
-                .await?;
-
-            // Return Ok to indicate the operation was initiated successfully
-            return Ok(());
-        }
-
-        // Find a remote peer to handle the subscription
+        // Find the best peer to handle the subscription (including ourselves)
         const EMPTY: &[PeerId] = &[];
-        let target = match op_manager.ring.closest_potentially_caching(key, EMPTY) {
-            Some(peer) => peer,
+        let caching_target = op_manager.ring.closest_caching_target(key, EMPTY);
+
+        let target = match caching_target {
+            Some(CachingTarget::Local) => {
+                // Contract should be cached locally - use our own location as target
+                tracing::debug!(
+                    tx = %id,
+                    %key,
+                    "Contract should be cached locally, targeting self for subscription"
+                );
+                op_manager.ring.connection_manager.own_location().clone()
+            }
+            Some(CachingTarget::Remote(peer)) => {
+                tracing::debug!(
+                    tx = %id,
+                    %key,
+                    target = %peer.peer,
+                    "Targeting remote peer for subscription"
+                );
+                peer
+            }
             None => {
                 tracing::debug!(%key, "No peers available for subscription");
                 return Err(RingError::NoCachingPeers(*key).into());
