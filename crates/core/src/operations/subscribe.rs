@@ -79,7 +79,11 @@ pub(crate) async fn request_subscribe(
                     );
 
                     // Add local subscription
-                    if let Err(_) = op_manager.ring.add_local_subscription(&key, client_id) {
+                    if op_manager
+                        .ring
+                        .add_local_subscription(&key, client_id)
+                        .is_err()
+                    {
                         tracing::warn!("Failed to add local subscription for client {}", client_id);
                         // Continue with operation completion even if we can't add the subscription
                     }

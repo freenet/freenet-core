@@ -395,11 +395,6 @@ impl Ring {
         self.seeding_manager.subscribers_of(contract)
     }
 
-    /// Get only remote subscribers for a contract
-    pub fn remote_subscribers_of(&self, contract: &ContractKey) -> Vec<PeerKeyLocation> {
-        self.seeding_manager.remote_subscribers_of(contract)
-    }
-
     /// Add a local client subscription
     pub fn add_local_subscription(
         &self,

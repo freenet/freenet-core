@@ -29,14 +29,6 @@ pub enum Subscriber {
 }
 
 impl Subscriber {
-    /// Check if this is a remote subscriber with the given peer
-    pub fn is_remote_peer(&self, peer: &crate::node::PeerId) -> bool {
-        match self {
-            Subscriber::Remote(loc) => &loc.peer == peer,
-            Subscriber::Local(_) => false,
-        }
-    }
-
     /// Get the location if this is a remote subscriber
     pub fn location(&self) -> Option<Location> {
         match self {
@@ -199,22 +191,6 @@ impl SeedingManager {
         self.subscribers.get(contract)
     }
 
-    /// Get only remote subscribers for backward compatibility
-    pub fn remote_subscribers_of(&self, contract: &ContractKey) -> Vec<PeerKeyLocation> {
-        self.subscribers
-            .get(contract)
-            .map(|subs| {
-                subs.value()
-                    .iter()
-                    .filter_map(|s| match s {
-                        Subscriber::Remote(loc) => Some(loc.clone()),
-                        Subscriber::Local(_) => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     pub fn prune_subscriber(&self, loc: Location) {
         self.subscribers.alter_all(|_, mut subs| {
             if let Some(pos) = subs.iter().position(|s| s.location() == Some(loc)) {
@@ -239,14 +215,6 @@ impl SeedingManager {
                     .collect();
                 (*entry.key(), remote_subs)
             })
-            .collect()
-    }
-
-    /// Get all subscribers (both local and remote) for a contract
-    pub fn all_subscribers(&self) -> Vec<(ContractKey, Vec<Subscriber>)> {
-        self.subscribers
-            .iter()
-            .map(|entry| (*entry.key(), entry.value().clone()))
             .collect()
     }
 }
