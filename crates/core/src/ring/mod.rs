@@ -328,11 +328,21 @@ impl Ring {
     }
 
     /// Get k best peers for caching a contract, ranked by routing predictions
+    /// Find k peers that are closest to the contract key location.
+    ///
+    /// # Arguments
+    /// * `contract_key` - The contract to find peers for
+    /// * `skip_list` - Peers to exclude from consideration
+    /// * `k` - Maximum number of peers to return
+    /// * `include_self` - Whether to include this node as a candidate.
+    ///   Should be `true` for PUT operations (determining where to store),
+    ///   `false` for GET forwarding (after checking locally and not finding it)
     pub fn k_closest_potentially_caching(
         &self,
         contract_key: &ContractKey,
         skip_list: impl Contains<PeerId> + Clone,
         k: usize,
+        include_self: bool,
     ) -> Vec<PeerKeyLocation> {
         let router = self.router.read();
         let target_location = Location::from(contract_key);
@@ -345,15 +355,19 @@ impl Ring {
             (!skip_list.has_element(conn.location.peer.clone())).then_some(conn.location.clone())
         });
 
-        // Chain with self if we have a location and aren't in skip list
-        let candidates = if let Some(own_peer) = self.connection_manager.get_peer_key() {
-            if !skip_list.has_element(own_peer) {
-                let own_pkloc = self.connection_manager.own_location();
-                if own_pkloc.location.is_some() {
-                    // Chain peer candidates with self location
-                    peer_candidates
-                        .chain(std::iter::once(own_pkloc))
-                        .collect::<Vec<_>>()
+        // Only include self if explicitly requested AND not in skip list
+        let candidates = if include_self {
+            if let Some(own_peer) = self.connection_manager.get_peer_key() {
+                if !skip_list.has_element(own_peer) {
+                    let own_pkloc = self.connection_manager.own_location();
+                    if own_pkloc.location.is_some() {
+                        // Chain peer candidates with self location
+                        peer_candidates
+                            .chain(std::iter::once(own_pkloc))
+                            .collect::<Vec<_>>()
+                    } else {
+                        peer_candidates.collect()
+                    }
                 } else {
                     peer_candidates.collect()
                 }
@@ -361,6 +375,7 @@ impl Ring {
                 peer_candidates.collect()
             }
         } else {
+            // Don't include self when include_self is false
             peer_candidates.collect()
         };
 
