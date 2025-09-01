@@ -91,10 +91,14 @@ pub(crate) async fn request_subscribe(
                     // Continue with operation completion even if we can't add the subscription
                 }
 
-                // Transition directly to completed state
-                sub_op.state = Some(SubscribeState::Completed { key });
+                // Set state to AwaitingResponse so we can process the synthetic ReturnSub
+                sub_op.state = Some(SubscribeState::AwaitingResponse {
+                    skip_list: HashSet::new(),
+                    retries: 0,
+                    upstream_subscriber: None,
+                    current_hop: 0,
+                });
 
-                // We need to notify the client about successful subscription
                 // Create a synthetic ReturnSub message to trigger the completion notification
                 let this_peer = op_manager.ring.connection_manager.own_location();
                 let return_msg = SubscribeMsg::ReturnSub {
@@ -105,7 +109,7 @@ pub(crate) async fn request_subscribe(
                     target: this_peer,
                 };
 
-                // Use notify_op_change to properly notify the client
+                // Use notify_op_change which will process the ReturnSub and complete the operation
                 op_manager
                     .notify_op_change(NetMessage::from(return_msg), OpEnum::Subscribe(sub_op))
                     .await?;
