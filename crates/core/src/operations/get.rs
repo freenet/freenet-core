@@ -68,7 +68,7 @@ pub(crate) async fn request_get(
             key,
             &skip_list,
             DEFAULT_MAX_BREADTH,
-            false,
+            true, // Include self for initial request to check local cache first
         );
         if candidates.is_empty() {
             // No peers available - check if we have the contract locally
