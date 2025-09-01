@@ -730,13 +730,22 @@ async fn try_to_broadcast(
 
     match state {
         // Handle initiating node that's also the target (single node or targeting self)
-        Some(PutState::AwaitingResponse { upstream: None, .. })
-            if broadcast_to.is_empty() && last_hop =>
-        {
+        Some(PutState::AwaitingResponse {
+            upstream: None,
+            subscribe,
+            ..
+        }) if broadcast_to.is_empty() && last_hop => {
             // We're the initiating node and the target - operation complete
             tracing::debug!(
                 "PUT operation complete - initiating node is also target (broadcast_to empty, last hop)"
             );
+
+            // Handle subscription if requested (similar to SuccessfulPut handler)
+            if subscribe {
+                tracing::debug!("Starting subscription request for initiating node as target");
+                super::start_subscription_request(op_manager, key, false, HashSet::new()).await;
+            }
+
             new_state = Some(PutState::Finished { key });
             return_msg = None;
         }
