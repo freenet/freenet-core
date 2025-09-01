@@ -67,52 +67,64 @@ pub(crate) async fn request_subscribe(
     client_id: Option<crate::ring::ClientId>,
 ) -> Result<(), OpError> {
     if let Some(SubscribeState::PrepareRequest { id, key }) = sub_op.state {
-        // Check if contract is cached locally
+        // Only handle local subscriptions if we have a client_id AND the contract is cached locally
+        // This ensures that only direct client subscriptions on the same node are handled locally
+        if let Some(client_id) = client_id {
+            // Check if contract is cached locally
+            const EMPTY: &[PeerId] = &[];
+            if let Some(crate::ring::CachingTarget::Local) =
+                op_manager.ring.closest_caching_target(&key, EMPTY)
+            {
+                tracing::info!(
+                    "SUBSCRIPTION_DIAG: Handling local subscription for client {} to contract {}",
+                    client_id,
+                    key.id()
+                );
+
+                // Add local subscription
+                if op_manager
+                    .ring
+                    .add_local_subscription(&key, client_id)
+                    .is_err()
+                {
+                    tracing::warn!("Failed to add local subscription for client {}", client_id);
+                    // Continue with operation completion even if we can't add the subscription
+                }
+
+                // Transition directly to completed state
+                sub_op.state = Some(SubscribeState::Completed { key });
+
+                // We need to notify the client about successful subscription
+                // Create a synthetic ReturnSub message to trigger the completion notification
+                let this_peer = op_manager.ring.connection_manager.own_location();
+                let return_msg = SubscribeMsg::ReturnSub {
+                    key,
+                    id,
+                    subscribed: true,
+                    sender: this_peer.clone(),
+                    target: this_peer,
+                };
+
+                // Use notify_op_change to properly notify the client
+                op_manager
+                    .notify_op_change(NetMessage::from(return_msg), OpEnum::Subscribe(sub_op))
+                    .await?;
+
+                return Ok(());
+            }
+        }
+
+        // For all other cases (no client_id or remote target), proceed with remote subscription
         const EMPTY: &[PeerId] = &[];
         match op_manager.ring.closest_caching_target(&key, EMPTY) {
             Some(crate::ring::CachingTarget::Local) => {
-                // Handle local subscription
-                if let Some(client_id) = client_id {
-                    tracing::info!(
-                        "SUBSCRIPTION_DIAG: Handling local subscription for client {} to contract {}",
-                        client_id, key.id()
-                    );
-
-                    // Add local subscription
-                    if op_manager
-                        .ring
-                        .add_local_subscription(&key, client_id)
-                        .is_err()
-                    {
-                        tracing::warn!("Failed to add local subscription for client {}", client_id);
-                        // Continue with operation completion even if we can't add the subscription
-                    }
-
-                    // Transition directly to completed state
-                    sub_op.state = Some(SubscribeState::Completed { key });
-
-                    // We need to notify the client about successful subscription
-                    // Create a synthetic ReturnSub message to trigger the completion notification
-                    let this_peer = op_manager.ring.connection_manager.own_location();
-                    let return_msg = SubscribeMsg::ReturnSub {
-                        key,
-                        id,
-                        subscribed: true,
-                        sender: this_peer.clone(),
-                        target: this_peer,
-                    };
-
-                    // Use notify_op_change to properly notify the client
-                    op_manager
-                        .notify_op_change(NetMessage::from(return_msg), OpEnum::Subscribe(sub_op))
-                        .await?;
-
-                    return Ok(());
-                } else {
-                    // No client ID provided - fall back to remote subscription
-                    tracing::debug!("No client ID for local subscription, falling back to remote");
-                    // Fall through to find a remote peer
-                }
+                // Contract is cached locally but no client_id was provided
+                // This happens for automatic subscriptions (e.g., after put)
+                // Just complete the operation without adding a local subscription
+                tracing::debug!("Contract cached locally, completing automatic subscription");
+                sub_op.state = Some(SubscribeState::Completed { key });
+                op_manager.push(id, OpEnum::Subscribe(sub_op)).await?;
+                return Ok(());
             }
             Some(crate::ring::CachingTarget::Remote(target)) => {
                 // Forward to remote peer
