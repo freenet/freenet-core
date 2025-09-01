@@ -790,7 +790,12 @@ pub async fn subscribe(
             .await;
     }
     // Initialize a subscribe op.
-    match subscribe::request_subscribe(&op_manager, op).await {
+    // Convert the ClientId to ring::ClientId if available
+    let ring_client_id = client_id.map(|id| {
+        let id_val: usize = id.into();
+        crate::ring::ClientId::new(id_val as u64)
+    });
+    match subscribe::request_subscribe(&op_manager, op, ring_client_id).await {
         Err(OpError::ContractError(ContractError::ContractNotFound(key))) => {
             tracing::info!(%key, "Trying to subscribe to a contract not present, requesting it first");
             let get_op = get::start_op(key, true, false);
@@ -812,7 +817,8 @@ pub async fn subscribe(
         loop {
             // just start a new op to check if contract is present
             let op = subscribe::start_op(key);
-            match subscribe::request_subscribe(&op_manager, op).await {
+            // No client_id for retry attempts
+            match subscribe::request_subscribe(&op_manager, op, None).await {
                 Err(OpError::ContractError(ContractError::ContractNotFound(_))) => {
                     tracing::warn!("Still waiting for {key} contract");
                     tokio::time::sleep(Duration::from_secs(2)).await

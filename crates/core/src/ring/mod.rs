@@ -62,6 +62,7 @@ pub use self::live_tx::LiveTransactionTracker;
 pub use connection::Connection;
 pub use location::{Distance, Location};
 pub use peer_key_location::PeerKeyLocation;
+pub use seeding::{ClientId, Subscriber};
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
@@ -390,8 +391,23 @@ impl Ring {
     pub fn subscribers_of(
         &self,
         contract: &ContractKey,
-    ) -> Option<DmRef<'_, ContractKey, Vec<PeerKeyLocation>>> {
+    ) -> Option<DmRef<'_, ContractKey, Vec<Subscriber>>> {
         self.seeding_manager.subscribers_of(contract)
+    }
+
+    /// Get only remote subscribers for a contract
+    pub fn remote_subscribers_of(&self, contract: &ContractKey) -> Vec<PeerKeyLocation> {
+        self.seeding_manager.remote_subscribers_of(contract)
+    }
+
+    /// Add a local client subscription
+    pub fn add_local_subscription(
+        &self,
+        contract: &ContractKey,
+        client_id: ClientId,
+    ) -> Result<(), ()> {
+        self.seeding_manager
+            .add_local_subscriber(contract, client_id)
     }
 
     /// Get all network subscriptions across all contracts

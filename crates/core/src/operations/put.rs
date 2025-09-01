@@ -688,8 +688,16 @@ impl OpManager {
             .map(|subs| {
                 subs.value()
                     .iter()
-                    .filter(|pk| &pk.peer != sender)
-                    .cloned()
+                    .filter_map(|sub| match sub {
+                        crate::ring::Subscriber::Remote(peer_loc) => {
+                            if &peer_loc.peer != sender {
+                                Some(peer_loc.clone())
+                            } else {
+                                None
+                            }
+                        }
+                        crate::ring::Subscriber::Local(_) => None,
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();

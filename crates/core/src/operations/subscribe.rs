@@ -63,23 +63,71 @@ pub(crate) fn start_op(key: ContractKey) -> SubscribeOp {
 /// Request to subscribe to value changes from a contract.
 pub(crate) async fn request_subscribe(
     op_manager: &OpManager,
-    sub_op: SubscribeOp,
+    mut sub_op: SubscribeOp,
+    client_id: Option<crate::ring::ClientId>,
 ) -> Result<(), OpError> {
-    if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        // TODO: Handle local subscriptions properly
-        // Currently, if a contract is cached locally, subscriptions still go through
-        // the network protocol by finding a remote peer. This works but is inefficient.
-        // A proper implementation would handle local subscriptions without network messages.
-        // The challenge is ensuring clients get proper notification when subscribing locally.
-        // See: https://github.com/freenet/freenet-core/issues/1782
-
-        // Find a remote peer to handle the subscription
+    if let Some(SubscribeState::PrepareRequest { id, key }) = sub_op.state {
+        // Check if contract is cached locally
         const EMPTY: &[PeerId] = &[];
-        let target = match op_manager.ring.closest_potentially_caching(key, EMPTY) {
+        match op_manager.ring.closest_caching_target(&key, EMPTY) {
+            Some(crate::ring::CachingTarget::Local) => {
+                // Handle local subscription
+                if let Some(client_id) = client_id {
+                    tracing::info!(
+                        "SUBSCRIPTION_DIAG: Handling local subscription for client {} to contract {}",
+                        client_id, key.id()
+                    );
+
+                    // Add local subscription
+                    if let Err(_) = op_manager.ring.add_local_subscription(&key, client_id) {
+                        tracing::warn!("Failed to add local subscription for client {}", client_id);
+                        // Continue with operation completion even if we can't add the subscription
+                    }
+
+                    // Transition directly to completed state
+                    sub_op.state = Some(SubscribeState::Completed { key });
+
+                    // Store the completed operation
+                    op_manager.push(id, OpEnum::Subscribe(sub_op)).await?;
+
+                    // Operation complete - client will get response
+                    return Ok(());
+                } else {
+                    // No client ID provided - fall back to remote subscription
+                    tracing::debug!("No client ID for local subscription, falling back to remote");
+                    // Fall through to find a remote peer
+                }
+            }
+            Some(crate::ring::CachingTarget::Remote(target)) => {
+                // Forward to remote peer
+                let new_state = Some(SubscribeState::AwaitingResponse {
+                    skip_list: vec![].into_iter().collect(),
+                    retries: 0,
+                    current_hop: op_manager.ring.max_hops_to_live,
+                    upstream_subscriber: None,
+                });
+                let msg = SubscribeMsg::RequestSub { id, key, target };
+                let op = SubscribeOp {
+                    id,
+                    state: new_state,
+                };
+                op_manager
+                    .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op))
+                    .await?;
+                return Ok(());
+            }
+            None => {
+                // No caching peer available, fall through to find any peer
+                tracing::debug!("No caching peer found, trying to find any peer");
+            }
+        }
+
+        // Fallback: find any remote peer if local handling failed
+        let target = match op_manager.ring.closest_potentially_caching(&key, EMPTY) {
             Some(peer) => peer,
             None => {
-                tracing::debug!(%key, "No peers available for subscription");
-                return Err(RingError::NoCachingPeers(*key).into());
+                tracing::debug!(key = %key, "No peers available for subscription");
+                return Err(RingError::NoCachingPeers(key).into());
             }
         };
 
@@ -90,13 +138,9 @@ pub(crate) async fn request_subscribe(
             current_hop: op_manager.ring.max_hops_to_live,
             upstream_subscriber: None,
         });
-        let msg = SubscribeMsg::RequestSub {
-            id: *id,
-            key: *key,
-            target,
-        };
+        let msg = SubscribeMsg::RequestSub { id, key, target };
         let op = SubscribeOp {
-            id: *id,
+            id,
             state: new_state,
         };
         op_manager

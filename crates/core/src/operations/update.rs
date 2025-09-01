@@ -509,44 +509,75 @@ async fn try_to_broadcast(
     Ok((new_state, return_msg))
 }
 
+/// Represents broadcast targets for an update
+pub struct BroadcastTargets {
+    pub remote_peers: Vec<PeerKeyLocation>,
+    pub local_clients: Vec<crate::ring::ClientId>,
+}
+
 impl OpManager {
     pub(crate) fn get_broadcast_targets_update(
         &self,
         key: &ContractKey,
         sender: &PeerId,
     ) -> Vec<PeerKeyLocation> {
-        let subscribers = self
-            .ring
-            .subscribers_of(key)
-            .map(|subs| {
-                let all_subs = subs.value();
-                tracing::info!(
-                    "SUBSCRIPTION_DIAG: Contract {} has {} total subscribers",
-                    key.id(),
-                    all_subs.len()
-                );
-                for sub in all_subs.iter() {
-                    tracing::info!(
-                        "SUBSCRIPTION_DIAG: Subscriber: {} (filtering sender: {})",
-                        sub.peer,
-                        sender
-                    );
-                }
-                all_subs
-                    .iter()
-                    .filter(|pk| &pk.peer != sender)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| {
-                tracing::info!(
-                    "SUBSCRIPTION_DIAG: Contract {} has NO subscribers",
-                    key.id()
-                );
-                vec![]
-            });
+        // For backward compatibility, just return remote peers
+        let targets = self.get_all_broadcast_targets(key, sender);
+        targets.remote_peers
+    }
 
-        subscribers
+    pub(crate) fn get_all_broadcast_targets(
+        &self,
+        key: &ContractKey,
+        sender: &PeerId,
+    ) -> BroadcastTargets {
+        let mut targets = BroadcastTargets {
+            remote_peers: Vec::new(),
+            local_clients: Vec::new(),
+        };
+
+        if let Some(subscribers) = self.ring.subscribers_of(key) {
+            tracing::info!(
+                "SUBSCRIPTION_DIAG: Contract {} has {} total subscribers",
+                key.id(),
+                subscribers.value().len()
+            );
+
+            for subscriber in subscribers.value() {
+                match subscriber {
+                    crate::ring::Subscriber::Remote(peer_location) => {
+                        // Skip sender for remote peers
+                        if &peer_location.peer != sender {
+                            tracing::info!(
+                                "SUBSCRIPTION_DIAG: Will broadcast to remote peer: {}",
+                                peer_location.peer
+                            );
+                            targets.remote_peers.push(peer_location.clone());
+                        } else {
+                            tracing::info!(
+                                "SUBSCRIPTION_DIAG: Skipping sender peer: {}",
+                                peer_location.peer
+                            );
+                        }
+                    }
+                    crate::ring::Subscriber::Local(client_id) => {
+                        // Always include local clients
+                        tracing::info!(
+                            "SUBSCRIPTION_DIAG: Will broadcast to local client: {}",
+                            client_id
+                        );
+                        targets.local_clients.push(*client_id);
+                    }
+                }
+            }
+        } else {
+            tracing::info!(
+                "SUBSCRIPTION_DIAG: Contract {} has NO subscribers",
+                key.id()
+            );
+        }
+
+        targets
     }
 }
 
@@ -638,10 +669,15 @@ pub(crate) async fn request_update(
     // the initial request must provide:
     // - a peer as close as possible to the contract location
     // - and the value to update
-    let target = if let Some(location) = op_manager.ring.subscribers_of(key) {
-        location
-            .clone()
-            .pop()
+    let target = if let Some(subscribers) = op_manager.ring.subscribers_of(key) {
+        // Get the first remote subscriber
+        subscribers
+            .value()
+            .iter()
+            .find_map(|sub| match sub {
+                crate::ring::Subscriber::Remote(peer_loc) => Some(peer_loc.clone()),
+                crate::ring::Subscriber::Local(_) => None,
+            })
             .ok_or(OpError::RingError(RingError::NoLocation))?
     } else {
         // Determine where this contract should be cached

@@ -314,7 +314,8 @@ async fn start_subscription_request(
     skip_list: HashSet<PeerId>,
 ) {
     let sub_op = subscribe::start_op(key);
-    if let Err(error) = subscribe::request_subscribe(op_manager, sub_op).await {
+    // No client_id for automatic subscription after put
+    if let Err(error) = subscribe::request_subscribe(op_manager, sub_op, None).await {
         if !try_get {
             tracing::warn!(%error, "Error subscribing to contract");
             return;

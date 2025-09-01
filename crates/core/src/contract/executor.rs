@@ -391,7 +391,8 @@ impl ComposeNetworkMessage<operations::subscribe::SubscribeOp> for SubscribeCont
         op: operations::subscribe::SubscribeOp,
         op_manager: &OpManager,
     ) -> Result<(), OpError> {
-        operations::subscribe::request_subscribe(op_manager, op).await
+        // No client_id for contract executor subscriptions
+        operations::subscribe::request_subscribe(op_manager, op, None).await
     }
 }
 

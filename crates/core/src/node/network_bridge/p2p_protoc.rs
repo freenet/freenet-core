@@ -504,20 +504,30 @@ impl P2pConnManager {
                                             .as_ref()
                                             .map(|s| s.value().len())
                                             .unwrap_or(0);
-                                        let subscriber_peer_ids: Vec<String> =
-                                            if config.include_subscriber_peer_ids {
-                                                subscribers_info
-                                                    .as_ref()
-                                                    .map(|s| {
-                                                        s.value()
-                                                            .iter()
-                                                            .map(|pk| pk.peer.to_string())
-                                                            .collect()
-                                                    })
-                                                    .unwrap_or_default()
-                                            } else {
-                                                Vec::new()
-                                            };
+                                        let subscriber_peer_ids: Vec<String> = if config
+                                            .include_subscriber_peer_ids
+                                        {
+                                            subscribers_info
+                                                .as_ref()
+                                                .map(|s| {
+                                                    s.value()
+                                                        .iter()
+                                                        .filter_map(|sub| match sub {
+                                                            crate::ring::Subscriber::Remote(
+                                                                peer_loc,
+                                                            ) => Some(peer_loc.peer.to_string()),
+                                                            crate::ring::Subscriber::Local(
+                                                                client_id,
+                                                            ) => {
+                                                                Some(format!("local:{}", client_id))
+                                                            }
+                                                        })
+                                                        .collect()
+                                                })
+                                                .unwrap_or_default()
+                                        } else {
+                                            Vec::new()
+                                        };
 
                                         response.contract_states.insert(
                                             *contract_key,
