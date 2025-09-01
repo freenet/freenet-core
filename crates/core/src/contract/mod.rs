@@ -277,6 +277,7 @@ where
 }
 
 #[derive(Debug, thiserror::Error)]
+#[allow(dead_code)]
 pub(crate) enum ContractError {
     #[error("handler channel dropped")]
     ChannelDropped(Box<ContractHandlerEvent>),

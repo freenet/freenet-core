@@ -9,7 +9,7 @@ use crate::{
     client_events::HostResult,
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
-    ring::{CachingTarget, Location, PeerKeyLocation, RingError},
+    ring::{Location, PeerKeyLocation, RingError},
 };
 use freenet_stdlib::{
     client_api::{ContractResponse, ErrorKind, HostResponse},
@@ -74,11 +74,14 @@ pub(crate) async fn request_subscribe(
         // See: https://github.com/freenet/freenet-core/issues/1782
 
         // Find a remote peer to handle the subscription
+        // TODO: This is a workaround - subscriptions to locally cached contracts
+        // still go through the network protocol to find a remote peer
         const EMPTY: &[PeerId] = &[];
-        let target = match op_manager.ring.closest_potentially_caching(key, EMPTY) {
+        let target = match op_manager.ring.closest_remote_peer(key, EMPTY) {
             Some(peer) => peer,
             None => {
-                tracing::debug!(%key, "No peers available for subscription");
+                // No remote peers available
+                tracing::debug!(%key, "No remote peers available for subscription");
                 return Err(RingError::NoCachingPeers(*key).into());
             }
         };
@@ -239,10 +242,8 @@ impl Operation for SubscribeOp {
                     if !super::has_contract(op_manager, *key).await? {
                         tracing::debug!(tx = %id, %key, "Contract not found, trying other peer");
 
-                        let caching_target = op_manager.ring.closest_caching_target(key, skip_list);
-
-                        // Can only forward to remote peers, not to ourselves
-                        let Some(CachingTarget::Remote(new_target)) = caching_target else {
+                        let Some(new_target) = op_manager.ring.closest_remote_peer(key, skip_list)
+                        else {
                             tracing::warn!(tx = %id, %key, "No remote peer available for forwarding");
                             return Ok(return_not_subbed());
                         };
@@ -332,8 +333,8 @@ impl Operation for SubscribeOp {
                         }) => {
                             if retries < MAX_RETRIES {
                                 skip_list.insert(sender.peer.clone());
-                                if let Some(CachingTarget::Remote(target)) =
-                                    op_manager.ring.closest_caching_target(key, &skip_list)
+                                if let Some(target) =
+                                    op_manager.ring.closest_remote_peer(key, &skip_list)
                                 {
                                     let subscriber =
                                         op_manager.ring.connection_manager.own_location();

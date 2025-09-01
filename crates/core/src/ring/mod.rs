@@ -326,6 +326,22 @@ impl Ring {
         }
     }
 
+    /// Find the best remote peer for a contract, excluding self even if we're the best location.
+    /// This is needed for subscriptions which currently require a remote peer.
+    #[inline]
+    pub fn closest_remote_peer(
+        &self,
+        contract_key: &ContractKey,
+        skip_list: impl Contains<PeerId>,
+    ) -> Option<PeerKeyLocation> {
+        let router = self.router.read();
+        let target_location = Location::from(contract_key);
+
+        // Only consider remote peers, never self
+        self.connection_manager
+            .routing(target_location, None, skip_list, &router)
+    }
+
     /// Get k best peers for caching a contract, ranked by routing predictions
     pub fn k_closest_potentially_caching(
         &self,
