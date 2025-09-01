@@ -729,6 +729,17 @@ async fn try_to_broadcast(
     let return_msg;
 
     match state {
+        // Handle initiating node that's also the target (single node or targeting self)
+        Some(PutState::AwaitingResponse { upstream: None, .. })
+            if broadcast_to.is_empty() && last_hop =>
+        {
+            // We're the initiating node and the target - operation complete
+            tracing::debug!(
+                "PUT operation complete - initiating node is also target (broadcast_to empty, last hop)"
+            );
+            new_state = Some(PutState::Finished { key });
+            return_msg = None;
+        }
         Some(PutState::ReceivedRequest | PutState::BroadcastOngoing) => {
             if broadcast_to.is_empty() && !last_hop {
                 // broadcast complete
