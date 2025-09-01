@@ -77,7 +77,7 @@ pub(crate) async fn request_subscribe(
         // TODO: This is a workaround - subscriptions to locally cached contracts
         // still go through the network protocol to find a remote peer
         const EMPTY: &[PeerId] = &[];
-        let target = match op_manager.ring.closest_remote_peer(key, EMPTY) {
+        let target = match op_manager.ring.closest_potentially_caching(key, EMPTY) {
             Some(peer) => peer,
             None => {
                 // No remote peers available
@@ -242,7 +242,8 @@ impl Operation for SubscribeOp {
                     if !super::has_contract(op_manager, *key).await? {
                         tracing::debug!(tx = %id, %key, "Contract not found, trying other peer");
 
-                        let Some(new_target) = op_manager.ring.closest_remote_peer(key, skip_list)
+                        let Some(new_target) =
+                            op_manager.ring.closest_potentially_caching(key, skip_list)
                         else {
                             tracing::warn!(tx = %id, %key, "No remote peer available for forwarding");
                             return Ok(return_not_subbed());
@@ -334,7 +335,7 @@ impl Operation for SubscribeOp {
                             if retries < MAX_RETRIES {
                                 skip_list.insert(sender.peer.clone());
                                 if let Some(target) =
-                                    op_manager.ring.closest_remote_peer(key, &skip_list)
+                                    op_manager.ring.closest_potentially_caching(key, &skip_list)
                                 {
                                     let subscriber =
                                         op_manager.ring.connection_manager.own_location();

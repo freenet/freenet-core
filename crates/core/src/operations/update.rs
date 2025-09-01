@@ -7,7 +7,7 @@ use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationRe
 use crate::contract::ContractHandlerEvent;
 use crate::message::{InnerMessage, NetMessage, Transaction};
 use crate::node::IsOperationCompleted;
-use crate::ring::{CachingTarget, Location, PeerKeyLocation, RingError};
+use crate::ring::{Location, PeerKeyLocation, RingError};
 use crate::{
     client_events::HostResult,
     node::{NetworkBridge, OpManager, PeerId},
@@ -611,60 +611,34 @@ pub(crate) async fn request_update(
             .pop()
             .ok_or(OpError::RingError(RingError::NoLocation))?
     } else {
-        // Determine where this contract should be cached
-        let caching_target = op_manager
+        // Find the best peer to send the update to
+        let remote_target = op_manager
             .ring
-            .closest_caching_target(key, [sender.peer.clone()].as_slice());
+            .closest_potentially_caching(key, [sender.peer.clone()].as_slice());
 
-        match caching_target {
-            Some(CachingTarget::Remote(target)) => {
-                // Subscribe to the contract
-                op_manager
-                    .ring
-                    .add_subscriber(key, sender)
-                    .map_err(|_| RingError::NoCachingPeers(*key))?;
+        if let Some(target) = remote_target {
+            // Subscribe to the contract
+            op_manager
+                .ring
+                .add_subscriber(key, sender)
+                .map_err(|_| RingError::NoCachingPeers(*key))?;
 
-                target
-            }
-            Some(CachingTarget::Local) => {
-                // We are the best location - handle locally
-                tracing::debug!(
-                    "UPDATE: We are the closest node for contract {}, handling locally",
-                    key
-                );
+            target
+        } else {
+            // No remote peers available, handle locally
+            tracing::debug!(
+                "UPDATE: No remote peers available for contract {}, handling locally",
+                key
+            );
 
-                // Subscribe ourselves
-                op_manager
-                    .ring
-                    .add_subscriber(key, sender)
-                    .map_err(|_| RingError::NoCachingPeers(*key))?;
+            // Subscribe ourselves
+            op_manager
+                .ring
+                .add_subscriber(key, sender.clone())
+                .map_err(|_| RingError::NoCachingPeers(*key))?;
 
-                op_manager.ring.connection_manager.own_location()
-            }
-            None => {
-                // Check if we actually have any connected peers at all
-                let has_connections = op_manager.ring.connection_manager.num_connections() > 0;
-
-                if has_connections {
-                    // We have connections but no suitable peer for this contract
-                    return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
-                } else {
-                    // We truly have no peers, handle locally
-                    tracing::debug!(
-                        "UPDATE: No peer connections available, handling contract {} locally",
-                        key
-                    );
-
-                    // If no other peers, we should be subscribed and handle locally
-                    op_manager
-                        .ring
-                        .add_subscriber(key, sender.clone())
-                        .map_err(|_| RingError::NoCachingPeers(*key))?;
-
-                    // Target ourselves
-                    sender.clone()
-                }
-            }
+            // Target ourselves
+            sender.clone()
         }
     };
 
