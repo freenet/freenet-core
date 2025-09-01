@@ -64,10 +64,12 @@ pub(crate) async fn request_get(
         // the initial request must provide:
         // - a location in the network where the contract resides
         // - and the key of the contract value to get
-        let candidates =
-            op_manager
-                .ring
-                .k_closest_potentially_caching(key, &skip_list, DEFAULT_MAX_BREADTH);
+        let candidates = op_manager.ring.k_closest_potentially_caching(
+            key,
+            &skip_list,
+            DEFAULT_MAX_BREADTH,
+            true, // Include self for initial request to check local cache first
+        );
         if candidates.is_empty() {
             // No peers available - check if we have the contract locally
             tracing::debug!(
@@ -662,6 +664,7 @@ impl Operation for GetOp {
                                         key,
                                         &new_skip_list,
                                         DEFAULT_MAX_BREADTH,
+                                        false, // Don't include self when forwarding after failures
                                     );
 
                                 if !new_candidates.is_empty() {
@@ -1107,6 +1110,7 @@ async fn try_forward_or_return(
             &key,
             &new_skip_list,
             DEFAULT_MAX_BREADTH,
+            false, // Don't include self when forwarding
         );
 
         if candidates.is_empty() {
