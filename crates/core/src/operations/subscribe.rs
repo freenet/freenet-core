@@ -91,10 +91,22 @@ pub(crate) async fn request_subscribe(
                     // Transition directly to completed state
                     sub_op.state = Some(SubscribeState::Completed { key });
 
-                    // Store the completed operation
-                    op_manager.push(id, OpEnum::Subscribe(sub_op)).await?;
+                    // We need to notify the client about successful subscription
+                    // Create a synthetic ReturnSub message to trigger the completion notification
+                    let this_peer = op_manager.ring.connection_manager.own_location();
+                    let return_msg = SubscribeMsg::ReturnSub {
+                        key,
+                        id,
+                        subscribed: true,
+                        sender: this_peer.clone(),
+                        target: this_peer,
+                    };
 
-                    // Operation complete - client will get response
+                    // Use notify_op_change to properly notify the client
+                    op_manager
+                        .notify_op_change(NetMessage::from(return_msg), OpEnum::Subscribe(sub_op))
+                        .await?;
+
                     return Ok(());
                 } else {
                     // No client ID provided - fall back to remote subscription
