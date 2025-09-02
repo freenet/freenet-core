@@ -919,11 +919,60 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
     // Transition to AwaitingResponse state (similar to GET operation)
     let key = contract.key();
 
+    // Cache locally when initiating a PUT per Nacho's requirement:
+    // "If you are doing a PUT, shouldn't we always be caching that locally"
+    let should_seed = op_manager.ring.should_seed(&key);
+    let is_already_seeding = op_manager.ring.is_seeding_contract(&key);
+
+    // Cache locally if we're not already seeding OR if we're not the optimal location
+    let should_cache = !is_already_seeding || !should_seed;
+
+    let modified_value = if should_cache {
+        tracing::debug!(
+            tx = %id,
+            %key,
+            should_seed,
+            is_already_seeding,
+            "Caching contract locally when initiating PUT"
+        );
+
+        // Put the contract locally
+        // IMPORTANT: Use the modified value returned from put_contract
+        let result = put_contract(
+            op_manager,
+            key,
+            value.clone(),
+            related_contracts.clone(),
+            &contract,
+        )
+        .await?;
+
+        // Mark as seeded locally if not already
+        if !is_already_seeding {
+            op_manager.ring.seed_contract(key);
+        }
+
+        tracing::debug!(
+            tx = %id,
+            %key,
+            "Successfully cached contract locally"
+        );
+
+        result
+    } else {
+        tracing::debug!(
+            tx = %id,
+            %key,
+            "Already seeding at optimal location, using existing value"
+        );
+        value.clone()
+    };
+
     put_op.state = Some(PutState::AwaitingResponse {
         key,
         upstream: None, // No upstream since we're initiating
         contract: contract.clone(),
-        state: value.clone(),
+        state: modified_value.clone(),
         subscribe,
     });
 
@@ -932,7 +981,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
         id,
         contract,
         related_contracts,
-        value,
+        value: modified_value, // Use the modified value from put_contract
         htl,
         target,
     };
