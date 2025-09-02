@@ -217,6 +217,18 @@ pub(crate) fn executor_channel(
     // Channel buffer size: In CI environments with limited CPU cores (2 vs 8+ locally),
     // task scheduling can be severely constrained. A larger buffer (1000 vs 10) provides
     // breathing room for the consumer when the scheduler doesn't give it CPU time promptly.
+    //
+    // TODO: This is a workaround. The real issue is that in resource-constrained environments,
+    // the contract executor task may not get scheduled quickly enough to process messages,
+    // causing senders to fill up the channel. When the channel is full and a sender tries
+    // to send with `.await`, it blocks. If all senders block and the receiver task isn't
+    // scheduled, we get a deadlock that eventually times out and drops the channel.
+    //
+    // A proper fix would involve:
+    // 1. Using try_send() with proper backpressure handling
+    // 2. Ensuring the executor task gets scheduled with higher priority
+    // 3. Breaking up large operations to yield more frequently
+    //
     // This is a pragmatic mitigation for CI's resource constraints - in normal operation
     // these channels shouldn't back up as they only coordinate transaction IDs.
     let (waiting_for_op_tx, waiting_for_op_rx) = mpsc::channel(1000);
