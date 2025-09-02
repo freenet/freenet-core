@@ -162,12 +162,12 @@ impl Operation for PutOp {
                         target.peer
                     );
 
-                    // Per Nacho's guidance: always cache locally when initiating a PUT
+                    // Always cache locally when initiating a PUT
                     // This ensures the initiating node has immediate access to the contract
                     // and prevents data loss if the network propagation fails
                     let is_already_seeding = op_manager.ring.is_seeding_contract(&key);
 
-                    // Always cache locally (Nacho: "should_seed = true")
+                    // Always cache locally (should_seed = true)
                     // Previously this was conditional on should_seed(&key)
                     if !is_already_seeding {
                         tracing::debug!(
@@ -899,7 +899,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
     // Transition to AwaitingResponse state (similar to GET operation)
     let key = contract.key();
 
-    // ALWAYS cache locally first when initiating a PUT (per Nacho's requirement)
+    // ALWAYS cache locally first when initiating a PUT
     // "If you are doing a PUT, shouldn't we always be caching that locally no matter if is or not an optimal location?"
     tracing::debug!(
         tx = %id,

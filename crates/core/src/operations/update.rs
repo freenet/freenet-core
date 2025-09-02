@@ -631,13 +631,13 @@ pub(crate) async fn request_update(
                 key
             );
 
-            // Subscribe ourselves
-            op_manager
-                .ring
-                .add_subscriber(key, sender.clone())
-                .map_err(|_| RingError::NoCachingPeers(*key))?;
+            // NOTE: We do NOT subscribe to ourselves here. As Nacho pointed out:
+            // "This makes no sense, why would we subscribe to ourselves? The only consumers
+            // of our updates in this case are client applications, and that flow is handled
+            // completely independently of this."
+            // Client subscriptions are handled through the WebSocket/contract executor layer.
 
-            // Target ourselves
+            // Target ourselves for the update
             sender.clone()
         }
     };
