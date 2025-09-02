@@ -162,50 +162,59 @@ impl Operation for PutOp {
                         target.peer
                     );
 
-                    // Always cache/update locally when initiating a PUT per Nacho's requirement:
+                    // Cache locally when initiating a PUT per Nacho's requirement:
                     // "If you are doing a PUT, shouldn't we always be caching that locally"
-                    // This ensures the initiating node has immediate access to the contract
-                    // and handles both new PUTs and updates to existing contracts
-
+                    // We cache if: not already seeding OR not an optimal location
+                    let should_seed = op_manager.ring.should_seed(&key);
                     let is_already_seeding = op_manager.ring.is_seeding_contract(&key);
 
-                    tracing::debug!(
-                        tx = %id,
-                        %key,
-                        peer = %sender.peer,
-                        is_already_seeding,
-                        "Processing PUT operation locally before propagation"
-                    );
+                    // Cache locally if we're not already seeding OR if we're not the optimal location
+                    // This ensures we always have it locally per Nacho's requirement
+                    let should_cache = !is_already_seeding || !should_seed;
 
-                    // Always put the contract locally (creates new or updates existing)
-                    // IMPORTANT: Use the modified value returned from put_contract
-                    let modified_value = put_contract(
-                        op_manager,
-                        key,
-                        value.clone(),
-                        related_contracts.clone(),
-                        contract,
-                    )
-                    .await?;
-
-                    // Mark as seeded locally if not already seeding
-                    // This ensures we keep track of contracts we're caching
-                    if !is_already_seeding {
-                        op_manager.ring.seed_contract(key);
+                    let modified_value = if should_cache {
                         tracing::debug!(
                             tx = %id,
                             %key,
                             peer = %sender.peer,
-                            "Marked contract as newly seeded locally"
+                            should_seed,
+                            is_already_seeding,
+                            "Caching contract locally in initiating node"
                         );
-                    }
 
-                    tracing::debug!(
-                        tx = %id,
-                        %key,
-                        peer = %sender.peer,
-                        "Successfully processed contract locally before propagation"
-                    );
+                        // Put the contract locally
+                        // IMPORTANT: Use the modified value returned from put_contract
+                        let result = put_contract(
+                            op_manager,
+                            key,
+                            value.clone(),
+                            related_contracts.clone(),
+                            contract,
+                        )
+                        .await?;
+
+                        // Mark as seeded locally if not already
+                        if !is_already_seeding {
+                            op_manager.ring.seed_contract(key);
+                        }
+
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            peer = %sender.peer,
+                            "Successfully cached contract locally"
+                        );
+
+                        result
+                    } else {
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            peer = %sender.peer,
+                            "Already seeding at optimal location, using existing value"
+                        );
+                        value.clone()
+                    };
 
                     // Create a SeekNode message to find the target node
                     // fixme: this node should filter out incoming redundant puts since is the one initiating the request
