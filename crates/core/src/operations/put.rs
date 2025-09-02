@@ -16,7 +16,7 @@ use super::{put, OpEnum, OpError, OpInitialization, OpOutcome, Operation, Operat
 use crate::node::IsOperationCompleted;
 use crate::{
     client_events::HostResult,
-    contract::ContractHandlerEvent,
+    contract::{ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, NetMessage, NetMessageV1, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
     ring::{Location, PeerKeyLocation},
@@ -1002,28 +1002,78 @@ async fn put_contract(
     related_contracts: RelatedContracts<'static>,
     contract: &ContractContainer,
 ) -> Result<WrappedState, OpError> {
-    // after the contract has been cached, push the update query
-    match op_manager
-        .notify_contract_handler(ContractHandlerEvent::PutQuery {
+    // First check if the contract already exists locally
+    let get_result = op_manager
+        .notify_contract_handler(ContractHandlerEvent::GetQuery {
             key,
-            state,
-            related_contracts,
-            contract: Some(contract.clone()),
+            return_contract_code: false,
         })
-        .await
-    {
-        Ok(ContractHandlerEvent::PutResponse {
-            new_value: Ok(new_val),
-        }) => Ok(new_val),
-        Ok(ContractHandlerEvent::PutResponse {
-            new_value: Err(err),
-        }) => {
-            tracing::error!(%key, "Failed to update contract value: {}", err);
-            Err(OpError::from(err))
-            // TODO: not a valid value update, notify back to requester
+        .await;
+
+    let contract_exists = matches!(
+        get_result,
+        Ok(ContractHandlerEvent::GetResponse {
+            response: Ok(StoreResponse { state: Some(_), .. }),
+            ..
+        })
+    );
+
+    if contract_exists {
+        // Contract already exists, update it instead of putting
+        tracing::debug!("Contract {} already exists locally, updating", key);
+        match op_manager
+            .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
+                key,
+                data: UpdateData::State(state.clone().into()),
+                related_contracts: related_contracts.clone(),
+            })
+            .await
+        {
+            Ok(ContractHandlerEvent::UpdateResponse {
+                new_value: Ok(new_val),
+                ..
+            }) => {
+                tracing::debug!("Successfully updated existing contract {}", key);
+                // Return the updated value
+                Ok(new_val)
+            }
+            Ok(ContractHandlerEvent::UpdateResponse {
+                new_value: Err(err),
+                ..
+            }) => {
+                tracing::error!("Failed to update existing contract {}: {}", key, err);
+                Err(OpError::from(err))
+            }
+            Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
+                tracing::debug!("No change needed for contract {}", key);
+                Ok(state)
+            }
+            Err(err) => Err(err.into()),
+            Ok(_) => Err(OpError::UnexpectedOpState),
         }
-        Err(err) => Err(err.into()),
-        Ok(_) => Err(OpError::UnexpectedOpState),
+    } else {
+        // Contract doesn't exist, put it
+        match op_manager
+            .notify_contract_handler(ContractHandlerEvent::PutQuery {
+                key,
+                state,
+                related_contracts,
+                contract: Some(contract.clone()),
+            })
+            .await
+        {
+            Ok(ContractHandlerEvent::PutResponse {
+                new_value: Ok(new_val),
+            }) => Ok(new_val),
+            Ok(ContractHandlerEvent::PutResponse {
+                new_value: Err(err),
+            }) => {
+                tracing::error!(%key, "Failed to put contract value: {}", err);
+                Err(OpError::from(err))
+            }
+            Err(err) => Err(err.into()),
+            Ok(_) => Err(OpError::UnexpectedOpState),
+        }
     }
 }
 
